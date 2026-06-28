@@ -304,7 +304,7 @@ pub fn resolve_state_block_claims(
     blocks: &[StateBlock],
     state_file: &Option<StateFile>,
     desired: &[Resource],
-    registry: &SchemaRegistry,   // import name_attribute resolution
+    registry: &SchemaRegistry,
 ) -> StateBlockClaims { ... }
 ```
 
@@ -330,15 +330,11 @@ address-granularity claims match it exactly; if two state entries share
 an address triple across provider instances, both are excluded —
 conservative over-exclusion (rename churn at worst), never corruption.
 
-**Import targets resolve like the import itself does.** Users commonly
-write `import { to = awscc.s3.Bucket 'carina-rs-state' }` against the
-resource's `name_attribute`, not the anonymous hash name
-(`resolve_import_target`'s documented style). A literal address match
-would therefore miss the desired resource the import targets. Claims
-construction reuses the same desired-side matching the import path uses —
-by name, then by `name_attribute` value against `desired` — and claims
-the *resolved desired resource's address* (its id projected onto the
-routing-agnostic `StateBlockAddress`, matching the field type). An
+**Import targets resolve by identity only.** Claims construction uses the
+same desired-side matching the import path uses: provider, resource type,
+and address identity. When an import target resolves, the claim records
+the resolved desired resource's address projected onto the
+routing-agnostic `StateBlockAddress`, matching the field type. An
 unresolvable import target claims nothing.
 
 One import trade-off is accepted deliberately: if the physical resource
@@ -609,12 +605,9 @@ RC2 (`carina-core/src/identifier/tests.rs`,
 - `test_reconcile_skips_state_entry_claimed_by_removed_from` — an
   effective `removed` block's `from` entry is not consumed by the
   heuristics.
-- Import claims: a `name_attribute`-style import target resolves to the
-  desired resource's id and is excluded from heuristic reconciliation;
-  an already-in-state or unresolvable target claims nothing; the
-  accepted trade-off shape (import target claimed while the physical
-  resource sits in state under an old hash) plans a visible import plus
-  orphan delete.
+- Import claims: an identity-matching import target resolves to the desired
+  resource's id and is excluded from heuristic reconciliation; an
+  already-in-state or unresolvable target claims nothing.
 - Claimed entries under commands without moved materialization: `destroy`
   routes a claimed state entry through the orphan path under its old
   name; `state refresh` refreshes it in place.

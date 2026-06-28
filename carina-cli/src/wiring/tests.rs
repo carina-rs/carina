@@ -533,68 +533,6 @@ fn test_resolve_enum_aliases_non_enum_values_unchanged() {
     );
 }
 
-#[test]
-fn import_fallback_matches_anonymous_resource_by_name_attribute() {
-    use carina_core::effect::Effect;
-    use carina_core::plan::Plan;
-    use carina_core::resource::{ConcreteValue, Resource, Value};
-    use carina_core::schema::ResourceSchema;
-
-    // Schema with name_attribute = "bucket_name"
-    let bucket_schema = ResourceSchema::new("s3.Bucket").with_name_attribute("bucket_name");
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", bucket_schema);
-
-    // Anonymous resource with hash name but bucket_name = "carina-rs-state"
-    let mut resource = Resource::with_provider("awscc", "s3.Bucket", "s3_bucket_1d43a664", None);
-    resource.set_attr(
-        "bucket_name".to_string(),
-        Value::Concrete(ConcreteValue::String("carina-rs-state".to_string())),
-    );
-    let mut plan = Plan::new();
-    plan.add(Effect::Create(resource));
-
-    // Import block with the logical name (not the hash)
-    let state_blocks = vec![StateBlock::Import {
-        to: StateBlockAddress::new("awscc", "s3.Bucket", "carina-rs-state"),
-        id: Value::Concrete(ConcreteValue::String("carina-rs-state".to_string())),
-    }];
-
-    let bindings = carina_core::binding_index::ResolvedBindings::default();
-    let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    add_state_block_effects(
-        &mut plan,
-        &state_blocks,
-        &None,
-        &[],
-        &schemas,
-        &bindings,
-        &no_upstreams,
-    );
-
-    // Expect only an Import effect (no Create) targeting the anonymous hash name
-    let effects = plan.effects();
-    assert_eq!(
-        effects.len(),
-        1,
-        "Expected only Import effect, got {effects:?}"
-    );
-    match &effects[0] {
-        Effect::Import { id, identifier } => {
-            assert_eq!(
-                id.identity_or_empty(),
-                "s3_bucket_1d43a664",
-                "Import should target the anonymous hash name"
-            );
-            assert_eq!(
-                identifier,
-                &Value::Concrete(ConcreteValue::String("carina-rs-state".to_string())),
-            );
-        }
-        other => panic!("Expected Import effect, got {other:?}"),
-    }
-}
-
 /// Sibling of the Import/Removed routing fix:
 /// `moved { from = X 'a', to = X 'b' }` faces the same address-
 /// equality bug when the state-resident `a` carries
@@ -817,105 +755,6 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
         }
         other => panic!("expected Import effect, got {other:?}"),
     }
-}
-
-#[test]
-fn import_fallback_skips_when_already_in_state_by_name_attribute() {
-    use carina_core::plan::Plan;
-    use carina_core::schema::ResourceSchema;
-    use carina_state::state::{ResourceState, StateFile};
-
-    let bucket_schema = ResourceSchema::new("s3.Bucket").with_name_attribute("bucket_name");
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", bucket_schema);
-
-    // State has the resource under its anonymous hash name
-    let mut state_file = StateFile::new();
-    let mut rs = ResourceState::new("s3.Bucket", "s3_bucket_1d43a664", "awscc");
-    rs.attributes.insert(
-        "bucket_name".to_string(),
-        serde_json::Value::String("carina-rs-state".to_string()),
-    );
-    state_file.resources.push(rs);
-
-    let mut plan = Plan::new();
-    let state_blocks = vec![StateBlock::Import {
-        to: StateBlockAddress::new("awscc", "s3.Bucket", "carina-rs-state"),
-        id: Value::Concrete(ConcreteValue::String("carina-rs-state".to_string())),
-    }];
-
-    let bindings = carina_core::binding_index::ResolvedBindings::default();
-    let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    add_state_block_effects(
-        &mut plan,
-        &state_blocks,
-        &Some(state_file),
-        &[],
-        &schemas,
-        &bindings,
-        &no_upstreams,
-    );
-
-    // Already in state (via fallback match) — no Import effect should be emitted
-    assert_eq!(
-        plan.effects().len(),
-        0,
-        "Import should be skipped when fallback-matched resource is already in state"
-    );
-}
-
-#[test]
-fn import_claims_resolve_name_attribute_target_and_skip_noop_targets() {
-    use carina_core::schema::ResourceSchema;
-    use carina_state::state::{ResourceState, StateFile};
-
-    let bucket_schema = ResourceSchema::new("s3.Bucket").with_name_attribute("bucket_name");
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert("awscc", bucket_schema);
-
-    let mut desired = Resource::with_provider("awscc", "s3.Bucket", "s3_bucket_1d43a664", None);
-    desired.set_attr(
-        "bucket_name".to_string(),
-        Value::Concrete(ConcreteValue::String("carina-rs-state".to_string())),
-    );
-    let block = StateBlock::Import {
-        to: StateBlockAddress::new("awscc", "s3.Bucket", "carina-rs-state"),
-        id: Value::Concrete(ConcreteValue::String("carina-rs-state".to_string())),
-    };
-
-    let claims = resolve_state_block_claims(
-        std::slice::from_ref(&block),
-        &None,
-        std::slice::from_ref(&desired),
-        &schemas,
-    );
-    assert!(
-        claims.claims_to("awscc", "s3.Bucket", "s3_bucket_1d43a664"),
-        "name_attribute import target must claim the resolved desired address"
-    );
-
-    let mut state_file = StateFile::new();
-    state_file.resources.push(ResourceState::new(
-        "s3.Bucket",
-        "s3_bucket_1d43a664",
-        "awscc",
-    ));
-    let claims = resolve_state_block_claims(
-        std::slice::from_ref(&block),
-        &Some(state_file),
-        std::slice::from_ref(&desired),
-        &schemas,
-    );
-    assert!(
-        !claims.claims_to("awscc", "s3.Bucket", "s3_bucket_1d43a664"),
-        "already-in-state import target must claim nothing"
-    );
-
-    let claims = resolve_state_block_claims(&[block], &None, &[], &schemas);
-    assert!(
-        !claims.claims_to("awscc", "s3.Bucket", "s3_bucket_1d43a664"),
-        "unresolvable import target must claim nothing"
-    );
 }
 
 #[test]
@@ -1358,7 +1197,7 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
 
         vec![
             ResourceSchema::new("s3.Bucket")
-                .with_name_attribute("bucket_name")
+                .with_unique_name_attribute("bucket_name")
                 .attribute(
                     AttributeSchema::new("bucket_name", AttributeType::string()).create_only(),
                 ),
@@ -1416,68 +1255,6 @@ fn desired_association(name: &str, route_table_binding: &str, subnet_id: &str) -
         Value::Concrete(ConcreteValue::String(subnet_id.to_string())),
     );
     resource
-}
-
-fn bucket_state(name: &str, bucket_name: &str) -> carina_state::state::ResourceState {
-    let mut state = carina_state::state::ResourceState::new("s3.Bucket", name, "awscc");
-    state.attributes.insert(
-        "bucket_name".to_string(),
-        serde_json::Value::String(bucket_name.to_string()),
-    );
-    state
-}
-
-fn desired_bucket(name: &str, bucket_name: &str) -> Resource {
-    let mut resource = Resource::with_provider("awscc", "s3.Bucket", name, None);
-    resource.set_attr(
-        "bucket_name".to_string(),
-        Value::Concrete(ConcreteValue::String(bucket_name.to_string())),
-    );
-    resource
-}
-
-#[test]
-fn import_claimed_name_attribute_target_excludes_desired_from_reconciliation() {
-    use carina_state::state::StateFile;
-
-    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)]);
-    let old_name = "s3_bucket_1d43a664";
-    let desired_name = "s3_bucket_desired";
-    let bucket_name = "carina-rs-state";
-    let mut state_file = StateFile::new();
-    state_file
-        .resources
-        .push(bucket_state(old_name, bucket_name));
-    let mut resources = vec![desired_bucket(desired_name, bucket_name)];
-    let state_blocks = vec![StateBlock::Import {
-        to: StateBlockAddress::new("awscc", "s3.Bucket", bucket_name),
-        id: Value::Concrete(ConcreteValue::String(bucket_name.to_string())),
-    }];
-
-    let claims = resolve_state_block_claims(
-        &state_blocks,
-        &Some(state_file.clone()),
-        &resources,
-        ctx.schemas(),
-    );
-    assert!(
-        claims.claims_to("awscc", "s3.Bucket", desired_name),
-        "name_attribute import target must claim the resolved desired resource"
-    );
-
-    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims);
-
-    assert_eq!(
-        resources[0].id.identity_or_empty(),
-        desired_name,
-        "import-claimed desired resource must not adopt the matching old hash name"
-    );
-    assert!(
-        state_file
-            .find_resource("awscc", "s3.Bucket", old_name)
-            .is_some(),
-        "old hash state entry must stay put for the orphan path"
-    );
 }
 
 fn assert_claimed_association_stays_orphaned_after_reconcile() {

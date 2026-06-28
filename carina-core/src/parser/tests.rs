@@ -1438,7 +1438,7 @@ fn parse_directives_anonymous_resource() {
 /// Regression test for issue #146: anonymous AWSCC resources should not have
 /// a spurious "name" attribute injected into the attributes map.
 #[test]
-fn anonymous_resource_no_spurious_name_attribute() {
+fn anonymous_resource_no_spurious_unique_name_attribute() {
     let input = r#"
         awscc.ec2.Vpc {
             cidr_block = "10.0.0.0/16"
@@ -1461,7 +1461,7 @@ fn anonymous_resource_no_spurious_name_attribute() {
 /// Regression test for issue #146: let-bound AWSCC resources should not have
 /// a spurious "name" attribute injected by the parser.
 #[test]
-fn let_bound_resource_no_spurious_name_attribute() {
+fn let_bound_resource_no_spurious_unique_name_attribute() {
     let input = r#"
         let vpc = awscc.ec2.Vpc {
             cidr_block = "10.0.0.0/16"

@@ -4054,7 +4054,7 @@ pub struct ResourceSchema {
     /// The attribute that serves as the unique name for this resource type.
     /// Used for automatic unique name generation during create-before-destroy replacement.
     /// (e.g., "bucket_name" for s3.bucket, "log_group_name" for logs.log_group)
-    pub name_attribute: Option<String>,
+    pub unique_name_attribute: Option<String>,
     /// Per-resource operational config (timeouts, retries).
     /// When None, provider defaults are used.
     pub operation_config: Option<OperationConfig>,
@@ -4104,7 +4104,7 @@ impl ResourceSchema {
             description: None,
             validator: None,
             kind: SchemaKind::Resource,
-            name_attribute: None,
+            unique_name_attribute: None,
             operation_config: None,
             exclusive_required: Vec::new(),
             default_wait_timeout: None,
@@ -4276,8 +4276,8 @@ impl ResourceSchema {
         matches!(self.kind, SchemaKind::DataSource)
     }
 
-    pub fn with_name_attribute(mut self, attr: impl Into<String>) -> Self {
-        self.name_attribute = Some(attr.into());
+    pub fn with_unique_name_attribute(mut self, attr: impl Into<String>) -> Self {
+        self.unique_name_attribute = Some(attr.into());
         self
     }
 

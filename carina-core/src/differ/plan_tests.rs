@@ -89,7 +89,7 @@ impl crate::provider::Provider for HintProvider {
 }
 
 #[test]
-fn create_before_destroy_generates_temporary_name_for_name_attribute() {
+fn create_before_destroy_generates_temporary_name_for_unique_name_attribute() {
     use crate::schema::{AttributeSchema, AttributeType};
 
     let mut resource = Resource::new("s3.Bucket", "my-bucket")
@@ -128,7 +128,7 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
             .attribute(
                 AttributeSchema::new("object_lock_enabled", AttributeType::bool()).create_only(),
             )
-            .with_name_attribute("bucket_name"),
+            .with_unique_name_attribute("bucket_name"),
     );
 
     let plan = create_plan(
@@ -149,9 +149,9 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
         Effect::Replace {
             temporary_name, to, ..
         } => {
-            let temp = temporary_name
-                .as_ref()
-                .expect("Should have temporary_name for create_before_destroy with name_attribute");
+            let temp = temporary_name.as_ref().expect(
+                "Should have temporary_name for create_before_destroy with unique_name_attribute",
+            );
             assert_eq!(temp.attribute, "bucket_name");
             assert_eq!(temp.original_value, "my-bucket");
             assert!(
@@ -218,7 +218,7 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
                 AttributeSchema::new("log_group_name", AttributeType::string()),
             )
             .attribute(AttributeSchema::new("kms_key_id", AttributeType::string()).create_only())
-            .with_name_attribute("log_group_name"),
+            .with_unique_name_attribute("log_group_name"),
     );
 
     let plan = create_plan(
@@ -287,7 +287,7 @@ fn no_temporary_name_without_create_before_destroy() {
             .attribute(
                 AttributeSchema::new("object_lock_enabled", AttributeType::bool()).create_only(),
             )
-            .with_name_attribute("bucket_name"),
+            .with_unique_name_attribute("bucket_name"),
     );
 
     let plan = create_plan(
@@ -359,7 +359,7 @@ fn no_temporary_name_when_name_prefix_is_used() {
             .attribute(
                 AttributeSchema::new("object_lock_enabled", AttributeType::bool()).create_only(),
             )
-            .with_name_attribute("bucket_name"),
+            .with_unique_name_attribute("bucket_name"),
     );
 
     let plan = create_plan(
@@ -388,7 +388,7 @@ fn no_temporary_name_when_name_prefix_is_used() {
 }
 
 #[test]
-fn no_temporary_name_without_name_attribute_in_schema() {
+fn no_temporary_name_without_unique_name_attribute_in_schema() {
     use crate::schema::{AttributeSchema, AttributeType};
 
     let mut resource = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
@@ -415,7 +415,7 @@ fn no_temporary_name_without_name_attribute_in_schema() {
         "",
         ResourceSchema::new("ec2.Vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only()),
-        // No name_attribute set
+        // No unique_name_attribute set
     );
 
     let plan = create_plan(
@@ -436,7 +436,7 @@ fn no_temporary_name_without_name_attribute_in_schema() {
         Effect::Replace { temporary_name, .. } => {
             assert!(
                 temporary_name.is_none(),
-                "Should not generate temporary_name without name_attribute in schema"
+                "Should not generate temporary_name without unique_name_attribute in schema"
             );
         }
         other => panic!("Expected Replace, got {:?}", other),
@@ -444,10 +444,10 @@ fn no_temporary_name_without_name_attribute_in_schema() {
 }
 
 #[test]
-fn no_temporary_name_when_name_attribute_changes() {
+fn no_temporary_name_when_unique_name_attribute_changes() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    // name_attribute itself changed: old-bucket → new-bucket
+    // unique_name_attribute itself changed: old-bucket → new-bucket
     // No temporary name needed since names are already different
     let mut resource = Resource::new("s3.Bucket", "my-bucket")
         .with_attribute(
@@ -485,7 +485,7 @@ fn no_temporary_name_when_name_attribute_changes() {
             .attribute(
                 AttributeSchema::new("object_lock_enabled", AttributeType::bool()).create_only(),
             )
-            .with_name_attribute("bucket_name"),
+            .with_unique_name_attribute("bucket_name"),
     );
 
     let plan = create_plan(
@@ -506,7 +506,7 @@ fn no_temporary_name_when_name_attribute_changes() {
         Effect::Replace { temporary_name, .. } => {
             assert!(
                 temporary_name.is_none(),
-                "Should not generate temporary_name when name_attribute value changes"
+                "Should not generate temporary_name when unique_name_attribute value changes"
             );
         }
         other => panic!("Expected Replace, got {:?}", other),

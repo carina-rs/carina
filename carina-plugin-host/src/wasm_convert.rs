@@ -768,7 +768,7 @@ fn proto_schema_to_core(
             proto::SchemaKind::Managed => carina_core::schema::SchemaKind::Resource,
             proto::SchemaKind::DataSource => carina_core::schema::SchemaKind::DataSource,
         },
-        name_attribute: s.name_attribute.clone(),
+        unique_name_attribute: s.unique_name_attribute.clone(),
         operation_config: s.operation_config.as_ref().map(|c| {
             carina_core::schema::OperationConfig {
                 delete_timeout_secs: c.delete_timeout_secs,
@@ -1813,7 +1813,7 @@ mod tests {
           {
             "resource_type": "ec2.SecurityGroup",
             "description": "EC2 Security Group",
-            "name_attribute": "group_name",
+            "unique_name_attribute": "group_name",
             "attributes": {
               "ingress": {
                 "name": "ingress",
@@ -1896,7 +1896,7 @@ mod tests {
         assert_eq!(schema.resource_type, "ec2.SecurityGroup");
         assert_eq!(schema.description.as_deref(), Some("EC2 Security Group"));
         assert!(!schema.is_data_source());
-        assert_eq!(schema.name_attribute.as_deref(), Some("group_name"));
+        assert_eq!(schema.unique_name_attribute.as_deref(), Some("group_name"));
 
         // Basic attribute types
         let desc_attr = schema
@@ -2095,7 +2095,7 @@ mod tests {
             attributes: HashMap::new(),
             description: None,
             kind: proto::SchemaKind::Managed,
-            name_attribute: None,
+            unique_name_attribute: None,
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
             exclusive_required: vec![],
@@ -2112,7 +2112,7 @@ mod tests {
             attributes: HashMap::new(),
             description: None,
             kind: proto::SchemaKind::Managed,
-            name_attribute: None,
+            unique_name_attribute: None,
             operation_config: None,
             validators: vec![],
             exclusive_required: vec![],
@@ -2131,7 +2131,7 @@ mod tests {
             attributes: HashMap::new(),
             description: None,
             kind: proto::SchemaKind::Managed,
-            name_attribute: None,
+            unique_name_attribute: None,
             operation_config: None,
             validators: vec![],
             exclusive_required: vec![vec![
@@ -2169,7 +2169,7 @@ mod tests {
             attributes: HashMap::new(),
             description: None,
             kind: proto::SchemaKind::Managed,
-            name_attribute: None,
+            unique_name_attribute: None,
             operation_config: None,
             validators: vec![],
             exclusive_required: vec![vec!["a".to_string(), "b".to_string()]],
@@ -2824,7 +2824,7 @@ mod tests {
             attributes: HashMap::new(),
             description: None,
             kind: proto::SchemaKind::Managed,
-            name_attribute: None,
+            unique_name_attribute: None,
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
             exclusive_required: vec![],

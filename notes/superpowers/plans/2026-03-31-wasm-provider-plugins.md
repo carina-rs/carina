@@ -770,7 +770,7 @@ fn test_schema_roundtrip_basic() {
         description: Some("S3 bucket".to_string()),
         validator: None,
         data_source: false,
-        name_attribute: None,
+        unique_name_attribute: None,
         force_replace: false,
     };
     let wit = wasm_convert::core_to_wit_schema(&core);
@@ -904,7 +904,7 @@ pub fn core_to_wit_schema(s: &CoreResSchema) -> WitResSchema {
             .collect(),
         description: s.description.clone(),
         data_source: s.data_source,
-        name_attribute: s.name_attribute.clone(),
+        unique_name_attribute: s.unique_name_attribute.clone(),
         force_replace: s.force_replace,
     }
 }
@@ -938,7 +938,7 @@ pub fn wit_to_core_schema(s: &WitResSchema) -> CoreResSchema {
         description: s.description.clone(),
         validator: None,
         data_source: s.data_source,
-        name_attribute: s.name_attribute.clone(),
+        unique_name_attribute: s.unique_name_attribute.clone(),
         force_replace: s.force_replace,
     }
 }

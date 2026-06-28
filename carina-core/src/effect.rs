@@ -52,7 +52,7 @@ pub struct TemporaryName {
     pub original_value: String,
     /// The generated temporary name (e.g., "my-bucket-a1b2c3d4")
     pub temporary_value: String,
-    /// Whether the name attribute can be updated after creation (not create-only)
+    /// Whether the unique-name attribute can be updated after creation (not create-only)
     pub can_rename: bool,
 }
 
