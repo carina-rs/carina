@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "test.Widget",
-      "name": "web_acl",
+      "identity": "web_acl",
       "provider": "test",
       "identifier": "widget-web-acl-live",
       "attributes": {

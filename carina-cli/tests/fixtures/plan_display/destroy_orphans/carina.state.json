@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "ec2.Vpc",
-      "name": "ec2_vpc_fb75c929",
+      "identity": "ec2_vpc_fb75c929",
       "provider": "awscc",
       "identifier": "vpc-0123456789abcdef0",
       "attributes": {
@@ -44,7 +44,7 @@
     },
     {
       "resource_type": "ec2.Subnet",
-      "name": "ec2_subnet_f5269366",
+      "identity": "ec2_subnet_f5269366",
       "provider": "awscc",
       "identifier": "subnet-0123456789abcdef0",
       "attributes": {

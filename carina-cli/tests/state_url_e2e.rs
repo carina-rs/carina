@@ -20,19 +20,19 @@ fn carina(args: &[&str]) -> std::process::Output {
         .expect("failed to execute carina")
 }
 
-/// Write a minimal v7 state file with a single ec2.Vpc resource bound
+/// Write a minimal v8 state file with a single ec2.Vpc resource bound
 /// to `vpc` and return its path.
 fn write_minimal_state(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("carina.state.json");
     let state = json!({
-        "version": 7,
+        "version": 8,
         "serial": 1,
         "lineage": "test-state-url-e2e",
         "carina_version": "0.1.0",
         "resources": [
             {
                 "resource_type": "ec2.Vpc",
-                "name": "my-vpc",
+                "identity": "my-vpc",
                 "binding": "vpc",
                 "provider": "awscc",
                 "identifier": "vpc-deadbeef",

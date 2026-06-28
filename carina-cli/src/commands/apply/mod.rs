@@ -954,7 +954,7 @@ async fn run_apply_locked(
             &|provider, resource_type| {
                 sf.resources_by_type(provider, resource_type)
                     .into_iter()
-                    .map(|r| r.name.clone())
+                    .map(|r| r.identity.clone())
                     .collect()
             },
             &state_block_claims,
@@ -964,7 +964,7 @@ async fn run_apply_locked(
             &|provider, resource_type| {
                 sf.resources_by_type(provider, resource_type)
                     .into_iter()
-                    .map(|r| r.name.clone())
+                    .map(|r| r.identity.clone())
                     .collect()
             },
             &state_block_claims,

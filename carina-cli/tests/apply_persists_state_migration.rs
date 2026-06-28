@@ -1,6 +1,6 @@
 //! Regression test for carina#3315.
 //!
-//! After carina#3283 improved the v6→v7 migration warning to promise
+//! After carina#3283 improved the v6→current migration warning to promise
 //! the operator that the upgrade "will be rewritten on the next
 //! `carina apply` or `carina state refresh`", an apply with no
 //! resource diff still left the on-disk state at v6: the no-op path
@@ -66,7 +66,7 @@ fn read_state_version_and_serial(path: &std::path::Path) -> (u32, u64) {
 }
 
 #[test]
-fn apply_persists_v6_to_v7_with_no_resource_diff() {
+fn apply_persists_v6_to_current_with_no_resource_diff() {
     let dir = TempDir::new().unwrap();
     write_v6_state(dir.path());
 
@@ -122,8 +122,8 @@ fn apply_persists_v6_to_v7_with_no_resource_diff() {
 }
 
 #[test]
-fn apply_persists_v6_to_v7_under_no_lock_flag() {
-    // Same scenario as `apply_persists_v6_to_v7_with_no_resource_diff`
+fn apply_persists_v6_to_current_under_no_lock_flag() {
+    // Same scenario as `apply_persists_v6_to_current_with_no_resource_diff`
     // but with `--lock=false`. The dispatch in
     // `load_state_persist_if_migrated` must pick the unlocked writer
     // (`save_state_unlocked`) when no `LockInfo` is held, and the
@@ -158,7 +158,7 @@ fn apply_persists_v6_to_v7_under_no_lock_flag() {
 }
 
 #[test]
-fn destroy_persists_v6_to_v7_when_state_has_no_resources() {
+fn destroy_persists_v6_to_current_when_state_has_no_resources() {
     // Sibling path of `apply`: `destroy` also takes the apply lock
     // and short-circuits ("No resources to destroy.") when the
     // state has no managed resources. The migration must still be
@@ -194,7 +194,7 @@ fn destroy_persists_v6_to_v7_when_state_has_no_resources() {
 }
 
 #[test]
-fn state_refresh_persists_v6_to_v7_when_state_has_no_resources() {
+fn state_refresh_persists_v6_to_current_when_state_has_no_resources() {
     // `state refresh` returns early when the state has no resources
     // ("No resources in state. Nothing to refresh."). The migration
     // persistence must still happen on that path — otherwise a v6

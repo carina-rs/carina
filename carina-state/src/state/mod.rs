@@ -43,7 +43,10 @@ impl StateFile {
     ///     state lift each top-level key to a `Leaf` child of the
     ///     root `Struct`; the next plan/apply rebuilds a full tree
     ///     from the resource's authored `Value`.
-    pub const CURRENT_VERSION: u32 = 7;
+    /// v7: Replaced top-level empty `ExplicitFields::Struct` with
+    ///     `ExplicitFields::Unrecorded`.
+    /// v8: Renamed `ResourceState.name` to `ResourceState.identity`.
+    pub const CURRENT_VERSION: u32 = 8;
 
     /// Create a new empty state file
     pub fn new() -> Self {
@@ -62,7 +65,7 @@ impl StateFile {
     /// the state backend writes after auto-creating its own storage —
     /// see [`ResourceState::managed_state_bucket`] for the shape.
     ///
-    /// `resource_name` must equal the desired resource's resolved name
+    /// `resource_identity` must equal the desired resource's resolved identity
     /// (e.g. `aws_s3_bucket_<hash>` for the auto-injected anonymous block);
     /// `bucket_name` is the AWS bucket identifier the provider acts on.
     /// Conflating the two reproduces #2533.
@@ -82,19 +85,19 @@ impl StateFile {
     ///     "my-state-bucket",
     /// );
     /// assert_eq!(state.resources.len(), 1);
-    /// assert_eq!(state.resources[0].name, "aws_s3_bucket_a3f2b1c8");
+    /// assert_eq!(state.resources[0].identity, "aws_s3_bucket_a3f2b1c8");
     /// ```
     pub fn with_managed_state_bucket(
         provider: impl Into<String>,
         resource_type: impl Into<String>,
-        resource_name: impl Into<String>,
+        resource_identity: impl Into<String>,
         bucket_name: impl Into<String>,
     ) -> Self {
         let mut state = Self::new();
         state.upsert_resource(ResourceState::managed_state_bucket(
             provider,
             resource_type,
-            resource_name,
+            resource_identity,
             bucket_name,
         ));
         state
@@ -118,16 +121,16 @@ impl StateFile {
         self.carina_version = env!("CARGO_PKG_VERSION").to_string();
     }
 
-    /// Find a resource by provider, type, and name
+    /// Find a resource by provider, type, and identity
     pub fn find_resource(
         &self,
         provider: &str,
         resource_type: &str,
-        name: &str,
+        identity: &str,
     ) -> Option<&ResourceState> {
-        self.resources
-            .iter()
-            .find(|r| r.provider == provider && r.resource_type == resource_type && r.name == name)
+        self.resources.iter().find(|r| {
+            r.provider == provider && r.resource_type == resource_type && r.identity == identity
+        })
     }
 
     /// Find all resources matching a provider and resource type
@@ -138,23 +141,25 @@ impl StateFile {
             .collect()
     }
 
-    /// Find a resource mutably by provider, type, and name
+    /// Find a resource mutably by provider, type, and identity
     pub fn find_resource_mut(
         &mut self,
         provider: &str,
         resource_type: &str,
-        name: &str,
+        identity: &str,
     ) -> Option<&mut ResourceState> {
-        self.resources
-            .iter_mut()
-            .find(|r| r.provider == provider && r.resource_type == resource_type && r.name == name)
+        self.resources.iter_mut().find(|r| {
+            r.provider == provider && r.resource_type == resource_type && r.identity == identity
+        })
     }
 
     /// Add or update a resource in the state
     pub fn upsert_resource(&mut self, resource: ResourceState) {
-        if let Some(existing) =
-            self.find_resource_mut(&resource.provider, &resource.resource_type, &resource.name)
-        {
+        if let Some(existing) = self.find_resource_mut(
+            &resource.provider,
+            &resource.resource_type,
+            &resource.identity,
+        ) {
             *existing = resource;
         } else {
             self.resources.push(resource);
@@ -187,7 +192,7 @@ impl StateFile {
         ResourceId::with_provider_name_compat(
             &rs.provider,
             &rs.resource_type,
-            &rs.name,
+            &rs.identity,
             rs.directives.provider_instance.clone(),
         )
     }
@@ -368,7 +373,7 @@ impl StateFile {
     pub fn canonicalize_addresses(&mut self) {
         use carina_core::utils::canonicalize_map_key_address;
         for r in &mut self.resources {
-            r.name = canonicalize_map_key_address(&r.name);
+            r.identity = canonicalize_map_key_address(&r.identity);
             if let Some(b) = r.binding.as_ref() {
                 r.binding = Some(canonicalize_map_key_address(b));
             }
@@ -385,10 +390,10 @@ impl StateFile {
         &mut self,
         provider: &str,
         resource_type: &str,
-        name: &str,
+        identity: &str,
     ) -> Option<ResourceState> {
         if let Some(pos) = self.resources.iter().position(|r| {
-            r.provider == provider && r.resource_type == resource_type && r.name == name
+            r.provider == provider && r.resource_type == resource_type && r.identity == identity
         }) {
             Some(self.resources.remove(pos))
         } else {
@@ -589,7 +594,7 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
             // authored an empty struct at the top level" (which the
             // current code never legitimately emits — `build_from_resource`
             // produces this shape only when `resource.attributes` is
-            // empty, and the v7 writeback path emits `Unrecorded`
+            // empty, and the v8 writeback path emits `Unrecorded`
             // instead). Rewriting every top-level empty Struct to
             // `Unrecorded` on read makes the variant the single
             // source of truth and lets every `match` arm be exhaustive
@@ -644,8 +649,9 @@ pub fn check_and_migrate_bytes(bytes: &[u8]) -> Result<MigratedStateFile, Backen
 pub struct ResourceState {
     /// Resource type (e.g., "s3.Bucket", "ec2.Vpc")
     pub resource_type: String,
-    /// Resource name (from the `name` attribute in DSL)
-    pub name: String,
+    /// Resource identity (from the DSL resource address identity)
+    #[serde(alias = "name")]
+    pub identity: String,
     /// Provider name (e.g., "aws")
     pub provider: String,
     /// AWS internal identifier (e.g., vpc-xxx, subnet-xxx)
@@ -707,12 +713,12 @@ impl ResourceState {
     /// Create a new resource state
     pub fn new(
         resource_type: impl Into<String>,
-        name: impl Into<String>,
+        identity: impl Into<String>,
         provider: impl Into<String>,
     ) -> Self {
         Self {
             resource_type: resource_type.into(),
-            name: name.into(),
+            identity: identity.into(),
             provider: provider.into(),
             identifier: None,
             attributes: HashMap::new(),
@@ -769,8 +775,8 @@ impl ResourceState {
     /// returns "not found" and the next apply re-issues `CreateBucket`,
     /// reproducing #2533 (`BucketAlreadyOwnedByYou`).
     ///
-    /// `resource_name` is the state-side resource name and must equal the
-    /// resolved name of the desired resource (anonymous resources get a
+    /// `resource_identity` is the state-side resource identity and must equal the
+    /// resolved identity of the desired resource (anonymous resources get a
     /// hash-derived id like `aws_s3_bucket_<hash>`); `bucket_name` is the
     /// AWS bucket name used as the provider identifier and as the value
     /// of the `bucket` attribute. Mixing the two breaks the differ — see
@@ -778,11 +784,11 @@ impl ResourceState {
     pub fn managed_state_bucket(
         provider: impl Into<String>,
         resource_type: impl Into<String>,
-        resource_name: impl Into<String>,
+        resource_identity: impl Into<String>,
         bucket_name: impl Into<String>,
     ) -> Self {
         let bucket_name = bucket_name.into();
-        Self::new(resource_type, resource_name, provider)
+        Self::new(resource_type, resource_identity, provider)
             .with_identifier(&bucket_name)
             .with_attribute("bucket", serde_json::json!(bucket_name))
             .with_protected(true)
@@ -978,7 +984,7 @@ fn is_empty_explicit(e: &ExplicitFields) -> bool {
 /// entry into a `Leaf` child of the v6 `explicit: ExplicitFields::Struct`
 /// tree.
 ///
-/// Resources are matched by `(provider, resource_type, name)` because
+/// Resources are matched by `(provider, resource_type, identity)` because
 /// state files use that triple as the canonical identity.
 fn migrate_v5_desired_keys_to_explicit(
     content: &str,
@@ -996,8 +1002,12 @@ fn migrate_v5_desired_keys_to_explicit(
     for raw_rs in raw_resources {
         let provider = raw_rs.get("provider").and_then(|v| v.as_str());
         let resource_type = raw_rs.get("resource_type").and_then(|v| v.as_str());
-        let name = raw_rs.get("name").and_then(|v| v.as_str());
-        let Some(((provider, resource_type), name)) = provider.zip(resource_type).zip(name) else {
+        let identity = raw_rs
+            .get("identity")
+            .or_else(|| raw_rs.get("name"))
+            .and_then(|v| v.as_str());
+        let Some(((provider, resource_type), identity)) = provider.zip(resource_type).zip(identity)
+        else {
             continue;
         };
         let Some(keys) = raw_rs.get("desired_keys").and_then(|v| v.as_array()) else {
@@ -1011,7 +1021,7 @@ fn migrate_v5_desired_keys_to_explicit(
             continue;
         }
         if let Some(rs) = state.resources.iter_mut().find(|rs| {
-            rs.provider == provider && rs.resource_type == resource_type && rs.name == name
+            rs.provider == provider && rs.resource_type == resource_type && rs.identity == identity
         }) {
             rs.explicit = ExplicitFields::Struct { children };
         }
@@ -1026,7 +1036,7 @@ fn migrate_v5_desired_keys_to_explicit(
 /// path that lost child attributes before reaching writeback), never a
 /// legitimate "user authored an empty struct at top level" — the
 /// current `build_from_resource` produces this shape only when
-/// `resource.attributes` is empty, and the v7 writeback path emits
+/// `resource.attributes` is empty, and the v8 writeback path emits
 /// `Unrecorded` for that case instead. Migrating eliminates the
 /// runtime ambiguity that callers used to disambiguate by convention.
 fn migrate_v6_empty_struct_to_unrecorded(state: &mut StateFile) {

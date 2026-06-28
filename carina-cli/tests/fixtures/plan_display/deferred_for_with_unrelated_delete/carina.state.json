@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "route53.RecordSet",
-      "name": "extra_record",
+      "identity": "extra_record",
       "provider": "aws",
       "identifier": "Z123:_extra.registry.example.com:CNAME",
       "attributes": {

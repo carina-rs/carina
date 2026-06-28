@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "test.Widget",
-      "name": "test_widget_11111111",
+      "identity": "test_widget_11111111",
       "provider": "awscc",
       "identifier": "widget-live-1",
       "attributes": {

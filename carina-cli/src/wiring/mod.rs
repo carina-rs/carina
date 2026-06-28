@@ -526,7 +526,7 @@ pub fn apply_anonymous_to_named_renames(
                         })
                         .collect();
                     AnonymousIdStateInfo {
-                        name: sr.name.clone(),
+                        name: sr.identity.clone(),
                         create_only_values,
                     }
                 })
@@ -567,7 +567,7 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
             Some((
                 binding.clone(),
                 AnonymousIdBindingStateInfo {
-                    name: sr.name.clone(),
+                    name: sr.identity.clone(),
                     attribute_values: sr
                         .attributes
                         .iter()
@@ -612,7 +612,7 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
                         })
                         .collect();
                     AnonymousIdStateInfo {
-                        name: sr.name.clone(),
+                        name: sr.identity.clone(),
                         create_only_values,
                     }
                 })
@@ -629,9 +629,9 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
 /// pairs (anonymous → anonymous due to identifier-format upgrade).
 ///
 /// For each `(old_name, new_name)` pair, find the matching `ResourceState`
-/// in `state_file.resources` and overwrite its `name` field. Downstream maps
+/// in `state_file.resources` and overwrite its `identity` field. Downstream maps
 /// (`build_saved_attrs`, `build_explicit`, `build_directives`) then key
-/// off the new name, so the differ sees the resource under its updated
+/// off the new identity, so the differ sees the resource under its updated
 /// identifier instead of an orphan-delete + create pair.
 pub fn apply_provider_prefix_renames(renames: &[(String, String)], state_file: &mut StateFile) {
     if renames.is_empty() {
@@ -642,8 +642,8 @@ pub fn apply_provider_prefix_renames(renames: &[(String, String)], state_file: &
         .map(|(old, new)| (old.as_str(), new.as_str()))
         .collect();
     for sr in &mut state_file.resources {
-        if let Some(new_name) = by_old.get(sr.name.as_str()) {
-            sr.name = new_name.to_string();
+        if let Some(new_name) = by_old.get(sr.identity.as_str()) {
+            sr.identity = new_name.to_string();
         }
     }
 }
@@ -2304,7 +2304,7 @@ fn materialize_moved_states_with_warning_sink(
                         ResourceId::with_provider_identity(
                             &rs.provider,
                             &rs.resource_type,
-                            &rs.name,
+                            &rs.identity,
                             rs.directives.provider_instance.clone(),
                         )
                     })
@@ -2417,7 +2417,7 @@ pub fn resolve_state_blocks(
                         ResourceId::with_provider_identity(
                             &rs.provider,
                             &rs.resource_type,
-                            &rs.name,
+                            &rs.identity,
                             rs.directives.provider_instance.clone(),
                         )
                     })
@@ -2680,7 +2680,7 @@ pub fn add_state_block_effects(
                             ResourceId::with_provider_identity(
                                 &rs.provider,
                                 &rs.resource_type,
-                                &rs.name,
+                                &rs.identity,
                                 rs.directives.provider_instance.clone(),
                             )
                         })

@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "route53.RecordSet",
-      "name": "validation_records[0]",
+      "identity": "validation_records[0]",
       "provider": "aws",
       "identifier": "Z123:_acme.registry.example.com:CNAME",
       "attributes": {

@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "iam.RolePolicy",
-      "name": "policy",
+      "identity": "policy",
       "provider": "awscc",
       "identifier": "delegation-writer|trust-policy",
       "attributes": {

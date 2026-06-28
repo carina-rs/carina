@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "route53.HostedZone",
-      "name": "zone",
+      "identity": "zone",
       "provider": "fixture",
       "identifier": "hosted-zone-fixture",
       "attributes": {

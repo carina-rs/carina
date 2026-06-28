@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "ec2.Vpc",
-      "name": "old_vpc",
+      "identity": "old_vpc",
       "provider": "awscc",
       "identifier": "vpc-old123",
       "attributes": {

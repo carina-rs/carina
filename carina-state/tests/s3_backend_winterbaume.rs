@@ -195,8 +195,8 @@ async fn write_then_read_state_round_trips() {
     let written_res = &written.resources[0];
     let read_res = &read_back.resources[0];
     assert_eq!(
-        read_res.name, written_res.name,
-        "the round-tripped resource must keep its name",
+        read_res.identity, written_res.identity,
+        "the round-tripped resource must keep its identity",
     );
     assert_eq!(
         read_res.resource_type, written_res.resource_type,

@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "iam.Role",
-      "name": "role",
+      "identity": "role",
       "provider": "awscc",
       "identifier": "test-role",
       "attributes": {
@@ -33,7 +33,7 @@
     },
     {
       "resource_type": "iam.RolePolicy",
-      "name": "policy",
+      "identity": "policy",
       "provider": "awscc",
       "identifier": "test-role|test-inline",
       "attributes": {
@@ -79,7 +79,7 @@
     },
     {
       "resource_type": "s3.Bucket",
-      "name": "zzz_bucket",
+      "identity": "zzz_bucket",
       "provider": "awscc",
       "identifier": "zzz-trailing-sibling",
       "attributes": {
