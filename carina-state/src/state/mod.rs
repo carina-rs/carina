@@ -44,6 +44,7 @@ impl StateFile {
     ///     state lift each top-level key to a `Leaf` child of the
     ///     root `Struct`; the next plan/apply rebuilds a full tree
     ///     from the resource's authored `Value`.
+    /// v7: Replaced top-level empty explicit structs with `Unrecorded`.
     /// v8: Replaced `name_overrides: HashMap<String, String>` with
     ///     `HashMap<String, NameOverride>` so permanent CBD temporary
     ///     names remember the DSL value that produced them.
@@ -557,6 +558,12 @@ pub fn log_state_migration_once(
              that directory.",
             display_target, info.from, info.to
         );
+        if info.from <= 7 && info.to >= 8 {
+            eprintln!(
+                "Warning: v7 -> v8 migration: override original values are unknown; \
+                 the first apply may overwrite an in-flight DSL rename. Re-run plan to verify."
+            );
+        }
     }
 }
 
@@ -621,6 +628,15 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
             // again.
             if v <= 6 {
                 migrate_v6_empty_struct_to_unrecorded(&mut state);
+            }
+            // v7 → v8: `ResourceState.name_overrides` changed from
+            // `HashMap<String, String>` to `HashMap<String, NameOverride>`.
+            // The concrete lift is handled by `NameOverride`'s untagged
+            // serde reader (legacy bare String → `{ temp_value, original_value: "" }`).
+            // Keep this no-op migration step explicit so future wire-shape
+            // changes do not accidentally depend on that fallback silently.
+            if v <= 7 {
+                migrate_v7_name_overrides_to_structs(&mut state);
             }
             state.version = StateFile::CURRENT_VERSION;
             state
@@ -1061,6 +1077,15 @@ fn migrate_v6_empty_struct_to_unrecorded(state: &mut StateFile) {
         }
     }
 }
+
+/// v7 → v8: state files written under v7 encode name overrides as
+/// bare strings (`"name": "tmp"`). `NameOverride`'s untagged
+/// deserializer has already lifted those into
+/// `NameOverride { temp_value, original_value: "" }` by the time this
+/// helper runs. The empty body is intentional: it documents the migration
+/// seam so a future `NameOverride` wire-shape change has an explicit place
+/// to preserve v7 compatibility.
+fn migrate_v7_name_overrides_to_structs(_state: &mut StateFile) {}
 
 #[cfg(test)]
 mod tests;

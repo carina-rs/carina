@@ -32,9 +32,7 @@ use crate::commands::shared::progress::{
     RefreshProgress, format_duration, refresh_multi_progress, spinner_style,
 };
 use crate::commands::shared::retry::{WaitResult, is_retryable_delete_error, wait_for_deletion};
-use crate::commands::shared::state_writeback::{
-    apply_destroy_to_state, apply_name_overrides, build_orphan_resource,
-};
+use crate::commands::shared::state_writeback::{apply_destroy_to_state, build_orphan_resource};
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
 use crate::display::{format_destroy_plan, format_effect};
@@ -184,8 +182,6 @@ async fn run_destroy_locked(
             &state_block_claims,
         );
     }
-    apply_name_overrides(&mut parsed.resources, &state_file);
-
     // Collect all resources (managed + orphans) before sorting.
     // We use the unsorted list for state reads, then sort once at the end.
     let mut all_resources: Vec<Resource> = parsed.resources.clone(); // allow: direct — plan-time reconciliation

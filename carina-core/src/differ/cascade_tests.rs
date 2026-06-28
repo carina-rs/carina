@@ -273,7 +273,8 @@ fn cascade_dependent_updates_promotes_create_only_dependent_to_replace() {
         ResourceSchema::new("cdn.Distribution")
             .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string()).create_only())
             .attribute(AttributeSchema::new("comment", AttributeType::string()))
-            .attribute(AttributeSchema::new("domain_name", AttributeType::string())),
+            .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
+            .with_name_attribute("domain_name"),
     );
     let web_acl_id = web_acl_id();
     let distribution_id = distribution_id();
@@ -351,7 +352,8 @@ fn chained_cbd_cascade_promoted_consumer_also_cbd() {
         ResourceSchema::new("cdn.Distribution")
             .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string()).create_only())
             .attribute(AttributeSchema::new("comment", AttributeType::string()))
-            .attribute(AttributeSchema::new("domain_name", AttributeType::string())),
+            .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
+            .with_name_attribute("domain_name"),
     );
     registry.insert(
         "",
@@ -454,6 +456,157 @@ fn chained_cbd_cascade_promoted_consumer_also_cbd() {
     assert!(deps[&delete_b].contains(&update_c));
     assert!(deps[&delete_b].contains(&create_b));
     assert!(deps[&delete_a].contains(&delete_b));
+}
+
+#[test]
+fn chained_cbd_anonymous_middle_node_auto_promoted() {
+    let mut registry = base_registry();
+    registry.insert(
+        "",
+        ResourceSchema::new("cdn.Distribution")
+            .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string()).create_only())
+            .attribute(AttributeSchema::new("comment", AttributeType::string()))
+            .attribute(AttributeSchema::new("domain_name", AttributeType::string()))
+            .with_name_attribute("domain_name"),
+    );
+    registry.insert(
+        "",
+        ResourceSchema::new("cdn.CachePolicy")
+            .attribute(AttributeSchema::new(
+                "distribution_domain",
+                AttributeType::string(),
+            ))
+            .attribute(AttributeSchema::new("comment", AttributeType::string())),
+    );
+
+    let web_acl_id = web_acl_id();
+    let distribution_id = distribution_id();
+    let cache_id = ResourceId::new("cdn.CachePolicy", "main");
+    let anonymous_distribution = Resource::new("cdn.Distribution", "main")
+        .with_attribute("web_acl_arn", ref_value("web_acl", "arn"))
+        .with_attribute("comment", str_value("unchanged"))
+        .with_attribute("domain_name", str_value("example.cloudfront.net"));
+    let cache = Resource::new("cdn.CachePolicy", "main")
+        .with_binding("cache_policy")
+        .with_attribute(
+            "distribution_domain",
+            ref_value("cdn.Distribution:main", "domain_name"),
+        )
+        .with_attribute("comment", str_value("unchanged"));
+
+    let mut distribution_state =
+        current_distribution_state(ref_value("web_acl", "arn"), "unchanged");
+    distribution_state
+        .dependency_bindings
+        .insert("web_acl".to_string());
+    let mut cache_state = state(
+        cache_id.clone(),
+        [
+            (
+                "distribution_domain",
+                ref_value("cdn.Distribution:main", "domain_name"),
+            ),
+            ("comment", str_value("unchanged")),
+        ],
+    );
+    cache_state
+        .dependency_bindings
+        .insert("cdn.Distribution:main".to_string());
+    let current_states = HashMap::from([
+        (web_acl_id, current_web_acl_state()),
+        (distribution_id.clone(), distribution_state),
+        (cache_id.clone(), cache_state),
+    ]);
+    let resources = vec![web_acl(), anonymous_distribution, cache];
+
+    let plan = cascade_plan_for(&resources, current_states, &registry);
+
+    assert_eq!(
+        updates_for(&plan, &distribution_id).len(),
+        0,
+        "anonymous B should be promoted from Update to Replace"
+    );
+    assert_eq!(decomposed_replace_count(&plan, &distribution_id), (1, 1));
+    assert!(
+        replace_metadata_for(&plan, &distribution_id).create_before_destroy,
+        "anonymous B must become CBD because C depends on it through its synthetic key"
+    );
+    assert_eq!(updates_for(&plan, &cache_id).len(), 1);
+    assert!(
+        delete_blockers_for(&plan, &distribution_id).contains("cache_policy"),
+        "anonymous B old delete must wait for C's consumer update"
+    );
+}
+
+#[test]
+fn auto_promote_with_missing_name_attribute_emits_plan_error() {
+    let mut registry = base_registry();
+    registry.insert(
+        "",
+        ResourceSchema::new("cdn.Distribution")
+            .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string()).create_only())
+            .attribute(AttributeSchema::new("comment", AttributeType::string()))
+            .attribute(AttributeSchema::new("domain_name", AttributeType::string())),
+    );
+    registry.insert(
+        "",
+        ResourceSchema::new("cdn.CachePolicy")
+            .attribute(AttributeSchema::new(
+                "distribution_domain",
+                AttributeType::string(),
+            ))
+            .attribute(AttributeSchema::new("comment", AttributeType::string())),
+    );
+
+    let web_acl_id = web_acl_id();
+    let distribution_id = distribution_id();
+    let cache_id = ResourceId::new("cdn.CachePolicy", "main");
+    let cache = Resource::new("cdn.CachePolicy", "main")
+        .with_binding("cache_policy")
+        .with_attribute(
+            "distribution_domain",
+            ref_value("distribution", "domain_name"),
+        )
+        .with_attribute("comment", str_value("unchanged"));
+
+    let mut distribution_state =
+        current_distribution_state(ref_value("web_acl", "arn"), "unchanged");
+    distribution_state
+        .dependency_bindings
+        .insert("web_acl".to_string());
+    let mut cache_state = state(
+        cache_id,
+        [
+            (
+                "distribution_domain",
+                ref_value("distribution", "domain_name"),
+            ),
+            ("comment", str_value("unchanged")),
+        ],
+    );
+    cache_state
+        .dependency_bindings
+        .insert("distribution".to_string());
+    let current_states = HashMap::from([
+        (web_acl_id, current_web_acl_state()),
+        (distribution_id.clone(), distribution_state),
+        (ResourceId::new("cdn.CachePolicy", "main"), cache_state),
+    ]);
+    let resources = vec![web_acl(), distribution(), cache];
+
+    let plan = cascade_plan_for(&resources, current_states, &registry);
+
+    assert!(
+        plan.errors().iter().any(|error| {
+            error.resource_id == distribution_id
+                && error.message.contains("lacks a name_attribute")
+                && error
+                    .message
+                    .contains("create_before_destroy cannot generate a temporary name")
+        }),
+        "auto-promote without name_attribute should surface a plan error: {:?}",
+        plan.errors()
+    );
 }
 
 #[test]

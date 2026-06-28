@@ -1000,9 +1000,6 @@ async fn run_apply_locked(
             &state_block_claims,
         );
     }
-    apply_name_overrides(&mut parsed.resources, &state_file);
-    apply_name_overrides(&mut unresolved_parsed.resources, &state_file);
-
     // Upstream state bindings are loaded up front so refs that target
     // `upstream_state` blocks can be resolved during refresh (#1683) and
     // so that provider configuration refs (`assume_role.role_arn =
@@ -1348,9 +1345,36 @@ async fn run_apply_locked(
         wait_aliases: &wait_aliases,
     });
 
-    // Resolve references and enum identifiers, then create initial plan for display
+    // Resolve references and enum identifiers, then create initial plan for display.
+    // Permanent CBD name overrides are applied only after this first resolver
+    // pass, because the persisted `original_value` is the resolved DSL value.
+    // If an override lands, rebuild the binding view from the overridden
+    // resource set and resolve once more from the unresolved snapshot so
+    // consumers of `<producer>.name` see the temporary cloud name too.
     let mut resources_for_plan = unresolved_sorted_resources.clone();
     resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings)?;
+    if apply_name_overrides(&mut resources_for_plan, &state_file) {
+        let override_bindings =
+            ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
+                managed: &resources_for_plan,
+                compositions: &pre_resolve_compositions,
+                data_sources: &data_sources,
+                current_states: &pre_apply_input_states,
+                remote_bindings: &remote_bindings,
+                wait_aliases: &wait_aliases,
+            });
+        resources_for_plan = unresolved_sorted_resources.clone();
+        resolve_refs_with_state_and_remote(&mut resources_for_plan, &override_bindings)?;
+        apply_name_overrides(&mut resources_for_plan, &state_file);
+        bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
+            managed: &resources_for_plan,
+            compositions: &pre_resolve_compositions,
+            data_sources: &data_sources,
+            current_states: &pre_apply_input_states,
+            remote_bindings: &remote_bindings,
+            wait_aliases: &wait_aliases,
+        });
+    }
 
     // Resolve data-source input refs and canonicalize, so each `read`
     // resource flows into `create_plan` with concrete attribute values

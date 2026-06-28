@@ -25,7 +25,6 @@ use super::{
     BackendDriftStatus, DriftCommand, inspect_backend_drift, validate_and_resolve_with_config,
     verify_for_mutation,
 };
-use crate::commands::shared::state_writeback::apply_name_overrides;
 use crate::error::AppError;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, get_provider_with_ctx,
@@ -932,8 +931,6 @@ pub(crate) async fn run_state_refresh_locked(
             &state_block_claims,
         );
     }
-    apply_name_overrides(&mut parsed.resources, &state_file);
-
     let mut sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select provider

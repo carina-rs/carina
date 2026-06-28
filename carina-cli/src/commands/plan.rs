@@ -21,7 +21,6 @@ use super::{
     BackendDriftStatus, drift_warning, inspect_backend_drift, validate_and_resolve_with_config,
 };
 use crate::DetailLevel;
-use crate::commands::shared::state_writeback::apply_name_overrides;
 use crate::display::{print_plan, refresh_plan_separator};
 use crate::error::AppError;
 use crate::wiring::{
@@ -652,9 +651,6 @@ pub async fn run_plan(
             &state_block_claims,
         );
     }
-    apply_name_overrides(&mut parsed.resources, &state_file);
-    apply_name_overrides(&mut unresolved_parsed.resources, &state_file);
-
     if !refresh {
         eprintln!(
             "{}",

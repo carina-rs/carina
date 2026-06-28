@@ -175,6 +175,42 @@ fn refresh_pending_temporary_name(pending: &mut PendingReplace, registry: &Schem
     }
 }
 
+fn resource_synthetic_key(id: &ResourceId) -> String {
+    format!("{}:{}", id.resource_type, id.name_str())
+}
+
+fn pending_replace_keys(pending: &PendingReplace) -> Vec<String> {
+    let synthetic = resource_synthetic_key(&pending.id);
+    match pending.to.binding.as_ref() {
+        Some(binding) if binding != &synthetic => vec![binding.clone(), synthetic],
+        Some(_) | None => vec![synthetic],
+    }
+}
+
+fn missing_temporary_name_attribute_error(
+    pending: &PendingReplace,
+    registry: &SchemaRegistry,
+) -> Option<PlanError> {
+    if pending.temporary_name.is_some() {
+        return None;
+    }
+    let schema = registry.get(
+        &pending.id.provider,
+        &pending.id.resource_type,
+        SchemaKind::Resource,
+    )?;
+    if schema.name_attribute.is_some() {
+        return None;
+    }
+    Some(PlanError {
+        resource_id: pending.id.clone(),
+        message: format!(
+            "Resource {} has dependents but its schema lacks a name_attribute; create_before_destroy cannot generate a temporary name. Either set 'directives {{ create_before_destroy = false }}' or wait for the schema to define name_attribute.",
+            pending.id
+        ),
+    })
+}
+
 pub(crate) fn decompose_replace_into_effects(
     plan: &mut Plan,
     pending: PendingReplace,
@@ -720,7 +756,7 @@ fn cbd_replaced_bindings(pending_replaces: &[PendingReplace]) -> HashSet<String>
     pending_replaces
         .iter()
         .filter(|pending| pending.create_before_destroy)
-        .filter_map(|pending| pending.to.binding.clone())
+        .flat_map(pending_replace_keys)
         .collect()
 }
 
@@ -728,13 +764,15 @@ fn promote_pending_replaces_for_dependents(
     pending_replaces: &mut [PendingReplace],
     unresolved_managed: &[Resource],
     registry: &SchemaRegistry,
-) -> bool {
-    let pending_by_binding: HashMap<String, usize> = pending_replaces
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, pending)| pending.to.binding.clone().map(|binding| (binding, idx)))
-        .collect();
+) -> (bool, Vec<PlanError>) {
+    let mut pending_by_binding: HashMap<String, usize> = HashMap::new();
+    for (idx, pending) in pending_replaces.iter().enumerate() {
+        for key in pending_replace_keys(pending) {
+            pending_by_binding.entry(key).or_insert(idx);
+        }
+    }
     let mut promoted = false;
+    let mut errors = Vec::new();
 
     for resource in unresolved_managed {
         for dep in get_resource_dependencies(resource) {
@@ -750,11 +788,14 @@ fn promote_pending_replaces_for_dependents(
             pending.create_before_destroy = true;
             pending.directives.create_before_destroy = true;
             refresh_pending_temporary_name(pending, registry);
+            if let Some(error) = missing_temporary_name_attribute_error(pending, registry) {
+                errors.push(error);
+            }
             promoted = true;
         }
     }
 
-    promoted
+    (promoted, errors)
 }
 
 fn annotate_pending_replaces_from_cbd_dependencies(
@@ -878,11 +919,15 @@ pub fn cascade_dependent_updates(
     let mut cascade_updates_by_id: HashMap<ResourceId, Effect> = HashMap::new();
 
     loop {
-        let mut changed = promote_pending_replaces_for_dependents(
+        let (promoted, promotion_errors) = promote_pending_replaces_for_dependents(
             &mut pending_replaces,
             unresolved_managed,
             registry,
         );
+        let mut changed = promoted;
+        for error in promotion_errors {
+            plan.add_error(error);
+        }
         let replaced_bindings = cbd_replaced_bindings(&pending_replaces);
         if replaced_bindings.is_empty() {
             break;
@@ -1084,13 +1129,17 @@ pub fn cascade_dependent_updates(
 
     for mut pending in pending_replaces {
         refresh_pending_temporary_name(&mut pending, registry);
-        let consumer_updates = pending
-            .to
-            .binding
-            .as_ref()
-            .and_then(|binding| consumer_updates_by_replaced.get(binding))
-            .cloned()
-            .unwrap_or_default();
+        let mut seen_update_keys = HashSet::new();
+        let mut consumer_updates = Vec::new();
+        for key in pending_replace_keys(&pending) {
+            if let Some(updates) = consumer_updates_by_replaced.get(&key) {
+                for (update_key, update) in updates {
+                    if seen_update_keys.insert(update_key.clone()) {
+                        consumer_updates.push((update_key.clone(), update.clone()));
+                    }
+                }
+            }
+        }
         decompose_replace_into_effects(plan, pending, consumer_updates);
     }
 }

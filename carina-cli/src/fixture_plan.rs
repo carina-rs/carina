@@ -151,9 +151,6 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             &state_block_claims,
         );
     }
-    apply_name_overrides(&mut parsed.resources, &state_file);
-    apply_name_overrides(&mut unresolved_parsed.resources, &state_file);
-
     // carina#3181: `parsed.resources` is managed-only; data sources live
     // in `parsed.data_sources`. Only managed resources are dependency-
     // sorted.
@@ -251,7 +248,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let upstream_binding_names: std::collections::HashSet<&str> =
         remote_bindings.keys().map(String::as_str).collect();
     let pre_apply_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
-    let plan_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+    let mut plan_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
         carina_core::binding_index::PreApplyInputs {
             managed: &resources,
             compositions: &parsed.compositions,
@@ -263,6 +260,32 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     );
     resolve_refs_for_plan(&mut resources, &plan_bindings, &upstream_binding_names)
         .expect("Failed to resolve refs with state");
+    if apply_name_overrides(&mut resources, &state_file) {
+        let override_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+            carina_core::binding_index::PreApplyInputs {
+                managed: &resources,
+                compositions: &parsed.compositions,
+                data_sources: &data_sources,
+                current_states: &pre_apply_input_states,
+                remote_bindings: &remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+        );
+        resources = unresolved_sorted_resources.clone();
+        resolve_refs_for_plan(&mut resources, &override_bindings, &upstream_binding_names)
+            .expect("Failed to resolve refs with override-aware state");
+        apply_name_overrides(&mut resources, &state_file);
+        plan_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+            carina_core::binding_index::PreApplyInputs {
+                managed: &resources,
+                compositions: &parsed.compositions,
+                data_sources: &data_sources,
+                current_states: &pre_apply_input_states,
+                remote_bindings: &remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+        );
+    }
 
     // Resolve data-source input refs for the plan (carina#3181).
     let mut data_sources_for_plan = data_sources.clone();

@@ -291,6 +291,10 @@ pub fn build_effect_dependency_analysis(
         {
             binding_to_idx.entry(binding).or_insert(idx);
         }
+        // Apply-only: destroy path uses explicit destroy_edges() and does not
+        // look up consumers via binding/synthetic key. If a future destroy-time
+        // blocked_by_updates equivalent is added, register the synthetic key
+        // for Destroy too.
         if matches!(inputs, ScheduleInputs::Apply)
             && !matches!(effect, Effect::Delete { .. })
             && effect.as_resource_ref().is_some()

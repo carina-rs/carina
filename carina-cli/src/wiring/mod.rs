@@ -40,6 +40,7 @@ use carina_provider_mock::MockProvider;
 use carina_state::StateFile;
 
 use crate::commands::shared::progress::{RefreshProgress, refresh_multi_progress};
+use crate::commands::shared::state_writeback::apply_name_overrides;
 use crate::error::AppError;
 
 /// Result of creating a plan, with context needed for saving
@@ -2186,7 +2187,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     let upstream_binding_names: std::collections::HashSet<&str> =
         remote_bindings.keys().map(String::as_str).collect();
     let pre_apply_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
-    let plan_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+    let mut plan_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
         carina_core::binding_index::PreApplyInputs {
             managed: &resources,
             compositions: &parsed.compositions,
@@ -2197,6 +2198,31 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         },
     );
     resolve_refs_for_plan(&mut resources, &plan_bindings, &upstream_binding_names)?;
+    if apply_name_overrides(&mut resources, state_file) {
+        let override_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+            carina_core::binding_index::PreApplyInputs {
+                managed: &resources,
+                compositions: &parsed.compositions,
+                data_sources: &data_sources,
+                current_states: &pre_apply_input_states,
+                remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+        );
+        resources = unresolved_sorted_resources.clone();
+        resolve_refs_for_plan(&mut resources, &override_bindings, &upstream_binding_names)?;
+        apply_name_overrides(&mut resources, state_file);
+        plan_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+            carina_core::binding_index::PreApplyInputs {
+                managed: &resources,
+                compositions: &parsed.compositions,
+                data_sources: &data_sources,
+                current_states: &pre_apply_input_states,
+                remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+        );
+    }
     // Resolve data-source input refs for the plan and canonicalize, so
     // each `read` resource flows into `create_plan` with concrete
     // attribute values (carina#3181).

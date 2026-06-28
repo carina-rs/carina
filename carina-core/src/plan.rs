@@ -58,6 +58,9 @@ impl<'de> Deserialize<'de> for NameOverride {
                 #[serde(default)]
                 original_value: String,
             },
+            // Reads the v7 bare-String shape into NameOverride. Retire only
+            // after enough release cycles have passed that surviving v7 state
+            // files are no longer reasonably expected.
             Legacy(String),
         }
 

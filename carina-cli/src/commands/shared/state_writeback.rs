@@ -20,17 +20,21 @@ use crate::error::AppError;
 /// When a create_before_destroy replacement uses a temporary name, the state
 /// stores that permanent override. This function applies those overrides so the
 /// plan doesn't detect a false diff.
-pub(crate) fn apply_name_overrides(resources: &mut [Resource], state_file: &Option<StateFile>) {
+pub(crate) fn apply_name_overrides(
+    resources: &mut [Resource],
+    state_file: &Option<StateFile>,
+) -> bool {
     let state_file = match state_file {
         Some(sf) => sf,
-        None => return,
+        None => return false,
     };
 
     let overrides = state_file.build_name_overrides();
     if overrides.is_empty() {
-        return;
+        return false;
     }
 
+    let mut applied = false;
     for resource in resources.iter_mut() {
         if let Some(name_overrides) = overrides.get(&resource.id) {
             for (attr, override_) in name_overrides {
@@ -48,9 +52,11 @@ pub(crate) fn apply_name_overrides(resources: &mut [Resource], state_file: &Opti
                     attr.clone(),
                     Value::Concrete(ConcreteValue::String(override_.temp_value.clone())),
                 );
+                applied = true;
             }
         }
     }
+    applied
 }
 
 /// Queue a state refresh for a resource after a failed operation.

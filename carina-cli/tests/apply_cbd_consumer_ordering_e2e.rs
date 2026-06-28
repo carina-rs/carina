@@ -122,6 +122,52 @@ let permanent = mock.test.resource {{
         .unwrap();
     }
 
+    fn write_interpolated_permanent_name_config(&self, prefix: &str) {
+        fs::write(
+            self.project.join("main.crn"),
+            format!(
+                r#"backend local {{ path = "{}" }}
+provider mock {{}}
+
+let prefix = "{prefix}"
+
+let permanent = mock.test.resource {{
+  name = "${{prefix}}-name"
+  force_replace = "new"
+  directives {{ create_before_destroy = true }}
+}}
+"#,
+                self.state_path.display(),
+                prefix = prefix
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_ref_permanent_name_config(&self, source_name: &str) {
+        fs::write(
+            self.project.join("main.crn"),
+            format!(
+                r#"backend local {{ path = "{}" }}
+provider mock {{}}
+
+let source = mock.test.renameable_resource {{
+  name = "{source_name}"
+}}
+
+let permanent = mock.test.resource {{
+  name = source.name
+  force_replace = "new"
+  directives {{ create_before_destroy = true }}
+}}
+"#,
+                self.state_path.display(),
+                source_name = source_name
+            ),
+        )
+        .unwrap();
+    }
+
     fn init(&self) {
         let output = carina(&self.project)
             .args(["init", "."])
@@ -269,11 +315,52 @@ let permanent = mock.test.resource {{
         .unwrap();
     }
 
+    fn seed_ref_permanent_state(&self, source_name: &str) {
+        let mut state = StateFile::new();
+        let mut source = ResourceState::new("test.renameable_resource", "source", "mock")
+            .with_identifier("source-id")
+            .with_attribute("name", serde_json::json!(source_name));
+        source.binding = Some("source".to_string());
+        state.upsert_resource(source);
+
+        let mut permanent = ResourceState::new("test.resource", "permanent", "mock")
+            .with_identifier("old-permanent-id")
+            .with_attribute("name", serde_json::json!(source_name))
+            .with_attribute("force_replace", serde_json::json!("old"));
+        permanent.binding = Some("permanent".to_string());
+        permanent.directives.create_before_destroy = true;
+        permanent.dependency_bindings.insert("source".to_string());
+        state.upsert_resource(permanent);
+
+        fs::write(
+            &self.state_path,
+            carina_core::utils::pretty_with_newline(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn seed_permanent_mock_provider_state(&self, name: &str, force_replace: &str) {
         let provider_state = serde_json::json!({
             "test.resource.permanent": {
                 "name": name,
                 "force_replace": force_replace
+            }
+        });
+        fs::write(
+            &self.mock_state_path,
+            carina_core::utils::pretty_with_newline(&provider_state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn seed_ref_permanent_mock_provider_state(&self, source_name: &str, permanent_name: &str) {
+        let provider_state = serde_json::json!({
+            "test.renameable_resource.source": {
+                "name": source_name
+            },
+            "test.resource.permanent": {
+                "name": permanent_name,
+                "force_replace": "old"
             }
         });
         fs::write(
@@ -359,6 +446,72 @@ let permanent = mock.test.resource {{
             .map(str::to_string)
             .collect()
     }
+}
+
+#[test]
+fn apply_name_overrides_applies_for_var_substituted_dsl_name() {
+    let scenario = Scenario::new();
+    scenario.write_interpolated_permanent_name_config("stable");
+    scenario.init();
+    scenario.seed_permanent_state();
+    scenario.seed_permanent_mock_provider_state("stable-name", "old");
+
+    let output = scenario.apply();
+    assert_success("carina apply with interpolated name", &output);
+    let state = scenario.state();
+    let first_override = state
+        .find_resource("mock", "test.resource", "permanent")
+        .and_then(|row| row.name_overrides.get("name"))
+        .expect("first apply should record a permanent name override")
+        .clone();
+    assert_eq!(first_override.original_value, "stable-name");
+
+    scenario.seed_mock_provider_state_from_carina_state();
+    let output = scenario.apply();
+    assert_apply_no_changes("second apply with unchanged interpolated name", &output);
+}
+
+#[test]
+fn apply_name_overrides_skips_for_ref_substituted_dsl_name_rename() {
+    let scenario = Scenario::new();
+    scenario.write_ref_permanent_name_config("stable-name");
+    scenario.init();
+    scenario.seed_ref_permanent_state("stable-name");
+    scenario.seed_ref_permanent_mock_provider_state("stable-name", "stable-name");
+
+    let output = scenario.apply();
+    assert_success("carina apply with ref-valued name", &output);
+    let state = scenario.state();
+    let first_override = state
+        .find_resource("mock", "test.resource", "permanent")
+        .and_then(|row| row.name_overrides.get("name"))
+        .expect("first apply should record a permanent name override")
+        .clone();
+    assert_eq!(first_override.original_value, "stable-name");
+
+    scenario.seed_mock_provider_state_from_carina_state();
+    scenario.write_ref_permanent_name_config("stable-name-v2");
+    let output = scenario.plan();
+    assert_success("carina plan after ref-valued DSL rename", &output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("to replace") || stdout.contains("+/-"),
+        "ref-valued DSL rename must trigger a new CBD replacement, not no-op\nstdout:\n{stdout}"
+    );
+
+    let output = scenario.apply();
+    assert_success("carina apply after ref-valued DSL rename", &output);
+    let state = scenario.state();
+    let second_override = state
+        .find_resource("mock", "test.resource", "permanent")
+        .and_then(|row| row.name_overrides.get("name"))
+        .expect("second apply should record a fresh permanent name override");
+    assert_eq!(second_override.original_value, "stable-name-v2");
+    assert_ne!(second_override.temp_value, first_override.temp_value);
+
+    scenario.seed_mock_provider_state_from_carina_state();
+    let output = scenario.plan();
+    assert_no_changes("carina plan after ref-valued rename apply", &output);
 }
 
 #[test]
@@ -663,6 +816,16 @@ fn assert_no_changes(label: &str, output: &Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("No changes. Infrastructure is up-to-date."),
+        "{label} should report no changes\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn assert_apply_no_changes(label: &str, output: &Output) {
+    assert_success(label, output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No changes needed."),
         "{label} should report no changes\nstdout:\n{stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr),
     );
