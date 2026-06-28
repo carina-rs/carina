@@ -116,7 +116,12 @@ impl WiringContext {
                     .attribute(AttributeSchema::new(
                         "tags",
                         AttributeType::map(AttributeType::string()),
-                    )),
+                    ))
+                    .attribute(
+                        AttributeSchema::new("identifier", AttributeType::string()).read_only(),
+                    )
+                    .attribute(AttributeSchema::new("comment", AttributeType::string()))
+                    .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string())),
             );
         }
         Self {
