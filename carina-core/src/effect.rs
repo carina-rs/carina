@@ -29,15 +29,21 @@ pub enum PlanOp {
     Delete,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum BindingKey {
+    Binding(String),
+    Anonymous { resource_type: String, name: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduleEdge {
-    /// This effect must wait for the named binding to complete.
-    DependsOn(String),
-    /// This effect must complete before the named binding can proceed.
-    BlockedBy(String),
-    /// This effect must complete before the named binding can proceed, but
-    /// only when that binding resolves to a delete effect.
-    BlockedByIfDelete(String),
+    /// This effect must wait for the keyed effect to complete.
+    DependsOn(BindingKey),
+    /// This effect must complete before the keyed effect can proceed.
+    BlockedBy(BindingKey),
+    /// This effect must complete before the keyed effect can proceed, but
+    /// only when that key resolves to a delete effect.
+    BlockedByIfDelete(BindingKey),
 }
 
 /// Temporary name used during create-before-destroy replacement.
@@ -869,6 +875,16 @@ impl Effect {
         }
     }
 
+    pub fn binding_key(&self) -> BindingKey {
+        match self.binding_name() {
+            Some(binding) => BindingKey::Binding(binding),
+            None => BindingKey::Anonymous {
+                resource_type: self.resource_id().resource_type.clone(),
+                name: self.resource_id().name_str().to_string(),
+            },
+        }
+    }
+
     /// Returns the ResourceIds whose state rows this effect requires be
     /// cleared after a successful apply.
     ///
@@ -1034,20 +1050,20 @@ impl Effect {
             Effect::Delete { dependencies, .. } => dependencies
                 .iter()
                 .cloned()
-                .map(ScheduleEdge::BlockedBy)
+                .map(|binding| ScheduleEdge::BlockedBy(BindingKey::Binding(binding)))
                 .collect(),
             Effect::Replace { from, .. } => from
                 .dependency_bindings
                 .iter()
                 .cloned()
-                .map(ScheduleEdge::BlockedByIfDelete)
+                .map(|binding| ScheduleEdge::BlockedByIfDelete(BindingKey::Binding(binding)))
                 .collect(),
             Effect::Wait { .. }
             | Effect::DeferredCreate { .. }
             | Effect::DeferredReplace { .. } => self
                 .blocking_bindings()
                 .into_iter()
-                .map(ScheduleEdge::DependsOn)
+                .map(|binding| ScheduleEdge::DependsOn(BindingKey::Binding(binding)))
                 .collect(),
             Effect::Read { .. }
             | Effect::Create(_)
@@ -1070,13 +1086,13 @@ impl Effect {
             Effect::Delete { dependencies, .. } => dependencies
                 .iter()
                 .cloned()
-                .map(ScheduleEdge::BlockedBy)
+                .map(|binding| ScheduleEdge::BlockedBy(BindingKey::Binding(binding)))
                 .collect(),
             Effect::Replace { from, .. } => from
                 .dependency_bindings
                 .iter()
                 .cloned()
-                .map(ScheduleEdge::BlockedBy)
+                .map(|binding| ScheduleEdge::BlockedBy(BindingKey::Binding(binding)))
                 .collect(),
             Effect::Read { .. }
             | Effect::Create(_)

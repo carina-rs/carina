@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::effect::{Effect, ScheduleEdge};
+use crate::effect::{BindingKey, Effect, ScheduleEdge};
 use crate::non_empty::NonEmptyVec;
 use crate::parser::ResourceRef;
 use crate::resource::{Resource, ResourceId};
@@ -65,15 +65,22 @@ impl DestroyWaitAlias {
     }
 
     fn destroy_edges(&self) -> Vec<ScheduleEdge> {
-        let mut edges = vec![ScheduleEdge::BlockedBy(self.target_binding.clone())];
+        let mut edges = vec![ScheduleEdge::BlockedBy(BindingKey::Binding(
+            self.target_binding.clone(),
+        ))];
         edges.extend(
             self.explicit_dependencies
                 .iter()
                 .filter(|dependency| dependency.as_str() != self.target_binding)
                 .cloned()
-                .map(ScheduleEdge::BlockedBy),
+                .map(|binding| ScheduleEdge::BlockedBy(BindingKey::Binding(binding))),
         );
-        edges.extend(self.consumers.iter().cloned().map(ScheduleEdge::DependsOn));
+        edges.extend(
+            self.consumers
+                .iter()
+                .cloned()
+                .map(|binding| ScheduleEdge::DependsOn(BindingKey::Binding(binding))),
+        );
         edges
     }
 }
@@ -231,15 +238,13 @@ impl DependencyAnalysis {
 }
 
 struct DependencyAnalyzer {
-    binding_to_idx: HashMap<String, usize>,
-    name_to_delete_idx: HashMap<String, usize>,
+    binding_to_idx: HashMap<BindingKey, usize>,
     compositions_by_binding: HashMap<String, crate::resource::Composition>,
 }
 
 impl DependencyAnalyzer {
     fn new(
-        binding_to_idx: HashMap<String, usize>,
-        name_to_delete_idx: HashMap<String, usize>,
+        binding_to_idx: HashMap<BindingKey, usize>,
         compositions: &[crate::resource::Composition],
     ) -> Self {
         let compositions_by_binding = compositions
@@ -253,16 +258,22 @@ impl DependencyAnalyzer {
             .collect();
         Self {
             binding_to_idx,
-            name_to_delete_idx,
             compositions_by_binding,
         }
     }
 
-    fn lookup_idx(&self, binding: &str) -> Option<usize> {
-        self.binding_to_idx
-            .get(binding)
-            .or_else(|| self.name_to_delete_idx.get(binding))
-            .copied()
+    fn lookup_by_key(&self, key: &BindingKey) -> Option<usize> {
+        self.binding_to_idx.get(key).copied()
+    }
+
+    fn lookup_by_string_ref(&self, name: &str) -> Option<usize> {
+        self.lookup_by_key(&BindingKey::Binding(name.to_string()))
+            .or_else(|| {
+                self.binding_to_idx.iter().find_map(|(key, idx)| match key {
+                    BindingKey::Anonymous { name: n, .. } if n == name => Some(*idx),
+                    _ => None,
+                })
+            })
     }
 
     fn collect_from_schedule_edges(
@@ -274,16 +285,18 @@ impl DependencyAnalyzer {
     ) {
         for edge in edges {
             match edge {
-                ScheduleEdge::DependsOn(binding) => {
-                    self.record_binding_edge(&binding, ReadsSet::unknown(), analysis, self_idx);
+                ScheduleEdge::DependsOn(key) => {
+                    if let Some(parent) = self.lookup_by_key(&key) {
+                        analysis.add_edge(self_idx, parent, ReadsSet::unknown());
+                    }
                 }
-                ScheduleEdge::BlockedBy(binding) => {
-                    if let Some(blocked_idx) = self.lookup_idx(&binding) {
+                ScheduleEdge::BlockedBy(key) => {
+                    if let Some(blocked_idx) = self.lookup_by_key(&key) {
                         analysis.add_edge(blocked_idx, self_idx, ReadsSet::unknown());
                     }
                 }
-                ScheduleEdge::BlockedByIfDelete(binding) => {
-                    if let Some(blocked_idx) = self.lookup_idx(&binding)
+                ScheduleEdge::BlockedByIfDelete(key) => {
+                    if let Some(blocked_idx) = self.lookup_by_key(&key)
                         && blocked_idx < effects.len()
                         && matches!(effects[blocked_idx], Effect::Delete { .. })
                     {
@@ -291,6 +304,32 @@ impl DependencyAnalyzer {
                     }
                 }
             }
+        }
+    }
+
+    fn collect_blocked_by_if_delete_string_ref(
+        &self,
+        effects: &[Effect],
+        binding: &str,
+        analysis: &mut DependencyAnalysis,
+        self_idx: usize,
+    ) {
+        if let Some(blocked_idx) = self.lookup_by_string_ref(binding)
+            && blocked_idx < effects.len()
+            && matches!(effects[blocked_idx], Effect::Delete { .. })
+        {
+            analysis.add_edge(blocked_idx, self_idx, ReadsSet::unknown());
+        }
+    }
+
+    fn collect_blocked_by_string_ref(
+        &self,
+        binding: &str,
+        analysis: &mut DependencyAnalysis,
+        self_idx: usize,
+    ) {
+        if let Some(blocked_idx) = self.lookup_by_string_ref(binding) {
+            analysis.add_edge(blocked_idx, self_idx, ReadsSet::unknown());
         }
     }
 
@@ -349,18 +388,18 @@ impl DependencyAnalyzer {
         self.record_binding_edge_inner(binding, reads, analysis, child, &mut visited);
     }
 
-    fn record_binding_edge_inner<'a>(
-        &'a self,
-        binding: &'a str,
+    fn record_binding_edge_inner(
+        &self,
+        binding: &str,
         reads: ReadsSet,
         analysis: &mut DependencyAnalysis,
         child: usize,
-        visited: &mut HashSet<&'a str>,
+        visited: &mut HashSet<String>,
     ) {
-        if !visited.insert(binding) {
+        if !visited.insert(binding.to_string()) {
             return;
         }
-        if let Some(parent) = self.lookup_idx(binding) {
+        if let Some(parent) = self.lookup_by_string_ref(binding) {
             analysis.add_edge(child, parent, reads);
             return;
         }
@@ -368,17 +407,37 @@ impl DependencyAnalyzer {
             return;
         };
         for inner in crate::deps::get_composition_dependencies(composition) {
-            let key: &'a str =
-                if let Some((k, _)) = self.compositions_by_binding.get_key_value(inner.as_str()) {
-                    k.as_str()
-                } else if let Some((k, _)) = self.binding_to_idx.get_key_value(inner.as_str()) {
-                    k.as_str()
-                } else {
-                    continue;
-                };
-            self.record_binding_edge_inner(key, ReadsSet::unknown(), analysis, child, visited);
+            if self.compositions_by_binding.contains_key(inner.as_str())
+                || self.lookup_by_string_ref(&inner).is_some()
+            {
+                self.record_binding_edge_inner(
+                    &inner,
+                    ReadsSet::unknown(),
+                    analysis,
+                    child,
+                    visited,
+                );
+            }
         }
     }
+}
+
+fn build_binding_index(
+    effects: &[Effect],
+    aliases: &[DestroyWaitAlias],
+) -> HashMap<BindingKey, usize> {
+    let mut binding_to_idx: HashMap<BindingKey, usize> = HashMap::new();
+    for (idx, effect) in effects.iter().enumerate() {
+        binding_to_idx.insert(effect.binding_key(), idx);
+    }
+    let alias_offset = effects.len();
+    for (alias_idx, alias) in aliases.iter().enumerate() {
+        binding_to_idx.insert(
+            BindingKey::Binding(alias.binding.clone()),
+            alias_offset + alias_idx,
+        );
+    }
+    binding_to_idx
 }
 
 /// Build the scheduling dependency graph for a slice of effects.
@@ -395,28 +454,14 @@ pub fn build_effect_dependency_analysis(
     compositions: &[crate::resource::Composition],
     inputs: ScheduleInputs<'_>,
 ) -> DependencyAnalysis {
-    let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
-    let mut name_to_delete_idx: HashMap<String, usize> = HashMap::new();
     let aliases = match inputs {
         ScheduleInputs::Apply => &[][..],
         ScheduleInputs::Destroy { aliases } => aliases,
     };
-    for (idx, effect) in effects.iter().enumerate() {
-        if let Some(binding) = effect.binding_name() {
-            binding_to_idx.insert(binding, idx);
-        }
-        if let Effect::Delete { id, binding, .. } = effect
-            && binding.is_none()
-        {
-            name_to_delete_idx.insert(id.name_str().to_string(), idx);
-        }
-    }
+    let binding_to_idx = build_binding_index(effects, aliases);
     let alias_offset = effects.len();
-    for (alias_idx, alias) in aliases.iter().enumerate() {
-        binding_to_idx.insert(alias.binding.clone(), alias_offset + alias_idx);
-    }
 
-    let analyzer = DependencyAnalyzer::new(binding_to_idx, name_to_delete_idx, compositions);
+    let analyzer = DependencyAnalyzer::new(binding_to_idx, compositions);
     let mut analysis = DependencyAnalysis::new(effects.len() + aliases.len());
 
     for (idx, effect) in effects.iter().enumerate() {
@@ -448,6 +493,16 @@ pub fn build_effect_dependency_analysis(
                     &mut analysis,
                     idx,
                 );
+                if let Effect::Replace { from, .. } = effect {
+                    for binding in &from.dependency_bindings {
+                        analyzer.collect_blocked_by_if_delete_string_ref(
+                            effects,
+                            binding,
+                            &mut analysis,
+                            idx,
+                        );
+                    }
+                }
             }
             ScheduleInputs::Destroy { .. } => {
                 analyzer.collect_from_schedule_edges(
@@ -456,6 +511,11 @@ pub fn build_effect_dependency_analysis(
                     &mut analysis,
                     idx,
                 );
+                if let Effect::Replace { from, .. } = effect {
+                    for binding in &from.dependency_bindings {
+                        analyzer.collect_blocked_by_string_ref(binding, &mut analysis, idx);
+                    }
+                }
             }
         }
     }
@@ -498,11 +558,26 @@ pub fn relax_update_update_edges(effects: &[Effect], analysis: &mut DependencyAn
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::ChangedCreateOnly;
+    use crate::effect::{BindingKey, ChangedCreateOnly};
     use crate::resource::{State, Value};
 
     fn state_for(id: &ResourceId) -> State {
         State::not_found(id.clone())
+    }
+
+    fn analyzer_for_effects(effects: &[Effect]) -> DependencyAnalyzer {
+        DependencyAnalyzer::new(build_binding_index(effects, &[]), &[])
+    }
+
+    fn delete_effect(resource_type: &str, name: &str, binding: Option<&str>) -> Effect {
+        Effect::Delete {
+            id: ResourceId::new(resource_type, name),
+            identifier: format!("{name}-id"),
+            directives: Default::default(),
+            binding: binding.map(str::to_string),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+        }
     }
 
     fn update_effect(binding: &str, refs: &[(&str, &str)], changed: &[&str]) -> Effect {
@@ -520,6 +595,141 @@ mod tests {
             to: resource,
             changed_attributes: changed.iter().map(|s| (*s).to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn blocked_by_if_delete_resolves_anonymous_delete_through_binding_key_index() {
+        let delete = delete_effect("test.Resource", "anonymous_old", None);
+        let update = update_effect("consumer", &[], &["ref"]);
+        let effects = vec![delete, update];
+        let mut analysis = DependencyAnalysis::new(effects.len());
+        let analyzer = analyzer_for_effects(&effects);
+
+        analyzer.collect_from_schedule_edges(
+            &effects,
+            vec![ScheduleEdge::BlockedByIfDelete(BindingKey::Anonymous {
+                resource_type: "test.Resource".to_string(),
+                name: "anonymous_old".to_string(),
+            })],
+            &mut analysis,
+            1,
+        );
+
+        let deps = analysis.into_deps_of();
+        assert!(
+            deps[&0].contains(&1),
+            "anonymous delete must wait for the consumer update"
+        );
+    }
+
+    #[test]
+    fn blocked_by_if_delete_resolves_let_bound_delete_through_binding_key_index() {
+        let delete = delete_effect("test.Resource", "old", Some("old_binding"));
+        let update = update_effect("consumer", &[], &["ref"]);
+        let effects = vec![delete, update];
+        let mut analysis = DependencyAnalysis::new(effects.len());
+        let analyzer = analyzer_for_effects(&effects);
+
+        analyzer.collect_from_schedule_edges(
+            &effects,
+            vec![ScheduleEdge::BlockedByIfDelete(BindingKey::Binding(
+                "old_binding".to_string(),
+            ))],
+            &mut analysis,
+            1,
+        );
+
+        let deps = analysis.into_deps_of();
+        assert!(
+            deps[&0].contains(&1),
+            "let-bound delete must still wait for the consumer update"
+        );
+    }
+
+    #[test]
+    fn effect_binding_key_distinguishes_named_and_anonymous_resources() {
+        let named = Effect::Create(Resource::new("test.Resource", "named").with_binding("r"));
+        assert_eq!(named.binding_key(), BindingKey::Binding("r".to_string()));
+
+        let anonymous = delete_effect("test.Resource", "anonymous", None);
+        assert_eq!(
+            anonymous.binding_key(),
+            BindingKey::Anonymous {
+                resource_type: "test.Resource".to_string(),
+                name: "anonymous".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn string_ref_resolves_to_anonymous_delete_when_no_binding_match() {
+        let create = Effect::Create(Resource::new("test.Resource", "foo").with_binding("foo"));
+        let delete = delete_effect("other.Resource", "foo", None);
+        let mut consumer = Resource::new("test.Resource", "consumer").with_binding("consumer");
+        consumer.dependency_bindings = std::collections::BTreeSet::from(["foo".to_string()]);
+        let consumer = Effect::Create(consumer);
+        let effects = vec![create, delete.clone(), consumer.clone()];
+        let analyzer = analyzer_for_effects(&effects);
+
+        assert_eq!(
+            analyzer.lookup_by_key(&BindingKey::Binding("foo".to_string())),
+            Some(0),
+            "strict BindingKey lookup must resolve the let-bound create"
+        );
+        assert_eq!(
+            analyzer.lookup_by_string_ref("foo"),
+            Some(0),
+            "string refs must prefer an exact binding match over an anonymous resource with the same name"
+        );
+
+        let mut schedule_analysis = DependencyAnalysis::new(effects.len());
+        analyzer.collect_from_schedule_edges(
+            &effects,
+            vec![ScheduleEdge::DependsOn(BindingKey::Binding(
+                "foo".to_string(),
+            ))],
+            &mut schedule_analysis,
+            2,
+        );
+        assert!(
+            schedule_analysis.into_deps_of()[&2].contains(&0),
+            "strict schedule edge should use the let-bound create"
+        );
+
+        let mut string_ref_analysis = DependencyAnalysis::new(effects.len());
+        analyzer.collect_from_resource_ref(
+            consumer.as_resource_ref().unwrap(),
+            &mut string_ref_analysis,
+            2,
+        );
+        assert!(
+            string_ref_analysis.into_deps_of()[&2].contains(&0),
+            "dependency_bindings string ref should use the let-bound create while it exists"
+        );
+
+        let effects = vec![delete, consumer];
+        let analyzer = analyzer_for_effects(&effects);
+        assert_eq!(
+            analyzer.lookup_by_key(&BindingKey::Binding("foo".to_string())),
+            None,
+            "strict BindingKey lookup must not resolve anonymous resources through Binding"
+        );
+        assert_eq!(
+            analyzer.lookup_by_string_ref("foo"),
+            Some(0),
+            "string refs should fall back to the anonymous resource name when no binding matches"
+        );
+
+        let mut string_ref_analysis = DependencyAnalysis::new(effects.len());
+        analyzer.collect_from_resource_ref(
+            effects[1].as_resource_ref().unwrap(),
+            &mut string_ref_analysis,
+            1,
+        );
+        assert!(
+            string_ref_analysis.into_deps_of()[&1].contains(&0),
+            "dependency_bindings string ref should fall back to the anonymous delete"
+        );
     }
 
     #[test]
