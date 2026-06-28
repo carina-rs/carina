@@ -367,8 +367,8 @@ pub struct ResourceSchema {
     pub description: Option<String>,
     #[serde(default)]
     pub kind: SchemaKind,
-    #[serde(default)]
-    pub name_attribute: Option<String>,
+    #[serde(default, alias = "name_attribute")]
+    pub unique_name_attribute: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_config: Option<OperationConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -890,7 +890,7 @@ mod tests {
             attributes: HashMap::new(),
             description: None,
             kind: SchemaKind::Managed,
-            name_attribute: None,
+            unique_name_attribute: None,
             operation_config: None,
             validators: vec![],
             exclusive_required: vec![],

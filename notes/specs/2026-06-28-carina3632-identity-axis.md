@@ -42,7 +42,7 @@ All carina-internal consumers refer to resources by identity:
 - Display (plan output, progress)
 - Provider WIT calls
 
-The `name` attribute is not special in carina-core. It is one schema attribute among many. If a provider needs the `name` attribute (e.g., to pass to a cloud API), it reads it from the resource's attributes, the same way it reads `bucket`, `region`, or any other attribute. The current `name_attribute` mechanism in carina-core that promotes a schema attribute value into the identity slot is eliminated.
+The `name` attribute is not special in carina-core. It is one schema attribute among many. If a provider needs the `name` attribute (e.g., to pass to a cloud API), it reads it from the resource's attributes, the same way it reads `bucket`, `region`, or any other attribute. The current `unique_name_attribute` mechanism in carina-core that promotes a schema attribute value into the identity slot is eliminated.
 
 ## 4. Lifecycle
 

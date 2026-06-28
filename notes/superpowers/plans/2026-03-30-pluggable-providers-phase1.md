@@ -171,7 +171,7 @@ pub struct ResourceSchema {
     #[serde(default)]
     pub data_source: bool,
     #[serde(default)]
-    pub name_attribute: Option<String>,
+    pub unique_name_attribute: Option<String>,
     #[serde(default)]
     pub force_replace: bool,
 }

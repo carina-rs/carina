@@ -2382,7 +2382,7 @@ pub fn resolve_state_blocks(
     blocks: &[StateBlock],
     state_file: &Option<StateFile>,
     desired: &[Resource],
-    registry: &SchemaRegistry,
+    _registry: &SchemaRegistry,
 ) -> StateBlockResolution {
     let mut from = HashSet::new();
     let mut to = HashSet::new();
@@ -2427,9 +2427,7 @@ pub fn resolve_state_blocks(
                 }
             }
             StateBlock::Import { to: import_to, .. } => {
-                let Some(resolved_to) =
-                    resolve_import_target_in_desired(import_to, desired, registry)
-                else {
+                let Some(resolved_to) = resolve_import_target_in_desired(import_to, desired) else {
                     continue;
                 };
                 let already_in_state = state_file.as_ref().is_some_and(|sf| {
@@ -2577,10 +2575,8 @@ fn find_desired_id<V>(
 fn resolve_import_target_in_desired(
     to: &StateBlockAddress,
     desired: &[Resource],
-    registry: &SchemaRegistry,
 ) -> Option<StateBlockAddress> {
-    let name_attr = import_target_name_attribute(to, registry);
-    match_import_target(to, name_attr, desired.iter()).map(|resource| {
+    match_import_target(to, desired.iter()).map(|resource| {
         StateBlockAddress::new(
             &resource.id.provider,
             &resource.id.resource_type,
@@ -2608,7 +2604,7 @@ pub fn add_state_block_effects(
     state_blocks: &[StateBlock],
     state_file: &Option<StateFile>,
     moved_pairs: &[(ResourceId, ResourceId)],
-    registry: &SchemaRegistry,
+    _registry: &SchemaRegistry,
     // carina#3329: resolved bindings + the set of upstream-state
     // binding names whose surviving refs are stamped as
     // `Value::Deferred(DeferredValue::Unknown(UpstreamRef { … }))`.
@@ -2633,11 +2629,7 @@ pub fn add_state_block_effects(
     for block in state_blocks {
         match block {
             StateBlock::Import { to, id } => {
-                // Try exact match first; fall back to matching against anonymous
-                // resources via the schema's name_attribute. This lets users write
-                // `to = awscc.s3.Bucket 'carina-rs-state'` without needing the
-                // auto-generated hash name.
-                let effective_to = resolve_import_target(to, plan, state_file, registry);
+                let effective_to = resolve_import_target(to, plan);
 
                 // Skip if resource already exists in state
                 let already_in_state = state_file.as_ref().is_some_and(|sf| {
@@ -2821,21 +2813,9 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
 ///
 /// Match precedence:
 /// 1. Exact `(provider, resource_type, name)` against a Create effect.
-/// 2. `name_attribute` fallback against a Create effect's anonymous
-///    resource (so `to = X 'carina-rs-state'` matches against
-///    `bucket_name = 'carina-rs-state'` on a `s3_bucket_1d43a664`).
-/// 3. `name_attribute` fallback against the state file
-///    (already-imported case).
-fn resolve_import_target(
-    to: &StateBlockAddress,
-    plan: &Plan,
-    state_file: &Option<StateFile>,
-    registry: &SchemaRegistry,
-) -> ResourceId {
-    let name_attr = import_target_name_attribute(to, registry);
+fn resolve_import_target(to: &StateBlockAddress, plan: &Plan) -> ResourceId {
     if let Some(resource) = match_import_target(
         to,
-        name_attr,
         plan.effects().iter().filter_map(|effect| match effect {
             Effect::Create(resource) => Some(resource),
             _ => None,
@@ -2844,46 +2824,13 @@ fn resolve_import_target(
         return resource.id.clone();
     }
 
-    // Fallback: match by name_attribute value in state file (already-imported case)
-    if let Some(attr) = name_attr
-        && let Some(sf) = state_file.as_ref()
-    {
-        for rs in sf.resources_by_type(&to.provider, &to.resource_type) {
-            if let Some(serde_json::Value::String(s)) = rs.attributes.get(attr)
-                && s == to.name_str()
-            {
-                return ResourceId::with_provider_identity(
-                    &rs.provider,
-                    &rs.resource_type,
-                    &rs.name,
-                    rs.directives.provider_instance.clone(),
-                );
-            }
-        }
-    }
-
     to.to_unrouted_resource_id()
-}
-
-fn import_target_name_attribute<'a>(
-    to: &StateBlockAddress,
-    registry: &'a SchemaRegistry,
-) -> Option<&'a str> {
-    registry
-        .get(
-            &to.provider,
-            &to.resource_type,
-            carina_core::schema::SchemaKind::Resource,
-        )
-        .and_then(|s| s.name_attribute.as_deref())
 }
 
 fn match_import_target<'a>(
     to: &StateBlockAddress,
-    name_attr: Option<&str>,
     resources: impl Iterator<Item = &'a Resource>,
 ) -> Option<&'a Resource> {
-    let mut fallback = None;
     for resource in resources {
         if resource.id.provider != to.provider || resource.id.resource_type != to.resource_type {
             continue;
@@ -2891,15 +2838,8 @@ fn match_import_target<'a>(
         if resource.id.identity_or_empty() == to.name_str() {
             return Some(resource);
         }
-        if fallback.is_none()
-            && let Some(attr) = name_attr
-            && let Some(Value::Concrete(ConcreteValue::String(s))) = resource.get_attr(attr)
-            && s == to.name_str()
-        {
-            fallback = Some(resource);
-        }
     }
-    fallback
+    None
 }
 
 /// Check whether a `ProviderError` is an AWS throttling error that should be retried.

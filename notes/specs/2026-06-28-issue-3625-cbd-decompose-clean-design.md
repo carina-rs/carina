@@ -21,7 +21,7 @@ The prior PR landed the decomposition incrementally:
 Specifically, the following CLAUDE.md violations remained:
 
 - `apply_name_overrides` is invoked at three entry points with a copy-pasted 7-step "resolve → apply → rebuild bindings → re-resolve → re-apply → rebuild" dance (sibling code paths doing the same dance).
-- The `name_attribute`-missing CBD check exists only on the cascade-promoted path; user-authored `directives { create_before_destroy = true }` on a schema without a name attribute still fails silently at apply time (one bug producing symptoms in multiple code paths).
+- The `unique_name_attribute`-missing CBD check exists only on the cascade-promoted path; user-authored `directives { create_before_destroy = true }` on a schema without a unique-name attribute still fails silently at apply time (one bug producing symptoms in multiple code paths).
 - `NameOverride.original_value: String` uses the empty string as a sentinel for "legacy unknown", so the type cannot distinguish legacy migration from a deliberately stored empty value.
 - The synthetic-key registration for anonymous resources is gated to `ScheduleInputs::Apply`, with a comment that future destroy paths must remember to register it (callers-must-remember-to seam).
 
@@ -199,7 +199,7 @@ Inside `OverrideAwareResources::build`:
 
 The chained-CBD problem (A → B name reference) is resolved by step 3: B's `current_dsl_value` is read from the pre-override snapshot, not from A-overridden bindings, so B's `original_value` match is not invalidated by A's override.
 
-### `name_attribute`-missing check lives inside `generate_temporary_name`
+### `unique_name_attribute`-missing check lives inside `generate_temporary_name`
 
 The prior PR added the check only on the cascade-promoted path. Encode it in the type signature from the start:
 
@@ -210,7 +210,7 @@ pub fn generate_temporary_name(
 ) -> Result<TemporaryName, MissingNameAttributeError>;
 ```
 
-Every CBD construction path (auto-promote, user directive, cascade) must `?` the result. The error is mapped to a `PlanError` and surfaces at plan time. A CBD on a schema without a `name_attribute` cannot reach the plan output.
+Every CBD construction path (auto-promote, user directive, cascade) must `?` the result. The error is mapped to a `PlanError` and surfaces at plan time. A CBD on a schema without a `unique_name_attribute` cannot reach the plan output.
 
 ### Chained CBD auto-promote — fixed-point loop
 
@@ -354,7 +354,7 @@ Tasks:
 - T4.2: Rewrite `cascade_dependent_updates` on top of `PendingReplace`; auto-promote runs as a fixed-point loop.
 - T4.3: Route `decompose_replace_into_effects` through `Plan::add_replacement(ReplacementGroup)`.
 - T4.4: Make `generate_temporary_name` return `Result<TemporaryName, MissingNameAttributeError>`; surface `MissingNameAttributeError` as `PlanError`.
-- T4.5: Rewrite cascade tests against the new shape (independent Update added or reused; `Delete.blocked_by_updates` carries the consumer binding; create-only consumer promotes to Replace; name_attribute-missing CBD produces a plan error).
+- T4.5: Rewrite cascade tests against the new shape (independent Update added or reused; `Delete.blocked_by_updates` carries the consumer binding; create-only consumer promotes to Replace; unique_name_attribute-missing CBD produces a plan error).
 
 Acceptance: `grep Effect::Replace` returns zero hits; Phase 0's Red e2e turns Green.
 
@@ -448,7 +448,7 @@ Each phase's acceptance criteria include the test additions for that phase. Cumu
 - `test_cbd_permanent_name_override_persists` (Phase 5; asserts the second plan is a no-op)
 - `test_cbd_dsl_rename_after_apply_triggers_new_cbd` (Phase 5)
 - `chained_cbd_anonymous_middle_node_auto_promoted` (Phase 4 + Phase 5; covers anonymous + chained together)
-- `auto_promote_with_missing_name_attribute_emits_plan_error` (Phase 4)
+- `auto_promote_with_missing_unique_name_attribute_emits_plan_error` (Phase 4)
 - `apply_name_overrides_applies_for_var_substituted_dsl_name` (Phase 5)
 - `apply_name_overrides_skips_for_ref_substituted_dsl_name_rename` (Phase 5)
 - `chained_cbd_consumer_reading_b_dot_name_resolves_to_b_override` (Phase 5; second-pass regression guard)

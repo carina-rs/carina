@@ -123,39 +123,39 @@ fn filter_non_removable_removals(
 
 /// Generate a temporary name for create-before-destroy replacement.
 ///
-/// When a resource has a `name_attribute` with a unique constraint and uses
+/// When a resource has a `unique_name_attribute` with a unique constraint and uses
 /// `create_before_destroy`, we need a temporary name for the new resource to
 /// avoid conflicts with the old resource that still exists.
 ///
-/// Returns `None` if no temporary name is needed (no name_attribute,
+/// Returns `None` if no temporary name is needed (no unique_name_attribute,
 /// the resource already uses name_prefix for that attribute, or
-/// the name_attribute value changed between `from` and `to`).
+/// the unique_name_attribute value changed between `from` and `to`).
 fn generate_temporary_name(
     resource: &Resource,
     from: &State,
     schema: &ResourceSchema,
 ) -> Option<TemporaryName> {
-    let name_attr = schema.name_attribute.as_ref()?;
+    let name_attr = schema.unique_name_attribute.as_ref()?;
 
     // Skip if the resource uses name_prefix for this attribute
     if resource.prefixes.contains_key(name_attr) {
         return None;
     }
 
-    // Get the current value of the name attribute
+    // Get the current value of the unique-name attribute.
     let original_value = match resource.get_attr(name_attr) {
         Some(Value::Concrete(ConcreteValue::String(s))) => s.clone(),
         _ => return None,
     };
 
-    // Skip if the name_attribute value changed (new name is already different from old)
+    // Skip if the unique_name_attribute value changed (new name is already different from old)
     if let Some(Value::Concrete(ConcreteValue::String(from_name))) = from.attributes.get(name_attr)
         && *from_name != original_value
     {
         return None;
     }
 
-    // Check if the name attribute is create-only (cannot be renamed after creation)
+    // Check if the unique-name attribute is create-only (cannot be renamed after creation).
     let can_rename = schema
         .attributes
         .get(name_attr)

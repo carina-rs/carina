@@ -341,7 +341,7 @@ fn read_only_resource_always_generates_read_effect() {
 /// a "name" attribute (the normal case for AWSCC resources after PR #151),
 /// the differ should report NoChange, not a false update.
 #[test]
-fn no_false_update_without_name_attribute() {
+fn no_false_update_without_unique_name_attribute() {
     // Simulate AWSCC resource: desired has cidr_block but no "name"
     let desired = Resource::new("ec2.Vpc", "vpc").with_attribute(
         "cidr_block",

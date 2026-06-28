@@ -245,7 +245,7 @@ pub fn proto_to_core_schema(s: &ProtoResourceSchema) -> CoreResourceSchema {
         description: s.description.clone(),
         validator: None,
         data_source: s.data_source,
-        name_attribute: s.name_attribute.clone(),
+        unique_name_attribute: s.unique_name_attribute.clone(),
         force_replace: s.force_replace,
     }
 }
@@ -311,7 +311,7 @@ pub fn core_to_proto_schema(s: &CoreResourceSchema) -> ProtoResourceSchema {
             .collect(),
         description: s.description.clone(),
         data_source: s.data_source,
-        name_attribute: s.name_attribute.clone(),
+        unique_name_attribute: s.unique_name_attribute.clone(),
         force_replace: s.force_replace,
     }
 }
@@ -369,7 +369,7 @@ mod tests {
             description: Some("VPC".into()),
             validator: None,
             data_source: false,
-            name_attribute: None,
+            unique_name_attribute: None,
             force_replace: false,
         };
 

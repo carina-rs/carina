@@ -408,7 +408,7 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
 }
 
 #[test]
-fn build_state_after_apply_preserves_block_name_attribute() {
+fn build_state_after_apply_preserves_block_unique_name_attribute() {
     // When a block_name attribute (e.g., "policies" with block_name "policy")
     // is carried over by the provider because CloudControl doesn't return it,
     // the state after apply should include the attribute under the canonical name.
@@ -551,7 +551,7 @@ fn build_state_after_apply_preserves_block_name_attribute() {
 }
 
 #[test]
-fn block_name_attribute_no_diff_when_hydrated() {
+fn block_unique_name_attribute_no_diff_when_hydrated() {
     // After apply, the state file contains the block_name attribute (canonical name).
     // On re-plan, if hydrate_read_state restores it into current_states,
     // the differ should see no changes.
@@ -663,7 +663,7 @@ fn block_name_attribute_no_diff_when_hydrated() {
 }
 
 #[test]
-fn block_name_attribute_state_roundtrip() {
+fn block_unique_name_attribute_state_roundtrip() {
     // Verify that block_name attributes (saved under canonical name in state)
     // roundtrip correctly through state save/load, meaning the saved_attrs
     // returned by build_saved_attrs have the correct canonical key.
