@@ -199,7 +199,10 @@ fn multi_instance_create_propagates_provider_instance() {
     let mut by_name: HashMap<String, Option<String>> = HashMap::new();
     for effect in plan.effects() {
         let id = effect.resource_id();
-        by_name.insert(id.name_str().to_string(), id.provider_instance.clone());
+        by_name.insert(
+            id.identity_or_empty().to_string(),
+            id.provider_instance.clone(),
+        );
     }
 
     assert_eq!(
@@ -234,7 +237,10 @@ fn module_routed_instance_propagates_provider_instance() {
         .iter()
         .map(|e| {
             let id = e.resource_id();
-            (id.name_str().to_string(), id.provider_instance.clone())
+            (
+                id.identity_or_empty().to_string(),
+                id.provider_instance.clone(),
+            )
         })
         .collect();
 
@@ -2136,7 +2142,7 @@ fn snapshot_composition_folding() {
     // path so the rendered header reads
     // `module "cluster" (./modules/cluster)`.
     let cluster_site = CallSite::new(
-        EphemeralId::new(ResourceId::new("_virtual", "cluster")),
+        EphemeralId::new(ResourceId::with_identity("_virtual", "cluster")),
         "./modules/cluster",
     );
     trace.record(PersistentId::new(inner_id), vec![cluster_site.clone()]);
@@ -2227,7 +2233,7 @@ fn snapshot_top_level_sigil_alignment() {
 
     let mut trace = ExpansionTrace::new();
     let cluster_site = CallSite::new(
-        EphemeralId::new(ResourceId::new("_virtual", "cluster")),
+        EphemeralId::new(ResourceId::with_identity("_virtual", "cluster")),
         "./modules/cluster",
     );
     trace.record(PersistentId::new(cluster_id), vec![cluster_site]);

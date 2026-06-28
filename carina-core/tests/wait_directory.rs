@@ -49,7 +49,7 @@ fn wait_resolves_target_and_depends_on_across_sibling_files() {
     let cert = parsed
         .resources
         .iter()
-        .find(|r| r.id.name.as_str() == "cert")
+        .find(|r| r.id.identity_or_empty() == "cert")
         .expect("cert binding should be present from main.crn");
     assert_eq!(cert.id.resource_type, "acm.Certificate");
 }

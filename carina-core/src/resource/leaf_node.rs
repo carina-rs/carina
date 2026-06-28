@@ -173,7 +173,7 @@ mod tests {
         use indexmap::IndexMap;
         use std::collections::{BTreeSet, HashSet};
         Composition {
-            id: ResourceId::new("_virtual", "m"),
+            id: ResourceId::with_identity("_virtual", "m"),
             signature: super::super::Signature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),
@@ -254,7 +254,7 @@ mod tests {
     /// use indexmap::IndexMap;
     /// use std::collections::{BTreeSet, HashSet};
     /// let c = Composition {
-    ///     id: ResourceId::new("_virtual", "m"),
+    ///     id: ResourceId::with_identity("_virtual", "m"),
     ///     signature: Signature {
     ///         arguments: IndexMap::new(),
     ///         attributes: IndexMap::new(),

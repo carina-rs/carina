@@ -238,7 +238,7 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                     // uses only the target edge because it visualizes the
                     // structural "wait gates this resource" relationship.
                     let mut deps = HashSet::new();
-                    deps.insert(target_id.name_str().to_string());
+                    deps.insert(target_id.identity_or_empty().to_string());
                     binding_to_effect.insert(binding.clone(), idx);
                     effect_bindings.insert(idx, binding.clone());
                     effect_types.insert(idx, "wait".to_string());
@@ -602,7 +602,7 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::DeferredReplace {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-                id: ResourceId::new("route53.Record", "validation_records[0]"),
+                id: ResourceId::with_identity("route53.Record", "validation_records[0]"),
                 identifier: "record-0".to_string(),
                 directives: Directives::default(),
                 binding: Some("validation_records[0]".to_string()),
@@ -610,12 +610,12 @@ mod tests {
                 explicit_dependencies: HashSet::new(),
             }])
             .expect("fixture has one delete"),
-            id: ResourceId::new("__deferred_for", "validation_records"),
+            id: ResourceId::with_identity("__deferred_for", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(deferred),
         });
         plan.add(Effect::Delete {
-            id: ResourceId::new("route53.Record", "old-record-0"),
+            id: ResourceId::with_identity("route53.Record", "old-record-0"),
             identifier: "record-0".to_string(),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
@@ -623,7 +623,7 @@ mod tests {
             explicit_dependencies: HashSet::new(),
         });
         plan.add(Effect::Delete {
-            id: ResourceId::new("route53.Record", "old-record-abc"),
+            id: ResourceId::with_identity("route53.Record", "old-record-abc"),
             identifier: "record-abc".to_string(),
             directives: Directives::default(),
             binding: Some("validation_records[abc]".to_string()),
@@ -661,7 +661,7 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::DeferredReplace {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-                id: ResourceId::new("route53.Record", "validation_records[0]"),
+                id: ResourceId::with_identity("route53.Record", "validation_records[0]"),
                 identifier: "record-0".to_string(),
                 directives: Directives::default(),
                 binding: Some("validation_records[0]".to_string()),
@@ -669,13 +669,13 @@ mod tests {
                 explicit_dependencies: HashSet::new(),
             }])
             .expect("fixture has one delete"),
-            id: ResourceId::new("__deferred_for", "validation_records"),
+            id: ResourceId::with_identity("__deferred_for", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(deferred),
         });
         plan.add(Effect::Wait {
             binding: "wait_validation_record_0".to_string(),
-            target_id: ResourceId::new("route53.Record", "validation_records[0]"),
+            target_id: ResourceId::with_identity("route53.Record", "validation_records[0]"),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ready".to_string())),

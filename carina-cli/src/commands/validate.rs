@@ -9,7 +9,7 @@ use carina_core::config_loader::{
 };
 use carina_core::lint::find_duplicate_attrs;
 use carina_core::parser::{File, ProviderContext, ResourceRef, UpstreamState};
-use carina_core::resource::{ResourceId, ResourceName};
+use carina_core::resource::ResourceId;
 
 use super::validate_and_resolve_errors;
 use crate::error::AppError;
@@ -154,15 +154,15 @@ fn format_inference_errors(
 /// resource can never silently render as a trailing-dot string
 /// (carina#3121). `Display` is the *only* place an entry becomes text.
 enum ValidatedEntry<'a> {
-    /// A direct resource whose name is already bound — the common
+    /// A direct resource whose identity is already assigned — the common
     /// case, renders exactly as its [`ResourceId`].
     Resolved(&'a ResourceId),
-    /// A direct resource still carrying a `Pending` name (anonymous,
-    /// `name` attribute not yet promoted at the point validate
+    /// A direct resource still missing identity (anonymous,
+    /// identity not yet assigned at the point validate
     /// enumerates). Rendering its `ResourceId` directly would emit a
     /// meaningless trailing-dot string; this variant makes the
-    /// not-yet-named state explicit instead of relying on the empty
-    /// string `ResourceName::Pending` produces.
+    /// not-yet-assigned state explicit instead of relying on an empty
+    /// identity string.
     PendingDirect(&'a ResourceId),
     /// The body of a `for` loop whose iterable is unresolved at parse
     /// time (e.g. a same-config provider-read attribute). It is a
@@ -232,12 +232,13 @@ fn validated_entries<E>(parsed: &File<E>) -> Vec<ValidatedEntry<'_>> {
                 line: d.line,
             },
             // Managed / Virtual / DataSource — all direct, classified
-            // by whether the id has a resolved name.
+            // by whether the id has a resolved identity.
             other => {
                 let id = other.id();
-                match id.name {
-                    ResourceName::Bound(_) => ValidatedEntry::Resolved(id),
-                    ResourceName::Pending => ValidatedEntry::PendingDirect(id),
+                if id.identity.is_some() {
+                    ValidatedEntry::Resolved(id)
+                } else {
+                    ValidatedEntry::PendingDirect(id)
                 }
             }
         })
@@ -496,12 +497,11 @@ mod tests {
         );
     }
 
-    /// Type-safety guarantee: a direct resource still carrying a
-    /// `Pending` name must NOT render as a trailing-dot string
+    /// Type-safety guarantee: a direct resource still missing identity
+    /// must NOT render as a trailing-dot string
     /// (`aws.s3.Bucket.`). The `ValidatedEntry::PendingDirect` variant
     /// makes the not-yet-named state explicit at the type level
-    /// instead of leaking the empty string `ResourceName::Pending`
-    /// produces. Guards the [[feedback_type_safety_over_runtime_checks]]
+    /// instead of leaking an empty identity string. Guards the [[feedback_type_safety_over_runtime_checks]]
     /// concern raised reviewing carina#3128.
     #[test]
     fn pending_named_direct_resource_does_not_render_trailing_dot() {
@@ -512,7 +512,7 @@ mod tests {
         let mut res = Resource::new("s3.Bucket", "placeholder");
         res.id.provider = "aws".to_string();
         // Force the anonymous/not-yet-promoted state explicitly.
-        res.id.name = ResourceName::Pending;
+        res.id.identity = None;
         parsed.resources.push(res); // allow: direct — fixture test inspection
 
         let entries = validated_entries(&parsed);

@@ -102,7 +102,7 @@ impl PostApplyStates {
     ) -> Self {
         let mut map = current_states.clone();
         for rs in &state.resources {
-            let id = ResourceId::with_provider(
+            let id = ResourceId::with_provider_name_compat(
                 &rs.provider,
                 &rs.resource_type,
                 &rs.name,
@@ -716,7 +716,7 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
 
     for (id, planned) in &writeback.upserts {
         let resource = planned.resource;
-        let existing = state.find_resource(&id.provider, &id.resource_type, id.name_str());
+        let existing = state.find_resource(&id.provider, &id.resource_type, id.identity_or_empty());
         let write_only_keys: Vec<String> = schemas
             .get_for(resource)
             .map(|schema| {
@@ -745,7 +745,7 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
     }
 
     for id in &writeback.cleanups {
-        state.remove_resource(&id.provider, &id.resource_type, id.name_str());
+        state.remove_resource(&id.provider, &id.resource_type, id.identity_or_empty());
     }
 
     Ok(state)
@@ -758,7 +758,7 @@ pub(crate) fn apply_destroy_to_state(
     destroyed_ids: &[ResourceId],
 ) {
     for id in destroyed_ids {
-        state.remove_resource(&id.provider, &id.resource_type, id.name_str());
+        state.remove_resource(&id.provider, &id.resource_type, id.identity_or_empty());
     }
     state.exports.clear();
 }
@@ -770,7 +770,7 @@ pub(crate) fn apply_destroy_to_state(
 /// and tree display work correctly.
 pub(crate) fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceId) -> Resource {
     let rs = sf
-        .find_resource(&id.provider, &id.resource_type, id.name_str())
+        .find_resource(&id.provider, &id.resource_type, id.identity_or_empty())
         .expect("orphan must exist in state file");
     let attributes: HashMap<String, Value> = rs
         .attributes
@@ -807,7 +807,8 @@ mod post_apply_states_tests {
     ///    the pre-apply snapshot.
     #[test]
     fn data_source_only_in_current_states_survives() {
-        let ds_id = ResourceId::with_provider("aws", "iam.Roles", "admin_access_roles", None);
+        let ds_id =
+            ResourceId::with_provider_identity("aws", "iam.Roles", "admin_access_roles", None);
         let mut ds_attrs = HashMap::new();
         ds_attrs.insert(
             "arns".to_string(),
@@ -835,7 +836,7 @@ mod post_apply_states_tests {
 
     #[test]
     fn state_resources_entry_wins_over_current_states_on_collision() {
-        let id = ResourceId::with_provider("awscc", "s3.Bucket", "log", None);
+        let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "log", None);
 
         // current_states carries the PRE-apply attribute value.
         let mut pre_attrs = HashMap::new();
@@ -945,7 +946,7 @@ mod apply_state_save_tests {
         Effect::DeferredReplace {
             deletes: NonEmptyDeletes::try_new(vec![deferred_replace_delete(id)])
                 .expect("fixture has one delete"),
-            id: ResourceId::new("__deferred_for", "validation_records"),
+            id: ResourceId::with_identity("__deferred_for", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(DeferredForExpression {
                 file: Some("main.crn".to_string()),
@@ -964,7 +965,12 @@ mod apply_state_save_tests {
 
     #[test]
     fn deferred_replace_delete_and_create_same_id_writes_one_upsert_no_cleanup() {
-        let id = ResourceId::with_provider("aws", "route53.Record", "validation_records[0]", None);
+        let id = ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            None,
+        );
         let runtime_child =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
                 .with_binding("validation_records[0]");
@@ -999,7 +1005,12 @@ mod apply_state_save_tests {
 
     #[test]
     fn deferred_replace_delete_success_create_failure_writes_cleanup() {
-        let id = ResourceId::with_provider("aws", "route53.Record", "validation_records[0]", None);
+        let id = ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            None,
+        );
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::new();
@@ -1024,7 +1035,12 @@ mod apply_state_save_tests {
 
     #[test]
     fn move_from_overlapping_desired_resource_still_errors() {
-        let id = ResourceId::with_provider("aws", "route53.Record", "validation_records[0]", None);
+        let id = ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            None,
+        );
         let desired =
             Resource::with_provider("aws", "route53.Record", "validation_records[0]", None);
         let applied_state =
@@ -1032,7 +1048,12 @@ mod apply_state_save_tests {
         let mut plan = Plan::new();
         plan.add(Effect::Move {
             from: id.clone(),
-            to: ResourceId::with_provider("aws", "route53.Record", "validation_records[1]", None),
+            to: ResourceId::with_provider_identity(
+                "aws",
+                "route53.Record",
+                "validation_records[1]",
+                None,
+            ),
         });
         let current_states = HashMap::new();
         let applied_states = HashMap::from([(id.clone(), applied_state)]);

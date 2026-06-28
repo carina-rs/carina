@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn persistent_id_round_trip() {
-        let id = ResourceId::new("aws.s3.Bucket", "b");
+        let id = ResourceId::with_identity("aws.s3.Bucket", "b");
         let pid = PersistentId::new(id.clone());
         assert_eq!(pid.inner(), &id);
         assert_eq!(pid.into_inner(), id);
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn ephemeral_id_round_trip() {
-        let id = ResourceId::new("_virtual", "m");
+        let id = ResourceId::with_identity("_virtual", "m");
         let eid = EphemeralId::new(id.clone());
         assert_eq!(eid.inner(), &id);
         assert_eq!(eid.into_inner(), id);
@@ -190,13 +190,13 @@ mod tests {
     /// ```compile_fail
     /// use carina_core::resource::{EphemeralId, PersistentId, ResourceId};
     /// fn loads_from_state(_pid: &PersistentId) {}
-    /// let eid = EphemeralId::new(ResourceId::new("_virtual", "m"));
+    /// let eid = EphemeralId::new(ResourceId::with_identity("_virtual", "m"));
     /// loads_from_state(&eid);
     /// ```
     ///
     /// ```compile_fail
     /// use carina_core::resource::{EphemeralId, PersistentId, ResourceId};
-    /// let eid = EphemeralId::new(ResourceId::new("_virtual", "m"));
+    /// let eid = EphemeralId::new(ResourceId::with_identity("_virtual", "m"));
     /// let _pid: PersistentId = eid.into();
     /// ```
     #[allow(dead_code)]
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn node_id_from_persistent_id() {
-        let pid = PersistentId::new(ResourceId::new("aws.s3.Bucket", "b"));
+        let pid = PersistentId::new(ResourceId::with_identity("aws.s3.Bucket", "b"));
         let nid: NodeId = pid.clone().into();
         assert!(matches!(nid, NodeId::Persistent(_)));
         assert_eq!(nid.inner(), pid.inner());
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn node_id_from_ephemeral_id() {
-        let eid = EphemeralId::new(ResourceId::new("_virtual", "m"));
+        let eid = EphemeralId::new(ResourceId::with_identity("_virtual", "m"));
         let nid: NodeId = eid.clone().into();
         assert!(matches!(nid, NodeId::Ephemeral(_)));
         assert_eq!(nid.inner(), eid.inner());

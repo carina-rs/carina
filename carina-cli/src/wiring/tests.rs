@@ -111,7 +111,7 @@ impl Provider for ReadWithRetryProvider {
 #[tokio::test]
 async fn read_with_retry_translates_not_found_to_state_not_found() {
     let provider = ReadWithRetryProvider::new(ReadBehavior::NotFound);
-    let id = ResourceId::new("test.Resource", "gone");
+    let id = ResourceId::with_identity("test.Resource", "gone");
 
     let state = read_with_retry(&provider, &id, Some("some-identifier"))
         .await
@@ -125,7 +125,7 @@ async fn read_with_retry_translates_not_found_to_state_not_found() {
 #[tokio::test]
 async fn read_with_retry_propagates_other_errors() {
     let provider = ReadWithRetryProvider::new(ReadBehavior::ApiError);
-    let id = ResourceId::new("test.Resource", "broken");
+    let id = ResourceId::with_identity("test.Resource", "broken");
 
     let result = read_with_retry(&provider, &id, Some("some-identifier")).await;
 
@@ -135,7 +135,7 @@ async fn read_with_retry_propagates_other_errors() {
 #[tokio::test]
 async fn read_with_retry_does_not_retry_not_found() {
     let provider = ReadWithRetryProvider::new(ReadBehavior::NotFoundThenSuccess);
-    let id = ResourceId::new("test.Resource", "gone");
+    let id = ResourceId::with_identity("test.Resource", "gone");
 
     let state = read_with_retry(&provider, &id, Some("some-identifier"))
         .await
@@ -225,7 +225,8 @@ fn test_resolve_enum_aliases_aws_provider() {
 fn test_resolve_enum_aliases_in_states() {
     // Current states should also have aliases resolved
     let ctx = WiringContext::new(vec![]);
-    let id = ResourceId::with_provider("awscc", "ec2.security_group_egress", "test-rule", None);
+    let id =
+        ResourceId::with_provider_identity("awscc", "ec2.security_group_egress", "test-rule", None);
     let mut attrs = HashMap::new();
     attrs.insert(
         "ip_protocol".to_string(),
@@ -581,7 +582,7 @@ fn import_fallback_matches_anonymous_resource_by_name_attribute() {
     match &effects[0] {
         Effect::Import { id, identifier } => {
             assert_eq!(
-                id.name_str(),
+                id.identity_or_empty(),
                 "s3_bucket_1d43a664",
                 "Import should target the anonymous hash name"
             );
@@ -621,7 +622,7 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
 
     // Pre-populate `current_states` with the routed `from` id (mirrors
     // what `build_state_for_resource` would produce).
-    let routed_from = ResourceId::with_provider(
+    let routed_from = ResourceId::with_provider_identity(
         "aws",
         "route53.RecordSet",
         "old_record",
@@ -695,7 +696,7 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
     // The orphan Delete effect carries the same routed instance.
     let mut plan = Plan::new();
     plan.add(Effect::Delete {
-        id: ResourceId::with_provider(
+        id: ResourceId::with_provider_identity(
             "aws",
             "route53.RecordSet",
             "r.delegation_ns",
@@ -964,7 +965,7 @@ fn test_materialize_moved_states_warns_on_missing_from() {
 }
 
 fn bucket_id(name: &str) -> ResourceId {
-    ResourceId::with_provider("awscc", "s3.Bucket", name, None)
+    ResourceId::with_provider_identity("awscc", "s3.Bucket", name, None)
 }
 
 fn bucket_resource(name: &str) -> Resource {
@@ -1467,7 +1468,7 @@ fn import_claimed_name_attribute_target_excludes_desired_from_reconciliation() {
     reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims);
 
     assert_eq!(
-        resources[0].id.name_str(),
+        resources[0].id.identity_or_empty(),
         desired_name,
         "import-claimed desired resource must not adopt the matching old hash name"
     );
@@ -1510,7 +1511,7 @@ fn assert_claimed_association_stays_orphaned_after_reconcile() {
     reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims);
 
     assert_eq!(
-        resources[0].id.name_str(),
+        resources[0].id.identity_or_empty(),
         desired_name,
         "claimed state entry must not be rebound to the desired resource"
     );
@@ -1587,7 +1588,7 @@ fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_s
 
     let names: Vec<_> = resources
         .iter()
-        .map(|resource| resource.id.name_str())
+        .map(|resource| resource.id.identity_or_empty())
         .collect();
     assert_eq!(
         names,
@@ -1646,7 +1647,7 @@ fn test_stale_moved_block_releases_claims() {
     reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims);
 
     assert_eq!(
-        resources[0].id.name_str(),
+        resources[0].id.identity_or_empty(),
         "ec2_subnet_route_table_association_11111111",
         "stale moved block must release claims so meaning-based matching can preserve the no-op"
     );
@@ -1684,8 +1685,12 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
             to: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", &desired_name),
         });
 
-        let old_id =
-            ResourceId::with_provider("awscc", "ec2.SubnetRouteTableAssociation", &old_name, None);
+        let old_id = ResourceId::with_provider_identity(
+            "awscc",
+            "ec2.SubnetRouteTableAssociation",
+            &old_name,
+            None,
+        );
         current_states.insert(old_id.clone(), State::not_found(old_id));
         old_names.push(old_name);
         desired_names.push(desired_name);
@@ -1701,7 +1706,7 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
     assert_eq!(
         resources
             .iter()
-            .map(|resource| resource.id.name_str().to_string())
+            .map(|resource| resource.id.identity_or_empty().to_string())
             .collect::<Vec<_>>(),
         desired_names,
         "heuristics must not re-key desired resources whose names are moved.to claims"
@@ -1716,18 +1721,28 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
     );
     assert_eq!(moved_pairs.len(), 5);
     for (idx, (from, to)) in moved_pairs.iter().enumerate() {
-        assert_eq!(from.name_str(), old_names[idx]);
-        assert_eq!(to.name_str(), desired_names[idx]);
+        assert_eq!(from.identity_or_empty(), old_names[idx]);
+        assert_eq!(to.identity_or_empty(), desired_names[idx]);
     }
     for name in old_names {
-        let id = ResourceId::with_provider("awscc", "ec2.SubnetRouteTableAssociation", name, None);
+        let id = ResourceId::with_provider_identity(
+            "awscc",
+            "ec2.SubnetRouteTableAssociation",
+            name,
+            None,
+        );
         assert!(
             !current_states.contains_key(&id),
             "old state key must be removed after materialized move"
         );
     }
     for name in desired_names {
-        let id = ResourceId::with_provider("awscc", "ec2.SubnetRouteTableAssociation", name, None);
+        let id = ResourceId::with_provider_identity(
+            "awscc",
+            "ec2.SubnetRouteTableAssociation",
+            name,
+            None,
+        );
         assert!(
             current_states.contains_key(&id),
             "desired state key must exist after materialized move"
@@ -2070,8 +2085,8 @@ fn compute_anonymous_identifiers_with_ctx_canonicalizes_provider_config_identity
     assert!(errors.is_empty(), "aws spelling errors: {errors:?}");
 
     assert_eq!(
-        resources_awscc[0].id.name_str(),
-        resources_aws[0].id.name_str(),
+        resources_awscc[0].id.identity_or_empty(),
+        resources_aws[0].id.identity_or_empty(),
         "provider config region spelling must canonicalize before anonymous hash"
     );
 }
@@ -2090,10 +2105,10 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
     let errors =
         compute_anonymous_identifiers_with_ctx(&ctx, canonical_anonymous, &providers_awscc);
     assert!(errors.is_empty(), "anonymous setup errors: {errors:?}");
-    let old_name = anonymous[0].id.name_str().to_string();
+    let old_name = anonymous[0].id.identity_or_empty().to_string();
 
     let mut named = anonymous_route_resource();
-    named.id = ResourceId::with_provider("awscc", "ec2.Route", "route", None);
+    named.id = ResourceId::with_provider_identity("awscc", "ec2.Route", "route", None);
     named.binding = Some("route".to_string());
     let resources = vec![named.clone()];
 
@@ -2119,7 +2134,7 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
     assert_eq!(
         renames,
         vec![(
-            ResourceId::with_provider("awscc", "ec2.Route", old_name, None),
+            ResourceId::with_provider_identity("awscc", "ec2.Route", old_name, None),
             named.id
         )],
         "provider config region spelling must canonicalize before rename simhash"
@@ -2475,7 +2490,7 @@ mod read_with_retry_identifier_tests {
     #[tokio::test]
     async fn read_with_retry_short_circuits_when_identifier_is_none() {
         let provider = RecordingProvider::new();
-        let id = ResourceId::with_provider("awscc", "iam.Role", "fresh", None);
+        let id = ResourceId::with_provider_identity("awscc", "iam.Role", "fresh", None);
 
         let state = read_with_retry(&provider, &id, None).await.unwrap();
 
@@ -2494,7 +2509,7 @@ mod read_with_retry_identifier_tests {
     #[tokio::test]
     async fn read_with_retry_forwards_when_identifier_is_some() {
         let provider = RecordingProvider::new();
-        let id = ResourceId::with_provider("awscc", "iam.Role", "existing", None);
+        let id = ResourceId::with_provider_identity("awscc", "iam.Role", "existing", None);
 
         let _state = read_with_retry(&provider, &id, Some("AROABC123"))
             .await
@@ -2568,7 +2583,7 @@ fn deferred_replace_test_template() -> carina_core::parser::DeferredForExpressio
 
 fn deferred_replace_test_target() -> DeferredCreateTarget {
     DeferredCreateTarget {
-        id: ResourceId::with_provider("aws", "__deferred_for", "validation_records", None),
+        id: ResourceId::with_provider_identity("aws", "__deferred_for", "validation_records", None),
         upstream_binding: "cert".to_string(),
         template: deferred_replace_test_template(),
     }
@@ -2576,7 +2591,7 @@ fn deferred_replace_test_target() -> DeferredCreateTarget {
 
 fn delete_effect_for_binding(binding: &str) -> Effect {
     Effect::Delete {
-        id: ResourceId::with_provider("aws", "route53.Record", binding, None),
+        id: ResourceId::with_provider_identity("aws", "route53.Record", binding, None),
         identifier: format!("{binding}-old-id"),
         directives: Directives::default(),
         binding: Some(binding.to_string()),
@@ -2586,7 +2601,7 @@ fn delete_effect_for_binding(binding: &str) -> Effect {
 }
 
 fn cert_replace_effect() -> Effect {
-    let id = ResourceId::with_provider("aws", "acm.Certificate", "cert", None);
+    let id = ResourceId::with_provider_identity("aws", "acm.Certificate", "cert", None);
     Effect::Replace {
         id: id.clone(),
         from: Box::new(State::existing(id, HashMap::new()).with_identifier("cert-old-id")),
@@ -2633,7 +2648,7 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
     assert_eq!(deletes.len(), 1);
     assert_eq!(
         deletes[0].id,
-        ResourceId::with_provider("aws", "route53.Record", "validation_records[0]", None)
+        ResourceId::with_provider_identity("aws", "route53.Record", "validation_records[0]", None)
     );
     assert_eq!(deletes[0].binding.as_deref(), Some("validation_records[0]"));
 
@@ -3914,7 +3929,7 @@ mod wait_until_enum_alias {
     }
 
     fn cert_state() -> HashMap<ResourceId, State> {
-        let id = ResourceId::with_provider("aws", "acm.Certificate", "cert", None);
+        let id = ResourceId::with_provider_identity("aws", "acm.Certificate", "cert", None);
         let mut attrs = HashMap::new();
         attrs.insert(
             "status".to_string(),

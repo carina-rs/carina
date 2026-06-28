@@ -1312,7 +1312,7 @@ mod tests {
 
     #[test]
     fn test_state_attributes_merged_into_binding_map() {
-        let rid = ResourceId::new("test.resource", "my-vpc");
+        let rid = ResourceId::with_identity("test.resource", "my-vpc");
         let mut resources = vec![
             make_resource(
                 "my-vpc",

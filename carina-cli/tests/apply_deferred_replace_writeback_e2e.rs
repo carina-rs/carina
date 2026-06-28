@@ -167,7 +167,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
     };
 
     let validation_id =
-        ResourceId::with_provider("mock", "test.resource", "validation_records[0]", None);
+        ResourceId::with_provider_identity("mock", "test.resource", "validation_records[0]", None);
     let mut plan = Plan::new();
     plan.add(Effect::Create(lb.clone()));
     plan.add(Effect::Create(cert.clone()));
@@ -181,7 +181,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             explicit_dependencies: HashSet::new(),
         }])
         .expect("fixture has one delete"),
-        id: ResourceId::new("__deferred_for", "validation_records"),
+        id: ResourceId::with_identity("__deferred_for", "validation_records"),
         upstream_binding: "cert".to_string(),
         template: Box::new(template),
     });

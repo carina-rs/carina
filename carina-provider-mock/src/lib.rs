@@ -107,7 +107,7 @@ impl MockProvider {
     }
 
     fn resource_key(id: &ResourceId) -> String {
-        format!("{}.{}", id.resource_type, id.name)
+        format!("{}.{}", id.resource_type, id.identity_or_empty())
     }
 
     fn partial_create_config_for(&self, id: &ResourceId) -> Option<&PartialConfig> {
@@ -121,7 +121,12 @@ impl MockProvider {
     }
 
     fn partial_config_matches(config: &PartialConfig, id: &ResourceId) -> bool {
-        let full = format!("{}.{}.{}", id.provider, id.resource_type, id.name);
+        let full = format!(
+            "{}.{}.{}",
+            id.provider,
+            id.resource_type,
+            id.identity_or_empty()
+        );
         let short = Self::resource_key(id);
         config.resource_id_pattern == "*"
             || config.resource_id_pattern == full
@@ -166,7 +171,7 @@ impl MockProvider {
     fn test_resource_identifier(id: &ResourceId, name: Option<&str>) -> Option<String> {
         (id.resource_type == "test.resource"
             && env::var_os("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA").is_some())
-        .then(|| format!("{}-id", name.unwrap_or_else(|| id.name_str())))
+        .then(|| format!("{}-id", name.unwrap_or_else(|| id.identity_or_empty())))
     }
 
     fn populate_test_resource_identifier_json(
@@ -549,7 +554,7 @@ mod tests {
     #[test]
     fn required_permissions_returns_empty_vec() {
         let provider = MockProvider::default();
-        let id = ResourceId::with_provider("mock", "foo", "example", None);
+        let id = ResourceId::with_provider_identity("mock", "foo", "example", None);
         assert_eq!(
             provider.required_permissions(&id, carina_core::effect::PlanOp::Create),
             Vec::<String>::new()
@@ -560,8 +565,8 @@ mod tests {
     fn append_delete_log_records_resource_keys() {
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("delete.log");
-        let first = ResourceId::with_provider("mock", "test.resource", "first", None);
-        let second = ResourceId::with_provider("mock", "test.resource", "second", None);
+        let first = ResourceId::with_provider_identity("mock", "test.resource", "first", None);
+        let second = ResourceId::with_provider_identity("mock", "test.resource", "second", None);
 
         MockProvider::append_delete_log(log_path.clone(), &first).unwrap();
         MockProvider::append_delete_log(log_path.clone(), &second).unwrap();
@@ -585,7 +590,7 @@ mod tests {
             partial_create: None,
             partial_update: None,
         };
-        let id = ResourceId::with_provider("mock", "test.resource", "web-acl-new", None);
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "web-acl-new", None);
         let resource = Resource::with_provider("mock", "test.resource", "web-acl-new", None)
             .with_attribute("name", string_value("web-acl-new"))
             .with_attribute("comment", string_value("v1"));
@@ -649,7 +654,7 @@ mod tests {
             partial_create: None,
             partial_update: None,
         };
-        let id = ResourceId::with_provider("mock", "test.resource", "blocked", None);
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "blocked", None);
         let resource = Resource::with_provider("mock", "test.resource", "blocked", None)
             .with_attribute("name", string_value("blocked"));
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -685,7 +690,7 @@ mod tests {
             partial_create: None,
             partial_update: None,
         };
-        let id = ResourceId::with_provider("mock", "test.resource", "slow", None);
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "slow", None);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()

@@ -13,7 +13,7 @@ use std::collections::{BTreeSet, HashSet};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use super::{Directives, ModuleSource, ResourceId, Value};
+use super::{Directives, ModuleSource, ResourceId, Value, identity_if_present};
 
 /// A read-only resource (data source).
 ///
@@ -57,7 +57,7 @@ impl DataSource {
     /// Create a data source with an empty attribute map.
     pub fn new(resource_type: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
-            id: ResourceId::new(resource_type, name),
+            id: ResourceId::new(resource_type, identity_if_present(name)),
             attributes: IndexMap::new(),
             directives: Directives::default(),
             binding: None,
@@ -84,7 +84,12 @@ impl DataSource {
         provider_instance: Option<String>,
     ) -> Self {
         Self {
-            id: ResourceId::with_provider(provider, resource_type, name, provider_instance),
+            id: ResourceId::with_provider(
+                provider,
+                resource_type,
+                identity_if_present(name),
+                provider_instance,
+            ),
             attributes: IndexMap::new(),
             directives: Directives::default(),
             binding: None,

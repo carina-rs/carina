@@ -90,7 +90,7 @@ fn carina3122_live_distribution_readback_defaults_are_projected_away() {
     let state_dc = load_dc("state_distribution_config.json");
     let prev_explicit = load_explicit();
 
-    let mut id = ResourceId::new("cloudfront.Distribution", "r.distribution");
+    let mut id = ResourceId::with_identity("cloudfront.Distribution", "r.distribution");
     id.provider = "awscc".to_string();
 
     let mut desired = Resource::new("cloudfront.Distribution", "r.distribution")

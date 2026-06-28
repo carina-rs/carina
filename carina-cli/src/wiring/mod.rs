@@ -1315,8 +1315,13 @@ pub struct DeferredCreateTarget {
 
 impl DeferredCreateTarget {
     fn from_deferred(deferred: &carina_core::parser::DeferredForExpression) -> Self {
-        let mut id = deferred.template_resource.id.clone();
-        id.set_name(deferred.binding_name.clone());
+        let template_id = &deferred.template_resource.id;
+        let id = ResourceId::with_provider_identity(
+            &template_id.provider,
+            &template_id.resource_type,
+            deferred.binding_name.clone(),
+            template_id.provider_instance.clone(),
+        );
         Self {
             id,
             upstream_binding: deferred.iterable_binding.clone(),
@@ -1790,8 +1795,11 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
                 sorted_resources
                     .iter()
                     .filter_map(|r| {
-                        let rs =
-                            sf.find_resource(&r.id.provider, &r.id.resource_type, r.id.name_str())?;
+                        let rs = sf.find_resource(
+                            &r.id.provider,
+                            &r.id.resource_type,
+                            r.id.identity_or_empty(),
+                        )?;
                         if rs.dependency_bindings.is_empty() {
                             None
                         } else {
@@ -2293,7 +2301,7 @@ fn materialize_moved_states_with_warning_sink(
             let resolved_from = state_file.as_ref().and_then(|sf| {
                 sf.find_resource(&from.provider, &from.resource_type, from.name_str())
                     .map(|rs| {
-                        ResourceId::with_provider(
+                        ResourceId::with_provider_identity(
                             &rs.provider,
                             &rs.resource_type,
                             &rs.name,
@@ -2406,7 +2414,7 @@ pub fn resolve_state_blocks(
                         removed_from.name_str(),
                     )
                     .map(|rs| {
-                        ResourceId::with_provider(
+                        ResourceId::with_provider_identity(
                             &rs.provider,
                             &rs.resource_type,
                             &rs.name,
@@ -2517,7 +2525,11 @@ pub fn validate_plan_time_state_block_collisions(
 
     for (from, to) in moved_pairs {
         let from_exists = sf
-            .find_resource(&from.provider, &from.resource_type, from.name_str())
+            .find_resource(
+                &from.provider,
+                &from.resource_type,
+                from.identity_or_empty(),
+            )
             .is_some();
         if from == to && from_exists {
             return Err(AppError::Validation(format!(
@@ -2526,7 +2538,7 @@ pub fn validate_plan_time_state_block_collisions(
             )));
         }
         let to_exists = sf
-            .find_resource(&to.provider, &to.resource_type, to.name_str())
+            .find_resource(&to.provider, &to.resource_type, to.identity_or_empty())
             .is_some();
         if from_exists && to_exists {
             return Err(AppError::Validation(format!(
@@ -2557,7 +2569,7 @@ fn find_desired_id<V>(
         .find(|k| {
             k.provider == to.provider
                 && k.resource_type == to.resource_type
-                && k.name_str() == to.name_str()
+                && k.identity_or_empty() == to.name_str()
         })
         .cloned()
 }
@@ -2572,7 +2584,7 @@ fn resolve_import_target_in_desired(
         StateBlockAddress::new(
             &resource.id.provider,
             &resource.id.resource_type,
-            resource.id.name_str(),
+            resource.id.identity_or_empty(),
         )
     })
 }
@@ -2632,7 +2644,7 @@ pub fn add_state_block_effects(
                     sf.find_resource(
                         &effective_to.provider,
                         &effective_to.resource_type,
-                        effective_to.name_str(),
+                        effective_to.identity_or_empty(),
                     )
                     .is_some()
                 });
@@ -2673,7 +2685,7 @@ pub fn add_state_block_effects(
                 let resolved_from = state_file.as_ref().and_then(|sf| {
                     sf.find_resource(&from.provider, &from.resource_type, from.name_str())
                         .map(|rs| {
-                            ResourceId::with_provider(
+                            ResourceId::with_provider_identity(
                                 &rs.provider,
                                 &rs.resource_type,
                                 &rs.name,
@@ -2838,7 +2850,7 @@ fn resolve_import_target(
             if let Some(serde_json::Value::String(s)) = rs.attributes.get(attr)
                 && s == to.name_str()
             {
-                return ResourceId::with_provider(
+                return ResourceId::with_provider_identity(
                     &rs.provider,
                     &rs.resource_type,
                     &rs.name,
@@ -2874,7 +2886,7 @@ fn match_import_target<'a>(
         if resource.id.provider != to.provider || resource.id.resource_type != to.resource_type {
             continue;
         }
-        if resource.id.name_str() == to.name_str() {
+        if resource.id.identity_or_empty() == to.name_str() {
             return Some(resource);
         }
         if fallback.is_none()

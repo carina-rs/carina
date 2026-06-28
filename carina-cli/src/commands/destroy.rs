@@ -378,11 +378,11 @@ async fn run_destroy_locked(
         let left_key = left
             .binding
             .as_deref()
-            .unwrap_or_else(|| left.id.name_str());
+            .unwrap_or_else(|| left.id.identity_or_empty());
         let right_key = right
             .binding
             .as_deref()
-            .unwrap_or_else(|| right.id.name_str());
+            .unwrap_or_else(|| right.id.identity_or_empty());
         left_key.cmp(right_key)
     });
 
@@ -422,7 +422,7 @@ async fn run_destroy_locked(
             resource
                 .binding
                 .clone()
-                .unwrap_or_else(|| resource.id.name_str().to_string())
+                .unwrap_or_else(|| resource.id.identity_or_empty().to_string())
         })
         .collect();
     let display_order = topological_delete_order(
@@ -591,7 +591,11 @@ async fn run_destroy_locked(
                 _ => unreachable!("destroy resource_info only contains delete effects"),
             };
             let binding = resource.binding.clone().unwrap_or_else(|| {
-                format!("{}:{}", resource.id.resource_type, resource.id.name_str())
+                format!(
+                    "{}:{}",
+                    resource.id.resource_type,
+                    resource.id.identity_or_empty()
+                )
             });
             (binding, identifier, effect.clone())
         })
@@ -1147,7 +1151,7 @@ fn build_destroy_wait_aliases(
                     resource
                         .binding
                         .clone()
-                        .unwrap_or_else(|| resource.id.name_str().to_string())
+                        .unwrap_or_else(|| resource.id.identity_or_empty().to_string())
                 })
                 .collect::<Vec<_>>();
 
@@ -1643,7 +1647,9 @@ mod tests {
             .exports
             .insert("vpc_id".to_string(), serde_json::json!("vpc-12345"));
 
-        let destroyed = vec![ResourceId::with_provider("awscc", "ec2.Vpc", "main", None)];
+        let destroyed = vec![ResourceId::with_provider_identity(
+            "awscc", "ec2.Vpc", "main", None,
+        )];
         apply_destroy_to_state(&mut state, &destroyed);
 
         assert!(state.resources.is_empty(), "resource should be removed");
@@ -1652,7 +1658,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_deletion_succeeds_when_resource_disappears() {
-        let id = ResourceId::new("s3.Bucket", "test");
+        let id = ResourceId::with_identity("s3.Bucket", "test");
         let provider = SequenceProvider::new(vec![Ok(State::not_found(id.clone()))]);
 
         let result = wait_for_deletion(
@@ -1669,7 +1675,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_deletion_returns_read_error_on_provider_error() {
-        let id = ResourceId::new("s3.Bucket", "test");
+        let id = ResourceId::with_identity("s3.Bucket", "test");
         let provider = SequenceProvider::new(vec![Err(ProviderError::api_error("auth expired"))]);
 
         let result = wait_for_deletion(
@@ -1697,7 +1703,7 @@ mod tests {
         // Previously, Err(_) from provider.read() was treated as successful
         // deletion, causing live infrastructure to be orphaned while the user
         // was told it was destroyed.
-        let id = ResourceId::new("s3.Bucket", "test");
+        let id = ResourceId::with_identity("s3.Bucket", "test");
         let provider = SequenceProvider::new(vec![Err(ProviderError::timeout("network timeout"))]);
 
         let result = wait_for_deletion(
@@ -1715,7 +1721,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_deletion_times_out_when_resource_keeps_existing() {
-        let id = ResourceId::new("s3.Bucket", "test");
+        let id = ResourceId::with_identity("s3.Bucket", "test");
         let existing_state = State::existing(id.clone(), HashMap::new());
         let provider = SequenceProvider::new(vec![
             Ok(existing_state.clone()),
@@ -1738,7 +1744,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_deletion_succeeds_after_transient_exists() {
         // Resource exists on first poll, then disappears on second.
-        let id = ResourceId::new("s3.Bucket", "test");
+        let id = ResourceId::with_identity("s3.Bucket", "test");
         let existing_state = State::existing(id.clone(), HashMap::new());
         let provider =
             SequenceProvider::new(vec![Ok(existing_state), Ok(State::not_found(id.clone()))]);

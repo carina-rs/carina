@@ -496,18 +496,18 @@ pub fn create_plan(
             .or_else(|| {
                 managed
                     .iter()
-                    .find(|r| r.id.name.as_str() == wb.target)
+                    .find(|r| r.id.identity_str() == Some(wb.target.as_str()))
                     .map(|r| r.id.clone())
             })
             .or_else(|| {
                 data_sources
                     .iter()
-                    .find(|r| r.id.name.as_str() == wb.target)
+                    .find(|r| r.id.identity_str() == Some(wb.target.as_str()))
                     .map(|r| r.id.clone())
             });
         let Some(target_id_resolved) = resolved else {
             plan.add_error(PlanError {
-                resource_id: ResourceId::new("__wait", wb.binding.as_str()),
+                resource_id: ResourceId::with_identity("__wait", wb.binding.as_str()),
                 message: format!(
                     "wait `{}`: target binding `{}` is not a known resource",
                     wb.binding, wb.target
@@ -683,10 +683,13 @@ pub fn cascade_dependent_updates(
     // (without _binding) are also found.
     let mut binding_to_unresolved: HashMap<String, &Resource> = HashMap::new();
     for resource in unresolved_managed {
-        let key = resource
-            .binding
-            .clone()
-            .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name_str()));
+        let key = resource.binding.clone().unwrap_or_else(|| {
+            format!(
+                "{}:{}",
+                resource.id.resource_type,
+                resource.id.identity_or_empty()
+            )
+        });
         binding_to_unresolved.insert(key, resource);
     }
 
@@ -762,7 +765,11 @@ pub fn cascade_dependent_updates(
         for dep in &deps {
             if replaced_bindings.contains(dep) {
                 let binding = resource.binding.clone().unwrap_or_else(|| {
-                    format!("{}:{}", resource.id.resource_type, resource.id.name_str())
+                    format!(
+                        "{}:{}",
+                        resource.id.resource_type,
+                        resource.id.identity_or_empty()
+                    )
                 });
                 dependents_of_replaced
                     .entry(dep.clone())

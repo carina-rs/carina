@@ -99,7 +99,7 @@ mod tests {
 
     #[test]
     fn primary_returns_first_watched_attr_present_in_last_attrs() {
-        let target_id = ResourceId::new("aws.test.Resource", "demo");
+        let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
         let status = AttrPath::single("status");
         let predicate = equals_predicate(status.clone(), "pending");
         let last_attrs = HashMap::from([
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn primary_walks_multi_segment_path() {
-        let target_id = ResourceId::new("aws.test.Resource", "demo");
+        let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
         let renewal_status =
             AttrPath::try_new(vec!["renewal_summary".into(), "renewal_status".into()]).unwrap();
         let predicate = equals_predicate(renewal_status.clone(), "PENDING");
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn primary_returns_none_when_no_watched_attr_present() {
-        let target_id = ResourceId::new("aws.test.Resource", "demo");
+        let target_id = ResourceId::with_identity("aws.test.Resource", "demo");
         let xyz = AttrPath::single("xyz");
         let predicate = equals_predicate(xyz, "present");
         let last_attrs = HashMap::from([("arn".to_string(), string_value("arn:demo"))]);

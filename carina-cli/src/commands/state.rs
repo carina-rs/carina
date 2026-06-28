@@ -790,7 +790,7 @@ async fn run_state_bucket_delete(
     // Delete the bucket resource (identifier is the bucket name)
     // Backend bucket is provider-default; named-instance routing is
     // a DSL concern that doesn't apply to the implicit state bucket.
-    let bucket_id = ResourceId::with_provider(
+    let bucket_id = ResourceId::with_provider_identity(
         backend_provider_name,
         backend_resource_type,
         bucket_name,
@@ -991,8 +991,11 @@ pub(crate) async fn run_state_refresh_locked(
             sorted_resources
                 .iter()
                 .filter_map(|r| {
-                    let rs =
-                        sf.find_resource(&r.id.provider, &r.id.resource_type, r.id.name_str())?;
+                    let rs = sf.find_resource(
+                        &r.id.provider,
+                        &r.id.resource_type,
+                        r.id.identity_or_empty(),
+                    )?;
                     if rs.dependency_bindings.is_empty() {
                         None
                     } else {
@@ -1039,7 +1042,7 @@ pub(crate) async fn run_state_refresh_locked(
             sf.resources
                 .iter()
                 .filter_map(|rs| {
-                    let id = ResourceId::with_provider(
+                    let id = ResourceId::with_provider_name_compat(
                         &rs.provider,
                         &rs.resource_type,
                         &rs.name,
@@ -1304,7 +1307,7 @@ fn diff_display_update_resource(
     updated_count: &mut u32,
     unchanged_count: &mut u32,
 ) -> Result<(), AppError> {
-    let existing = state.find_resource(&id.provider, &id.resource_type, id.name_str());
+    let existing = state.find_resource(&id.provider, &id.resource_type, id.identity_or_empty());
     let existing_rs = match existing {
         Some(rs) => rs,
         None => return Ok(()),
@@ -1376,7 +1379,7 @@ fn diff_display_update_resource(
         println!(
             "  {} \"{}\"{}:",
             id.display_type().cyan(),
-            id.name,
+            id.identity_or_empty(),
             label_suffix,
         );
         for change in &changes {
@@ -1396,17 +1399,18 @@ fn diff_display_update_resource(
                 owned_resource = Resource::with_provider(
                     &id.provider,
                     &id.resource_type,
-                    id.name_str(),
+                    id.identity_or_empty(),
                     id.provider_instance.clone(),
                 );
                 &owned_resource
             }
         };
-        let existing_rs = state.find_resource(&id.provider, &id.resource_type, id.name_str());
+        let existing_rs =
+            state.find_resource(&id.provider, &id.resource_type, id.identity_or_empty());
         let resource_state = ResourceState::from_provider_state(res, fresh_state, existing_rs)?;
         state.upsert_resource(resource_state);
     } else {
-        state.remove_resource(&id.provider, &id.resource_type, id.name_str());
+        state.remove_resource(&id.provider, &id.resource_type, id.identity_or_empty());
     }
 
     Ok(())

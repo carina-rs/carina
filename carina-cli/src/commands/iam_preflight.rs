@@ -822,12 +822,12 @@ mod tests {
         let mut plan = Plan::new();
         let read = DataSource::with_provider("awscc", "identity.User", "me", None);
         let create = Resource::with_provider("awscc", "ec2.Vpc", "new", None);
-        let update_id = ResourceId::with_provider("awscc", "ec2.Subnet", "old", None);
+        let update_id = ResourceId::with_provider_identity("awscc", "ec2.Subnet", "old", None);
         let update_to = Resource::with_provider("awscc", "ec2.Subnet", "old", None);
-        let replace_id = ResourceId::with_provider("awscc", "s3.Bucket", "old", None);
+        let replace_id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "old", None);
         let replace_to = Resource::with_provider("awscc", "s3.Bucket", "new", None);
-        let delete_id = ResourceId::with_provider("awscc", "iam.Role", "old", None);
-        let import_id = ResourceId::with_provider("awscc", "logs.Group", "existing", None);
+        let delete_id = ResourceId::with_provider_identity("awscc", "iam.Role", "old", None);
+        let import_id = ResourceId::with_provider_identity("awscc", "logs.Group", "existing", None);
 
         plan.add(Effect::Read { resource: read });
         plan.add(Effect::Create(create));
@@ -860,11 +860,11 @@ mod tests {
             identifier: Value::Concrete(ConcreteValue::String("group".to_string())),
         });
         plan.add(Effect::Remove {
-            id: ResourceId::with_provider("awscc", "skip.Remove", "x", None),
+            id: ResourceId::with_provider_identity("awscc", "skip.Remove", "x", None),
         });
         plan.add(Effect::Move {
-            from: ResourceId::with_provider("awscc", "skip.Move", "x", None),
-            to: ResourceId::with_provider("awscc", "skip.Move", "y", None),
+            from: ResourceId::with_provider_identity("awscc", "skip.Move", "x", None),
+            to: ResourceId::with_provider_identity("awscc", "skip.Move", "y", None),
         });
 
         let entries = collect_required_actions(&plan, &PermissionProvider);
@@ -890,7 +890,7 @@ mod tests {
             Resource::with_provider("aws", "route53.RecordSet", "validation_records", None);
         let mut plan = Plan::new();
         plan.add(Effect::DeferredCreate {
-            id: ResourceId::new("__deferred_for", "validation_records"),
+            id: ResourceId::with_identity("__deferred_for", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(DeferredForExpression {
                 file: None,

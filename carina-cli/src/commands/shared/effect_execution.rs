@@ -217,7 +217,7 @@ mod tests {
     /// gates that path.
     #[tokio::test]
     async fn execute_import_effects_rejects_deferred_identifier_without_calling_provider() {
-        let id = ResourceId::new("aws.route53.RecordSet", "r");
+        let id = ResourceId::with_identity("aws.route53.RecordSet", "r");
         let deferred = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
                 UnknownReason::UpstreamBareRef {
@@ -256,7 +256,7 @@ mod tests {
     /// would block the happy path.
     #[tokio::test]
     async fn execute_import_effects_passes_concrete_identifier_through() {
-        let id = ResourceId::new("aws.s3.Bucket", "b");
+        let id = ResourceId::with_identity("aws.s3.Bucket", "b");
         let mut plan = Plan::new();
         plan.add(Effect::Import {
             id: id.clone(),
@@ -281,7 +281,8 @@ mod tests {
     #[test]
     fn remove_effect_line_has_no_failure_shaped_glyph() {
         colored::control::set_override(true);
-        let id = ResourceId::new("aws.route53.RecordSet", "aws_route53_record_set_7059de08");
+        let id =
+            ResourceId::with_identity("aws.route53.RecordSet", "aws_route53_record_set_7059de08");
         let line = format_state_only_effect_line(&Effect::Remove { id: id.clone() })
             .expect("Remove must render a line");
         colored::control::unset_override();
@@ -316,8 +317,8 @@ mod tests {
     #[test]
     fn move_effect_line_format_is_unchanged() {
         colored::control::set_override(false);
-        let from = ResourceId::new("aws.s3.Bucket", "old");
-        let to = ResourceId::new("aws.s3.Bucket", "new");
+        let from = ResourceId::with_identity("aws.s3.Bucket", "old");
+        let to = ResourceId::with_identity("aws.s3.Bucket", "new");
         let line = format_state_only_effect_line(&Effect::Move {
             from: from.clone(),
             to: to.clone(),

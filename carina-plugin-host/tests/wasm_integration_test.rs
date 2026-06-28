@@ -93,7 +93,7 @@ async fn test_wasm_mock_provider_create_and_read() {
     assert_eq!(provider.name(), "mock");
 
     // Read before create - should return a state with no identifier and empty attributes
-    let id = ResourceId::with_provider("mock", "test.resource", "my-resource", None);
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "my-resource", None);
     let state = provider
         .read(&id, None, ReadRequest)
         .await
@@ -172,7 +172,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
         .await
         .expect("provider should init");
 
-    let id = ResourceId::with_provider("mock", "test.resource", "updatable", None);
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "updatable", None);
 
     // Create first
     let mut resource = Resource::with_provider("mock", "test.resource", "updatable", None);
@@ -304,7 +304,7 @@ async fn test_wasm_mock_provider_normalizer() {
     assert_eq!(resources[0].resolved_attributes(), original_attrs);
 
     // normalize_state: mock provider returns states unchanged
-    let id = ResourceId::with_provider("mock", "test.resource", "norm-test", None);
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "norm-test", None);
     let attrs = HashMap::from([(
         "key".into(),
         Value::Concrete(ConcreteValue::String("value".into())),
@@ -421,9 +421,9 @@ async fn test_wasm_mock_provider_merge_default_tags_preserves_order() {
         .merge_default_tags(&mut resources, &default_tags, &registry)
         .await;
 
-    assert_eq!(resources[0].id.name.as_str(), "alpha");
-    assert_eq!(resources[1].id.name.as_str(), "beta");
-    assert_eq!(resources[2].id.name.as_str(), "gamma");
+    assert_eq!(resources[0].id.identity_or_empty(), "alpha");
+    assert_eq!(resources[1].id.identity_or_empty(), "beta");
+    assert_eq!(resources[2].id.identity_or_empty(), "gamma");
     for r in &resources {
         assert!(
             r.get_attr("__mock_merged_default_tags__").is_some(),
@@ -494,7 +494,7 @@ async fn test_wasm_mock_provider_required_permissions_dispatches_through_wit() {
         .create_provider(None, &indexmap::IndexMap::new())
         .await
         .expect("provider should init");
-    let id = ResourceId::with_provider("mock", "test.resource", "example", None);
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "example", None);
 
     assert_eq!(
         provider.required_permissions(&id, PlanOp::Create),

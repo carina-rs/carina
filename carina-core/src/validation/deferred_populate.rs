@@ -381,12 +381,12 @@ mod tests {
     /// that references the deferred field.
     fn parsed_with_unsynchronized_chained_ref() -> ParsedFile {
         let mut cert = Resource::new("acm.Certificate", "cert");
-        cert.id = ResourceId::new("acm.Certificate", "cert");
+        cert.id = ResourceId::with_identity("acm.Certificate", "cert");
         cert.id.provider = "aws".to_string();
         cert.binding = Some("cert".to_string());
 
         let mut record = Resource::new("route53.RecordSet", "record");
-        record.id = ResourceId::new("route53.RecordSet", "record");
+        record.id = ResourceId::with_identity("route53.RecordSet", "record");
         record.id.provider = "aws".to_string();
         record.binding = Some("record".to_string());
         record.set_attr(
@@ -450,13 +450,13 @@ mod tests {
     #[test]
     fn chained_ref_to_non_deferred_inner_field_is_not_flagged() {
         let mut record = Resource::new("route53.RecordSet", "record");
-        record.id = ResourceId::new("route53.RecordSet", "record");
+        record.id = ResourceId::with_identity("route53.RecordSet", "record");
         record.id.provider = "aws".to_string();
         record.binding = Some("record".to_string());
         record.set_attr("name", dvo_chained_ref("domain_name"));
 
         let mut cert = Resource::new("acm.Certificate", "cert");
-        cert.id = ResourceId::new("acm.Certificate", "cert");
+        cert.id = ResourceId::with_identity("acm.Certificate", "cert");
         cert.id.provider = "aws".to_string();
         cert.binding = Some("cert".to_string());
 
@@ -473,7 +473,7 @@ mod tests {
         // A typo in the binding name produces an undefined-identifier
         // error elsewhere; this pass must not pile on.
         let mut record = Resource::new("route53.RecordSet", "record");
-        record.id = ResourceId::new("route53.RecordSet", "record");
+        record.id = ResourceId::with_identity("route53.RecordSet", "record");
         record.id.provider = "aws".to_string();
         record.binding = Some("record".to_string());
         let path = AccessPath::with_segments(
@@ -524,12 +524,12 @@ mod tests {
         r.insert("aws", consumer);
 
         let mut db = Resource::new("rds.DBInstance", "db");
-        db.id = ResourceId::new("rds.DBInstance", "db");
+        db.id = ResourceId::with_identity("rds.DBInstance", "db");
         db.id.provider = "aws".to_string();
         db.binding = Some("db".to_string());
 
         let mut inst = Resource::new("ec2.Instance", "i");
-        inst.id = ResourceId::new("ec2.Instance", "i");
+        inst.id = ResourceId::with_identity("ec2.Instance", "i");
         inst.id.provider = "aws".to_string();
         inst.binding = Some("i".to_string());
         let path = AccessPath::with_segments(
@@ -558,7 +558,7 @@ mod tests {
         // Resource type not in the registry — pass should bail
         // silently. Other passes report unknown resource types.
         let mut record = Resource::new("unknown.thing", "x");
-        record.id = ResourceId::new("unknown.thing", "x");
+        record.id = ResourceId::with_identity("unknown.thing", "x");
         record.id.provider = "aws".to_string();
         record.binding = Some("x".to_string());
         record.set_attr(

@@ -288,7 +288,7 @@ fn plan_file_serde_round_trip() {
         ),
     ));
     plan.add(Effect::Delete {
-        id: ResourceId::with_provider("aws", "s3.Bucket", "old-bucket", None),
+        id: ResourceId::with_provider_identity("aws", "s3.Bucket", "old-bucket", None),
         identifier: "old-bucket".to_string(),
         directives: Directives::default(),
         binding: None,
@@ -304,8 +304,8 @@ fn plan_file_serde_round_trip() {
     ];
 
     let current_states = vec![CurrentStateEntry {
-        id: ResourceId::with_provider("aws", "s3.Bucket", "my-bucket", None),
-        state: State::not_found(ResourceId::with_provider(
+        id: ResourceId::with_provider_identity("aws", "s3.Bucket", "my-bucket", None),
+        state: State::not_found(ResourceId::with_provider_identity(
             "aws",
             "s3.Bucket",
             "my-bucket",
@@ -658,12 +658,12 @@ fn test_anonymous_id_different_regions_produce_different_identifiers() {
     compute_anonymous_identifiers(&mut resources_west, &providers_west).unwrap();
 
     // Both should have identifiers assigned
-    assert!(!resources_east[0].id.name_str().is_empty());
-    assert!(!resources_west[0].id.name_str().is_empty());
+    assert!(!resources_east[0].id.identity_or_empty().is_empty());
+    assert!(!resources_west[0].id.identity_or_empty().is_empty());
     // They must be different because providers have different regions
     assert_ne!(
-        resources_east[0].id.name_str(),
-        resources_west[0].id.name_str()
+        resources_east[0].id.identity_or_empty(),
+        resources_west[0].id.identity_or_empty()
     );
 }
 
@@ -710,9 +710,12 @@ fn test_anonymous_id_different_create_only_same_region_no_collision() {
     let mut resources = vec![r1, r2];
     compute_anonymous_identifiers(&mut resources, &providers).unwrap();
 
-    assert!(!resources[0].id.name_str().is_empty());
-    assert!(!resources[1].id.name_str().is_empty());
-    assert_ne!(resources[0].id.name_str(), resources[1].id.name_str());
+    assert!(!resources[0].id.identity_or_empty().is_empty());
+    assert!(!resources[1].id.identity_or_empty().is_empty());
+    assert_ne!(
+        resources[0].id.identity_or_empty(),
+        resources[1].id.identity_or_empty()
+    );
 }
 
 #[test]
@@ -729,7 +732,7 @@ fn test_anonymous_id_named_resources_are_skipped() {
     compute_anonymous_identifiers(&mut resources, &providers).unwrap();
 
     // Name should remain unchanged
-    assert_eq!(resources[0].id.name_str(), "my_vpc");
+    assert_eq!(resources[0].id.identity_or_empty(), "my_vpc");
 }
 
 #[test]
@@ -874,7 +877,11 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
 
     // 3. compute_anonymous_identifiers
     compute_anonymous_identifiers(&mut resources_run1, &providers).unwrap();
-    let run1_name = resources_run1[0].id.name_str().to_string();
+    let run1_name = resources_run1[0]
+        .id
+        .identity_str()
+        .unwrap_or("")
+        .to_string();
     assert!(
         !run1_name.is_empty(),
         "Anonymous identifier should be assigned"
@@ -914,7 +921,11 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
 
     // 3. compute_anonymous_identifiers - should produce SAME identifier
     compute_anonymous_identifiers(&mut resources_run2, &providers).unwrap();
-    let run2_name = resources_run2[0].id.name_str().to_string();
+    let run2_name = resources_run2[0]
+        .id
+        .identity_str()
+        .unwrap_or("")
+        .to_string();
 
     assert_eq!(
         run1_name, run2_name,
@@ -976,7 +987,11 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     let mut resources_run1 = vec![resource_run1];
     resolve_names(&mut resources_run1).unwrap();
     compute_anonymous_identifiers(&mut resources_run1, &providers).unwrap();
-    let run1_name = resources_run1[0].id.name_str().to_string();
+    let run1_name = resources_run1[0]
+        .id
+        .identity_str()
+        .unwrap_or("")
+        .to_string();
 
     // Simulate state after apply
     let run1_role_name = match resources_run1[0].get_attr("role_name") {
@@ -1034,7 +1049,11 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     let mut resources_run2 = vec![resource_run2];
     resolve_names(&mut resources_run2).unwrap();
     compute_anonymous_identifiers(&mut resources_run2, &providers).unwrap();
-    let run2_name = resources_run2[0].id.name_str().to_string();
+    let run2_name = resources_run2[0]
+        .id
+        .identity_str()
+        .unwrap_or("")
+        .to_string();
 
     assert_eq!(
         run1_name, run2_name,
@@ -1103,7 +1122,11 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
 
     let mut resources_run1 = vec![resource_run1];
     compute_anonymous_identifiers(&mut resources_run1, &providers).unwrap();
-    let run1_name = resources_run1[0].id.name_str().to_string();
+    let run1_name = resources_run1[0]
+        .id
+        .identity_str()
+        .unwrap_or("")
+        .to_string();
 
     // Simulate state after apply
     let applied_state = State::existing(resources_run1[0].id.clone(), HashMap::new())
@@ -1160,7 +1183,11 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
 
     let mut resources_run2 = vec![resource_run2];
     compute_anonymous_identifiers(&mut resources_run2, &providers).unwrap();
-    let run2_name = resources_run2[0].id.name_str().to_string();
+    let run2_name = resources_run2[0]
+        .id
+        .identity_str()
+        .unwrap_or("")
+        .to_string();
 
     assert_eq!(
         run1_name, run2_name,
@@ -1346,7 +1373,7 @@ fn orphaned_state_resource_produces_delete_effect() {
 
     match &delete_effects[0] {
         Effect::Delete { id, identifier, .. } => {
-            assert_eq!(id.name_str(), "removed-bucket");
+            assert_eq!(id.identity_or_empty(), "removed-bucket");
             assert_eq!(identifier, "removed-bucket");
         }
         _ => unreachable!(),
@@ -1699,7 +1726,7 @@ impl Provider for RecordingProvider {
         let mut to = Resource::with_provider(
             &id.provider,
             &id.resource_type,
-            id.name_str(),
+            id.identity_or_empty(),
             id.provider_instance.clone(),
         );
         for (k, v) in &attrs {
@@ -1796,7 +1823,7 @@ impl Provider for RenameFailProvider {
 async fn rename_failure_in_create_before_destroy_counts_as_failure() {
     use carina_core::effect::TemporaryName;
 
-    let id = ResourceId::with_provider("awscc", "s3.Bucket", "my-bucket", None);
+    let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "my-bucket", None);
 
     let old_state = State::existing(
         id.clone(),
@@ -1888,8 +1915,8 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
 /// should reference the new (post-replacement) resource ID, not the old one.
 #[tokio::test]
 async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
-    let vpc_id = ResourceId::new("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::new("ec2.Subnet", "my-subnet");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
+    let subnet_id = ResourceId::with_identity("ec2.Subnet", "my-subnet");
 
     // --- Unresolved resources (before ref resolution) ---
     let vpc_unresolved = Resource::new("ec2.Vpc", "my-vpc")
@@ -2415,7 +2442,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
     }
 
     // Verify state was loaded from state file
-    let id = ResourceId::with_provider("awscc", "s3.Bucket", "my-bucket", None);
+    let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "my-bucket", None);
     let cached_state = current_states.get(&id).unwrap();
     assert!(cached_state.exists, "State should exist from state file");
     assert_eq!(
@@ -2909,7 +2936,7 @@ fn plan_file_serialization_redacts_secrets() {
     );
     state_attrs.insert("master_password".to_string(), secret_password.clone());
     let state_with_secret = State::existing(
-        ResourceId::with_provider("awscc", "rds.db_instance", "my-db", None),
+        ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None),
         state_attrs,
     );
 
@@ -2929,7 +2956,7 @@ fn plan_file_serialization_redacts_secrets() {
         compositions: vec![],
         data_sources: vec![],
         current_states: vec![CurrentStateEntry {
-            id: ResourceId::with_provider("awscc", "rds.db_instance", "my-db", None),
+            id: ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None),
             state: redact_secrets_in_state(&state_with_secret).unwrap(),
         }],
         upstream_snapshot: HashMap::new(),

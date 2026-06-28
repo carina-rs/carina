@@ -152,7 +152,10 @@ fn type_aware_diff_no_change_with_schema() {
         "port".to_string(),
         Value::Concrete(ConcreteValue::Float(443.0)),
     );
-    let current = State::existing(ResourceId::new("test.resource", "test"), current_attrs);
+    let current = State::existing(
+        ResourceId::with_identity("test.resource", "test"),
+        current_attrs,
+    );
 
     // Without schema: detects a change (Int != Float)
     let result = diff(&desired, &current, None, None, None);
@@ -1011,10 +1014,10 @@ fn secret_with_context_no_change_when_hash_matches() {
     use crate::resource::{ConcreteValue, DeferredValue, ResourceId};
     use crate::value::{SecretHashContext, value_to_json_with_context};
 
-    let resource_id = ResourceId::with_provider("awscc", "rds.db_instance", "my-db", None);
+    let resource_id = ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None);
     let ctx = SecretHashContext::new(
         resource_id.display_type(),
-        resource_id.name_str(),
+        resource_id.identity_or_empty(),
         "master_password",
     );
 
@@ -1045,10 +1048,10 @@ fn secret_with_context_detects_change() {
     use crate::resource::ResourceId;
     use crate::value::{SecretHashContext, value_to_json_with_context};
 
-    let resource_id = ResourceId::with_provider("awscc", "rds.db_instance", "my-db", None);
+    let resource_id = ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None);
     let ctx = SecretHashContext::new(
         resource_id.display_type(),
-        resource_id.name_str(),
+        resource_id.identity_or_empty(),
         "master_password",
     );
 
@@ -1096,7 +1099,7 @@ fn secret_same_password_different_resources_produces_different_hashes() {
     );
 
     // Each hash should match its own context
-    let id1 = ResourceId::with_provider("awscc", "rds.db_instance", "db-1", None);
+    let id1 = ResourceId::with_provider_identity("awscc", "rds.db_instance", "db-1", None);
     let desired1 = HashMap::from([("master_password".to_string(), secret.clone())]);
     let current1 = HashMap::from([(
         "master_password".to_string(),
@@ -1109,7 +1112,7 @@ fn secret_same_password_different_resources_produces_different_hashes() {
     );
 
     // But not the other resource's context
-    let id2 = ResourceId::with_provider("awscc", "rds.db_instance", "db-2", None);
+    let id2 = ResourceId::with_provider_identity("awscc", "rds.db_instance", "db-2", None);
     let desired2 = HashMap::from([("master_password".to_string(), secret)]);
     let current2 = HashMap::from([(
         "master_password".to_string(),
@@ -1182,7 +1185,8 @@ fn secret_in_map_with_refresh_no_false_diff() {
     use crate::resource::ResourceId;
     use crate::schema::{AttributeSchema, ResourceSchema};
 
-    let resource_id = ResourceId::with_provider("awscc", "ec2.Vpc", "ec2_vpc_fb75c929", None);
+    let resource_id =
+        ResourceId::with_provider_identity("awscc", "ec2.Vpc", "ec2_vpc_fb75c929", None);
 
     // Desired: tags map with a secret value (as written in .crn)
     let desired_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
@@ -1383,7 +1387,7 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
         "principal".to_string(),
         Value::Concrete(ConcreteValue::Map(state_inner)),
     );
-    let mut id = ResourceId::new("iam.policy", "p1");
+    let mut id = ResourceId::with_identity("iam.policy", "p1");
     id.provider = "aws".to_string();
     let mut states = std::collections::HashMap::new();
     let st = State::existing(id, state_attrs);
@@ -1637,7 +1641,7 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
         "distribution_config".to_string(),
         Value::Concrete(ConcreteValue::Map(state_dc)),
     );
-    let mut id = ResourceId::new("cloudfront.Distribution", "d1");
+    let mut id = ResourceId::with_identity("cloudfront.Distribution", "d1");
     id.provider = "awscc".to_string();
     let mut states = std::collections::HashMap::new();
     let st = State::existing(id, state_attrs);
@@ -1759,7 +1763,7 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
 
     let mut state_attrs = HashMap::new();
     state_attrs.insert("distribution_config".to_string(), dcb("head", "get"));
-    let mut id = ResourceId::new("cloudfront.Distribution", "d1");
+    let mut id = ResourceId::with_identity("cloudfront.Distribution", "d1");
     id.provider = "awscc".to_string();
     let mut states = std::collections::HashMap::new();
     let st = State::existing(id, state_attrs);

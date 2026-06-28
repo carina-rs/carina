@@ -385,7 +385,7 @@ let route = awscc.ec2.route {
     let route = parsed
         .resources
         .iter()
-        .find(|r| r.id.name_str() == "route")
+        .find(|r| r.id.identity_or_empty() == "route")
         .unwrap();
     let gateway_id = route.get_attr("gateway_id").unwrap();
     match gateway_id {

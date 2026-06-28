@@ -175,7 +175,7 @@ fn parse_resource_with_namespaced_type() {
 
     let resource = &result.resources[0];
     assert_eq!(resource.id.resource_type, "s3_bucket");
-    assert_eq!(resource.id.name_str(), "my_bucket"); // binding name becomes the resource ID
+    assert_eq!(resource.id.identity_or_empty(), "my_bucket"); // binding name becomes the resource ID
     assert_eq!(
         resource.get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -204,8 +204,8 @@ fn parse_multiple_resources() {
 
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.resources.len(), 2);
-    assert_eq!(result.resources[0].id.name_str(), "logs"); // binding name becomes the resource ID
-    assert_eq!(result.resources[1].id.name_str(), "data");
+    assert_eq!(result.resources[0].id.identity_or_empty(), "logs"); // binding name becomes the resource ID
+    assert_eq!(result.resources[1].id.identity_or_empty(), "data");
 }
 
 #[test]
@@ -319,7 +319,7 @@ fn parse_anonymous_resource() {
 
     let resource = &result.resources[0];
     assert_eq!(resource.id.resource_type, "s3_bucket");
-    assert_eq!(resource.id.name_str(), ""); // anonymous resources get empty name (computed later)
+    assert_eq!(resource.id.identity_or_empty(), ""); // anonymous resources get empty name (computed later)
 }
 
 #[test]
@@ -338,8 +338,8 @@ fn parse_mixed_resources() {
 
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.resources.len(), 2);
-    assert_eq!(result.resources[0].id.name_str(), ""); // anonymous gets empty name
-    assert_eq!(result.resources[1].id.name_str(), "named"); // binding name becomes the resource ID
+    assert_eq!(result.resources[0].id.identity_or_empty(), ""); // anonymous gets empty name
+    assert_eq!(result.resources[1].id.identity_or_empty(), "named"); // binding name becomes the resource ID
 }
 
 #[test]
@@ -353,7 +353,7 @@ fn parse_anonymous_resource_without_name_succeeds() {
     let result = parse(input, &ProviderContext::default());
     assert!(result.is_ok());
     let parsed = result.unwrap();
-    assert_eq!(parsed.resources[0].id.name_str(), ""); // empty name, computed later
+    assert_eq!(parsed.resources[0].id.identity_or_empty(), ""); // empty name, computed later
 }
 
 #[test]
@@ -1318,7 +1318,7 @@ fn parse_read_resource_expr() {
 
     let data_source = &result.data_sources[0];
     assert_eq!(data_source.id.resource_type, "s3_bucket");
-    assert_eq!(data_source.id.name_str(), "existing"); // binding name becomes the resource ID
+    assert_eq!(data_source.id.identity_or_empty(), "existing"); // binding name becomes the resource ID
 }
 
 #[test]
@@ -1352,7 +1352,7 @@ fn parse_read_resource_without_name_uses_binding() {
     assert!(result.is_ok());
     let parsed = result.unwrap();
     // carina#3181 PR C: `read` resources live in the `data_sources` slice.
-    assert_eq!(parsed.data_sources[0].id.name_str(), "existing"); // binding name
+    assert_eq!(parsed.data_sources[0].id.identity_or_empty(), "existing"); // binding name
 }
 
 #[test]
@@ -1374,10 +1374,13 @@ fn parse_read_with_regular_resources() {
     // carina#3181 PR C: the data source and the managed resource land
     // in separate typed slices.
     assert_eq!(result.data_sources.len(), 1);
-    assert_eq!(result.data_sources[0].id.name_str(), "existing_bucket"); // binding name
+    assert_eq!(
+        result.data_sources[0].id.identity_or_empty(),
+        "existing_bucket"
+    ); // binding name
 
     assert_eq!(result.resources.len(), 1);
-    assert_eq!(result.resources[0].id.name_str(), "new_bucket"); // binding name
+    assert_eq!(result.resources[0].id.identity_or_empty(), "new_bucket"); // binding name
 }
 
 #[test]
@@ -1446,7 +1449,7 @@ fn anonymous_resource_no_spurious_name_attribute() {
     assert_eq!(result.resources.len(), 1);
 
     let resource = &result.resources[0];
-    assert_eq!(resource.id.name_str(), ""); // anonymous → empty name
+    assert_eq!(resource.id.identity_or_empty(), ""); // anonymous → empty name
     // "name" must NOT appear in attributes unless the user explicitly wrote it
     assert!(
         !resource.attributes.contains_key("name"),
@@ -1469,7 +1472,7 @@ fn let_bound_resource_no_spurious_name_attribute() {
     assert_eq!(result.resources.len(), 1);
 
     let resource = &result.resources[0];
-    assert_eq!(resource.id.name_str(), "vpc"); // binding name → resource name
+    assert_eq!(resource.id.identity_or_empty(), "vpc"); // binding name → resource name
     // "name" must NOT appear in attributes (it's only the id.name, not an attribute)
     assert!(
         !resource.attributes.contains_key("name"),
@@ -3510,8 +3513,8 @@ fn parse_for_expression_over_list() {
     assert_eq!(result.resources.len(), 2);
 
     // Resources should be addressed as subnets[0] and subnets[1]
-    assert_eq!(result.resources[0].id.name_str(), "subnets[0]");
-    assert_eq!(result.resources[1].id.name_str(), "subnets[1]");
+    assert_eq!(result.resources[0].id.identity_or_empty(), "subnets[0]");
+    assert_eq!(result.resources[1].id.identity_or_empty(), "subnets[1]");
 
     // Each resource should have the loop variable substituted
     assert_eq!(
@@ -3542,8 +3545,8 @@ fn parse_for_expression_with_index() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.resources.len(), 2);
 
-    assert_eq!(result.resources[0].id.name_str(), "subnets[0]");
-    assert_eq!(result.resources[1].id.name_str(), "subnets[1]");
+    assert_eq!(result.resources[0].id.identity_or_empty(), "subnets[0]");
+    assert_eq!(result.resources[1].id.identity_or_empty(), "subnets[1]");
 
     // Check index variable is substituted
     if let Some(Value::Deferred(DeferredValue::FunctionCall { args, .. })) =
@@ -3586,7 +3589,7 @@ fn parse_for_expression_over_map() {
     let names: Vec<&str> = result
         .resources
         .iter()
-        .map(|r| r.id.name.as_str())
+        .map(|r| r.id.identity_or_empty())
         .collect();
     assert!(names.contains(&"networks.prod"));
     assert!(names.contains(&"networks.staging"));
@@ -4292,7 +4295,11 @@ fn for_expression_over_map_uses_canonical_dot_form() {
         }
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
-    let names: Vec<&str> = result.resources.iter().map(|r| r.id.name_str()).collect();
+    let names: Vec<&str> = result
+        .resources
+        .iter()
+        .map(|r| r.id.identity_or_empty())
+        .collect();
     assert_eq!(names, vec!["resources.dev", "resources.prod"]);
 }
 
@@ -4314,8 +4321,8 @@ fn parse_for_expression_with_keys_function_call() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     // keys({Name = "web", Env = "prod"}) should evaluate to ["Env", "Name"] (sorted)
     assert_eq!(result.resources.len(), 2);
-    assert_eq!(result.resources[0].id.name_str(), "resources[0]");
-    assert_eq!(result.resources[1].id.name_str(), "resources[1]");
+    assert_eq!(result.resources[0].id.identity_or_empty(), "resources[0]");
+    assert_eq!(result.resources[1].id.identity_or_empty(), "resources[1]");
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String("Env".to_string())))
@@ -4425,7 +4432,7 @@ fn parse_if_true_condition_includes_resource() {
 
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.resources.len(), 1);
-    assert_eq!(result.resources[0].id.name_str(), "alarm");
+    assert_eq!(result.resources[0].id.identity_or_empty(), "alarm");
     assert_eq!(
         result.resources[0].get_attr("alarm_name"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -4813,7 +4820,7 @@ fn parse_top_level_multiple_for_no_collision() {
     let names: Vec<&str> = result
         .resources
         .iter()
-        .map(|r| r.id.name.as_str())
+        .map(|r| r.id.identity_or_empty())
         .collect();
     assert_eq!(names[0], "_for0[0]");
     assert_eq!(names[1], "_for0[1]");
@@ -4838,7 +4845,7 @@ fn parse_top_level_for_uses_iterable_name_as_binding() {
     let names: Vec<&str> = result
         .resources
         .iter()
-        .map(|r| r.id.name.as_str())
+        .map(|r| r.id.identity_or_empty())
         .collect();
     assert_eq!(names[0], "_azs[0]");
     assert_eq!(names[1], "_azs[1]");
@@ -4877,7 +4884,7 @@ fn parse_top_level_for_literal_list_uses_counter_fallback() {
     let names: Vec<&str> = result
         .resources
         .iter()
-        .map(|r| r.id.name.as_str())
+        .map(|r| r.id.identity_or_empty())
         .collect();
     assert_eq!(names[0], "_for0[0]");
     assert_eq!(names[1], "_for0[1]");
@@ -8867,11 +8874,13 @@ fn quoted_literal_marker_survives_anonymous_resource_rename() {
     let mut parsed = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(parsed.resources.len(), 1); // allow: direct — fixture test inspection
 
-    // Simulate the rename that compute_anonymous_identifiers would
-    // perform: the pending name becomes a hash-based bound identifier.
+    // Simulate the identity assignment that compute_anonymous_identifiers would
+    // perform: the absent identity becomes a hash-based identifier.
     let resource = &mut parsed.resources[0]; // allow: direct — fixture test inspection
-    assert!(resource.id.name.is_pending());
-    resource.id.name = crate::resource::ResourceName::Bound("hash123".to_string());
+    assert!(resource.id.identity.is_none());
+    resource
+        .id
+        .set_identity(crate::resource::ResourceIdentity::new("hash123"));
 
     // The "was quoted" marker must still be reachable on the
     // resource — it co-locates with the attributes, not in a
@@ -10294,7 +10303,7 @@ fn extract_directives_reads_depends_on_list() {
     let bucket = parsed
         .resources
         .iter()
-        .find(|r| r.id.name.as_str() == "bucket")
+        .find(|r| r.id.identity_or_empty() == "bucket")
         .expect("bucket binding");
     assert_eq!(
         bucket.directives.depends_on,
@@ -10318,7 +10327,7 @@ fn parser_resolve_unions_directives_depends_on_into_dependency_bindings() {
     let bucket = parsed
         .resources
         .iter()
-        .find(|r| r.id.name.as_str() == "bucket")
+        .find(|r| r.id.identity_or_empty() == "bucket")
         .expect("bucket binding");
     let deps = crate::deps::get_resource_dependencies(bucket);
     assert!(
@@ -10548,7 +10557,7 @@ fn extract_directives_accepts_empty_depends_on_list() {
     let bucket = parsed
         .resources
         .iter()
-        .find(|r| r.id.name.as_str() == "bucket")
+        .find(|r| r.id.identity_or_empty() == "bucket")
         .expect("bucket binding");
     assert!(
         bucket.directives.depends_on.is_empty(),
@@ -10970,7 +10979,7 @@ fn extract_directives_reads_provider_binding() {
     let bucket = parsed
         .resources
         .iter()
-        .find(|r| r.id.name.as_str() == "bucket")
+        .find(|r| r.id.identity_or_empty() == "bucket")
         .expect("bucket binding");
     assert_eq!(
         bucket.directives.provider_instance.as_deref(),
@@ -10998,7 +11007,7 @@ fn extract_directives_provider_default_is_none() {
     let bucket = parsed
         .resources
         .iter()
-        .find(|r| r.id.name.as_str() == "bucket")
+        .find(|r| r.id.identity_or_empty() == "bucket")
         .expect("bucket binding");
     assert!(bucket.directives.provider_instance.is_none());
 }
@@ -11063,7 +11072,7 @@ fn extract_directives_provider_visible_across_files() {
     let cert = parsed
         .resources
         .iter()
-        .find(|r| r.id.name.as_str() == "cert")
+        .find(|r| r.id.identity_or_empty() == "cert")
         .expect("cert binding");
     assert_eq!(
         cert.directives.provider_instance.as_deref(),
@@ -11417,7 +11426,7 @@ fn parser_propagates_directives_provider_instance_to_resource_id() {
     let cert = parsed
         .resources
         .iter()
-        .find(|r| r.id.name.as_str() == "cert")
+        .find(|r| r.id.identity_or_empty() == "cert")
         .expect("cert binding");
     assert_eq!(
         cert.id.provider_instance.as_deref(),
@@ -11457,11 +11466,11 @@ fn parser_propagates_directives_provider_instance_to_resource_id() {
 
 #[test]
 fn resource_id_provider_instance_round_trips_serde() {
-    use crate::resource::{ResourceId, ResourceName};
+    use crate::resource::{ResourceId, ResourceIdentity};
     let id = ResourceId {
         provider: "aws".to_string(),
         resource_type: "s3.Bucket".to_string(),
-        name: ResourceName::Bound("x".to_string()),
+        identity: Some(ResourceIdentity::new("x")),
         provider_instance: Some("us".to_string()),
     };
     let json = serde_json::to_string(&id).unwrap();
@@ -11475,11 +11484,11 @@ fn resource_id_provider_instance_round_trips_serde() {
 
 #[test]
 fn resource_id_provider_instance_default_skipped_in_serde() {
-    use crate::resource::{ResourceId, ResourceName};
+    use crate::resource::{ResourceId, ResourceIdentity};
     let id = ResourceId {
         provider: "aws".to_string(),
         resource_type: "s3.Bucket".to_string(),
-        name: ResourceName::Bound("x".to_string()),
+        identity: Some(ResourceIdentity::new("x")),
         provider_instance: None,
     };
     let json = serde_json::to_string(&id).unwrap();
@@ -11497,17 +11506,17 @@ fn resource_id_provider_instance_default_skipped_in_serde() {
 fn resource_id_provider_instance_makes_distinct_ids() {
     // Same kind/type/name but different instances must compare unequal
     // so HashMap<ResourceId, _> treats them as separate resources.
-    use crate::resource::{ResourceId, ResourceName};
+    use crate::resource::{ResourceId, ResourceIdentity};
     let tokyo = ResourceId {
         provider: "aws".to_string(),
         resource_type: "s3.Bucket".to_string(),
-        name: ResourceName::Bound("x".to_string()),
+        identity: Some(ResourceIdentity::new("x")),
         provider_instance: None,
     };
     let us = ResourceId {
         provider: "aws".to_string(),
         resource_type: "s3.Bucket".to_string(),
-        name: ResourceName::Bound("x".to_string()),
+        identity: Some(ResourceIdentity::new("x")),
         provider_instance: Some("us".to_string()),
     };
     assert_ne!(tokyo, us, "instances differ → ResourceId differs");

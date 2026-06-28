@@ -166,7 +166,7 @@ impl StateFile {
         if let Some(resource_state) = self.find_resource(
             &resource.id.provider,
             &resource.id.resource_type,
-            resource.id.name_str(),
+            resource.id.identity_or_empty(),
         ) {
             return resource_state.identifier.clone();
         }
@@ -177,27 +177,26 @@ impl StateFile {
     pub fn build_directives(&self) -> HashMap<ResourceId, Directives> {
         let mut directives_map = HashMap::new();
         for rs in &self.resources {
-            let id = ResourceId::with_provider(
-                &rs.provider,
-                &rs.resource_type,
-                &rs.name,
-                rs.directives.provider_instance.clone(),
-            );
+            let id = Self::id_for_resource_state(rs);
             directives_map.insert(id, rs.directives.clone());
         }
         directives_map
+    }
+
+    fn id_for_resource_state(rs: &ResourceState) -> ResourceId {
+        ResourceId::with_provider_name_compat(
+            &rs.provider,
+            &rs.resource_type,
+            &rs.name,
+            rs.directives.provider_instance.clone(),
+        )
     }
 
     /// Build a map of saved attributes, converting JSON values to DSL values.
     pub fn build_saved_attrs(&self) -> HashMap<ResourceId, HashMap<String, Value>> {
         let mut result = HashMap::new();
         for rs in &self.resources {
-            let id = ResourceId::with_provider(
-                &rs.provider,
-                &rs.resource_type,
-                &rs.name,
-                rs.directives.provider_instance.clone(),
-            );
+            let id = Self::id_for_resource_state(rs);
             let attrs: HashMap<String, Value> = rs
                 .attributes
                 .iter()
@@ -216,7 +215,7 @@ impl StateFile {
                 continue;
             }
             let marker = self
-                .find_resource(&id.provider, &id.resource_type, id.name_str())
+                .find_resource(&id.provider, &id.resource_type, id.identity_or_empty())
                 .and_then(|rs| rs.partial_read.clone());
             if let Some(mut marker) = marker {
                 marker
@@ -239,12 +238,7 @@ impl StateFile {
         let mut result = HashMap::new();
         for rs in &self.resources {
             if !is_empty_explicit(&rs.explicit) {
-                let id = ResourceId::with_provider(
-                    &rs.provider,
-                    &rs.resource_type,
-                    &rs.name,
-                    rs.directives.provider_instance.clone(),
-                );
+                let id = Self::id_for_resource_state(rs);
                 result.insert(id, rs.explicit.clone());
             }
         }
@@ -256,7 +250,7 @@ impl StateFile {
     /// state file. Takes a `&ResourceId` so it works for managed
     /// resources and data sources alike (carina#3181).
     pub fn build_state_for_resource(&self, id: &ResourceId) -> State {
-        let rs = self.find_resource(&id.provider, &id.resource_type, id.name_str());
+        let rs = self.find_resource(&id.provider, &id.resource_type, id.identity_or_empty());
         if let Some(identifier) = rs.and_then(|r| r.identifier.as_deref()) {
             let attrs: HashMap<String, Value> = rs
                 .unwrap()
@@ -285,12 +279,7 @@ impl StateFile {
     ) -> HashMap<ResourceId, State> {
         let mut result = HashMap::new();
         for rs in &self.resources {
-            let id = ResourceId::with_provider(
-                &rs.provider,
-                &rs.resource_type,
-                &rs.name,
-                rs.directives.provider_instance.clone(),
-            );
+            let id = Self::id_for_resource_state(rs);
             if desired_ids.contains(&id) {
                 continue;
             }
@@ -330,12 +319,7 @@ impl StateFile {
     ) -> HashMap<ResourceId, BTreeSet<String>> {
         let mut result = HashMap::new();
         for rs in &self.resources {
-            let id = ResourceId::with_provider(
-                &rs.provider,
-                &rs.resource_type,
-                &rs.name,
-                rs.directives.provider_instance.clone(),
-            );
+            let id = Self::id_for_resource_state(rs);
             if desired_ids.contains(&id) {
                 continue;
             }
@@ -352,12 +336,7 @@ impl StateFile {
         let mut result = HashMap::new();
         for rs in &self.resources {
             if !rs.name_overrides.is_empty() {
-                let id = ResourceId::with_provider(
-                    &rs.provider,
-                    &rs.resource_type,
-                    &rs.name,
-                    rs.directives.provider_instance.clone(),
-                );
+                let id = Self::id_for_resource_state(rs);
                 result.insert(id, rs.name_overrides.clone());
             }
         }
@@ -848,7 +827,7 @@ impl ResourceState {
     ) -> Result<Self, String> {
         let mut rs = Self::new(
             &resource.id.resource_type,
-            resource.id.name_str(),
+            resource.id.identity_or_empty(),
             resource.id.provider.clone(),
         );
         rs.identifier = state.identifier.clone();
@@ -865,8 +844,11 @@ impl ResourceState {
         // the provider-returned structure to preserve extra keys from the provider.
         for (k, v) in &resource.attributes {
             if contains_secret(v) {
-                let ctx =
-                    SecretHashContext::new(resource.id.display_type(), resource.id.name_str(), k);
+                let ctx = SecretHashContext::new(
+                    resource.id.display_type(),
+                    resource.id.identity_or_empty(),
+                    k,
+                );
                 if let Some(provider_json) = rs.attributes.get(k).cloned() {
                     rs.attributes.insert(
                         k.clone(),

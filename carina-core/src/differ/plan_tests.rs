@@ -116,8 +116,8 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
         Value::Concrete(ConcreteValue::Bool(false)),
     );
     current_states.insert(
-        ResourceId::new("s3.Bucket", "my-bucket"),
-        State::existing(ResourceId::new("s3.Bucket", "my-bucket"), attrs),
+        ResourceId::with_identity("s3.Bucket", "my-bucket"),
+        State::existing(ResourceId::with_identity("s3.Bucket", "my-bucket"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -202,8 +202,11 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
         Value::Concrete(ConcreteValue::String("old-key".to_string())),
     );
     current_states.insert(
-        ResourceId::new("logs.LogGroup", "my-log-group"),
-        State::existing(ResourceId::new("logs.LogGroup", "my-log-group"), attrs),
+        ResourceId::with_identity("logs.LogGroup", "my-log-group"),
+        State::existing(
+            ResourceId::with_identity("logs.LogGroup", "my-log-group"),
+            attrs,
+        ),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -272,8 +275,8 @@ fn no_temporary_name_without_create_before_destroy() {
         Value::Concrete(ConcreteValue::Bool(false)),
     );
     current_states.insert(
-        ResourceId::new("s3.Bucket", "my-bucket"),
-        State::existing(ResourceId::new("s3.Bucket", "my-bucket"), attrs),
+        ResourceId::with_identity("s3.Bucket", "my-bucket"),
+        State::existing(ResourceId::with_identity("s3.Bucket", "my-bucket"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -344,8 +347,8 @@ fn no_temporary_name_when_name_prefix_is_used() {
         Value::Concrete(ConcreteValue::Bool(false)),
     );
     current_states.insert(
-        ResourceId::new("s3.Bucket", "my-bucket"),
-        State::existing(ResourceId::new("s3.Bucket", "my-bucket"), attrs),
+        ResourceId::with_identity("s3.Bucket", "my-bucket"),
+        State::existing(ResourceId::with_identity("s3.Bucket", "my-bucket"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -403,8 +406,8 @@ fn no_temporary_name_without_name_attribute_in_schema() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     current_states.insert(
-        ResourceId::new("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
+        ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -470,8 +473,8 @@ fn no_temporary_name_when_name_attribute_changes() {
         Value::Concrete(ConcreteValue::Bool(true)),
     );
     current_states.insert(
-        ResourceId::new("s3.Bucket", "my-bucket"),
-        State::existing(ResourceId::new("s3.Bucket", "my-bucket"), attrs),
+        ResourceId::with_identity("s3.Bucket", "my-bucket"),
+        State::existing(ResourceId::with_identity("s3.Bucket", "my-bucket"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -530,7 +533,10 @@ fn diff_detects_attribute_removal_with_prev_desired_keys() {
             Value::Concrete(ConcreteValue::String("test".to_string())),
         )]))),
     );
-    let current = State::existing(ResourceId::new("s3.Bucket", "test"), current_attrs);
+    let current = State::existing(
+        ResourceId::with_identity("s3.Bucket", "test"),
+        current_attrs,
+    );
 
     // Previous desired state had both "region" and "tags"
     let prev_explicit = explicit_top_level(&["region", "tags"]);
@@ -565,7 +571,10 @@ fn diff_ignores_attributes_not_in_prev_desired_keys() {
         "arn".to_string(),
         Value::Concrete(ConcreteValue::String("arn:aws:s3:::test".to_string())),
     );
-    let current = State::existing(ResourceId::new("s3.Bucket", "test"), current_attrs);
+    let current = State::existing(
+        ResourceId::with_identity("s3.Bucket", "test"),
+        current_attrs,
+    );
 
     // User previously only specified "region", not "arn"
     let prev_explicit = explicit_top_level(&["region"]);
@@ -626,7 +635,10 @@ fn server_default_struct_field_does_not_appear_in_diff() {
         "lifecycle_configuration".to_string(),
         Value::Concrete(ConcreteValue::Map(current_lc)),
     );
-    let current = State::existing(ResourceId::new("s3.Bucket", "test"), current_attrs);
+    let current = State::existing(
+        ResourceId::with_identity("s3.Bucket", "test"),
+        current_attrs,
+    );
 
     // prev_explicit reflects what the user wrote: lifecycle_configuration > rules
     let prev_explicit = ExplicitFields::Struct {
@@ -672,7 +684,10 @@ fn explicit_top_level_removal_still_detected() {
             Value::Concrete(ConcreteValue::String("prod".to_string())),
         )]))),
     );
-    let current = State::existing(ResourceId::new("s3.Bucket", "test"), current_attrs);
+    let current = State::existing(
+        ResourceId::with_identity("s3.Bucket", "test"),
+        current_attrs,
+    );
 
     let prev_explicit = explicit_top_level(&["tags"]);
     let result = diff(&desired, &current, None, Some(&prev_explicit), None);
@@ -711,7 +726,10 @@ fn diff_no_change_without_prev_desired_keys() {
             Value::Concrete(ConcreteValue::String("test".to_string())),
         )]))),
     );
-    let current = State::existing(ResourceId::new("s3.Bucket", "test"), current_attrs);
+    let current = State::existing(
+        ResourceId::with_identity("s3.Bucket", "test"),
+        current_attrs,
+    );
 
     let result = diff(&desired, &current, None, None, None);
     assert!(
@@ -744,13 +762,13 @@ fn create_plan_detects_attribute_removal() {
         )]))),
     );
     current_states.insert(
-        ResourceId::new("s3.Bucket", "test"),
-        State::existing(ResourceId::new("s3.Bucket", "test"), attrs),
+        ResourceId::with_identity("s3.Bucket", "test"),
+        State::existing(ResourceId::with_identity("s3.Bucket", "test"), attrs),
     );
 
     let mut prev_explicit = HashMap::new();
     prev_explicit.insert(
-        ResourceId::new("s3.Bucket", "test"),
+        ResourceId::with_identity("s3.Bucket", "test"),
         explicit_top_level(&["region", "tags"]),
     );
 
@@ -799,13 +817,13 @@ fn create_plan_filters_non_removable_attribute_removal() {
         )]))),
     );
     current_states.insert(
-        ResourceId::new("s3.Bucket", "test"),
-        State::existing(ResourceId::new("s3.Bucket", "test"), attrs),
+        ResourceId::with_identity("s3.Bucket", "test"),
+        State::existing(ResourceId::with_identity("s3.Bucket", "test"), attrs),
     );
 
     let mut prev_explicit = HashMap::new();
     prev_explicit.insert(
-        ResourceId::new("s3.Bucket", "test"),
+        ResourceId::with_identity("s3.Bucket", "test"),
         explicit_top_level(&["region", "tags"]),
     );
 
@@ -874,13 +892,13 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
         Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
     );
     current_states.insert(
-        ResourceId::new("s3.Bucket", "test"),
-        State::existing(ResourceId::new("s3.Bucket", "test"), attrs),
+        ResourceId::with_identity("s3.Bucket", "test"),
+        State::existing(ResourceId::with_identity("s3.Bucket", "test"), attrs),
     );
 
     let mut prev_explicit = HashMap::new();
     prev_explicit.insert(
-        ResourceId::new("s3.Bucket", "test"),
+        ResourceId::with_identity("s3.Bucket", "test"),
         explicit_top_level(&["bucket", "region"]),
     );
 
@@ -930,7 +948,10 @@ fn diff_skips_internal_attributes_in_removal_detection() {
         "_internal".to_string(),
         Value::Concrete(ConcreteValue::String("something".to_string())),
     );
-    let current = State::existing(ResourceId::new("s3.Bucket", "test"), current_attrs);
+    let current = State::existing(
+        ResourceId::with_identity("s3.Bucket", "test"),
+        current_attrs,
+    );
 
     let prev_explicit = explicit_top_level(&["region", "_internal"]);
 
@@ -955,14 +976,14 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     current_states.insert(
-        ResourceId::new("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
+        ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
     );
 
     // Directives from state say prevent_destroy
     let mut directives_map = HashMap::new();
     directives_map.insert(
-        ResourceId::new("ec2.Vpc", "my-vpc"),
+        ResourceId::with_identity("ec2.Vpc", "my-vpc"),
         Directives {
             prevent_destroy: true,
             ..Default::default()
@@ -999,7 +1020,7 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
     );
     assert_eq!(
         plan.errors()[0].resource_id,
-        ResourceId::new("ec2.Vpc", "my-vpc")
+        ResourceId::with_identity("ec2.Vpc", "my-vpc")
     );
 }
 
@@ -1024,8 +1045,8 @@ fn prevent_destroy_blocks_replace() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     current_states.insert(
-        ResourceId::new("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
+        ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -1087,8 +1108,8 @@ fn prevent_destroy_does_not_block_update() {
         Value::Concrete(ConcreteValue::String("Disabled".to_string())),
     );
     current_states.insert(
-        ResourceId::new("s3.Bucket", "my-bucket"),
-        State::existing(ResourceId::new("s3.Bucket", "my-bucket"), attrs),
+        ResourceId::with_identity("s3.Bucket", "my-bucket"),
+        State::existing(ResourceId::with_identity("s3.Bucket", "my-bucket"), attrs),
     );
 
     let plan = create_plan(
@@ -1169,8 +1190,8 @@ fn without_prevent_destroy_delete_works_normally() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     current_states.insert(
-        ResourceId::new("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
+        ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
     );
 
     let plan = create_plan(
@@ -1208,8 +1229,8 @@ fn prevent_destroy_collects_multiple_errors() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     current_states.insert(
-        ResourceId::new("ec2.Vpc", "vpc-1"),
-        State::existing(ResourceId::new("ec2.Vpc", "vpc-1"), attrs1),
+        ResourceId::with_identity("ec2.Vpc", "vpc-1"),
+        State::existing(ResourceId::with_identity("ec2.Vpc", "vpc-1"), attrs1),
     );
     let mut attrs2 = HashMap::new();
     attrs2.insert(
@@ -1217,20 +1238,20 @@ fn prevent_destroy_collects_multiple_errors() {
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
     );
     current_states.insert(
-        ResourceId::new("ec2.Vpc", "vpc-2"),
-        State::existing(ResourceId::new("ec2.Vpc", "vpc-2"), attrs2),
+        ResourceId::with_identity("ec2.Vpc", "vpc-2"),
+        State::existing(ResourceId::with_identity("ec2.Vpc", "vpc-2"), attrs2),
     );
 
     let mut directives_map = HashMap::new();
     directives_map.insert(
-        ResourceId::new("ec2.Vpc", "vpc-1"),
+        ResourceId::with_identity("ec2.Vpc", "vpc-1"),
         Directives {
             prevent_destroy: true,
             ..Default::default()
         },
     );
     directives_map.insert(
-        ResourceId::new("ec2.Vpc", "vpc-2"),
+        ResourceId::with_identity("ec2.Vpc", "vpc-2"),
         Directives {
             prevent_destroy: true,
             ..Default::default()
@@ -1325,7 +1346,7 @@ fn wait_binding_lowers_to_wait_effect() {
         unreachable!();
     };
     assert_eq!(binding, "cert_issued");
-    assert_eq!(target_id.name.as_str(), "cert");
+    assert_eq!(target_id.identity_str(), Some("cert"));
     assert_eq!(target_id.resource_type, "acm.Certificate");
     assert_eq!(
         until,
@@ -1637,13 +1658,16 @@ fn wait_omitted_when_all_consumers_unchanged() {
     // so neither produces a mutating effect.
     let mut current_states = HashMap::new();
     current_states.insert(
-        ResourceId::new("acm.Certificate", "cert"),
-        State::existing(ResourceId::new("acm.Certificate", "cert"), HashMap::new()),
+        ResourceId::with_identity("acm.Certificate", "cert"),
+        State::existing(
+            ResourceId::with_identity("acm.Certificate", "cert"),
+            HashMap::new(),
+        ),
     );
     current_states.insert(
-        ResourceId::new("cloudfront.Distribution", "dist"),
+        ResourceId::with_identity("cloudfront.Distribution", "dist"),
         State::existing(
-            ResourceId::new("cloudfront.Distribution", "dist"),
+            ResourceId::with_identity("cloudfront.Distribution", "dist"),
             HashMap::new(),
         ),
     );
@@ -1766,9 +1790,12 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
     );
     let mut current_states = HashMap::new();
     current_states.insert(
-        ResourceId::new("acm.Certificate", "cert"),
-        State::existing(ResourceId::new("acm.Certificate", "cert"), cert_state_attrs)
-            .with_identifier("arn:aws:acm:::certificate/abc"),
+        ResourceId::with_identity("acm.Certificate", "cert"),
+        State::existing(
+            ResourceId::with_identity("acm.Certificate", "cert"),
+            cert_state_attrs,
+        )
+        .with_identifier("arn:aws:acm:::certificate/abc"),
     );
 
     let wait = WaitBinding {
@@ -1895,9 +1922,12 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
     );
     let mut current_states = HashMap::new();
     current_states.insert(
-        ResourceId::new("acm.Certificate", "cert"),
-        State::existing(ResourceId::new("acm.Certificate", "cert"), cert_state_attrs)
-            .with_identifier("arn:aws:acm:::certificate/abc"),
+        ResourceId::with_identity("acm.Certificate", "cert"),
+        State::existing(
+            ResourceId::with_identity("acm.Certificate", "cert"),
+            cert_state_attrs,
+        )
+        .with_identifier("arn:aws:acm:::certificate/abc"),
     );
 
     let wait = WaitBinding {
@@ -1933,7 +1963,7 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
         plan.effects()
             .iter()
             .any(|e| matches!(e, Effect::Update { id, .. }
-            if id == &ResourceId::new("acm.Certificate", "cert"))),
+            if id == &ResourceId::with_identity("acm.Certificate", "cert"))),
         "test precondition: cert must have a pending Update; effects were {:?}",
         plan.effects()
     );

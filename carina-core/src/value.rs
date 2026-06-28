@@ -3387,7 +3387,7 @@ mod tests {
             )))),
         );
         let virt = Composition {
-            id: ResourceId::new("_virtual", "module_instance"),
+            id: ResourceId::with_identity("_virtual", "module_instance"),
             signature: Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: attrs,
@@ -4600,7 +4600,7 @@ mod tests {
     }
 
     fn make_resource(attrs: Vec<(&str, Value)>) -> crate::resource::Resource {
-        use crate::resource::{Resource, ResourceId, ResourceName};
+        use crate::resource::{Resource, ResourceId, ResourceIdentity};
         use std::collections::{BTreeSet, HashMap, HashSet};
         let mut attributes = IndexMap::new();
         for (k, v) in attrs {
@@ -4610,7 +4610,7 @@ mod tests {
             id: ResourceId {
                 provider: "aws".to_string(),
                 resource_type: "iam.policy".to_string(),
-                name: ResourceName::Bound("p1".to_string()),
+                identity: Some(ResourceIdentity::new("p1")),
                 provider_instance: None,
             },
             attributes,
@@ -4718,7 +4718,7 @@ mod tests {
     // ---- canonicalize_states_with_schemas tests (#2481, #2513) ----
 
     fn make_state(attrs: Vec<(&str, Value)>) -> crate::resource::State {
-        use crate::resource::{ResourceId, ResourceName, State};
+        use crate::resource::{ResourceId, ResourceIdentity, State};
         use std::collections::{BTreeSet, HashMap};
         let mut attributes = HashMap::new();
         for (k, v) in attrs {
@@ -4728,7 +4728,7 @@ mod tests {
             id: ResourceId {
                 provider: "aws".to_string(),
                 resource_type: "iam.policy".to_string(),
-                name: ResourceName::Bound("p1".to_string()),
+                identity: Some(ResourceIdentity::new("p1")),
                 provider_instance: None,
             },
             identifier: Some("arn:aws:iam::123:policy/p1".to_string()),
@@ -4846,7 +4846,7 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert("awscc", schema.clone());
 
-        let id = ResourceId::with_provider("awscc", "ec2.Subnet", "subnet", None);
+        let id = ResourceId::with_provider_identity("awscc", "ec2.Subnet", "subnet", None);
         let mut desired = vec![
             Resource::with_provider("awscc", "ec2.Subnet", "subnet", None).with_attribute(
                 "availability_zone",
@@ -5070,7 +5070,7 @@ mod tests {
             InterpolationPart::Literal("|registry-dev.carina-rs.dev|NS".to_string()),
         ]));
         let effect = Effect::Import {
-            id: ResourceId::new("aws.route53.RecordSet", "r.delegation_ns"),
+            id: ResourceId::with_identity("aws.route53.RecordSet", "r.delegation_ns"),
             identifier,
         };
         let redacted = redact_secrets_in_effect(&effect)
@@ -5107,7 +5107,7 @@ mod tests {
             InterpolationPart::Literal("|tail".to_string()),
         ]));
         let effect = Effect::Import {
-            id: ResourceId::new("aws.s3.Bucket", "b"),
+            id: ResourceId::with_identity("aws.s3.Bucket", "b"),
             identifier,
         };
         let redacted = redact_secrets_in_effect(&effect).expect("redaction succeeds");
@@ -5161,7 +5161,7 @@ mod tests {
         let mut template_resource = Resource::new("aws.route53.RecordSet", "validation_records");
         template_resource.set_attr("name", placeholder.clone());
         let effect = Effect::DeferredCreate {
-            id: ResourceId::new("__deferred_for", "validation_records"),
+            id: ResourceId::with_identity("__deferred_for", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(DeferredForExpression {
                 file: None,

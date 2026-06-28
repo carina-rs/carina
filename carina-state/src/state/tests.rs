@@ -183,7 +183,7 @@ fn test_build_directives() {
     state.upsert_resource(rs);
 
     let directives_map = state.build_directives();
-    let id = ResourceId::with_provider("awscc", "s3.Bucket", "my-bucket", None);
+    let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "my-bucket", None);
     assert!(directives_map.get(&id).unwrap().force_delete);
 }
 
@@ -197,7 +197,7 @@ fn test_build_saved_attrs() {
     state.upsert_resource(rs);
 
     let saved = state.build_saved_attrs();
-    let id = ResourceId::with_provider("awscc", "s3.Bucket", "my-bucket", None);
+    let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "my-bucket", None);
     let attrs = saved.get(&id).unwrap();
     assert_eq!(
         attrs.get("region"),
@@ -710,8 +710,8 @@ fn test_build_directives_provider_scoped() {
     state.upsert_resource(awscc_rs);
 
     let directives_map = state.build_directives();
-    let aws_id = ResourceId::with_provider("aws", "s3.Bucket", "main", None);
-    let awscc_id = ResourceId::with_provider("awscc", "s3.Bucket", "main", None);
+    let aws_id = ResourceId::with_provider_identity("aws", "s3.Bucket", "main", None);
+    let awscc_id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "main", None);
 
     assert!(directives_map.get(&aws_id).unwrap().force_delete);
     assert!(!directives_map.get(&awscc_id).unwrap().force_delete);
@@ -731,8 +731,8 @@ fn test_build_saved_attrs_provider_scoped() {
     state.upsert_resource(awscc_rs);
 
     let saved = state.build_saved_attrs();
-    let aws_id = ResourceId::with_provider("aws", "s3.Bucket", "main", None);
-    let awscc_id = ResourceId::with_provider("awscc", "s3.Bucket", "main", None);
+    let aws_id = ResourceId::with_provider_identity("aws", "s3.Bucket", "main", None);
+    let awscc_id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "main", None);
 
     assert_eq!(
         saved.get(&aws_id).unwrap().get("region"),
@@ -849,7 +849,7 @@ fn test_build_orphan_states_injects_binding() {
     let desired_ids = std::collections::HashSet::new();
     let orphans = state.build_orphan_states(&desired_ids);
 
-    let id = ResourceId::with_provider("awscc", "ec2.Subnet", "orphan-subnet", None);
+    let id = ResourceId::with_provider_identity("awscc", "ec2.Subnet", "orphan-subnet", None);
     let orphan_state = orphans.get(&id).unwrap();
     assert!(orphan_state.exists);
     assert_eq!(
@@ -874,7 +874,7 @@ fn test_build_orphan_dependencies() {
     let desired_ids = std::collections::HashSet::new();
     let deps = state.build_orphan_dependencies(&desired_ids);
 
-    let id = ResourceId::with_provider("awscc", "ec2.Subnet", "orphan-subnet", None);
+    let id = ResourceId::with_provider_identity("awscc", "ec2.Subnet", "orphan-subnet", None);
     assert_eq!(
         deps.get(&id).unwrap(),
         &BTreeSet::from(["my_vpc".to_string()])
@@ -897,7 +897,7 @@ fn test_build_orphan_dependencies_excludes_desired() {
     rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
     state.upsert_resource(rs);
 
-    let id = ResourceId::with_provider("awscc", "ec2.Subnet", "kept-subnet", None);
+    let id = ResourceId::with_provider_identity("awscc", "ec2.Subnet", "kept-subnet", None);
     let mut desired_ids = std::collections::HashSet::new();
     desired_ids.insert(id.clone());
 
@@ -1721,7 +1721,7 @@ fn build_explicit_yields_per_resource_trees() {
     state.upsert_resource(rs);
 
     let map = state.build_explicit();
-    let id = ResourceId::with_provider("aws", "s3.Bucket", "my-bucket", None);
+    let id = ResourceId::with_provider_identity("aws", "s3.Bucket", "my-bucket", None);
     assert!(map.contains_key(&id));
     assert!(matches!(map[&id], ExplicitFields::Struct { .. }));
 }
@@ -1742,15 +1742,19 @@ fn build_directives_keys_include_provider_instance() {
     state.upsert_resource(rs);
 
     let map = state.build_directives();
-    let expected =
-        ResourceId::with_provider("aws", "s3.Bucket", "shared-name", Some("us".to_string()));
+    let expected = ResourceId::with_provider_identity(
+        "aws",
+        "s3.Bucket",
+        "shared-name",
+        Some("us".to_string()),
+    );
     assert!(
         map.contains_key(&expected),
         "build_directives must construct ResourceId with provider_instance, got keys: {:?}",
         map.keys().collect::<Vec<_>>()
     );
     // Without the instance, the legacy ResourceId must NOT match.
-    let legacy = ResourceId::with_provider("aws", "s3.Bucket", "shared-name", None);
+    let legacy = ResourceId::with_provider_identity("aws", "s3.Bucket", "shared-name", None);
     assert!(
         !map.contains_key(&legacy),
         "ResourceId without provider_instance must not match a Some(_) entry"

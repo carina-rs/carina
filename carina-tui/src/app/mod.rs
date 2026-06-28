@@ -645,7 +645,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
                 // For bound resources, show the binding name
                 r.binding()
                     .map(str::to_string)
-                    .unwrap_or_else(|| r.id().name_str().to_string())
+                    .unwrap_or_else(|| r.id().identity_or_empty().to_string())
             } else {
                 // For anonymous resources, try to extract a compact hint
                 let parent_binding = nodes[idx].parent.and_then(|p_idx| {
@@ -660,7 +660,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
                 if let Some(hint) = extract_compact_hint(r, parent_binding.as_deref()) {
                     format!("({})", hint)
                 } else {
-                    r.id().name_str().to_string()
+                    r.id().identity_or_empty().to_string()
                 }
             };
 
@@ -669,9 +669,10 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
             nodes[idx].effect_label = format!("{} {}", display_type, name_part);
         } else if let Effect::Delete { id, .. } = effect {
             let display_type = id.display_type();
+            let name_part = id.identity_or_empty().to_string();
             nodes[idx].resource_type = display_type.clone();
-            nodes[idx].name_part = id.name_str().to_string();
-            nodes[idx].effect_label = format!("{} {}", display_type, id.name);
+            nodes[idx].name_part = name_part.clone();
+            nodes[idx].effect_label = format!("{} {}", display_type, name_part);
         }
     }
 }
@@ -683,7 +684,7 @@ fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>
         Effect::Read { resource } => TreeNode {
             effect_label: format!("{}", resource.id.human()),
             resource_type: resource.id.display_type(),
-            name_part: resource.id.name_str().to_string(),
+            name_part: resource.id.identity_or_empty().to_string(),
             symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Read,
             detail_rows,
@@ -694,7 +695,7 @@ fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>
         Effect::Create(resource) => TreeNode {
             effect_label: format!("{}", resource.id.human()),
             resource_type: resource.id.display_type(),
-            name_part: resource.id.name_str().to_string(),
+            name_part: resource.id.identity_or_empty().to_string(),
             symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Create,
             detail_rows,
@@ -705,7 +706,7 @@ fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>
         Effect::Update { id, .. } => TreeNode {
             effect_label: format!("{}", id.human()),
             resource_type: id.display_type(),
-            name_part: id.name_str().to_string(),
+            name_part: id.identity_or_empty().to_string(),
             symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Update,
             detail_rows,
@@ -716,7 +717,7 @@ fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>
         Effect::Replace { id, .. } => TreeNode {
             effect_label: format!("{}", id.human()),
             resource_type: id.display_type(),
-            name_part: id.name_str().to_string(),
+            name_part: id.identity_or_empty().to_string(),
             symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Replace,
             detail_rows,
@@ -739,7 +740,7 @@ fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>
             TreeNode {
                 effect_label: format!("{}", id.human()),
                 resource_type: id.display_type(),
-                name_part: id.name_str().to_string(),
+                name_part: id.identity_or_empty().to_string(),
                 symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Delete,
                 detail_rows: rows,
@@ -751,7 +752,7 @@ fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>
         Effect::Import { id, .. } => TreeNode {
             effect_label: format!("{}", id.human()),
             resource_type: id.display_type(),
-            name_part: id.name_str().to_string(),
+            name_part: id.identity_or_empty().to_string(),
             symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Read,
             detail_rows,
@@ -762,7 +763,7 @@ fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>
         Effect::Remove { id } => TreeNode {
             effect_label: format!("{}", id.human()),
             resource_type: id.display_type(),
-            name_part: id.name_str().to_string(),
+            name_part: id.identity_or_empty().to_string(),
             // carina#3332: avoid the `x` glyph that shape-collides with
             // the `✗` failure indicator. `~` matches the CLI plan
             // tree's Remove symbol; `(remove from state)` annotation
@@ -781,7 +782,7 @@ fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>
         Effect::Move { from, to } => TreeNode {
             effect_label: format!("{} -> {}", from.human(), to.human()),
             resource_type: to.display_type(),
-            name_part: to.name_str().to_string(),
+            name_part: to.identity_or_empty().to_string(),
             symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Update,
             detail_rows,

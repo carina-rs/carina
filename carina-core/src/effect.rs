@@ -477,7 +477,7 @@ impl Effect {
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
-        let id = ResourceId::new("test", "x");
+        let id = ResourceId::with_identity("test", "x");
 
         macro_rules! effect_cases {
             ($(($effect:expr, $pattern:pat)),+ $(,)?) => {{
@@ -547,7 +547,7 @@ impl Effect {
             (
                 Effect::Move {
                     from: id.clone(),
-                    to: ResourceId::new("test", "y"),
+                    to: ResourceId::with_identity("test", "y"),
                 },
                 Effect::Move { .. }
             ),
@@ -568,7 +568,7 @@ impl Effect {
             ),
             (
                 Effect::DeferredCreate {
-                    id: ResourceId::new("route53.Record", "validation_records"),
+                    id: ResourceId::with_identity("route53.Record", "validation_records"),
                     upstream_binding: "cert".to_string(),
                     template: Box::new(crate::parser::DeferredForExpression {
                         file: Some("main.crn".to_string()),
@@ -588,7 +588,7 @@ impl Effect {
             (
                 Effect::DeferredReplace {
                     deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-                        id: ResourceId::new("route53.Record", "validation_records[0]"),
+                        id: ResourceId::with_identity("route53.Record", "validation_records[0]"),
                         identifier: "record-0".to_string(),
                         directives: Directives::default(),
                         binding: Some("validation_records[0]".to_string()),
@@ -596,7 +596,7 @@ impl Effect {
                         explicit_dependencies: HashSet::new(),
                     }])
                     .expect("test fixture has one delete"),
-                    id: ResourceId::new("route53.Record", "validation_records"),
+                    id: ResourceId::with_identity("route53.Record", "validation_records"),
                     upstream_binding: "cert".to_string(),
                     template: Box::new(crate::parser::DeferredForExpression {
                         file: Some("main.crn".to_string()),
@@ -618,7 +618,7 @@ impl Effect {
 
     #[cfg(test)]
     fn synthetic_replace_effect(create_before_destroy: bool) -> Self {
-        let id = ResourceId::new("test", "x");
+        let id = ResourceId::with_identity("test", "x");
         let directives = Directives {
             create_before_destroy,
             ..Directives::default()
@@ -967,7 +967,7 @@ impl Effect {
 
     /// Bindings whose failure must prevent this effect from being dispatched.
     ///
-    /// For [`Effect::Wait`] this is `target_id.name_str()` plus the wait's
+    /// For [`Effect::Wait`] this is `target_id.identity_or_empty()` plus the wait's
     /// explicit dependencies, with the target binding first. For other
     /// resource-carrying variants this is value-reference bindings plus
     /// explicit dependencies. State-only effects that do not carry dependency
@@ -982,7 +982,7 @@ impl Effect {
                 explicit_dependencies,
                 ..
             } => {
-                let target_binding = target_id.name_str();
+                let target_binding = target_id.identity_or_empty();
                 let mut out = Vec::with_capacity(1 + explicit_dependencies.len());
                 out.push(target_binding.to_string());
                 out.extend(
@@ -1186,7 +1186,7 @@ mod tests {
 
     fn deferred_create_effect() -> Effect {
         Effect::DeferredCreate {
-            id: ResourceId::new("route53.Record", "validation_records"),
+            id: ResourceId::with_identity("route53.Record", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(deferred_for_template()),
         }
@@ -1198,7 +1198,7 @@ mod tests {
         template.line = 0;
         Effect::DeferredReplace {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-                id: ResourceId::new("route53.Record", "validation_records[0]"),
+                id: ResourceId::with_identity("route53.Record", "validation_records[0]"),
                 identifier: "old-record-id".to_string(),
                 directives: Directives::default(),
                 binding: Some("validation_records[0]".to_string()),
@@ -1206,7 +1206,7 @@ mod tests {
                 explicit_dependencies: HashSet::new(),
             }])
             .expect("test fixture has one delete"),
-            id: ResourceId::new("__deferred_for", "validation_records"),
+            id: ResourceId::with_identity("__deferred_for", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(template),
         }
@@ -1217,7 +1217,7 @@ mod tests {
         use crate::wait::predicate::{AttrPath, WaitPredicate};
         use std::time::Duration;
 
-        let rid = ResourceId::new("test", "x");
+        let rid = ResourceId::with_identity("test", "x");
         vec![
             (
                 "Read",
@@ -1271,7 +1271,7 @@ mod tests {
                 "Move",
                 Effect::Move {
                     from: rid.clone(),
-                    to: ResourceId::new("test", "y"),
+                    to: ResourceId::with_identity("test", "y"),
                 },
             ),
             (
@@ -1398,7 +1398,7 @@ mod tests {
         template.line = 0;
         let effect = Effect::DeferredReplace {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-                id: ResourceId::new("route53.Record", "validation_records[0]"),
+                id: ResourceId::with_identity("route53.Record", "validation_records[0]"),
                 identifier: "old-record-id".to_string(),
                 directives: Directives::default(),
                 binding: Some("validation_records[0]".to_string()),
@@ -1406,7 +1406,7 @@ mod tests {
                 explicit_dependencies: HashSet::new(),
             }])
             .expect("fixture has one delete"),
-            id: ResourceId::new("__deferred_for", "validation_records"),
+            id: ResourceId::with_identity("__deferred_for", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(template),
         };
@@ -1424,7 +1424,7 @@ mod tests {
         template.line = 0;
         let effect = Effect::DeferredReplace {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-                id: ResourceId::new("route53.Record", "validation_records[0]"),
+                id: ResourceId::with_identity("route53.Record", "validation_records[0]"),
                 identifier: "old-record-id".to_string(),
                 directives: Directives::default(),
                 binding: Some("validation_records[0]".to_string()),
@@ -1432,7 +1432,7 @@ mod tests {
                 explicit_dependencies: HashSet::from(["foo".to_string()]),
             }])
             .expect("fixture has one delete"),
-            id: ResourceId::new("__deferred_for", "validation_records"),
+            id: ResourceId::with_identity("__deferred_for", "validation_records"),
             upstream_binding: "cert".to_string(),
             template: Box::new(template),
         };
@@ -1454,7 +1454,7 @@ mod tests {
         let effect = deferred_create_effect();
         assert_eq!(
             effect.resource_id(),
-            &ResourceId::new("route53.Record", "validation_records")
+            &ResourceId::with_identity("route53.Record", "validation_records")
         );
     }
 
@@ -1540,7 +1540,7 @@ mod tests {
     #[test]
     fn resource_returns_none_for_delete() {
         let effect = Effect::Delete {
-            id: ResourceId::new("test", "a"),
+            id: ResourceId::with_identity("test", "a"),
             identifier: "id-123".to_string(),
             directives: Directives::default(),
             binding: None,
@@ -1579,9 +1579,9 @@ mod tests {
                 resource: DataSource::new("s3.Bucket", "existing"),
             },
             Effect::Update {
-                id: ResourceId::new("s3.Bucket", "my-bucket"),
+                id: ResourceId::with_identity("s3.Bucket", "my-bucket"),
                 from: Box::new(State::existing(
-                    ResourceId::new("s3.Bucket", "my-bucket"),
+                    ResourceId::with_identity("s3.Bucket", "my-bucket"),
                     HashMap::from([(
                         "versioning".to_string(),
                         Value::Concrete(ConcreteValue::String("Disabled".to_string())),
@@ -1594,9 +1594,9 @@ mod tests {
                 changed_attributes: vec!["versioning".to_string()],
             },
             Effect::Replace {
-                id: ResourceId::new("ec2.Vpc", "my-vpc"),
+                id: ResourceId::with_identity("ec2.Vpc", "my-vpc"),
                 from: Box::new(State::existing(
-                    ResourceId::new("ec2.Vpc", "my-vpc"),
+                    ResourceId::with_identity("ec2.Vpc", "my-vpc"),
                     HashMap::from([(
                         "cidr_block".to_string(),
                         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -1614,8 +1614,11 @@ mod tests {
                 // carina#3181 PR D: cover `CascadingUpdate.to:
                 // Resource` in the serde round-trip.
                 cascading_updates: vec![CascadingUpdate {
-                    id: ResourceId::new("ec2.Subnet", "my-subnet"),
-                    from: Box::new(State::not_found(ResourceId::new("ec2.Subnet", "my-subnet"))),
+                    id: ResourceId::with_identity("ec2.Subnet", "my-subnet"),
+                    from: Box::new(State::not_found(ResourceId::with_identity(
+                        "ec2.Subnet",
+                        "my-subnet",
+                    ))),
                     to: Resource::new("ec2.Subnet", "my-subnet").with_attribute(
                         "vpc_id",
                         Value::Concrete(ConcreteValue::String("vpc.id".to_string())),
@@ -1625,7 +1628,7 @@ mod tests {
                 cascade_ref_hints: vec![],
             },
             Effect::Delete {
-                id: ResourceId::new("s3.Bucket", "old-bucket"),
+                id: ResourceId::with_identity("s3.Bucket", "old-bucket"),
                 identifier: "old-bucket".to_string(),
                 directives: Directives::default(),
                 binding: None,
@@ -1663,8 +1666,8 @@ mod tests {
     #[test]
     fn replace_changed_create_only_serializes_as_plain_array() {
         let effect = Effect::Replace {
-            id: ResourceId::new("test", "x"),
-            from: Box::new(State::not_found(ResourceId::new("test", "x"))),
+            id: ResourceId::with_identity("test", "x"),
+            from: Box::new(State::not_found(ResourceId::with_identity("test", "x"))),
             to: Resource::new("test", "x"),
             directives: Directives::default(),
             changed_create_only: ChangedCreateOnly::new(vec!["x".to_string()]).unwrap(),
@@ -1731,7 +1734,7 @@ mod tests {
     #[test]
     fn explicit_dependencies_for_delete_uses_stored_set() {
         let effect = Effect::Delete {
-            id: ResourceId::new("s3.Bucket", "b"),
+            id: ResourceId::with_identity("s3.Bucket", "b"),
             identifier: "x".to_string(),
             directives: Directives::default(),
             binding: Some("bucket".to_string()),
@@ -1746,17 +1749,17 @@ mod tests {
     #[test]
     fn explicit_dependencies_empty_for_state_only_effects() {
         let imp = Effect::Import {
-            id: ResourceId::new("s3.Bucket", "b"),
+            id: ResourceId::with_identity("s3.Bucket", "b"),
             identifier: crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
                 "x".to_string(),
             )),
         };
         let rem = Effect::Remove {
-            id: ResourceId::new("s3.Bucket", "b"),
+            id: ResourceId::with_identity("s3.Bucket", "b"),
         };
         let mov = Effect::Move {
-            from: ResourceId::new("s3.Bucket", "old"),
-            to: ResourceId::new("s3.Bucket", "new"),
+            from: ResourceId::with_identity("s3.Bucket", "old"),
+            to: ResourceId::with_identity("s3.Bucket", "new"),
         };
         for e in [imp, rem, mov] {
             assert!(
@@ -1801,7 +1804,7 @@ mod tests {
 
         let _ = Effect::Wait {
             binding: "cert_issued".to_string(),
-            target_id: ResourceId::new("acm.Certificate", "cert"),
+            target_id: ResourceId::with_identity("acm.Certificate", "cert"),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -1821,7 +1824,7 @@ mod tests {
 
         let e = Effect::Wait {
             binding: "cert_issued".to_string(),
-            target_id: ResourceId::new("acm.Certificate", "cert"),
+            target_id: ResourceId::with_identity("acm.Certificate", "cert"),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -1842,7 +1845,7 @@ mod tests {
 
         let e = Effect::Wait {
             binding: "cert_issued".to_string(),
-            target_id: ResourceId::new("acm.Certificate", "cert"),
+            target_id: ResourceId::with_identity("acm.Certificate", "cert"),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -1864,7 +1867,7 @@ mod tests {
 
         let original = Effect::Wait {
             binding: "cert_issued".to_string(),
-            target_id: ResourceId::new("acm.Certificate", "cert"),
+            target_id: ResourceId::with_identity("acm.Certificate", "cert"),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -1895,7 +1898,7 @@ mod tests {
     fn as_basic_narrows_to_create_update_and_delete_only() {
         use crate::resource::State as ResState;
 
-        let rid = ResourceId::new("test", "x");
+        let rid = ResourceId::with_identity("test", "x");
 
         // Basic variants must narrow.
         let create = Effect::Create(Resource::new("test", "x"));
@@ -1954,7 +1957,7 @@ mod tests {
         let remove = Effect::Remove { id: rid.clone() };
         let mov = Effect::Move {
             from: rid.clone(),
-            to: ResourceId::new("test", "y"),
+            to: ResourceId::with_identity("test", "y"),
         };
         let wait = Effect::Wait {
             binding: "w".to_string(),

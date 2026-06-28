@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 #[test]
 fn diff_create_when_not_exists() {
     let desired = Resource::new("bucket", "test");
-    let current = State::not_found(ResourceId::new("bucket", "test"));
+    let current = State::not_found(ResourceId::with_identity("bucket", "test"));
 
     let result = diff(&desired, &current, None, None, None);
     assert!(matches!(result, Diff::Create(_)));
@@ -24,7 +24,7 @@ fn diff_no_change_when_same() {
         "region".to_string(),
         Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
     );
-    let current = State::existing(ResourceId::new("bucket", "test"), attrs);
+    let current = State::existing(ResourceId::with_identity("bucket", "test"), attrs);
 
     let result = diff(&desired, &current, None, None, None);
     assert!(matches!(result, Diff::NoChange(_)));
@@ -42,7 +42,7 @@ fn diff_update_when_different() {
         "region".to_string(),
         Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
     );
-    let current = State::existing(ResourceId::new("bucket", "test"), attrs);
+    let current = State::existing(ResourceId::with_identity("bucket", "test"), attrs);
 
     let result = diff(&desired, &current, None, None, None);
     match result {
@@ -114,8 +114,11 @@ fn create_plan_from_resources() {
         Value::Concrete(ConcreteValue::Bool(false)),
     );
     current_states.insert(
-        ResourceId::new("bucket", "existing-bucket"),
-        State::existing(ResourceId::new("bucket", "existing-bucket"), attrs),
+        ResourceId::with_identity("bucket", "existing-bucket"),
+        State::existing(
+            ResourceId::with_identity("bucket", "existing-bucket"),
+            attrs,
+        ),
     );
 
     let plan = create_plan(
@@ -214,7 +217,7 @@ fn diff_update_when_list_of_maps_changed() {
         )])),
     );
     let current = State::existing(
-        ResourceId::new("ec2_security_group", "test-sg"),
+        ResourceId::with_identity("ec2_security_group", "test-sg"),
         current_attrs,
     );
 
@@ -241,8 +244,11 @@ fn create_plan_detects_orphaned_resources_for_deletion() {
     let mut current_states = HashMap::new();
     // "keep-this" exists and matches
     current_states.insert(
-        ResourceId::new("bucket", "keep-this"),
-        State::existing(ResourceId::new("bucket", "keep-this"), HashMap::new()),
+        ResourceId::with_identity("bucket", "keep-this"),
+        State::existing(
+            ResourceId::with_identity("bucket", "keep-this"),
+            HashMap::new(),
+        ),
     );
     // "orphaned-bucket" exists in state but not in desired
     let mut orphan_attrs = HashMap::new();
@@ -251,8 +257,11 @@ fn create_plan_detects_orphaned_resources_for_deletion() {
         Value::Concrete(ConcreteValue::String("orphaned-bucket".to_string())),
     );
     current_states.insert(
-        ResourceId::new("bucket", "orphaned-bucket"),
-        State::existing(ResourceId::new("bucket", "orphaned-bucket"), orphan_attrs),
+        ResourceId::with_identity("bucket", "orphaned-bucket"),
+        State::existing(
+            ResourceId::with_identity("bucket", "orphaned-bucket"),
+            orphan_attrs,
+        ),
     );
 
     let plan = create_plan(
@@ -303,8 +312,11 @@ fn read_only_resource_always_generates_read_effect() {
         Value::Concrete(ConcreteValue::String("existing-bucket".to_string())),
     );
     current_states.insert(
-        ResourceId::new("bucket", "existing-bucket"),
-        State::existing(ResourceId::new("bucket", "existing-bucket"), attrs),
+        ResourceId::with_identity("bucket", "existing-bucket"),
+        State::existing(
+            ResourceId::with_identity("bucket", "existing-bucket"),
+            attrs,
+        ),
     );
 
     let plan = create_plan(
@@ -342,7 +354,7 @@ fn no_false_update_without_name_attribute() {
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
-    let current = State::existing(ResourceId::new("ec2.Vpc", "vpc"), attrs);
+    let current = State::existing(ResourceId::with_identity("ec2.Vpc", "vpc"), attrs);
 
     let result = diff(&desired, &current, None, None, None);
     assert!(
@@ -368,8 +380,8 @@ fn replace_when_create_only_attr_changed() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     current_states.insert(
-        ResourceId::new("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
+        ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
     );
 
     // Build schema with cidr_block marked as create-only
@@ -421,8 +433,8 @@ fn normal_update_when_non_create_only_attr_changed() {
         Value::Concrete(ConcreteValue::Bool(false)),
     );
     current_states.insert(
-        ResourceId::new("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
+        ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
     );
 
     // cidr_block is create-only, but enable_dns_support is not
@@ -485,8 +497,8 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
         Value::Concrete(ConcreteValue::Bool(false)),
     );
     current_states.insert(
-        ResourceId::new("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
+        ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -544,8 +556,8 @@ fn replace_carries_create_before_destroy_directives() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     current_states.insert(
-        ResourceId::new("ec2.Vpc", "my-vpc"),
-        State::existing(ResourceId::new("ec2.Vpc", "my-vpc"), attrs),
+        ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
     );
 
     let mut schemas = SchemaRegistry::new();
@@ -631,7 +643,7 @@ fn diff_no_change_when_list_of_maps_reordered() {
         ])),
     );
     let current = State::existing(
-        ResourceId::new("ec2_security_group", "test-sg"),
+        ResourceId::with_identity("ec2_security_group", "test-sg"),
         current_attrs,
     );
 
@@ -663,9 +675,9 @@ fn replace_with_provider_prefixed_schema_key() {
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
     current_states.insert(
-        ResourceId::with_provider("awscc", "ec2.Vpc", "my-vpc", None),
+        ResourceId::with_provider_identity("awscc", "ec2.Vpc", "my-vpc", None),
         State::existing(
-            ResourceId::with_provider("awscc", "ec2.Vpc", "my-vpc", None),
+            ResourceId::with_provider_identity("awscc", "ec2.Vpc", "my-vpc", None),
             attrs,
         ),
     );
@@ -734,7 +746,10 @@ fn diff_no_change_when_struct_has_extra_fields_with_saved() {
             ),
         ]))),
     )]);
-    let current = State::existing(ResourceId::new("ec2.Subnet", "test-subnet"), current_attrs);
+    let current = State::existing(
+        ResourceId::with_identity("ec2.Subnet", "test-subnet"),
+        current_attrs,
+    );
 
     let saved = IndexMap::from([
         (
@@ -798,7 +813,10 @@ fn diff_detects_drift_on_unmanaged_field() {
             ),
         ]))),
     )]);
-    let current = State::existing(ResourceId::new("ec2.Subnet", "test-subnet"), current_attrs);
+    let current = State::existing(
+        ResourceId::with_identity("ec2.Subnet", "test-subnet"),
+        current_attrs,
+    );
 
     let saved = IndexMap::from([
         (
@@ -864,7 +882,10 @@ fn diff_no_change_when_bare_struct_with_extra_fields() {
             ),
         ]))),
     )]);
-    let current = State::existing(ResourceId::new("ec2.Subnet", "test-subnet"), current_attrs);
+    let current = State::existing(
+        ResourceId::with_identity("ec2.Subnet", "test-subnet"),
+        current_attrs,
+    );
 
     // Saved state has the same Map with extra fields
     let saved_map = HashMap::from([(
@@ -915,7 +936,10 @@ fn diff_works_without_saved_state() {
             ("c".to_string(), Value::Concrete(ConcreteValue::Int(3))),
         ]))),
     )]);
-    let current = State::existing(ResourceId::new("ec2.Subnet", "test-subnet"), current_attrs);
+    let current = State::existing(
+        ResourceId::with_identity("ec2.Subnet", "test-subnet"),
+        current_attrs,
+    );
 
     // Without saved state, the map comparison uses semantically_equal which
     // checks both key count AND values. Since desired map has 2 keys and current
@@ -945,8 +969,11 @@ fn orphan_delete_preserves_binding_and_dependencies() {
         Value::resource_ref("my_vpc".to_string(), "vpc_id".to_string(), vec![]),
     );
     current_states.insert(
-        ResourceId::new("subnet", "my-subnet"),
-        State::existing(ResourceId::new("subnet", "my-subnet"), orphan_attrs),
+        ResourceId::with_identity("subnet", "my-subnet"),
+        State::existing(
+            ResourceId::with_identity("subnet", "my-subnet"),
+            orphan_attrs,
+        ),
     );
 
     let plan = create_plan(
@@ -1139,7 +1166,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
         ])),
     )]);
     let current = State::existing(
-        ResourceId::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None),
+        ResourceId::with_provider_identity("awscc", "ec2.SecurityGroup", "test-sg", None),
         current_attrs,
     );
 
@@ -1289,7 +1316,7 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
             Value::Concrete(ConcreteValue::List(vec![item_a.clone(), item_b.clone()])),
         );
     let current = State::existing(
-        ResourceId::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None),
+        ResourceId::with_provider_identity("awscc", "ec2.SecurityGroup", "test-sg", None),
         HashMap::from([(
             "security_group_egress".to_string(),
             // AWS returns items in reversed order
@@ -1381,7 +1408,7 @@ fn diff_no_change_for_compound_word_dsl_alias() {
         )),
     );
     let current = State::existing(
-        ResourceId::with_provider("aws", "s3.BucketOwnershipControls", "test", None),
+        ResourceId::with_provider_identity("aws", "s3.BucketOwnershipControls", "test", None),
         attrs,
     );
 

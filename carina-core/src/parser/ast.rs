@@ -9,7 +9,7 @@ use super::util::snake_to_pascal;
 use crate::binding_index::IterableBindings;
 use crate::resource::{
     Composition, ConcreteValue, DataSource, DeferredValue, Directives, GraphNode, LeafNode,
-    Resource, ResourceId, UnknownReason, Value,
+    Resource, ResourceId, ResourceIdentity, UnknownReason, Value,
 };
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
@@ -575,7 +575,7 @@ impl ExportParamLike for ParsedExportParam {
 /// use carina_core::resource::ResourceId;
 ///
 /// let addr = StateBlockAddress::new("aws", "route53.RecordSet", "r");
-/// let routed = ResourceId::with_provider(
+/// let routed = ResourceId::with_provider_identity(
 ///     "aws",
 ///     "route53.RecordSet",
 ///     "r",
@@ -592,7 +592,7 @@ impl ExportParamLike for ParsedExportParam {
 pub struct StateBlockAddress {
     pub provider: String,
     pub resource_type: String,
-    pub name: crate::resource::ResourceName,
+    pub name: crate::resource::ResourceIdentity,
 }
 
 impl StateBlockAddress {
@@ -615,7 +615,7 @@ impl StateBlockAddress {
         Self {
             provider: provider.into(),
             resource_type: resource_type.into(),
-            name: crate::resource::ResourceName::from_string(canonical),
+            name: crate::resource::ResourceIdentity::new(canonical),
         }
     }
 
@@ -649,7 +649,7 @@ impl StateBlockAddress {
     /// method as a shortcut. Doing so re-introduces the carina#3324
     /// bug class.
     pub fn to_unrouted_resource_id(&self) -> crate::resource::ResourceId {
-        crate::resource::ResourceId::with_provider(
+        crate::resource::ResourceId::with_provider_identity(
             &self.provider,
             &self.resource_type,
             self.name_str(),
@@ -1567,7 +1567,9 @@ fn build_expanded_child(
     item: &Value,
 ) -> Resource {
     let mut resource = deferred.template_resource.clone();
-    resource.id.set_name(address.clone());
+    resource
+        .id
+        .set_identity(ResourceIdentity::new(address.clone()));
     resource.binding = Some(address);
     resource
         .dependency_bindings
@@ -1698,7 +1700,7 @@ mod substitute_placeholder_tests {
         parsed.data_sources.push(data_source);
 
         parsed.compositions.push(Composition {
-            id: ResourceId::new("_virtual", "composition_node"),
+            id: ResourceId::with_identity("_virtual", "composition_node"),
             signature: Signature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),

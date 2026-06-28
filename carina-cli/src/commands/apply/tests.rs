@@ -91,7 +91,7 @@ impl Provider for FailBCreateProvider {
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
         let id = id.clone();
         Box::pin(async move {
-            if id.name_str() == "b" {
+            if id.identity_or_empty() == "b" {
                 return Err(ProviderError::api_error("create failed").for_resource(id));
             }
             let resource = request.resource.as_resource().clone();
@@ -536,8 +536,12 @@ fn build_state_after_apply_preserves_block_name_attribute() {
 
     // Now simulate second plan: build_saved_attrs should return the policies
     let saved_attrs = state.build_saved_attrs();
-    let id =
-        carina_core::resource::ResourceId::with_provider("awscc", "iam.role", "test-role", None);
+    let id = carina_core::resource::ResourceId::with_provider_identity(
+        "awscc",
+        "iam.role",
+        "test-role",
+        None,
+    );
     let attrs = saved_attrs.get(&id).unwrap();
     assert!(
         attrs.contains_key("policies"),
@@ -767,8 +771,12 @@ fn block_name_attribute_state_roundtrip() {
 
     // Verify roundtrip through saved_attrs
     let saved_attrs = state.build_saved_attrs();
-    let id =
-        carina_core::resource::ResourceId::with_provider("awscc", "ec2.ipam", "test-ipam", None);
+    let id = carina_core::resource::ResourceId::with_provider_identity(
+        "awscc",
+        "ec2.ipam",
+        "test-ipam",
+        None,
+    );
     let attrs = saved_attrs.get(&id).unwrap();
     let operating_regions = attrs
         .get("operating_regions")
@@ -824,7 +832,7 @@ fn move_plus_replace_keeps_post_replace_identifier_and_attributes() {
     // Desired resource lives at the post-rename SimHash address with
     // the post-rename role_name + policy_name (the values the user
     // wrote in .crn after the IAM Role rename).
-    let new_id = ResourceId::with_provider(
+    let new_id = ResourceId::with_provider_identity(
         "awscc",
         "iam.RolePolicy",
         "rd.awscc_iam_role_policy_0cd2c914",
@@ -835,7 +843,7 @@ fn move_plus_replace_keeps_post_replace_identifier_and_attributes() {
         ..Resource::with_provider(
             new_id.provider.clone(),
             new_id.resource_type.clone(),
-            new_id.name.as_str(),
+            new_id.identity_or_empty(),
             None,
         )
     };
@@ -911,7 +919,7 @@ fn move_plus_replace_keeps_post_replace_identifier_and_attributes() {
     // Plan has Replace (handled via applied_states in Phase 1) plus
     // Move from the old address to the new one (Phase 2).
     let mut plan = Plan::new();
-    let from_id = ResourceId::with_provider(
+    let from_id = ResourceId::with_provider_identity(
         "awscc",
         "iam.RolePolicy",
         "rd.awscc_iam_role_policy_02942703",
@@ -1007,7 +1015,7 @@ fn move_plus_update_keeps_post_update_attributes() {
         .attribute(AttributeSchema::new("value", AttributeType::string()));
     schemas.insert("awscc", schema);
 
-    let new_id = ResourceId::with_provider("awscc", "ec2.Tag", "tag_new", None);
+    let new_id = ResourceId::with_provider_identity("awscc", "ec2.Tag", "tag_new", None);
     let mut resource = Resource::with_provider("awscc", "ec2.Tag", "tag_new", None);
     resource.set_attr(
         "key".to_string(),
@@ -1041,7 +1049,7 @@ fn move_plus_update_keeps_post_update_attributes() {
     state_file.resources.push(old_row);
 
     let mut plan = Plan::new();
-    let from_id = ResourceId::with_provider("awscc", "ec2.Tag", "tag_old", None);
+    let from_id = ResourceId::with_provider_identity("awscc", "ec2.Tag", "tag_old", None);
     plan.add(Effect::Update {
         id: new_id.clone(),
         from: Box::new(State::existing(from_id.clone(), HashMap::new())),
@@ -1098,7 +1106,7 @@ fn move_alone_carries_attributes_via_current_states() {
             .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only()),
     );
 
-    let new_id = ResourceId::with_provider("awscc", "s3.Bucket", "bucket_new", None);
+    let new_id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "bucket_new", None);
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "bucket_new", None);
     resource.set_attr(
         "bucket_name".to_string(),
@@ -1118,7 +1126,7 @@ fn move_alone_carries_attributes_via_current_states() {
 
     // State file still has the pre-move address — that's what the
     // Move's `from` cleanup targets.
-    let from_id = ResourceId::with_provider("awscc", "s3.Bucket", "bucket_old", None);
+    let from_id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "bucket_old", None);
     let old_row = ResourceState::new("s3.Bucket", "bucket_old", "awscc")
         .with_identifier("my-bucket")
         .with_attribute("bucket_name", serde_json::Value::String("my-bucket".into()));
@@ -1175,8 +1183,8 @@ fn move_with_absent_from_is_no_op() {
     use carina_state::StateFile;
 
     let schemas = SchemaRegistry::new();
-    let from_id = ResourceId::with_provider("awscc", "s3.Bucket", "stale_from", None);
-    let to_id = ResourceId::with_provider("awscc", "s3.Bucket", "stale_to", None);
+    let from_id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "stale_from", None);
+    let to_id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "stale_to", None);
 
     let mut plan = Plan::new();
     plan.add(Effect::Move {
@@ -1215,7 +1223,7 @@ fn failed_refresh_preserves_existing_row() {
             .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only()),
     );
 
-    let id = ResourceId::with_provider("awscc", "s3.Bucket", "stuck", None);
+    let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "stuck", None);
     let resource = Resource::with_provider("awscc", "s3.Bucket", "stuck", None);
     let sorted_resources = vec![resource];
 
@@ -1268,7 +1276,7 @@ fn move_from_overlapping_desired_resource_errors() {
             .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only()),
     );
 
-    let id = ResourceId::with_provider("awscc", "s3.Bucket", "collision", None);
+    let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "collision", None);
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "collision", None);
     resource.set_attr(
         "bucket_name".to_string(),
@@ -1282,7 +1290,7 @@ fn move_from_overlapping_desired_resource_errors() {
         State::existing(id.clone(), HashMap::new()).with_identifier("x"),
     );
 
-    let to_id = ResourceId::with_provider("awscc", "s3.Bucket", "elsewhere", None);
+    let to_id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "elsewhere", None);
     let mut plan = Plan::new();
     plan.add(Effect::Move {
         from: id.clone(),
@@ -1326,7 +1334,7 @@ fn remove_overlapping_desired_resource_errors() {
             .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only()),
     );
 
-    let id = ResourceId::with_provider("awscc", "s3.Bucket", "collision", None);
+    let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "collision", None);
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "collision", None);
     resource.set_attr(
         "bucket_name".to_string(),
@@ -1378,7 +1386,7 @@ fn self_move_overlapping_desired_resource_errors() {
             .attribute(AttributeSchema::new("bucket_name", AttributeType::string()).create_only()),
     );
 
-    let id = ResourceId::with_provider("awscc", "s3.Bucket", "self", None);
+    let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "self", None);
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "self", None);
     resource.set_attr(
         "bucket_name".to_string(),
@@ -1569,7 +1577,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         )),
     );
     let composition = Composition {
-        id: carina_core::resource::ResourceId::new("_virtual", "github_actions_carina"),
+        id: carina_core::resource::ResourceId::with_identity("_virtual", "github_actions_carina"),
         signature: carina_core::resource::Signature {
             arguments: indexmap::IndexMap::new(),
             attributes: virt_attrs,
@@ -1672,7 +1680,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
             )),
         );
         Composition {
-            id: carina_core::resource::ResourceId::new("_virtual", id_name),
+            id: carina_core::resource::ResourceId::with_identity("_virtual", id_name),
             signature: carina_core::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes,
@@ -1819,7 +1827,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // pipeline resolver sees. Holds the OLD ARN, so the pre-apply
     // pass freezes composition `role_arn` to OLD_ARN.
     let pre_apply_current_states: HashMap<ResourceId, ResourceState> = {
-        let id = ResourceId::with_provider("awscc", "iam.Role", "carina_role", None);
+        let id = ResourceId::with_provider_identity("awscc", "iam.Role", "carina_role", None);
         let mut attrs: HashMap<String, Value> = HashMap::new();
         attrs.insert(
             "arn".to_string(),
@@ -1851,7 +1859,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         )),
     );
     let composition = Composition {
-        id: ResourceId::new("_virtual", "carina_module"),
+        id: ResourceId::with_identity("_virtual", "carina_module"),
         signature: carina_core::resource::Signature {
             arguments: indexmap::IndexMap::new(),
             attributes: virt_attrs,
@@ -1969,7 +1977,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     };
 
     // The authored data source: `let admin_access_roles = read aws.iam.Roles { ... }`.
-    let ds_id = ResourceId::with_provider("aws", "iam.Roles", "admin_access_roles", None);
+    let ds_id = ResourceId::with_provider_identity("aws", "iam.Roles", "admin_access_roles", None);
     let mut ds = DataSource::with_provider("aws", "iam.Roles", "admin_access_roles", None);
     ds.binding = Some("admin_access_roles".to_string());
     ds.attributes.insert(

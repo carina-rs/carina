@@ -22,7 +22,7 @@ fn depends_on_resolves_across_sibling_files_in_directory() {
     let bucket = parsed
         .resources
         .iter()
-        .find(|r| r.id.name.as_str() == "bucket")
+        .find(|r| r.id.identity_or_empty() == "bucket")
         .expect("bucket binding should be present");
 
     let deps = get_resource_dependencies(bucket);
