@@ -80,6 +80,60 @@ that this is exactly the convention-only fix the rule forbids.)
 > of landing in the same PR. The lesson: apply *both* lenses at PR
 > creation, not after the user asks.
 
+### Don't use `name` (or any user-supplied attribute) as an identity
+
+A resource's `name` is **a user-facing attribute**, not its identity.
+Anonymous resources without a name, anonymous resources whose `name`
+attribute is unresolved (`Value::Unknown`, deferred refs), and resources
+whose `name` is empty by construction can all coexist in a single plan.
+Any data structure that keys on `name` collapses these into the same
+slot and produces silent, often catastrophic, mis-scheduling — the
+classic "two anonymous resources collide and one Delete eats the other's
+edge" bug.
+
+The rule: **never use `name` (or any other user-supplied attribute) as
+the identity component of a scheduler key, plan-diff key, state-lookup
+key, or any other equality-bearing position.** The identity of an effect
+or resource is what the *system* assigns (the parser's resource address,
+the state row's UUID/lineage, a routing tag), not what the *user*
+types into a `name = "..."` slot.
+
+Concretely:
+
+- A `BindingKey::Anonymous`-style enum variant must not contain a
+  `name: String` field sourced from the user-facing `name` attribute.
+  Carry the system-assigned identity (a `ResourceAddress`, a
+  state lineage, a parser-assigned ordinal — pick what the surrounding
+  type already guarantees is unique) instead.
+- If the existing identity type (`ResourceId`, `ResourceName`, etc.)
+  *itself* permits a "pending / unresolved" state at the point a
+  scheduler/state/diff consumer holds it, that is the bug to fix first.
+  Split the type so the consumer can only hold the resolved variant —
+  do not paper over with a runtime "must be Bound" assertion in the
+  consumer.
+- Do not justify the shortcut with "scope" or "blast radius". If
+  reaching a name-free identity requires reshaping `ResourceId` itself
+  or introducing a `ResolvedResourceId` newtype, do that in the same
+  PR. "It would balloon the PR" is exactly the failure mode the prior
+  rule forbids.
+- Same rule applies to plan / state / diff keys, not just scheduler
+  keys: an `HashMap<String, _>` keyed on a name attribute, a
+  `BTreeSet<String>` of "resource names this depends on", a Display
+  impl that round-trips through a name and is compared elsewhere —
+  all of these are the same bug in disguise.
+
+Past failure mode (Phase 1 of carina#3625 — PR #3630, closed):
+`BindingKey::Anonymous { resource_type, name }` was sourced from
+`ResourceId::name_str()`, which for `ResourceName::Pending` returns
+`""`. Two anonymous resources of the same type without a resolved
+`name` would hash to the same key and silently share scheduling slots.
+The fix shipped in Phase 1 redo: drop the `name` field, carry the
+resource's system-assigned identity (`ResourceId` or a split type
+that guarantees resolved-only) instead. The lesson: the moment the
+type signature says `name: String`, ask "does this slot ever
+participate in equality?" — if yes, it is identity, and `name` is the
+wrong source.
+
 ## Delegate hands-on work to Codex
 
 Work that edits files — implementation, refactoring, and plan-writing —
