@@ -29,7 +29,7 @@ fn plain_text_command(bin: &str) -> Command {
 }
 
 /// Write a minimal local-backend project plus a hand-authored v6
-/// state file so the very next `carina plan` triggers a v6 → v7
+/// state file so the very next `carina plan` triggers a v6 → current
 /// in-memory migration.
 fn init_project_with_v6_state(dir: &std::path::Path) {
     fs::write(

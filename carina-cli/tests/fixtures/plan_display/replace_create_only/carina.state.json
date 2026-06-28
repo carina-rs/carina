@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "test.Widget",
-      "name": "alpha",
+      "identity": "alpha",
       "provider": "test",
       "identifier": "widget-alpha-live",
       "attributes": {
@@ -32,7 +32,7 @@
     },
     {
       "resource_type": "test.Widget",
-      "name": "beta",
+      "identity": "beta",
       "provider": "test",
       "identifier": "widget-beta-live",
       "attributes": {

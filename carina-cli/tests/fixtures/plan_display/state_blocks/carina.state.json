@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "ec2.Subnet",
-      "name": "legacy-subnet",
+      "identity": "legacy-subnet",
       "provider": "awscc",
       "identifier": "subnet-0abc123",
       "attributes": {
@@ -29,7 +29,7 @@
     },
     {
       "resource_type": "ec2.SecurityGroup",
-      "name": "old-sg",
+      "identity": "old-sg",
       "provider": "awscc",
       "identifier": "sg-0abc123",
       "attributes": {

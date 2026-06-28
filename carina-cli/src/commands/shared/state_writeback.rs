@@ -105,7 +105,7 @@ impl PostApplyStates {
             let id = ResourceId::with_provider_name_compat(
                 &rs.provider,
                 &rs.resource_type,
-                &rs.name,
+                &rs.identity,
                 rs.directives.provider_instance.clone(),
             );
             let attrs: HashMap<String, carina_core::resource::Value> = rs
@@ -919,7 +919,7 @@ mod apply_state_save_tests {
                 .iter()
                 .any(|row| row.provider == child_id.provider
                     && row.resource_type == child_id.resource_type
-                    && row.name == "validation_records[0]"),
+                    && row.identity == "validation_records[0]"),
             "runtime-synthesized child must be persisted in state"
         );
     }

@@ -88,11 +88,11 @@ fn complete_state_lookup(current: &OsStr) -> Vec<CompletionCandidate> {
 ///
 /// Three candidate spaces are produced (carina#3338):
 ///
-/// - **Resource bindings / names**: surface every binding the state
+/// - **Resource bindings / identities**: surface every binding the state
 ///   carries — module-prefixed (`r.distribution`) shows up as one
 ///   candidate, just like `state list` already prints it. No splitting
-///   on `.`; matched by `starts_with(current)`. (Top-level names with
-///   no binding fall back to `rs.name`.)
+///   on `.`; matched by `starts_with(current)`. (Top-level identities
+///   with no binding fall back to `rs.identity`.)
 /// - **`exports.<key>`** when the partial starts with `exports.` and
 ///   no resource binding `exports` shadows it.
 /// - **`exports`** as a top-level candidate when the state has any
@@ -132,10 +132,10 @@ fn complete_state_lookup_from(state: &StateFile, current: &str) -> Vec<Completio
             .collect();
     }
 
-    // Top-level: resource bindings/names + optional `exports`.
+    // Top-level: resource bindings/identities + optional `exports`.
     let mut candidates: Vec<CompletionCandidate> = Vec::new();
     for rs in &state.resources {
-        let display_name = rs.binding.as_deref().unwrap_or(&rs.name);
+        let display_name = rs.binding.as_deref().unwrap_or(&rs.identity);
         if display_name.starts_with(current) {
             candidates.push(CompletionCandidate::new(display_name));
         }
@@ -361,7 +361,7 @@ async fn load_state_file(
 }
 
 /// Find a resource by binding name first, then fall back to resource
-/// name. Retained for test coverage of the precedence rule; production
+/// identity. Retained for test coverage of the precedence rule; production
 /// lookup uses [`resolve_resource_address`] which generalizes this with
 /// longest-prefix matching for module-prefixed bindings (carina#3338).
 #[cfg(test)]
@@ -372,8 +372,8 @@ fn find_resource_by_query<'a>(state: &'a StateFile, name: &str) -> Option<&'a Re
         .iter()
         .find(|r| r.binding.as_deref() == Some(name))
         .or_else(|| {
-            // Fall back to name
-            state.resources.iter().find(|r| r.name == name)
+            // Fall back to identity
+            state.resources.iter().find(|r| r.identity == name)
         })
 }
 
@@ -383,7 +383,7 @@ fn format_state_list(state: &StateFile) -> Vec<String> {
         .resources
         .iter()
         .map(|rs| {
-            let display_name = rs.binding.as_deref().unwrap_or(&rs.name);
+            let display_name = rs.binding.as_deref().unwrap_or(&rs.identity);
             format!("{}.{} {}", rs.provider, rs.resource_type, display_name)
         })
         .collect()
@@ -517,13 +517,13 @@ fn resolve_resource_address<'a>(
 }
 
 /// Candidate addresses for a resource, paired with `is_binding` so the
-/// longest-prefix tie-break can prefer bindings over names.
+/// longest-prefix tie-break can prefer bindings over identities.
 fn candidate_addresses(rs: &ResourceState) -> impl Iterator<Item = (&str, bool)> {
     rs.binding
         .as_deref()
         .map(|b| (b, true))
         .into_iter()
-        .chain(std::iter::once((rs.name.as_str(), false)))
+        .chain(std::iter::once((rs.identity.as_str(), false)))
 }
 
 /// `true` if `query` is exactly `address` or starts with `address` + '.'.
@@ -550,7 +550,7 @@ fn format_resource_value(
 ) -> Result<String, AppError> {
     match attribute {
         Some(attr) => {
-            let display_name = rs.binding.as_deref().unwrap_or(&rs.name);
+            let display_name = rs.binding.as_deref().unwrap_or(&rs.identity);
             let value = rs.attributes.get(attr).ok_or_else(|| {
                 AppError::Config(format!(
                     "Attribute '{}' not found on resource '{}'.",
@@ -595,7 +595,7 @@ fn build_plan_from_state(state: &StateFile) -> Plan {
         let mut resource = carina_core::resource::DataSource::with_provider(
             &rs.provider,
             &rs.resource_type,
-            &rs.name,
+            &rs.identity,
             rs.directives.provider_instance.clone(),
         );
         resource.directives = rs.directives.clone();
@@ -618,14 +618,14 @@ fn build_plan_from_state(state: &StateFile) -> Plan {
 
 /// Format state show output (non-TUI mode).
 ///
-/// Shows all resources with their type, name/binding, and full attributes.
+/// Shows all resources with their type, identity/binding, and full attributes.
 fn format_state_show(state: &StateFile) -> String {
     let mut output = String::new();
     for (i, rs) in state.resources.iter().enumerate() {
         if i > 0 {
             output.push('\n');
         }
-        let display_name = rs.binding.as_deref().unwrap_or(&rs.name);
+        let display_name = rs.binding.as_deref().unwrap_or(&rs.identity);
         output.push_str(&format!(
             "# {}.{} ({})\n",
             rs.provider, rs.resource_type, display_name
@@ -899,8 +899,8 @@ pub(crate) async fn run_state_refresh_locked(
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
 
-    // Read current state from backend. carina#3315: persist any v6→v7
-    // schema migration under the refresh lock before the "no
+    // Read current state from backend. carina#3315: persist any older-schema
+    // migration under the refresh lock before the "no
     // resources" short-circuit returns — see
     // `apply::load_state_persist_if_migrated`. The on-disk version
     // must advance so the carina#3283 warning text matches reality.
@@ -1045,7 +1045,7 @@ pub(crate) async fn run_state_refresh_locked(
                     let id = ResourceId::with_provider_name_compat(
                         &rs.provider,
                         &rs.resource_type,
-                        &rs.name,
+                        &rs.identity,
                         rs.directives.provider_instance.clone(),
                     );
                     if desired_ids.contains(&id) {
@@ -1446,7 +1446,7 @@ mod tests {
     fn find_resource_by_binding() {
         let state = load_fixture_state();
         let found = find_resource_by_query(&state, "vpc").unwrap();
-        assert_eq!(found.name, "my-vpc");
+        assert_eq!(found.identity, "my-vpc");
         assert_eq!(found.resource_type, "ec2.Vpc");
     }
 

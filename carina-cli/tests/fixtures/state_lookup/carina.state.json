@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "ec2.Vpc",
-      "name": "my-vpc",
+      "identity": "my-vpc",
       "provider": "awscc",
       "identifier": "vpc-0123456789abcdef0",
       "attributes": {
@@ -18,13 +18,16 @@
       "directives": {},
       "prefixes": {},
       "name_overrides": {},
-      "desired_keys": ["cidr_block", "enable_dns_support"],
+      "desired_keys": [
+        "cidr_block",
+        "enable_dns_support"
+      ],
       "binding": "vpc",
       "dependency_bindings": []
     },
     {
       "resource_type": "ec2.Subnet",
-      "name": "my-subnet",
+      "identity": "my-subnet",
       "provider": "awscc",
       "identifier": "subnet-0123456789abcdef0",
       "attributes": {
@@ -32,19 +35,28 @@
         "cidr_block": "10.0.1.0/24",
         "availability_zone": "ap-northeast-1a",
         "subnet_id": "subnet-0123456789abcdef0",
-        "tags": { "Name": "test-subnet" }
+        "tags": {
+          "Name": "test-subnet"
+        }
       },
       "protected": false,
       "directives": {},
       "prefixes": {},
       "name_overrides": {},
-      "desired_keys": ["vpc_id", "cidr_block", "availability_zone", "tags"],
+      "desired_keys": [
+        "vpc_id",
+        "cidr_block",
+        "availability_zone",
+        "tags"
+      ],
       "binding": "subnet",
-      "dependency_bindings": ["vpc"]
+      "dependency_bindings": [
+        "vpc"
+      ]
     },
     {
       "resource_type": "ec2.RouteTable",
-      "name": "main-rt",
+      "identity": "main-rt",
       "provider": "awscc",
       "identifier": "rtb-0123456789abcdef0",
       "attributes": {
@@ -55,9 +67,13 @@
       "directives": {},
       "prefixes": {},
       "name_overrides": {},
-      "desired_keys": ["vpc_id"],
+      "desired_keys": [
+        "vpc_id"
+      ],
       "binding": null,
-      "dependency_bindings": ["vpc"]
+      "dependency_bindings": [
+        "vpc"
+      ]
     }
   ]
 }

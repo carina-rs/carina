@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "network.Subnet",
-      "name": "subnet",
+      "identity": "subnet",
       "provider": "fixture",
       "identifier": "subnet-fixture",
       "attributes": {

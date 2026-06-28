@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "cloudfront.Distribution",
-      "name": "r-distribution",
+      "identity": "r-distribution",
       "provider": "awscc",
       "identifier": "E2E954VKWYKT8K",
       "attributes": {
@@ -22,7 +22,7 @@
     },
     {
       "resource_type": "route53.HostedZone",
-      "name": "r-zone",
+      "identity": "r-zone",
       "provider": "awscc",
       "identifier": "Z008131930MO3U3NYWJTM",
       "attributes": {
@@ -38,7 +38,7 @@
     },
     {
       "resource_type": "s3.Bucket",
-      "name": "registry-bucket",
+      "identity": "registry-bucket",
       "provider": "awscc",
       "identifier": "registry-content-dev",
       "attributes": {
@@ -55,6 +55,9 @@
   "exports": {
     "cloudfront_distribution_id": "E2E954VKWYKT8K",
     "zone_id": "Z008131930MO3U3NYWJTM",
-    "nameservers": ["ns-1234.awsdns-12.com", "ns-5678.awsdns-56.net"]
+    "nameservers": [
+      "ns-1234.awsdns-12.com",
+      "ns-5678.awsdns-56.net"
+    ]
   }
 }

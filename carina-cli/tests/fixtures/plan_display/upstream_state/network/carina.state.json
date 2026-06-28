@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "ec2.Vpc",
-      "name": "main-vpc",
+      "identity": "main-vpc",
       "provider": "awscc",
       "identifier": "vpc-abc123",
       "attributes": {
@@ -17,7 +17,9 @@
       "directives": {},
       "prefixes": {},
       "name_overrides": {},
-      "desired_keys": ["cidr_block"],
+      "desired_keys": [
+        "cidr_block"
+      ],
       "binding": "vpc",
       "dependency_bindings": []
     }

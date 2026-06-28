@@ -68,10 +68,10 @@ fn test_resource_state_protected() {
 #[test]
 fn test_resource_state_managed_state_bucket_shape() {
     // The seed must use the desired resource's resolved anonymous identifier
-    // as `name` (so the differ matches the seed against the desired resource)
+    // as `identity` (so the differ matches the seed against the desired resource)
     // AND set the AWS bucket name as `identifier`. Conflating the two
-    // reproduces #2533: phantom Delete on the seed's name plus phantom
-    // Create on the desired's name.
+    // reproduces #2533: phantom Delete on the seed's identity plus phantom
+    // Create on the desired's identity.
     let resource = ResourceState::managed_state_bucket(
         "aws",
         "s3.Bucket",
@@ -81,8 +81,8 @@ fn test_resource_state_managed_state_bucket_shape() {
     assert_eq!(resource.provider, "aws");
     assert_eq!(resource.resource_type, "s3.Bucket");
     assert_eq!(
-        resource.name, "aws_s3_bucket_a3f2b1c8",
-        "name must match the desired resource's anonymous identifier"
+        resource.identity, "aws_s3_bucket_a3f2b1c8",
+        "identity must match the desired resource's anonymous identifier"
     );
     assert_eq!(
         resource.identifier.as_deref(),
@@ -106,7 +106,7 @@ fn test_state_file_with_managed_state_bucket_contains_one_resource() {
     );
     assert_eq!(state.resources.len(), 1);
     let bucket = &state.resources[0];
-    assert_eq!(bucket.name, "aws_s3_bucket_a3f2b1c8");
+    assert_eq!(bucket.identity, "aws_s3_bucket_a3f2b1c8");
     assert_eq!(bucket.identifier.as_deref(), Some("my-state-bucket"));
     assert!(bucket.protected);
 }
@@ -224,6 +224,7 @@ fn test_resource_state_serialization_with_binding_and_deps() {
     }"#;
 
     let deserialized: ResourceState = serde_json::from_str(json).unwrap();
+    assert_eq!(deserialized.identity, "my-bucket");
     assert_eq!(deserialized.binding, Some("my_bucket".to_string()));
     assert_eq!(
         deserialized.dependency_bindings,
@@ -247,6 +248,7 @@ fn test_resource_state_deserialization_without_v3_fields() {
     }"#;
 
     let deserialized: ResourceState = serde_json::from_str(json).unwrap();
+    assert_eq!(deserialized.identity, "my-bucket");
     assert_eq!(deserialized.binding, None);
     assert!(deserialized.dependency_bindings.is_empty());
     assert!(deserialized.write_only_attributes.is_empty());
@@ -524,7 +526,7 @@ fn test_migrate_v6_empty_struct_to_unrecorded() {
     let rs = state
         .resources
         .iter()
-        .find(|r| r.name == "x")
+        .find(|r| r.identity == "x")
         .expect("test resource");
     assert!(
         matches!(rs.explicit, ExplicitFields::Unrecorded),
@@ -567,7 +569,11 @@ fn test_migrate_v6_preserves_populated_explicit() {
     let state = check_and_migrate(v6)
         .expect("migration should succeed")
         .into_state();
-    let rs = state.resources.iter().find(|r| r.name == "vpc").unwrap();
+    let rs = state
+        .resources
+        .iter()
+        .find(|r| r.identity == "vpc")
+        .unwrap();
     let ExplicitFields::Struct { children } = &rs.explicit else {
         panic!(
             "populated v6 Struct must survive migration, got {:?}",
@@ -616,7 +622,11 @@ fn test_migrate_v6_does_not_rewrite_nested_empty_struct() {
     let state = check_and_migrate(v6)
         .expect("migration should succeed")
         .into_state();
-    let rs = state.resources.iter().find(|r| r.name == "vpc").unwrap();
+    let rs = state
+        .resources
+        .iter()
+        .find(|r| r.identity == "vpc")
+        .unwrap();
     let ExplicitFields::Struct { children } = &rs.explicit else {
         panic!("expected top-level Struct, got {:?}", rs.explicit);
     };
@@ -882,9 +892,9 @@ fn test_build_orphan_dependencies() {
 }
 
 #[test]
-fn test_state_file_version_is_v7() {
+fn test_state_file_version_is_v8() {
     let state = StateFile::new();
-    assert_eq!(state.version, 7);
+    assert_eq!(state.version, 8);
 }
 
 #[test]
@@ -1083,12 +1093,16 @@ fn check_and_migrate_drops_artifact_rows_with_null_identifier_3266() {
     }"#;
 
     let state = check_and_migrate(json).expect("read").into_state();
-    let kept_names: Vec<&str> = state.resources.iter().map(|r| r.name.as_str()).collect();
+    let kept_identities: Vec<&str> = state
+        .resources
+        .iter()
+        .map(|r| r.identity.as_str())
+        .collect();
     assert_eq!(
-        kept_names,
+        kept_identities,
         vec!["log"],
         "identifier=None artifact rows must be pruned at read time; \
-         only managed resources with identifiers survive. Got: {kept_names:?}",
+         only managed resources with identifiers survive. Got: {kept_identities:?}",
     );
 }
 
@@ -1534,7 +1548,7 @@ fn build_remote_bindings_ignores_resource_bindings() {
     // Add a resource with a binding — should NOT appear in remote bindings
     state.resources.push(ResourceState {
         resource_type: "ec2.Vpc".to_string(),
-        name: "vpc_123".to_string(),
+        identity: "vpc_123".to_string(),
         provider: "awscc".to_string(),
         identifier: Some("vpc-123".to_string()),
         attributes: HashMap::from([(
@@ -1588,7 +1602,7 @@ fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
     );
     let state = check_and_migrate(&json).expect("load state").into_state();
     let r = &state.resources[0];
-    assert_eq!(r.name, "_accounts.registry_prod");
+    assert_eq!(r.identity, "_accounts.registry_prod");
     assert_eq!(r.binding.as_deref(), Some("_accounts.registry_prod"));
     let deps: Vec<&str> = r.dependency_bindings.iter().map(String::as_str).collect();
     assert!(deps.contains(&"other.a"));

@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "acm.Certificate",
-      "name": "orphan_cert",
+      "identity": "orphan_cert",
       "provider": "aws",
       "identifier": "arn:aws:acm:us-east-1:151116838382:certificate/3fc2dbff-d965-4533-aeac-9e9d85ac527a",
       "attributes": {

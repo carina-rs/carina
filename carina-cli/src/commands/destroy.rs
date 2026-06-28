@@ -150,8 +150,8 @@ async fn run_destroy_locked(
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
 
-    // Read current state from backend. carina#3315: persist any v6→v7
-    // schema migration under the destroy lock before any short-circuit
+    // Read current state from backend. carina#3315: persist any older-schema
+    // migration under the destroy lock before any short-circuit
     // (e.g. "No resources to destroy.") returns — see
     // `apply::load_state_persist_if_migrated`.
     let mut state_file =
@@ -170,7 +170,7 @@ async fn run_destroy_locked(
             &|provider, resource_type| {
                 sf.resources_by_type(provider, resource_type)
                     .into_iter()
-                    .map(|r| r.name.clone())
+                    .map(|r| r.identity.clone())
                     .collect()
             },
             &state_block_claims,
