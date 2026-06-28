@@ -99,7 +99,7 @@ let r1 = mock.test.resource {{
 }
 
 #[test]
-fn test_dbd_create_failure_cleans_up_old_state() {
+fn test_dbc_create_failure_cleans_up_old_state() {
     let scenario = Scenario::new();
     scenario.write_config();
     scenario.init();
@@ -118,7 +118,7 @@ fn test_dbd_create_failure_cleans_up_old_state() {
         serde_json::from_str(&fs::read_to_string(&scenario.state_path).unwrap()).unwrap();
     assert!(
         state.find_resource("mock", "test.resource", "r1").is_none(),
-        "DBD delete success + create failure must remove stale state row:\n{}",
+        "DBC delete success + create failure must remove stale state row:\n{}",
         fs::read_to_string(&scenario.state_path).unwrap()
     );
 

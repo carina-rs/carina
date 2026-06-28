@@ -644,7 +644,7 @@ impl<'a> WritebackPlan<'a> {
     /// Register a cleanup against `id`. Calling after `add_upsert(id)`
     /// returns `UpsertCleanupOverlap` when that upsert is an apply
     /// result. A stale `CurrentState` upsert can be superseded by
-    /// cleanup: that is the DBD "delete succeeded, create failed" shape.
+    /// cleanup: that is the DBC "delete succeeded, create failed" shape.
     /// Cleanup is idempotent.
     fn add_cleanup(&mut self, id: ResourceId) -> Result<(), WritebackConflict> {
         if let Some(upsert) = self.upserts.get(&id) {
@@ -1150,7 +1150,7 @@ mod apply_state_save_tests {
     }
 
     #[test]
-    fn dbd_delete_success_create_failure_cleans_up_current_state_upsert() {
+    fn dbc_delete_success_create_failure_cleans_up_current_state_upsert() {
         let id = ResourceId::with_provider("aws", "s3.Bucket", "bucket", None);
         let desired = Resource::with_provider("aws", "s3.Bucket", "bucket", None);
         let current_state =
@@ -1180,7 +1180,7 @@ mod apply_state_save_tests {
             &successfully_deleted,
             &failed_refreshes,
         )
-        .expect("DBD create failure must let delete cleanup win over stale current state");
+        .expect("DBC create failure must let delete cleanup win over stale current state");
 
         assert!(wb.upserts.is_empty());
         assert_eq!(wb.cleanups, HashSet::from([id]));
