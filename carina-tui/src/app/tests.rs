@@ -16,7 +16,10 @@ fn app_from_plan_with_effects() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(Resource::new("s3.Bucket", "my-bucket")));
     plan.add(Effect::Delete {
-        id: ResourceId::with_identity("s3.Bucket", "old-bucket"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "s3.Bucket",
+            "old-bucket",
+        )),
         identifier: "old-bucket-id".to_string(),
         directives: Directives::default(),
         binding: None,
@@ -41,7 +44,10 @@ fn app_from_plan_with_effects() {
 fn remove_effect_uses_non_failure_symbol_and_kind() {
     let mut plan = Plan::new();
     plan.add(Effect::Remove {
-        id: ResourceId::with_identity("aws.route53.RecordSet", "aws_route53_record_set_7059de08"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "aws.route53.RecordSet",
+            "aws_route53_record_set_7059de08",
+        )),
     });
 
     let app = App::new(&plan, &SchemaRegistry::new());
@@ -79,7 +85,10 @@ fn deferred_create_uses_create_symbol_and_kind() {
 
     let mut plan = Plan::new();
     plan.add(Effect::DeferredCreate {
-        id: ResourceId::with_identity("__deferred_for", "validation_records"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "__deferred_for",
+            "validation_records",
+        )),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
     });
@@ -127,7 +136,10 @@ fn navigation() {
 fn update_effect_has_detail_rows() {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: ResourceId::with_identity("s3.Bucket", "my-bucket"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "s3.Bucket",
+            "my-bucket",
+        )),
         from: Box::new(State::existing(
             ResourceId::with_identity("s3.Bucket", "my-bucket"),
             [(
@@ -214,7 +226,9 @@ fn replace_effect_symbols() {
 
     // create_before_destroy = true -> "+/-"
     plan.add(Effect::Replace {
-        id: ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "ec2.Vpc", "my-vpc",
+        )),
         from: from.clone(),
         to: Resource::new("ec2.Vpc", "my-vpc"),
         directives: Directives {
@@ -230,7 +244,9 @@ fn replace_effect_symbols() {
 
     // create_before_destroy = false -> "-/+"
     plan.add(Effect::Replace {
-        id: ResourceId::with_identity("ec2.Vpc", "my-vpc2"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "ec2.Vpc", "my-vpc2",
+        )),
         from,
         to: Resource::new("ec2.Vpc", "my-vpc2"),
         directives: Directives::default(),
@@ -733,12 +749,21 @@ fn move_suppressed_when_update_exists_for_same_target() {
     let mut plan = Plan::new();
     // Move from old name to new name
     plan.add(Effect::Move {
-        from: ResourceId::with_identity("s3.Bucket", "old-name"),
-        to: ResourceId::with_identity("s3.Bucket", "new-name"),
+        from: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "s3.Bucket",
+            "old-name",
+        )),
+        to: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "s3.Bucket",
+            "new-name",
+        )),
     });
     // Update for the same target
     plan.add(Effect::Update {
-        id: ResourceId::with_identity("s3.Bucket", "new-name"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "s3.Bucket",
+            "new-name",
+        )),
         from: Box::new(State::existing(
             ResourceId::with_identity("s3.Bucket", "new-name"),
             [(
@@ -765,11 +790,17 @@ fn move_suppressed_when_update_exists_for_same_target() {
 fn move_suppressed_when_replace_exists_for_same_target() {
     let mut plan = Plan::new();
     plan.add(Effect::Move {
-        from: ResourceId::with_identity("ec2.Vpc", "old-vpc"),
-        to: ResourceId::with_identity("ec2.Vpc", "new-vpc"),
+        from: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "ec2.Vpc", "old-vpc",
+        )),
+        to: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "ec2.Vpc", "new-vpc",
+        )),
     });
     plan.add(Effect::Replace {
-        id: ResourceId::with_identity("ec2.Vpc", "new-vpc"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "ec2.Vpc", "new-vpc",
+        )),
         from: Box::new(State::existing(
             ResourceId::with_identity("ec2.Vpc", "new-vpc"),
             [(
@@ -797,8 +828,14 @@ fn move_suppressed_when_replace_exists_for_same_target() {
 fn pure_move_not_suppressed() {
     let mut plan = Plan::new();
     plan.add(Effect::Move {
-        from: ResourceId::with_identity("s3.Bucket", "old-name"),
-        to: ResourceId::with_identity("s3.Bucket", "new-name"),
+        from: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "s3.Bucket",
+            "old-name",
+        )),
+        to: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "s3.Bucket",
+            "new-name",
+        )),
     });
 
     let app = App::new(&plan, &SchemaRegistry::new());

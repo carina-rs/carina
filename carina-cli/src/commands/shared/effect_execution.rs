@@ -47,7 +47,7 @@ pub(crate) async fn execute_import_effects(
                 Ok(state) => {
                     if state.exists {
                         println!("  {} Imported {}", "✓".green(), id);
-                        result.applied_states.insert(id.clone(), state);
+                        result.applied_states.insert(id.clone().into_inner(), state);
                         result.success_count += 1;
                     } else {
                         println!(
@@ -229,7 +229,7 @@ mod tests {
 
         let mut plan = Plan::new();
         plan.add(Effect::Import {
-            id: id.clone(),
+            id: carina_core::resource::ResolvedResourceId::new(id.clone()),
             identifier: deferred,
         });
 
@@ -259,7 +259,7 @@ mod tests {
         let id = ResourceId::with_identity("aws.s3.Bucket", "b");
         let mut plan = Plan::new();
         plan.add(Effect::Import {
-            id: id.clone(),
+            id: carina_core::resource::ResolvedResourceId::new(id.clone()),
             identifier: Value::Concrete(ConcreteValue::String("my-bucket".into())),
         });
 
@@ -283,8 +283,10 @@ mod tests {
         colored::control::set_override(true);
         let id =
             ResourceId::with_identity("aws.route53.RecordSet", "aws_route53_record_set_7059de08");
-        let line = format_state_only_effect_line(&Effect::Remove { id: id.clone() })
-            .expect("Remove must render a line");
+        let line = format_state_only_effect_line(&Effect::Remove {
+            id: carina_core::resource::ResolvedResourceId::new(id.clone()),
+        })
+        .expect("Remove must render a line");
         colored::control::unset_override();
 
         // No literal `x` or `✗` anywhere — the leading token and the
@@ -320,8 +322,8 @@ mod tests {
         let from = ResourceId::with_identity("aws.s3.Bucket", "old");
         let to = ResourceId::with_identity("aws.s3.Bucket", "new");
         let line = format_state_only_effect_line(&Effect::Move {
-            from: from.clone(),
-            to: to.clone(),
+            from: carina_core::resource::ResolvedResourceId::new(from.clone()),
+            to: carina_core::resource::ResolvedResourceId::new(to.clone()),
         })
         .expect("Move must render a line");
         colored::control::unset_override();

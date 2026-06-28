@@ -514,7 +514,7 @@ fn snapshot_delete_orphan() {
             if let carina_core::effect::Effect::Delete { id, .. } = e {
                 current_states
                     .get(id)
-                    .map(|s| (id.clone(), s.attributes.clone()))
+                    .map(|s| (id.clone().into_inner(), s.attributes.clone()))
             } else {
                 None
             }
@@ -551,7 +551,7 @@ fn snapshot_delete_orphan_list_of_maps() {
             if let carina_core::effect::Effect::Delete { id, .. } = e {
                 current_states
                     .get(id)
-                    .map(|s| (id.clone(), s.attributes.clone()))
+                    .map(|s| (id.clone().into_inner(), s.attributes.clone()))
             } else {
                 None
             }
@@ -879,7 +879,7 @@ fn snapshot_secret_values() {
             if let carina_core::effect::Effect::Delete { id, .. } = e {
                 current_states
                     .get(id)
-                    .map(|s| (id.clone(), s.attributes.clone()))
+                    .map(|s| (id.clone().into_inner(), s.attributes.clone()))
             } else {
                 None
             }

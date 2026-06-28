@@ -64,7 +64,7 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
     // Build a plan with Replace for VPC (create_before_destroy)
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: vpc_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: (vpc.clone().with_binding("vpc")),
         directives: Directives {
@@ -168,7 +168,7 @@ fn cascade_skips_resources_already_in_plan() {
     // Plan with both Replace for VPC and Update for subnet
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: vpc_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: (vpc.clone()),
         directives: Directives {
@@ -182,7 +182,7 @@ fn cascade_skips_resources_already_in_plan() {
         cascade_ref_hints: vec![],
     });
     plan.add(Effect::Update {
-        id: subnet_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(subnet_id.clone()),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
         to: (subnet.clone()),
         changed_attributes: vec!["cidr_block".to_string()],
@@ -245,7 +245,7 @@ fn cascade_no_op_without_create_before_destroy() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: vpc_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: (vpc.clone()),
         directives: Directives::default(), // create_before_destroy = false
@@ -343,7 +343,7 @@ fn cascade_transitive_dependencies() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: vpc_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: (vpc.clone()),
         directives: Directives {
@@ -428,7 +428,7 @@ fn cascade_anonymous_resource_dependent() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: vpc_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: (vpc.clone()),
         directives: Directives {
@@ -544,7 +544,7 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
     // Build a plan with Replace for VPC (create_before_destroy)
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: vpc_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: (vpc.clone().with_binding("vpc")),
         directives: Directives {
@@ -700,7 +700,7 @@ fn cascade_generates_replace_when_create_only_list_contains_nested_ref() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: vpc_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone().with_binding("vpc"),
         directives: Directives {
@@ -819,7 +819,7 @@ fn cascade_hint_prefers_resource_ref_over_binding_ref_in_mixed_list() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: vpc_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone().with_binding("vpc"),
         directives: Directives {
@@ -942,7 +942,7 @@ fn cascade_generates_replace_when_create_only_map_contains_nested_ref() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: vpc_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone().with_binding("vpc"),
         directives: Directives {
@@ -1074,7 +1074,7 @@ fn cascade_prevent_destroy_blocks_nested_map_ref_promotion_to_replace() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: vpc_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc.clone().with_binding("vpc"),
         directives: Directives {
@@ -1210,7 +1210,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     // - Subnet Replace due to availability_zone change (direct change from differ)
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: vpc_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: (vpc.clone().with_binding("vpc")),
         directives: Directives {
@@ -1224,7 +1224,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
         cascade_ref_hints: vec![],
     });
     plan.add(Effect::Replace {
-        id: subnet_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(subnet_id.clone()),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
         to: (subnet.clone().with_binding("subnet")),
         directives: Directives::default(),
@@ -1364,7 +1364,7 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
     // Build a plan with Replace for VPC using DEFAULT directives (no explicit CBD)
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: vpc_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: (vpc.clone().with_binding("vpc")),
         directives: Directives::default(), // create_before_destroy = false (user didn't set it)
@@ -1495,7 +1495,7 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
     // - Subnet Update due to tags change (non-create-only, from differ)
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: vpc_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: (vpc.clone().with_binding("vpc")),
         directives: Directives {
@@ -1509,7 +1509,7 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
         cascade_ref_hints: vec![],
     });
     plan.add(Effect::Update {
-        id: subnet_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(subnet_id.clone()),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
         to: (subnet.clone().with_binding("subnet")),
         changed_attributes: vec!["tags".to_string()],
@@ -1626,7 +1626,7 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
     // Build a plan with Replace for VPC (create_before_destroy)
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: vpc_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: (vpc.clone().with_binding("vpc")),
         directives: Directives {
@@ -1760,7 +1760,7 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
     // Build a plan with Replace for VPC and Update for subnet (tags changed)
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: vpc_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: (vpc.clone().with_binding("vpc")),
         directives: Directives {
@@ -1774,7 +1774,7 @@ fn cascade_prevent_destroy_blocks_merge_upgrade_to_replace() {
         cascade_ref_hints: vec![],
     });
     plan.add(Effect::Update {
-        id: subnet_id.clone(),
+        id: crate::resource::ResolvedResourceId::new(subnet_id.clone()),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
         to: (subnet.clone().with_binding("subnet")),
         changed_attributes: vec!["tags".to_string()],

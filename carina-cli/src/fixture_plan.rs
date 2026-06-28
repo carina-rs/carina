@@ -702,7 +702,7 @@ pub fn delete_attributes_from_plan(
             if let carina_core::effect::Effect::Delete { id, .. } = e {
                 current_states
                     .get(id)
-                    .map(|s| (id.clone(), s.attributes.clone()))
+                    .map(|s| (id.clone().into_inner(), s.attributes.clone()))
             } else {
                 None
             }

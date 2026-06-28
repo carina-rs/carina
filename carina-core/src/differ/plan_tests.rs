@@ -1346,7 +1346,7 @@ fn wait_binding_lowers_to_wait_effect() {
         unreachable!();
     };
     assert_eq!(binding, "cert_issued");
-    assert_eq!(target_id.identity_str(), Some("cert"));
+    assert_eq!(target_id.identity_str(), "cert");
     assert_eq!(target_id.resource_type, "acm.Certificate");
     assert_eq!(
         until,

@@ -278,7 +278,7 @@ pub(super) async fn execute_effects_phased(
     let replaced_ids: HashSet<ResourceId> = effects
         .iter()
         .filter_map(|effect| match effect {
-            Effect::Replace { id, .. } => Some(id.clone()),
+            Effect::Replace { id, .. } => Some(id.clone().into_inner()),
             _ => None,
         })
         .collect();
@@ -286,7 +286,9 @@ pub(super) async fn execute_effects_phased(
         .iter()
         .enumerate()
         .filter_map(|(idx, effect)| match effect {
-            Effect::Wait { target_id, .. } if replaced_ids.contains(target_id) => Some(idx),
+            Effect::Wait { target_id, .. } if replaced_ids.contains(target_id.as_inner()) => {
+                Some(idx)
+            }
             _ => None,
         })
         .collect();
@@ -856,7 +858,7 @@ pub(super) async fn execute_effects_phased(
                                             let cascade_identifier =
                                                 cascade.from.identifier.as_deref().unwrap_or("");
                                             refreshes.push((
-                                                cascade.id.clone(),
+                                                cascade.id.clone().into_inner(),
                                                 cascade_identifier.to_string(),
                                             ));
                                             cascade_failed = true;
@@ -896,8 +898,10 @@ pub(super) async fn execute_effects_phased(
                                             let cascade_state =
                                                 cascade_outcome.into_state_for_writeback();
                                             if let Some(diagnostic) = cascade_diagnostic {
-                                                cascade_diagnostics
-                                                    .push((cascade.id.clone(), diagnostic));
+                                                cascade_diagnostics.push((
+                                                    cascade.id.clone().into_inner(),
+                                                    diagnostic,
+                                                ));
                                             }
                                             let cascade_attrs =
                                                 resolved_to.as_resource().resolved_attributes();
@@ -907,7 +911,7 @@ pub(super) async fn execute_effects_phased(
                                                 &cascade_state,
                                             );
                                             cascade_states.push((
-                                                cascade.id.clone(),
+                                                cascade.id.clone().into_inner(),
                                                 cascade_state,
                                                 cascade_attrs,
                                                 cascade.to.binding.clone(),
@@ -922,7 +926,7 @@ pub(super) async fn execute_effects_phased(
                                                 },
                                             );
                                             refreshes.push((
-                                                cascade.id.clone(),
+                                                cascade.id.clone().into_inner(),
                                                 cascade_identifier.to_string(),
                                             ));
                                             cascade_failed = true;
@@ -1223,7 +1227,10 @@ pub(super) async fn execute_effects_phased(
                                 (
                                     idx,
                                     PhaseEffectResult::ReplaceDeleteFailure {
-                                        refresh: Some((id.clone(), identifier.to_string())),
+                                        refresh: Some((
+                                            id.clone().into_inner(),
+                                            identifier.to_string(),
+                                        )),
                                         cbd_refresh: cbd_refresh_info,
                                     },
                                 )
@@ -2343,7 +2350,7 @@ mod tests {
         plan.add(Effect::Create(cert.clone()));
         plan.add(Effect::Wait {
             binding: "cert_issued".to_string(),
-            target_id: cert_id.clone(),
+            target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -2441,7 +2448,7 @@ mod tests {
         plan.add(Effect::Create(cert.clone()));
         plan.add(Effect::Wait {
             binding: "cert_issued".to_string(),
-            target_id: cert_id.clone(),
+            target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -2633,7 +2640,7 @@ mod tests {
         let bucket_state = State::not_found(bucket.id.clone());
 
         let role_replace = Effect::Replace {
-            id: role.id.clone(),
+            id: crate::resource::ResolvedResourceId::new(role.id.clone()),
             from: Box::new(role_state),
             to: role.clone(),
             directives: Directives::default(),
@@ -2646,7 +2653,7 @@ mod tests {
             cascade_ref_hints: vec![],
         };
         let bucket_replace = Effect::Replace {
-            id: bucket.id.clone(),
+            id: crate::resource::ResolvedResourceId::new(bucket.id.clone()),
             from: Box::new(bucket_state),
             to: bucket.clone(),
             directives: Directives::default(),

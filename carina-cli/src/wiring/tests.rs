@@ -696,12 +696,12 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
     // The orphan Delete effect carries the same routed instance.
     let mut plan = Plan::new();
     plan.add(Effect::Delete {
-        id: ResourceId::with_provider_identity(
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
             "aws",
             "route53.RecordSet",
             "r.delegation_ns",
             Some("management".to_string()),
-        ),
+        )),
         identifier: String::new(),
         directives: carina_core::resource::Directives::default(),
         binding: None,
@@ -2591,7 +2591,12 @@ fn deferred_replace_test_target() -> DeferredCreateTarget {
 
 fn delete_effect_for_binding(binding: &str) -> Effect {
     Effect::Delete {
-        id: ResourceId::with_provider_identity("aws", "route53.Record", binding, None),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            binding,
+            None,
+        )),
         identifier: format!("{binding}-old-id"),
         directives: Directives::default(),
         binding: Some(binding.to_string()),
@@ -2603,7 +2608,7 @@ fn delete_effect_for_binding(binding: &str) -> Effect {
 fn cert_replace_effect() -> Effect {
     let id = ResourceId::with_provider_identity("aws", "acm.Certificate", "cert", None);
     Effect::Replace {
-        id: id.clone(),
+        id: carina_core::resource::ResolvedResourceId::new(id.clone()),
         from: Box::new(State::existing(id, HashMap::new()).with_identifier("cert-old-id")),
         to: Resource::with_provider("aws", "acm.Certificate", "cert", None).with_binding("cert"),
         directives: Directives::default(),

@@ -584,7 +584,9 @@ mod tests {
         use crate::resource::ResourceId;
         let id =
             ResourceId::with_identity("aws.route53.RecordSet", "aws_route53_record_set_7059de08");
-        let s = format_effect_brief(&Effect::Remove { id: id.clone() });
+        let s = format_effect_brief(&Effect::Remove {
+            id: crate::resource::ResolvedResourceId::new(id.clone()),
+        });
         assert!(!s.contains('x'), "must not contain `x`; got: {s:?}");
         assert!(!s.contains('✗'), "must not contain `✗`; got: {s:?}");
         assert!(
@@ -605,7 +607,10 @@ mod tests {
 
         let e = Effect::Wait {
             binding: "cert_issued".to_string(),
-            target_id: ResourceId::with_identity("acm.Certificate", "cert"),
+            target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "acm.Certificate",
+                "cert",
+            )),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -631,7 +636,10 @@ mod tests {
         plan.add(Effect::Create(Resource::new("acm.Certificate", "cert")));
         plan.add(Effect::Wait {
             binding: "cert_issued".to_string(),
-            target_id: ResourceId::with_identity("acm.Certificate", "cert"),
+            target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "acm.Certificate",
+                "cert",
+            )),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -652,7 +660,9 @@ mod tests {
         plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
         plan.add(Effect::Create(Resource::new("s3.Bucket", "b")));
         plan.add(Effect::Delete {
-            id: crate::resource::ResourceId::with_identity("s3.Bucket", "c"),
+            id: crate::resource::ResolvedResourceId::new(
+                crate::resource::ResourceId::with_identity("s3.Bucket", "c"),
+            ),
             identifier: String::new(),
             directives: crate::resource::Directives::default(),
             binding: None,
@@ -688,7 +698,10 @@ mod tests {
             Resource::new("acm.Certificate", "cert").with_binding("cert"),
         ));
         plan.add(Effect::DeferredCreate {
-            id: ResourceId::with_identity("route53.RecordSet", "validation_records"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "route53.RecordSet",
+                "validation_records",
+            )),
             upstream_binding: "cert".to_string(),
             template: Box::new(deferred),
         });
@@ -727,10 +740,10 @@ mod tests {
         };
         let deletes = (0..3)
             .map(|idx| DeferredReplaceDelete {
-                id: ResourceId::with_identity(
+                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.RecordSet",
                     format!("validation_records[{idx}]"),
-                ),
+                )),
                 identifier: format!("record-{idx}"),
                 directives: Directives::default(),
                 binding: Some(format!("validation_records[{idx}]")),
@@ -742,7 +755,10 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::DeferredReplace {
             deletes: NonEmptyDeletes::try_new(deletes).expect("fixture has deletes"),
-            id: ResourceId::with_identity("route53.RecordSet", "validation_records"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "route53.RecordSet",
+                "validation_records",
+            )),
             upstream_binding: "cert".to_string(),
             template: Box::new(template),
         });
@@ -828,7 +844,10 @@ mod tests {
             .with_identifier("vpc-123");
         let to = Resource::new("ec2.Vpc", "vpc");
         let cascading = CascadingUpdate {
-            id: ResourceId::with_identity("ec2.Subnet", "subnet"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "ec2.Subnet",
+                "subnet",
+            )),
             from: Box::new(
                 State::not_found(ResourceId::with_identity("ec2.Subnet", "subnet"))
                     .with_identifier("subnet-123"),
@@ -836,7 +855,9 @@ mod tests {
             to: (Resource::new("ec2.Subnet", "subnet")),
         };
         plan.add(Effect::Replace {
-            id: ResourceId::with_identity("ec2.Vpc", "vpc"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "ec2.Vpc", "vpc",
+            )),
             from: Box::new(from),
             to,
             directives: Directives::default(),
@@ -868,7 +889,10 @@ mod tests {
             .with_identifier("vpc-123");
         let to = Resource::new("ec2.Vpc", "vpc");
         let cascading = CascadingUpdate {
-            id: ResourceId::with_identity("ec2.Subnet", "subnet"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "ec2.Subnet",
+                "subnet",
+            )),
             from: Box::new(
                 State::not_found(ResourceId::with_identity("ec2.Subnet", "subnet"))
                     .with_identifier("subnet-123"),
@@ -876,7 +900,9 @@ mod tests {
             to: (Resource::new("ec2.Subnet", "subnet")),
         };
         plan.add(Effect::Replace {
-            id: ResourceId::with_identity("ec2.Vpc", "vpc"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "ec2.Vpc", "vpc",
+            )),
             from: Box::new(from),
             to,
             directives: Directives::default(),
@@ -909,7 +935,10 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
         plan.add(Effect::Delete {
-            id: ResourceId::with_identity("s3.Bucket", "b"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "s3.Bucket",
+                "b",
+            )),
             identifier: "b-id".to_string(),
             directives: crate::resource::Directives::default(),
             binding: None,

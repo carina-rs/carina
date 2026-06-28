@@ -602,7 +602,10 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::DeferredReplace {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-                id: ResourceId::with_identity("route53.Record", "validation_records[0]"),
+                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                    "route53.Record",
+                    "validation_records[0]",
+                )),
                 identifier: "record-0".to_string(),
                 directives: Directives::default(),
                 binding: Some("validation_records[0]".to_string()),
@@ -610,12 +613,18 @@ mod tests {
                 explicit_dependencies: HashSet::new(),
             }])
             .expect("fixture has one delete"),
-            id: ResourceId::with_identity("__deferred_for", "validation_records"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "__deferred_for",
+                "validation_records",
+            )),
             upstream_binding: "cert".to_string(),
             template: Box::new(deferred),
         });
         plan.add(Effect::Delete {
-            id: ResourceId::with_identity("route53.Record", "old-record-0"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "route53.Record",
+                "old-record-0",
+            )),
             identifier: "record-0".to_string(),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
@@ -623,7 +632,10 @@ mod tests {
             explicit_dependencies: HashSet::new(),
         });
         plan.add(Effect::Delete {
-            id: ResourceId::with_identity("route53.Record", "old-record-abc"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "route53.Record",
+                "old-record-abc",
+            )),
             identifier: "record-abc".to_string(),
             directives: Directives::default(),
             binding: Some("validation_records[abc]".to_string()),
@@ -661,7 +673,10 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::DeferredReplace {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-                id: ResourceId::with_identity("route53.Record", "validation_records[0]"),
+                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                    "route53.Record",
+                    "validation_records[0]",
+                )),
                 identifier: "record-0".to_string(),
                 directives: Directives::default(),
                 binding: Some("validation_records[0]".to_string()),
@@ -669,13 +684,19 @@ mod tests {
                 explicit_dependencies: HashSet::new(),
             }])
             .expect("fixture has one delete"),
-            id: ResourceId::with_identity("__deferred_for", "validation_records"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "__deferred_for",
+                "validation_records",
+            )),
             upstream_binding: "cert".to_string(),
             template: Box::new(deferred),
         });
         plan.add(Effect::Wait {
             binding: "wait_validation_record_0".to_string(),
-            target_id: ResourceId::with_identity("route53.Record", "validation_records[0]"),
+            target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "route53.Record",
+                "validation_records[0]",
+            )),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ready".to_string())),

@@ -129,6 +129,39 @@ fn resource_id_deserializes_legacy_name_alias() {
 }
 
 #[test]
+#[should_panic(expected = "ResolvedResourceId requires identity")]
+fn resolved_resource_id_new_panics_without_identity() {
+    ResolvedResourceId::new(ResourceId::with_provider("aws", "s3.Bucket", None, None));
+}
+
+#[test]
+fn resolved_resource_id_try_new_returns_none_without_identity() {
+    let id = ResourceId::with_provider("aws", "s3.Bucket", None, None);
+    assert!(ResolvedResourceId::try_new(id).is_none());
+}
+
+#[test]
+fn resolved_resource_id_try_new_returns_some_with_identity() {
+    let id = ResourceId::with_provider_identity("aws", "s3.Bucket", "logs", None);
+    let resolved = ResolvedResourceId::try_new(id).expect("identity is present");
+    assert_eq!(resolved.identity_str(), "logs");
+}
+
+#[test]
+fn resolved_resource_id_serde_round_trips_as_resource_id() {
+    let resolved = ResolvedResourceId::new(ResourceId::with_provider_identity(
+        "aws",
+        "s3.Bucket",
+        "logs",
+        Some("primary".to_string()),
+    ));
+    let json = serde_json::to_string(&resolved).unwrap();
+    let decoded: ResolvedResourceId = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, resolved);
+    assert_eq!(decoded.identity_str(), "logs");
+}
+
+#[test]
 fn resource_id_rejects_legacy_empty_name() {
     let legacy = r#"{"provider":"aws","resource_type":"ec2.Subnet","name":""}"#;
     assert!(

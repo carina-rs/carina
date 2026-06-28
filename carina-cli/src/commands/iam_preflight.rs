@@ -294,15 +294,15 @@ fn effect_required_ops(effect: &Effect) -> Vec<(ResourceId, PlanOp)> {
     match effect {
         Effect::Read { resource } => vec![(resource.id.clone(), PlanOp::Read)],
         Effect::Create(resource) => vec![(resource.id.clone(), PlanOp::Create)],
-        Effect::Update { id, .. } => vec![(id.clone(), PlanOp::Update)],
+        Effect::Update { id, .. } => vec![(id.clone().into_inner(), PlanOp::Update)],
         Effect::Replace { id, to, .. } => {
             vec![
-                (id.clone(), PlanOp::Delete),
+                (id.clone().into_inner(), PlanOp::Delete),
                 (to.id.clone(), PlanOp::Create),
             ]
         }
-        Effect::Delete { id, .. } => vec![(id.clone(), PlanOp::Delete)],
-        Effect::Import { id, .. } => vec![(id.clone(), PlanOp::Read)],
+        Effect::Delete { id, .. } => vec![(id.clone().into_inner(), PlanOp::Delete)],
+        Effect::Import { id, .. } => vec![(id.clone().into_inner(), PlanOp::Read)],
         Effect::DeferredCreate { template, .. } => {
             effect_required_ops(&Effect::Create(template.template_resource.clone()))
         }
@@ -311,7 +311,7 @@ fn effect_required_ops(effect: &Effect) -> Vec<(ResourceId, PlanOp)> {
         } => {
             let mut ops: Vec<_> = deletes
                 .iter()
-                .map(|delete| (delete.id.clone(), PlanOp::Delete))
+                .map(|delete| (delete.id.clone().into_inner(), PlanOp::Delete))
                 .collect();
             ops.extend(effect_required_ops(&Effect::Create(
                 template.template_resource.clone(),
@@ -326,17 +326,17 @@ fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
     match effect {
         Effect::Read { resource } => vec![&resource.id],
         Effect::Create(resource) => vec![&resource.id],
-        Effect::Update { id, .. } => vec![id],
-        Effect::Replace { id, to, .. } => vec![id, &to.id],
-        Effect::Delete { id, .. } => vec![id],
-        Effect::Import { id, .. } => vec![id],
-        Effect::Remove { id, .. } => vec![id],
-        Effect::Move { from, to } => vec![from, to],
+        Effect::Update { id, .. } => vec![id.as_inner()],
+        Effect::Replace { id, to, .. } => vec![id.as_inner(), &to.id],
+        Effect::Delete { id, .. } => vec![id.as_inner()],
+        Effect::Import { id, .. } => vec![id.as_inner()],
+        Effect::Remove { id, .. } => vec![id.as_inner()],
+        Effect::Move { from, to } => vec![from.as_inner(), to.as_inner()],
         Effect::Wait { .. } => Vec::new(),
-        Effect::DeferredCreate { id, .. } => vec![id],
+        Effect::DeferredCreate { id, .. } => vec![id.as_inner()],
         Effect::DeferredReplace { deletes, id, .. } => {
-            let mut ids = vec![id];
-            ids.extend(deletes.iter().map(|delete| &delete.id));
+            let mut ids = vec![id.as_inner()];
+            ids.extend(deletes.iter().map(|delete| delete.id.as_inner()));
             ids
         }
     }
@@ -832,13 +832,13 @@ mod tests {
         plan.add(Effect::Read { resource: read });
         plan.add(Effect::Create(create));
         plan.add(Effect::Update {
-            id: update_id.clone(),
+            id: carina_core::resource::ResolvedResourceId::new(update_id.clone()),
             from: Box::new(State::not_found(update_id.clone())),
             to: update_to,
             changed_attributes: vec!["cidr".to_string()],
         });
         plan.add(Effect::Replace {
-            id: replace_id.clone(),
+            id: carina_core::resource::ResolvedResourceId::new(replace_id.clone()),
             from: Box::new(State::not_found(replace_id.clone())),
             to: replace_to,
             directives: Default::default(),
@@ -848,7 +848,7 @@ mod tests {
             cascade_ref_hints: vec![],
         });
         plan.add(Effect::Delete {
-            id: delete_id.clone(),
+            id: carina_core::resource::ResolvedResourceId::new(delete_id.clone()),
             identifier: "role-id".to_string(),
             directives: Default::default(),
             binding: None,
@@ -856,15 +856,27 @@ mod tests {
             explicit_dependencies: Default::default(),
         });
         plan.add(Effect::Import {
-            id: import_id,
+            id: carina_core::resource::ResolvedResourceId::new(import_id),
             identifier: Value::Concrete(ConcreteValue::String("group".to_string())),
         });
         plan.add(Effect::Remove {
-            id: ResourceId::with_provider_identity("awscc", "skip.Remove", "x", None),
+            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+                "awscc",
+                "skip.Remove",
+                "x",
+                None,
+            )),
         });
         plan.add(Effect::Move {
-            from: ResourceId::with_provider_identity("awscc", "skip.Move", "x", None),
-            to: ResourceId::with_provider_identity("awscc", "skip.Move", "y", None),
+            from: carina_core::resource::ResolvedResourceId::new(
+                ResourceId::with_provider_identity("awscc", "skip.Move", "x", None),
+            ),
+            to: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+                "awscc",
+                "skip.Move",
+                "y",
+                None,
+            )),
         });
 
         let entries = collect_required_actions(&plan, &PermissionProvider);
@@ -890,7 +902,10 @@ mod tests {
             Resource::with_provider("aws", "route53.RecordSet", "validation_records", None);
         let mut plan = Plan::new();
         plan.add(Effect::DeferredCreate {
-            id: ResourceId::with_identity("__deferred_for", "validation_records"),
+            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "__deferred_for",
+                "validation_records",
+            )),
             upstream_binding: "cert".to_string(),
             template: Box::new(DeferredForExpression {
                 file: None,

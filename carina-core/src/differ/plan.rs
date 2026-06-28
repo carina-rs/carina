@@ -9,7 +9,8 @@ use crate::parser::WaitBinding;
 use crate::plan::{Plan, PlanError};
 use crate::provider::Provider;
 use crate::resource::{
-    ConcreteValue, DataSource, Directives, PlanInputState, Resource, ResourceId, State, Value,
+    ConcreteValue, DataSource, Directives, PlanInputState, ResolvedResourceId, Resource,
+    ResourceId, State, Value,
 };
 use crate::schema::{
     ResourceSchema, SchemaKind, SchemaRegistry, WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
@@ -365,7 +366,7 @@ pub fn create_plan(
                     };
 
                     plan.add(Effect::Replace {
-                        id,
+                        id: ResolvedResourceId::new(id),
                         from,
                         to,
                         directives,
@@ -376,7 +377,7 @@ pub fn create_plan(
                     });
                 } else {
                     plan.add(Effect::Update {
-                        id,
+                        id: ResolvedResourceId::new(id),
                         from,
                         to,
                         changed_attributes,
@@ -403,7 +404,7 @@ pub fn create_plan(
                 let explicit_dependencies =
                     resource.directives.depends_on.iter().cloned().collect();
                 plan.add(Effect::Delete {
-                    id,
+                    id: ResolvedResourceId::new(id),
                     identifier,
                     directives,
                     binding,
@@ -456,7 +457,7 @@ pub fn create_plan(
                 get_resource_dependencies(&temp_resource)
             };
             plan.add(Effect::Delete {
-                id: id.clone(),
+                id: ResolvedResourceId::new(id.clone()),
                 identifier,
                 directives,
                 binding,
@@ -633,7 +634,7 @@ pub fn create_plan(
             // executor IR (Effect) is string-keyed and is the separate
             // type tracked for its own newtype migration (carina#3066).
             binding: wb.binding.as_str().to_string(),
-            target_id,
+            target_id: ResolvedResourceId::new(target_id),
             until,
             until_surface: wb.until_raw.clone(),
             timeout,
@@ -706,7 +707,7 @@ pub fn cascade_dependent_updates(
                 if let Effect::Replace { id, directives, .. } = e {
                     // Only consider Replace effects that are NOT already CBD
                     if !directives.create_before_destroy {
-                        e.binding_name().map(|b| (b, id.clone()))
+                        e.binding_name().map(|b| (b, id.clone().into_inner()))
                     } else {
                         None
                     }
@@ -902,7 +903,7 @@ pub fn cascade_dependent_updates(
 
                         // Promote to a separate Replace effect
                         promoted_replaces.push(Effect::Replace {
-                            id: unresolved.id.clone(),
+                            id: ResolvedResourceId::new(unresolved.id.clone()),
                             from: Box::new(from),
                             to: (*unresolved).clone(),
                             directives: unresolved.directives.clone(),
@@ -918,7 +919,7 @@ pub fn cascade_dependent_updates(
                         .entry(replaced_binding.clone())
                         .or_default()
                         .push(CascadingUpdate {
-                            id: unresolved.id.clone(),
+                            id: ResolvedResourceId::new(unresolved.id.clone()),
                             from: Box::new(from),
                             to: (*unresolved).clone(),
                         });
