@@ -395,7 +395,7 @@ async fn run_destroy_locked(
         let dependencies = get_resource_dependencies(resource);
         let explicit_dependencies = resource.directives.depends_on.iter().cloned().collect();
         delete_effects.push(Effect::Delete {
-            id: resource.id.clone(),
+            id: carina_core::resource::ResolvedResourceId::new(resource.id.clone()),
             identifier,
             directives: resource.directives.clone(),
             binding: resource.binding.clone(),

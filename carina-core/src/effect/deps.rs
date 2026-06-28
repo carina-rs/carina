@@ -515,7 +515,7 @@ mod tests {
             );
         }
         Effect::Update {
-            id: resource.id.clone(),
+            id: crate::resource::ResolvedResourceId::new(resource.id.clone()),
             from: Box::new(state_for(&resource.id)),
             to: resource,
             changed_attributes: changed.iter().map(|s| (*s).to_string()).collect(),
@@ -525,7 +525,9 @@ mod tests {
     #[test]
     fn destroy_delete_edges_block_dependencies_by_consumers() {
         let parent = Effect::Delete {
-            id: ResourceId::with_identity("test", "parent"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "test", "parent",
+            )),
             identifier: "parent-id".to_string(),
             directives: Default::default(),
             binding: Some("parent".to_string()),
@@ -533,7 +535,9 @@ mod tests {
             explicit_dependencies: HashSet::new(),
         };
         let child = Effect::Delete {
-            id: ResourceId::with_identity("test", "child"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "test", "child",
+            )),
             identifier: "child-id".to_string(),
             directives: Default::default(),
             binding: Some("child".to_string()),
@@ -556,7 +560,7 @@ mod tests {
     #[test]
     fn destroy_wait_alias_bridges_target_to_consumers() {
         let cert = Effect::Delete {
-            id: ResourceId::with_identity("test", "cert"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("test", "cert")),
             identifier: "cert-id".to_string(),
             directives: Default::default(),
             binding: Some("cert".to_string()),
@@ -564,7 +568,9 @@ mod tests {
             explicit_dependencies: HashSet::new(),
         };
         let listener = Effect::Delete {
-            id: ResourceId::with_identity("test", "listener"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "test", "listener",
+            )),
             identifier: "listener-id".to_string(),
             directives: Default::default(),
             binding: Some("listener".to_string()),
@@ -613,7 +619,10 @@ mod tests {
         let effects = vec![
             Effect::Create(x),
             Effect::Replace {
-                id: ResourceId::with_identity("test", "replace_me"),
+                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                    "test",
+                    "replace_me",
+                )),
                 from: Box::new(from),
                 to,
                 directives: Default::default(),
@@ -637,7 +646,9 @@ mod tests {
     #[test]
     fn unknown_destroy_dependency_names_are_dropped() {
         let orphan = Effect::Delete {
-            id: ResourceId::with_identity("test", "listener"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "test", "listener",
+            )),
             identifier: "listener-id".to_string(),
             directives: Default::default(),
             binding: Some("listener".to_string()),

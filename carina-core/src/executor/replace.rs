@@ -204,7 +204,10 @@ pub(super) async fn execute_cbd_replace_parallel(
                             error: &e,
                         });
                         let cascade_identifier = cascade.from.identifier.as_deref().unwrap_or("");
-                        refreshes.push((cascade.id.clone(), cascade_identifier.to_string()));
+                        refreshes.push((
+                            cascade.id.clone().into_inner(),
+                            cascade_identifier.to_string(),
+                        ));
                         cascade_failed = true;
                         break;
                     }
@@ -234,7 +237,7 @@ pub(super) async fn execute_cbd_replace_parallel(
                         };
                         let cascade_state = cascade_outcome.into_state_for_writeback();
                         if let Some(diagnostic) = cascade_diagnostic {
-                            cascade_diagnostics.push((cascade.id.clone(), diagnostic));
+                            cascade_diagnostics.push((cascade.id.clone().into_inner(), diagnostic));
                         }
                         observer
                             .on_event(&ExecutionEvent::CascadeUpdateSucceeded { id: &cascade.id });
@@ -250,7 +253,10 @@ pub(super) async fn execute_cbd_replace_parallel(
                             id: &cascade.id,
                             error: &error_str,
                         });
-                        refreshes.push((cascade.id.clone(), cascade_identifier.to_string()));
+                        refreshes.push((
+                            cascade.id.clone().into_inner(),
+                            cascade_identifier.to_string(),
+                        ));
                         cascade_failed = true;
                         break;
                     }

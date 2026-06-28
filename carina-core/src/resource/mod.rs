@@ -3,7 +3,9 @@
 mod enum_value;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::{self, Display, Formatter};
 use std::hash::{Hash, Hasher};
+use std::ops::Deref;
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -231,6 +233,118 @@ impl std::fmt::Display for ResourceId {
             (false, Some(id)) => write!(f, "{}.{}.{}", self.provider, self.resource_type, id),
             (false, None) => write!(f, "{}.{}", self.provider, self.resource_type),
         }
+    }
+}
+
+/// A `ResourceId` whose identity has been resolved. Downstream consumers
+/// (differ, scheduler, executor, state, provider) hold this type to
+/// guarantee at compile time that every resource has an identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "ResourceId", into = "ResourceId")]
+pub struct ResolvedResourceId(ResourceId);
+
+impl ResolvedResourceId {
+    /// Construct from a `ResourceId`, panicking if identity is `None`.
+    pub fn new(id: ResourceId) -> Self {
+        assert!(
+            id.identity.is_some(),
+            "ResolvedResourceId requires identity"
+        );
+        Self(id)
+    }
+
+    /// Try to construct; returns `None` if identity is absent.
+    pub fn try_new(id: ResourceId) -> Option<Self> {
+        if id.identity.is_some() {
+            Some(Self(id))
+        } else {
+            None
+        }
+    }
+
+    /// Borrow the inner `ResourceId`.
+    pub fn as_inner(&self) -> &ResourceId {
+        &self.0
+    }
+
+    /// Consume and return the inner `ResourceId`.
+    pub fn into_inner(self) -> ResourceId {
+        self.0
+    }
+
+    /// The identity string (always present).
+    pub fn identity_str(&self) -> &str {
+        self.0.identity_str().unwrap()
+    }
+
+    pub fn identity_or_empty(&self) -> &str {
+        self.identity_str()
+    }
+
+    pub fn display_type(&self) -> String {
+        self.0.display_type()
+    }
+
+    pub fn human(&self) -> ResourceIdDisplay<'_> {
+        self.0.human()
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.0.provider
+    }
+
+    pub fn resource_type(&self) -> &str {
+        &self.0.resource_type
+    }
+
+    pub fn provider_instance(&self) -> Option<&str> {
+        self.0.provider_instance.as_deref()
+    }
+}
+
+impl Deref for ResolvedResourceId {
+    type Target = ResourceId;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Display for ResolvedResourceId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<ResolvedResourceId> for ResourceId {
+    fn from(r: ResolvedResourceId) -> Self {
+        r.0
+    }
+}
+
+impl TryFrom<ResourceId> for ResolvedResourceId {
+    type Error = String;
+
+    fn try_from(id: ResourceId) -> Result<Self, String> {
+        Self::try_new(id).ok_or_else(|| "identity is required".to_string())
+    }
+}
+
+impl PartialEq<ResourceId> for ResolvedResourceId {
+    fn eq(&self, other: &ResourceId) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<ResolvedResourceId> for ResourceId {
+    fn eq(&self, other: &ResolvedResourceId) -> bool {
+        *self == other.0
+    }
+}
+
+impl AsRef<ResourceId> for ResolvedResourceId {
+    fn as_ref(&self) -> &ResourceId {
+        self.as_inner()
     }
 }
 

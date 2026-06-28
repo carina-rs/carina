@@ -83,7 +83,9 @@ fn build_all_create_plan() -> Plan {
 fn build_mixed_operations_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "ec2.Vpc", "my-vpc",
+        )),
         from: Box::new(State::existing(
             ResourceId::with_identity("ec2.Vpc", "my-vpc"),
             [
@@ -124,7 +126,10 @@ fn build_mixed_operations_plan() -> Plan {
             ),
     ));
     plan.add(Effect::Delete {
-        id: ResourceId::with_identity("ec2.Subnet", "old-subnet"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "ec2.Subnet",
+            "old-subnet",
+        )),
         identifier: "subnet-12345678".to_string(),
         directives: Directives::default(),
         binding: Some("old_subnet".to_string()),
@@ -173,7 +178,9 @@ fn build_map_key_diff_plan() -> Plan {
     .collect();
 
     plan.add(Effect::Update {
-        id: ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "ec2.Vpc", "my-vpc",
+        )),
         from: Box::new(State::existing(
             ResourceId::with_identity("ec2.Vpc", "my-vpc"),
             [
@@ -224,7 +231,10 @@ fn build_deferred_for_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Create(certificate_resource()));
     plan.add(Effect::DeferredCreate {
-        id: ResourceId::with_identity("__deferred_for", "validation_records"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "__deferred_for",
+            "validation_records",
+        )),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
     });
@@ -249,7 +259,10 @@ fn build_anonymous_deferred_for_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Create(certificate_resource()));
     plan.add(Effect::DeferredCreate {
-        id: ResourceId::with_identity("__deferred_for", "_anon_validation_records"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "__deferred_for",
+            "_anon_validation_records",
+        )),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
     });
@@ -276,7 +289,10 @@ fn build_deferred_replace_plan() -> Plan {
     plan.add(Effect::Create(certificate_resource()));
     plan.add(Effect::DeferredReplace {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-            id: ResourceId::with_identity("route53.Record", "old-record-0"),
+            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "route53.Record",
+                "old-record-0",
+            )),
             identifier: "record-0".to_string(),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
@@ -284,7 +300,10 @@ fn build_deferred_replace_plan() -> Plan {
             explicit_dependencies: HashSet::new(),
         }])
         .expect("fixture has one delete"),
-        id: ResourceId::with_identity("__deferred_for", "validation_records"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "__deferred_for",
+            "validation_records",
+        )),
         upstream_binding: "cert".to_string(),
         template: Box::new(deferred),
     });
@@ -495,11 +514,17 @@ fn snapshot_filter_mode_route_table() {
 fn build_moved_with_changes_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Move {
-        from: ResourceId::with_identity("ec2.Vpc", "old_vpc"),
-        to: ResourceId::with_identity("ec2.Vpc", "new_vpc"),
+        from: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "ec2.Vpc", "old_vpc",
+        )),
+        to: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "ec2.Vpc", "new_vpc",
+        )),
     });
     plan.add(Effect::Update {
-        id: ResourceId::with_identity("ec2.Vpc", "new_vpc"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "ec2.Vpc", "new_vpc",
+        )),
         from: Box::new(State::existing(
             ResourceId::with_identity("ec2.Vpc", "new_vpc"),
             [
@@ -552,8 +577,12 @@ fn build_moved_with_changes_plan() -> Plan {
 fn build_moved_pure_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Move {
-        from: ResourceId::with_identity("ec2.Vpc", "old_vpc"),
-        to: ResourceId::with_identity("ec2.Vpc", "new_vpc"),
+        from: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "ec2.Vpc", "old_vpc",
+        )),
+        to: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "ec2.Vpc", "new_vpc",
+        )),
     });
     plan
 }

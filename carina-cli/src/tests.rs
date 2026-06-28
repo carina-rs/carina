@@ -288,7 +288,12 @@ fn plan_file_serde_round_trip() {
         ),
     ));
     plan.add(Effect::Delete {
-        id: ResourceId::with_provider_identity("aws", "s3.Bucket", "old-bucket", None),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+            "aws",
+            "s3.Bucket",
+            "old-bucket",
+            None,
+        )),
         identifier: "old-bucket".to_string(),
         directives: Directives::default(),
         binding: None,
@@ -1842,7 +1847,7 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: id.clone(),
+        id: carina_core::resource::ResolvedResourceId::new(id.clone()),
         from: Box::new(old_state.clone()),
         to: new_resource.clone(),
         directives: Directives {
@@ -1987,7 +1992,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
     // Subnet: Update (cidr_block changed, vpc_id eagerly resolved to old value)
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: vpc_id.clone(),
+        id: carina_core::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
         to: vpc_unresolved.clone().with_binding("vpc"),
         directives: Directives {
@@ -2003,7 +2008,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
         cascade_ref_hints: vec![],
     });
     plan.add(Effect::Update {
-        id: subnet_id.clone(),
+        id: carina_core::resource::ResolvedResourceId::new(subnet_id.clone()),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
         to: subnet_resolved.clone(), // Has stale "vpc-OLD" in vpc_id
         changed_attributes: vec!["cidr_block".to_string()],
@@ -2620,7 +2625,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
     // Build a plan with an Import effect
     let mut plan = Plan::new();
     plan.add(Effect::Import {
-        id: id.clone(),
+        id: carina_core::resource::ResolvedResourceId::new(id.clone()),
         identifier: Value::Concrete(ConcreteValue::String(identifier.to_string())),
     });
 

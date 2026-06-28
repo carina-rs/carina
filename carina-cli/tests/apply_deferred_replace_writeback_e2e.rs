@@ -173,7 +173,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
     plan.add(Effect::Create(cert.clone()));
     plan.add(Effect::DeferredReplace {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-            id: validation_id.clone(),
+            id: carina_core::resource::ResolvedResourceId::new(validation_id.clone()),
             identifier: "old-validation-id".to_string(),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
@@ -181,7 +181,10 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             explicit_dependencies: HashSet::new(),
         }])
         .expect("fixture has one delete"),
-        id: ResourceId::with_identity("__deferred_for", "validation_records"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "__deferred_for",
+            "validation_records",
+        )),
         upstream_binding: "cert".to_string(),
         template: Box::new(template),
     });

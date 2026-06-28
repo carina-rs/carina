@@ -926,7 +926,7 @@ fn move_plus_replace_keeps_post_replace_identifier_and_attributes() {
         None,
     );
     plan.add(Effect::Replace {
-        id: new_id.clone(),
+        id: carina_core::resource::ResolvedResourceId::new(new_id.clone()),
         from: Box::new(State::existing(from_id.clone(), HashMap::new())),
         to: sorted_resources[0].clone(),
         directives: Directives::default(),
@@ -940,8 +940,8 @@ fn move_plus_replace_keeps_post_replace_identifier_and_attributes() {
         cascade_ref_hints: vec![],
     });
     plan.add(Effect::Move {
-        from: from_id.clone(),
-        to: new_id.clone(),
+        from: carina_core::resource::ResolvedResourceId::new(from_id.clone()),
+        to: carina_core::resource::ResolvedResourceId::new(new_id.clone()),
     });
 
     let saved = build_state_after_apply(ApplyStateSave {
@@ -1051,14 +1051,14 @@ fn move_plus_update_keeps_post_update_attributes() {
     let mut plan = Plan::new();
     let from_id = ResourceId::with_provider_identity("awscc", "ec2.Tag", "tag_old", None);
     plan.add(Effect::Update {
-        id: new_id.clone(),
+        id: carina_core::resource::ResolvedResourceId::new(new_id.clone()),
         from: Box::new(State::existing(from_id.clone(), HashMap::new())),
         to: sorted_resources[0].clone(),
         changed_attributes: vec!["value".to_string()],
     });
     plan.add(Effect::Move {
-        from: from_id,
-        to: new_id.clone(),
+        from: carina_core::resource::ResolvedResourceId::new(from_id),
+        to: carina_core::resource::ResolvedResourceId::new(new_id.clone()),
     });
 
     let saved = build_state_after_apply(ApplyStateSave {
@@ -1135,8 +1135,8 @@ fn move_alone_carries_attributes_via_current_states() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Move {
-        from: from_id,
-        to: new_id.clone(),
+        from: carina_core::resource::ResolvedResourceId::new(from_id),
+        to: carina_core::resource::ResolvedResourceId::new(new_id.clone()),
     });
 
     let saved = build_state_after_apply(ApplyStateSave {
@@ -1188,8 +1188,8 @@ fn move_with_absent_from_is_no_op() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Move {
-        from: from_id.clone(),
-        to: to_id.clone(),
+        from: carina_core::resource::ResolvedResourceId::new(from_id.clone()),
+        to: carina_core::resource::ResolvedResourceId::new(to_id.clone()),
     });
 
     let saved = build_state_after_apply(ApplyStateSave {
@@ -1293,8 +1293,8 @@ fn move_from_overlapping_desired_resource_errors() {
     let to_id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "elsewhere", None);
     let mut plan = Plan::new();
     plan.add(Effect::Move {
-        from: id.clone(),
-        to: to_id,
+        from: carina_core::resource::ResolvedResourceId::new(id.clone()),
+        to: carina_core::resource::ResolvedResourceId::new(to_id),
     });
 
     let result = build_state_after_apply(ApplyStateSave {
@@ -1349,7 +1349,9 @@ fn remove_overlapping_desired_resource_errors() {
     );
 
     let mut plan = Plan::new();
-    plan.add(Effect::Remove { id: id.clone() });
+    plan.add(Effect::Remove {
+        id: carina_core::resource::ResolvedResourceId::new(id.clone()),
+    });
 
     let result = build_state_after_apply(ApplyStateSave {
         state_file: None,
@@ -1402,8 +1404,8 @@ fn self_move_overlapping_desired_resource_errors() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Move {
-        from: id.clone(),
-        to: id.clone(),
+        from: carina_core::resource::ResolvedResourceId::new(id.clone()),
+        to: carina_core::resource::ResolvedResourceId::new(id.clone()),
     });
 
     let result = build_state_after_apply(ApplyStateSave {

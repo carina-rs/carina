@@ -123,7 +123,9 @@ impl App {
             .effects()
             .iter()
             .filter_map(|e| match e {
-                Effect::Update { id, .. } | Effect::Replace { id, .. } => Some(id.clone()),
+                Effect::Update { id, .. } | Effect::Replace { id, .. } => {
+                    Some(id.clone().into_inner())
+                }
                 Effect::DeferredReplace { .. } => None,
                 _ => None,
             })

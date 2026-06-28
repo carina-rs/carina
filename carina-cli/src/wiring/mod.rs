@@ -1331,7 +1331,7 @@ impl DeferredCreateTarget {
 
     fn to_effect(&self) -> Effect {
         Effect::DeferredCreate {
-            id: self.id.clone(),
+            id: carina_core::resource::ResolvedResourceId::new(self.id.clone()),
             upstream_binding: self.upstream_binding.clone(),
             template: Box::new(self.template.clone()),
         }
@@ -1340,7 +1340,7 @@ impl DeferredCreateTarget {
     fn to_deferred_replace_effect(&self, deletes: Vec<DeferredReplaceDelete>) -> Effect {
         Effect::DeferredReplace {
             deletes: NonEmptyDeletes::try_new(deletes).expect("planner checked non-empty deletes"),
-            id: self.id.clone(),
+            id: carina_core::resource::ResolvedResourceId::new(self.id.clone()),
             upstream_binding: self.upstream_binding.clone(),
             template: Box::new(self.template.clone()),
         }
@@ -2667,7 +2667,7 @@ pub fn add_state_block_effects(
                     );
                     suppress_create.insert(effective_to.clone());
                     new_effects.push(Effect::Import {
-                        id: effective_to,
+                        id: carina_core::resource::ResolvedResourceId::new(effective_to),
                         identifier: resolved_id,
                     });
                 }
@@ -2695,7 +2695,9 @@ pub fn add_state_block_effects(
                 });
                 if let Some(id) = resolved_from {
                     suppress_delete.insert(id.clone());
-                    new_effects.push(Effect::Remove { id });
+                    new_effects.push(Effect::Remove {
+                        id: carina_core::resource::ResolvedResourceId::new(id),
+                    });
                 }
             }
             StateBlock::Moved { .. } => {
@@ -2713,8 +2715,8 @@ pub fn add_state_block_effects(
     for (from, to) in moved_pairs {
         suppress_delete.insert(to.clone());
         new_effects.push(Effect::Move {
-            from: from.clone(),
-            to: to.clone(),
+            from: carina_core::resource::ResolvedResourceId::new(from.clone()),
+            to: carina_core::resource::ResolvedResourceId::new(to.clone()),
         });
     }
 
@@ -2779,7 +2781,7 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
         if deletes.is_empty() {
             deferred_effects.push(target.to_effect());
         } else {
-            deletes_to_absorb.extend(deletes.iter().map(|delete| delete.id.clone()));
+            deletes_to_absorb.extend(deletes.iter().map(|delete| delete.id.clone().into_inner()));
             deferred_effects.push(target.to_deferred_replace_effect(deletes));
         }
     }

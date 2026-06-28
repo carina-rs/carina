@@ -1953,7 +1953,10 @@ mod tests {
             Value::Concrete(ConcreteValue::String("Enabled".to_string())),
         );
         let effect = Effect::Update {
-            id: ResourceId::with_identity("s3.Bucket", "my-bucket"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "s3.Bucket",
+                "my-bucket",
+            )),
             from: Box::new(from),
             to,
             changed_attributes: vec!["versioning".to_string()],
@@ -1999,7 +2002,10 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("Enabled".to_string())),
             );
         let effect = Effect::Update {
-            id: ResourceId::with_identity("s3.Bucket", "my-bucket"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "s3.Bucket",
+                "my-bucket",
+            )),
             from: Box::new(from),
             to,
             changed_attributes: vec!["versioning".to_string()],
@@ -2053,7 +2059,10 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("new-value".to_string())),
             );
         let effect = Effect::Update {
-            id: ResourceId::with_identity("s3.Bucket", "my-bucket"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "s3.Bucket",
+                "my-bucket",
+            )),
             from: Box::new(from),
             to,
             changed_attributes: vec!["trigger_diff".to_string()],
@@ -2100,7 +2109,7 @@ mod tests {
     fn test_delete_with_attributes() {
         let id = ResourceId::with_identity("s3.Bucket", "old-bucket");
         let effect = Effect::Delete {
-            id: id.clone(),
+            id: crate::resource::ResolvedResourceId::new(id.clone()),
             identifier: "old-bucket".to_string(),
             directives: crate::resource::Directives::default(),
             binding: None,
@@ -2144,7 +2153,10 @@ mod tests {
             Value::Concrete(ConcreteValue::String("test".to_string())),
         );
         let effect = Effect::Update {
-            id: ResourceId::with_identity("s3.Bucket", "my-bucket"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "s3.Bucket",
+                "my-bucket",
+            )),
             from: Box::new(from),
             to,
             changed_attributes: vec!["removed_attr".to_string()],
@@ -2174,7 +2186,10 @@ mod tests {
         );
         let to = Resource::new("test.Widget", "beta");
         let effect = Effect::Update {
-            id: ResourceId::with_identity("test.Widget", "beta"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "test.Widget",
+                "beta",
+            )),
             from: Box::new(from),
             to,
             changed_attributes: vec!["rules".to_string()],
@@ -2320,7 +2335,7 @@ mod tests {
     fn test_delete_map_expanded() {
         let id = ResourceId::with_identity("s3.Bucket", "old-bucket");
         let effect = Effect::Delete {
-            id: id.clone(),
+            id: crate::resource::ResolvedResourceId::new(id.clone()),
             identifier: "old-bucket".to_string(),
             directives: crate::resource::Directives::default(),
             binding: None,
@@ -2366,7 +2381,7 @@ mod tests {
         // PrettyAttribute so format_value_pretty's vertical layout applies.
         let id = ResourceId::with_identity("acm.Certificate", "cert");
         let effect = Effect::Delete {
-            id: id.clone(),
+            id: crate::resource::ResolvedResourceId::new(id.clone()),
             identifier: "cert".to_string(),
             directives: crate::resource::Directives::default(),
             binding: None,
@@ -2432,7 +2447,9 @@ mod tests {
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
         let effect = Effect::Replace {
-            id: ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "ec2.Vpc", "my-vpc",
+            )),
             from: Box::new(from),
             to,
             directives: crate::resource::Directives::default(),
@@ -2465,7 +2482,10 @@ mod tests {
         );
         let to = Resource::new("test.Widget", "beta");
         let effect = Effect::Replace {
-            id: ResourceId::with_identity("test.Widget", "beta"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "test.Widget",
+                "beta",
+            )),
             from: Box::new(from),
             to,
             directives: crate::resource::Directives::default(),
@@ -2511,7 +2531,10 @@ mod tests {
         );
         let to = Resource::new("test.Widget", "beta");
         let effect = Effect::Replace {
-            id: ResourceId::with_identity("test.Widget", "beta"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "test.Widget",
+                "beta",
+            )),
             from: Box::new(from),
             to,
             directives: crate::resource::Directives::default(),
@@ -2565,7 +2588,10 @@ mod tests {
         );
         let to = Resource::new("test.Widget", "beta");
         let effect = Effect::Replace {
-            id: ResourceId::with_identity("test.Widget", "beta"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "test.Widget",
+                "beta",
+            )),
             from: Box::new(from),
             to,
             directives: crate::resource::Directives::default(),
@@ -2655,7 +2681,10 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("CLOUDFRONT".to_string())),
             );
         let effect = Effect::Replace {
-            id: ResourceId::with_identity("wafv2.WebAcl", "edge"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "wafv2.WebAcl",
+                "edge",
+            )),
             from: Box::new(from),
             to,
             directives: crate::resource::Directives::default(),
@@ -2762,14 +2791,20 @@ mod tests {
             Value::Concrete(ConcreteValue::Map(new_config)),
         );
         let effect = Effect::Replace {
-            id: ResourceId::with_identity("wafv2.WebAcl", "edge"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "wafv2.WebAcl",
+                "edge",
+            )),
             from: Box::new(from),
             to,
             directives: crate::resource::Directives::default(),
             changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
                 .unwrap(),
             cascading_updates: vec![CascadingUpdate {
-                id: ResourceId::with_identity("cloudfront.Distribution", "cdn"),
+                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                    "cloudfront.Distribution",
+                    "cdn",
+                )),
                 from: Box::new(cascade_from),
                 to: cascade_to,
             }],
@@ -2854,14 +2889,20 @@ mod tests {
         );
 
         let effect = Effect::Replace {
-            id: ResourceId::with_identity("wafv2.WebAcl", "edge"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "wafv2.WebAcl",
+                "edge",
+            )),
             from: Box::new(from),
             to,
             directives: crate::resource::Directives::default(),
             changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
                 .unwrap(),
             cascading_updates: vec![CascadingUpdate {
-                id: ResourceId::with_identity("test.RuleSet", "rules"),
+                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                    "test.RuleSet",
+                    "rules",
+                )),
                 from: Box::new(cascade_from),
                 to: cascade_to,
             }],
@@ -2925,7 +2966,10 @@ mod tests {
             Value::Concrete(ConcreteValue::String("arn:old".to_string())),
         );
         let effect = Effect::Replace {
-            id: ResourceId::with_identity("test.Widget", "w"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "test.Widget",
+                "w",
+            )),
             from: Box::new(from),
             to,
             directives: crate::resource::Directives::default(),
@@ -2964,7 +3008,10 @@ mod tests {
             Value::Concrete(ConcreteValue::String("arn:old".to_string())),
         );
         let effect = Effect::Replace {
-            id: ResourceId::with_identity("test.Widget", "w"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "test.Widget",
+                "w",
+            )),
             from: Box::new(from),
             to,
             directives: crate::resource::Directives::default(),
@@ -3037,7 +3084,10 @@ mod tests {
             )])),
         );
         let effect = Effect::Replace {
-            id: ResourceId::with_identity("test.Widget", "w"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "test.Widget",
+                "w",
+            )),
             from: Box::new(from),
             to,
             directives: crate::resource::Directives::default(),
@@ -3089,7 +3139,10 @@ mod tests {
             Value::Concrete(ConcreteValue::Map(new_settings)),
         );
         let effect = Effect::Replace {
-            id: ResourceId::with_identity("test.Widget", "w"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "test.Widget",
+                "w",
+            )),
             from: Box::new(from),
             to,
             directives: crate::resource::Directives::default(),
@@ -3131,7 +3184,10 @@ mod tests {
             )])),
         );
         let effect = Effect::Replace {
-            id: ResourceId::with_identity("test.Widget", "w"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "test.Widget",
+                "w",
+            )),
             from: Box::new(from),
             to,
             directives: crate::resource::Directives::default(),
@@ -3184,7 +3240,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("kept".to_string())),
             );
         let effect = Effect::Replace {
-            id: id.clone(),
+            id: crate::resource::ResolvedResourceId::new(id.clone()),
             from: Box::new(from),
             to,
             directives: crate::resource::Directives::default(),
@@ -3239,7 +3295,10 @@ mod tests {
             Value::Concrete(ConcreteValue::String("new-name".to_string())),
         );
         let effect = Effect::Replace {
-            id: ResourceId::with_identity("test.Widget", "w"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "test.Widget",
+                "w",
+            )),
             from: Box::new(from),
             to,
             directives: crate::resource::Directives::default(),
@@ -3539,7 +3598,9 @@ mod tests {
             ),
         );
         let effect = Effect::Update {
-            id: ResourceId::with_identity("iam.Role", "r"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "iam.Role", "r",
+            )),
             from: Box::new(from),
             to,
             changed_attributes: vec!["policy".to_string()],
@@ -3588,7 +3649,9 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("new".to_string())),
             );
         let effect = Effect::Update {
-            id: ResourceId::with_identity("iam.Role", "r"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "iam.Role", "r",
+            )),
             from: Box::new(from),
             to,
             changed_attributes: vec!["policy".to_string(), "description".to_string()],
@@ -3632,7 +3695,9 @@ mod tests {
             ),
         );
         let effect = Effect::Update {
-            id: ResourceId::with_identity("iam.Role", "r"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "iam.Role", "r",
+            )),
             from: Box::new(from),
             to,
             changed_attributes: vec!["policy".to_string()],
@@ -3672,7 +3737,9 @@ mod tests {
             ),
         );
         let effect = Effect::Update {
-            id: ResourceId::with_identity("iam.Role", "r"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "iam.Role", "r",
+            )),
             from: Box::new(from),
             to,
             changed_attributes: vec!["policy".to_string()],
@@ -3734,7 +3801,7 @@ mod tests {
         let to = Resource::new("x.Thing", "t")
             .with_attribute("modes", mk(ConcreteValue::String("On".to_string())));
         let effect = Effect::Update {
-            id: ResourceId::with_identity("x.Thing", "t"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("x.Thing", "t")),
             from: Box::new(from),
             to,
             changed_attributes: vec!["modes".to_string()],
@@ -3774,7 +3841,9 @@ mod tests {
             ),
         );
         let effect = Effect::Update {
-            id: ResourceId::with_identity("iam.Role", "r"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "iam.Role", "r",
+            )),
             from: Box::new(from),
             to,
             changed_attributes: vec!["policy".to_string()],
@@ -3835,7 +3904,9 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
             );
         let effect = Effect::Update {
-            id: ResourceId::with_identity("iam.Role", "r"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "iam.Role", "r",
+            )),
             from: Box::new(from),
             to,
             changed_attributes: vec!["policy".to_string(), "description".to_string()],
@@ -3924,7 +3995,7 @@ mod tests {
         let to =
             Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
         let effect = Effect::Update {
-            id: ResourceId::with_identity("x.Thing", "t"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("x.Thing", "t")),
             from: Box::new(from),
             to,
             changed_attributes: vec!["modes".to_string()],
@@ -4139,7 +4210,7 @@ mod tests {
             )])),
         );
         let effect = Effect::Update {
-            id: ResourceId::with_identity("x.Thing", "t"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("x.Thing", "t")),
             from: Box::new(from),
             to,
             changed_attributes: vec!["tags".to_string()],
@@ -4182,7 +4253,7 @@ mod tests {
             )))),
         );
         let effect = Effect::Update {
-            id: ResourceId::with_identity("x.Thing", "t"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("x.Thing", "t")),
             from: Box::new(from),
             to,
             changed_attributes: vec!["password".to_string()],
@@ -4404,7 +4475,7 @@ mod tests {
         let to =
             Resource::new("x.Thing", "t").with_attribute("modes", enum_list(&["Allow", "Deny"]));
         let effect = Effect::Update {
-            id: ResourceId::with_identity("x.Thing", "t"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("x.Thing", "t")),
             from: Box::new(from),
             to,
             changed_attributes: vec!["modes".to_string()],

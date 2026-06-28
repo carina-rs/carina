@@ -926,7 +926,7 @@ mod apply_state_save_tests {
 
     fn deferred_replace_delete(id: &ResourceId) -> DeferredReplaceDelete {
         DeferredReplaceDelete {
-            id: id.clone(),
+            id: carina_core::resource::ResolvedResourceId::new(id.clone()),
             identifier: "old-record-id".to_string(),
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
@@ -946,7 +946,10 @@ mod apply_state_save_tests {
         Effect::DeferredReplace {
             deletes: NonEmptyDeletes::try_new(vec![deferred_replace_delete(id)])
                 .expect("fixture has one delete"),
-            id: ResourceId::with_identity("__deferred_for", "validation_records"),
+            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "__deferred_for",
+                "validation_records",
+            )),
             upstream_binding: "cert".to_string(),
             template: Box::new(DeferredForExpression {
                 file: Some("main.crn".to_string()),
@@ -1047,13 +1050,13 @@ mod apply_state_save_tests {
             State::existing(id.clone(), HashMap::new()).with_identifier("new-record-id");
         let mut plan = Plan::new();
         plan.add(Effect::Move {
-            from: id.clone(),
-            to: ResourceId::with_provider_identity(
+            from: carina_core::resource::ResolvedResourceId::new(id.clone()),
+            to: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
                 "aws",
                 "route53.Record",
                 "validation_records[1]",
                 None,
-            ),
+            )),
         });
         let current_states = HashMap::new();
         let applied_states = HashMap::from([(id.clone(), applied_state)]);

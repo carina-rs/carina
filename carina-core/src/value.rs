@@ -5070,7 +5070,10 @@ mod tests {
             InterpolationPart::Literal("|registry-dev.carina-rs.dev|NS".to_string()),
         ]));
         let effect = Effect::Import {
-            id: ResourceId::with_identity("aws.route53.RecordSet", "r.delegation_ns"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "aws.route53.RecordSet",
+                "r.delegation_ns",
+            )),
             identifier,
         };
         let redacted = redact_secrets_in_effect(&effect)
@@ -5107,7 +5110,10 @@ mod tests {
             InterpolationPart::Literal("|tail".to_string()),
         ]));
         let effect = Effect::Import {
-            id: ResourceId::with_identity("aws.s3.Bucket", "b"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "aws.s3.Bucket",
+                "b",
+            )),
             identifier,
         };
         let redacted = redact_secrets_in_effect(&effect).expect("redaction succeeds");
@@ -5161,7 +5167,10 @@ mod tests {
         let mut template_resource = Resource::new("aws.route53.RecordSet", "validation_records");
         template_resource.set_attr("name", placeholder.clone());
         let effect = Effect::DeferredCreate {
-            id: ResourceId::with_identity("__deferred_for", "validation_records"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "__deferred_for",
+                "validation_records",
+            )),
             upstream_binding: "cert".to_string(),
             template: Box::new(DeferredForExpression {
                 file: None,

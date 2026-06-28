@@ -766,7 +766,7 @@ mod tests {
             );
         }
         Effect::Update {
-            id: id.clone(),
+            id: crate::resource::ResolvedResourceId::new(id.clone()),
             from: Box::new(state_for(&id)),
             to,
             changed_attributes: writes.iter().map(|attr| (*attr).to_string()).collect(),
@@ -784,7 +784,7 @@ mod tests {
             );
         }
         Effect::Replace {
-            id: id.clone(),
+            id: crate::resource::ResolvedResourceId::new(id.clone()),
             from: Box::new(state_for(&id)),
             to,
             directives: Default::default(),
@@ -969,7 +969,7 @@ mod tests {
         plan.add(Effect::Create(cert.clone()));
         plan.add(Effect::Wait {
             binding: "cert_issued".to_string(),
-            target_id: cert_id.clone(),
+            target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -1063,7 +1063,7 @@ mod tests {
         plan.add(Effect::Create(cert.clone()));
         plan.add(Effect::Wait {
             binding: "cert_issued".to_string(),
-            target_id: cert_id.clone(),
+            target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
                 value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
@@ -1198,7 +1198,7 @@ mod tests {
             }),
         );
         let child = Effect::Update {
-            id: child.id.clone(),
+            id: crate::resource::ResolvedResourceId::new(child.id.clone()),
             from: Box::new(state_for(&child.id)),
             to: child,
             changed_attributes: vec!["name".to_string()],
@@ -1217,7 +1217,7 @@ mod tests {
         };
         child.directives.depends_on.push("parent".to_string());
         let child = Effect::Update {
-            id: child.id.clone(),
+            id: crate::resource::ResolvedResourceId::new(child.id.clone()),
             from: Box::new(state_for(&child.id)),
             to: child,
             changed_attributes: vec!["name".to_string()],
@@ -1242,7 +1242,7 @@ mod tests {
         let effects = vec![
             parent,
             Effect::Update {
-                id: child_id.clone(),
+                id: crate::resource::ResolvedResourceId::new(child_id.clone()),
                 from: Box::new(state_for(&child_id)),
                 to: child.clone(),
                 changed_attributes: vec!["name".to_string()],
@@ -1340,7 +1340,7 @@ mod tests {
         let effects = vec![
             parent,
             Effect::Update {
-                id: child_id.clone(),
+                id: crate::resource::ResolvedResourceId::new(child_id.clone()),
                 from: Box::new(state_for(&child_id)),
                 to: child.clone(),
                 changed_attributes: vec!["name".to_string()],
