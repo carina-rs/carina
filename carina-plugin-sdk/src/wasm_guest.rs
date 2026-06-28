@@ -58,7 +58,7 @@ pub fn proto_value_to_json(v: &proto::Value) -> serde_json::Value {
     }
 }
 
-/// Parse a ResourceId string (provider.resource_type.name) into a proto::ResourceId.
+/// Parse a ResourceId string (provider.resource_type.identity) into a proto::ResourceId.
 ///
 /// Delegates to `crate::parse_resource_id_string` which is available on all targets.
 pub fn parse_resource_id_string(key: &str) -> crate::types::ResourceId {
@@ -117,7 +117,7 @@ macro_rules! export_provider {
                 proto::ResourceId {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
-                    name: id.identity.clone(),
+                    identity: id.identity.clone(),
                 }
             }
 
@@ -135,7 +135,7 @@ macro_rules! export_provider {
                 wit_types::ResourceId {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
-                    identity: id.name.clone(),
+                    identity: id.identity.clone(),
                 }
             }
 
@@ -719,7 +719,7 @@ macro_rules! export_provider {
                 proto::ResourceId {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
-                    name: id.identity.clone(),
+                    identity: id.identity.clone(),
                 }
             }
 
@@ -737,7 +737,7 @@ macro_rules! export_provider {
                 wit_types::ResourceId {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
-                    identity: id.name.clone(),
+                    identity: id.identity.clone(),
                 }
             }
 
