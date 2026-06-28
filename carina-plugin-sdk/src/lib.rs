@@ -21,10 +21,10 @@ pub mod wasi_http;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod wasi_http_body;
 
-/// Parse a ResourceId string (provider.resource_type.name) into a ResourceId.
+/// Parse a ResourceId string (provider.resource_type.identity) into a ResourceId.
 ///
-/// Format: "provider.service.type.name" where provider is the first segment,
-/// name is the last segment, and resource_type is everything in between.
+/// Format: "provider.service.type.identity" where provider is the first segment,
+/// identity is the last segment, and resource_type is everything in between.
 ///
 /// This is also used by the WASM guest SDK via `wasm_guest::parse_resource_id_string`.
 pub fn parse_resource_id_string(key: &str) -> carina_provider_protocol::types::ResourceId {
@@ -33,7 +33,7 @@ pub fn parse_resource_id_string(key: &str) -> carina_provider_protocol::types::R
         return carina_provider_protocol::types::ResourceId {
             provider: String::new(),
             resource_type: String::new(),
-            name: key.to_string(),
+            identity: key.to_string(),
         };
     }
     let provider = parts[0].to_string();
@@ -42,13 +42,13 @@ pub fn parse_resource_id_string(key: &str) -> carina_provider_protocol::types::R
         carina_provider_protocol::types::ResourceId {
             provider,
             resource_type: rest[..dot_pos].to_string(),
-            name: rest[dot_pos + 1..].to_string(),
+            identity: rest[dot_pos + 1..].to_string(),
         }
     } else {
         carina_provider_protocol::types::ResourceId {
             provider,
             resource_type: String::new(),
-            name: rest.to_string(),
+            identity: rest.to_string(),
         }
     }
 }
@@ -443,7 +443,7 @@ mod tests {
         let id = parse_resource_id_string("awscc.iam.role.my-role");
         assert_eq!(id.provider, "awscc");
         assert_eq!(id.resource_type, "iam.role");
-        assert_eq!(id.name, "my-role");
+        assert_eq!(id.identity, "my-role");
     }
 
     #[test]
@@ -451,7 +451,7 @@ mod tests {
         let id = parse_resource_id_string("awscc.ec2.ipam.test-ipam");
         assert_eq!(id.provider, "awscc");
         assert_eq!(id.resource_type, "ec2.ipam");
-        assert_eq!(id.name, "test-ipam");
+        assert_eq!(id.identity, "test-ipam");
     }
 
     #[test]
@@ -459,7 +459,7 @@ mod tests {
         let id = parse_resource_id_string("awscc.s3.Bucket.carina-acc-test-abc123");
         assert_eq!(id.provider, "awscc");
         assert_eq!(id.resource_type, "s3.Bucket");
-        assert_eq!(id.name, "carina-acc-test-abc123");
+        assert_eq!(id.identity, "carina-acc-test-abc123");
     }
 
     #[test]
@@ -467,7 +467,7 @@ mod tests {
         let id = parse_resource_id_string("aws.s3.Bucket.my-bucket");
         assert_eq!(id.provider, "aws");
         assert_eq!(id.resource_type, "s3.Bucket");
-        assert_eq!(id.name, "my-bucket");
+        assert_eq!(id.identity, "my-bucket");
     }
 
     #[test]
@@ -475,7 +475,7 @@ mod tests {
         let id = parse_resource_id_string("simple");
         assert_eq!(id.provider, "");
         assert_eq!(id.resource_type, "");
-        assert_eq!(id.name, "simple");
+        assert_eq!(id.identity, "simple");
     }
 
     #[test]
@@ -483,6 +483,6 @@ mod tests {
         let id = parse_resource_id_string("provider.name");
         assert_eq!(id.provider, "provider");
         assert_eq!(id.resource_type, "");
-        assert_eq!(id.name, "name");
+        assert_eq!(id.identity, "name");
     }
 }

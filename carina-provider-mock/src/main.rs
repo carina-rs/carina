@@ -17,7 +17,7 @@ impl Default for MockProcessProvider {
 
 impl MockProcessProvider {
     fn resource_key(id: &ResourceId) -> String {
-        format!("{}.{}", id.resource_type, id.name)
+        format!("{}.{}", id.resource_type, id.identity)
     }
 }
 

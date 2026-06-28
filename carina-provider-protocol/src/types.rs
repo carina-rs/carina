@@ -15,7 +15,8 @@ fn default_true() -> bool {
 pub struct ResourceId {
     pub provider: String,
     pub resource_type: String,
-    pub name: String,
+    #[serde(alias = "name")]
+    pub identity: String,
 }
 
 /// Structured identity of a provider-defined custom type.
@@ -705,7 +706,7 @@ mod tests {
             id: ResourceId {
                 provider: "mock".into(),
                 resource_type: "test.resource".into(),
-                name: "my-resource".into(),
+                identity: "my-resource".into(),
             },
             identifier: Some("mock-id".into()),
             attributes: HashMap::from([("name".into(), Value::String("test".into()))]),
@@ -717,6 +718,15 @@ mod tests {
         assert_eq!(state.id, back.id);
         assert_eq!(state.identifier, back.identifier);
         assert_eq!(state.exists, back.exists);
+    }
+
+    #[test]
+    fn test_resource_id_deserializes_legacy_name() {
+        let json = r#"{"provider":"mock","resource_type":"test.resource","name":"old-key"}"#;
+
+        let id: ResourceId = serde_json::from_str(json).unwrap();
+
+        assert_eq!(id.identity, "old-key");
     }
 
     #[test]
