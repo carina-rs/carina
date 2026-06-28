@@ -206,12 +206,12 @@ fn topological_sort(resources: &[Resource]) -> Result<Vec<Resource>, String> {
 mod tests {
     use super::*;
     use crate::effect::Effect;
-    use crate::resource::{DeferredValue, Resource, ResourceId, Value};
+    use crate::resource::{DeferredValue, Resource, ResourceId, ResourceIdentity, Value};
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
     fn wait_effect_with_explicit_dependency(binding: Option<&str>) -> Effect {
         Effect::Wait {
-            binding: "cert_issued".to_string(),
+            identity: ResourceIdentity::new("cert_issued"),
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",

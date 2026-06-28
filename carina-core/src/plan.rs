@@ -121,11 +121,11 @@ impl Plan {
         for effect in &mut self.effects {
             match effect {
                 Effect::Replace {
-                    id,
+                    to,
                     changed_create_only,
                     cascade_ref_hints,
                     ..
-                } if id == resource_id => {
+                } if to.id == *resource_id => {
                     for attr in cascade_attrs.iter() {
                         if !changed_create_only.contains(attr) {
                             changed_create_only.push(attr.to_string());
@@ -138,15 +138,16 @@ impl Plan {
                     }
                     return;
                 }
-                Effect::Update { id, .. } if id == resource_id => {
+                Effect::Update { to, .. } if to.id == *resource_id => {
                     // Take ownership of the Update fields and upgrade to Replace.
                     // The `Create` here is a throwaway placeholder overwritten
                     // on the next line.
-                    let placeholder = crate::resource::Resource::new("", "");
+                    let placeholder = crate::resource::ResolvedResource::new(
+                        crate::resource::Resource::new("__placeholder", "__placeholder"),
+                    );
                     let old = std::mem::replace(effect, Effect::Create(placeholder));
-                    if let Effect::Update { id, from, to, .. } = old {
+                    if let Effect::Update { from, to, .. } = old {
                         *effect = Effect::Replace {
-                            id,
                             from,
                             to,
                             directives,
@@ -171,8 +172,8 @@ impl Plan {
     /// to avoid breaking dependents during replacement.
     pub fn promote_to_create_before_destroy(&mut self, resource_id: &crate::resource::ResourceId) {
         for effect in &mut self.effects {
-            if let Effect::Replace { id, directives, .. } = effect
-                && id == resource_id
+            if let Effect::Replace { to, directives, .. } = effect
+                && to.id == *resource_id
             {
                 directives.create_before_destroy = true;
                 return;
@@ -480,8 +481,8 @@ impl ModularPlan {
 fn format_effect_brief(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("{} {}", effect.display_glyph(), r.id),
-        Effect::Update { id, .. } => format!("{} {}", effect.display_glyph(), id),
-        Effect::Replace { id, .. } => format!("{} {}", effect.display_glyph(), id),
+        Effect::Update { to, .. } => format!("{} {}", effect.display_glyph(), to.id),
+        Effect::Replace { to, .. } => format!("{} {}", effect.display_glyph(), to.id),
         Effect::Delete { id, .. } => format!("{} {}", effect.display_glyph(), id),
         Effect::Read { resource } => {
             format!("{} {} (data source)", effect.display_glyph(), resource.id)
@@ -499,13 +500,13 @@ fn format_effect_brief(effect: &Effect) -> String {
         Effect::Remove { id } => format!("{} {} (remove from state)", effect.display_glyph(), id),
         Effect::Move { from, to } => format!("{} {} (from: {})", effect.display_glyph(), to, from),
         Effect::Wait {
-            binding,
+            identity,
             until_surface,
             ..
         } => format!(
             "{} {} (until {})",
             effect.display_glyph(),
-            binding,
+            identity,
             until_surface
         ),
         Effect::DeferredCreate {
@@ -534,7 +535,17 @@ fn format_effect_brief(effect: &Effect) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::Resource;
+    use crate::resource::{
+        DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceIdentity,
+    };
+
+    fn resolved(resource: Resource) -> ResolvedResource {
+        ResolvedResource::new(resource)
+    }
+
+    fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
+        ResolvedDataSource::new(resource)
+    }
 
     #[test]
     fn empty_plan() {
@@ -552,11 +563,14 @@ mod tests {
     /// run through the full resource-apply pipeline.
     #[test]
     fn read_only_plan_has_no_mutations() {
-        use crate::resource::DataSource;
-
         let mut plan = Plan::new();
         plan.add(Effect::Read {
-            resource: DataSource::with_provider("aws", "iam.Roles", "admin_access_roles", None),
+            resource: resolved_data_source(DataSource::with_provider(
+                "aws",
+                "iam.Roles",
+                "admin_access_roles",
+                None,
+            )),
         });
         // `effects().is_empty()` is false — Read counts as a present effect.
         assert!(!plan.effects().is_empty());
@@ -569,7 +583,10 @@ mod tests {
     #[test]
     fn plan_with_create_has_mutations() {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("acm.Certificate", "cert")));
+        plan.add(Effect::Create(resolved(Resource::new(
+            "acm.Certificate",
+            "cert",
+        ))));
         assert!(plan.has_mutations());
         assert_eq!(plan.mutation_count(), 1);
     }
@@ -606,7 +623,7 @@ mod tests {
         use std::time::Duration;
 
         let e = Effect::Wait {
-            binding: "cert_issued".to_string(),
+            identity: ResourceIdentity::new("cert_issued"),
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
@@ -633,9 +650,12 @@ mod tests {
         use std::time::Duration;
 
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("acm.Certificate", "cert")));
+        plan.add(Effect::Create(resolved(Resource::new(
+            "acm.Certificate",
+            "cert",
+        ))));
         plan.add(Effect::Wait {
-            binding: "cert_issued".to_string(),
+            identity: ResourceIdentity::new("cert_issued"),
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
@@ -657,8 +677,8 @@ mod tests {
     #[test]
     fn plan_summary() {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
-        plan.add(Effect::Create(Resource::new("s3.Bucket", "b")));
+        plan.add(Effect::Create(resolved(Resource::new("s3.Bucket", "a"))));
+        plan.add(Effect::Create(resolved(Resource::new("s3.Bucket", "b"))));
         plan.add(Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(
                 crate::resource::ResourceId::with_identity("s3.Bucket", "c"),
@@ -694,9 +714,9 @@ mod tests {
             template_resource,
         };
         let mut plan = Plan::new();
-        plan.add(Effect::Create(
+        plan.add(Effect::Create(resolved(
             Resource::new("acm.Certificate", "cert").with_binding("cert"),
-        ));
+        )));
         plan.add(Effect::DeferredCreate {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "route53.RecordSet",
@@ -780,7 +800,7 @@ mod tests {
         let mut plan = Plan::new();
 
         // Root resource
-        plan.add(Effect::Create(Resource::new("vpc", "main")));
+        plan.add(Effect::Create(resolved(Resource::new("vpc", "main"))));
 
         // Module resource
         let module_resource =
@@ -788,7 +808,7 @@ mod tests {
                 name: "web_tier".to_string(),
                 instance: "web".to_string(),
             });
-        plan.add(Effect::Create(module_resource));
+        plan.add(Effect::Create(resolved(module_resource)));
 
         let modular = ModularPlan::from_plan(plan);
 
@@ -807,8 +827,8 @@ mod tests {
         let mut plan = Plan::new();
 
         // Two root resources
-        plan.add(Effect::Create(Resource::new("vpc", "main")));
-        plan.add(Effect::Create(Resource::new("subnet", "public")));
+        plan.add(Effect::Create(resolved(Resource::new("vpc", "main"))));
+        plan.add(Effect::Create(resolved(Resource::new("subnet", "public"))));
 
         // Module resource
         let module_resource =
@@ -816,7 +836,7 @@ mod tests {
                 name: "web_tier".to_string(),
                 instance: "web".to_string(),
             });
-        plan.add(Effect::Create(module_resource));
+        plan.add(Effect::Create(resolved(module_resource)));
 
         let modular = ModularPlan::from_plan(plan);
         let groups = modular.group_by_module();
@@ -844,22 +864,15 @@ mod tests {
             .with_identifier("vpc-123");
         let to = Resource::new("ec2.Vpc", "vpc");
         let cascading = CascadingUpdate {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "ec2.Subnet",
-                "subnet",
-            )),
             from: Box::new(
                 State::not_found(ResourceId::with_identity("ec2.Subnet", "subnet"))
                     .with_identifier("subnet-123"),
             ),
-            to: (Resource::new("ec2.Subnet", "subnet")),
+            to: resolved(Resource::new("ec2.Subnet", "subnet")),
         };
         plan.add(Effect::Replace {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "ec2.Vpc", "vpc",
-            )),
             from: Box::new(from),
-            to,
+            to: resolved(to),
             directives: Directives::default(),
             changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
                 "cidr_block".to_string(),
@@ -889,22 +902,15 @@ mod tests {
             .with_identifier("vpc-123");
         let to = Resource::new("ec2.Vpc", "vpc");
         let cascading = CascadingUpdate {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "ec2.Subnet",
-                "subnet",
-            )),
             from: Box::new(
                 State::not_found(ResourceId::with_identity("ec2.Subnet", "subnet"))
                     .with_identifier("subnet-123"),
             ),
-            to: (Resource::new("ec2.Subnet", "subnet")),
+            to: resolved(Resource::new("ec2.Subnet", "subnet")),
         };
         plan.add(Effect::Replace {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "ec2.Vpc", "vpc",
-            )),
             from: Box::new(from),
-            to,
+            to: resolved(to),
             directives: Directives::default(),
             changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
                 "cidr_block".to_string(),
@@ -933,7 +939,7 @@ mod tests {
         use crate::resource::ResourceId;
 
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
+        plan.add(Effect::Create(resolved(Resource::new("s3.Bucket", "a"))));
         plan.add(Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "s3.Bucket",

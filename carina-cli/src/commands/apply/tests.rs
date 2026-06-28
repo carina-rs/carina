@@ -3,7 +3,7 @@ use carina_core::provider::{
     BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, Provider, ProviderError,
     ProviderFactory, ProviderNormalizer, ProviderResult, ReadRequest, UpdateRequest,
 };
-use carina_core::resource::{DataSource, ResourceId};
+use carina_core::resource::{DataSource, ResolvedResource, Resource, ResourceId};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -13,6 +13,10 @@ use std::time::Duration;
 mod cancellation_fixture;
 
 use cancellation_fixture::ApplyCancellationFixture;
+
+fn resolved(resource: Resource) -> ResolvedResource {
+    ResolvedResource::new(resource)
+}
 
 struct FailBCreateFactory;
 
@@ -926,9 +930,8 @@ fn move_plus_replace_keeps_post_replace_identifier_and_attributes() {
         None,
     );
     plan.add(Effect::Replace {
-        id: carina_core::resource::ResolvedResourceId::new(new_id.clone()),
         from: Box::new(State::existing(from_id.clone(), HashMap::new())),
-        to: sorted_resources[0].clone(),
+        to: resolved(sorted_resources[0].clone()),
         directives: Directives::default(),
         changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
             "role_name".to_string(),
@@ -1051,9 +1054,8 @@ fn move_plus_update_keeps_post_update_attributes() {
     let mut plan = Plan::new();
     let from_id = ResourceId::with_provider_identity("awscc", "ec2.Tag", "tag_old", None);
     plan.add(Effect::Update {
-        id: carina_core::resource::ResolvedResourceId::new(new_id.clone()),
         from: Box::new(State::existing(from_id.clone(), HashMap::new())),
-        to: sorted_resources[0].clone(),
+        to: resolved(sorted_resources[0].clone()),
         changed_attributes: vec!["value".to_string()],
     });
     plan.add(Effect::Move {

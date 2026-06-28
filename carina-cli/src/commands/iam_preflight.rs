@@ -7,7 +7,7 @@ use aws_sdk_iam::types::PolicyEvaluationDecisionType;
 use carina_core::effect::{Effect, PlanOp};
 use carina_core::plan::Plan;
 use carina_core::provider::Provider;
-use carina_core::resource::ResourceId;
+use carina_core::resource::{ResolvedResource, ResourceId};
 use colored::Colorize;
 use serde_json::Value as JsonValue;
 
@@ -294,18 +294,16 @@ fn effect_required_ops(effect: &Effect) -> Vec<(ResourceId, PlanOp)> {
     match effect {
         Effect::Read { resource } => vec![(resource.id.clone(), PlanOp::Read)],
         Effect::Create(resource) => vec![(resource.id.clone(), PlanOp::Create)],
-        Effect::Update { id, .. } => vec![(id.clone().into_inner(), PlanOp::Update)],
-        Effect::Replace { id, to, .. } => {
-            vec![
-                (id.clone().into_inner(), PlanOp::Delete),
-                (to.id.clone(), PlanOp::Create),
-            ]
-        }
+        Effect::Update { to, .. } => vec![(to.id.clone(), PlanOp::Update)],
+        Effect::Replace { to, .. } => vec![
+            (to.id.clone(), PlanOp::Delete),
+            (to.id.clone(), PlanOp::Create),
+        ],
         Effect::Delete { id, .. } => vec![(id.clone().into_inner(), PlanOp::Delete)],
         Effect::Import { id, .. } => vec![(id.clone().into_inner(), PlanOp::Read)],
-        Effect::DeferredCreate { template, .. } => {
-            effect_required_ops(&Effect::Create(template.template_resource.clone()))
-        }
+        Effect::DeferredCreate { template, .. } => effect_required_ops(&Effect::Create(
+            ResolvedResource::new(template.template_resource.clone()),
+        )),
         Effect::DeferredReplace {
             deletes, template, ..
         } => {
@@ -313,9 +311,9 @@ fn effect_required_ops(effect: &Effect) -> Vec<(ResourceId, PlanOp)> {
                 .iter()
                 .map(|delete| (delete.id.clone().into_inner(), PlanOp::Delete))
                 .collect();
-            ops.extend(effect_required_ops(&Effect::Create(
+            ops.extend(effect_required_ops(&Effect::Create(ResolvedResource::new(
                 template.template_resource.clone(),
-            )));
+            ))));
             ops
         }
         Effect::Remove { .. } | Effect::Move { .. } | Effect::Wait { .. } => Vec::new(),
@@ -326,8 +324,8 @@ fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
     match effect {
         Effect::Read { resource } => vec![&resource.id],
         Effect::Create(resource) => vec![&resource.id],
-        Effect::Update { id, .. } => vec![id.as_inner()],
-        Effect::Replace { id, to, .. } => vec![id.as_inner(), &to.id],
+        Effect::Update { to, .. } => vec![&to.id],
+        Effect::Replace { to, .. } => vec![&to.id],
         Effect::Delete { id, .. } => vec![id.as_inner()],
         Effect::Import { id, .. } => vec![id.as_inner()],
         Effect::Remove { id, .. } => vec![id.as_inner()],
@@ -763,7 +761,17 @@ mod tests {
         BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
         UpdateRequest,
     };
-    use carina_core::resource::{ConcreteValue, DataSource, Resource, State, Value};
+    use carina_core::resource::{
+        ConcreteValue, DataSource, ResolvedDataSource, ResolvedResource, Resource, State, Value,
+    };
+
+    fn resolved(resource: Resource) -> ResolvedResource {
+        ResolvedResource::new(resource)
+    }
+
+    fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
+        ResolvedDataSource::new(resource)
+    }
 
     struct PermissionProvider;
 
@@ -829,18 +837,18 @@ mod tests {
         let delete_id = ResourceId::with_provider_identity("awscc", "iam.Role", "old", None);
         let import_id = ResourceId::with_provider_identity("awscc", "logs.Group", "existing", None);
 
-        plan.add(Effect::Read { resource: read });
-        plan.add(Effect::Create(create));
+        plan.add(Effect::Read {
+            resource: resolved_data_source(read),
+        });
+        plan.add(Effect::Create(resolved(create)));
         plan.add(Effect::Update {
-            id: carina_core::resource::ResolvedResourceId::new(update_id.clone()),
             from: Box::new(State::not_found(update_id.clone())),
-            to: update_to,
+            to: resolved(update_to),
             changed_attributes: vec!["cidr".to_string()],
         });
         plan.add(Effect::Replace {
-            id: carina_core::resource::ResolvedResourceId::new(replace_id.clone()),
             from: Box::new(State::not_found(replace_id.clone())),
-            to: replace_to,
+            to: resolved(replace_to),
             directives: Default::default(),
             changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
             cascading_updates: vec![],

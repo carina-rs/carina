@@ -1,5 +1,6 @@
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::IsTerminal;
 use std::path::Path;
 
@@ -623,6 +624,130 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
     );
 
     apply_provider_prefix_renames(&renames, state_file);
+}
+
+pub(crate) fn adopt_unique_state_identity_for_unresolved_anonymous(
+    resources: &mut [Resource],
+    state_file: &StateFile,
+) {
+    for resource in resources {
+        if resource.id.identity.is_some() || resource.binding.is_some() {
+            continue;
+        }
+
+        let candidates: Vec<_> = state_file
+            .resources_by_type(&resource.id.provider, &resource.id.resource_type)
+            .into_iter()
+            .filter(|state| !state.identity.is_empty())
+            .filter(|state| state.directives.provider_instance == resource.id.provider_instance)
+            .collect();
+        let [state] = candidates.as_slice() else {
+            continue;
+        };
+
+        resource.id = ResourceId::with_provider_identity(
+            &resource.id.provider,
+            &resource.id.resource_type,
+            state.identity.as_str(),
+            resource.id.provider_instance.clone(),
+        );
+    }
+}
+
+pub(crate) fn assign_fallback_identities_for_unresolved_anonymous(
+    resources: &mut [Resource],
+) -> Vec<(ResourceId, ResourceId)> {
+    let mut used: HashMap<(String, String, Option<String>), HashSet<String>> = HashMap::new();
+    let mut renames = Vec::new();
+    for resource in resources.iter() {
+        if let Some(identity) = resource.id.identity_str() {
+            used.entry((
+                resource.id.provider.clone(),
+                resource.id.resource_type.clone(),
+                resource.id.provider_instance.clone(),
+            ))
+            .or_default()
+            .insert(identity.to_string());
+        }
+    }
+
+    for (idx, resource) in resources.iter_mut().enumerate() {
+        if resource.id.identity.is_some() || resource.binding.is_some() {
+            continue;
+        }
+
+        let provider_snake = resource
+            .id
+            .provider
+            .split('.')
+            .map(carina_core::parser::pascal_to_snake)
+            .collect::<Vec<_>>()
+            .join("_");
+        let type_snake = resource
+            .id
+            .resource_type
+            .split('.')
+            .map(carina_core::parser::pascal_to_snake)
+            .collect::<Vec<_>>()
+            .join("_");
+        let hash = fallback_anonymous_hash(resource);
+        let bare_identifier = if provider_snake.is_empty() {
+            format!("{type_snake}_{hash}")
+        } else {
+            format!("{provider_snake}_{type_snake}_{hash}")
+        };
+        let base_identifier = match &resource.module_source {
+            Some(carina_core::resource::ModuleSource::Module { instance, .. }) => {
+                format!("{instance}.{bare_identifier}")
+            }
+            _ => bare_identifier,
+        };
+
+        let key = (
+            resource.id.provider.clone(),
+            resource.id.resource_type.clone(),
+            resource.id.provider_instance.clone(),
+        );
+        let used_for_type = used.entry(key).or_default();
+        let mut identifier = base_identifier;
+        if used_for_type.contains(&identifier) {
+            identifier = format!("{identifier}_{idx}");
+        }
+        used_for_type.insert(identifier.clone());
+
+        let old_id = resource.id.clone();
+        resource.id = ResourceId::with_provider_identity(
+            &resource.id.provider,
+            &resource.id.resource_type,
+            identifier,
+            resource.id.provider_instance.clone(),
+        );
+        renames.push((old_id, resource.id.clone()));
+    }
+    renames
+}
+
+fn fallback_anonymous_hash(resource: &Resource) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    resource.id.provider.hash(&mut hasher);
+    resource.id.resource_type.hash(&mut hasher);
+    resource.id.provider_instance.hash(&mut hasher);
+    resource.module_source.hash(&mut hasher);
+    for (key, value) in &resource.attributes {
+        key.hash(&mut hasher);
+        format!("{value:?}").hash(&mut hasher);
+    }
+    resource.directives.force_delete.hash(&mut hasher);
+    resource.directives.create_before_destroy.hash(&mut hasher);
+    resource.directives.prevent_destroy.hash(&mut hasher);
+    resource.directives.depends_on.hash(&mut hasher);
+    resource.directives.provider_instance.hash(&mut hasher);
+    for (key, value) in BTreeMap::from_iter(resource.prefixes.iter()) {
+        key.hash(&mut hasher);
+        value.hash(&mut hasher);
+    }
+    resource.dependency_bindings.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() & 0xffff_ffff)
 }
 
 /// Re-key state entries when `reconcile_anonymous_identifiers` produced rename
@@ -2090,15 +2215,6 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // separator + plan render below it instead of being swallowed (#3150).
     finish_refresh_bar_region(refresh_printed_bars);
 
-    // Build orphan dependency bindings from state file for tree structure
-    let orphan_dependencies = if let Some(sf) = state_file.as_ref() {
-        let desired_ids: HashSet<ResourceId> =
-            sorted_resources.iter().map(|r| r.id.clone()).collect();
-        sf.build_orphan_dependencies(&desired_ids)
-    } else {
-        HashMap::new()
-    };
-
     // Resolve ResourceRef values and enum identifiers using AWS state.
     // Plan-only: surviving upstream refs are stamped for display as
     // `(known after upstream apply: <ref>)` (#2366). `apply` calls
@@ -2181,6 +2297,55 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
             &mut wait_bindings,
         )
         .await;
+
+    // Anonymous resources whose identity attributes include ResourceRefs can
+    // only be named and matched after plan-time refs and provider normalization
+    // have made those create-only values concrete. Keep this late pass local to
+    // the desired resources; the earlier mutable-state reconciliation still
+    // owns state-file rename migration.
+    {
+        let canonical_resources =
+            carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
+        let errors =
+            compute_anonymous_identifiers_with_ctx(&ctx, canonical_resources, &parsed.providers);
+        if let Some(error) = errors.into_iter().next() {
+            return Err(error);
+        }
+    }
+    if let Some(sf) = state_file.as_ref() {
+        let mut state_for_late_reconcile = sf.clone();
+        reconcile_anonymous_identifiers_with_ctx(
+            &ctx,
+            &mut resources,
+            &mut state_for_late_reconcile,
+            state_block_claims,
+        );
+        adopt_unique_state_identity_for_unresolved_anonymous(&mut resources, sf);
+    }
+    let fallback_renames = assign_fallback_identities_for_unresolved_anonymous(&mut resources);
+    for (from, to) in &fallback_renames {
+        if let Some(mut state) = current_states.remove(from) {
+            state.id = to.clone();
+            current_states.insert(to.clone(), state);
+        }
+        if let Some(attrs) = saved_attrs.remove(from) {
+            saved_attrs.insert(to.clone(), attrs);
+        }
+        if let Some(explicit) = prev_explicit.remove(from) {
+            prev_explicit.insert(to.clone(), explicit);
+        }
+    }
+
+    // Build orphan dependency bindings from state file for tree structure
+    // after late anonymous reconciliation, so an anonymous desired resource
+    // matched from state is not also treated as an orphan.
+    let orphan_dependencies = if let Some(sf) = state_file.as_ref() {
+        let desired_ids: HashSet<ResourceId> = resources.iter().map(|r| r.id.clone()).collect();
+        sf.build_orphan_dependencies(&desired_ids)
+    } else {
+        HashMap::new()
+    };
+
     let plan_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
 
     // Build directives map from state file for orphaned resource deletion
@@ -2817,7 +2982,7 @@ fn resolve_import_target(to: &StateBlockAddress, plan: &Plan) -> ResourceId {
     if let Some(resource) = match_import_target(
         to,
         plan.effects().iter().filter_map(|effect| match effect {
-            Effect::Create(resource) => Some(resource),
+            Effect::Create(resource) => Some(resource.as_inner()),
             _ => None,
         }),
     ) {

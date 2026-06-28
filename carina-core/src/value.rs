@@ -1008,22 +1008,23 @@ pub fn redact_secrets_in_effect(
     use crate::effect::Effect;
     Ok(match effect {
         Effect::Read { resource } => Effect::Read {
-            resource: redact_secrets_in_data_source(resource)?,
+            resource: crate::resource::ResolvedDataSource::new(redact_secrets_in_data_source(
+                resource,
+            )?),
         },
-        Effect::Create(resource) => Effect::Create(redact_secrets_in_managed(resource)?),
+        Effect::Create(resource) => Effect::Create(crate::resource::ResolvedResource::new(
+            redact_secrets_in_managed(resource)?,
+        )),
         Effect::Update {
-            id,
             from,
             to,
             changed_attributes,
         } => Effect::Update {
-            id: id.clone(),
             from: Box::new(redact_secrets_in_state(from)?),
-            to: redact_secrets_in_managed(to)?,
+            to: crate::resource::ResolvedResource::new(redact_secrets_in_managed(to)?),
             changed_attributes: changed_attributes.clone(),
         },
         Effect::Replace {
-            id,
             from,
             to,
             directives,
@@ -1032,9 +1033,8 @@ pub fn redact_secrets_in_effect(
             temporary_name,
             cascade_ref_hints,
         } => Effect::Replace {
-            id: id.clone(),
             from: Box::new(redact_secrets_in_state(from)?),
-            to: redact_secrets_in_managed(to)?,
+            to: crate::resource::ResolvedResource::new(redact_secrets_in_managed(to)?),
             directives: directives.clone(),
             changed_create_only: changed_create_only.clone(),
             temporary_name: temporary_name.clone(),
@@ -1043,9 +1043,10 @@ pub fn redact_secrets_in_effect(
                 .iter()
                 .map(|cu| {
                     Ok::<_, SerializationError>(crate::effect::CascadingUpdate {
-                        id: cu.id.clone(),
                         from: Box::new(redact_secrets_in_state(&cu.from)?),
-                        to: redact_secrets_in_managed(&cu.to)?,
+                        to: crate::resource::ResolvedResource::new(redact_secrets_in_managed(
+                            &cu.to,
+                        )?),
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?,

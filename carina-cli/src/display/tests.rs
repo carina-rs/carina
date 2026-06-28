@@ -5,9 +5,13 @@ use colored::Colorize;
 use carina_core::effect::{CascadingUpdate, DeferredReplaceDelete, Effect, NonEmptyDeletes};
 use carina_core::plan::Plan;
 use carina_core::resource::{
-    AccessPath, ConcreteValue, DeferredValue, Directives, Resource, ResourceId, State,
-    UnknownReason, Value,
+    AccessPath, ConcreteValue, DeferredValue, Directives, ResolvedResource, Resource, ResourceId,
+    State, UnknownReason, Value,
 };
+
+fn resolved(resource: Resource) -> ResolvedResource {
+    ResolvedResource::new(resource)
+}
 
 fn make_resource(resource_type: &str, name: &str, binding: &str, deps: &[&str]) -> Resource {
     let mut r = Resource::new(resource_type, name);
@@ -31,7 +35,7 @@ fn test_print_plan_with_external_dependency_does_not_panic() {
     // This simulates an external/unresolved dependency.
     let b = make_resource("test.resource", "b", "b", &["a"]);
     let mut plan = Plan::new();
-    plan.add(Effect::Create(b));
+    plan.add(Effect::Create(resolved(b)));
 
     // Should not panic
     print_plan(
@@ -54,8 +58,8 @@ fn test_print_plan_with_internal_dependency_does_not_panic() {
     let a = make_resource("test.resource", "a", "a", &[]);
     let b = make_resource("test.resource", "b", "b", &["a"]);
     let mut plan = Plan::new();
-    plan.add(Effect::Create(a));
-    plan.add(Effect::Create(b));
+    plan.add(Effect::Create(resolved(a)));
+    plan.add(Effect::Create(resolved(b)));
 
     // Should not panic
     print_plan(
@@ -153,11 +157,11 @@ fn test_siblings_sorted_by_resource_type_and_binding() {
     let subnet_a = make_resource("ec2.Subnet", "subnet_a", "subnet_a", &["vpc"]);
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(vpc));
-    plan.add(Effect::Create(rt_b));
-    plan.add(Effect::Create(subnet_b));
-    plan.add(Effect::Create(rt_a));
-    plan.add(Effect::Create(subnet_a));
+    plan.add(Effect::Create(resolved(vpc)));
+    plan.add(Effect::Create(resolved(rt_b)));
+    plan.add(Effect::Create(resolved(subnet_b)));
+    plan.add(Effect::Create(resolved(rt_a)));
+    plan.add(Effect::Create(resolved(subnet_a)));
 
     let (roots, dependents, effect_bindings, _effect_types) = build_plan_tree(&plan);
 
@@ -216,9 +220,9 @@ fn test_parent_selection_prefers_most_ancestral_dependency() {
     let endpoint = make_resource("ec2.vpc_endpoint", "endpoint", "endpoint", &["vpc", "sg"]);
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(vpc));
-    plan.add(Effect::Create(sg));
-    plan.add(Effect::Create(endpoint));
+    plan.add(Effect::Create(resolved(vpc)));
+    plan.add(Effect::Create(resolved(sg)));
+    plan.add(Effect::Create(resolved(endpoint)));
 
     let (roots, dependents, effect_bindings, _) = build_plan_tree(&plan);
     let _print_order = collect_print_order(&roots, &dependents, &effect_bindings);
@@ -298,11 +302,11 @@ fn test_referenced_resource_without_deps_should_not_be_root() {
     );
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(vpc));
-    plan.add(Effect::Create(rt));
-    plan.add(Effect::Create(igw));
-    plan.add(Effect::Create(route));
-    plan.add(Effect::Create(igw_attachment));
+    plan.add(Effect::Create(resolved(vpc)));
+    plan.add(Effect::Create(resolved(rt)));
+    plan.add(Effect::Create(resolved(igw)));
+    plan.add(Effect::Create(resolved(route)));
+    plan.add(Effect::Create(resolved(igw_attachment)));
 
     let roots = compute_roots(&plan);
 
@@ -343,11 +347,11 @@ fn test_dependency_free_resource_nested_under_shallowest_referencing_resource() 
     );
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(vpc));
-    plan.add(Effect::Create(rt));
-    plan.add(Effect::Create(igw));
-    plan.add(Effect::Create(route));
-    plan.add(Effect::Create(igw_attachment));
+    plan.add(Effect::Create(resolved(vpc)));
+    plan.add(Effect::Create(resolved(rt)));
+    plan.add(Effect::Create(resolved(igw)));
+    plan.add(Effect::Create(resolved(route)));
+    plan.add(Effect::Create(resolved(igw_attachment)));
 
     let (roots, dependents, effect_bindings, _) = build_plan_tree(&plan);
 
@@ -599,8 +603,8 @@ fn test_print_plan_compact_does_not_panic() {
     let vpc = make_resource("ec2.Vpc", "vpc", "vpc", &[]);
     let rt = make_resource("ec2.RouteTable", "rt", "rt", &["vpc"]);
     let mut plan = Plan::new();
-    plan.add(Effect::Create(vpc));
-    plan.add(Effect::Create(rt));
+    plan.add(Effect::Create(resolved(vpc)));
+    plan.add(Effect::Create(resolved(rt)));
 
     // Should not panic
     print_plan(
@@ -631,7 +635,7 @@ fn test_print_plan_compact_with_anonymous_resources() {
     );
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(anon));
+    plan.add(Effect::Create(resolved(anon)));
 
     // Should not panic; anonymous resources should show hints
     print_plan(
@@ -781,11 +785,8 @@ fn test_cascading_update_shows_attribute_diffs() {
         );
 
     let replace_effect = Effect::Replace {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "ec2.Vpc", "vpc",
-        )),
         from: Box::new(vpc_from),
-        to: vpc_to,
+        to: resolved(vpc_to),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -795,12 +796,8 @@ fn test_cascading_update_shows_attribute_diffs() {
         ])
         .unwrap(),
         cascading_updates: vec![CascadingUpdate {
-            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                "ec2.Subnet",
-                "subnet",
-            )),
             from: Box::new(subnet_from),
-            to: subnet_to,
+            to: resolved(subnet_to),
         }],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -828,10 +825,6 @@ fn test_format_cascading_update_attr_diff() {
     use std::collections::HashMap;
 
     let cascade = CascadingUpdate {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "ec2.Subnet",
-            "subnet",
-        )),
         from: Box::new(State::existing(
             ResourceId::with_identity("ec2.Subnet", "subnet"),
             HashMap::from([
@@ -845,15 +838,17 @@ fn test_format_cascading_update_attr_diff() {
                 ),
             ]),
         )),
-        to: Resource::new("ec2.Subnet", "subnet")
-            .with_attribute(
-                "vpc_id",
-                Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-            )
-            .with_attribute(
-                "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
-            ),
+        to: resolved(
+            Resource::new("ec2.Subnet", "subnet")
+                .with_attribute(
+                    "vpc_id",
+                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
+                )
+                .with_attribute(
+                    "cidr_block",
+                    Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
+                ),
+        ),
     };
 
     let output = format_cascading_update_diff(&cascade, "    ", "vpc");
@@ -927,9 +922,8 @@ fn test_replace_changed_create_only_same_value_shown_as_known_after_apply() {
     );
 
     let effect = Effect::Replace {
-        id: carina_core::resource::ResolvedResourceId::new(id),
         from: Box::new(from),
-        to,
+        to: resolved(to),
         directives: Directives::default(),
         changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
             "vpc_id".to_string(),
@@ -1000,9 +994,8 @@ fn test_replace_cascade_ref_hints_show_binding() {
     to.id = id.clone();
 
     let effect = Effect::Replace {
-        id: carina_core::resource::ResolvedResourceId::new(id),
         from: Box::new(from),
-        to,
+        to: resolved(to),
         directives: Directives::default(),
         changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
             "vpc_id".to_string(),
@@ -1240,7 +1233,7 @@ fn test_deferred_replace_renders_dependent_children() {
 
     let mut plan = Plan::new();
     plan.add(deferred_replace_validation_records_effect());
-    plan.add(Effect::Create(dependent));
+    plan.add(Effect::Create(resolved(dependent)));
 
     let output = strip_ansi(&format_plan(
         &plan,
@@ -1272,9 +1265,9 @@ fn test_deferred_replace_renders_dependent_children() {
 #[test]
 fn test_deferred_replace_keeps_unrelated_same_type_delete() {
     let mut plan = Plan::new();
-    plan.add(Effect::Create(
+    plan.add(Effect::Create(resolved(
         Resource::new("acm.Certificate", "cert").with_binding("cert"),
-    ));
+    )));
     plan.add(delete_record_effect("old_record"));
     plan.add(deferred_replace_validation_records_effect());
 
@@ -1312,10 +1305,6 @@ fn test_format_cascading_update_diff_excludes_non_ref_attributes() {
     use std::collections::HashMap;
 
     let cascade = CascadingUpdate {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "ec2.Subnet",
-            "subnet",
-        )),
         from: Box::new(State::existing(
             ResourceId::with_identity("ec2.Subnet", "subnet"),
             HashMap::from([
@@ -1333,21 +1322,23 @@ fn test_format_cascading_update_diff_excludes_non_ref_attributes() {
                 ),
             ]),
         )),
-        to: Resource::new("ec2.Subnet", "subnet")
-            .with_attribute(
-                "vpc_id",
-                Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-            )
-            .with_attribute(
-                "availability_zone",
-                Value::Concrete(ConcreteValue::String(
-                    "awscc.AvailabilityZone.ap_northeast_1a".to_string(),
-                )),
-            )
-            .with_attribute(
-                "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
-            ),
+        to: resolved(
+            Resource::new("ec2.Subnet", "subnet")
+                .with_attribute(
+                    "vpc_id",
+                    Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
+                )
+                .with_attribute(
+                    "availability_zone",
+                    Value::Concrete(ConcreteValue::String(
+                        "awscc.AvailabilityZone.ap_northeast_1a".to_string(),
+                    )),
+                )
+                .with_attribute(
+                    "cidr_block",
+                    Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
+                ),
+        ),
     };
 
     let replaced_binding = "vpc";
@@ -1381,10 +1372,6 @@ fn test_format_cascading_update_diff_includes_list_with_ref() {
     use std::collections::HashMap;
 
     let cascade = CascadingUpdate {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "ec2.Instance",
-            "instance",
-        )),
         from: Box::new(State::existing(
             ResourceId::with_identity("ec2.Instance", "instance"),
             HashMap::from([(
@@ -1394,14 +1381,14 @@ fn test_format_cascading_update_diff_includes_list_with_ref() {
                 )])),
             )]),
         )),
-        to: Resource::new("ec2.Instance", "instance").with_attribute(
+        to: resolved(Resource::new("ec2.Instance", "instance").with_attribute(
             "security_group_ids",
             Value::Concrete(ConcreteValue::List(vec![Value::resource_ref(
                 "sg".to_string(),
                 "group_id".to_string(),
                 vec![],
             )])),
-        ),
+        )),
     };
 
     let replaced_binding = "sg";
@@ -1476,20 +1463,13 @@ fn test_mixed_plan_tree_with_delete_effect() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "ec2.Vpc", "vpc",
-        )),
         from: Box::new(vpc_from),
-        to: vpc_to,
+        to: resolved(vpc_to),
         changed_attributes: vec!["cidr_block".to_string()],
     });
     plan.add(Effect::Replace {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "ec2.SecurityGroup",
-            "sg",
-        )),
         from: Box::new(sg_from),
-        to: sg_to,
+        to: resolved(sg_to),
         directives: Directives::default(),
         changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
             "ref_vpc".to_string(),
@@ -1581,14 +1561,11 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "ec2.Vpc", "vpc",
-        )),
         from: Box::new(vpc_from),
-        to: vpc_to,
+        to: resolved(vpc_to),
         changed_attributes: vec!["tags".to_string()],
     });
-    plan.add(Effect::Create(sg));
+    plan.add(Effect::Create(resolved(sg)));
 
     let (roots, dependents, effect_bindings, _effect_types) = build_plan_tree(&plan);
 
@@ -1663,7 +1640,7 @@ fn format_effect_delete_falls_back_to_id_name() {
 fn format_effect_create_separates_type_and_name_with_space() {
     let mut r = Resource::new("s3.Bucket", "state_bucket");
     r.id = ResourceId::with_provider_identity("aws", "s3.Bucket", "state_bucket", None);
-    let effect = Effect::Create(r);
+    let effect = Effect::Create(resolved(r));
     assert_eq!(format_effect(&effect), "Create aws.s3.Bucket state_bucket");
 }
 
@@ -1673,14 +1650,13 @@ fn format_effect_update_separates_type_and_name_with_space() {
     let mut to = Resource::new("iam.Role", "bs.bootstrap.role");
     to.id = id.clone();
     let effect = Effect::Update {
-        id: carina_core::resource::ResolvedResourceId::new(id),
         from: Box::new(State::not_found(ResourceId::with_provider_identity(
             "awscc",
             "iam.Role",
             "bs.bootstrap.role",
             None,
         ))),
-        to,
+        to: resolved(to),
         changed_attributes: Vec::new(),
     };
     assert_eq!(
@@ -1695,11 +1671,10 @@ fn format_effect_replace_separates_type_and_name_with_space() {
     let mut to = Resource::new("ec2.Vpc", "vpc");
     to.id = id.clone();
     let effect = Effect::Replace {
-        id: carina_core::resource::ResolvedResourceId::new(id),
         from: Box::new(State::not_found(ResourceId::with_provider_identity(
             "awscc", "ec2.Vpc", "vpc", None,
         ))),
-        to,
+        to: resolved(to),
         directives: Directives::default(),
         changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
             .unwrap(),
@@ -1725,9 +1700,8 @@ fn format_replace_with_removed_create_only_attribute_shows_forcing_detail() {
     let mut to = Resource::new("Widget", "beta");
     to.id = id.clone();
     let effect = Effect::Replace {
-        id: carina_core::resource::ResolvedResourceId::new(id),
         from: Box::new(from),
-        to,
+        to: resolved(to),
         directives: Directives::default(),
         changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
             "legacy_token".to_string(),
@@ -2090,15 +2064,11 @@ fn forcing_changed_uses_plain_green_cli_value() {
         new: "\"new\"".to_string(),
     };
     let effect = Effect::Update {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "test.Widget",
-            "w",
-        )),
         from: Box::new(State::existing(
             ResourceId::with_identity("test.Widget", "w"),
             HashMap::new(),
         )),
-        to: Resource::new("test.Widget", "w"),
+        to: resolved(Resource::new("test.Widget", "w")),
         changed_attributes: vec!["name".to_string()],
     };
 
@@ -2121,15 +2091,11 @@ fn forcing_changed_multiline_green_style_does_not_cross_newline() {
         new: "[\n  \"new\"\n]".to_string(),
     };
     let effect = Effect::Update {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "test.Widget",
-            "w",
-        )),
         from: Box::new(State::existing(
             ResourceId::with_identity("test.Widget", "w"),
             HashMap::new(),
         )),
-        to: Resource::new("test.Widget", "w"),
+        to: resolved(Resource::new("test.Widget", "w")),
         changed_attributes: vec!["rules".to_string()],
     };
 
@@ -2184,7 +2150,8 @@ fn test_composition_header_drops_parens_for_none_source_path() {
 #[test]
 fn module_header_sigil_is_module_specific_not_create() {
     let module_sigil = Sigil::module_header();
-    let create_sigil = Effect::Create(Resource::new("aws.s3.Bucket", "x")).display_glyph();
+    let create_sigil =
+        Effect::Create(resolved(Resource::new("aws.s3.Bucket", "x"))).display_glyph();
 
     assert_eq!(module_sigil.raw, "▾");
     assert_ne!(
@@ -2241,8 +2208,8 @@ fn module_children_render_with_tree_connectors() {
     let role_id = role.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(inner));
-    plan.add(Effect::Create(role));
+    plan.add(Effect::Create(resolved(inner)));
+    plan.add(Effect::Create(resolved(role)));
 
     let cluster_site = CallSite::new(
         EphemeralId::new(ResourceId::with_identity("_virtual", "cluster")),
@@ -2284,9 +2251,9 @@ fn module_child_connector_gutter_extends_through_nested_dependents() {
     let bucket_id = bucket.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(cluster));
-    plan.add(Effect::Create(node_role));
-    plan.add(Effect::Create(bucket));
+    plan.add(Effect::Create(resolved(cluster)));
+    plan.add(Effect::Create(resolved(node_role)));
+    plan.add(Effect::Create(resolved(bucket)));
 
     let cluster_site = CallSite::new(
         EphemeralId::new(ResourceId::with_identity("_virtual", "cluster")),
@@ -2329,9 +2296,8 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
         to: carina_core::resource::ResolvedResourceId::new(to_id.clone()),
     });
     plan.add(Effect::Update {
-        id: carina_core::resource::ResolvedResourceId::new(to_id.clone()),
         from: Box::new(State::not_found(to_id.clone())),
-        to: updated,
+        to: resolved(updated),
         changed_attributes: Vec::new(),
     });
 
@@ -2396,15 +2362,14 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
     updated.id = to_id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(parent));
+    plan.add(Effect::Create(resolved(parent)));
     plan.add(Effect::Move {
         from: carina_core::resource::ResolvedResourceId::new(from_id),
         to: carina_core::resource::ResolvedResourceId::new(to_id.clone()),
     });
     plan.add(Effect::Update {
-        id: carina_core::resource::ResolvedResourceId::new(to_id.clone()),
         from: Box::new(State::not_found(to_id.clone())),
-        to: updated,
+        to: resolved(updated),
         changed_attributes: Vec::new(),
     });
 

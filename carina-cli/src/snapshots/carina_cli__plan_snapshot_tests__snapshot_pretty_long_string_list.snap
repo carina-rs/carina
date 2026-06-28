@@ -4,7 +4,7 @@ expression: output
 ---
 Execution Plan:
 
-  + awscc.iam.Role 
+  + awscc.iam.Role awscc_iam_role_179c5ce4
       managed_policy_arns: [
         "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess",
         "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess",

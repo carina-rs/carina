@@ -16,7 +16,7 @@ Execution Plan:
               ttl: 60
               type: (known after cert applies)
               │
-              └─ + aws.acm.CertificateValidation 
+              └─ + aws.acm.CertificateValidation aws_acm_certificate_validation_1075605a
                     certificate_arn: "arn:aws:acm:us-east-1:123456789012:certificate/example"
                     validation_record_id: "known-after-validation-records"
 

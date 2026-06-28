@@ -156,13 +156,17 @@ mod tests {
     use super::*;
     use carina_core::effect::Effect;
     use carina_core::plan::Plan;
-    use carina_core::resource::{ConcreteValue, Resource, Value};
+    use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, Value};
     use carina_core::schema::SchemaRegistry;
+
+    fn create(resource: Resource) -> Effect {
+        Effect::Create(ResolvedResource::new(resource))
+    }
 
     #[test]
     fn tree_connector_root_has_no_prefix() {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3.Bucket", "my-bucket")));
+        plan.add(create(Resource::new("s3.Bucket", "my-bucket")));
         let app = App::new(&plan, &SchemaRegistry::new());
         assert_eq!(build_tree_connector(0, &app), "");
     }
@@ -170,7 +174,7 @@ mod tests {
     #[test]
     fn tree_connector_single_child() {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(
+        plan.add(create(
             Resource::new("ec2.Vpc", "my-vpc")
                 .with_binding("vpc")
                 .with_attribute(
@@ -178,7 +182,7 @@ mod tests {
                     Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
                 ),
         ));
-        plan.add(Effect::Create(
+        plan.add(create(
             Resource::new("ec2.Subnet", "my-subnet")
                 .with_binding("subnet")
                 .with_attribute(
@@ -196,10 +200,10 @@ mod tests {
     #[test]
     fn tree_connector_multiple_children() {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(
+        plan.add(create(
             Resource::new("ec2.Vpc", "my-vpc").with_binding("vpc"),
         ));
-        plan.add(Effect::Create(
+        plan.add(create(
             Resource::new("ec2.Subnet", "subnet-a")
                 .with_binding("subnet_a")
                 .with_attribute(
@@ -207,7 +211,7 @@ mod tests {
                     Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
                 ),
         ));
-        plan.add(Effect::Create(
+        plan.add(create(
             Resource::new("ec2.Subnet", "subnet-b")
                 .with_binding("subnet_b")
                 .with_attribute(

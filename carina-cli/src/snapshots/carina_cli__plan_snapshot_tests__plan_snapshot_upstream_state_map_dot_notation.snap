@@ -4,7 +4,7 @@ expression: stripped
 ---
 Execution Plan:
 
-  + awscc.s3.Bucket 
+  + awscc.s3.Bucket awscc_s3_bucket_92e40ff2
       bucket_name: "shared-222222222222-bucket"
       tags:
         DevAccount: "222222222222"

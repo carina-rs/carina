@@ -4,13 +4,10 @@ expression: output
 ---
 Execution Plan:
 
-  + awscc.ec2.Vpc 
-      cidr_block: "10.0.0.0/16"
-      enable_dns_hostnames: true
-      enable_dns_support: true
+  ~ awscc.ec2.Vpc ec2_vpc_fb75c929
       tags:
-        Environment: "production"
-        Name: "main"
-  - awscc.ec2.Vpc ec2_vpc_fb75c929
+        ~ Environment: "staging" → "production"
+        - OldTag: "remove-me"
+      # (3 unchanged attributes hidden)
 
-Plan: 1 to add, 0 to change, 1 to destroy.
+Plan: 0 to add, 1 to change, 0 to destroy.

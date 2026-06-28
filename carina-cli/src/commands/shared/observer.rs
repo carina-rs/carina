@@ -397,13 +397,17 @@ mod tests {
     use carina_core::effect::Effect;
     use carina_core::executor::ProgressInfo;
     use carina_core::resource::{
-        ConcreteValue, DeferredValue, Resource, ResourceId, UnknownReason, Value,
+        ConcreteValue, DeferredValue, ResolvedResource, Resource, ResourceId, UnknownReason, Value,
     };
     use carina_core::wait::predicate::{AttrPath, WaitPredicate};
     use indexmap::IndexMap;
 
+    fn resolved(resource: Resource) -> ResolvedResource {
+        ResolvedResource::new(resource)
+    }
+
     fn dummy_create_effect() -> Effect {
-        Effect::Create(Resource::new("aws.s3.Bucket", "demo"))
+        Effect::Create(resolved(Resource::new("aws.s3.Bucket", "demo")))
     }
 
     fn wait_observation<'a>(

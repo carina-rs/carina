@@ -7,7 +7,7 @@ Execution Plan:
   + awscc.iam.Role bootstrap.role
       role_name: "carina-bootstrap"
         │
-        └─ + awscc.iam.RolePolicy 
+        └─ + awscc.iam.RolePolicy bootstrap.awscc_iam_role_policy_c09d442a
               policy_name: "inline"
               role_name: "carina-bootstrap"
 

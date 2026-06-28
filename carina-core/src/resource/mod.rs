@@ -348,6 +348,100 @@ impl AsRef<ResourceId> for ResolvedResourceId {
     }
 }
 
+/// A [`Resource`] whose identity has been resolved.
+///
+/// Downstream effect consumers hold this type to guarantee at compile
+/// time that the wrapped resource has an identity. The inner field is
+/// private so callers cannot bypass the constructor invariant:
+///
+/// ```compile_fail
+/// use carina_core::resource::{ResolvedResource, Resource};
+///
+/// let resource = Resource::new("test", "");
+/// let _ = ResolvedResource(resource);
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::resource::{ResolvedResource, Resource};
+///
+/// let resource = Resource::new("test", "");
+/// let _: ResolvedResource = resource.into();
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "Resource", into = "Resource")]
+pub struct ResolvedResource(Resource);
+
+impl ResolvedResource {
+    /// Construct from a [`Resource`], panicking if identity is `None`.
+    pub fn new(resource: Resource) -> Self {
+        assert!(
+            resource.id.identity.is_some(),
+            "ResolvedResource requires identity"
+        );
+        Self(resource)
+    }
+
+    /// Try to construct; returns `None` if identity is absent.
+    pub fn try_new(resource: Resource) -> Option<Self> {
+        if resource.id.identity.is_some() {
+            Some(Self(resource))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn new_fully_resolved(
+        resource: Resource,
+        _token: crate::executor::basic::ResolvedResourceToken,
+    ) -> Result<Self, crate::value::SerializationError> {
+        assert_resource_fully_resolved(&resource)?;
+        Ok(Self::new(resource))
+    }
+
+    /// Borrow the inner [`Resource`].
+    pub fn as_inner(&self) -> &Resource {
+        &self.0
+    }
+
+    /// Borrow the underlying resource for provider-boundary consumers.
+    pub fn as_resource(&self) -> &Resource {
+        self.as_inner()
+    }
+
+    /// Consume and return the inner [`Resource`].
+    pub fn into_inner(self) -> Resource {
+        self.0
+    }
+}
+
+impl Deref for ResolvedResource {
+    type Target = Resource;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<ResolvedResource> for Resource {
+    fn from(resource: ResolvedResource) -> Self {
+        resource.0
+    }
+}
+
+impl TryFrom<Resource> for ResolvedResource {
+    type Error = String;
+
+    fn try_from(resource: Resource) -> Result<Self, Self::Error> {
+        Self::try_new(resource).ok_or_else(|| "identity is required".to_string())
+    }
+}
+
+impl AsRef<Resource> for ResolvedResource {
+    fn as_ref(&self) -> &Resource {
+        self.as_inner()
+    }
+}
+
 pub(crate) fn identity_if_present(identity: impl Into<String>) -> Option<ResourceIdentity> {
     let identity = identity.into();
     if identity.is_empty() {
@@ -2391,51 +2485,8 @@ mod enum_attr_tests {
     }
 }
 
-/// A managed resource whose attribute tree has been checked and found
-/// free of any `Value::Deferred` placeholder before provider dispatch.
-///
-/// The constructor requires a private token from
-/// `carina_core::executor::basic`, so callers outside the basic
-/// executor's resolve helpers cannot manufacture this witness.
-///
-/// ```compile_fail
-/// use carina_core::resource::{ResolvedResource, Resource};
-///
-/// let resource = Resource::new("test", "example");
-/// let _: ResolvedResource = resource.into();
-/// ```
-///
-/// ```compile_fail
-/// use carina_core::resource::{ResolvedResource, Resource};
-///
-/// let resource = Resource::new("test", "example");
-/// let _ = ResolvedResource::new(resource);
-/// ```
-///
-/// ```compile_fail
-/// use carina_core::resource::{ResolvedResource, Resource};
-///
-/// let resource = Resource::new("test", "example");
-/// let _ = ResolvedResource::try_new(resource);
-/// ```
-#[derive(Debug, Clone, PartialEq)]
-pub struct ResolvedResource(Resource);
-
-impl ResolvedResource {
-    pub(crate) fn new(
-        resource: Resource,
-        _token: crate::executor::basic::ResolvedResourceToken,
-    ) -> Result<Self, crate::value::SerializationError> {
-        assert_resource_fully_resolved(&resource)?;
-        Ok(Self(resource))
-    }
-
-    /// Borrow the underlying resource for provider-boundary consumers.
-    pub fn as_resource(&self) -> &Resource {
-        &self.0
-    }
-}
-
+/// Check that a resource's attribute tree is free of any
+/// [`Value::Deferred`] placeholder before provider dispatch.
 pub(crate) fn assert_resource_fully_resolved(
     resource: &Resource,
 ) -> Result<(), crate::value::SerializationError> {
@@ -2616,7 +2667,7 @@ pub mod leaf_node;
 pub mod persistent_id;
 
 pub use composition::{Composition, CompositionAttribute, Signature};
-pub use data_source::DataSource;
+pub use data_source::{DataSource, ResolvedDataSource};
 pub use expansion_trace::{CallSite, ExpansionTrace};
 pub use graph_node::GraphNode;
 pub use leaf_node::{CompositionNotALeaf, LeafNode, expand_to_leaves};

@@ -230,7 +230,9 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                     continue;
                 }
                 Effect::Wait {
-                    binding, target_id, ..
+                    identity,
+                    target_id,
+                    ..
                 } => {
                     // Scheduling uses `Effect::blocking_bindings()` so
                     // wait targets and explicit wait-block dependencies
@@ -239,6 +241,7 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                     // structural "wait gates this resource" relationship.
                     let mut deps = HashSet::new();
                     deps.insert(target_id.identity_or_empty().to_string());
+                    let binding = identity.to_string();
                     binding_to_effect.insert(binding.clone(), idx);
                     effect_bindings.insert(idx, binding.clone());
                     effect_types.insert(idx, "wait".to_string());
@@ -552,9 +555,15 @@ mod tests {
     use crate::effect::{DeferredReplaceDelete, NonEmptyDeletes};
     use crate::parser::{DeferredForExpression, ForBinding};
     use crate::plan::Plan;
-    use crate::resource::{ConcreteValue, Directives, Resource, ResourceId, Value};
+    use crate::resource::{
+        ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, ResourceIdentity, Value,
+    };
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::time::Duration;
+
+    fn resolved(resource: Resource) -> ResolvedResource {
+        ResolvedResource::new(resource)
+    }
 
     #[test]
     fn explicit_only_depends_on_edge_is_in_dependency_graph() {
@@ -563,8 +572,8 @@ mod tests {
         bucket.directives.depends_on = vec!["role".to_string()];
 
         let mut plan = Plan::new();
-        plan.add(Effect::Create(role));
-        plan.add(Effect::Create(bucket));
+        plan.add(Effect::Create(resolved(role)));
+        plan.add(Effect::Create(resolved(bucket)));
         let graph = build_dependency_graph(&plan);
 
         let bucket_idx = *graph
@@ -692,7 +701,7 @@ mod tests {
             template: Box::new(deferred),
         });
         plan.add(Effect::Wait {
-            binding: "wait_validation_record_0".to_string(),
+            identity: ResourceIdentity::new("wait_validation_record_0"),
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "route53.Record",
                 "validation_records[0]",

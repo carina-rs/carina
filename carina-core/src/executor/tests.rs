@@ -9,8 +9,8 @@ use crate::provider::{
     ReadRequest, UpdateRequest,
 };
 use crate::resource::{
-    AccessPath, ConcreteValue, DataSource, DeferredValue, Directives, Resource, UnknownReason,
-    Value,
+    AccessPath, ConcreteValue, DataSource, DeferredValue, Directives, ResolvedDataSource,
+    ResolvedResource, Resource, ResourceIdentity, UnknownReason, Value,
 };
 use crate::value::SerializationError;
 use parallel::build_dependency_levels;
@@ -20,6 +20,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{Barrier, Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
+
+fn resolved(resource: Resource) -> ResolvedResource {
+    ResolvedResource::new(resource)
+}
+
+fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
+    ResolvedDataSource::new(resource)
+}
+
+fn create_effect(resource: Resource) -> Effect {
+    Effect::Create(resolved(resource))
+}
 
 fn validation_deferred_for_expression() -> crate::parser::DeferredForExpression {
     let mut template_resource = Resource::new("test", "validation_records");
@@ -784,7 +796,7 @@ fn provider_config_with_default_tags(
 fn create_independent_create_plan<const N: usize>(names: [&str; N]) -> Plan {
     let mut plan = Plan::new();
     for name in names {
-        plan.add(Effect::Create(make_resource(name, &[])));
+        plan.add(create_effect(make_resource(name, &[])));
     }
     plan
 }
@@ -809,9 +821,8 @@ fn create_interdependent_replace_plan() -> Plan {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(a_id),
         from: Box::new(a_from),
-        to: a_to,
+        to: resolved(a_to),
         directives: directives.clone(),
         changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
             .unwrap(),
@@ -820,9 +831,8 @@ fn create_interdependent_replace_plan() -> Plan {
         cascade_ref_hints: vec![],
     });
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(b_id),
         from: Box::new(b_from),
-        to: b_to,
+        to: resolved(b_to),
         directives,
         changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
             .unwrap(),
@@ -849,9 +859,8 @@ fn create_interdependent_replace_plan_with_renames<const N: usize>(names: [&str;
             to.dependency_bindings = std::collections::BTreeSet::from([names[idx - 1].to_string()]);
         }
         plan.add(Effect::Replace {
-            id: crate::resource::ResolvedResourceId::new(id),
             from: Box::new(from),
-            to,
+            to: resolved(to),
             directives: directives.clone(),
             changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
                 .unwrap(),
@@ -1150,9 +1159,9 @@ impl CancelsWhenWaitStarted {
 impl ExecutionObserver for CancelsWhenWaitStarted {
     fn on_event(&self, event: &ExecutionEvent) {
         if let ExecutionEvent::EffectStarted {
-            effect: Effect::Wait { binding, .. },
+            effect: Effect::Wait { identity, .. },
         } = event
-            && binding == &self.binding
+            && identity.as_str() == self.binding
         {
             self.token.cancel();
         }
@@ -1190,9 +1199,9 @@ impl ExecutionObserver for RecordingCancelsWhenWaitStarted {
             .unwrap()
             .push(format_execution_event(event));
         if let ExecutionEvent::EffectStarted {
-            effect: Effect::Wait { binding, .. },
+            effect: Effect::Wait { identity, .. },
         } = event
-            && binding == &self.binding
+            && identity.as_str() == self.binding
         {
             self.token.cancel();
         }
@@ -1242,7 +1251,7 @@ async fn execute_plan_returns_completed_when_not_cancelled() {
     let rid = resource.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(resource));
+    plan.add(create_effect(resource));
 
     provider.push_create(Ok(ok_state(&rid)));
 
@@ -1279,7 +1288,7 @@ async fn execute_plan_with_pre_cancelled_token_returns_cancelled_at_t4_or_later(
     let resource = make_resource("one", &[]);
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(resource));
+    plan.add(create_effect(resource));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -1387,9 +1396,9 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
     );
     dist.dependency_bindings = ["cert_ready".to_string()].into_iter().collect();
     let mut plan = Plan::new();
-    plan.add(Effect::Create(cert));
+    plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        binding: "cert_ready".to_string(),
+        identity: ResourceIdentity::new("cert_ready"),
         target_id: crate::resource::ResolvedResourceId::new(cert_id),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
@@ -1400,7 +1409,7 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
         interval: std::time::Duration::from_secs(60),
         explicit_dependencies: std::collections::HashSet::new(),
     });
-    plan.add(Effect::Create(dist));
+    plan.add(create_effect(dist));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -1455,9 +1464,9 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
     dist.dependency_bindings = ["cert_ready".to_string()].into_iter().collect();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(cert));
+    plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        binding: "cert_ready".to_string(),
+        identity: ResourceIdentity::new("cert_ready"),
         target_id: crate::resource::ResolvedResourceId::new(cert_id),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
@@ -1468,7 +1477,7 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
         interval: std::time::Duration::from_secs(60),
         explicit_dependencies: std::collections::HashSet::new(),
     });
-    plan.add(Effect::Create(dist));
+    plan.add(create_effect(dist));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -1653,7 +1662,7 @@ async fn test_simple_create() {
     let rid = resource.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(resource));
+    plan.add(create_effect(resource));
 
     provider.push_create(Ok(ok_state(&rid)));
 
@@ -1696,7 +1705,7 @@ async fn partial_create_records_state_and_diagnostic() {
     .expect("missing attributes are non-empty");
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(resource));
+    plan.add(create_effect(resource));
 
     provider.push_create_outcome(Ok(crate::provider::CreateOutcome::partial_success(
         ok_state(&rid),
@@ -1752,7 +1761,7 @@ async fn test_apply_renormalizes_after_resolution() {
     let rid = resource.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(resource));
+    plan.add(create_effect(resource));
     provider.push_create(Ok(ok_state(&rid)));
 
     let input = ExecutionInput {
@@ -1809,7 +1818,7 @@ async fn test_apply_reapplies_enum_alias_stage() {
     let rid = resource.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(resource));
+    plan.add(create_effect(resource));
     provider.push_create(Ok(ok_state(&rid)));
 
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AliasFactory)];
@@ -1868,9 +1877,8 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: crate::resource::ResolvedResourceId::new(rid.clone()),
         from: Box::new(from_state),
-        to: to_resource,
+        to: resolved(to_resource),
         changed_attributes: vec!["ip_protocol".to_string()],
     });
     provider.push_update(Ok(ok_state(&rid)));
@@ -1928,7 +1936,7 @@ async fn test_apply_reapplies_canonicalize_stage() {
     let rid = resource.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(resource));
+    plan.add(create_effect(resource));
     provider.push_create(Ok(ok_state(&rid)));
 
     let input = ExecutionInput {
@@ -1985,9 +1993,8 @@ async fn test_apply_renormalizes_update_path() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: crate::resource::ResolvedResourceId::new(rid.clone()),
         from: Box::new(from_state),
-        to: to_resource,
+        to: resolved(to_resource),
         changed_attributes: vec!["marker".to_string()],
     });
     provider.push_update(Ok(ok_state(&rid)));
@@ -2072,9 +2079,8 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: crate::resource::ResolvedResourceId::new(rid.clone()),
         from: Box::new(from_state),
-        to: to_resource,
+        to: resolved(to_resource),
         changed_attributes: vec!["tags".to_string()],
     });
     provider.push_update(Ok(ok_state(&rid)));
@@ -2182,9 +2188,8 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: crate::resource::ResolvedResourceId::new(rid.clone()),
         from: Box::new(from_state),
-        to: to_resource,
+        to: resolved(to_resource),
         changed_attributes: vec!["description".to_string()],
     });
     provider.push_update(Ok(ok_state(&rid)));
@@ -2242,9 +2247,8 @@ async fn test_apply_effective_changed_skips_internal_and_write_only_attributes()
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: crate::resource::ResolvedResourceId::new(rid.clone()),
         from: Box::new(from_state),
-        to: to_resource,
+        to: resolved(to_resource),
         changed_attributes: vec!["description".to_string()],
     });
     provider.push_update(Ok(ok_state(&rid)));
@@ -2306,9 +2310,8 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: crate::resource::ResolvedResourceId::new(rid.clone()),
         from: Box::new(from_state),
-        to: to_resource,
+        to: resolved(to_resource),
         changed_attributes: vec![],
     });
     provider.push_update(Ok(ok_state(&rid)));
@@ -2375,9 +2378,8 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: crate::resource::ResolvedResourceId::new(rid.clone()),
         from: Box::new(from_state),
-        to: to_resource,
+        to: resolved(to_resource),
         changed_attributes: vec![],
     });
     provider.push_update(Ok(ok_state(&rid)));
@@ -2434,8 +2436,8 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
     let rb_id = rb.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(ra));
-    plan.add(Effect::Create(rb));
+    plan.add(create_effect(ra));
+    plan.add(create_effect(rb));
     provider.push_create(Ok(ok_state(&ra_id)));
     provider.push_create(Ok(ok_state(&rb_id)));
 
@@ -2570,8 +2572,8 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
     let rb_id = rb.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(ra));
-    plan.add(Effect::Create(rb));
+    plan.add(create_effect(ra));
+    plan.add(create_effect(rb));
     provider.push_create(Ok(ok_state(&ra_id)));
     provider.push_create(Ok(ok_state(&rb_id)));
 
@@ -2672,8 +2674,8 @@ async fn test_failed_effect_propagates_to_dependent() {
     let _rid_a = ra.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(ra));
-    plan.add(Effect::Create(rb));
+    plan.add(create_effect(ra));
+    plan.add(create_effect(rb));
 
     // First create fails
     provider.push_create(Err(ProviderError::api_error("create failed")));
@@ -2716,9 +2718,8 @@ async fn test_cbd_creates_before_deletes() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(rid.clone()),
         from: Box::new(from),
-        to,
+        to: resolved(to),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -2787,9 +2788,8 @@ async fn test_cbd_cascade_update_patch_uses_plan_time_comparison_semantics() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(replace_id.clone()),
         from: Box::new(replace_from),
-        to: replace_to,
+        to: resolved(replace_to),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -2797,9 +2797,8 @@ async fn test_cbd_cascade_update_patch_uses_plan_time_comparison_semantics() {
         changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
             .unwrap(),
         cascading_updates: vec![crate::effect::CascadingUpdate {
-            id: crate::resource::ResolvedResourceId::new(cascade_id.clone()),
             from: Box::new(cascade_from),
-            to: cascade_to,
+            to: resolved(cascade_to),
         }],
         temporary_name: None,
         cascade_ref_hints: vec![],
@@ -2854,9 +2853,8 @@ async fn test_cbd_rename_partial_create_partial_counts_once() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(id.clone()),
         from: Box::new(from),
-        to,
+        to: resolved(to),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -2934,9 +2932,8 @@ async fn test_cbd_rename_success_create_partial_keeps_create_marker() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(id.clone()),
         from: Box::new(from),
-        to,
+        to: resolved(to),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -3006,9 +3003,8 @@ async fn test_dbd_deletes_before_creates() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(rid.clone()),
         from: Box::new(from),
-        to,
+        to: resolved(to),
         directives: Directives::default(),
         changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
             .unwrap(),
@@ -3074,9 +3070,8 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
     let mut plan = Plan::new();
     // Order in plan: vpc first, subnet second
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(vpc_from),
-        to: vpc_to,
+        to: resolved(vpc_to),
         directives: cbd_directives.clone(),
         changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
             .unwrap(),
@@ -3085,9 +3080,8 @@ async fn test_phased_cbd_creates_in_forward_order_deletes_in_reverse() {
         cascade_ref_hints: vec![],
     });
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(subnet_id.clone()),
         from: Box::new(subnet_from),
-        to: subnet_to,
+        to: resolved(subnet_to),
         directives: cbd_directives,
         changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
             .unwrap(),
@@ -3156,9 +3150,8 @@ async fn test_phased_noncbd_creates_after_deletes() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(vpc_from),
-        to: vpc_to,
+        to: resolved(vpc_to),
         directives: dbd_directives.clone(),
         changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
             .unwrap(),
@@ -3167,9 +3160,8 @@ async fn test_phased_noncbd_creates_after_deletes() {
         cascade_ref_hints: vec![],
     });
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(subnet_id.clone()),
         from: Box::new(subnet_from),
-        to: subnet_to,
+        to: resolved(subnet_to),
         directives: dbd_directives,
         changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["attr".to_string()])
             .unwrap(),
@@ -3221,7 +3213,7 @@ async fn test_observer_events_emitted_correctly() {
     let rid = resource.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(resource));
+    plan.add(create_effect(resource));
 
     provider.push_create(Ok(ok_state(&rid)));
 
@@ -3254,7 +3246,9 @@ async fn test_read_effect_is_no_op() {
     let resource = DataSource::new("test", "data");
 
     let mut plan = Plan::new();
-    plan.add(Effect::Read { resource });
+    plan.add(Effect::Read {
+        resource: resolved_data_source(resource),
+    });
 
     let input = ExecutionInput {
         plan: &plan,
@@ -3292,9 +3286,9 @@ async fn test_independent_effects_run_in_parallel() {
     let subnet_b_id = subnet_b.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(vpc));
-    plan.add(Effect::Create(subnet_a));
-    plan.add(Effect::Create(subnet_b));
+    plan.add(create_effect(vpc));
+    plan.add(create_effect(subnet_a));
+    plan.add(create_effect(subnet_b));
 
     provider.push_create(Ok(ok_state(&vpc_id)));
     provider.push_create(Ok(ok_state(&subnet_a_id)));
@@ -3344,10 +3338,10 @@ async fn test_parallel_failure_skips_dependents() {
     let subnet_b_id = subnet_b.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(vpc));
-    plan.add(Effect::Create(subnet_a));
-    plan.add(Effect::Create(subnet_b));
-    plan.add(Effect::Create(subnet_c));
+    plan.add(create_effect(vpc));
+    plan.add(create_effect(subnet_a));
+    plan.add(create_effect(subnet_b));
+    plan.add(create_effect(subnet_c));
 
     provider.push_create(Ok(ok_state(&vpc_id)));
     // subnet_a fails, subnet_b succeeds
@@ -3397,9 +3391,9 @@ async fn test_dependency_levels_sequential_chain() {
     let c_id = c.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(a));
-    plan.add(Effect::Create(b));
-    plan.add(Effect::Create(c));
+    plan.add(create_effect(a));
+    plan.add(create_effect(b));
+    plan.add(create_effect(c));
 
     provider.push_create(Ok(ok_state(&a_id)));
     provider.push_create(Ok(ok_state(&b_id)));
@@ -3440,10 +3434,10 @@ fn test_build_dependency_levels() {
     let d = make_resource("d", &["b", "c"]);
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(a));
-    plan.add(Effect::Create(b));
-    plan.add(Effect::Create(c));
-    plan.add(Effect::Create(d));
+    plan.add(create_effect(a));
+    plan.add(create_effect(b));
+    plan.add(create_effect(c));
+    plan.add(create_effect(d));
 
     let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
 
@@ -3505,12 +3499,12 @@ fn test_build_dependency_levels_transitive_ref_preserves_direct_dep() {
     rt.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(vpc)); // idx 0
-    plan.add(Effect::Create(tgw)); // idx 1
-    plan.add(Effect::Create(subnet)); // idx 2
-    plan.add(Effect::Create(tgw_attach)); // idx 3
-    plan.add(Effect::Create(rt)); // idx 4
-    plan.add(Effect::Create(route)); // idx 5
+    plan.add(create_effect(vpc)); // idx 0
+    plan.add(create_effect(tgw)); // idx 1
+    plan.add(create_effect(subnet)); // idx 2
+    plan.add(create_effect(tgw_attach)); // idx 3
+    plan.add(create_effect(rt)); // idx 4
+    plan.add(create_effect(route)); // idx 5
 
     let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
 
@@ -3641,9 +3635,9 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
     let c = make_resource("c", &["a"]);
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(a));
-    plan.add(Effect::Create(b));
-    plan.add(Effect::Create(c));
+    plan.add(create_effect(a));
+    plan.add(create_effect(b));
+    plan.add(create_effect(c));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -3834,9 +3828,8 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> (std::time::Duration, usize
         let from = tag_update_state(&resource.id, binding);
         current_states.insert(resource.id.clone(), from.clone());
         plan.add(Effect::Update {
-            id: crate::resource::ResolvedResourceId::new(resource.id.clone()),
             from: Box::new(from),
-            to: resource.clone(),
+            to: resolved(resource.clone()),
             changed_attributes: vec!["tags".to_string()],
         });
     }
@@ -3903,9 +3896,8 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
         let from = tag_update_state(&resource.id, binding);
         current_states.insert(resource.id.clone(), from.clone());
         plan.add(Effect::Update {
-            id: crate::resource::ResolvedResourceId::new(resource.id.clone()),
             from: Box::new(from),
-            to: resource.clone(),
+            to: resolved(resource.clone()),
             changed_attributes: vec!["tags".to_string()],
         });
     }
@@ -4001,8 +3993,8 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
     let c = make_resource("c", &["a"]);
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(a));
-    plan.add(Effect::Create(c));
+    plan.add(create_effect(a));
+    plan.add(create_effect(c));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -4132,10 +4124,10 @@ fn test_build_dependency_levels_consistent_with_dependency_map() {
     let d = make_resource("d", &["b", "c"]);
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(a));
-    plan.add(Effect::Create(b));
-    plan.add(Effect::Create(c));
-    plan.add(Effect::Create(d));
+    plan.add(create_effect(a));
+    plan.add(create_effect(b));
+    plan.add(create_effect(c));
+    plan.add(create_effect(d));
 
     let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
     let dep_map =
@@ -4179,9 +4171,8 @@ async fn test_update_effect_binding_map_propagation() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: crate::resource::ResolvedResourceId::new(ra_id.clone()),
         from: Box::new(from_state),
-        to: to_resource,
+        to: resolved(to_resource),
         changed_attributes: vec!["some_attr".to_string()],
     });
 
@@ -4289,8 +4280,8 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     let subnet_id = subnet.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(vpc));
-    plan.add(Effect::Create(subnet));
+    plan.add(create_effect(vpc));
+    plan.add(create_effect(subnet));
 
     // VPC create returns state with vpc_id
     let vpc_state = State::existing(
@@ -4479,7 +4470,7 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
     // tgw_b: Create (new resource)
     let mut tgw_b = Resource::new("test", "tgw_b");
     tgw_b.binding = Some("tgw_b".to_string());
-    plan.add(Effect::Create(tgw_b));
+    plan.add(create_effect(tgw_b));
 
     // tgw_a: Delete
     plan.add(Effect::Delete {
@@ -4493,9 +4484,8 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
 
     // attachment: Replace (CBD) — from depends on tgw_a
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(attachment_id.clone()),
         from: Box::new(attachment_from),
-        to: attachment_to,
+        to: resolved(attachment_to),
         directives: cbd_directives,
         changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
             "transit_gateway_id".to_string(),
@@ -4579,7 +4569,7 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
     // tgw_b: Create
     let mut tgw_b = Resource::new("test", "tgw_b");
     tgw_b.binding = Some("tgw_b".to_string());
-    plan.add(Effect::Create(tgw_b));
+    plan.add(create_effect(tgw_b));
 
     // tgw_a: Delete — binding is None (the key difference from the previous test)
     plan.add(Effect::Delete {
@@ -4593,9 +4583,8 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
 
     // attachment: Replace (CBD)
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(attachment_id.clone()),
         from: Box::new(attachment_from),
-        to: attachment_to,
+        to: resolved(attachment_to),
         directives: cbd_directives,
         changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
             "transit_gateway_id".to_string(),
@@ -4658,9 +4647,9 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
     let dist_id = dist.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(cert));
+    plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        binding: "cert_issued".to_string(),
+        identity: ResourceIdentity::new("cert_issued"),
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
@@ -4671,7 +4660,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         interval: std::time::Duration::from_millis(1),
         explicit_dependencies: std::collections::HashSet::new(),
     });
-    plan.add(Effect::Create(dist));
+    plan.add(create_effect(dist));
 
     // create cert → state with status PENDING (the Create result; the
     // wait polls via read for ISSUED).
@@ -4810,9 +4799,9 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
     );
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(cert));
+    plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        binding: "cert_issued".to_string(),
+        identity: ResourceIdentity::new("cert_issued"),
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
@@ -4823,7 +4812,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         interval: std::time::Duration::from_millis(1),
         explicit_dependencies: std::collections::HashSet::new(),
     });
-    plan.add(Effect::Create(dist));
+    plan.add(create_effect(dist));
 
     // create cert → PENDING; wait polls read → PENDING → ISSUED+arn.
     let mut create_attrs = HashMap::new();
@@ -4911,9 +4900,9 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
     let cert_id = cert.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(cert));
+    plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        binding: "cert_issued".to_string(),
+        identity: ResourceIdentity::new("cert_issued"),
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
@@ -5034,8 +5023,8 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
     let record_id = record.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(cert));
-    plan.add(Effect::Create(record));
+    plan.add(create_effect(cert));
+    plan.add(create_effect(record));
 
     // Mirror the AWS RequestCertificate read-back race: the DVO list
     // is populated asynchronously by ACM after RequestCertificate
@@ -5191,8 +5180,8 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
     let record_id = record.id.clone();
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(cert));
-    plan.add(Effect::Create(record));
+    plan.add(create_effect(cert));
+    plan.add(create_effect(record));
 
     // Cert create returns post-read state with DVO populated. Shape
     // mirrors what `read_acm_certificate` inserts after aws#295.
@@ -5433,9 +5422,9 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
     let provider = IdentifierAwareProvider::new("cert-arn-real", created_state);
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(cert));
+    plan.add(create_effect(cert));
     plan.add(Effect::Wait {
-        binding: "cert_issued".to_string(),
+        identity: ResourceIdentity::new("cert_issued"),
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
@@ -5521,9 +5510,8 @@ async fn wait_resolves_target_identifier_from_just_replaced_state() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         from: Box::new(old_state.clone()),
-        to: cert,
+        to: resolved(cert),
         directives: Directives::default(),
         changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
         cascading_updates: Vec::new(),
@@ -5531,7 +5519,7 @@ async fn wait_resolves_target_identifier_from_just_replaced_state() {
         cascade_ref_hints: Vec::new(),
     });
     plan.add(Effect::Wait {
-        binding: "cert_issued".to_string(),
+        identity: ResourceIdentity::new("cert_issued"),
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
@@ -5624,9 +5612,8 @@ async fn wait_resolves_target_identifier_from_just_replaced_state_phased() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         from: Box::new(old_cert_state.clone()),
-        to: cert,
+        to: resolved(cert),
         directives: Directives::default(),
         changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
         cascading_updates: Vec::new(),
@@ -5634,9 +5621,8 @@ async fn wait_resolves_target_identifier_from_just_replaced_state_phased() {
         cascade_ref_hints: Vec::new(),
     });
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(dep_id.clone()),
         from: Box::new(old_dep_state.clone()),
-        to: dep,
+        to: resolved(dep),
         directives: Directives::default(),
         changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
         cascading_updates: Vec::new(),
@@ -5644,7 +5630,7 @@ async fn wait_resolves_target_identifier_from_just_replaced_state_phased() {
         cascade_ref_hints: Vec::new(),
     });
     plan.add(Effect::Wait {
-        binding: "cert_issued".to_string(),
+        identity: ResourceIdentity::new("cert_issued"),
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
@@ -5767,9 +5753,8 @@ async fn deferred_create_dispatches_after_upstream_replace_before_wait_phased() 
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         from: Box::new(old_cert_state.clone()),
-        to: cert,
+        to: resolved(cert),
         directives: Directives::default(),
         changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
         cascading_updates: Vec::new(),
@@ -5777,9 +5762,8 @@ async fn deferred_create_dispatches_after_upstream_replace_before_wait_phased() 
         cascade_ref_hints: Vec::new(),
     });
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(dep_id.clone()),
         from: Box::new(old_dep_state.clone()),
-        to: dep,
+        to: resolved(dep),
         directives: Directives::default(),
         changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
         cascading_updates: Vec::new(),
@@ -5795,7 +5779,7 @@ async fn deferred_create_dispatches_after_upstream_replace_before_wait_phased() 
         template: Box::new(validation_deferred_for_expression()),
     });
     plan.add(Effect::Wait {
-        binding: "cert_issued".to_string(),
+        identity: ResourceIdentity::new("cert_issued"),
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
@@ -5906,9 +5890,8 @@ async fn deferred_create_emits_zero_children_when_collection_is_empty() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         from: Box::new(old_cert_state.clone()),
-        to: cert,
+        to: resolved(cert),
         directives: Directives::default(),
         changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
         cascading_updates: Vec::new(),
@@ -5924,7 +5907,7 @@ async fn deferred_create_emits_zero_children_when_collection_is_empty() {
         template: Box::new(validation_deferred_for_expression()),
     });
     plan.add(Effect::Wait {
-        binding: "cert_issued".to_string(),
+        identity: ResourceIdentity::new("cert_issued"),
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
@@ -6064,9 +6047,8 @@ async fn deferred_create_cancelled_after_upstream_create_reports_skipped() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         from: Box::new(old_cert_state.clone()),
-        to: cert,
+        to: resolved(cert),
         directives: Directives::default(),
         changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
         cascading_updates: Vec::new(),
@@ -6156,7 +6138,7 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
     provider.push_create(Ok(State::existing(cert_id.clone(), HashMap::new())));
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(cert));
+    plan.add(create_effect(cert));
     plan.add(Effect::DeferredCreate {
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "__deferred_for",
@@ -6206,7 +6188,7 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
     provider.push_create(Ok(cert_state));
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(cert));
+    plan.add(create_effect(cert));
     plan.add(Effect::DeferredCreate {
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "__deferred_for",
@@ -6349,7 +6331,7 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
     let mut cert = Resource::new("test", "cert_concurrent_deferred_replace");
     cert.binding = Some("cert".to_string());
     let mut plan = Plan::new();
-    plan.add(Effect::Create(cert));
+    plan.add(create_effect(cert));
     plan.add(Effect::DeferredReplace {
         deletes: NonEmptyDeletes::try_new(vec![
             DeferredReplaceDelete {
@@ -6452,7 +6434,7 @@ async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
     let mut cert = Resource::new("test", "cert_delete_failure");
     cert.binding = Some("cert".to_string());
     let mut plan = Plan::new();
-    plan.add(Effect::Create(cert));
+    plan.add(create_effect(cert));
     plan.add(Effect::DeferredReplace {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -6537,9 +6519,8 @@ async fn phased_deferred_replace_gate_skips_on_absorbed_delete_failure() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         from: Box::new(old_cert_state.clone()),
-        to: cert,
+        to: resolved(cert),
         directives: Directives::default(),
         changed_create_only: ChangedCreateOnly::new(vec!["domain_name".to_string()]).unwrap(),
         cascading_updates: Vec::new(),
@@ -6547,9 +6528,8 @@ async fn phased_deferred_replace_gate_skips_on_absorbed_delete_failure() {
         cascade_ref_hints: Vec::new(),
     });
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(dep_id.clone()),
         from: Box::new(old_dep_state.clone()),
-        to: dep,
+        to: resolved(dep),
         directives: Directives::default(),
         changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
         cascading_updates: Vec::new(),
@@ -6675,11 +6655,10 @@ async fn phased_cbd_replace_skips_when_phase1_dependency_fails() {
     provider.push_delete(Ok(()));
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(bucket));
+    plan.add(create_effect(bucket));
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(anchor_id.clone()),
         from: Box::new(anchor_from.clone()),
-        to: anchor_to,
+        to: resolved(anchor_to),
         directives: Directives::default(),
         changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
         cascading_updates: Vec::new(),
@@ -6687,9 +6666,8 @@ async fn phased_cbd_replace_skips_when_phase1_dependency_fails() {
         cascade_ref_hints: Vec::new(),
     });
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(policy_id.clone()),
         from: Box::new(policy_from.clone()),
-        to: policy_to,
+        to: resolved(policy_to),
         directives: Directives {
             create_before_destroy: true,
             depends_on: vec!["bucket".to_string()],
@@ -6766,11 +6744,10 @@ async fn phased_replace_delete_skips_when_phase1_dependency_fails() {
     provider.push_delete(Ok(()));
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(bucket));
+    plan.add(create_effect(bucket));
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(anchor_id.clone()),
         from: Box::new(anchor_from.clone()),
-        to: anchor_to,
+        to: resolved(anchor_to),
         directives: Directives::default(),
         changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
         cascading_updates: Vec::new(),
@@ -6778,9 +6755,8 @@ async fn phased_replace_delete_skips_when_phase1_dependency_fails() {
         cascade_ref_hints: Vec::new(),
     });
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(target_id.clone()),
         from: Box::new(target_from.clone()),
-        to: target_to,
+        to: resolved(target_to),
         directives: Directives {
             depends_on: vec!["bucket".to_string()],
             ..Default::default()
@@ -6882,9 +6858,8 @@ async fn phased_anonymous_replace_failure_propagates_to_dependent_wait() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(a_id.clone()),
         from: Box::new(old_a_state.clone()),
-        to: a,
+        to: resolved(a),
         directives: Directives::default(),
         changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
         cascading_updates: Vec::new(),
@@ -6892,9 +6867,8 @@ async fn phased_anonymous_replace_failure_propagates_to_dependent_wait() {
         cascade_ref_hints: Vec::new(),
     });
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(b_id.clone()),
         from: Box::new(old_b_state.clone()),
-        to: b,
+        to: resolved(b),
         directives: Directives::default(),
         changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
         cascading_updates: Vec::new(),
@@ -6902,9 +6876,8 @@ async fn phased_anonymous_replace_failure_propagates_to_dependent_wait() {
         cascade_ref_hints: Vec::new(),
     });
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(anonymous_id.clone()),
         from: Box::new(old_anonymous_state.clone()),
-        to: anonymous_to,
+        to: resolved(anonymous_to),
         directives: Directives::default(),
         changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
         cascading_updates: Vec::new(),
@@ -6912,7 +6885,7 @@ async fn phased_anonymous_replace_failure_propagates_to_dependent_wait() {
         cascade_ref_hints: Vec::new(),
     });
     plan.add(Effect::Wait {
-        binding: "anonymous_ready".to_string(),
+        identity: ResourceIdentity::new("anonymous_ready"),
         target_id: crate::resource::ResolvedResourceId::new(anonymous_id.clone()),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
@@ -7021,15 +6994,13 @@ async fn phased_cross_phase_explicit_dependency_failure_triggers_wait_terminal()
 
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: crate::resource::ResolvedResourceId::new(failed_id.clone()),
         from: Box::new(old_failed_state.clone()),
-        to: failed_to,
+        to: resolved(failed_to),
         changed_attributes: vec!["name".to_string()],
     });
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(parent_id.clone()),
         from: Box::new(old_parent_state.clone()),
-        to: parent,
+        to: resolved(parent),
         directives: Directives::default(),
         changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
         cascading_updates: Vec::new(),
@@ -7037,9 +7008,8 @@ async fn phased_cross_phase_explicit_dependency_failure_triggers_wait_terminal()
         cascade_ref_hints: Vec::new(),
     });
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(child_id.clone()),
         from: Box::new(old_child_state.clone()),
-        to: child,
+        to: resolved(child),
         directives: Directives::default(),
         changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
         cascading_updates: Vec::new(),
@@ -7047,7 +7017,7 @@ async fn phased_cross_phase_explicit_dependency_failure_triggers_wait_terminal()
         cascade_ref_hints: Vec::new(),
     });
     plan.add(Effect::Wait {
-        binding: "sibling_ready".to_string(),
+        identity: ResourceIdentity::new("sibling_ready"),
         target_id: crate::resource::ResolvedResourceId::new(parent_id.clone()),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
@@ -7059,7 +7029,7 @@ async fn phased_cross_phase_explicit_dependency_failure_triggers_wait_terminal()
         explicit_dependencies: HashSet::new(),
     });
     plan.add(Effect::Wait {
-        binding: "blocked_ready".to_string(),
+        identity: ResourceIdentity::new("blocked_ready"),
         target_id: crate::resource::ResolvedResourceId::new(child_id.clone()),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
@@ -7145,9 +7115,8 @@ fn phased_anonymous_replace_failure_unblocks_wait_terminal_check() {
 
     let effects = vec![
         Effect::Replace {
-            id: crate::resource::ResolvedResourceId::new(anonymous_id.clone()),
             from: Box::new(old_anonymous_state),
-            to: anonymous_to,
+            to: resolved(anonymous_to),
             directives: Directives::default(),
             changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
             cascading_updates: Vec::new(),
@@ -7155,7 +7124,7 @@ fn phased_anonymous_replace_failure_unblocks_wait_terminal_check() {
             cascade_ref_hints: Vec::new(),
         },
         Effect::Wait {
-            binding: "anonymous_terminal_ready".to_string(),
+            identity: ResourceIdentity::new("anonymous_terminal_ready"),
             target_id: crate::resource::ResolvedResourceId::new(anonymous_id.clone()),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
@@ -7378,8 +7347,8 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
     let mut plan = Plan::new();
     let cert = resource_with_binding("cert", "cert");
     let cert_id = cert.id.clone();
-    plan.add(Effect::Create(cert.clone()));
-    plan.add(Effect::Create(resource_with_binding("alb", "alb")));
+    plan.add(create_effect(cert.clone()));
+    plan.add(create_effect(resource_with_binding("alb", "alb")));
     plan.add(Effect::DeferredReplace {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -7506,9 +7475,8 @@ async fn test_phased_move_with_interdependent_replace_does_not_panic() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(role_id.clone()),
         from: Box::new(role_from),
-        to: role_to,
+        to: resolved(role_to),
         directives: Directives::default(),
         changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["role_name".to_string()])
             .unwrap(),
@@ -7521,9 +7489,8 @@ async fn test_phased_move_with_interdependent_replace_does_not_panic() {
         to: crate::resource::ResolvedResourceId::new(policy_new_id.clone()),
     });
     plan.add(Effect::Replace {
-        id: crate::resource::ResolvedResourceId::new(policy_new_id),
         from: Box::new(policy_from),
-        to: policy_to,
+        to: resolved(policy_to),
         directives: Directives::default(),
         changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["policy_name".to_string()])
             .unwrap(),
@@ -7656,7 +7623,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
     };
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(role.clone()));
+    plan.add(create_effect(role.clone()));
 
     let role_state =
         State::existing(role_id.clone(), HashMap::new()).with_identifier("rd.role-iam-id");

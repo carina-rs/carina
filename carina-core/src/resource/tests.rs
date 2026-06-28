@@ -162,6 +162,94 @@ fn resolved_resource_id_serde_round_trips_as_resource_id() {
 }
 
 #[test]
+#[should_panic(expected = "ResolvedResource requires identity")]
+fn resolved_resource_new_panics_without_identity() {
+    ResolvedResource::new(Resource::new("s3.Bucket", ""));
+}
+
+#[test]
+fn resolved_resource_try_new_returns_none_without_identity() {
+    assert!(ResolvedResource::try_new(Resource::new("s3.Bucket", "")).is_none());
+}
+
+#[test]
+fn resolved_resource_try_new_returns_some_with_identity() {
+    let resolved =
+        ResolvedResource::try_new(Resource::new("s3.Bucket", "logs")).expect("identity is present");
+    assert_eq!(resolved.id.identity_str(), Some("logs"));
+    assert_eq!(resolved.as_inner().id.identity_str(), Some("logs"));
+    assert_eq!(
+        resolved.clone().into_inner().id.identity_str(),
+        Some("logs")
+    );
+}
+
+#[test]
+fn resolved_resource_serde_round_trips_as_resource() {
+    let resolved = ResolvedResource::new(Resource::with_provider(
+        "aws",
+        "s3.Bucket",
+        "logs",
+        Some("primary".to_string()),
+    ));
+    let json = serde_json::to_string(&resolved).unwrap();
+    let decoded: ResolvedResource = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, resolved);
+    assert_eq!(decoded.id.identity_str(), Some("logs"));
+}
+
+#[test]
+fn resolved_resource_deserialize_rejects_absent_identity() {
+    let json = serde_json::to_string(&Resource::new("s3.Bucket", "")).unwrap();
+    let err = serde_json::from_str::<ResolvedResource>(&json).unwrap_err();
+    assert!(err.to_string().contains("identity is required"));
+}
+
+#[test]
+#[should_panic(expected = "ResolvedDataSource requires identity")]
+fn resolved_data_source_new_panics_without_identity() {
+    ResolvedDataSource::new(DataSource::new("aws_ami", ""));
+}
+
+#[test]
+fn resolved_data_source_try_new_returns_none_without_identity() {
+    assert!(ResolvedDataSource::try_new(DataSource::new("aws_ami", "")).is_none());
+}
+
+#[test]
+fn resolved_data_source_try_new_returns_some_with_identity() {
+    let resolved =
+        ResolvedDataSource::try_new(DataSource::new("aws_ami", "ubuntu")).expect("identity");
+    assert_eq!(resolved.id.identity_str(), Some("ubuntu"));
+    assert_eq!(resolved.as_inner().id.identity_str(), Some("ubuntu"));
+    assert_eq!(
+        resolved.clone().into_inner().id.identity_str(),
+        Some("ubuntu")
+    );
+}
+
+#[test]
+fn resolved_data_source_serde_round_trips_as_data_source() {
+    let resolved = ResolvedDataSource::new(DataSource::with_provider(
+        "aws",
+        "ami",
+        "ubuntu",
+        Some("primary".to_string()),
+    ));
+    let json = serde_json::to_string(&resolved).unwrap();
+    let decoded: ResolvedDataSource = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded, resolved);
+    assert_eq!(decoded.id.identity_str(), Some("ubuntu"));
+}
+
+#[test]
+fn resolved_data_source_deserialize_rejects_absent_identity() {
+    let json = serde_json::to_string(&DataSource::new("aws_ami", "")).unwrap();
+    let err = serde_json::from_str::<ResolvedDataSource>(&json).unwrap_err();
+    assert!(err.to_string().contains("identity is required"));
+}
+
+#[test]
 fn resource_id_rejects_legacy_empty_name() {
     let legacy = r#"{"provider":"aws","resource_type":"ec2.Subnet","name":""}"#;
     assert!(

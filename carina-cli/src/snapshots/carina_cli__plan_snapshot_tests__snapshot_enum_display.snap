@@ -4,7 +4,7 @@ expression: output
 ---
 Execution Plan:
 
-  + awscc.ec2.Vpc 
+  + awscc.ec2.Vpc awscc_ec2_vpc_a0424857060c4250
       cidr_block: "10.0.0.0/16"
       instance_tenancy: dedicated
 

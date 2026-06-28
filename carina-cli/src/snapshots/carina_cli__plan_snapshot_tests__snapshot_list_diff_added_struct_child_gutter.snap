@@ -24,7 +24,7 @@ Execution Plan:
         │         }
         │     # (2 unchanged attributes hidden)
         │
-        └─ + awscc.s3.Bucket 
+        └─ + awscc.s3.Bucket awscc_s3_bucket_991b6004
               bucket_name: "zzz-trailing-sibling"
 
 Plan: 2 to add, 1 to change, 0 to destroy.

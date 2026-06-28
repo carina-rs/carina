@@ -13,7 +13,9 @@ use carina_core::effect::Effect;
 use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use carina_core::resource::{
+    ConcreteValue, ResolvedDataSource, Resource, ResourceId, State, Value,
+};
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
@@ -611,7 +613,9 @@ fn build_plan_from_state(state: &StateFile) -> Plan {
             }
         }
 
-        plan.add(Effect::Read { resource });
+        plan.add(Effect::Read {
+            resource: ResolvedDataSource::new(resource),
+        });
     }
     plan
 }

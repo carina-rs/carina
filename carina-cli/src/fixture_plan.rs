@@ -22,7 +22,9 @@ use carina_state::{StateFile, check_and_migrate};
 
 use crate::commands::validate_and_resolve;
 use crate::wiring::{
-    WiringContext, add_deferred_create_effects, compute_anonymous_identifiers_with_ctx,
+    WiringContext, add_deferred_create_effects,
+    adopt_unique_state_identity_for_unresolved_anonymous,
+    assign_fallback_identities_for_unresolved_anonymous, compute_anonymous_identifiers_with_ctx,
     expand_same_config_deferred_for, normalize_state_with_ctx,
     reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
     resolve_enum_aliases_in_states,
@@ -287,10 +289,35 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     }
 
     resolve_enum_aliases_in_states(&wiring, &mut current_states);
+    {
+        let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
+            &mut resources,
+            wiring.schemas(),
+        );
+        let errors =
+            compute_anonymous_identifiers_with_ctx(&wiring, canonical_resources, &parsed.providers);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+    if let Some(sf) = state_file.as_mut() {
+        reconcile_anonymous_identifiers_with_ctx(&wiring, &mut resources, sf, &state_block_claims);
+        adopt_unique_state_identity_for_unresolved_anonymous(&mut resources, sf);
+    }
+    let fallback_renames = assign_fallback_identities_for_unresolved_anonymous(&mut resources);
+    for (from, to) in &fallback_renames {
+        if let Some(mut state) = current_states.remove(from) {
+            state.id = to.clone();
+            current_states.insert(to.clone(), state);
+        }
+        if let Some(attrs) = saved_attrs.remove(from) {
+            saved_attrs.insert(to.clone(), attrs);
+        }
+        if let Some(explicit) = prev_explicit.remove(from) {
+            prev_explicit.insert(to.clone(), explicit);
+        }
+    }
 
     let orphan_dependencies = if let Some(sf) = state_file.as_ref() {
-        let desired_ids: HashSet<ResourceId> =
-            sorted_resources.iter().map(|r| r.id.clone()).collect();
+        let desired_ids: HashSet<ResourceId> = resources.iter().map(|r| r.id.clone()).collect();
         sf.build_orphan_dependencies(&desired_ids)
     } else {
         HashMap::new()

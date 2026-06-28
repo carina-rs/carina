@@ -7,10 +7,16 @@ use carina_cli::commands::plan::{CurrentStateEntry, PlanFile};
 use carina_core::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes};
 use carina_core::parser::{BackendConfig, DeferredForExpression, ForBinding, ProviderConfig};
 use carina_core::plan::Plan;
-use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
+use carina_core::resource::{
+    ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, State, Value,
+};
 use carina_state::{ResourceState, StateFile};
 use indexmap::IndexMap;
 use tempfile::TempDir;
+
+fn resolved(resource: Resource) -> ResolvedResource {
+    ResolvedResource::new(resource)
+}
 
 struct Scenario {
     _tmp: TempDir,
@@ -169,8 +175,8 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
     let validation_id =
         ResourceId::with_provider_identity("mock", "test.resource", "validation_records[0]", None);
     let mut plan = Plan::new();
-    plan.add(Effect::Create(lb.clone()));
-    plan.add(Effect::Create(cert.clone()));
+    plan.add(Effect::Create(resolved(lb.clone())));
+    plan.add(Effect::Create(resolved(cert.clone())));
     plan.add(Effect::DeferredReplace {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: carina_core::resource::ResolvedResourceId::new(validation_id.clone()),
@@ -188,7 +194,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         upstream_binding: "cert".to_string(),
         template: Box::new(template),
     });
-    plan.add(Effect::Create(alias.clone()));
+    plan.add(Effect::Create(resolved(alias.clone())));
 
     let sorted_resources = vec![lb.clone(), cert.clone(), alias.clone()];
     let current_states = sorted_resources

@@ -10,12 +10,22 @@ use std::path::PathBuf;
 use carina_core::config_loader::load_configuration;
 use carina_core::effect::Effect;
 use carina_core::plan::Plan;
-use carina_core::resource::{ResourceId, State};
+use carina_core::resource::{
+    DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceId, State,
+};
 use carina_core::schema::SchemaRegistry;
 
 use crate::DetailLevel;
 use crate::display::{format_destroy_plan, format_plan};
 use crate::fixture_plan::build_plan_from_fixture_name;
+
+fn resolved(resource: Resource) -> ResolvedResource {
+    ResolvedResource::new(resource)
+}
+
+fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
+    ResolvedDataSource::new(resource)
+}
 
 /// Strip ANSI escape codes from a string for snapshot readability.
 fn strip_ansi(s: &str) -> String {
@@ -2006,15 +2016,19 @@ fn snapshot_deferred_for_with_dependent_wait() {
     let mut fp = build_plan_from_fixture_name("deferred_for_with_dependent_wait");
     let mut plan = Plan::new();
     for effect in fp.plan.effects() {
-        let mut effect = effect.clone();
-        if let Effect::Create(resource) = &mut effect
-            && resource.id.resource_type == "acm.CertificateValidation"
-        {
-            resource
-                .directives
-                .depends_on
-                .push("validation_records".to_string());
-        }
+        let effect = match effect.clone() {
+            Effect::Create(resource)
+                if resource.id.resource_type == "acm.CertificateValidation" =>
+            {
+                let mut resource = resource.into_inner();
+                resource
+                    .directives
+                    .depends_on
+                    .push("validation_records".to_string());
+                Effect::Create(resolved(resource))
+            }
+            effect => effect,
+        };
         plan.add(effect);
     }
     fp.plan = plan;
@@ -2133,9 +2147,9 @@ fn snapshot_composition_folding() {
     let inner_id = inner.id.clone();
     let inner_role_id = inner_role.id.clone();
 
-    plan.add(Effect::Create(inner));
-    plan.add(Effect::Create(inner_role));
-    plan.add(Effect::Create(logs));
+    plan.add(Effect::Create(resolved(inner)));
+    plan.add(Effect::Create(resolved(inner_role)));
+    plan.add(Effect::Create(resolved(logs)));
 
     let mut trace = ExpansionTrace::new();
     // carina#3322: the call site carries the `use { source = "..." }`
@@ -2209,9 +2223,11 @@ fn snapshot_top_level_sigil_alignment() {
     let cluster = Resource::new("aws.eks.Cluster", "cluster/inner");
     let cluster_id = cluster.id.clone();
 
-    plan.add(Effect::Create(bucket));
-    plan.add(Effect::Read { resource: roles });
-    plan.add(Effect::Create(cluster));
+    plan.add(Effect::Create(resolved(bucket)));
+    plan.add(Effect::Read {
+        resource: resolved_data_source(roles),
+    });
+    plan.add(Effect::Create(resolved(cluster)));
 
     let deferred_template = Resource::new("aws.route53.RecordSet", "validation_records");
     let deferred = DeferredForExpression {

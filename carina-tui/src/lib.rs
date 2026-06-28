@@ -226,12 +226,16 @@ fn run_tui<A>(
 mod tests {
     use super::*;
     use carina_core::effect::Effect;
-    use carina_core::resource::Resource;
+    use carina_core::resource::{ResolvedResource, Resource};
+
+    fn create(resource: Resource) -> Effect {
+        Effect::Create(ResolvedResource::new(resource))
+    }
 
     fn make_app() -> App {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3.Bucket", "a")));
-        plan.add(Effect::Create(Resource::new("s3.Bucket", "b")));
+        plan.add(create(Resource::new("s3.Bucket", "a")));
+        plan.add(create(Resource::new("s3.Bucket", "b")));
         App::new(&plan, &SchemaRegistry::new())
     }
 
@@ -274,13 +278,13 @@ mod tests {
 
     fn make_search_app() -> App {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(
+        plan.add(create(
             Resource::new("s3.Bucket", "my-bucket").with_binding("bucket"),
         ));
-        plan.add(Effect::Create(
+        plan.add(create(
             Resource::new("ec2.Vpc", "my-vpc").with_binding("vpc"),
         ));
-        plan.add(Effect::Create(
+        plan.add(create(
             Resource::new("ec2.Subnet", "my-subnet")
                 .with_binding("subnet")
                 .with_attribute(
@@ -482,14 +486,14 @@ mod tests {
 
     fn make_provider_prefixed_app() -> App {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(
+        plan.add(create(
             Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None).with_binding("vpc"),
         ));
-        plan.add(Effect::Create(
+        plan.add(create(
             Resource::with_provider("awscc", "ec2.Subnet", "my-subnet", None)
                 .with_binding("subnet"),
         ));
-        plan.add(Effect::Create(
+        plan.add(create(
             Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None).with_binding("bucket"),
         ));
         App::new(&plan, &SchemaRegistry::new())
