@@ -11,12 +11,12 @@ Execution Plan:
       tags:
         Name: "test-vpc"
         │
-        ├─ + awscc.ec2.RouteTable 
+        ├─ + awscc.ec2.RouteTable awscc_ec2_route_table_8710819e
         │     tags:
         │       Name: "test-route-table"
         │     vpc_id: vpc.vpc_id
         │
-        └─ + awscc.ec2.Subnet 
+        └─ + awscc.ec2.Subnet awscc_ec2_subnet_8b692b3f
               availability_zone: "ap-northeast-1a"
               cidr_block: "10.0.1.0/24"
               tags:

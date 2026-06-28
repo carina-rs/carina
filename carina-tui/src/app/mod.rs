@@ -123,9 +123,7 @@ impl App {
             .effects()
             .iter()
             .filter_map(|e| match e {
-                Effect::Update { id, .. } | Effect::Replace { id, .. } => {
-                    Some(id.clone().into_inner())
-                }
+                Effect::Update { to, .. } | Effect::Replace { to, .. } => Some(to.id.clone()),
                 Effect::DeferredReplace { .. } => None,
                 _ => None,
             })
@@ -705,28 +703,34 @@ fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>
             depth: 0,
             parent: None,
         },
-        Effect::Update { id, .. } => TreeNode {
-            effect_label: format!("{}", id.human()),
-            resource_type: id.display_type(),
-            name_part: id.identity_or_empty().to_string(),
-            symbol: effect.display_glyph().to_string(),
-            kind: EffectKind::Update,
-            detail_rows,
-            children: Vec::new(),
-            depth: 0,
-            parent: None,
-        },
-        Effect::Replace { id, .. } => TreeNode {
-            effect_label: format!("{}", id.human()),
-            resource_type: id.display_type(),
-            name_part: id.identity_or_empty().to_string(),
-            symbol: effect.display_glyph().to_string(),
-            kind: EffectKind::Replace,
-            detail_rows,
-            children: Vec::new(),
-            depth: 0,
-            parent: None,
-        },
+        Effect::Update { to, .. } => {
+            let id = &to.id;
+            TreeNode {
+                effect_label: format!("{}", id.human()),
+                resource_type: id.display_type(),
+                name_part: id.identity_or_empty().to_string(),
+                symbol: effect.display_glyph().to_string(),
+                kind: EffectKind::Update,
+                detail_rows,
+                children: Vec::new(),
+                depth: 0,
+                parent: None,
+            }
+        }
+        Effect::Replace { to, .. } => {
+            let id = &to.id;
+            TreeNode {
+                effect_label: format!("{}", id.human()),
+                resource_type: id.display_type(),
+                name_part: id.identity_or_empty().to_string(),
+                symbol: effect.display_glyph().to_string(),
+                kind: EffectKind::Replace,
+                detail_rows,
+                children: Vec::new(),
+                depth: 0,
+                parent: None,
+            }
+        }
         Effect::Delete { id, identifier, .. } => {
             // build_detail_rows returns empty for Delete without delete_attributes,
             // so add the identifier as a manual attribute row
@@ -793,20 +797,23 @@ fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>
             parent: None,
         },
         Effect::Wait {
-            binding,
+            identity,
             until_surface,
             ..
-        } => TreeNode {
-            effect_label: format!("{} (until {})", binding, until_surface),
-            resource_type: "wait".to_string(),
-            name_part: binding.clone(),
-            symbol: effect.display_glyph().to_string(),
-            kind: EffectKind::Wait,
-            detail_rows,
-            children: Vec::new(),
-            depth: 0,
-            parent: None,
-        },
+        } => {
+            let binding = identity.to_string();
+            TreeNode {
+                effect_label: format!("{} (until {})", binding, until_surface),
+                resource_type: "wait".to_string(),
+                name_part: binding,
+                symbol: effect.display_glyph().to_string(),
+                kind: EffectKind::Wait,
+                detail_rows,
+                children: Vec::new(),
+                depth: 0,
+                parent: None,
+            }
+        }
         Effect::DeferredCreate {
             upstream_binding,
             template,

@@ -499,7 +499,7 @@ pub fn relax_update_update_edges(effects: &[Effect], analysis: &mut DependencyAn
 mod tests {
     use super::*;
     use crate::effect::ChangedCreateOnly;
-    use crate::resource::{State, Value};
+    use crate::resource::{ResolvedResource, State, Value};
 
     fn state_for(id: &ResourceId) -> State {
         State::not_found(id.clone())
@@ -515,9 +515,8 @@ mod tests {
             );
         }
         Effect::Update {
-            id: crate::resource::ResolvedResourceId::new(resource.id.clone()),
             from: Box::new(state_for(&resource.id)),
-            to: resource,
+            to: ResolvedResource::new(resource),
             changed_attributes: changed.iter().map(|s| (*s).to_string()).collect(),
         }
     }
@@ -617,14 +616,10 @@ mod tests {
         to.binding = Some("replace_me".to_string());
 
         let effects = vec![
-            Effect::Create(x),
+            Effect::Create(ResolvedResource::new(x)),
             Effect::Replace {
-                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                    "test",
-                    "replace_me",
-                )),
                 from: Box::new(from),
-                to,
+                to: ResolvedResource::new(to),
                 directives: Default::default(),
                 changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
                 cascading_updates: Vec::new(),
@@ -677,7 +672,7 @@ mod tests {
             .filter_map(|effect| match effect {
                 Effect::Update { to, .. } => Some((
                     effect.resource_id().clone(),
-                    UnresolvedResource::from_pre_resolve(to.clone()),
+                    UnresolvedResource::from_pre_resolve(to.as_inner().clone()),
                 )),
                 _ => None,
             })

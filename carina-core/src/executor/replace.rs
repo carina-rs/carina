@@ -130,7 +130,7 @@ pub(super) struct ReplaceContext<'a> {
     pub(super) effect: &'a Effect,
     pub(super) id: &'a ResourceId,
     pub(super) from: &'a State,
-    pub(super) to: &'a Resource,
+    pub(super) to: &'a ResolvedResource,
     pub(super) directives: &'a crate::resource::Directives,
     pub(super) cascading_updates: &'a [crate::effect::CascadingUpdate],
     pub(super) temporary_name: Option<&'a crate::effect::TemporaryName>,
@@ -200,14 +200,11 @@ pub(super) async fn execute_cbd_replace_parallel(
                     Ok(r) => r,
                     Err(e) => {
                         observer.on_event(&ExecutionEvent::CascadeUpdateFailed {
-                            id: &cascade.id,
+                            id: &cascade.to.id,
                             error: &e,
                         });
                         let cascade_identifier = cascade.from.identifier.as_deref().unwrap_or("");
-                        refreshes.push((
-                            cascade.id.clone().into_inner(),
-                            cascade_identifier.to_string(),
-                        ));
+                        refreshes.push((cascade.to.id.clone(), cascade_identifier.to_string()));
                         cascade_failed = true;
                         break;
                     }
@@ -218,14 +215,14 @@ pub(super) async fn execute_cbd_replace_parallel(
                     &resolved_to,
                     &cascade.to,
                     ctx.pipeline.schemas,
-                    &cascade.id,
+                    &cascade.to.id,
                 );
                 let cascade_request = UpdateRequest {
                     from: (*cascade.from).clone(),
                     patch: cascade_patch,
                 };
                 match provider
-                    .update(&cascade.id, cascade_identifier, cascade_request)
+                    .update(&cascade.to.id, cascade_identifier, cascade_request)
                     .await
                 {
                     Ok(cascade_outcome) => {
@@ -237,10 +234,11 @@ pub(super) async fn execute_cbd_replace_parallel(
                         };
                         let cascade_state = cascade_outcome.into_state_for_writeback();
                         if let Some(diagnostic) = cascade_diagnostic {
-                            cascade_diagnostics.push((cascade.id.clone().into_inner(), diagnostic));
+                            cascade_diagnostics.push((cascade.to.id.clone(), diagnostic));
                         }
-                        observer
-                            .on_event(&ExecutionEvent::CascadeUpdateSucceeded { id: &cascade.id });
+                        observer.on_event(&ExecutionEvent::CascadeUpdateSucceeded {
+                            id: &cascade.to.id,
+                        });
                         local_bindings.record_applied(
                             cascade.to.binding.as_deref(),
                             &resolved_to.as_resource().resolved_attributes(),
@@ -250,13 +248,10 @@ pub(super) async fn execute_cbd_replace_parallel(
                     Err(e) => {
                         let error_str = e.to_string();
                         observer.on_event(&ExecutionEvent::CascadeUpdateFailed {
-                            id: &cascade.id,
+                            id: &cascade.to.id,
                             error: &error_str,
                         });
-                        refreshes.push((
-                            cascade.id.clone().into_inner(),
-                            cascade_identifier.to_string(),
-                        ));
+                        refreshes.push((cascade.to.id.clone(), cascade_identifier.to_string()));
                         cascade_failed = true;
                         break;
                     }
@@ -477,7 +472,7 @@ pub(super) async fn execute_dbd_replace_parallel(
             let resolve_source = ctx
                 .unresolved
                 .get(&ctx.to.id)
-                .map_or(ctx.to, UnresolvedResource::as_resource);
+                .map_or(ctx.to.as_inner(), UnresolvedResource::as_resource);
             let resolved = match resolve_resource_with_source(
                 ctx.to,
                 resolve_source,

@@ -456,7 +456,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     );
 
     let has_wait = plan.effects().iter().any(|e| {
-        matches!(e, carina_core::effect::Effect::Wait { binding, .. } if binding == "r.cert_issued")
+        matches!(e, carina_core::effect::Effect::Wait { identity, .. } if identity.as_str() == "r.cert_issued")
     });
     assert!(
         has_wait,

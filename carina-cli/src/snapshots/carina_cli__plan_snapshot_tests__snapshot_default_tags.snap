@@ -10,7 +10,7 @@ Execution Plan:
         Environment: "staging"
         Name: "main-vpc"
         │
-        └─ + awscc.ec2.RouteTable 
+        └─ + awscc.ec2.RouteTable awscc_ec2_route_table_fd47570c
               vpc_id: vpc.vpc_id
 
 Plan: 2 to add, 0 to change, 0 to destroy.

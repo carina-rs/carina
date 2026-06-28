@@ -12,13 +12,22 @@ use carina_core::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes};
 use carina_core::parser::{DeferredForExpression, ForBinding};
 use carina_core::plan::Plan;
 use carina_core::resource::{
-    ConcreteValue, DeferredValue, Directives, Resource, ResourceId, State, UnknownReason, Value,
+    ConcreteValue, DeferredValue, Directives, ResolvedResource, Resource, ResourceId, State,
+    UnknownReason, Value,
 };
 use carina_core::schema::SchemaRegistry;
 
 use crate::app::App;
 use crate::test_utils::buffer_to_string;
 use crate::ui::draw;
+
+fn resolved(resource: Resource) -> ResolvedResource {
+    ResolvedResource::new(resource)
+}
+
+fn create(resource: Resource) -> Effect {
+    Effect::Create(resolved(resource))
+}
 
 /// Render the TUI into a string, optionally selecting a specific node.
 fn render_tui(plan: &Plan, width: u16, height: u16, selection: usize) -> String {
@@ -48,7 +57,7 @@ fn render_tui_with_schemas(
 /// Build a plan with VPC + route table + subnet (all Create effects with dependencies).
 fn build_all_create_plan() -> Plan {
     let mut plan = Plan::new();
-    plan.add(Effect::Create(
+    plan.add(create(
         Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
             .with_attribute(
@@ -56,7 +65,7 @@ fn build_all_create_plan() -> Plan {
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
             ),
     ));
-    plan.add(Effect::Create(
+    plan.add(create(
         Resource::new("ec2.RouteTable", "my-rt")
             .with_binding("rt")
             .with_attribute(
@@ -64,7 +73,7 @@ fn build_all_create_plan() -> Plan {
                 Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
             ),
     ));
-    plan.add(Effect::Create(
+    plan.add(create(
         Resource::new("ec2.Subnet", "my-subnet")
             .with_binding("subnet")
             .with_attribute(
@@ -83,9 +92,6 @@ fn build_all_create_plan() -> Plan {
 fn build_mixed_operations_plan() -> Plan {
     let mut plan = Plan::new();
     plan.add(Effect::Update {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "ec2.Vpc", "my-vpc",
-        )),
         from: Box::new(State::existing(
             ResourceId::with_identity("ec2.Vpc", "my-vpc"),
             [
@@ -101,19 +107,21 @@ fn build_mixed_operations_plan() -> Plan {
             .into_iter()
             .collect(),
         )),
-        to: Resource::new("ec2.Vpc", "my-vpc")
-            .with_binding("vpc")
-            .with_attribute(
-                "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-            )
-            .with_attribute(
-                "enable_dns_support",
-                Value::Concrete(ConcreteValue::Bool(true)),
-            ),
+        to: resolved(
+            Resource::new("ec2.Vpc", "my-vpc")
+                .with_binding("vpc")
+                .with_attribute(
+                    "cidr_block",
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                )
+                .with_attribute(
+                    "enable_dns_support",
+                    Value::Concrete(ConcreteValue::Bool(true)),
+                ),
+        ),
         changed_attributes: vec!["enable_dns_support".to_string()],
     });
-    plan.add(Effect::Create(
+    plan.add(create(
         Resource::new("ec2.SecurityGroup", "my-sg")
             .with_binding("sg")
             .with_attribute(
@@ -178,9 +186,6 @@ fn build_map_key_diff_plan() -> Plan {
     .collect();
 
     plan.add(Effect::Update {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "ec2.Vpc", "my-vpc",
-        )),
         from: Box::new(State::existing(
             ResourceId::with_identity("ec2.Vpc", "my-vpc"),
             [
@@ -200,13 +205,15 @@ fn build_map_key_diff_plan() -> Plan {
             .into_iter()
             .collect(),
         )),
-        to: Resource::new("ec2.Vpc", "my-vpc")
-            .with_binding("vpc")
-            .with_attribute(
-                "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-            )
-            .with_attribute("tags", Value::Concrete(ConcreteValue::Map(new_tags))),
+        to: resolved(
+            Resource::new("ec2.Vpc", "my-vpc")
+                .with_binding("vpc")
+                .with_attribute(
+                    "cidr_block",
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                )
+                .with_attribute("tags", Value::Concrete(ConcreteValue::Map(new_tags))),
+        ),
         changed_attributes: vec!["tags".to_string()],
     });
     plan
@@ -229,7 +236,7 @@ fn build_deferred_for_plan() -> Plan {
     };
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(certificate_resource()));
+    plan.add(create(certificate_resource()));
     plan.add(Effect::DeferredCreate {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "__deferred_for",
@@ -257,7 +264,7 @@ fn build_anonymous_deferred_for_plan() -> Plan {
     };
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(certificate_resource()));
+    plan.add(create(certificate_resource()));
     plan.add(Effect::DeferredCreate {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "__deferred_for",
@@ -286,7 +293,7 @@ fn build_deferred_replace_plan() -> Plan {
     };
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(certificate_resource()));
+    plan.add(create(certificate_resource()));
     plan.add(Effect::DeferredReplace {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -407,7 +414,7 @@ fn snapshot_deferred_replace() {
 #[test]
 fn snapshot_create_with_schema() {
     let mut plan = Plan::new();
-    plan.add(Effect::Create(
+    plan.add(create(
         Resource::new("ec2.Vpc", "my-vpc")
             .with_binding("vpc")
             .with_attribute(
@@ -522,9 +529,6 @@ fn build_moved_with_changes_plan() -> Plan {
         )),
     });
     plan.add(Effect::Update {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "ec2.Vpc", "new_vpc",
-        )),
         from: Box::new(State::existing(
             ResourceId::with_identity("ec2.Vpc", "new_vpc"),
             [
@@ -540,26 +544,28 @@ fn build_moved_with_changes_plan() -> Plan {
             .into_iter()
             .collect(),
         )),
-        to: Resource::new("ec2.Vpc", "new_vpc")
-            .with_binding("new_vpc")
-            .with_attribute(
-                "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-            )
-            .with_attribute(
-                "tags",
-                Value::Concrete(ConcreteValue::Map(
-                    [(
-                        "Name".to_string(),
-                        Value::Concrete(ConcreteValue::String("updated".to_string())),
-                    )]
-                    .into_iter()
-                    .collect(),
-                )),
-            ),
+        to: resolved(
+            Resource::new("ec2.Vpc", "new_vpc")
+                .with_binding("new_vpc")
+                .with_attribute(
+                    "cidr_block",
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                )
+                .with_attribute(
+                    "tags",
+                    Value::Concrete(ConcreteValue::Map(
+                        [(
+                            "Name".to_string(),
+                            Value::Concrete(ConcreteValue::String("updated".to_string())),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    )),
+                ),
+        ),
         changed_attributes: vec!["tags".to_string()],
     });
-    plan.add(Effect::Create(
+    plan.add(create(
         Resource::new("ec2.Subnet", "my-subnet")
             .with_attribute(
                 "cidr_block",

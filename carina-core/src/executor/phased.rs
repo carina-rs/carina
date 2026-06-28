@@ -278,7 +278,7 @@ pub(super) async fn execute_effects_phased(
     let replaced_ids: HashSet<ResourceId> = effects
         .iter()
         .filter_map(|effect| match effect {
-            Effect::Replace { id, .. } => Some(id.clone().into_inner()),
+            Effect::Replace { to, .. } => Some(to.id.clone()),
             _ => None,
         })
         .collect();
@@ -410,7 +410,8 @@ pub(super) async fn execute_effects_phased(
                             for child in children {
                                 let child_idx = effects.len();
                                 if let Effect::Create(resource) = &child {
-                                    runtime_synthesized_resources.push(resource.clone());
+                                    runtime_synthesized_resources
+                                        .push(resource.clone().into_inner());
                                 }
                                 effects.push(child);
                                 phase1_indices.push(child_idx);
@@ -430,7 +431,7 @@ pub(super) async fn execute_effects_phased(
                 }
 
                 if let Effect::Wait {
-                    binding,
+                    identity,
                     target_id,
                     until,
                     timeout,
@@ -438,7 +439,7 @@ pub(super) async fn execute_effects_phased(
                     ..
                 } = &effect
                 {
-                    let binding = binding.clone();
+                    let binding = identity.to_string();
                     let target_id = target_id.clone();
                     let until = until.clone();
                     let timeout = *timeout;
@@ -793,7 +794,7 @@ pub(super) async fn execute_effects_phased(
 
                         let resolve_source = unresolved
                             .get(&to.id)
-                            .map_or(to, UnresolvedResource::as_resource);
+                            .map_or(to.as_inner(), UnresolvedResource::as_resource);
                         let resolved = match resolve_resource_with_source(
                             to,
                             resolve_source,
@@ -851,14 +852,14 @@ pub(super) async fn execute_effects_phased(
                                         Err(e) => {
                                             observer.on_event(
                                                 &ExecutionEvent::CascadeUpdateFailed {
-                                                    id: &cascade.id,
+                                                    id: &cascade.to.id,
                                                     error: &e,
                                                 },
                                             );
                                             let cascade_identifier =
                                                 cascade.from.identifier.as_deref().unwrap_or("");
                                             refreshes.push((
-                                                cascade.id.clone().into_inner(),
+                                                cascade.to.id.clone(),
                                                 cascade_identifier.to_string(),
                                             ));
                                             cascade_failed = true;
@@ -872,14 +873,14 @@ pub(super) async fn execute_effects_phased(
                                         &resolved_to,
                                         &cascade.to,
                                         pipeline.schemas,
-                                        &cascade.id,
+                                        &cascade.to.id,
                                     );
                                     let cascade_request = UpdateRequest {
                                         from: (*cascade.from).clone(),
                                         patch: cascade_patch,
                                     };
                                     match provider
-                                        .update(&cascade.id, cascade_identifier, cascade_request)
+                                        .update(&cascade.to.id, cascade_identifier, cascade_request)
                                         .await
                                     {
                                         Ok(cascade_outcome) => {
@@ -892,16 +893,14 @@ pub(super) async fn execute_effects_phased(
                                             };
                                             observer.on_event(
                                                 &ExecutionEvent::CascadeUpdateSucceeded {
-                                                    id: &cascade.id,
+                                                    id: &cascade.to.id,
                                                 },
                                             );
                                             let cascade_state =
                                                 cascade_outcome.into_state_for_writeback();
                                             if let Some(diagnostic) = cascade_diagnostic {
-                                                cascade_diagnostics.push((
-                                                    cascade.id.clone().into_inner(),
-                                                    diagnostic,
-                                                ));
+                                                cascade_diagnostics
+                                                    .push((cascade.to.id.clone(), diagnostic));
                                             }
                                             let cascade_attrs =
                                                 resolved_to.as_resource().resolved_attributes();
@@ -911,7 +910,7 @@ pub(super) async fn execute_effects_phased(
                                                 &cascade_state,
                                             );
                                             cascade_states.push((
-                                                cascade.id.clone().into_inner(),
+                                                cascade.to.id.clone(),
                                                 cascade_state,
                                                 cascade_attrs,
                                                 cascade.to.binding.clone(),
@@ -921,12 +920,12 @@ pub(super) async fn execute_effects_phased(
                                             let error_str = e.to_string();
                                             observer.on_event(
                                                 &ExecutionEvent::CascadeUpdateFailed {
-                                                    id: &cascade.id,
+                                                    id: &cascade.to.id,
                                                     error: &error_str,
                                                 },
                                             );
                                             refreshes.push((
-                                                cascade.id.clone().into_inner(),
+                                                cascade.to.id.clone(),
                                                 cascade_identifier.to_string(),
                                             ));
                                             cascade_failed = true;
@@ -1198,8 +1197,8 @@ pub(super) async fn execute_effects_phased(
 
                 in_flight.push(async move {
                     if let Effect::Replace {
-                        id,
                         from,
+                        to,
                         directives,
                         ..
                     } = effect
@@ -1207,7 +1206,7 @@ pub(super) async fn execute_effects_phased(
                         let identifier = from.identifier.as_deref().unwrap_or("");
                         match provider
                             .delete(
-                                id,
+                                &to.id,
                                 identifier,
                                 DeleteRequest {
                                     directives: directives.clone(),
@@ -1227,10 +1226,7 @@ pub(super) async fn execute_effects_phased(
                                 (
                                     idx,
                                     PhaseEffectResult::ReplaceDeleteFailure {
-                                        refresh: Some((
-                                            id.clone().into_inner(),
-                                            identifier.to_string(),
-                                        )),
+                                        refresh: Some((to.id.clone(), identifier.to_string())),
                                         cbd_refresh: cbd_refresh_info,
                                     },
                                 )
@@ -1421,7 +1417,8 @@ pub(super) async fn execute_effects_phased(
                             for child in children {
                                 let child_idx = effects.len();
                                 if let Effect::Create(resource) = &child {
-                                    runtime_synthesized_resources.push(resource.clone());
+                                    runtime_synthesized_resources
+                                        .push(resource.clone().into_inner());
                                 }
                                 effects.push(child);
                                 phase4_indices.push(child_idx);
@@ -1483,7 +1480,6 @@ pub(super) async fn execute_effects_phased(
                 };
 
                 if let Effect::Replace {
-                    id,
                     to,
                     directives,
                     temporary_name,
@@ -1502,7 +1498,7 @@ pub(super) async fn execute_effects_phased(
                             completed_indices.insert(idx);
                             continue;
                         };
-                        let id = id.clone();
+                        let id = to.id.clone();
                         let to = to.clone();
                         let temporary_name = temporary_name.clone();
                         let effect_for_future = effect.clone();
@@ -1653,7 +1649,7 @@ pub(super) async fn execute_effects_phased(
                                 let started = effect_started;
                                 let resolve_source = unresolved
                                     .get(&to.id)
-                                    .map_or(to, UnresolvedResource::as_resource);
+                                    .map_or(to.as_inner(), UnresolvedResource::as_resource);
                                 let resolved = match resolve_resource_with_source(
                                     to,
                                     resolve_source,
@@ -1933,7 +1929,7 @@ pub(super) async fn execute_effects_phased(
                 }
 
                 if let Effect::Wait {
-                    binding,
+                    identity,
                     target_id,
                     until,
                     timeout,
@@ -1968,7 +1964,7 @@ pub(super) async fn execute_effects_phased(
                             (
                                 idx,
                                 PhaseEffectResult::Wait {
-                                    binding: binding.clone(),
+                                    binding: identity.to_string(),
                                     outcome,
                                     duration: started.elapsed(),
                                     progress,
@@ -2155,10 +2151,17 @@ mod tests {
         BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError, ProviderResult,
         ReadRequest, UpdateRequest,
     };
-    use crate::resource::{Composition, ConcreteValue, DataSource, ResourceId, Value};
+    use crate::resource::{
+        Composition, ConcreteValue, DataSource, ResolvedResource, ResourceId, ResourceIdentity,
+        Value,
+    };
     use crate::schema::SchemaRegistry;
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::sync::Mutex;
+
+    fn resolved(resource: Resource) -> ResolvedResource {
+        ResolvedResource::new(resource)
+    }
 
     struct TerminalWaitProvider {
         create_log: Mutex<Vec<String>>,
@@ -2347,9 +2350,9 @@ mod tests {
         alb.binding = Some("alb".to_string());
 
         let mut plan = Plan::new();
-        plan.add(Effect::Create(cert.clone()));
+        plan.add(Effect::Create(resolved(cert.clone())));
         plan.add(Effect::Wait {
-            binding: "cert_issued".to_string(),
+            identity: ResourceIdentity::new("cert_issued"),
             target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
@@ -2360,7 +2363,7 @@ mod tests {
             interval: std::time::Duration::from_millis(1),
             explicit_dependencies: std::collections::HashSet::new(),
         });
-        plan.add(Effect::Create(alb.clone()));
+        plan.add(Effect::Create(resolved(alb.clone())));
 
         let unresolved = HashMap::from([
             (
@@ -2445,9 +2448,9 @@ mod tests {
         );
 
         let mut plan = Plan::new();
-        plan.add(Effect::Create(cert.clone()));
+        plan.add(Effect::Create(resolved(cert.clone())));
         plan.add(Effect::Wait {
-            binding: "cert_issued".to_string(),
+            identity: ResourceIdentity::new("cert_issued"),
             target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
@@ -2458,8 +2461,8 @@ mod tests {
             interval: std::time::Duration::from_millis(1),
             explicit_dependencies: std::collections::HashSet::new(),
         });
-        plan.add(Effect::Create(alb.clone()));
-        plan.add(Effect::Create(listener.clone()));
+        plan.add(Effect::Create(resolved(alb.clone())));
+        plan.add(Effect::Create(resolved(listener.clone())));
 
         let unresolved = HashMap::from([
             (
@@ -2549,8 +2552,8 @@ mod tests {
         );
 
         let effects = vec![
-            Effect::Create(role.clone()),
-            Effect::Create(role_policy.clone()),
+            Effect::Create(resolved(role.clone())),
+            Effect::Create(resolved(role_policy.clone())),
         ];
         let phase_indices: Vec<usize> = vec![0, 1];
 
@@ -2596,7 +2599,10 @@ mod tests {
             Value::resource_ref("outer", "role_name", vec![]),
         );
 
-        let effects = vec![Effect::Create(role.clone()), Effect::Create(caller.clone())];
+        let effects = vec![
+            Effect::Create(resolved(role.clone())),
+            Effect::Create(resolved(caller.clone())),
+        ];
         let phase_indices: Vec<usize> = vec![0, 1];
 
         let mut unresolved: HashMap<ResourceId, UnresolvedResource> = HashMap::new();
@@ -2640,9 +2646,8 @@ mod tests {
         let bucket_state = State::not_found(bucket.id.clone());
 
         let role_replace = Effect::Replace {
-            id: crate::resource::ResolvedResourceId::new(role.id.clone()),
             from: Box::new(role_state),
-            to: role.clone(),
+            to: resolved(role.clone()),
             directives: Directives::default(),
             changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
                 "role_name".to_string(),
@@ -2653,9 +2658,8 @@ mod tests {
             cascade_ref_hints: vec![],
         };
         let bucket_replace = Effect::Replace {
-            id: crate::resource::ResolvedResourceId::new(bucket.id.clone()),
             from: Box::new(bucket_state),
-            to: bucket.clone(),
+            to: resolved(bucket.clone()),
             directives: Directives::default(),
             changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
                 "bucket_name".to_string(),

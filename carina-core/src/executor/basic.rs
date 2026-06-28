@@ -27,9 +27,8 @@ use super::wait::AppliedStates;
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 
 /// Private capability token for constructing [`ResolvedResource`].
-/// Only this module can create a value, so the checked constructor in
-/// `resource` cannot be used by sibling modules as a convention-only
-/// escape hatch.
+/// Only this module can request the provider-dispatch constructor that
+/// also checks the resource for unresolved value placeholders.
 pub(crate) struct ResolvedResourceToken(());
 
 /// Result of executing a basic effect (Create, Update, or Delete).
@@ -201,7 +200,7 @@ pub(super) async fn resolve_resource_with_source(
 pub(super) fn resolved_resource(
     resource: Resource,
 ) -> Result<ResolvedResource, SerializationError> {
-    ResolvedResource::new(resource, ResolvedResourceToken(()))
+    ResolvedResource::new_fully_resolved(resource, ResolvedResourceToken(()))
 }
 
 pub(super) fn resolved_normalized_resource(
@@ -584,15 +583,15 @@ pub(super) async fn execute_basic_effect<'a>(
             }
         }
         BasicEffect::Update {
-            id,
             from,
             to,
             changed_attributes,
             ..
         } => {
+            let id = &to.id;
             let resolve_source = unresolved
                 .get(id)
-                .map_or(to, UnresolvedResource::as_resource);
+                .map_or(to.as_inner(), UnresolvedResource::as_resource);
             let resolved_to =
                 match resolve_resource_with_source(to, resolve_source, bindings, pipeline).await {
                     Ok(r) => r,

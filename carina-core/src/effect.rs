@@ -18,7 +18,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::non_empty::NonEmptyVec;
 use crate::parser::DeferredForExpression;
-use crate::resource::{DataSource, Directives, ResolvedResourceId, Resource, ResourceId, State};
+#[cfg(test)]
+use crate::resource::{DataSource, Resource};
+use crate::resource::{
+    Directives, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
+    ResourceIdentity, State,
+};
 use crate::wait::predicate::WaitPredicate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -65,9 +70,8 @@ pub struct TemporaryName {
 /// newly created resource's state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CascadingUpdate {
-    pub id: ResolvedResourceId,
     pub from: Box<State>,
-    pub to: Resource,
+    pub to: ResolvedResource,
 }
 
 /// Delete payload absorbed into [`Effect::DeferredReplace`].
@@ -242,25 +246,23 @@ impl From<ChangedCreateOnly> for Vec<String> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Effect {
     /// Read the current state of a resource (data source)
-    Read { resource: DataSource },
+    Read { resource: ResolvedDataSource },
 
     /// Create a new resource
-    Create(Resource),
+    Create(ResolvedResource),
 
     /// Update an existing resource
     Update {
-        id: ResolvedResourceId,
         from: Box<State>,
-        to: Resource,
+        to: ResolvedResource,
         /// Attribute names that changed (including removed attributes)
         changed_attributes: Vec<String>,
     },
 
     /// Replace a resource (delete then create) due to create-only property changes
     Replace {
-        id: ResolvedResourceId,
         from: Box<State>,
-        to: Resource,
+        to: ResolvedResource,
         #[serde(default)]
         directives: Directives,
         /// Which create-only attributes forced the replacement
@@ -343,8 +345,8 @@ pub enum Effect {
     /// re-evaluated on every plan/apply. See
     /// `notes/specs/2026-05-09-wait-construct-design.md` §State file.
     Wait {
-        /// The wait's binding name (e.g. `"cert_issued"`).
-        binding: String,
+        /// The wait's own identity (e.g. `"cert_issued"`).
+        identity: ResourceIdentity,
         /// Resolved id of the target resource (`wait cert { ... }` →
         /// `cert`'s `ResourceId`).
         target_id: ResolvedResourceId,
@@ -428,13 +430,12 @@ pub enum Effect {
 pub enum BasicEffect<'a> {
     Create {
         effect: &'a Effect,
-        resource: &'a Resource,
+        resource: &'a ResolvedResource,
     },
     Update {
         effect: &'a Effect,
-        id: &'a ResourceId,
         from: &'a State,
-        to: &'a Resource,
+        to: &'a ResolvedResource,
         changed_attributes: &'a [String],
     },
     Delete {
@@ -504,19 +505,18 @@ impl Effect {
         effect_cases![
             (
                 Effect::Read {
-                    resource: DataSource::new("test", "x"),
+                    resource: ResolvedDataSource::new(DataSource::new("test", "x")),
                 },
                 Effect::Read { .. }
             ),
             (
-                Effect::Create(Resource::new("test", "x")),
+                Effect::Create(ResolvedResource::new(Resource::new("test", "x"))),
                 Effect::Create(_)
             ),
             (
                 Effect::Update {
-                    id: crate::resource::ResolvedResourceId::new(id.clone()),
                     from: Box::new(State::not_found(id.clone())),
-                    to: Resource::new("test", "x"),
+                    to: ResolvedResource::new(Resource::new("test", "x")),
                     changed_attributes: vec![],
                 },
                 Effect::Update { .. }
@@ -560,7 +560,7 @@ impl Effect {
             ),
             (
                 Effect::Wait {
-                    binding: "w".to_string(),
+                    identity: ResourceIdentity::new("w"),
                     target_id: crate::resource::ResolvedResourceId::new(id.clone()),
                     until: WaitPredicate::Equals {
                         attr: AttrPath::single("status"),
@@ -641,9 +641,8 @@ impl Effect {
         };
 
         Effect::Replace {
-            id: crate::resource::ResolvedResourceId::new(id.clone()),
             from: Box::new(State::not_found(id)),
-            to: Resource::new("test", "x"),
+            to: ResolvedResource::new(Resource::new("test", "x")),
             directives,
             changed_create_only: ChangedCreateOnly::new(vec!["attr".to_string()]).unwrap(),
             cascading_updates: vec![],
@@ -694,8 +693,8 @@ impl Effect {
     ///
     /// ```compile_fail
     /// use carina_core::effect::{BasicEffect, Effect};
-    /// use carina_core::resource::Resource;
-    /// let effect = Effect::Create(Resource::new("test", "x"));
+    /// use carina_core::resource::{ResolvedResource, Resource};
+    /// let effect = Effect::Create(ResolvedResource::new(Resource::new("test", "x")));
     /// // Was: a missed filter could pass a non-basic `&Effect` straight
     /// // into `execute_basic_effect` and trip `unreachable!()` at apply
     /// // time (carina#3164). The conversion no longer exists.
@@ -708,13 +707,11 @@ impl Effect {
                 resource,
             }),
             Effect::Update {
-                id,
                 from,
                 to,
                 changed_attributes,
             } => Some(BasicEffect::Update {
                 effect: self,
-                id,
                 from,
                 to,
                 changed_attributes,
@@ -823,8 +820,8 @@ impl Effect {
         match self {
             Effect::Read { resource } => &resource.id,
             Effect::Create(r) => &r.id,
-            Effect::Update { id, .. } => id,
-            Effect::Replace { id, .. } => id,
+            Effect::Update { to, .. } => &to.id,
+            Effect::Replace { to, .. } => &to.id,
             Effect::Delete { id, .. } => id,
             Effect::Import { id, .. } => id,
             Effect::Remove { id, .. } => id,
@@ -872,7 +869,7 @@ impl Effect {
             Effect::Import { .. } => None,
             Effect::Remove { .. } => None,
             Effect::Move { .. } => None,
-            Effect::Wait { binding, .. } => Some(binding.clone()),
+            Effect::Wait { identity, .. } => Some(identity.to_string()),
             // INVARIANT: DeferredCreate has no binding identity until the
             // upstream resolves at apply time (the iterable's cardinality is
             // unknown), so binding_name() is None. DeferredReplace already
@@ -1250,25 +1247,26 @@ mod tests {
             (
                 "Read",
                 Effect::Read {
-                    resource: DataSource::new("test", "x"),
+                    resource: ResolvedDataSource::new(DataSource::new("test", "x")),
                 },
             ),
-            ("Create", Effect::Create(Resource::new("test", "x"))),
+            (
+                "Create",
+                Effect::Create(ResolvedResource::new(Resource::new("test", "x"))),
+            ),
             (
                 "Update",
                 Effect::Update {
-                    id: crate::resource::ResolvedResourceId::new(rid.clone()),
                     from: Box::new(State::not_found(rid.clone())),
-                    to: Resource::new("test", "x"),
+                    to: ResolvedResource::new(Resource::new("test", "x")),
                     changed_attributes: vec![],
                 },
             ),
             (
                 "Replace",
                 Effect::Replace {
-                    id: crate::resource::ResolvedResourceId::new(rid.clone()),
                     from: Box::new(State::not_found(rid.clone())),
-                    to: Resource::new("test", "x"),
+                    to: ResolvedResource::new(Resource::new("test", "x")),
                     directives: Directives::default(),
                     changed_create_only: ChangedCreateOnly::new(vec!["attr".to_string()]).unwrap(),
                     cascading_updates: vec![],
@@ -1312,7 +1310,7 @@ mod tests {
             (
                 "Wait",
                 Effect::Wait {
-                    binding: "w".to_string(),
+                    identity: ResourceIdentity::new("w"),
                     target_id: crate::resource::ResolvedResourceId::new(rid),
                     until: WaitPredicate::Equals {
                         attr: AttrPath::single("status"),
@@ -1557,14 +1555,16 @@ mod tests {
     #[test]
     fn read_is_not_mutating() {
         let resource = DataSource::new("test", "example");
-        let effect = Effect::Read { resource };
+        let effect = Effect::Read {
+            resource: ResolvedDataSource::new(resource),
+        };
         assert!(!effect.is_mutating());
     }
 
     #[test]
     fn create_is_mutating() {
         let resource = Resource::new("s3.Bucket", "my-bucket");
-        let effect = Effect::Create(resource);
+        let effect = Effect::Create(ResolvedResource::new(resource));
         assert!(effect.is_mutating());
     }
 
@@ -1572,7 +1572,7 @@ mod tests {
     fn resource_id_returns_correct_id() {
         let resource = DataSource::new("s3.Bucket", "my-bucket");
         let effect = Effect::Read {
-            resource: resource.clone(),
+            resource: ResolvedDataSource::new(resource.clone()),
         };
         assert_eq!(effect.resource_id(), &resource.id);
     }
@@ -1580,7 +1580,7 @@ mod tests {
     #[test]
     fn resource_returns_some_for_create() {
         let resource = Resource::new("s3.Bucket", "my-bucket");
-        let effect = Effect::Create(resource.clone());
+        let effect = Effect::Create(ResolvedResource::new(resource.clone()));
         assert_eq!(effect.as_resource_ref().unwrap().id(), &resource.id);
     }
 
@@ -1600,7 +1600,7 @@ mod tests {
     #[test]
     fn binding_name_returns_binding() {
         let resource = Resource::new("test", "my_binding").with_binding("my_binding");
-        let effect = Effect::Create(resource);
+        let effect = Effect::Create(ResolvedResource::new(resource));
         assert_eq!(effect.binding_name(), Some("my_binding".to_string()));
     }
 
@@ -1611,7 +1611,7 @@ mod tests {
             "name",
             Value::Concrete(ConcreteValue::String("test".to_string())),
         );
-        let effect = Effect::Create(resource);
+        let effect = Effect::Create(ResolvedResource::new(resource));
         assert_eq!(effect.binding_name(), None);
     }
 
@@ -1621,15 +1621,14 @@ mod tests {
         use std::collections::HashMap;
 
         let effects = vec![
-            Effect::Create(Resource::new("s3.Bucket", "my-bucket")),
+            Effect::Create(ResolvedResource::new(Resource::new(
+                "s3.Bucket",
+                "my-bucket",
+            ))),
             Effect::Read {
-                resource: DataSource::new("s3.Bucket", "existing"),
+                resource: ResolvedDataSource::new(DataSource::new("s3.Bucket", "existing")),
             },
             Effect::Update {
-                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                    "s3.Bucket",
-                    "my-bucket",
-                )),
                 from: Box::new(State::existing(
                     ResourceId::with_identity("s3.Bucket", "my-bucket"),
                     HashMap::from([(
@@ -1637,16 +1636,13 @@ mod tests {
                         Value::Concrete(ConcreteValue::String("Disabled".to_string())),
                     )]),
                 )),
-                to: Resource::new("s3.Bucket", "my-bucket").with_attribute(
+                to: ResolvedResource::new(Resource::new("s3.Bucket", "my-bucket").with_attribute(
                     "versioning",
                     Value::Concrete(ConcreteValue::String("Enabled".to_string())),
-                ),
+                )),
                 changed_attributes: vec!["versioning".to_string()],
             },
             Effect::Replace {
-                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                    "ec2.Vpc", "my-vpc",
-                )),
                 from: Box::new(State::existing(
                     ResourceId::with_identity("ec2.Vpc", "my-vpc"),
                     HashMap::from([(
@@ -1654,29 +1650,27 @@ mod tests {
                         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
                     )]),
                 )),
-                to: Resource::new("ec2.Vpc", "my-vpc").with_attribute(
+                to: ResolvedResource::new(Resource::new("ec2.Vpc", "my-vpc").with_attribute(
                     "cidr_block",
                     Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-                ),
+                )),
                 directives: Directives::default(),
                 changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
                     "cidr_block".to_string(),
                 ])
                 .unwrap(),
-                // carina#3181 PR D: cover `CascadingUpdate.to:
-                // Resource` in the serde round-trip.
+                // carina#3181 PR D: cover `CascadingUpdate.to` in
+                // the serde round-trip.
                 cascading_updates: vec![CascadingUpdate {
-                    id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-                        "ec2.Subnet",
-                        "my-subnet",
-                    )),
                     from: Box::new(State::not_found(ResourceId::with_identity(
                         "ec2.Subnet",
                         "my-subnet",
                     ))),
-                    to: Resource::new("ec2.Subnet", "my-subnet").with_attribute(
-                        "vpc_id",
-                        Value::Concrete(ConcreteValue::String("vpc.id".to_string())),
+                    to: ResolvedResource::new(
+                        Resource::new("ec2.Subnet", "my-subnet").with_attribute(
+                            "vpc_id",
+                            Value::Concrete(ConcreteValue::String("vpc.id".to_string())),
+                        ),
                     ),
                 }],
                 temporary_name: None,
@@ -1724,9 +1718,8 @@ mod tests {
     #[test]
     fn replace_changed_create_only_serializes_as_plain_array() {
         let effect = Effect::Replace {
-            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("test", "x")),
             from: Box::new(State::not_found(ResourceId::with_identity("test", "x"))),
-            to: Resource::new("test", "x"),
+            to: ResolvedResource::new(Resource::new("test", "x")),
             directives: Directives::default(),
             changed_create_only: ChangedCreateOnly::new(vec!["x".to_string()]).unwrap(),
             cascading_updates: vec![],
@@ -1747,7 +1740,6 @@ mod tests {
     fn replace_deserialize_rejects_empty_changed_create_only() {
         let json = serde_json::json!({
             "Replace": {
-                "id": {"provider": "", "resource_type": "test", "name": "x"},
                 "from": {
                     "id": {"provider": "", "resource_type": "test", "name": "x"},
                     "identifier": "x-1",
@@ -1784,7 +1776,7 @@ mod tests {
             depends_on: vec!["role".to_string(), "kms".to_string()],
             ..Directives::default()
         };
-        let create = Effect::Create(bucket.clone());
+        let create = Effect::Create(ResolvedResource::new(bucket.clone()));
         let got = create.explicit_dependencies();
         assert!(got.contains("role") && got.contains("kms"), "got {:?}", got);
     }
@@ -1876,7 +1868,7 @@ mod tests {
         use std::time::Duration;
 
         let _ = Effect::Wait {
-            binding: "cert_issued".to_string(),
+            identity: ResourceIdentity::new("cert_issued"),
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
@@ -1899,7 +1891,7 @@ mod tests {
         use std::time::Duration;
 
         let e = Effect::Wait {
-            binding: "cert_issued".to_string(),
+            identity: ResourceIdentity::new("cert_issued"),
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
@@ -1923,7 +1915,7 @@ mod tests {
         use std::time::Duration;
 
         let e = Effect::Wait {
-            binding: "cert_issued".to_string(),
+            identity: ResourceIdentity::new("cert_issued"),
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
@@ -1948,7 +1940,7 @@ mod tests {
         use std::time::Duration;
 
         let original = Effect::Wait {
-            binding: "cert_issued".to_string(),
+            identity: ResourceIdentity::new("cert_issued"),
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "acm.Certificate",
                 "cert",
@@ -1970,6 +1962,7 @@ mod tests {
             "expected `\"timeout\":4500` in JSON, got: {}",
             json
         );
+        assert!(json.contains("\"identity\":\"cert_issued\""), "got: {json}");
         let decoded: Effect = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, original);
     }
@@ -1986,16 +1979,15 @@ mod tests {
         let rid = ResourceId::with_identity("test", "x");
 
         // Basic variants must narrow.
-        let create = Effect::Create(Resource::new("test", "x"));
+        let create = Effect::Create(ResolvedResource::new(Resource::new("test", "x")));
         assert!(matches!(
             create.as_basic(),
             Some(BasicEffect::Create { .. })
         ));
 
         let update = Effect::Update {
-            id: crate::resource::ResolvedResourceId::new(rid.clone()),
             from: Box::new(ResState::not_found(rid.clone())),
-            to: Resource::new("test", "x"),
+            to: ResolvedResource::new(Resource::new("test", "x")),
             changed_attributes: vec![],
         };
         assert!(matches!(
@@ -2021,12 +2013,11 @@ mod tests {
         // inside `as_basic` is what catches it at compile time; this
         // test catches misclassification of an existing variant.
         let read = Effect::Read {
-            resource: DataSource::new("test", "x"),
+            resource: ResolvedDataSource::new(DataSource::new("test", "x")),
         };
         let replace = Effect::Replace {
-            id: crate::resource::ResolvedResourceId::new(rid.clone()),
             from: Box::new(ResState::not_found(rid.clone())),
-            to: Resource::new("test", "x"),
+            to: ResolvedResource::new(Resource::new("test", "x")),
             directives: Directives::default(),
             changed_create_only: ChangedCreateOnly::new(vec!["attr".to_string()]).unwrap(),
             cascading_updates: vec![],
@@ -2047,7 +2038,7 @@ mod tests {
             to: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("test", "y")),
         };
         let wait = Effect::Wait {
-            binding: "w".to_string(),
+            identity: ResourceIdentity::new("w"),
             target_id: crate::resource::ResolvedResourceId::new(rid.clone()),
             until: WaitPredicate::Equals {
                 attr: crate::wait::predicate::AttrPath::single("status"),

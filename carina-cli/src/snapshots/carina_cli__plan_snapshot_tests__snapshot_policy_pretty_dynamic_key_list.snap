@@ -4,7 +4,7 @@ expression: output
 ---
 Execution Plan:
 
-  + awscc.ec2.Vpc 
+  + awscc.ec2.Vpc awscc_ec2_vpc_9e631a9b
       cidr_block: "10.0.0.0/16"
       config:
         statement: 

@@ -5,6 +5,7 @@ use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::parser::{DeferredForExpression, ShapeMismatch, expand_deferred_children};
+use crate::resource::ResolvedResource;
 
 /// Failure while expanding a deferred-for create half against apply-time
 /// upstream state.
@@ -90,7 +91,7 @@ pub(super) fn materialize_deferred_create(
                 resource.dependency_bindings.contains(upstream_binding),
                 "apply-time deferred-for child must retain iterable dependency"
             );
-            Effect::Create(resource)
+            Effect::Create(ResolvedResource::new(resource))
         })
         .collect())
 }

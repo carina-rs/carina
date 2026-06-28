@@ -4,7 +4,7 @@ expression: output
 ---
 Execution Plan:
 
-  + awscc.iam.RolePolicy 
+  + awscc.iam.RolePolicy awscc_iam_role_policy_93d2412e
       policy_name: "test-inline"
       role_name: "test-role"
       statement: 

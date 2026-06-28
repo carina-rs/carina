@@ -11,7 +11,8 @@ use carina_core::parser::{ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, ProviderError, ProviderResult};
 use carina_core::resource::{
-    ConcreteValue, DataSource, DeferredValue, Directives, Resource, ResourceId, State, Value,
+    ConcreteValue, DataSource, DeferredValue, Directives, ResolvedDataSource, ResolvedResource,
+    Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_state::{BackendError, LoadedState, LockInfo, ResourceState, StateBackend, StateFile};
@@ -33,6 +34,14 @@ use crate::wiring::{
 use carina_core::parser::BackendConfig;
 use carina_core::provider::Provider;
 use std::sync::Mutex;
+
+fn resolved(resource: Resource) -> ResolvedResource {
+    ResolvedResource::new(resource)
+}
+
+fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
+    ResolvedDataSource::new(resource)
+}
 
 struct TestProvider {
     read_results: HashMap<(String, String), Result<State, String>>,
@@ -281,12 +290,12 @@ fn plan_file_serde_round_trip() {
     use carina_core::plan::Plan;
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(
+    plan.add(Effect::Create(resolved(
         Resource::with_provider("aws", "s3.Bucket", "my-bucket", None).with_attribute(
             "bucket",
             Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
         ),
-    ));
+    )));
     plan.add(Effect::Delete {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
             "aws",
@@ -600,7 +609,7 @@ fn test_detailed_exitcode_no_changes() {
 fn test_detailed_exitcode_with_changes() {
     // A plan with mutating effects means changes -- has_changes should be true
     let mut plan = Plan::new();
-    plan.add(Effect::Create(Resource::new("s3.Bucket", "test")));
+    plan.add(Effect::Create(resolved(Resource::new("s3.Bucket", "test"))));
     let has_changes = plan.mutation_count() > 0;
     assert!(has_changes);
 }
@@ -610,7 +619,7 @@ fn test_detailed_exitcode_read_only_no_changes() {
     // A plan with only Read effects should NOT count as changes
     let mut plan = Plan::new();
     plan.add(Effect::Read {
-        resource: DataSource::new("sts.caller_identity", "identity"),
+        resource: resolved_data_source(DataSource::new("sts.caller_identity", "identity")),
     });
     let has_changes = plan.mutation_count() > 0;
     assert!(!has_changes);
@@ -1847,9 +1856,8 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
 
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: carina_core::resource::ResolvedResourceId::new(id.clone()),
         from: Box::new(old_state.clone()),
-        to: new_resource.clone(),
+        to: resolved(new_resource.clone()),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -1992,9 +2000,8 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
     // Subnet: Update (cidr_block changed, vpc_id eagerly resolved to old value)
     let mut plan = Plan::new();
     plan.add(Effect::Replace {
-        id: carina_core::resource::ResolvedResourceId::new(vpc_id.clone()),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc_unresolved.clone().with_binding("vpc"),
+        to: resolved(vpc_unresolved.clone().with_binding("vpc")),
         directives: Directives {
             create_before_destroy: true,
             ..Default::default()
@@ -2008,9 +2015,8 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
         cascade_ref_hints: vec![],
     });
     plan.add(Effect::Update {
-        id: carina_core::resource::ResolvedResourceId::new(subnet_id.clone()),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: subnet_resolved.clone(), // Has stale "vpc-OLD" in vpc_id
+        to: resolved(subnet_resolved.clone()), // Has stale "vpc-OLD" in vpc_id
         changed_attributes: vec!["cidr_block".to_string()],
     });
 
@@ -2932,7 +2938,7 @@ fn plan_file_serialization_redacts_secrets() {
         .with_attribute("master_password", secret_password.clone());
 
     let mut plan = Plan::new();
-    plan.add(Effect::Create(resource_with_secret.clone()));
+    plan.add(Effect::Create(resolved(resource_with_secret.clone())));
 
     let mut state_attrs = HashMap::new();
     state_attrs.insert(

@@ -50,7 +50,7 @@ impl NormalizedResource {
         self,
         token: crate::executor::basic::ResolvedResourceToken,
     ) -> Result<ResolvedResource, crate::value::SerializationError> {
-        ResolvedResource::new(self.0, token)
+        ResolvedResource::new_fully_resolved(self.0, token)
     }
 }
 

@@ -9,7 +9,7 @@ Execution Plan:
         + Environment: "staging"
       # (3 unchanged attributes hidden)
         │
-        ├─ + awscc.ec2.SecurityGroup 
+        ├─ + awscc.ec2.SecurityGroup awscc_ec2_security_group_395c3f9f
         │     group_description: "Test security group"
         │     tags:
         │       Name: "test-sg"

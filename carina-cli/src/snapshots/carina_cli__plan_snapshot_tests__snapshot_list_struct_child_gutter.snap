@@ -8,7 +8,7 @@ Execution Plan:
       assume_role_policy_document: "{}"
       role_name: "test-role"
         │
-        ├─ + awscc.iam.RolePolicy 
+        ├─ + awscc.iam.RolePolicy awscc_iam_role_policy_e31a6d61
         │     policy_name: "test-inline"
         │     role_name: "test-role"
         │     statement: 
@@ -22,7 +22,7 @@ Execution Plan:
         │         resource: "arn:aws:s3:::example/*"
         │         sid: "DenyS3Write"
         │
-        └─ + awscc.s3.Bucket 
+        └─ + awscc.s3.Bucket awscc_s3_bucket_991b6004
               bucket_name: "zzz-trailing-sibling"
 
 Plan: 3 to add, 0 to change, 0 to destroy.

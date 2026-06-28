@@ -277,7 +277,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     assert!(
         plan.effects().iter().any(|e| matches!(
             e,
-            carina_core::effect::Effect::Wait { binding, .. } if binding == "r.cert_issued"
+            carina_core::effect::Effect::Wait { identity, .. } if identity.as_str() == "r.cert_issued"
         )),
         "create_plan must emit Effect::Wait for the prefixed wait binding"
     );
@@ -426,7 +426,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     assert!(
         plan.effects().iter().any(|e| matches!(
             e,
-            carina_core::effect::Effect::Wait { binding, .. } if binding == "o.c.cert_issued"
+            carina_core::effect::Effect::Wait { identity, .. } if identity.as_str() == "o.c.cert_issued"
         )),
         "create_plan must emit Effect::Wait for the doubly-prefixed binding"
     );
@@ -584,7 +584,7 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     assert!(
         plan.effects().iter().any(|e| matches!(
             e,
-            carina_core::effect::Effect::Wait { binding, .. } if binding == "r.cert_issued"
+            carina_core::effect::Effect::Wait { identity, .. } if identity.as_str() == "r.cert_issued"
         )),
         "the value-layer alias fix must NOT remove the Effect::Wait \
          dependency edge — both halves of the wait binding must hold"

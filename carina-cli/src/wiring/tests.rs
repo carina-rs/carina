@@ -6,12 +6,16 @@ use carina_core::provider::{
     BoxFuture, CreateOutcome, DeleteRequest, ProviderResult, ReadRequest, UpdateOutcome,
     UpdateRequest,
 };
-use carina_core::resource::Directives;
+use carina_core::resource::{Directives, ResolvedResource, Resource};
 
 enum ReadBehavior {
     NotFound,
     ApiError,
     NotFoundThenSuccess,
+}
+
+fn resolved(resource: Resource) -> ResolvedResource {
+    ResolvedResource::new(resource)
 }
 
 struct ReadWithRetryProvider {
@@ -712,7 +716,7 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
         Some("management".to_string()),
     );
     let mut plan = Plan::new();
-    plan.add(Effect::Create(resource));
+    plan.add(Effect::Create(resolved(resource)));
 
     // The import block address has no routing slot (`StateBlockAddress`
     // is routing-agnostic by construction). The downstream resolver
@@ -2385,9 +2389,10 @@ fn delete_effect_for_binding(binding: &str) -> Effect {
 fn cert_replace_effect() -> Effect {
     let id = ResourceId::with_provider_identity("aws", "acm.Certificate", "cert", None);
     Effect::Replace {
-        id: carina_core::resource::ResolvedResourceId::new(id.clone()),
         from: Box::new(State::existing(id, HashMap::new()).with_identifier("cert-old-id")),
-        to: Resource::with_provider("aws", "acm.Certificate", "cert", None).with_binding("cert"),
+        to: resolved(
+            Resource::with_provider("aws", "acm.Certificate", "cert", None).with_binding("cert"),
+        ),
         directives: Directives::default(),
         changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
             "domain_name".to_string(),

@@ -318,7 +318,7 @@ pub(super) async fn execute_effects_sequential(
                         for child in children {
                             let child_idx = effects.len();
                             if let Effect::Create(resource) = &child {
-                                runtime_synthesized_resources.push(resource.clone());
+                                runtime_synthesized_resources.push(resource.clone().into_inner());
                             }
                             if let Some(binding) = failure_binding_name(&child) {
                                 idx_to_binding.insert(child_idx, binding);
@@ -385,7 +385,6 @@ pub(super) async fn execute_effects_sequential(
                             unreachable!("Create/Update/Delete are narrowed by as_basic()")
                         }
                         Effect::Replace {
-                            id,
                             from,
                             to,
                             directives,
@@ -407,7 +406,7 @@ pub(super) async fn execute_effects_sequential(
                                 provider,
                                 &ReplaceContext {
                                     effect: &effect_for_future,
-                                    id,
+                                    id: &to.id,
                                     from,
                                     to,
                                     directives,
@@ -435,7 +434,7 @@ pub(super) async fn execute_effects_sequential(
                             "DeferredReplace is handled synchronously before provider dispatch"
                         ),
                         Effect::Wait {
-                            binding,
+                            identity,
                             target_id,
                             until,
                             timeout,
@@ -466,7 +465,7 @@ pub(super) async fn execute_effects_sequential(
                             )
                             .await;
                             SingleEffectResult::Wait {
-                                binding: binding.clone(),
+                                binding: identity.to_string(),
                                 outcome,
                                 duration: started.elapsed(),
                                 progress,
@@ -741,7 +740,9 @@ mod tests {
         BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError, ProviderResult,
         ReadRequest, UpdateRequest,
     };
-    use crate::resource::{Composition, ConcreteValue, DataSource, State, Value};
+    use crate::resource::{
+        Composition, ConcreteValue, DataSource, ResolvedResource, ResourceIdentity, State, Value,
+    };
     use crate::schema::SchemaRegistry;
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::collections::BTreeSet;
@@ -755,6 +756,10 @@ mod tests {
         State::existing(id.clone(), HashMap::new()).with_identifier("id")
     }
 
+    fn resolved(resource: Resource) -> ResolvedResource {
+        ResolvedResource::new(resource)
+    }
+
     fn update_effect(binding: &str, reads: &[(&str, &str)], writes: &[&str]) -> Effect {
         let id = ResourceId::with_identity("test", binding);
         let mut to = Resource::new("test", binding);
@@ -766,9 +771,8 @@ mod tests {
             );
         }
         Effect::Update {
-            id: crate::resource::ResolvedResourceId::new(id.clone()),
             from: Box::new(state_for(&id)),
-            to,
+            to: resolved(to),
             changed_attributes: writes.iter().map(|attr| (*attr).to_string()).collect(),
         }
     }
@@ -784,9 +788,8 @@ mod tests {
             );
         }
         Effect::Replace {
-            id: crate::resource::ResolvedResourceId::new(id.clone()),
             from: Box::new(state_for(&id)),
-            to,
+            to: resolved(to),
             directives: Default::default(),
             changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
             cascading_updates: Vec::new(),
@@ -942,7 +945,7 @@ mod tests {
                 | Effect::Update { to: resource, .. }
                 | Effect::Replace { to: resource, .. } => Some((
                     resource.id.clone(),
-                    UnresolvedResource::from_pre_resolve(resource.clone()),
+                    UnresolvedResource::from_pre_resolve(resource.as_inner().clone()),
                 )),
                 Effect::DeferredReplace { .. } => None,
                 _ => None,
@@ -966,9 +969,9 @@ mod tests {
         alb.binding = Some("alb".to_string());
 
         let mut plan = Plan::new();
-        plan.add(Effect::Create(cert.clone()));
+        plan.add(Effect::Create(resolved(cert.clone())));
         plan.add(Effect::Wait {
-            binding: "cert_issued".to_string(),
+            identity: ResourceIdentity::new("cert_issued"),
             target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
@@ -979,7 +982,7 @@ mod tests {
             interval: std::time::Duration::from_millis(1),
             explicit_dependencies: std::collections::HashSet::new(),
         });
-        plan.add(Effect::Create(alb.clone()));
+        plan.add(Effect::Create(resolved(alb.clone())));
 
         let unresolved = HashMap::from([
             (
@@ -1060,9 +1063,9 @@ mod tests {
         );
 
         let mut plan = Plan::new();
-        plan.add(Effect::Create(cert.clone()));
+        plan.add(Effect::Create(resolved(cert.clone())));
         plan.add(Effect::Wait {
-            binding: "cert_issued".to_string(),
+            identity: ResourceIdentity::new("cert_issued"),
             target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
@@ -1073,8 +1076,8 @@ mod tests {
             interval: std::time::Duration::from_millis(1),
             explicit_dependencies: std::collections::HashSet::new(),
         });
-        plan.add(Effect::Create(alb.clone()));
-        plan.add(Effect::Create(listener.clone()));
+        plan.add(Effect::Create(resolved(alb.clone())));
+        plan.add(Effect::Create(resolved(listener.clone())));
 
         let unresolved = HashMap::from([
             (
@@ -1163,7 +1166,9 @@ mod tests {
         assert!(ReadsSet::from_walker(KnownReads::from_attrs(&["id"])).disjoint(&writes));
         assert!(!ReadsSet::from_walker(KnownReads::from_attrs(&["tags"])).disjoint(&writes));
         assert!(!ReadsSet::unknown().disjoint(&writes));
-        assert!(WritesSet::from_update(&Effect::Create(Resource::new("test", "x"))).is_none());
+        assert!(
+            WritesSet::from_update(&Effect::Create(resolved(Resource::new("test", "x")))).is_none()
+        );
     }
 
     #[test]
@@ -1188,7 +1193,7 @@ mod tests {
     fn keep_update_update_edge_for_bare_binding_unknown_read() {
         let parent = update_effect("parent", &[], &["cidr_block"]);
         let mut child = match update_effect("child", &[], &["name"]) {
-            Effect::Update { to, .. } => to,
+            Effect::Update { to, .. } => to.into_inner(),
             _ => unreachable!(),
         };
         child.set_attr(
@@ -1198,9 +1203,8 @@ mod tests {
             }),
         );
         let child = Effect::Update {
-            id: crate::resource::ResolvedResourceId::new(child.id.clone()),
             from: Box::new(state_for(&child.id)),
-            to: child,
+            to: resolved(child),
             changed_attributes: vec!["name".to_string()],
         };
 
@@ -1212,14 +1216,13 @@ mod tests {
     fn keep_update_update_edge_when_known_read_also_has_depends_on_unknown() {
         let parent = update_effect("parent", &[], &["tags"]);
         let mut child = match update_effect("child", &[("parent", "id")], &["name"]) {
-            Effect::Update { to, .. } => to,
+            Effect::Update { to, .. } => to.into_inner(),
             _ => unreachable!(),
         };
         child.directives.depends_on.push("parent".to_string());
         let child = Effect::Update {
-            id: crate::resource::ResolvedResourceId::new(child.id.clone()),
             from: Box::new(state_for(&child.id)),
-            to: child,
+            to: resolved(child),
             changed_attributes: vec!["name".to_string()],
         };
 
@@ -1234,7 +1237,7 @@ mod tests {
     fn dependency_bindings_only_path_escalates_to_unknown() {
         let parent = update_effect("parent", &[], &["tags"]);
         let mut child = match update_effect("child", &[], &["name"]) {
-            Effect::Update { to, .. } => to,
+            Effect::Update { to, .. } => to.into_inner(),
             _ => unreachable!(),
         };
         child.dependency_bindings.insert("parent".to_string());
@@ -1242,9 +1245,8 @@ mod tests {
         let effects = vec![
             parent,
             Effect::Update {
-                id: crate::resource::ResolvedResourceId::new(child_id.clone()),
                 from: Box::new(state_for(&child_id)),
-                to: child.clone(),
+                to: resolved(child.clone()),
                 changed_attributes: vec!["name".to_string()],
             },
         ];
@@ -1252,7 +1254,7 @@ mod tests {
             (
                 effects[0].resource_id().clone(),
                 UnresolvedResource::from_pre_resolve(match &effects[0] {
-                    Effect::Update { to, .. } => to.clone(),
+                    Effect::Update { to, .. } => to.as_inner().clone(),
                     _ => unreachable!(),
                 }),
             ),
@@ -1280,7 +1282,7 @@ mod tests {
         let mut parent = Resource::new("test", "parent");
         parent.binding = Some("parent".to_string());
         let deps = dependency_after_relax(
-            Effect::Create(parent),
+            Effect::Create(resolved(parent)),
             update_effect("child", &[("parent", "id")], &["tags"]),
         );
         assert!(
@@ -1305,7 +1307,7 @@ mod tests {
     fn keep_update_update_edge_for_composition_expansion_unknown_read() {
         let parent = update_effect("parent", &[], &["tags"]);
         let mut child = match update_effect("child", &[], &["name"]) {
-            Effect::Update { to, .. } => to,
+            Effect::Update { to, .. } => to.into_inner(),
             _ => unreachable!(),
         };
         child.set_attr(
@@ -1340,9 +1342,8 @@ mod tests {
         let effects = vec![
             parent,
             Effect::Update {
-                id: crate::resource::ResolvedResourceId::new(child_id.clone()),
                 from: Box::new(state_for(&child_id)),
-                to: child.clone(),
+                to: resolved(child.clone()),
                 changed_attributes: vec!["name".to_string()],
             },
         ];
@@ -1350,7 +1351,7 @@ mod tests {
             (
                 effects[0].resource_id().clone(),
                 UnresolvedResource::from_pre_resolve(match &effects[0] {
-                    Effect::Update { to, .. } => to.clone(),
+                    Effect::Update { to, .. } => to.as_inner().clone(),
                     _ => unreachable!(),
                 }),
             ),
@@ -1391,7 +1392,7 @@ mod tests {
         let child = Resource::new("test", "child");
         let effects = vec![
             update_effect("parent", &[], &["tags"]),
-            Effect::Create(child),
+            Effect::Create(resolved(child)),
         ];
         let mut analysis =
             build_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply);
@@ -1438,8 +1439,8 @@ mod tests {
         );
 
         let effects = vec![
-            Effect::Create(role.clone()),
-            Effect::Create(role_policy.clone()),
+            Effect::Create(resolved(role.clone())),
+            Effect::Create(resolved(role_policy.clone())),
         ];
 
         let mut unresolved: HashMap<ResourceId, UnresolvedResource> = HashMap::new();

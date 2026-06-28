@@ -609,7 +609,8 @@ impl<'a> TreeRenderContext<'a> {
                     .unwrap();
                 }
             }
-            Effect::Update { id, to, .. } => {
+            Effect::Update { to, .. } => {
+                let id = &to.id;
                 let moved_note = self
                     .moved_origins
                     .get(id)
@@ -641,9 +642,8 @@ impl<'a> TreeRenderContext<'a> {
                     .unwrap();
                 }
             }
-            Effect::Replace {
-                id, to, directives, ..
-            } => {
+            Effect::Replace { to, directives, .. } => {
+                let id = &to.id;
                 let replace_note = if directives.create_before_destroy {
                     "(must be replaced, create before destroy)"
                 } else {
@@ -773,10 +773,11 @@ impl<'a> TreeRenderContext<'a> {
                 .unwrap();
             }
             Effect::Wait {
-                binding,
+                identity,
                 until_surface,
                 ..
             } => {
+                let binding = identity.to_string();
                 writeln!(
                     self.out,
                     "{}{} {}",
@@ -2187,13 +2188,14 @@ fn render_modified_fields(fields: &[ListOfMapsDiffField]) -> String {
 pub fn format_effect(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("Create {}", r.id.human()),
-        Effect::Update { id, .. } => format!("Update {}", id.human()),
+        Effect::Update { to, .. } => format!("Update {}", to.id.human()),
         Effect::Replace {
-            id,
+            to,
             directives,
             cascading_updates,
             ..
         } => {
+            let id = &to.id;
             if directives.create_before_destroy {
                 if cascading_updates.is_empty() {
                     format!("Replace {} (create-before-destroy)", id.human())
@@ -2229,10 +2231,11 @@ pub fn format_effect(effect: &Effect) -> String {
             format!("Move {} -> {}", from.human(), to.human())
         }
         Effect::Wait {
-            binding,
+            identity,
             until_surface,
             ..
         } => {
+            let binding = identity.to_string();
             format!("Wait {} (until {})", binding, until_surface)
         }
         Effect::DeferredCreate {

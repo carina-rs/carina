@@ -1335,7 +1335,7 @@ fn wait_binding_lowers_to_wait_effect() {
         .find(|e| e.is_wait())
         .expect("expected Wait effect");
     let Effect::Wait {
-        binding,
+        identity,
         target_id,
         until,
         until_surface,
@@ -1345,7 +1345,7 @@ fn wait_binding_lowers_to_wait_effect() {
     else {
         unreachable!();
     };
-    assert_eq!(binding, "cert_issued");
+    assert_eq!(identity.as_str(), "cert_issued");
     assert_eq!(target_id.identity_str(), "cert");
     assert_eq!(target_id.resource_type, "acm.Certificate");
     assert_eq!(
@@ -1748,9 +1748,9 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
     );
 
     assert!(
-        plan.effects()
-            .iter()
-            .any(|e| matches!(e, Effect::Wait { binding, .. } if binding == "cert_issued")),
+        plan.effects().iter().any(
+            |e| matches!(e, Effect::Wait { identity, .. } if identity.as_str() == "cert_issued")
+        ),
         "carina#3101: the wait must still be emitted when a consumer \
          has a pending change (carina#3085/#3061 not regressed); \
          effects were {:?}",
@@ -1877,9 +1877,9 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
     );
 
     assert!(
-        plan.effects()
-            .iter()
-            .any(|e| matches!(e, Effect::Wait { binding, .. } if binding == "cert_issued")),
+        plan.effects().iter().any(
+            |e| matches!(e, Effect::Wait { identity, .. } if identity.as_str() == "cert_issued")
+        ),
         "carina#3358: the wait must still be emitted when its target is \
          changing in this plan (cached state is stale); effects were {:?}",
         plan.effects()
@@ -1962,15 +1962,15 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
     assert!(
         plan.effects()
             .iter()
-            .any(|e| matches!(e, Effect::Update { id, .. }
-            if id == &ResourceId::with_identity("acm.Certificate", "cert"))),
+            .any(|e| matches!(e, Effect::Update { to, .. }
+            if to.id == ResourceId::with_identity("acm.Certificate", "cert"))),
         "test precondition: cert must have a pending Update; effects were {:?}",
         plan.effects()
     );
     assert!(
-        plan.effects()
-            .iter()
-            .any(|e| matches!(e, Effect::Wait { binding, .. } if binding == "cert_issued")),
+        plan.effects().iter().any(
+            |e| matches!(e, Effect::Wait { identity, .. } if identity.as_str() == "cert_issued")
+        ),
         "carina#3358: the wait must still be emitted when an existing \
          (Known) target has a pending Update, even though its cached \
          state satisfies the predicate; effects were {:?}",

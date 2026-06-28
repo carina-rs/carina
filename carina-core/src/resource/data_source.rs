@@ -9,6 +9,7 @@
 //! against other resources.
 
 use std::collections::{BTreeSet, HashSet};
+use std::ops::Deref;
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -117,5 +118,85 @@ impl DataSource {
     pub fn with_binding(mut self, binding: impl Into<String>) -> Self {
         self.binding = Some(binding.into());
         self
+    }
+}
+
+/// A [`DataSource`] whose identity has been resolved.
+///
+/// The inner field is private so callers cannot bypass the constructor
+/// invariant:
+///
+/// ```compile_fail
+/// use carina_core::resource::{DataSource, ResolvedDataSource};
+///
+/// let resource = DataSource::new("test", "");
+/// let _ = ResolvedDataSource(resource);
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::resource::{DataSource, ResolvedDataSource};
+///
+/// let resource = DataSource::new("test", "");
+/// let _: ResolvedDataSource = resource.into();
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "DataSource", into = "DataSource")]
+pub struct ResolvedDataSource(DataSource);
+
+impl ResolvedDataSource {
+    /// Construct from a [`DataSource`], panicking if identity is `None`.
+    pub fn new(resource: DataSource) -> Self {
+        assert!(
+            resource.id.identity.is_some(),
+            "ResolvedDataSource requires identity"
+        );
+        Self(resource)
+    }
+
+    /// Try to construct; returns `None` if identity is absent.
+    pub fn try_new(resource: DataSource) -> Option<Self> {
+        if resource.id.identity.is_some() {
+            Some(Self(resource))
+        } else {
+            None
+        }
+    }
+
+    /// Borrow the inner [`DataSource`].
+    pub fn as_inner(&self) -> &DataSource {
+        &self.0
+    }
+
+    /// Consume and return the inner [`DataSource`].
+    pub fn into_inner(self) -> DataSource {
+        self.0
+    }
+}
+
+impl Deref for ResolvedDataSource {
+    type Target = DataSource;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<ResolvedDataSource> for DataSource {
+    fn from(resource: ResolvedDataSource) -> Self {
+        resource.0
+    }
+}
+
+impl TryFrom<DataSource> for ResolvedDataSource {
+    type Error = String;
+
+    fn try_from(resource: DataSource) -> Result<Self, Self::Error> {
+        Self::try_new(resource).ok_or_else(|| "identity is required".to_string())
+    }
+}
+
+impl AsRef<DataSource> for ResolvedDataSource {
+    fn as_ref(&self) -> &DataSource {
+        self.as_inner()
     }
 }
