@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::effect::{Effect, ScheduleEdge};
 use crate::non_empty::NonEmptyVec;
 use crate::parser::ResourceRef;
-use crate::resource::{Resource, ResourceId};
+use crate::resource::{Resource, ResourceId, ResourceIdentity};
 
 #[derive(Debug, Clone)]
 pub struct UnresolvedResource(Resource);
@@ -65,15 +65,24 @@ impl DestroyWaitAlias {
     }
 
     fn destroy_edges(&self) -> Vec<ScheduleEdge> {
-        let mut edges = vec![ScheduleEdge::BlockedBy(self.target_binding.clone())];
+        let mut edges = vec![ScheduleEdge::BlockedBy(ResourceIdentity::new(
+            self.target_binding.clone(),
+        ))];
         edges.extend(
             self.explicit_dependencies
                 .iter()
                 .filter(|dependency| dependency.as_str() != self.target_binding)
                 .cloned()
+                .map(ResourceIdentity::new)
                 .map(ScheduleEdge::BlockedBy),
         );
-        edges.extend(self.consumers.iter().cloned().map(ScheduleEdge::DependsOn));
+        edges.extend(
+            self.consumers
+                .iter()
+                .cloned()
+                .map(ResourceIdentity::new)
+                .map(ScheduleEdge::DependsOn),
+        );
         edges
     }
 }
@@ -231,15 +240,13 @@ impl DependencyAnalysis {
 }
 
 struct DependencyAnalyzer {
-    binding_to_idx: HashMap<String, usize>,
-    name_to_delete_idx: HashMap<String, usize>,
+    identity_to_idx: HashMap<ResourceIdentity, usize>,
     compositions_by_binding: HashMap<String, crate::resource::Composition>,
 }
 
 impl DependencyAnalyzer {
     fn new(
-        binding_to_idx: HashMap<String, usize>,
-        name_to_delete_idx: HashMap<String, usize>,
+        identity_to_idx: HashMap<ResourceIdentity, usize>,
         compositions: &[crate::resource::Composition],
     ) -> Self {
         let compositions_by_binding = compositions
@@ -252,17 +259,17 @@ impl DependencyAnalyzer {
             })
             .collect();
         Self {
-            binding_to_idx,
-            name_to_delete_idx,
+            identity_to_idx,
             compositions_by_binding,
         }
     }
 
-    fn lookup_idx(&self, binding: &str) -> Option<usize> {
-        self.binding_to_idx
-            .get(binding)
-            .or_else(|| self.name_to_delete_idx.get(binding))
-            .copied()
+    fn lookup_by_identity(&self, identity: &ResourceIdentity) -> Option<usize> {
+        self.identity_to_idx.get(identity).copied()
+    }
+
+    fn lookup_by_string_ref(&self, binding: &str) -> Option<usize> {
+        self.lookup_by_identity(&ResourceIdentity::new(binding))
     }
 
     fn collect_from_schedule_edges(
@@ -274,16 +281,18 @@ impl DependencyAnalyzer {
     ) {
         for edge in edges {
             match edge {
-                ScheduleEdge::DependsOn(binding) => {
-                    self.record_binding_edge(&binding, ReadsSet::unknown(), analysis, self_idx);
+                ScheduleEdge::DependsOn(identity) => {
+                    if let Some(parent) = self.lookup_by_identity(&identity) {
+                        analysis.add_edge(self_idx, parent, ReadsSet::unknown());
+                    }
                 }
-                ScheduleEdge::BlockedBy(binding) => {
-                    if let Some(blocked_idx) = self.lookup_idx(&binding) {
+                ScheduleEdge::BlockedBy(identity) => {
+                    if let Some(blocked_idx) = self.lookup_by_identity(&identity) {
                         analysis.add_edge(blocked_idx, self_idx, ReadsSet::unknown());
                     }
                 }
-                ScheduleEdge::BlockedByIfDelete(binding) => {
-                    if let Some(blocked_idx) = self.lookup_idx(&binding)
+                ScheduleEdge::BlockedByIfDelete(identity) => {
+                    if let Some(blocked_idx) = self.lookup_by_identity(&identity)
                         && blocked_idx < effects.len()
                         && matches!(effects[blocked_idx], Effect::Delete { .. })
                     {
@@ -349,18 +358,18 @@ impl DependencyAnalyzer {
         self.record_binding_edge_inner(binding, reads, analysis, child, &mut visited);
     }
 
-    fn record_binding_edge_inner<'a>(
-        &'a self,
-        binding: &'a str,
+    fn record_binding_edge_inner(
+        &self,
+        binding: &str,
         reads: ReadsSet,
         analysis: &mut DependencyAnalysis,
         child: usize,
-        visited: &mut HashSet<&'a str>,
+        visited: &mut HashSet<String>,
     ) {
-        if !visited.insert(binding) {
+        if !visited.insert(binding.to_string()) {
             return;
         }
-        if let Some(parent) = self.lookup_idx(binding) {
+        if let Some(parent) = self.lookup_by_string_ref(binding) {
             analysis.add_edge(child, parent, reads);
             return;
         }
@@ -368,15 +377,17 @@ impl DependencyAnalyzer {
             return;
         };
         for inner in crate::deps::get_composition_dependencies(composition) {
-            let key: &'a str =
-                if let Some((k, _)) = self.compositions_by_binding.get_key_value(inner.as_str()) {
-                    k.as_str()
-                } else if let Some((k, _)) = self.binding_to_idx.get_key_value(inner.as_str()) {
-                    k.as_str()
-                } else {
-                    continue;
-                };
-            self.record_binding_edge_inner(key, ReadsSet::unknown(), analysis, child, visited);
+            if self.compositions_by_binding.contains_key(inner.as_str())
+                || self.lookup_by_string_ref(inner.as_str()).is_some()
+            {
+                self.record_binding_edge_inner(
+                    inner.as_str(),
+                    ReadsSet::unknown(),
+                    analysis,
+                    child,
+                    visited,
+                );
+            }
         }
     }
 }
@@ -395,28 +406,23 @@ pub fn build_effect_dependency_analysis(
     compositions: &[crate::resource::Composition],
     inputs: ScheduleInputs<'_>,
 ) -> DependencyAnalysis {
-    let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
-    let mut name_to_delete_idx: HashMap<String, usize> = HashMap::new();
+    let mut identity_to_idx: HashMap<ResourceIdentity, usize> = HashMap::new();
     let aliases = match inputs {
         ScheduleInputs::Apply => &[][..],
         ScheduleInputs::Destroy { aliases } => aliases,
     };
     for (idx, effect) in effects.iter().enumerate() {
-        if let Some(binding) = effect.binding_name() {
-            binding_to_idx.insert(binding, idx);
-        }
-        if let Effect::Delete { id, binding, .. } = effect
-            && binding.is_none()
-        {
-            name_to_delete_idx.insert(id.identity_or_empty().to_string(), idx);
-        }
+        identity_to_idx.insert(effect.identity(), idx);
     }
     let alias_offset = effects.len();
     for (alias_idx, alias) in aliases.iter().enumerate() {
-        binding_to_idx.insert(alias.binding.clone(), alias_offset + alias_idx);
+        identity_to_idx.insert(
+            ResourceIdentity::new(alias.binding.clone()),
+            alias_offset + alias_idx,
+        );
     }
 
-    let analyzer = DependencyAnalyzer::new(binding_to_idx, name_to_delete_idx, compositions);
+    let analyzer = DependencyAnalyzer::new(identity_to_idx, compositions);
     let mut analysis = DependencyAnalysis::new(effects.len() + aliases.len());
 
     for (idx, effect) in effects.iter().enumerate() {
@@ -499,7 +505,7 @@ pub fn relax_update_update_edges(effects: &[Effect], analysis: &mut DependencyAn
 mod tests {
     use super::*;
     use crate::effect::ChangedCreateOnly;
-    use crate::resource::{ResolvedResource, State, Value};
+    use crate::resource::{ResolvedResource, ResolvedResourceId, ResourceIdentity, State, Value};
 
     fn state_for(id: &ResourceId) -> State {
         State::not_found(id.clone())
@@ -519,6 +525,112 @@ mod tests {
             to: ResolvedResource::new(resource),
             changed_attributes: changed.iter().map(|s| (*s).to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn effect_identity_returns_let_binding_for_named_effect() {
+        let mut resource = Resource::new("test", "named");
+        resource.binding = Some("named".to_string());
+        let effect = Effect::Create(ResolvedResource::new(resource));
+
+        assert_eq!(effect.identity(), ResourceIdentity::new("named"));
+    }
+
+    #[test]
+    fn effect_identity_returns_system_hash_for_anonymous_effect() {
+        let anonymous = Effect::Delete {
+            id: ResolvedResourceId::new(ResourceId::with_identity("test", "anon_1234")),
+            identifier: "anonymous-id".to_string(),
+            directives: Default::default(),
+            binding: None,
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+        };
+        let mut named_resource = Resource::new("test", "named");
+        named_resource.binding = Some("named".to_string());
+        let named = Effect::Create(ResolvedResource::new(named_resource));
+
+        assert_eq!(anonymous.identity(), ResourceIdentity::new("anon_1234"));
+        assert_ne!(anonymous.identity(), named.identity());
+    }
+
+    #[test]
+    fn scheduler_index_keys_on_identity_not_string() {
+        let first = ResourceIdentity::new("first");
+        let second = ResourceIdentity::new("second");
+        let analyzer = DependencyAnalyzer::new(
+            HashMap::from([(first.clone(), 0), (second.clone(), 1)]),
+            &[],
+        );
+
+        assert_eq!(analyzer.lookup_by_identity(&first), Some(0));
+        assert_eq!(analyzer.lookup_by_identity(&second), Some(1));
+        assert_eq!(analyzer.lookup_by_string_ref("first"), Some(0));
+        assert_eq!(analyzer.lookup_by_string_ref("second"), Some(1));
+    }
+
+    #[test]
+    fn blocked_by_if_delete_resolves_anonymous_delete_through_identity_index() {
+        let delete = Effect::Delete {
+            id: ResolvedResourceId::new(ResourceId::with_identity("test", "foo")),
+            identifier: "foo-id".to_string(),
+            directives: Default::default(),
+            binding: None,
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+        };
+        let mut blocker_resource = Resource::new("test", "blocker");
+        blocker_resource.binding = Some("blocker".to_string());
+        let blocker = Effect::Create(ResolvedResource::new(blocker_resource));
+        let effects = vec![delete, blocker];
+        let analyzer =
+            DependencyAnalyzer::new(HashMap::from([(ResourceIdentity::new("foo"), 0)]), &[]);
+        let mut analysis = DependencyAnalysis::new(effects.len());
+
+        analyzer.collect_from_schedule_edges(
+            &effects,
+            vec![ScheduleEdge::BlockedByIfDelete(ResourceIdentity::new(
+                "foo",
+            ))],
+            &mut analysis,
+            1,
+        );
+
+        assert!(
+            analysis.into_deps_of()[&0].contains(&1),
+            "anonymous delete must wait for the effect that blocks its identity"
+        );
+    }
+
+    #[test]
+    fn string_ref_resolves_to_anonymous_delete_via_identity_match() {
+        let delete = Effect::Delete {
+            id: ResolvedResourceId::new(ResourceId::with_identity("test", "foo")),
+            identifier: "foo-id".to_string(),
+            directives: Default::default(),
+            binding: None,
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+        };
+        let mut consumer_resource = Resource::new("test", "consumer");
+        consumer_resource.binding = Some("consumer".to_string());
+        consumer_resource
+            .dependency_bindings
+            .insert("foo".to_string());
+        let consumer = Effect::Create(ResolvedResource::new(consumer_resource));
+
+        let deps = build_effect_dependency_analysis(
+            &[delete, consumer],
+            &HashMap::new(),
+            &[],
+            ScheduleInputs::Apply,
+        )
+        .into_deps_of();
+
+        assert!(
+            deps[&1].contains(&0),
+            "plain string refs resolve by exact ResourceIdentity match"
+        );
     }
 
     #[test]

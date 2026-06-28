@@ -1928,18 +1928,18 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
 /// should reference the new (post-replacement) resource ID, not the old one.
 #[tokio::test]
 async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
-    let vpc_id = ResourceId::with_identity("ec2.Vpc", "my-vpc");
-    let subnet_id = ResourceId::with_identity("ec2.Subnet", "my-subnet");
+    let vpc_id = ResourceId::with_identity("ec2.Vpc", "vpc");
+    let subnet_id = ResourceId::with_identity("ec2.Subnet", "subnet");
 
     // --- Unresolved resources (before ref resolution) ---
-    let vpc_unresolved = Resource::new("ec2.Vpc", "my-vpc")
+    let vpc_unresolved = Resource::new("ec2.Vpc", "vpc")
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
 
-    let subnet_unresolved = Resource::new("ec2.Subnet", "my-subnet")
+    let subnet_unresolved = Resource::new("ec2.Subnet", "subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",
@@ -1952,7 +1952,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
 
     // --- Resolved resources (after ref resolution with old state) ---
     // The subnet's vpc_id has been eagerly resolved to "vpc-OLD"
-    let subnet_resolved = Resource::new("ec2.Subnet", "my-subnet")
+    let subnet_resolved = Resource::new("ec2.Subnet", "subnet")
         .with_binding("subnet")
         .with_attribute(
             "vpc_id",

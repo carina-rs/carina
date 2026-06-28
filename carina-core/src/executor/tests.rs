@@ -4072,9 +4072,7 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
     // For deletion: vpc delete must wait for subnet delete → subnet first, then vpc
     let mut plan = Plan::new();
     plan.add(Effect::Delete {
-        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "ec2.Vpc", "my-vpc",
-        )),
+        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("ec2.Vpc", "vpc")),
         identifier: "vpc-123".to_string(),
         directives: Directives::default(),
         binding: Some("vpc".to_string()),
@@ -4084,7 +4082,7 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
     plan.add(Effect::Delete {
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "ec2.Subnet",
-            "my-subnet",
+            "subnet",
         )),
         identifier: "subnet-456".to_string(),
         directives: Directives::default(),
@@ -4211,9 +4209,7 @@ async fn test_update_effect_binding_map_propagation() {
 fn test_dependency_analysis_respects_delete_dependencies() {
     let mut plan = Plan::new();
     plan.add(Effect::Delete {
-        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "ec2.Vpc", "my-vpc",
-        )),
+        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("ec2.Vpc", "vpc")),
         identifier: "vpc-123".to_string(),
         directives: Directives::default(),
         binding: Some("vpc".to_string()),
@@ -4223,7 +4219,7 @@ fn test_dependency_analysis_respects_delete_dependencies() {
     plan.add(Effect::Delete {
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "ec2.Subnet",
-            "my-subnet",
+            "subnet",
         )),
         identifier: "subnet-456".to_string(),
         directives: Directives::default(),
@@ -4258,7 +4254,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     let provider = RecordingMockProvider::new();
 
     // VPC resource with binding "vpc"
-    let mut vpc = Resource::new("test", "my-vpc");
+    let mut vpc = Resource::new("test", "vpc");
     vpc.binding = Some("vpc".to_string());
     vpc.set_attr(
         "cidr_block",
@@ -4267,7 +4263,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     let vpc_id = vpc.id.clone();
 
     // Subnet resource that references vpc.vpc_id
-    let mut subnet = Resource::new("test", "my-subnet");
+    let mut subnet = Resource::new("test", "subnet");
     subnet.set_attr(
         "vpc_id",
         Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
@@ -5860,7 +5856,7 @@ async fn deferred_create_emits_zero_children_when_collection_is_empty() {
     use crate::effect::ChangedCreateOnly;
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
-    let mut cert = Resource::new("test", "cert_empty");
+    let mut cert = Resource::new("test", "cert");
     cert.binding = Some("cert".to_string());
     cert.set_attr(
         "domain_name",
@@ -5947,7 +5943,7 @@ async fn deferred_create_emits_zero_children_when_collection_is_empty() {
     );
     let events = observer.events();
     assert!(
-        events.contains(&"succeeded:test.cert_empty".to_string()),
+        events.contains(&"succeeded:test.cert".to_string()),
         "events: {events:?}"
     );
 }
@@ -6822,13 +6818,13 @@ async fn phased_anonymous_replace_failure_propagates_to_dependent_wait() {
     // kept failed_bindings: HashSet<String>, so a failed anonymous Replace
     // (binding_name() == None) is not recorded and a dependent Wait can run
     // until timeout instead of being skipped as dependency-failed.
-    let a_id = ResourceId::with_identity("test", "a_anonymous_wait_gate");
-    let mut a = Resource::new("test", "a_anonymous_wait_gate");
+    let a_id = ResourceId::with_identity("test", "a");
+    let mut a = Resource::new("test", "a");
     a.binding = Some("a".to_string());
     let old_a_state = State::existing(a_id.clone(), HashMap::new()).with_identifier("a-old");
 
-    let b_id = ResourceId::with_identity("test", "b_anonymous_wait_gate");
-    let mut b = Resource::new("test", "b_anonymous_wait_gate");
+    let b_id = ResourceId::with_identity("test", "b");
+    let mut b = Resource::new("test", "b");
     b.binding = Some("b".to_string());
     b.dependency_bindings.insert("a".to_string());
     let old_b_state = State::existing(b_id.clone(), HashMap::new()).with_identifier("b-old");

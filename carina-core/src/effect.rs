@@ -36,13 +36,13 @@ pub enum PlanOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduleEdge {
-    /// This effect must wait for the named binding to complete.
-    DependsOn(String),
-    /// This effect must complete before the named binding can proceed.
-    BlockedBy(String),
-    /// This effect must complete before the named binding can proceed, but
-    /// only when that binding resolves to a delete effect.
-    BlockedByIfDelete(String),
+    /// This effect must wait for the resource identity to complete.
+    DependsOn(ResourceIdentity),
+    /// This effect must complete before the resource identity can proceed.
+    BlockedBy(ResourceIdentity),
+    /// This effect must complete before the resource identity can proceed, but
+    /// only when that identity resolves to a delete effect.
+    BlockedByIfDelete(ResourceIdentity),
 }
 
 /// Temporary name used during create-before-destroy replacement.
@@ -832,6 +832,25 @@ impl Effect {
         }
     }
 
+    /// Returns the scheduler identity for this effect.
+    ///
+    /// `Effect::identity()` is total because all scheduler-bound payloads went
+    /// through the `Resolved*` checked constructors after the resolver boundary.
+    /// `Wait` is keyed by the wait effect's own identity, not by its target.
+    pub fn identity(&self) -> ResourceIdentity {
+        if let Effect::Wait { identity, .. } = self {
+            return identity.clone();
+        }
+        self.resource_id()
+            .identity
+            .as_ref()
+            .expect(
+                "Effect::identity is total because all scheduler-bound Effect payloads \
+                 went through the Resolved* checked constructors",
+            )
+            .clone()
+    }
+
     /// Returns a read-only [`ResourceRef`](crate::parser::ResourceRef)
     /// view of the resource for this effect, if it has one. Delete,
     /// Import, Remove, Move, and Wait effects have no resource.
@@ -1050,12 +1069,14 @@ impl Effect {
             Effect::Delete { dependencies, .. } => dependencies
                 .iter()
                 .cloned()
+                .map(ResourceIdentity::new)
                 .map(ScheduleEdge::BlockedBy)
                 .collect(),
             Effect::Replace { from, .. } => from
                 .dependency_bindings
                 .iter()
                 .cloned()
+                .map(ResourceIdentity::new)
                 .map(ScheduleEdge::BlockedByIfDelete)
                 .collect(),
             Effect::Wait { .. }
@@ -1063,6 +1084,7 @@ impl Effect {
             | Effect::DeferredReplace { .. } => self
                 .blocking_bindings()
                 .into_iter()
+                .map(ResourceIdentity::new)
                 .map(ScheduleEdge::DependsOn)
                 .collect(),
             Effect::Read { .. }
@@ -1086,12 +1108,14 @@ impl Effect {
             Effect::Delete { dependencies, .. } => dependencies
                 .iter()
                 .cloned()
+                .map(ResourceIdentity::new)
                 .map(ScheduleEdge::BlockedBy)
                 .collect(),
             Effect::Replace { from, .. } => from
                 .dependency_bindings
                 .iter()
                 .cloned()
+                .map(ResourceIdentity::new)
                 .map(ScheduleEdge::BlockedBy)
                 .collect(),
             Effect::Read { .. }

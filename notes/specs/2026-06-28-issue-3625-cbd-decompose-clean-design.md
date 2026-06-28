@@ -64,37 +64,24 @@ Remove `Effect::Replace`. The supporting types the prior PR introduced for the n
 
 Keep / add the following:
 
-- `Effect::Delete.blocked_by_updates: HashSet<BindingKey>`, `#[serde(default, skip_serializing_if = "HashSet::is_empty")]`.
+- `Effect::Delete.blocked_by_updates: HashSet<ResourceIdentity>`, `#[serde(default, skip_serializing_if = "HashSet::is_empty")]`.
 - `ScheduleEdge::BlockedByIfDelete` stays as the edge `Effect::Delete.dependencies` emits during apply (the PR #3624 destroy-time semantics). Delete-side dependencies create an edge only when the target binding resolves to another Delete — Create/Update targets do not get an edge.
 - Box the large variants from the start: `Effect::DeferredReplace(Box<DeferredReplacePayload>)`, and the `state` fields on `BasicEffectResult::Success` / `BasicEffectResult::PartialSuccess`.
 
-### `BindingKey` — newtype that includes anonymous resources
+### Identity-keyed scheduling (no BindingKey enum)
 
-An anonymous resource (without a `let` binding) returns `None` from `binding_name()`. String-keyed binding lookups fall over for these. The prior PR patched this by registering a synthetic `<resource_type>:<name>` string into `binding_to_idx` and gating the registration to Apply-only, which created the asymmetry Round 9 flagged.
+The original Phase 1 section called for a `BindingKey::{Binding(String), Anonymous { resource_type, name }}` enum and `Effect::binding_key()`. That design predated #3632 and the merged identity foundation.
 
-Model it in the type from the start:
+Per the identity-axis spec merged in #3633, identity is one axis: `ResourceIdentity`. It is not a two-variant key that distinguishes let-bound from anonymous resources. The scheduler indexes effects directly with `HashMap<ResourceIdentity, usize>`; no `BindingKey` enum is needed. The closed PR #3630 exposed why the old anonymous shape was wrong: it reached for resource type plus user-facing `name` rather than a system-assigned identity. The #3633 and #3647 merges closed that gap by making every scheduler-bound `Effect` payload carry resolved identity through the `Resolved*` types.
 
-```rust
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub enum BindingKey {
-    Binding(String),                       // let foo = ...
-    Anonymous { resource_type: String, name: String },
-}
+`Effect::identity() -> ResourceIdentity` is the projection from an effect to its scheduler key. `ScheduleEdge` variants carry `ResourceIdentity`, so edge consumers perform strict keyed lookup instead of reinterpreting strings.
 
-impl Effect {
-    pub fn binding_key(&self) -> BindingKey {
-        match self.binding_name() {
-            Some(b) => BindingKey::Binding(b),
-            None => BindingKey::Anonymous {
-                resource_type: self.resource_id().resource_type.clone(),
-                name: self.resource_id().name_str().into(),
-            },
-        }
-    }
-}
-```
+The lookup API splits along the type the caller already holds:
 
-The scheduler's binding index becomes `HashMap<BindingKey, usize>`. `Effect::Delete.blocked_by_updates: HashSet<BindingKey>` uses the same type. Registration is performed in a single function shared by Apply and Destroy — no input-mode branching is needed for the lookup itself.
+- `lookup_by_identity(&ResourceIdentity)` is used for strict keyed lookup, including every `ScheduleEdge` consumer.
+- `lookup_by_string_ref(&str)` is used by plain-string ref paths: `Resource::dependency_bindings`, `directives.depends_on`, value-position binding refs, and composition expansion. It wraps the string in `ResourceIdentity::new` and delegates to `lookup_by_identity`; no anonymous fallback scan is needed.
+
+Phase 2 uses the same key directly: `Effect::Delete.blocked_by_updates: HashSet<ResourceIdentity>`.
 
 ### `ReplacementGroup` — atomic addition of Create + Delete + display metadata
 
@@ -109,7 +96,7 @@ pub(crate) struct ReplacementGroup {
     pub changed_create_only: ChangedCreateOnly,
     pub cascade_ref_hints: Vec<(String, String)>,
     pub temporary_name: Option<TemporaryName>,  // Some only on CBD
-    pub consumer_updates: Vec<BindingKey>,      // populates blocked_by_updates
+    pub consumer_updates: Vec<ResourceIdentity>, // populates blocked_by_updates
 }
 ```
 
@@ -223,7 +210,7 @@ loop {
 }
 ```
 
-Lookups in `pending_replaces` use `BindingKey`, so anonymous middle nodes are included.
+Lookups in `pending_replaces` use `ResourceIdentity`, so anonymous middle nodes are included.
 
 ### `Plan.replace_display` rendering
 
@@ -301,14 +288,14 @@ Acceptance: the e2e test is Red as intended; mock-provider unit tests are green;
 
 PR: standalone (only the mock-provider extension and the Red e2e).
 
-### Phase 1 — `BindingKey` type foundation
+### Phase 1 — `ResourceIdentity` scheduler foundation
 
 Goal: lay the typed scheduler foundation. Replace string-keyed binding lookups so anonymous resources are first-class.
 
 Tasks:
 
-- T1.1: Introduce the `BindingKey` enum and `Effect::binding_key()`.
-- T1.2: Switch the scheduler's binding index to `HashMap<BindingKey, usize>` inside `build_effect_dependency_analysis`.
+- T1.1: Introduce `Effect::identity() -> ResourceIdentity`.
+- T1.2: Switch the scheduler's binding index to `HashMap<ResourceIdentity, usize>` inside `build_effect_dependency_analysis`.
 - T1.3: Update existing test fixtures.
 
 Acceptance: full verify green; new unit tests cover both binding-name and anonymous lookups.
@@ -321,7 +308,7 @@ Goal: introduce the apply-side edge that orders Delete after consumer Updates. R
 
 Tasks:
 
-- T2.1: Add `blocked_by_updates: HashSet<BindingKey>` to `Effect::Delete`.
+- T2.1: Add `blocked_by_updates: HashSet<ResourceIdentity>` to `Effect::Delete`.
 - T2.2: `apply_edges()` returns both the `BlockedByIfDelete` edges from `dependencies` and the `DependsOn` edges from `blocked_by_updates`.
 - T2.3: `destroy_edges()` returns only the `BlockedBy` edges from `dependencies`.
 - T2.4: Update every `Effect::Delete` construction site, including tests.
@@ -436,7 +423,7 @@ Goal: park scope-adjacent work as separate issues so the main PR chain stays foc
 Tasks:
 
 - T9.1: Re-file or reopen the `Effect::DeferredReplace` consumer-ordering verification issue (the existing #3627 can be amended).
-- T9.2: `Delete.blocked_by_updates: HashSet<BindingKey>` already adopts the typed key — close any prior follow-up issue requesting that reshape.
+- T9.2: `Delete.blocked_by_updates: HashSet<ResourceIdentity>` already adopts the typed key — close any prior follow-up issue requesting that reshape.
 - T9.3: File the repo-wide `DBD → DBC` cleanup PR for older code/docs left out of this work.
 
 ## Test strategy
@@ -461,7 +448,7 @@ Each phase's acceptance criteria include the test additions for that phase. Cumu
 ## Risks and open questions
 
 - The `OverrideAwareResources` deref surface — many downstream paths want to read the underlying `Vec<Resource>`. Decide between exposing `Deref<Target=[Resource]>` as `pub(crate)` and adding focused query methods. Resolve at implementation time.
-- The `BindingKey` serde format — `Delete.blocked_by_updates: HashSet<BindingKey>` appears in saved plans, so the serde shape (tagged vs untagged) matters. The two variants have different shapes (`Binding(String)` vs `Anonymous { resource_type, name }`), so a tagged representation is the safer default.
+- The `ResourceIdentity` serde format — `Delete.blocked_by_updates: HashSet<ResourceIdentity>` appears in saved plans, so the string identity shape must remain stable across saved-plan round trips.
 - The migration-warning emission point — emit at state-load, once. Reuse `log_state_migration_once` (or equivalent) if it already exists.
 - Scope of the `--accept-legacy-name-overrides` flag — apply only, or every state-touching subcommand. `apply` alone is sufficient because `plan` never mutates state.
 

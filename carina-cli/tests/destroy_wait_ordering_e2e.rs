@@ -75,7 +75,7 @@ let lst = mock.test.resource {{
 
     fn seed_carina_state_with_cert_name(&self, cert_name: &str) {
         let mut state = StateFile::new();
-        let mut cert = ResourceState::new("test.resource", cert_name, "mock")
+        let mut cert = ResourceState::new("test.resource", "cert", "mock")
             .with_identifier("mock-id")
             .with_attribute("name", serde_json::json!(cert_name))
             .with_attribute("id", serde_json::json!("cert-id"))
@@ -105,7 +105,7 @@ let lst = mock.test.resource {{
 
     fn seed_mock_provider_state_with_cert_name(&self, cert_name: &str) {
         let provider_state = serde_json::json!({
-            format!("test.resource.{cert_name}"): {
+            "test.resource.cert": {
                 "name": cert_name,
                 "id": "cert-id",
                 "status": "ISSUED"
@@ -168,8 +168,8 @@ fn destroy_wait_ordering_uses_wait_target_binding_not_resource_name() {
         .expect("delete log should contain lst");
     let cert_pos = delete_log
         .iter()
-        .position(|entry| entry == "test.resource.primary-cert")
-        .expect("delete log should contain primary-cert");
+        .position(|entry| entry == "test.resource.cert")
+        .expect("delete log should contain cert identity");
 
     assert!(
         lst_pos < cert_pos,
