@@ -10,7 +10,7 @@ use carina_core::executor::ExecutionResult;
 use carina_core::plan::Plan;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::schema::SchemaRegistry;
-use carina_state::{LockInfo, ResourceState, StateBackend, StateFile};
+use carina_state::{LockInfo, NameOverride, ResourceState, StateBackend, StateFile};
 use colored::Colorize;
 
 use crate::error::AppError;
@@ -739,7 +739,21 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
         let mut resource_state =
             ResourceState::from_provider_state(resource, applied_state, existing)?;
         if is_applied && let Some(overrides) = permanent_name_overrides.get(id) {
-            resource_state.name_overrides = overrides.clone();
+            resource_state.name_overrides = overrides
+                .iter()
+                .map(|(attribute, temp_value)| {
+                    let original_value = existing
+                        .and_then(|rs| rs.name_overrides.get(attribute))
+                        .and_then(|override_| override_.original_value.clone());
+                    (
+                        attribute.clone(),
+                        NameOverride {
+                            temp_value: temp_value.clone(),
+                            original_value,
+                        },
+                    )
+                })
+                .collect();
         }
         if !write_only_keys.is_empty() {
             resource_state.merge_write_only_attributes(resource, &write_only_keys);

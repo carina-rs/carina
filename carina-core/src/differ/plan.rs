@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::effect::{ChangedCreateOnly, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
 use crate::parser::WaitBinding;
-use crate::plan::{Plan, PlanError, ReplacementDelete, ReplacementGroup};
+use crate::plan::{PermanentNameOverride, Plan, PlanError, ReplacementDelete, ReplacementGroup};
 use crate::provider::Provider;
 use crate::resource::{
     ConcreteValue, DataSource, Directives, PlanInputState, ResolvedDataSource, ResolvedResource,
@@ -811,6 +811,17 @@ fn decompose_replace_into_effects(
     pending_replaces.sort_by_key(|pending| pending.create.id.to_string());
 
     for pending in pending_replaces {
+        let permanent_name_override =
+            pending
+                .temporary_name
+                .as_ref()
+                .map(|temporary_name| PermanentNameOverride {
+                    resource_id: ResolvedResourceId::new(pending.create.id.clone()),
+                    attribute: temporary_name.attribute.clone(),
+                    temp_value: temporary_name.temporary_value.clone(),
+                    original_value: Some(temporary_name.original_value.clone()),
+                });
+
         plan.add_replacement(ReplacementGroup {
             create: pending.create,
             delete: pending.delete,
@@ -818,6 +829,7 @@ fn decompose_replace_into_effects(
             changed_create_only: pending.changed_create_only,
             cascade_ref_hints: pending.cascade_ref_hints,
             temporary_name: pending.temporary_name,
+            permanent_name_override,
             consumer_updates: pending.consumer_updates,
             previous_attributes: pending.previous_attributes,
         });

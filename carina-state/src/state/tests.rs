@@ -149,6 +149,84 @@ fn test_resource_state_prefixes_serialization() {
 }
 
 #[test]
+fn name_override_deserializes_legacy_bare_string_to_original_none() {
+    let deserialized: NameOverride = serde_json::from_str(r#""foo""#).unwrap();
+
+    assert_eq!(
+        deserialized,
+        NameOverride {
+            temp_value: "foo".to_string(),
+            original_value: None,
+        }
+    );
+}
+
+#[test]
+fn name_override_deserializes_struct_form() {
+    let original = NameOverride {
+        temp_value: "foo-cbd".to_string(),
+        original_value: Some("foo".to_string()),
+    };
+
+    let json = serde_json::to_string(&original).unwrap();
+    let deserialized: NameOverride = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(deserialized, original);
+}
+
+#[test]
+fn should_apply_override_returns_apply_when_dsl_matches_recorded() {
+    let override_ = NameOverride {
+        temp_value: "foo-cbd".to_string(),
+        original_value: Some("foo".to_string()),
+    };
+
+    assert_eq!(
+        should_apply_override(Some("foo"), &override_),
+        ApplyDecision::Apply
+    );
+}
+
+#[test]
+fn should_apply_override_returns_skip_when_dsl_diverges() {
+    let override_ = NameOverride {
+        temp_value: "foo-cbd".to_string(),
+        original_value: Some("foo".to_string()),
+    };
+
+    assert_eq!(
+        should_apply_override(Some("bar"), &override_),
+        ApplyDecision::Skip
+    );
+}
+
+#[test]
+fn should_apply_override_returns_apply_with_unknown_dsl_when_dsl_unresolved() {
+    let override_ = NameOverride {
+        temp_value: "foo-cbd".to_string(),
+        original_value: Some("foo".to_string()),
+    };
+
+    assert_eq!(
+        should_apply_override(None, &override_),
+        ApplyDecision::ApplyWithUnknownDsl
+    );
+}
+
+#[test]
+fn should_apply_override_returns_apply_legacy_for_pre_phase_5_state() {
+    let override_ = NameOverride {
+        temp_value: "foo-cbd".to_string(),
+        original_value: None,
+    };
+
+    assert_eq!(
+        should_apply_override(Some("renamed"), &override_),
+        ApplyDecision::ApplyLegacy
+    );
+}
+
+#[test]
 fn test_get_identifier_for_resource_from_state() {
     use carina_core::resource::Resource;
 
@@ -252,6 +330,32 @@ fn test_resource_state_deserialization_without_v3_fields() {
     assert_eq!(deserialized.binding, None);
     assert!(deserialized.dependency_bindings.is_empty());
     assert!(deserialized.write_only_attributes.is_empty());
+}
+
+#[test]
+fn resource_state_name_overrides_migrates_from_v7_bare_string() {
+    let json = r#"{
+        "resource_type": "s3.Bucket",
+        "identity": "my-bucket",
+        "provider": "aws",
+        "attributes": {"bucket": "old-name"},
+        "protected": false,
+        "directives": {},
+        "prefixes": {},
+        "name_overrides": {"bucket": "old-name-cbd"},
+        "binding": "my_bucket",
+        "dependency_bindings": []
+    }"#;
+
+    let deserialized: ResourceState = serde_json::from_str(json).unwrap();
+
+    assert_eq!(
+        deserialized.name_overrides.get("bucket"),
+        Some(&NameOverride {
+            temp_value: "old-name-cbd".to_string(),
+            original_value: None,
+        })
+    );
 }
 
 #[test]
