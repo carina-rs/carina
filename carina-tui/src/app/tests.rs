@@ -219,51 +219,6 @@ fn format_value_display() {
 }
 
 #[test]
-fn replace_effect_symbols() {
-    let mut plan = Plan::new();
-    let from = Box::new(State::existing(
-        ResourceId::with_identity("ec2.Vpc", "my-vpc"),
-        [(
-            "cidr".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-        )]
-        .into_iter()
-        .collect(),
-    ));
-
-    // create_before_destroy = true -> "+/-"
-    plan.add(Effect::Replace {
-        from: from.clone(),
-        to: resolved(Resource::new("ec2.Vpc", "my-vpc")),
-        directives: Directives {
-            create_before_destroy: true,
-            ..Default::default()
-        },
-        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec!["cidr".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    // create_before_destroy = false -> "-/+"
-    plan.add(Effect::Replace {
-        from,
-        to: resolved(Resource::new("ec2.Vpc", "my-vpc2")),
-        directives: Directives::default(),
-        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec!["cidr".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    let app = App::new(&plan, &SchemaRegistry::new());
-    assert_eq!(app.nodes[0].symbol, "+/-");
-    assert_eq!(app.nodes[1].symbol, "-/+");
-}
-
-#[test]
 fn tree_structure_with_dependencies() {
     // Create a plan where subnet depends on vpc via ResourceRef
     let mut plan = Plan::new();
@@ -778,41 +733,6 @@ fn move_suppressed_when_update_exists_for_same_target() {
     // Move should be suppressed; only the Update node should remain
     assert_eq!(app.nodes.len(), 1);
     assert_eq!(app.nodes[0].kind, EffectKind::Update);
-}
-
-#[test]
-fn move_suppressed_when_replace_exists_for_same_target() {
-    let mut plan = Plan::new();
-    plan.add(Effect::Move {
-        from: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "ec2.Vpc", "old-vpc",
-        )),
-        to: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
-            "ec2.Vpc", "new-vpc",
-        )),
-    });
-    plan.add(Effect::Replace {
-        from: Box::new(State::existing(
-            ResourceId::with_identity("ec2.Vpc", "new-vpc"),
-            [(
-                "cidr".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-            )]
-            .into_iter()
-            .collect(),
-        )),
-        to: resolved(Resource::new("ec2.Vpc", "new-vpc")),
-        directives: Directives::default(),
-        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec!["cidr".to_string()])
-            .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    });
-
-    let app = App::new(&plan, &SchemaRegistry::new());
-    assert_eq!(app.nodes.len(), 1);
-    assert_eq!(app.nodes[0].symbol, "-/+");
 }
 
 #[test]

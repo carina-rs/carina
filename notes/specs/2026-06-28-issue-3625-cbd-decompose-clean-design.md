@@ -8,13 +8,13 @@ Prior design doc: `notes/specs/2026-06-27-issue-3625-cbd-decompose-plan.md` (on 
 
 Fix `carina apply` so that a create-before-destroy (CBD) replacement schedules the consumer's update between the new resource's create and the old resource's delete. Today the consumer update is invisible to the scheduler, the old delete races ahead of it, and the provider rejects the delete with "used by another resource".
 
-The approach is the same A-2 chosen for the prior PR: drop `Effect::Replace` and decompose every replacement into independent `Effect::Create` / `Effect::Update` / `Effect::Delete` effects in the plan.
+The approach is the same A-2 chosen for the prior PR: drop the legacy replace effect and decompose every replacement into independent `Effect::Create` / `Effect::Update` / `Effect::Delete` effects in the plan.
 
 ## Why a clean rewrite
 
 The prior PR landed the decomposition incrementally:
 
-- Rounds 1–6 produced the `Effect::Replace` removal and dropped the rename Update.
+- Rounds 1–6 produced the the legacy replace effect removal and dropped the rename Update.
 - Rounds 7–8 added the `NameOverride` mechanism needed to operate with a temporary name on the cloud side.
 - Round 9 surfaced multiple type-safety problems in that mechanism.
 
@@ -29,7 +29,7 @@ Instead of patching these one more time, rewrite the design so they are resolved
 
 ## Root cause (recap)
 
-Today `Effect::Replace` executes `create → cascading update → delete → optional rename` sequentially inside the executor. To the scheduler, Replace is one effect and `cascading_updates` is not a graph node.
+Today the legacy replace effect executes `create → cascading update → delete → optional rename` sequentially inside the executor. To the scheduler, Replace is one effect and `cascading_updates` is not a graph node.
 
 When a consumer already has its own `Effect::Update` in the plan, `cascade_dependent_updates` skips it. The consumer update then has no ordering constraint relative to the old delete, and the two run in parallel.
 
@@ -60,7 +60,7 @@ DBC does not need a temporary name (the old resource is gone before the new one 
 
 ### `Effect` structural changes
 
-Remove `Effect::Replace`. The supporting types the prior PR introduced for the now-discarded rename Update — `CascadingUpdate`, `Effect::Update.from: UpdateBase`, `ScheduleEdge::BlockedByIfDelete` (for `Effect::Replace.apply_edges`) — are simply not introduced. `Effect::Update.from` stays `Box<State>`.
+Remove the legacy replace effect. The supporting types the prior PR introduced for the now-discarded rename Update — `LegacyCascadePayload`, `Effect::Update.from: UpdateBase`, `ScheduleEdge::BlockedByIfDelete` (for old replace apply edges) — are simply not introduced. `Effect::Update.from` stays `Box<State>`.
 
 Keep / add the following:
 
@@ -331,9 +331,9 @@ Acceptance: full verify green; `Plan::add_replacement` unit tests verify atomic 
 
 PR: stacks on Phase 2.
 
-### Phase 4 — Decommission `Effect::Replace` in the differ
+### Phase 4 — Decommission the legacy replace effect in the differ
 
-Goal: production code never constructs `Effect::Replace`.
+Goal: production code never constructs the legacy replace effect.
 
 Tasks:
 
@@ -343,7 +343,7 @@ Tasks:
 - T4.4: Make `generate_temporary_name` return `Result<TemporaryName, MissingNameAttributeError>`; surface `MissingNameAttributeError` as `PlanError`.
 - T4.5: Rewrite cascade tests against the new shape (independent Update added or reused; `Delete.blocked_by_updates` carries the consumer binding; create-only consumer promotes to Replace; unique_name_attribute-missing CBD produces a plan error).
 
-Acceptance: `grep Effect::Replace` returns zero hits; Phase 0's Red e2e turns Green.
+Acceptance: `grep the legacy replace effect` returns zero hits; Phase 0's Red e2e turns Green.
 
 PR: stacks on Phase 3.
 
@@ -391,13 +391,13 @@ Goal: delete `executor/replace.rs` and `executor/phased.rs`; bump the saved-plan
 
 Tasks:
 
-- T7.1: Delete `executor/replace.rs` (`execute_replace_parallel`, `execute_cbd_replace_parallel`, `execute_dbc_replace_parallel`, `ReplaceContext`, `SingleEffectResult::Replace`).
+- T7.1: Delete `executor/replace.rs` (legacy replace executor helper, legacy create-before-delete replace helper, legacy delete-before-create replace helper, legacy replace executor context, legacy replace result).
 - T7.2: Delete the Replace-specific phase in `executor/phased.rs` (the basic scheduler handles every shape).
 - T7.3: Bump `PlanFile.version` to v8; introduce `PlanFile::CURRENT_VERSION`.
 - T7.4: Rewrite `redact_secrets_in_plan` to clone-in-place (new fields are not dropped).
 - T7.5: In `run_apply_from_plan_with_observer_factory`, read the version from raw JSON and reject anything other than v8 with an explicit error.
 
-Acceptance: full verify green; `grep Effect::Replace` returns zero hits; saved-plan round-trip tests preserve `replace_display` and `permanent_name_overrides`.
+Acceptance: full verify green; `grep the legacy replace effect` returns zero hits; saved-plan round-trip tests preserve `replace_display` and `permanent_name_overrides`.
 
 PR: stacks on Phase 6.
 

@@ -219,7 +219,7 @@ Each task is one TDD cycle. Goal: write failing test → run → see fail → mi
       /// Surface form of the `until` expression as the user wrote it
       /// (e.g., `"cert.status == aws.acm.Certificate.Status.Issued"`).
       /// Used by `format_effect_brief` so display never has to invert
-      /// the parsed AST. Same pattern as `Effect::Replace::cascade_ref_hints`.
+      /// the parsed AST. Same pattern as `legacy replacement cascade ref hints`.
       until_surface: String,
       #[serde(with = "crate::utils::serde_duration")]  // or impl serde manually if helper missing
       timeout: std::time::Duration,
@@ -846,7 +846,7 @@ Each task is one TDD cycle. Goal: write failing test → run → see fail → mi
       format!("> {} (until {})", binding, until_surface)
   }
   ```
-  This requires `Effect::Wait` to carry the original surface form of `until`. Update Task 2.1's `Effect::Wait` shape: add `until_surface: String` (rendered exactly as the user wrote it, e.g. `"cert.status == aws.acm.Certificate.Status.Issued"`). The differ in Task 4.1 populates it from the source span captured during parsing (`UntilSurface::raw` already exists from Task 3.4). Carrying the surface form means display never has to invert the parsed AST — a pattern Carina already uses for cascade replacement hints (`cascade_ref_hints` in `Effect::Replace`, see `effect.rs`).
+  This requires `Effect::Wait` to carry the original surface form of `until`. Update Task 2.1's `Effect::Wait` shape: add `until_surface: String` (rendered exactly as the user wrote it, e.g. `"cert.status == aws.acm.Certificate.Status.Issued"`). The differ in Task 4.1 populates it from the source span captured during parsing (`UntilSurface::raw` already exists from Task 3.4). Carrying the surface form means display never has to invert the parsed AST — a pattern Carina already uses for cascade replacement hints (`cascade_ref_hints` in the legacy replace effect, see `effect.rs`).
 - **Verification:** `cargo nextest run -p carina-core plan::tests::format_effect_brief_renders_wait`.
 
 **Task 5.2: Wait effects do not appear in `carina.state.json` after apply.**

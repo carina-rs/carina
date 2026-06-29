@@ -16,7 +16,7 @@ payloads:
 - `Effect::Create(Resource)`
 - `Effect::Read { resource: DataSource }`
 - `Effect::Wait { binding: String }`
-- `Resource` payloads inside `Update`, `Replace`, and `CascadingUpdate`
+- `Resource` payloads inside `Update`, legacy replace, and `LegacyCascadePayload`
 
 After this change, a resource or data source without identity cannot be stored
 inside an `Effect`.
@@ -99,15 +99,15 @@ pub enum BasicEffect<'a> {
 read `&to.id` when it needs the id; the identity guarantee comes from the
 `ResolvedResource` wrapper, not from a duplicated field on `Effect::Update`.
 
-## 5. CascadingUpdate
+## 5. Legacy Cascade Payload
 
-`CascadingUpdate` carries a dependent resource that will be updated during
+`LegacyCascadePayload` carries a dependent resource that will be updated during
 create-before-destroy replacement. Its `id` field is the same resource identity
 as `to.id`, so it follows the same rule as `Effect::Update`.
 
 | Before | After |
 |---|---|
-| `CascadingUpdate { id: ResolvedResourceId, from: Box<State>, to: Resource }` | `CascadingUpdate { from: Box<State>, to: ResolvedResource }` |
+| `LegacyCascadePayload { id: ResolvedResourceId, from: Box<State>, to: Resource }` | `LegacyCascadePayload { from: Box<State>, to: ResolvedResource }` |
 
 Consumers derive the affected id from `to.id`.
 
@@ -153,7 +153,7 @@ Saved-plan format changes are intentionally minimal:
 
 - `Update.id` disappears.
 - `Replace.id` disappears.
-- `CascadingUpdate.id` disappears.
+- `LegacyCascadePayload.id` disappears.
 - `Read.resource` and `Create` keep their existing inner JSON shape.
 - `Wait.binding` is renamed to `Wait.identity`.
 
@@ -167,8 +167,8 @@ Implementation should update consumers at the boundary where effects are built
 or inspected:
 
 - Differ: wrap resolved `Resource` and `DataSource` values before constructing
-  effects; stop passing duplicate ids into `Update`, `Replace`, and
-  `CascadingUpdate`; construct wait identity as `ResourceIdentity`.
+  effects; stop passing duplicate ids into `Update`, legacy replace, and
+  `LegacyCascadePayload`; construct wait identity as `ResourceIdentity`.
 - Executor: match the new shapes; pass `&Resource`/`&DataSource` to provider
   code through `Deref` or `as_inner()`; read update ids from `to.id`.
 - Display: derive ids and labels from resolved payloads; render wait identity
@@ -197,7 +197,7 @@ Suggested implementation order:
 
 1. Add `ResolvedResource` and `ResolvedDataSource`, including serde and invariant
    tests.
-2. Change `Effect`, `CascadingUpdate`, and `BasicEffect` shapes, then update
+2. Change `Effect`, `LegacyCascadePayload`, and `BasicEffect` shapes, then update
    core helpers such as `resource_id()`, `as_basic()`, `as_resource_ref()`, and
    `binding_name()`.
 3. Migrate differ/executor/display/scheduler call sites and update tests and

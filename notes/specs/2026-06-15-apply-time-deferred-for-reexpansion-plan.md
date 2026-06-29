@@ -250,7 +250,7 @@ schedule as ordinary `Create`s.
 **File targets**:
 
 - `carina-core/src/executor/phased.rs` —
-  - The Phase 4 dispatch loop (`Effect::Replace` finalization +
+  - The Phase 4 dispatch loop (the legacy replace effect finalization +
     `Effect::Create` for non-CBD replaces) gets a sibling
     `if let Effect::ExpandDeferredFor { … } = effect { … }` arm.
     Dispatch is synchronous: look up

@@ -80,7 +80,7 @@ reaches apply with three intertwined gaps:
    | 5     | Waits whose `target_id` is a Replace in this run                      |
 
    The deferred-for child (`Effect::Create validation_records[0]`) is a
-   Phase 1 member. The upstream `cert` is `Effect::Replace`, placed in
+   Phase 1 member. The upstream `cert` is the legacy replace effect, placed in
    phases 2/3/4. `build_phase_dependency_map` builds a `binding_to_idx`
    *limited to the current phase's effects*; cert is not in Phase 1's
    index, so the resolver's `expand("cert", …)` walk drops to the
@@ -386,7 +386,7 @@ them.
   emits pre-expanded `Effect::Create` children otherwise. A single
   fixture covers both branches.
 - Integration: a `for opt in cert.domain_validation_options { … }`
-  fixture where `cert` is `Effect::Replace`. Assert the apply event
+  fixture where `cert` is the legacy replace effect. Assert the apply event
   trace is `Replace cert → ExpandDeferredFor → Create validation_records[N]`
   and no `Create validation_records[N]` event is emitted before the
   `Replace cert` completes (the #3554 race).

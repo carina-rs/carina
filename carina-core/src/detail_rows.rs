@@ -131,11 +131,6 @@ pub enum DetailRow {
         original_value: String,
         attribute: String,
     },
-    /// Cascading updates section
-    CascadingUpdates {
-        count: usize,
-        updates: Vec<CascadingUpdateIR>,
-    },
 }
 
 /// A single entry in an expanded map (e.g., tags with default_tags annotation).
@@ -309,22 +304,6 @@ pub enum ListOfMapsDiffField {
     },
 }
 
-/// A cascading update entry
-#[derive(Debug, Clone, PartialEq)]
-pub struct CascadingUpdateIR {
-    pub display_type: String,
-    pub name: String,
-    pub changed_attrs: Vec<CascadingUpdateAttr>,
-}
-
-/// A changed attribute in a cascading update
-#[derive(Debug, Clone, PartialEq)]
-pub struct CascadingUpdateAttr {
-    pub key: String,
-    pub old: String,
-    pub new: String,
-}
-
 /// Resolve the subtype for map entry `key`: a `Map`'s `value` type, a
 /// `Struct` field's type, or `None`. `List`/`Union` are unwrapped so a
 /// nested `List<Map>`/`List<Struct>` still resolves its entries
@@ -424,29 +403,6 @@ pub fn build_detail_rows(
             let explicit = prev_explicit.and_then(|map| map.get(&to.id));
             let schema = registry.and_then(|r| r.get_for(to));
             build_update_rows(from, to, changed_attributes, schema, detail, explicit)
-        }
-        Effect::Replace {
-            from,
-            to,
-            changed_create_only,
-            cascading_updates,
-            temporary_name,
-            cascade_ref_hints,
-            ..
-        } => {
-            let explicit = prev_explicit.and_then(|map| map.get(&to.id));
-            let schema = registry.and_then(|r| r.get_for(to));
-            build_replace_rows(
-                from,
-                to,
-                changed_create_only,
-                cascading_updates,
-                temporary_name,
-                cascade_ref_hints,
-                schema,
-                detail,
-                explicit,
-            )
         }
         Effect::Delete { id, .. } => build_delete_rows(id, delete_attributes),
         Effect::Read { resource } => {
@@ -802,7 +758,7 @@ fn project_previous_attrs(
     explicit: Option<&crate::explicit::ExplicitFields>,
 ) -> HashMap<String, Value> {
     // Same projection as `project_from_attrs`, but sourced from
-    // replacement-display metadata instead of an `Effect::Replace` State.
+    // replacement-display metadata instead of a replace effect state.
     match explicit {
         Some(e) => crate::explicit::project_attributes(previous_attributes.clone(), e),
         None => previous_attributes.clone(),
@@ -961,31 +917,6 @@ fn build_attribute_diff_rows(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_replace_rows(
-    from: &crate::resource::State,
-    to: &crate::resource::Resource,
-    changed_create_only: &[String],
-    cascading_updates: &[crate::effect::CascadingUpdate],
-    temporary_name: &Option<crate::effect::TemporaryName>,
-    cascade_ref_hints: &[(String, String)],
-    schema: Option<&ResourceSchema>,
-    detail: DetailLevel,
-    explicit: Option<&crate::explicit::ExplicitFields>,
-) -> Vec<DetailRow> {
-    build_replace_rows_from_attributes(
-        &from.attributes,
-        to,
-        changed_create_only,
-        cascading_updates,
-        temporary_name.as_ref(),
-        cascade_ref_hints,
-        schema,
-        detail,
-        explicit,
-    )
-}
-
 /// Build replacement detail rows for a decomposed Create/Delete replacement.
 ///
 /// Phase 4 stores replacement display metadata separately from the Create
@@ -1005,7 +936,6 @@ pub fn build_replace_detail_rows_from_display(
         replacement.previous_attributes,
         to,
         replacement.changed_create_only,
-        &[],
         replacement.temporary_name,
         replacement.cascade_ref_hints,
         schema,
@@ -1019,7 +949,6 @@ fn build_replace_rows_from_attributes(
     previous_attributes: &HashMap<String, Value>,
     to: &crate::resource::Resource,
     changed_create_only: &[String],
-    cascading_updates: &[crate::effect::CascadingUpdate],
     temporary_name: Option<&crate::effect::TemporaryName>,
     cascade_ref_hints: &[(String, String)],
     schema: Option<&ResourceSchema>,
@@ -1104,33 +1033,6 @@ fn build_replace_rows_from_attributes(
                 count: unchanged_count,
             });
         }
-    }
-
-    // Cascading updates
-    if !cascading_updates.is_empty() {
-        let replaced_binding = to.binding.as_deref().unwrap_or("");
-
-        let mut updates = Vec::new();
-        for cascade in cascading_updates {
-            let mut changed_attrs = Vec::new();
-            collect_cascading_update_attrs(
-                &cascade.from.attributes,
-                &cascade.to.attributes,
-                replaced_binding,
-                &mut changed_attrs,
-            );
-
-            updates.push(CascadingUpdateIR {
-                display_type: cascade.to.id.display_type(),
-                name: cascade.to.id.identity_or_empty().to_string(),
-                changed_attrs,
-            });
-        }
-
-        rows.push(DetailRow::CascadingUpdates {
-            count: cascading_updates.len(),
-            updates,
-        });
     }
 
     rows
@@ -1847,109 +1749,6 @@ fn string_list_inner_type(attr_type: &AttributeType) -> Option<&AttributeType> {
     }
 }
 
-/// Check whether a Value references the given binding name.
-fn value_references_binding(value: &Value, binding: &str) -> bool {
-    let mut found = false;
-    value.visit_resource_refs(&mut |path| {
-        if path.binding() == binding {
-            found = true;
-        }
-    });
-    value.visit_binding_refs(&mut |bare_binding| {
-        if bare_binding == binding {
-            found = true;
-        }
-    });
-    found
-}
-
-fn collect_cascading_update_attrs(
-    old_attrs: &HashMap<String, Value>,
-    new_attrs: &IndexMap<String, Value>,
-    replaced_binding: &str,
-    changed_attrs: &mut Vec<CascadingUpdateAttr>,
-) {
-    let mut keys: Vec<_> = new_attrs.keys().filter(|k| !k.starts_with('_')).collect();
-    keys.sort();
-    for key in keys {
-        collect_cascading_update_attrs_for_value(
-            key,
-            old_attrs.get(key),
-            &new_attrs[key],
-            replaced_binding,
-            changed_attrs,
-        );
-    }
-}
-
-fn collect_cascading_update_attrs_for_value(
-    path: &str,
-    old_value: Option<&Value>,
-    new_value: &Value,
-    replaced_binding: &str,
-    changed_attrs: &mut Vec<CascadingUpdateAttr>,
-) {
-    if let Value::Concrete(ConcreteValue::Map(new_map)) = new_value {
-        let old_map = match old_value {
-            Some(Value::Concrete(ConcreteValue::Map(map))) => Some(map),
-            _ => None,
-        };
-        let mut keys: Vec<_> = new_map.keys().filter(|k| !k.starts_with('_')).collect();
-        keys.sort();
-        for key in keys {
-            let nested_path = format!("{path}.{key}");
-            collect_cascading_update_attrs_for_value(
-                &nested_path,
-                old_map.and_then(|map| map.get(key)),
-                &new_map[key],
-                replaced_binding,
-                changed_attrs,
-            );
-        }
-        return;
-    }
-
-    if let Value::Concrete(ConcreteValue::List(new_items)) = new_value {
-        let old_items = match old_value {
-            Some(Value::Concrete(ConcreteValue::List(items))) => Some(items),
-            _ => None,
-        };
-        for (idx, new_item) in new_items.iter().enumerate() {
-            let nested_path = format!("{path}[{idx}]");
-            collect_cascading_update_attrs_for_value(
-                &nested_path,
-                old_items.and_then(|items| items.get(idx)),
-                new_item,
-                replaced_binding,
-                changed_attrs,
-            );
-        }
-        return;
-    }
-
-    if !value_references_binding(new_value, replaced_binding) {
-        return;
-    }
-
-    let key_hint = cascade_key_hint(path);
-    let old_str = old_value
-        .map(|v| format_value_with_key(v, key_hint))
-        .unwrap_or_else(|| "(none)".to_string());
-    let new_str = format_value_with_key(new_value, key_hint);
-    changed_attrs.push(CascadingUpdateAttr {
-        key: path.to_string(),
-        old: old_str,
-        new: new_str,
-    });
-}
-
-fn cascade_key_hint(path: &str) -> Option<&str> {
-    debug_assert!(!path.starts_with('['));
-    let segment = path.rsplit('.').next()?;
-    let hint = segment.split('[').next().unwrap_or(segment);
-    if hint.is_empty() { None } else { Some(hint) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1959,6 +1758,31 @@ mod tests {
 
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
+    }
+
+    fn replace_rows_for_test(
+        from: State,
+        to: Resource,
+        changed_create_only: &[&str],
+        detail: DetailLevel,
+        cascade_ref_hints: Vec<(String, String)>,
+        prev_explicit: Option<&HashMap<ResourceId, crate::explicit::ExplicitFields>>,
+    ) -> Vec<DetailRow> {
+        let id = to.id.clone();
+        let changed_create_only: Vec<String> = changed_create_only
+            .iter()
+            .map(|attr| (*attr).to_string())
+            .collect();
+        build_replace_rows_from_attributes(
+            &from.attributes,
+            &to,
+            &changed_create_only,
+            None,
+            &cascade_ref_hints,
+            None,
+            detail,
+            prev_explicit.and_then(|map| map.get(&id)),
+        )
     }
 
     #[test]
@@ -2539,19 +2363,14 @@ mod tests {
             "cidr_block",
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
-        let effect = Effect::Replace {
-            from: Box::new(from),
-            to: resolved(to),
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                "cidr_block".to_string(),
-            ])
-            .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+        let rows = replace_rows_for_test(
+            from,
+            to,
+            &["cidr_block"],
+            DetailLevel::Explicit,
+            vec![],
+            None,
+        );
         assert_eq!(rows.len(), 1);
         assert!(matches!(
             &rows[0],
@@ -2571,20 +2390,14 @@ mod tests {
             .collect(),
         );
         let to = Resource::new("test.Widget", "beta");
-        let effect = Effect::Replace {
-            from: Box::new(from),
-            to: resolved(to),
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                "legacy_token".to_string(),
-            ])
-            .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+        let rows = replace_rows_for_test(
+            from,
+            to,
+            &["legacy_token"],
+            DetailLevel::Explicit,
+            vec![],
+            None,
+        );
 
         assert_eq!(
             rows,
@@ -2616,20 +2429,8 @@ mod tests {
             .collect(),
         );
         let to = Resource::new("test.Widget", "beta");
-        let effect = Effect::Replace {
-            from: Box::new(from),
-            to: resolved(to),
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                "settings".to_string(),
-            ])
-            .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+        let rows =
+            replace_rows_for_test(from, to, &["settings"], DetailLevel::Explicit, vec![], None);
 
         assert_eq!(
             rows,
@@ -2669,18 +2470,7 @@ mod tests {
             [("rules".to_string(), old_rules)].into_iter().collect(),
         );
         let to = Resource::new("test.Widget", "beta");
-        let effect = Effect::Replace {
-            from: Box::new(from),
-            to: resolved(to),
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["rules".to_string()])
-                .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+        let rows = replace_rows_for_test(from, to, &["rules"], DetailLevel::Explicit, vec![], None);
 
         assert_eq!(
             rows,
@@ -2758,18 +2548,7 @@ mod tests {
                 "scope",
                 Value::Concrete(ConcreteValue::String("CLOUDFRONT".to_string())),
             );
-        let effect = Effect::Replace {
-            from: Box::new(from),
-            to: resolved(to),
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
-                .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
+        let rows = replace_rows_for_test(from, to, &["name"], DetailLevel::Full, vec![], None);
 
         assert!(
             rows.iter().any(|row| matches!(
@@ -2810,205 +2589,6 @@ mod tests {
     }
 
     #[test]
-    fn replace_cascading_updates_render_nested_ref_diffs_with_dotted_paths() {
-        use crate::effect::CascadingUpdate;
-        use crate::resource::InterpolationPart;
-
-        let from = State::existing(
-            ResourceId::with_identity("wafv2.WebAcl", "edge"),
-            [(
-                "name".to_string(),
-                Value::Concrete(ConcreteValue::String("edge-old".to_string())),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let to = Resource::new("wafv2.WebAcl", "edge")
-            .with_binding("web_acl")
-            .with_attribute(
-                "name",
-                Value::Concrete(ConcreteValue::String("edge-new".to_string())),
-            );
-
-        let mut old_config = IndexMap::new();
-        old_config.insert(
-            "web_acl_id".to_string(),
-            Value::Concrete(ConcreteValue::String("arn:old-web-acl".to_string())),
-        );
-        old_config.insert(
-            "comment".to_string(),
-            Value::Concrete(ConcreteValue::String("old comment".to_string())),
-        );
-        let cascade_from = State::existing(
-            ResourceId::with_identity("cloudfront.Distribution", "cdn"),
-            [(
-                "distribution_config".to_string(),
-                Value::Concrete(ConcreteValue::Map(old_config)),
-            )]
-            .into_iter()
-            .collect(),
-        );
-
-        let mut new_config = IndexMap::new();
-        new_config.insert(
-            "web_acl_id".to_string(),
-            Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
-                Value::resource_ref("web_acl", "arn", vec![]),
-            )])),
-        );
-        new_config.insert(
-            "comment".to_string(),
-            Value::Concrete(ConcreteValue::String("new comment".to_string())),
-        );
-        let cascade_to = Resource::new("cloudfront.Distribution", "cdn").with_attribute(
-            "distribution_config",
-            Value::Concrete(ConcreteValue::Map(new_config)),
-        );
-        let effect = Effect::Replace {
-            from: Box::new(from),
-            to: resolved(to),
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
-                .unwrap(),
-            cascading_updates: vec![CascadingUpdate {
-                from: Box::new(cascade_from),
-                to: resolved(cascade_to),
-            }],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
-
-        let updates = rows
-            .iter()
-            .find_map(|row| match row {
-                DetailRow::CascadingUpdates { updates, .. } => Some(updates),
-                _ => None,
-            })
-            .expect("expected cascading update rows");
-        assert!(
-            updates[0].changed_attrs.iter().any(|attr| {
-                attr.key == "distribution_config.web_acl_id"
-                    && attr.old == "\"arn:old-web-acl\""
-                    && attr.new == "\"${web_acl.arn}\""
-            }),
-            "cascade rendering must surface the nested web_acl_id rewrite: {updates:?}"
-        );
-    }
-
-    #[test]
-    fn replace_cascading_updates_render_list_nested_ref_diffs_with_indexed_paths() {
-        use crate::effect::CascadingUpdate;
-
-        let from = State::existing(
-            ResourceId::with_identity("wafv2.WebAcl", "edge"),
-            [(
-                "name".to_string(),
-                Value::Concrete(ConcreteValue::String("edge-old".to_string())),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let to = Resource::new("wafv2.WebAcl", "edge")
-            .with_binding("web_acl")
-            .with_attribute(
-                "name",
-                Value::Concrete(ConcreteValue::String("edge-new".to_string())),
-            );
-
-        let mut old_rule = IndexMap::new();
-        old_rule.insert(
-            "name".to_string(),
-            Value::Concrete(ConcreteValue::String("rule-1".to_string())),
-        );
-        old_rule.insert(
-            "web_acl_id".to_string(),
-            Value::Concrete(ConcreteValue::String("arn:old-web-acl".to_string())),
-        );
-        let cascade_from = State::existing(
-            ResourceId::with_identity("test.RuleSet", "rules"),
-            [(
-                "rules".to_string(),
-                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::Map(old_rule),
-                )])),
-            )]
-            .into_iter()
-            .collect(),
-        );
-
-        let mut new_rule = IndexMap::new();
-        new_rule.insert(
-            "name".to_string(),
-            Value::Concrete(ConcreteValue::String("rule-1".to_string())),
-        );
-        new_rule.insert(
-            "web_acl_id".to_string(),
-            Value::resource_ref("web_acl", "arn", vec![]),
-        );
-        let cascade_to = Resource::new("test.RuleSet", "rules").with_attribute(
-            "rules",
-            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::Map(new_rule),
-            )])),
-        );
-
-        let effect = Effect::Replace {
-            from: Box::new(from),
-            to: resolved(to),
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".to_string()])
-                .unwrap(),
-            cascading_updates: vec![CascadingUpdate {
-                from: Box::new(cascade_from),
-                to: resolved(cascade_to),
-            }],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
-
-        let updates = rows
-            .iter()
-            .find_map(|row| match row {
-                DetailRow::CascadingUpdates { updates, .. } => Some(updates),
-                _ => None,
-            })
-            .expect("expected cascading update rows");
-        assert!(
-            updates[0].changed_attrs.iter().any(|attr| {
-                attr.key == "rules[0].web_acl_id"
-                    && attr.old == "\"arn:old-web-acl\""
-                    && attr.new == "web_acl.arn"
-            }),
-            "cascade rendering must surface the nested list web_acl_id rewrite: {updates:?}"
-        );
-    }
-
-    #[test]
-    fn cascade_key_hint_strips_top_level_list_index() {
-        assert_eq!(cascade_key_hint("rules[0]"), Some("rules"));
-    }
-
-    #[test]
-    fn cascade_key_hint_rejects_index_only_path() {
-        #[cfg(debug_assertions)]
-        {
-            assert!(
-                std::panic::catch_unwind(|| cascade_key_hint("[0]")).is_err(),
-                "index-only paths should trip the debug assertion"
-            );
-        }
-
-        #[cfg(not(debug_assertions))]
-        {
-            assert_eq!(cascade_key_hint("[0]"), None);
-        }
-    }
-
-    #[test]
     fn replace_same_forcing_key_prefers_cascade_ref_hint() {
         let from = State::existing(
             ResourceId::with_identity("test.Widget", "w"),
@@ -3023,18 +2603,14 @@ mod tests {
             "arn",
             Value::Concrete(ConcreteValue::String("arn:old".to_string())),
         );
-        let effect = Effect::Replace {
-            from: Box::new(from),
-            to: resolved(to),
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["arn".to_string()])
-                .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![("arn".to_string(), "${web_acl.arn}".to_string())],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+        let rows = replace_rows_for_test(
+            from,
+            to,
+            &["arn"],
+            DetailLevel::Explicit,
+            vec![("arn".to_string(), "${web_acl.arn}".to_string())],
+            None,
+        );
 
         assert!(
             rows.iter().any(|row| matches!(
@@ -3061,18 +2637,7 @@ mod tests {
             "arn",
             Value::Concrete(ConcreteValue::String("arn:old".to_string())),
         );
-        let effect = Effect::Replace {
-            from: Box::new(from),
-            to: resolved(to),
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["arn".to_string()])
-                .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+        let rows = replace_rows_for_test(from, to, &["arn"], DetailLevel::Explicit, vec![], None);
 
         assert!(
             rows.iter().any(|row| matches!(
@@ -3133,18 +2698,7 @@ mod tests {
                 ConcreteValue::Map(new_item),
             )])),
         );
-        let effect = Effect::Replace {
-            from: Box::new(from),
-            to: resolved(to),
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["rules".to_string()])
-                .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
+        let rows = replace_rows_for_test(from, to, &["rules"], DetailLevel::Full, vec![], None);
 
         assert!(
             rows.iter().any(|row| matches!(
@@ -3184,20 +2738,7 @@ mod tests {
             "settings",
             Value::Concrete(ConcreteValue::Map(new_settings)),
         );
-        let effect = Effect::Replace {
-            from: Box::new(from),
-            to: resolved(to),
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                "settings".to_string(),
-            ])
-            .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
+        let rows = replace_rows_for_test(from, to, &["settings"], DetailLevel::Full, vec![], None);
 
         assert!(
             rows.iter().any(|row| matches!(
@@ -3225,18 +2766,7 @@ mod tests {
                 ConcreteValue::String("only-one".to_string()),
             )])),
         );
-        let effect = Effect::Replace {
-            from: Box::new(from),
-            to: resolved(to),
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["aliases".to_string()])
-                .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, None);
+        let rows = replace_rows_for_test(from, to, &["aliases"], DetailLevel::Full, vec![], None);
 
         assert!(
             rows.iter().any(|row| matches!(
@@ -3277,18 +2807,6 @@ mod tests {
                 "authored",
                 Value::Concrete(ConcreteValue::String("kept".to_string())),
             );
-        let effect = Effect::Replace {
-            from: Box::new(from),
-            to: resolved(to),
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                "server_defaulted_name".to_string(),
-            ])
-            .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
         let explicit = HashMap::from([(
             id,
             ExplicitFields::Struct {
@@ -3296,7 +2814,14 @@ mod tests {
             },
         )]);
 
-        let rows = build_detail_rows(&effect, None, DetailLevel::Full, None, Some(&explicit));
+        let rows = replace_rows_for_test(
+            from,
+            to,
+            &["server_defaulted_name"],
+            DetailLevel::Full,
+            vec![],
+            Some(&explicit),
+        );
 
         assert!(
             rows.iter().any(|row| matches!(
@@ -3331,98 +2856,20 @@ mod tests {
             "external_name",
             Value::Concrete(ConcreteValue::String("new-name".to_string())),
         );
-        let effect = Effect::Replace {
-            from: Box::new(from),
-            to: resolved(to),
-            directives: crate::resource::Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                "external_name".to_string(),
-            ])
-            .unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
+        let rows = replace_rows_for_test(
+            from,
+            to,
+            &["external_name"],
+            DetailLevel::Explicit,
+            vec![],
+            None,
+        );
 
         assert!(
             rows.iter()
                 .any(|row| matches!(row, DetailRow::Removed { key, old } if key == "tag" && old == "\"legacy\"")),
             "replace rows must render non-forcing removed attributes alongside forcing changes: {rows:?}"
         );
-    }
-
-    /// The pre-#1971 hand-rolled walker only descended into `List` and `Map`,
-    /// so a ResourceRef nested inside `Interpolation` / `FunctionCall` /
-    /// `Secret` / `Closure` would fail to mark the attribute as referencing
-    /// the binding. Guard against regressing that after migrating to
-    /// `Value::visit_resource_refs` / `Value::visit_binding_refs`.
-    #[test]
-    fn value_references_binding_covers_non_container_variants() {
-        use crate::resource::InterpolationPart;
-
-        let refs_vpc = Value::resource_ref("vpc", "id", vec![]);
-
-        let interpolation = Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Literal("vpc-".to_string()),
-            InterpolationPart::Expr(refs_vpc.clone()),
-        ]));
-        assert!(value_references_binding(&interpolation, "vpc"));
-
-        let function_call = Value::Deferred(DeferredValue::FunctionCall {
-            name: "join".to_string(),
-            args: vec![
-                Value::Concrete(ConcreteValue::String(",".to_string())),
-                refs_vpc.clone(),
-            ],
-        });
-        assert!(value_references_binding(&function_call, "vpc"));
-
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(refs_vpc)));
-        assert!(value_references_binding(&secret, "vpc"));
-
-        let binding_ref = || {
-            Value::Deferred(DeferredValue::BindingRef {
-                binding: "vpc".to_string(),
-            })
-        };
-
-        let list_binding = Value::Concrete(ConcreteValue::List(vec![binding_ref()]));
-        assert!(value_references_binding(&list_binding, "vpc"));
-
-        let map_binding = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-            "k".to_string(),
-            binding_ref(),
-        )])));
-        assert!(value_references_binding(&map_binding, "vpc"));
-
-        let interpolation_binding = Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Literal("vpc-".to_string()),
-            InterpolationPart::Expr(binding_ref()),
-        ]));
-        assert!(value_references_binding(&interpolation_binding, "vpc"));
-
-        let function_call_binding = Value::Deferred(DeferredValue::FunctionCall {
-            name: "join".to_string(),
-            args: vec![
-                Value::Concrete(ConcreteValue::String(",".to_string())),
-                binding_ref(),
-            ],
-        });
-        assert!(value_references_binding(&function_call_binding, "vpc"));
-
-        let secret_binding = Value::Deferred(DeferredValue::Secret(Box::new(binding_ref())));
-        assert!(value_references_binding(&secret_binding, "vpc"));
-
-        // Closure variant removed from `Value` (issue #2230): closures
-        // live on `EvalValue` and never reach this code path.
-
-        // Still false when the binding is genuinely absent.
-        assert!(!value_references_binding(
-            &Value::Concrete(ConcreteValue::String("plain".to_string())),
-            "vpc"
-        ));
     }
 
     #[test]

@@ -39,7 +39,6 @@ impl<'a> PureMetaStep<'a> {
             }),
             Effect::Create(_)
             | Effect::Update { .. }
-            | Effect::Replace { .. }
             | Effect::Delete { .. }
             | Effect::Wait { .. }
             | Effect::Read { .. }
@@ -101,50 +100,6 @@ pub(super) fn build_scheduler_deps(
     relax_update_update_edges(effects, &mut analysis);
     let mut deps_of = analysis.into_deps_of();
     apply_deferred_replace_delete_deps(&mut deps_of, deferred_replace_delete_deps);
-    deps_of
-}
-
-pub(super) fn build_phase_scheduler_deps(
-    effects: &[Effect],
-    phase_indices: &[usize],
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
-    compositions: &[crate::resource::Composition],
-    deferred_replace_delete_deps: &[(usize, usize)],
-) -> HashMap<usize, HashSet<usize>> {
-    let mut deps_of = super::phased::build_phase_dependency_map(
-        effects,
-        phase_indices,
-        unresolved_resources,
-        compositions,
-    );
-    apply_deferred_replace_delete_deps(&mut deps_of, deferred_replace_delete_deps);
-    deps_of
-}
-
-/// Build the dependency map for a "post-replace wait" phase. Combines
-/// `build_phase_dependency_map`'s binding-based edges with cross-phase
-/// target-id edges: each wait's target effect is looked up across the full
-/// effect list, so anonymous replaces still gate their waits.
-pub(super) fn build_post_replace_wait_scheduler_deps(
-    effects: &[Effect],
-    post_replace_wait_indices: &[usize],
-    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
-    compositions: &[crate::resource::Composition],
-) -> HashMap<usize, HashSet<usize>> {
-    let mut deps_of = super::phased::build_phase_dependency_map(
-        effects,
-        post_replace_wait_indices,
-        unresolved_resources,
-        compositions,
-    );
-    for &idx in post_replace_wait_indices {
-        if let Effect::Wait { target_id, .. } = &effects[idx] {
-            let target_deps = effects.iter().enumerate().filter_map(|(dep_idx, effect)| {
-                (dep_idx != idx && effect.resource_id() == target_id).then_some(dep_idx)
-            });
-            deps_of.entry(idx).or_default().extend(target_deps);
-        }
-    }
     deps_of
 }
 

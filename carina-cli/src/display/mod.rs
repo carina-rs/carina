@@ -8,8 +8,6 @@ use carina_core::detail_rows::{
     ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows,
     build_replace_detail_rows_from_display, hidden_unchanged_summary,
 };
-#[cfg(test)]
-use carina_core::effect::CascadingUpdate;
 use carina_core::effect::Effect;
 use carina_core::plan::{DeferredSummaryAction, Plan, PlanSummaryPart, ReplaceDisplayInfo};
 #[cfg(test)]
@@ -22,8 +20,6 @@ use carina_core::plan_tree::{
 use carina_core::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
 use carina_core::schema::SchemaRegistry;
 use carina_core::value::format_value_pretty;
-#[cfg(test)]
-use carina_core::value::format_value_with_key;
 
 use crate::DetailLevel;
 
@@ -72,7 +68,7 @@ impl Sigil {
         let rendered = match effect {
             Effect::Create(_) | Effect::DeferredCreate { .. } => raw.green().bold(),
             Effect::Update { .. } => raw.yellow().bold(),
-            Effect::Replace { .. } | Effect::DeferredReplace { .. } => raw.magenta().bold(),
+            Effect::DeferredReplace { .. } => raw.magenta().bold(),
             Effect::Delete { .. } => raw.red().bold(),
             Effect::Read { .. } | Effect::Import { .. } => raw.cyan().bold(),
             // carina#3332: the previous `x` (red, bold) shape-collides
@@ -699,46 +695,6 @@ impl<'a> TreeRenderContext<'a> {
                     .unwrap();
                 }
             }
-            Effect::Replace { to, directives, .. } => {
-                let id = &to.id;
-                let replace_note = if directives.create_before_destroy {
-                    "(must be replaced, create before destroy)"
-                } else {
-                    "(must be replaced)"
-                };
-                let moved_note = self
-                    .moved_origins
-                    .get(id)
-                    .map(|from| format!(" (moved from: {})", from.identity_or_empty()));
-                if self.detail == DetailLevel::None {
-                    let name_part = format_compact_name(
-                        carina_core::parser::ResourceRef::Resource(to),
-                        id.identity_or_empty(),
-                        parent_binding,
-                    );
-                    writeln!(
-                        self.out,
-                        "{}{} {} {}{}",
-                        line_prefix,
-                        id.display_type().cyan().bold(),
-                        name_part.magenta().bold(),
-                        replace_note.magenta(),
-                        moved_note.as_deref().unwrap_or("").magenta()
-                    )
-                    .unwrap();
-                } else {
-                    writeln!(
-                        self.out,
-                        "{}{} {} {}{}",
-                        line_prefix,
-                        id.display_type().cyan().bold(),
-                        id.identity_or_empty().magenta().bold(),
-                        replace_note.magenta(),
-                        moved_note.as_deref().unwrap_or("").magenta()
-                    )
-                    .unwrap();
-                }
-            }
             Effect::Delete { id, binding, .. } => {
                 let display_name = binding.as_deref().unwrap_or(id.identity_or_empty());
                 writeln!(
@@ -1003,7 +959,6 @@ impl<'a> TreeRenderContext<'a> {
             Effect::Move { to, .. } => !self.update_or_replace_targets.contains(to),
             Effect::Create(_)
             | Effect::Update { .. }
-            | Effect::Replace { .. }
             | Effect::Delete { .. }
             | Effect::Read { .. }
             | Effect::Import { .. }
@@ -1144,7 +1099,6 @@ fn format_plan_tree<'a>(
         .enumerate()
         .filter_map(|(idx, e)| match e {
             Effect::Update { to, .. } => Some(to.id.clone()),
-            Effect::Replace { to, .. } => Some(to.id.clone()),
             Effect::Create(r) if replacement_create_info.contains_key(&idx) => Some(r.id.clone()),
             Effect::DeferredReplace { .. } => None,
             _ => None,
@@ -1945,31 +1899,6 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                 .unwrap();
             }
         }
-        DetailRow::CascadingUpdates { count, updates } => {
-            writeln!(out, "{}  {} cascading update(s):", attr_prefix, count).unwrap();
-            for update in updates {
-                writeln!(
-                    out,
-                    "{}    ~ {} {}",
-                    attr_prefix,
-                    update.display_type.as_str().cyan(),
-                    update.name.as_str().magenta()
-                )
-                .unwrap();
-                for attr in &update.changed_attrs {
-                    writeln!(
-                        out,
-                        "{}        {}: {} → {} {}",
-                        attr_prefix,
-                        attr.key,
-                        attr.old.as_str().red().strikethrough(),
-                        attr.new.as_str().green(),
-                        "(known after apply)".dimmed()
-                    )
-                    .unwrap();
-                }
-            }
-        }
     }
 }
 
@@ -2279,27 +2208,6 @@ pub fn format_effect(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("Create {}", r.id.human()),
         Effect::Update { to, .. } => format!("Update {}", to.id.human()),
-        Effect::Replace {
-            to,
-            directives,
-            cascading_updates,
-            ..
-        } => {
-            let id = &to.id;
-            if directives.create_before_destroy {
-                if cascading_updates.is_empty() {
-                    format!("Replace {} (create-before-destroy)", id.human())
-                } else {
-                    format!(
-                        "Replace {} (create-before-destroy, {} cascade)",
-                        id.human(),
-                        cascading_updates.len()
-                    )
-                }
-            } else {
-                format!("Replace {}", id.human())
-            }
-        }
         Effect::Delete { id, binding, .. } => {
             let display_name = binding.as_deref().unwrap_or(id.identity_or_empty());
             format!("Delete {} {}", id.display_type(), display_name)
@@ -2351,59 +2259,6 @@ pub fn format_effect(effect: &Effect) -> String {
             )
         }
     }
-}
-
-#[cfg(test)]
-fn format_cascading_update_diff(
-    cascade: &CascadingUpdate,
-    attr_prefix: &str,
-    replaced_binding: &str,
-) -> String {
-    let mut lines = Vec::new();
-    let mut keys: Vec<_> = cascade
-        .to
-        .attributes
-        .keys()
-        .filter(|k| !k.starts_with('_'))
-        .collect();
-    keys.sort();
-    for key in keys {
-        let new_value = &cascade.to.attributes[key];
-        if !value_references_binding(new_value, replaced_binding) {
-            continue;
-        }
-        let old_value = cascade.from.attributes.get(key);
-        let old_str = old_value
-            .map(|v| format_value_with_key(v, Some(key)))
-            .unwrap_or_else(|| "(none)".to_string());
-        let new_str = format_value_with_key(new_value, Some(key));
-        lines.push(format!(
-            "{}    {}: {} → {} {}",
-            attr_prefix,
-            key,
-            old_str.red().strikethrough(),
-            new_str.green(),
-            "(known after apply)".dimmed()
-        ));
-    }
-    lines.join("\n")
-}
-
-#[cfg(test)]
-/// Check whether a Value references the given binding name (either ResourceRef or bare BindingRef).
-fn value_references_binding(value: &Value, binding: &str) -> bool {
-    let mut found = false;
-    value.visit_resource_refs(&mut |path| {
-        if path.binding() == binding {
-            found = true;
-        }
-    });
-    value.visit_binding_refs(&mut |bare_binding| {
-        if bare_binding == binding {
-            found = true;
-        }
-    });
-    found
 }
 
 #[cfg(test)]

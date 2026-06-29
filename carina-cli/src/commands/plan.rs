@@ -127,6 +127,10 @@ pub struct PlanFile {
     pub wait_bindings: Vec<PlanWaitBinding>,
 }
 
+impl PlanFile {
+    pub const CURRENT_VERSION: u32 = 8;
+}
+
 pub(crate) fn collect_delete_attributes(
     plan: &Plan,
     current_states: &HashMap<ResourceId, State>,
@@ -190,6 +194,10 @@ fn build_plan_file<E>(
         .to_string();
 
     Ok(PlanFile {
+        // Phase 7: bumped 6→8 — saved plans no longer support the
+        // legacy Replace effect shape and replacement display metadata
+        // must survive plan redaction.
+        //
         // carina#3486: bumped 5→6 — saved plans now persist
         // `unresolved_resources`, the pre-resolution snapshot needed by
         // apply-time dependency analysis and reference re-resolution.
@@ -205,7 +213,7 @@ fn build_plan_file<E>(
         // the same `ResolvedBindings` view as the live-apply path.
         // Older plans (version below current) are rejected with a
         // clear message pointing the user at re-running `plan`.
-        version: 6,
+        version: PlanFile::CURRENT_VERSION,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         source_path,

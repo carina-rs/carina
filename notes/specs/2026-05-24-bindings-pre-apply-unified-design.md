@@ -424,7 +424,7 @@ Test coverage:
   binding to a managed sibling literal (the #3246 reproduction at
   the resolver level).
 - New e2e test: directory fixture mirroring `envs/registry/dev/bootstrap/`,
-  drives the full plan path, asserts no `Effect::Replace` against a
+  drives the full plan path, asserts no the legacy replace effect against a
   state holding the resolved literal.
 - New regression: saved-plan apply against a fixture whose plan was
   generated with virtuals — the saved plan deserializes correctly,
@@ -472,7 +472,7 @@ Filed separately after this design lands (not blocking implementation):
   prints "No changes" under the implementation PR's binary.
 - A unit test in `carina-core/src/resolver.rs` asserts the virtual-chain
   resolution. An e2e test in `carina-cli/tests/` asserts the plan
-  path produces no `Effect::Replace` for the headline shape. A
+  path produces no the legacy replace effect for the headline shape. A
   saved-plan apply test exercises the persisted `virtual_resources`
   path.
 - The `apply/mod.rs:1698-1700` "no virtual slice" comment is deleted.

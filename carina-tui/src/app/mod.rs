@@ -136,14 +136,14 @@ impl App {
 
         let mut suppressed: HashSet<usize> = HashSet::new();
 
-        // Suppress Move nodes when an Update/Replace exists for the same target,
-        // matching CLI behavior (the move info is shown as annotation on Update/Replace).
+        // Suppress Move nodes when an Update exists for the same target,
+        // matching CLI behavior (the move info is shown as annotation on Update).
         let update_or_replace_targets: HashSet<ResourceId> = plan
             .effects()
             .iter()
             .enumerate()
             .filter_map(|(idx, e)| match e {
-                Effect::Update { to, .. } | Effect::Replace { to, .. } => Some(to.id.clone()),
+                Effect::Update { to, .. } => Some(to.id.clone()),
                 Effect::Create(r) if replacement_create_info.contains_key(&idx) => {
                     Some(r.id.clone())
                 }
@@ -760,20 +760,6 @@ fn effect_to_node(
                 name_part: id.identity_or_empty().to_string(),
                 symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Update,
-                detail_rows,
-                children: Vec::new(),
-                depth: 0,
-                parent: None,
-            }
-        }
-        Effect::Replace { to, .. } => {
-            let id = &to.id;
-            TreeNode {
-                effect_label: format!("{}", id.human()),
-                resource_type: id.display_type(),
-                name_part: id.identity_or_empty().to_string(),
-                symbol: effect.display_glyph().to_string(),
-                kind: EffectKind::Replace,
                 detail_rows,
                 children: Vec::new(),
                 depth: 0,

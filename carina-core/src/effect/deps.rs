@@ -23,10 +23,9 @@ impl UnresolvedResource {
 /// Selects which scheduling contract [`build_effect_dependency_analysis`]
 /// applies.
 ///
-/// `Apply` follows the apply scheduler's rules (resource refs become edges,
-/// `Replace` from-bindings block only when they resolve to deletes, meta
-/// effects contribute `DependsOn` edges). `Destroy` ignores resource-ref
-/// edges and instead lets each effect's [`Effect::destroy_edges`] drive the
+/// `Apply` follows the apply scheduler's rules (resource refs become edges
+/// and meta effects contribute `DependsOn` edges). `Destroy` ignores
+/// resource-ref edges and instead lets each effect's [`Effect::destroy_edges`] drive the
 /// graph; the typed `aliases` slot carries `wait`-binding bridges that
 /// would otherwise be dropped from the destroy plan, and the variant shape
 /// makes it impossible to pass aliases into an apply run.
@@ -559,7 +558,6 @@ pub fn relax_update_update_edges(effects: &[Effect], analysis: &mut DependencyAn
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::ChangedCreateOnly;
     use crate::resource::{ResolvedResource, ResolvedResourceId, ResourceIdentity, State, Value};
 
     fn state_for(id: &ResourceId) -> State {
@@ -933,42 +931,6 @@ mod tests {
     #[test]
     fn destroy_wait_alias_rejects_empty_consumers() {
         assert!(DestroyWaitAlias::new("w".into(), "t".into(), HashSet::new(), vec![]).is_none());
-    }
-
-    #[test]
-    fn replace_from_dependency_only_blocks_delete_targets() {
-        let mut x = Resource::new("test", "x");
-        x.binding = Some("x".to_string());
-
-        let from = State::existing(
-            ResourceId::with_identity("test", "replace_me"),
-            HashMap::new(),
-        )
-        .with_dependency_bindings(std::collections::BTreeSet::from(["x".to_string()]));
-        let mut to = Resource::new("test", "replace_me");
-        to.binding = Some("replace_me".to_string());
-
-        let effects = vec![
-            Effect::Create(ResolvedResource::new(x)),
-            Effect::Replace {
-                from: Box::new(from),
-                to: ResolvedResource::new(to),
-                directives: Default::default(),
-                changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-                cascading_updates: Vec::new(),
-                temporary_name: None,
-                cascade_ref_hints: Vec::new(),
-            },
-        ];
-
-        let deps =
-            build_effect_dependency_analysis(&effects, &HashMap::new(), &[], ScheduleInputs::Apply)
-                .into_deps_of();
-
-        assert!(
-            deps[&0].is_empty(),
-            "create target must not be blocked by replace"
-        );
     }
 
     #[test]

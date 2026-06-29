@@ -17,7 +17,7 @@ use super::basic::{
     execute_basic_effect, process_basic_result, refresh_pending_states,
 };
 use super::deferred_dispatch::PureMetaCtx;
-use super::replace::{ReplaceContext, SingleEffectResult, execute_replace_parallel};
+use super::replace::SingleEffectResult;
 use super::scheduler::{
     FailureView, PureMetaOutcome, build_scheduler_deps, dependency_failed_reason,
     emit_cancelled_skips_with_progress, failure_binding_name, try_dispatch_pure_meta,
@@ -162,7 +162,7 @@ pub(super) async fn execute_effects_sequential(
     let mut skip_count = 0;
     let (mut applied_states, wait_identifiers) = AppliedStates::with_initial(&input.current_states);
     let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
-    let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
+    let permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
     let mut runtime_synthesized_resources: Vec<Resource> = Vec::new();
 
@@ -384,44 +384,6 @@ pub(super) async fn execute_effects_sequential(
                             // arm above.
                             unreachable!("Create/Update/Delete are narrowed by as_basic()")
                         }
-                        Effect::Replace {
-                            from,
-                            to,
-                            directives,
-                            cascading_updates,
-                            temporary_name,
-                            ..
-                        } => {
-                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                            let started = Instant::now();
-                            let progress = ProgressInfo {
-                                completed: c,
-                                total,
-                            };
-                            observer.on_event(&ExecutionEvent::EffectStarted {
-                                effect: &effect_for_future,
-                            });
-
-                            execute_replace_parallel(
-                                provider,
-                                &ReplaceContext {
-                                    effect: &effect_for_future,
-                                    id: &to.id,
-                                    from,
-                                    to,
-                                    directives,
-                                    cascading_updates,
-                                    temporary_name: temporary_name.as_ref(),
-                                    bindings: &binding_snapshot,
-                                    unresolved,
-                                    pipeline: &pipeline,
-                                    started,
-                                    progress,
-                                },
-                                observer,
-                            )
-                            .await
-                        }
                         Effect::Read { .. } => SingleEffectResult::ReadNoOp,
                         // State operations are handled separately during apply
                         Effect::Import { .. } | Effect::Remove { .. } | Effect::Move { .. } => {
@@ -581,53 +543,6 @@ pub(super) async fn execute_effects_sequential(
                     },
                 );
             }
-            SingleEffectResult::Replace {
-                success,
-                state,
-                resource_id,
-                diagnostic,
-                cascade_diagnostics,
-                resolved_attrs,
-                binding,
-                refreshes,
-                permanent_overrides,
-            } => {
-                if let Some(state) = &state {
-                    applied_states.insert(resource_id.clone(), state.clone());
-                    if let Some(attrs) = &resolved_attrs {
-                        input
-                            .bindings
-                            .record_applied(binding.as_deref(), attrs, state);
-                    }
-                }
-                if success {
-                    let mut recorded_partial = false;
-                    if let Some(diagnostic) = diagnostic {
-                        partial_count += 1;
-                        partial_diagnostics.push((resource_id.clone(), diagnostic));
-                        recorded_partial = true;
-                    }
-                    for (id, diagnostic) in cascade_diagnostics {
-                        partial_count += 1;
-                        partial_diagnostics.push((id, diagnostic));
-                        recorded_partial = true;
-                    }
-                    if !recorded_partial {
-                        success_count += 1;
-                    }
-                    if let Some((id, overrides)) = permanent_overrides {
-                        permanent_name_overrides.insert(id, overrides);
-                    }
-                } else {
-                    failure_count += 1;
-                    failed_indices.insert(finished_idx);
-                }
-                for (id, identifier) in refreshes {
-                    if !identifier.is_empty() {
-                        pending_refreshes.insert(id, identifier);
-                    }
-                }
-            }
             SingleEffectResult::ReadNoOp => {}
             SingleEffectResult::Wait {
                 binding,
@@ -729,7 +644,6 @@ pub(super) async fn execute_effects_sequential(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::ChangedCreateOnly;
     use crate::effect::deps::reads::{KnownReads, ReadsSet};
     use crate::effect::deps::{
         ScheduleInputs, WritesSet, build_effect_dependency_analysis as build_dependency_analysis,
@@ -774,27 +688,6 @@ mod tests {
             from: Box::new(state_for(&id)),
             to: resolved(to),
             changed_attributes: writes.iter().map(|attr| (*attr).to_string()).collect(),
-        }
-    }
-
-    fn replace_effect(binding: &str, reads: &[(&str, &str)]) -> Effect {
-        let id = ResourceId::with_identity("test", binding);
-        let mut to = Resource::new("test", binding);
-        to.binding = Some(binding.to_string());
-        for (dep, attr) in reads {
-            to.set_attr(
-                format!("{}_{}", dep, attr),
-                Value::resource_ref(*dep, *attr, vec![]),
-            );
-        }
-        Effect::Replace {
-            from: Box::new(state_for(&id)),
-            to: resolved(to),
-            directives: Default::default(),
-            changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-            cascading_updates: Vec::new(),
-            temporary_name: None,
-            cascade_ref_hints: Vec::new(),
         }
     }
 
@@ -941,9 +834,7 @@ mod tests {
         let unresolved: HashMap<ResourceId, UnresolvedResource> = effects
             .iter()
             .filter_map(|effect| match effect {
-                Effect::Create(resource)
-                | Effect::Update { to: resource, .. }
-                | Effect::Replace { to: resource, .. } => Some((
+                Effect::Create(resource) | Effect::Update { to: resource, .. } => Some((
                     resource.id.clone(),
                     UnresolvedResource::from_pre_resolve(resource.as_inner().clone()),
                 )),
@@ -1288,18 +1179,6 @@ mod tests {
         assert!(
             deps.contains(&0),
             "Create parent is outside relaxation scope"
-        );
-    }
-
-    #[test]
-    fn replace_parent_update_child_is_not_relaxed() {
-        let deps = dependency_after_relax(
-            replace_effect("parent", &[]),
-            update_effect("child", &[("parent", "id")], &["tags"]),
-        );
-        assert!(
-            deps.contains(&0),
-            "Replace parent is outside relaxation scope"
         );
     }
 

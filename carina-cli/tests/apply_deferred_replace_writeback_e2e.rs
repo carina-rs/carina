@@ -204,7 +204,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         .collect::<Vec<_>>();
 
     PlanFile {
-        version: 6,
+        version: PlanFile::CURRENT_VERSION,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: "2026-06-25T00:00:00Z".to_string(),
         source_path: project.display().to_string(),

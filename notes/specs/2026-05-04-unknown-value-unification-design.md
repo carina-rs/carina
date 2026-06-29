@@ -310,7 +310,7 @@ serialization path is a compile error.
 
 ## Edge cases
 
-- **Cascade ref hints in `Effect::Replace::cascade_ref_hints`**: these
+- **Cascade ref hints in `legacy replacement cascade ref hints`**: these
   are `(String, String)` already (attribute name → original ref dot
   string), not `Value`. They are display-only strings, not affected by
   the `Value::Unknown` change.

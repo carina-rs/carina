@@ -1024,33 +1024,6 @@ pub fn redact_secrets_in_effect(
             to: crate::resource::ResolvedResource::new(redact_secrets_in_managed(to)?),
             changed_attributes: changed_attributes.clone(),
         },
-        Effect::Replace {
-            from,
-            to,
-            directives,
-            changed_create_only,
-            cascading_updates,
-            temporary_name,
-            cascade_ref_hints,
-        } => Effect::Replace {
-            from: Box::new(redact_secrets_in_state(from)?),
-            to: crate::resource::ResolvedResource::new(redact_secrets_in_managed(to)?),
-            directives: directives.clone(),
-            changed_create_only: changed_create_only.clone(),
-            temporary_name: temporary_name.clone(),
-            cascade_ref_hints: cascade_ref_hints.clone(),
-            cascading_updates: cascading_updates
-                .iter()
-                .map(|cu| {
-                    Ok::<_, SerializationError>(crate::effect::CascadingUpdate {
-                        from: Box::new(redact_secrets_in_state(&cu.from)?),
-                        to: crate::resource::ResolvedResource::new(redact_secrets_in_managed(
-                            &cu.to,
-                        )?),
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        },
         Effect::Delete {
             id,
             identifier,
@@ -1135,10 +1108,20 @@ pub fn redact_secrets_in_effect(
 pub fn redact_secrets_in_plan(
     plan: &crate::plan::Plan,
 ) -> Result<crate::plan::Plan, SerializationError> {
-    let mut redacted = crate::plan::Plan::new();
-    for effect in plan.effects() {
-        redacted.add(redact_secrets_in_effect(effect)?);
+    let mut redacted = plan.clone();
+    let redacted_effects: Vec<_> = plan
+        .effects()
+        .iter()
+        .map(redact_secrets_in_effect)
+        .collect::<Result<_, _>>()?;
+    *redacted.effects_mut() = redacted_effects;
+
+    for metadata in redacted.replace_display_mut() {
+        for value in metadata.previous_attributes.values_mut() {
+            *value = redact_secrets_in_value(value)?;
+        }
     }
+
     Ok(redacted)
 }
 
@@ -5237,6 +5220,114 @@ mod tests {
                 assert_for_value_path(template.template_resource.attributes.get("name"), expected);
             }
             other => panic!("expected Effect::DeferredCreate, got {other:?}"),
+        }
+    }
+
+    fn replacement_plan_with_previous_attributes(
+        previous_attributes: std::collections::HashMap<String, Value>,
+        permanent_name_override: Option<crate::plan::PermanentNameOverride>,
+    ) -> crate::plan::Plan {
+        use crate::effect::ChangedCreateOnly;
+        use crate::plan::{ReplacementDelete, ReplacementGroup};
+        use crate::resource::{
+            Directives, ResolvedResource, ResolvedResourceId, Resource, ResourceId,
+        };
+        use std::collections::HashSet;
+
+        let id = ResourceId::with_identity("aws.s3.Bucket", "bucket");
+        let mut create = Resource::new("aws.s3.Bucket", "bucket");
+        create.binding = Some("bucket".to_string());
+
+        let mut plan = crate::plan::Plan::new();
+        plan.add_replacement(ReplacementGroup {
+            create: ResolvedResource::new(create),
+            delete: ReplacementDelete {
+                id: ResolvedResourceId::new(id.clone()),
+                identifier: "bucket-old".to_string(),
+                directives: Directives::default(),
+                binding: Some("bucket".to_string()),
+                dependencies: HashSet::new(),
+                explicit_dependencies: HashSet::new(),
+            },
+            create_before_destroy: true,
+            changed_create_only: ChangedCreateOnly::new(vec!["bucket_name".to_string()])
+                .expect("test replacement has a create-only attribute"),
+            cascade_ref_hints: vec![("vpc_id".to_string(), "vpc.id".to_string())],
+            temporary_name: None,
+            permanent_name_override,
+            consumer_updates: HashSet::new(),
+            previous_attributes,
+        });
+        plan
+    }
+
+    #[test]
+    fn redact_secrets_in_plan_preserves_replace_display() {
+        use crate::resource::{ConcreteValue, Value};
+        use std::collections::HashMap;
+
+        let plan = replacement_plan_with_previous_attributes(
+            HashMap::from([(
+                "bucket_name".to_string(),
+                Value::Concrete(ConcreteValue::String("bucket-old".to_string())),
+            )]),
+            None,
+        );
+        let expected = plan.replace_display.clone();
+
+        let redacted = redact_secrets_in_plan(&plan).expect("plan redaction succeeds");
+
+        assert_eq!(redacted.replace_display, expected);
+    }
+
+    #[test]
+    fn redact_secrets_in_plan_preserves_permanent_name_overrides() {
+        use crate::plan::PermanentNameOverride;
+        use crate::resource::{ResolvedResourceId, ResourceId};
+        use std::collections::HashMap;
+
+        let override_ = PermanentNameOverride {
+            resource_id: ResolvedResourceId::new(ResourceId::with_identity(
+                "aws.s3.Bucket",
+                "bucket",
+            )),
+            attribute: "bucket_name".to_string(),
+            temp_value: "bucket-temp".to_string(),
+            original_value: Some("bucket".to_string()),
+        };
+        let plan = replacement_plan_with_previous_attributes(HashMap::new(), Some(override_));
+        let expected = plan.permanent_name_overrides.clone();
+
+        let redacted = redact_secrets_in_plan(&plan).expect("plan redaction succeeds");
+
+        assert_eq!(redacted.permanent_name_overrides, expected);
+    }
+
+    #[test]
+    fn redact_secrets_in_plan_redacts_secret_in_previous_attributes() {
+        use crate::resource::{ConcreteValue, DeferredValue, Value};
+        use std::collections::HashMap;
+
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("previous-secret".to_string()),
+        ))));
+        let plan = replacement_plan_with_previous_attributes(
+            HashMap::from([("password".to_string(), secret)]),
+            None,
+        );
+
+        let redacted = redact_secrets_in_plan(&plan).expect("plan redaction succeeds");
+        let value = redacted.replace_display[0]
+            .previous_attributes
+            .get("password")
+            .expect("previous password attribute");
+
+        match value {
+            Value::Concrete(ConcreteValue::String(redacted_secret)) => {
+                assert!(redacted_secret.starts_with(SECRET_PREFIX));
+                assert!(!redacted_secret.contains("previous-secret"));
+            }
+            other => panic!("expected concrete redacted secret string, got {other:?}"),
         }
     }
 }

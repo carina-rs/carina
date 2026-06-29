@@ -236,7 +236,7 @@ The call graph that must thread `.await`:
 **synchronous** is the only non-mechanical part. All 8 call sites were
 audited (`carina-core/src/executor/{basic,replace,phased}.rs`); every
 one is inside an `async fn` already: `execute_basic_effect`,
-`execute_cbd_replace_parallel`, `execute_dbd_replace_parallel`,
+legacy create-before-delete replace helper, legacy delete-before-create replace helper,
 `execute_effects_phased`. There is **no** synchronous leaf caller, so
 the change is `.await`-threading through already-async frames, not a
 sync→async inversion anywhere.

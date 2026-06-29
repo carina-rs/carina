@@ -295,10 +295,6 @@ fn effect_required_ops(effect: &Effect) -> Vec<(ResourceId, PlanOp)> {
         Effect::Read { resource } => vec![(resource.id.clone(), PlanOp::Read)],
         Effect::Create(resource) => vec![(resource.id.clone(), PlanOp::Create)],
         Effect::Update { to, .. } => vec![(to.id.clone(), PlanOp::Update)],
-        Effect::Replace { to, .. } => vec![
-            (to.id.clone(), PlanOp::Delete),
-            (to.id.clone(), PlanOp::Create),
-        ],
         Effect::Delete { id, .. } => vec![(id.clone().into_inner(), PlanOp::Delete)],
         Effect::Import { id, .. } => vec![(id.clone().into_inner(), PlanOp::Read)],
         Effect::DeferredCreate { template, .. } => effect_required_ops(&Effect::Create(
@@ -325,7 +321,6 @@ fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
         Effect::Read { resource } => vec![&resource.id],
         Effect::Create(resource) => vec![&resource.id],
         Effect::Update { to, .. } => vec![&to.id],
-        Effect::Replace { to, .. } => vec![&to.id],
         Effect::Delete { id, .. } => vec![id.as_inner()],
         Effect::Import { id, .. } => vec![id.as_inner()],
         Effect::Remove { id, .. } => vec![id.as_inner()],
@@ -755,7 +750,6 @@ fn plan_op_rank(op: PlanOp) -> u8 {
 mod tests {
     use super::*;
     use aws_sdk_iam::error::ErrorMetadata;
-    use carina_core::effect::ChangedCreateOnly;
     use carina_core::parser::{DeferredForExpression, ForBinding};
     use carina_core::provider::{
         BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
@@ -846,15 +840,16 @@ mod tests {
             to: resolved(update_to),
             changed_attributes: vec!["cidr".to_string()],
         });
-        plan.add(Effect::Replace {
-            from: Box::new(State::not_found(replace_id.clone())),
-            to: resolved(replace_to),
+        plan.add(Effect::Delete {
+            id: carina_core::resource::ResolvedResourceId::new(replace_id.clone()),
+            identifier: "bucket-old".to_string(),
             directives: Default::default(),
-            changed_create_only: ChangedCreateOnly::new(vec!["name".to_string()]).unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
+            binding: None,
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
+        plan.add(Effect::Create(resolved(replace_to)));
         plan.add(Effect::Delete {
             id: carina_core::resource::ResolvedResourceId::new(delete_id.clone()),
             identifier: "role-id".to_string(),

@@ -103,7 +103,6 @@ impl<'a> ReplaceDisplayInfo<'a> {
     }
 }
 
-#[allow(dead_code)] // Phase 3 staging API; wired into the differ in Phase 4.
 pub(crate) struct ReplacementGroup {
     /// Create-side payload (identity-resolved).
     pub create: ResolvedResource,
@@ -129,7 +128,6 @@ pub(crate) struct ReplacementGroup {
     pub previous_attributes: HashMap<String, Value>,
 }
 
-#[allow(dead_code)] // Phase 3 staging API; wired into the differ in Phase 4.
 pub(crate) struct ReplacementDelete {
     pub id: ResolvedResourceId,
     pub identifier: String,
@@ -161,7 +159,6 @@ impl Plan {
         self.effects.push(effect);
     }
 
-    #[allow(dead_code)] // Phase 3 staging API; wired into the differ in Phase 4.
     pub(crate) fn add_replacement(&mut self, group: ReplacementGroup) {
         let delete = group.delete;
         let delete_effect = Effect::Delete {
@@ -212,6 +209,10 @@ impl Plan {
         self.replace_display
             .iter()
             .map(ReplaceDisplayInfo::from_metadata)
+    }
+
+    pub(crate) fn replace_display_mut(&mut self) -> &mut Vec<ReplaceDisplayMetadata> {
+        &mut self.replace_display
     }
 
     pub fn permanent_name_overrides_for_state(
@@ -275,106 +276,6 @@ impl Plan {
         self.effects.retain(f);
     }
 
-    /// Set cascading updates on Replace effects that match the given replaced bindings.
-    pub fn set_cascading_updates(
-        &mut self,
-        replaced_bindings: &std::collections::HashSet<String>,
-        updates_by_binding: &std::collections::HashMap<String, Vec<crate::effect::CascadingUpdate>>,
-    ) {
-        for effect in &mut self.effects {
-            if let Effect::Replace {
-                to,
-                cascading_updates,
-                ..
-            } = effect
-            {
-                let binding = to.binding.clone();
-                if let Some(binding) = binding
-                    && replaced_bindings.contains(&binding)
-                    && let Some(updates) = updates_by_binding.get(&binding)
-                {
-                    *cascading_updates = updates.clone();
-                }
-            }
-        }
-    }
-
-    /// Merge cascade-triggered create-only attributes into existing effects.
-    ///
-    /// For a resource already in the plan:
-    /// - If it is a Replace, add the new create-only attrs to `changed_create_only`
-    /// - If it is an Update, upgrade it to a Replace with the cascade attrs as `changed_create_only`
-    /// - Other effect types (Create, Delete, Read) are left unchanged
-    pub fn merge_cascade_create_only(
-        &mut self,
-        resource_id: &crate::resource::ResourceId,
-        cascade_attrs: ChangedCreateOnly,
-        directives: crate::resource::Directives,
-        ref_hints: Vec<(String, String)>,
-    ) {
-        for effect in &mut self.effects {
-            match effect {
-                Effect::Replace {
-                    to,
-                    changed_create_only,
-                    cascade_ref_hints,
-                    ..
-                } if to.id == *resource_id => {
-                    for attr in cascade_attrs.iter() {
-                        if !changed_create_only.contains(attr) {
-                            changed_create_only.push(attr.to_string());
-                        }
-                    }
-                    for hint in &ref_hints {
-                        if !cascade_ref_hints.contains(hint) {
-                            cascade_ref_hints.push(hint.clone());
-                        }
-                    }
-                    return;
-                }
-                Effect::Update { to, .. } if to.id == *resource_id => {
-                    // Take ownership of the Update fields and upgrade to Replace.
-                    // The `Create` here is a throwaway placeholder overwritten
-                    // on the next line.
-                    let placeholder = crate::resource::ResolvedResource::new(
-                        crate::resource::Resource::new("__placeholder", "__placeholder"),
-                    );
-                    let old = std::mem::replace(effect, Effect::Create(placeholder));
-                    if let Effect::Update { from, to, .. } = old {
-                        *effect = Effect::Replace {
-                            from,
-                            to,
-                            directives,
-                            changed_create_only: cascade_attrs,
-                            cascading_updates: vec![],
-                            temporary_name: None,
-                            cascade_ref_hints: ref_hints,
-                        };
-                    }
-                    return;
-                }
-                Effect::DeferredReplace { .. } => {}
-                _ => {}
-            }
-        }
-    }
-
-    /// Promote a Replace effect to create_before_destroy.
-    ///
-    /// This is used by auto-detection: when a resource being replaced is
-    /// referenced by other resources, it should use create_before_destroy
-    /// to avoid breaking dependents during replacement.
-    pub fn promote_to_create_before_destroy(&mut self, resource_id: &crate::resource::ResourceId) {
-        for effect in &mut self.effects {
-            if let Effect::Replace { to, directives, .. } = effect
-                && to.id == *resource_id
-            {
-                directives.create_before_destroy = true;
-                return;
-            }
-        }
-    }
-
     /// Number of mutating Effects
     pub fn mutation_count(&self) -> usize {
         self.effects.iter().filter(|e| e.is_mutating()).count()
@@ -421,12 +322,6 @@ impl Plan {
                     }
                 }
                 Effect::Update { .. } => summary.update += 1,
-                Effect::Replace {
-                    cascading_updates, ..
-                } => {
-                    summary.replace += 1;
-                    summary.update += cascading_updates.len();
-                }
                 Effect::Delete { .. } => {
                     if !replacement_delete_indices.contains(&idx) {
                         summary.delete += 1;
@@ -589,7 +484,6 @@ impl ModularPlan {
             let source = match effect {
                 Effect::Create(r) => Self::extract_source(&r.module_source),
                 Effect::Update { to, .. } => Self::extract_source(&to.module_source),
-                Effect::Replace { to, .. } => Self::extract_source(&to.module_source),
                 Effect::Read { resource } => Self::extract_source(&resource.module_source),
                 Effect::Delete { .. }
                 | Effect::Import { .. }
@@ -692,7 +586,6 @@ fn format_effect_brief(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("{} {}", effect.display_glyph(), r.id),
         Effect::Update { to, .. } => format!("{} {}", effect.display_glyph(), to.id),
-        Effect::Replace { to, .. } => format!("{} {}", effect.display_glyph(), to.id),
         Effect::Delete { id, .. } => format!("{} {}", effect.display_glyph(), id),
         Effect::Read { resource } => {
             format!("{} {} (data source)", effect.display_glyph(), resource.id)
@@ -1133,89 +1026,6 @@ mod tests {
                 .unwrap()
                 .len(),
             1
-        );
-    }
-
-    #[test]
-    fn plan_summary_counts_cascading_updates() {
-        use crate::effect::CascadingUpdate;
-        use crate::resource::State;
-        use crate::resource::{Directives, ResourceId};
-
-        let mut plan = Plan::new();
-
-        // A Replace effect with one cascading update
-        let from = State::not_found(ResourceId::with_identity("ec2.Vpc", "vpc"))
-            .with_identifier("vpc-123");
-        let to = Resource::new("ec2.Vpc", "vpc");
-        let cascading = CascadingUpdate {
-            from: Box::new(
-                State::not_found(ResourceId::with_identity("ec2.Subnet", "subnet"))
-                    .with_identifier("subnet-123"),
-            ),
-            to: resolved(Resource::new("ec2.Subnet", "subnet")),
-        };
-        plan.add(Effect::Replace {
-            from: Box::new(from),
-            to: resolved(to),
-            directives: Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                "cidr_block".to_string(),
-            ])
-            .unwrap(),
-            cascading_updates: vec![cascading],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        });
-
-        let summary = plan.summary();
-        assert_eq!(summary.replace, 1);
-        assert_eq!(summary.update, 1, "cascading updates should be counted");
-        assert_eq!(summary.create, 0);
-        assert_eq!(summary.delete, 0);
-    }
-
-    #[test]
-    fn plan_summary_display_includes_cascading_updates() {
-        use crate::effect::CascadingUpdate;
-        use crate::resource::State;
-        use crate::resource::{Directives, ResourceId};
-
-        let mut plan = Plan::new();
-
-        let from = State::not_found(ResourceId::with_identity("ec2.Vpc", "vpc"))
-            .with_identifier("vpc-123");
-        let to = Resource::new("ec2.Vpc", "vpc");
-        let cascading = CascadingUpdate {
-            from: Box::new(
-                State::not_found(ResourceId::with_identity("ec2.Subnet", "subnet"))
-                    .with_identifier("subnet-123"),
-            ),
-            to: resolved(Resource::new("ec2.Subnet", "subnet")),
-        };
-        plan.add(Effect::Replace {
-            from: Box::new(from),
-            to: resolved(to),
-            directives: Directives::default(),
-            changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                "cidr_block".to_string(),
-            ])
-            .unwrap(),
-            cascading_updates: vec![cascading],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        });
-
-        let display = format!("{}", plan.summary());
-        assert!(
-            display.contains("1 to update"),
-            "display should show cascading updates: {}",
-            display
-        );
-        assert!(
-            display.contains("1 to replace"),
-            "display should show replace: {}",
-            display
         );
     }
 

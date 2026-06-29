@@ -187,7 +187,7 @@ pub enum PlanOp {
 }
 ```
 
-`Effect::Replace` は `Delete` と `Create` の二回問い合わせる。
+the legacy replace effect は `Delete` と `Create` の二回問い合わせる。
 `Effect::Remove` / `Effect::Move` / `Effect::Wait` は state 操作の
 みで provider に触らないので問い合わせない。`Effect::Import` は
 read として扱う。

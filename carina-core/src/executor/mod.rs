@@ -9,8 +9,7 @@
 //! - `basic`: Single-effect execution (Create/Update/Delete), resource resolution, binding map
 //! - `parallel`: Dependency computation and fine-grained parallel scheduling
 //! - `deferred_dispatch`: DeferredCreate and DeferredReplace materialization/dispatch
-//! - `replace`: Replace effect orchestration (CBD and DBD)
-//! - `phased`: Interdependent Replace ordering (4-phase execution)
+//! - `replace`: Shared update patch helpers
 
 pub(crate) mod basic;
 mod deferred_dispatch;
@@ -18,7 +17,6 @@ pub mod normalized;
 #[cfg(test)]
 mod normalized_tests;
 mod parallel;
-mod phased;
 mod replace;
 pub(super) mod scheduler;
 pub(crate) mod wait;
@@ -39,7 +37,6 @@ use crate::value::SerializationError;
 use crate::wait::WaitObservation;
 
 use parallel::execute_effects_sequential;
-use phased::{execute_effects_phased, has_interdependent_replaces};
 use tokio_util::sync::CancellationToken;
 
 pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
@@ -222,7 +219,6 @@ pub trait ExecutionObserver: Send + Sync {
 ///
 /// This function contains the core execution logic, including:
 /// - Reference resolution via the canonical `ResolvedBindings` view
-/// - 3-phase Replace ordering for interdependent replaces
 /// - Binding map updates after each effect
 /// - Failure propagation (failed_bindings)
 /// - Dependency skip
@@ -233,11 +229,8 @@ pub async fn execute_plan(
     observer: &dyn ExecutionObserver,
     cancel: CancellationToken,
 ) -> ExecutionOutcome {
-    let (result, was_cancelled) = if has_interdependent_replaces(input.plan.effects()) {
-        execute_effects_phased(provider, &mut input, observer, &cancel).await
-    } else {
-        execute_effects_sequential(provider, &mut input, observer, &cancel).await
-    };
+    let (result, was_cancelled) =
+        execute_effects_sequential(provider, &mut input, observer, &cancel).await;
     if was_cancelled {
         ExecutionOutcome::Cancelled(result)
     } else {
