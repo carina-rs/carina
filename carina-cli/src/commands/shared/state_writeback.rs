@@ -678,10 +678,13 @@ fn decompose<'a>(
         }
     }
 
-    for effect in plan.effects() {
+    for (idx, effect) in plan.effects().iter().enumerate() {
         for id in
             effect.writeback_cleanup_ids(successfully_deleted, &|id| wb.upserts.contains_key(id))
         {
+            if plan.is_replacement_delete_index(idx) && wb.upserts.contains_key(&id) {
+                continue;
+            }
             wb.add_cleanup(id)?;
         }
     }

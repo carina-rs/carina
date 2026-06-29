@@ -88,6 +88,16 @@ impl crate::provider::Provider for HintProvider {
     }
 }
 
+fn replacement_metadata<'a>(
+    plan: &'a Plan,
+    id: &ResourceId,
+) -> &'a crate::plan::ReplaceDisplayMetadata {
+    plan.replace_display
+        .iter()
+        .find(|metadata| plan.effects()[metadata.create_idx].resource_id() == id)
+        .unwrap_or_else(|| panic!("replacement metadata for {id} not found"))
+}
+
 #[test]
 fn create_before_destroy_generates_temporary_name_for_unique_name_attribute() {
     use crate::schema::{AttributeSchema, AttributeType};
@@ -144,33 +154,31 @@ fn create_before_destroy_generates_temporary_name_for_unique_name_attribute() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace {
-            temporary_name, to, ..
-        } => {
-            let temp = temporary_name.as_ref().expect(
-                "Should have temporary_name for create_before_destroy with unique_name_attribute",
-            );
-            assert_eq!(temp.attribute, "bucket_name");
-            assert_eq!(temp.original_value, "my-bucket");
-            assert!(
-                temp.temporary_value.starts_with("my-bucket-"),
-                "Temporary value '{}' should start with 'my-bucket-'",
-                temp.temporary_value
-            );
-            assert_eq!(temp.temporary_value.len(), "my-bucket-".len() + 8);
-            // bucket_name is create-only, so can_rename should be false
-            assert!(!temp.can_rename);
-            // The `to` resource should have the temporary name
-            assert_eq!(
-                to.get_attr("bucket_name"),
-                Some(&Value::Concrete(ConcreteValue::String(
-                    temp.temporary_value.clone()
-                )))
-            );
-        }
-        other => panic!("Expected Replace, got {:?}", other),
+    assert_eq!(plan.effects().len(), 2);
+    let metadata =
+        replacement_metadata(&plan, &ResourceId::with_identity("s3.Bucket", "my-bucket"));
+    let temp = metadata
+        .temporary_name
+        .as_ref()
+        .expect("Should have temporary_name for create_before_destroy with unique_name_attribute");
+    assert_eq!(temp.attribute, "bucket_name");
+    assert_eq!(temp.original_value, "my-bucket");
+    assert!(
+        temp.temporary_value.starts_with("my-bucket-"),
+        "Temporary value '{}' should start with 'my-bucket-'",
+        temp.temporary_value
+    );
+    assert_eq!(temp.temporary_value.len(), "my-bucket-".len() + 8);
+    // bucket_name is create-only, so can_rename should be false
+    assert!(!temp.can_rename);
+    match &plan.effects()[metadata.create_idx] {
+        Effect::Create(to) => assert_eq!(
+            to.get_attr("bucket_name"),
+            Some(&Value::Concrete(ConcreteValue::String(
+                temp.temporary_value.clone()
+            )))
+        ),
+        other => panic!("Expected replacement Create, got {:?}", other),
     }
 }
 
@@ -234,17 +242,18 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace { temporary_name, .. } => {
-            let temp = temporary_name.as_ref().expect("Should have temporary_name");
-            assert_eq!(temp.attribute, "log_group_name");
-            assert_eq!(temp.original_value, "my-log-group");
-            // log_group_name is not create-only, so can_rename should be true
-            assert!(temp.can_rename);
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert_eq!(plan.effects().len(), 2);
+    let temp = replacement_metadata(
+        &plan,
+        &ResourceId::with_identity("logs.LogGroup", "my-log-group"),
+    )
+    .temporary_name
+    .as_ref()
+    .expect("Should have temporary_name");
+    assert_eq!(temp.attribute, "log_group_name");
+    assert_eq!(temp.original_value, "my-log-group");
+    // log_group_name is not create-only, so can_rename should be true
+    assert!(temp.can_rename);
 }
 
 #[test]
@@ -303,16 +312,13 @@ fn no_temporary_name_without_create_before_destroy() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace { temporary_name, .. } => {
-            assert!(
-                temporary_name.is_none(),
-                "Should not have temporary_name without create_before_destroy"
-            );
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert_eq!(plan.effects().len(), 2);
+    assert!(
+        replacement_metadata(&plan, &ResourceId::with_identity("s3.Bucket", "my-bucket"))
+            .temporary_name
+            .is_none(),
+        "Should not have temporary_name without create_before_destroy"
+    );
 }
 
 #[test]
@@ -375,20 +381,17 @@ fn no_temporary_name_when_name_prefix_is_used() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace { temporary_name, .. } => {
-            assert!(
-                temporary_name.is_none(),
-                "Should not generate temporary_name when name_prefix is used"
-            );
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert_eq!(plan.effects().len(), 2);
+    assert!(
+        replacement_metadata(&plan, &ResourceId::with_identity("s3.Bucket", "my-bucket"))
+            .temporary_name
+            .is_none(),
+        "Should not generate temporary_name when name_prefix is used"
+    );
 }
 
 #[test]
-fn no_temporary_name_without_unique_name_attribute_in_schema() {
+fn create_before_destroy_without_unique_name_attribute_emits_plan_error() {
     use crate::schema::{AttributeSchema, AttributeType};
 
     let mut resource = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
@@ -431,16 +434,17 @@ fn no_temporary_name_without_unique_name_attribute_in_schema() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace { temporary_name, .. } => {
-            assert!(
-                temporary_name.is_none(),
-                "Should not generate temporary_name without unique_name_attribute in schema"
-            );
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert!(plan.effects().is_empty());
+    assert!(plan.has_errors());
+    assert_eq!(
+        plan.errors()[0].resource_id,
+        ResourceId::with_identity("ec2.Vpc", "my-vpc")
+    );
+    assert!(
+        plan.errors()[0]
+            .message
+            .contains("has no unique_name_attribute")
+    );
 }
 
 #[test]
@@ -501,16 +505,13 @@ fn no_temporary_name_when_unique_name_attribute_changes() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace { temporary_name, .. } => {
-            assert!(
-                temporary_name.is_none(),
-                "Should not generate temporary_name when unique_name_attribute value changes"
-            );
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert_eq!(plan.effects().len(), 2);
+    assert!(
+        replacement_metadata(&plan, &ResourceId::with_identity("s3.Bucket", "my-bucket"))
+            .temporary_name
+            .is_none(),
+        "Should not generate temporary_name when unique_name_attribute value changes"
+    );
 }
 
 #[test]

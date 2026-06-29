@@ -11,7 +11,7 @@ use futures::stream::{self, StreamExt};
 use carina_core::binding_index::{ResolvedBindings, WaitAliasSpec};
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
-use carina_core::differ::{cascade_dependent_updates, create_plan};
+use carina_core::differ::create_plan_with_cascades;
 use carina_core::executor::normalized::apply_desired_normalization;
 use carina_core::executor::{
     ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult, UnresolvedResource,
@@ -1372,9 +1372,10 @@ async fn run_apply_locked(
         .map(|sf| sf.build_directives())
         .unwrap_or_default();
     let schemas = ctx.schemas();
-    let mut plan = create_plan(
+    let mut plan = create_plan_with_cascades(
         &resources_for_plan,
         &data_sources_for_plan,
+        &sorted_resources,
         &provider,
         &plan_input_states,
         &directives_map,
@@ -1384,10 +1385,6 @@ async fn run_apply_locked(
         &orphan_dependencies,
         &wait_bindings,
     );
-
-    // Populate cascading updates for create_before_destroy Replace effects.
-    // Uses unresolved resources (sorted_resources) so dependents retain ResourceRef values.
-    cascade_dependent_updates(&mut plan, &sorted_resources, &plan_input_states, schemas);
 
     // Add state block effects (import/removed/moved) to the plan.
     // carina#3329: resolve `import { id = "${…}|…" }` interpolations

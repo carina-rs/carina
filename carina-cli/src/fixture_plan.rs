@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use carina_core::config_loader::{get_base_dir, load_configuration};
 use carina_core::deps::sort_resources_by_dependencies;
-use carina_core::differ::{cascade_dependent_updates, create_plan};
+use carina_core::differ::create_plan_with_cascades;
 use carina_core::executor::normalized::apply_desired_normalization_slice;
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
@@ -378,9 +378,10 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             .cloned(),
     );
     let plan_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
-    let mut plan = create_plan(
+    let mut plan = create_plan_with_cascades(
         &resources,
         &data_sources_for_plan,
+        &sorted_resources,
         &carina_core::provider::ProviderRouter::new(),
         &plan_input_states,
         &directives_map,
@@ -389,13 +390,6 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &prev_explicit,
         &orphan_dependencies,
         &wait_bindings,
-    );
-
-    cascade_dependent_updates(
-        &mut plan,
-        &sorted_resources,
-        &plan_input_states,
-        wiring.schemas(),
     );
 
     crate::wiring::add_state_block_effects(

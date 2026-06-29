@@ -107,12 +107,8 @@ impl Plan {
 
     #[allow(dead_code)] // Phase 3 staging API; wired into the differ in Phase 4.
     pub(crate) fn add_replacement(&mut self, group: ReplacementGroup) {
-        let create_idx = self.effects.len();
-        self.effects.push(Effect::Create(group.create));
-
-        let delete_idx = self.effects.len();
         let delete = group.delete;
-        self.effects.push(Effect::Delete {
+        let delete_effect = Effect::Delete {
             id: delete.id,
             identifier: delete.identifier,
             directives: delete.directives,
@@ -120,7 +116,21 @@ impl Plan {
             dependencies: delete.dependencies,
             explicit_dependencies: delete.explicit_dependencies,
             blocked_by_updates: group.consumer_updates,
-        });
+        };
+
+        let (create_idx, delete_idx) = if group.create_before_destroy {
+            let create_idx = self.effects.len();
+            self.effects.push(Effect::Create(group.create));
+            let delete_idx = self.effects.len();
+            self.effects.push(delete_effect);
+            (create_idx, delete_idx)
+        } else {
+            let delete_idx = self.effects.len();
+            self.effects.push(delete_effect);
+            let create_idx = self.effects.len();
+            self.effects.push(Effect::Create(group.create));
+            (create_idx, delete_idx)
+        };
 
         self.replace_display.push(ReplaceDisplayMetadata {
             create_idx,
@@ -135,6 +145,16 @@ impl Plan {
 
     pub fn effects(&self) -> &[Effect] {
         &self.effects
+    }
+
+    pub fn is_replacement_delete_index(&self, idx: usize) -> bool {
+        self.replace_display
+            .iter()
+            .any(|metadata| metadata.delete_idx == idx)
+    }
+
+    pub(crate) fn effects_mut(&mut self) -> &mut Vec<Effect> {
+        &mut self.effects
     }
 
     // No `Plan::is_empty()`: it ambiguously straddled "no effects at

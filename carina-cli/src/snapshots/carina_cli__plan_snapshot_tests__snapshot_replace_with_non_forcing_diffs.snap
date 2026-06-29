@@ -4,10 +4,11 @@ expression: output
 ---
 Execution Plan:
 
-  -/+ test.test.Widget web_acl (must be replaced)
-      description: "old description" → "new description"
-      external_name: "edge-old" → "edge-new" (forces replacement)
-      metric_name: "edge-old-metric" → "edge-new-metric"
-      # (1 unchanged attribute hidden)
+  - test.test.Widget web_acl
+  + test.test.Widget web_acl
+      description: "new description"
+      external_name: "edge-new"
+      metric_name: "edge-new-metric"
+      scope: "CLOUDFRONT"
 
-Plan: 0 to add, 0 to change, 1 to replace, 0 to destroy.
+Plan: 1 to add, 0 to change, 1 to destroy.
