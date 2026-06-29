@@ -40,9 +40,9 @@ pub(super) fn expand_deferred_replace_effects(plan_effects: &[Effect]) -> Expand
     let mut deferred_replace_delete_deps = Vec::new();
 
     for effect in plan_effects {
-        if let Effect::DeferredReplace { deletes, .. } = effect {
-            let mut delete_indices = Vec::with_capacity(deletes.len());
-            for delete in deletes.iter() {
+        if let Effect::DeferredReplace(payload) = effect {
+            let mut delete_indices = Vec::with_capacity(payload.deletes.len());
+            for delete in payload.deletes.iter() {
                 let delete_idx = effects.len();
                 effects.push(delete.to_delete_effect());
                 delete_indices.push(delete_idx);
@@ -392,7 +392,7 @@ pub(super) async fn execute_effects_sequential(
                         Effect::DeferredCreate { .. } => unreachable!(
                             "DeferredCreate is handled synchronously before provider dispatch"
                         ),
-                        Effect::DeferredReplace { .. } => unreachable!(
+                        Effect::DeferredReplace(_) => unreachable!(
                             "DeferredReplace is handled synchronously before provider dispatch"
                         ),
                         Effect::Wait {
@@ -838,7 +838,7 @@ mod tests {
                     resource.id.clone(),
                     UnresolvedResource::from_pre_resolve(resource.as_inner().clone()),
                 )),
-                Effect::DeferredReplace { .. } => None,
+                Effect::DeferredReplace(_) => None,
                 _ => None,
             })
             .collect();

@@ -68,7 +68,7 @@ impl Sigil {
         let rendered = match effect {
             Effect::Create(_) | Effect::DeferredCreate { .. } => raw.green().bold(),
             Effect::Update { .. } => raw.yellow().bold(),
-            Effect::DeferredReplace { .. } => raw.magenta().bold(),
+            Effect::DeferredReplace(_) => raw.magenta().bold(),
             Effect::Delete { .. } => raw.red().bold(),
             Effect::Read { .. } | Effect::Import { .. } => raw.cyan().bold(),
             // carina#3332: the previous `x` (red, bold) shape-collides
@@ -804,19 +804,40 @@ impl<'a> TreeRenderContext<'a> {
                 upstream_binding,
                 template,
                 ..
-            }
-            | Effect::DeferredReplace {
-                upstream_binding,
-                template,
-                ..
             } => {
                 let verb = deferred_for_verb(self.plan, upstream_binding);
                 let display_name = deferred_for_display_name(template, upstream_binding, verb);
-                let display_name = if matches!(effect, Effect::DeferredReplace { .. }) {
-                    display_name.magenta().bold()
+                let display_name = display_name.green().bold();
+                writeln!(
+                    self.out,
+                    "{}{} {}",
+                    line_prefix,
+                    template.resource_type.cyan().bold(),
+                    display_name
+                )
+                .unwrap();
+                let attr_prefix = if indent == 0 {
+                    format!("{}{}", base_indent, attr_base)
                 } else {
-                    display_name.green().bold()
+                    let continuation = if is_last {
+                        format!("{}{}", prefix, SPACE_CONTINUATION)
+                    } else {
+                        format!("{}{}", prefix, VERTICAL_CONTINUATION)
+                    };
+                    format!("{}{}{}", base_indent, continuation, SPACE_CONTINUATION)
                 };
+                for row in deferred_for_detail_rows(template, upstream_binding, verb) {
+                    render_detail_row(&mut self.out, &row, effect, &attr_prefix);
+                }
+                has_displayed_attrs = true;
+            }
+            Effect::DeferredReplace(payload) => {
+                let upstream_binding = payload.upstream_binding.as_str();
+                let template = payload.template.as_ref();
+                let verb = deferred_for_verb(self.plan, upstream_binding);
+                let display_name = deferred_for_display_name(template, upstream_binding, verb)
+                    .magenta()
+                    .bold();
                 writeln!(
                     self.out,
                     "{}{} {}",
@@ -965,7 +986,7 @@ impl<'a> TreeRenderContext<'a> {
             | Effect::Remove { .. }
             | Effect::Wait { .. }
             | Effect::DeferredCreate { .. }
-            | Effect::DeferredReplace { .. } => true,
+            | Effect::DeferredReplace(_) => true,
         }
     }
 
@@ -1100,7 +1121,7 @@ fn format_plan_tree<'a>(
         .filter_map(|(idx, e)| match e {
             Effect::Update { to, .. } => Some(to.id.clone()),
             Effect::Create(r) if replacement_create_info.contains_key(&idx) => Some(r.id.clone()),
-            Effect::DeferredReplace { .. } => None,
+            Effect::DeferredReplace(_) => None,
             _ => None,
         })
         .collect();
@@ -2247,15 +2268,11 @@ pub fn format_effect(effect: &Effect) -> String {
                 upstream_binding
             )
         }
-        Effect::DeferredReplace {
-            id,
-            upstream_binding,
-            ..
-        } => {
+        Effect::DeferredReplace(payload) => {
             format!(
                 "Deferred replace {} (waits on {})",
-                id.human(),
-                upstream_binding
+                payload.id.human(),
+                payload.upstream_binding
             )
         }
     }

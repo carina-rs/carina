@@ -16,7 +16,7 @@ use carina_core::binding_index::{PreApplyInputs, ResolvedBindings, WaitAliasSpec
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::binding_matches_deferred_template;
 use carina_core::differ::create_plan_with_cascades;
-use carina_core::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes};
+use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes};
 use carina_core::executor::normalized::{
     is_value_fully_concrete_for_expansion, restore_stripped_attributes,
     run_desired_normalization_stages, states_contain_unknown, strip_provider_boundary_attributes,
@@ -1465,12 +1465,12 @@ impl DeferredCreateTarget {
     }
 
     fn to_deferred_replace_effect(&self, deletes: Vec<DeferredReplaceDelete>) -> Effect {
-        Effect::DeferredReplace {
+        Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(deletes).expect("planner checked non-empty deletes"),
             id: carina_core::resource::ResolvedResourceId::new(self.id.clone()),
             upstream_binding: self.upstream_binding.clone(),
             template: Box::new(self.template.clone()),
-        }
+        }))
     }
 }
 

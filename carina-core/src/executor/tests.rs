@@ -2,7 +2,7 @@ use super::*;
 use crate::effect::deps::{
     ScheduleInputs, build_effect_dependency_analysis as build_dependency_analysis,
 };
-use crate::effect::{DeferredReplaceDelete, NonEmptyDeletes};
+use crate::effect::{DeferredReplaceDelete, DeferredReplacePayload, NonEmptyDeletes};
 use crate::plan::Plan;
 use crate::provider::{
     BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError, ProviderResult,
@@ -4794,7 +4794,7 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
     cert.binding = Some("cert".to_string());
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
-    plan.add(Effect::DeferredReplace {
+    plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
         deletes: NonEmptyDeletes::try_new(vec![
             DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -4828,7 +4828,7 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
         )),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
-    });
+    })));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -4899,7 +4899,7 @@ async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
     cert.binding = Some("cert".to_string());
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
-    plan.add(Effect::DeferredReplace {
+    plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "test",
@@ -4919,7 +4919,7 @@ async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
         )),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
-    });
+    })));
 
     let input = ExecutionInput {
         plan: &plan,
@@ -5133,7 +5133,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
     let cert_id = cert.id.clone();
     plan.add(create_effect(cert.clone()));
     plan.add(create_effect(resource_with_binding("alb", "alb")));
-    plan.add(Effect::DeferredReplace {
+    plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "test",
@@ -5153,7 +5153,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
         )),
         upstream_binding: "cert".to_string(),
         template: Box::new(validation_deferred_for_expression()),
-    });
+    })));
 
     let unresolved = HashMap::from([(cert_id, UnresolvedResource::from_pre_resolve(cert.clone()))]);
     let input = ExecutionInput {

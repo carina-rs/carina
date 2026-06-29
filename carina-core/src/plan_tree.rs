@@ -47,11 +47,9 @@ pub fn deferred_summary_for_plan(plan: &Plan) -> DeferredSummaryForPlan {
                 verb: deferred_for_verb(plan, upstream_binding).to_string(),
                 action: DeferredSummaryAction::Add,
             }),
-            Effect::DeferredReplace {
-                upstream_binding, ..
-            } => Some(DeferredSummaryEntry {
-                upstream_binding: upstream_binding.clone(),
-                verb: deferred_for_verb(plan, upstream_binding).to_string(),
+            Effect::DeferredReplace(payload) => Some(DeferredSummaryEntry {
+                upstream_binding: payload.upstream_binding.clone(),
+                verb: deferred_for_verb(plan, &payload.upstream_binding).to_string(),
                 action: DeferredSummaryAction::Replace,
             }),
             _ => None,
@@ -272,24 +270,18 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                     effect_deps.insert(idx, HashSet::from([upstream_binding.clone()]));
                     continue;
                 }
-                Effect::DeferredReplace {
-                    deletes,
-                    id,
-                    upstream_binding,
-                    template,
-                    ..
-                } => {
-                    let fallback = id.to_string();
+                Effect::DeferredReplace(payload) => {
+                    let fallback = payload.id.to_string();
                     binding_to_effect.insert(fallback.clone(), idx);
-                    binding_to_effect.insert(template.binding_name.clone(), idx);
-                    for delete in deletes {
+                    binding_to_effect.insert(payload.template.binding_name.clone(), idx);
+                    for delete in payload.deletes.iter() {
                         if let Some(binding) = &delete.binding {
                             binding_to_effect.insert(binding.clone(), idx);
                         }
                     }
                     effect_bindings.insert(idx, fallback);
                     effect_types.insert(idx, "deferred_for".to_string());
-                    effect_deps.insert(idx, HashSet::from([upstream_binding.clone()]));
+                    effect_deps.insert(idx, HashSet::from([payload.upstream_binding.clone()]));
                     continue;
                 }
             };
@@ -589,7 +581,9 @@ pub fn shorten_service_name<'a>(attr_name: &str, value: &'a str) -> Cow<'a, str>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::{ChangedCreateOnly, DeferredReplaceDelete, NonEmptyDeletes};
+    use crate::effect::{
+        ChangedCreateOnly, DeferredReplaceDelete, DeferredReplacePayload, NonEmptyDeletes,
+    };
     use crate::parser::{DeferredForExpression, ForBinding};
     use crate::plan::{Plan, ReplacementDelete, ReplacementGroup};
     use crate::resource::{
@@ -701,7 +695,7 @@ mod tests {
         };
 
         let mut plan = Plan::new();
-        plan.add(Effect::DeferredReplace {
+        plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",
@@ -721,7 +715,7 @@ mod tests {
             )),
             upstream_binding: "cert".to_string(),
             template: Box::new(deferred),
-        });
+        })));
         plan.add(Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "route53.Record",
@@ -775,7 +769,7 @@ mod tests {
         };
 
         let mut plan = Plan::new();
-        plan.add(Effect::DeferredReplace {
+        plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",
@@ -795,7 +789,7 @@ mod tests {
             )),
             upstream_binding: "cert".to_string(),
             template: Box::new(deferred),
-        });
+        })));
         plan.add(Effect::Wait {
             identity: ResourceIdentity::new("wait_validation_record_0"),
             target_id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
