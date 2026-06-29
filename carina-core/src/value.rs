@@ -1005,7 +1005,7 @@ pub fn redact_secrets_in_state(
 pub fn redact_secrets_in_effect(
     effect: &crate::effect::Effect,
 ) -> Result<crate::effect::Effect, SerializationError> {
-    use crate::effect::Effect;
+    use crate::effect::{DeferredReplacePayload, Effect};
     Ok(match effect {
         Effect::Read { resource } => Effect::Read {
             resource: crate::resource::ResolvedDataSource::new(redact_secrets_in_data_source(
@@ -1080,13 +1080,8 @@ pub fn redact_secrets_in_effect(
                 template: Box::new(redacted_template),
             }
         }
-        Effect::DeferredReplace {
-            deletes,
-            id,
-            upstream_binding,
-            template,
-        } => {
-            let mut redacted_template = (**template).clone();
+        Effect::DeferredReplace(payload) => {
+            let mut redacted_template = (*payload.template).clone();
             redacted_template.attributes = redacted_template
                 .attributes
                 .iter()
@@ -1094,12 +1089,12 @@ pub fn redact_secrets_in_effect(
                 .collect::<Result<Vec<_>, SerializationError>>()?;
             redacted_template.template_resource =
                 redact_secrets_in_managed_only(&redacted_template.template_resource)?;
-            Effect::DeferredReplace {
-                deletes: deletes.clone(),
-                id: id.clone(),
-                upstream_binding: upstream_binding.clone(),
+            Effect::DeferredReplace(Box::new(DeferredReplacePayload {
+                deletes: payload.deletes.clone(),
+                id: payload.id.clone(),
+                upstream_binding: payload.upstream_binding.clone(),
                 template: Box::new(redacted_template),
-            }
+            }))
         }
     })
 }

@@ -243,7 +243,7 @@ Once the state has been written under v8, subsequent applies do not require the 
 
 ### DBC (destroy-before-create) wording
 
-New files and new doc text use `DBC`. Older code/docs that still say `DBD` are left alone in this PR — a separate cleanup PR will sweep them together to keep the scope of this work focused.
+New files and new doc text use `DBC`. Older code/docs that still use legacy wording are left alone in this PR — a separate cleanup PR will sweep them together to keep the scope of this work focused.
 
 ## Scheduler edge summary
 
@@ -424,7 +424,7 @@ Tasks:
 
 - T9.1: Re-file or reopen the `Effect::DeferredReplace` consumer-ordering verification issue (the existing #3627 can be amended).
 - T9.2: `Delete.blocked_by_updates: HashSet<ResourceIdentity>` already adopts the typed key — close any prior follow-up issue requesting that reshape.
-- T9.3: File the repo-wide `DBD → DBC` cleanup PR for older code/docs left out of this work.
+- T9.3: File the repo-wide legacy wording cleanup PR for older code/docs left out of this work.
 
 ## Test strategy
 

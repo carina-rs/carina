@@ -2400,12 +2400,12 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
     add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));
 
     let mut deferred_replaces = plan.effects().iter().filter_map(|effect| match effect {
-        Effect::DeferredReplace {
-            deletes,
-            id,
-            upstream_binding,
-            template,
-        } => Some((deletes, id, upstream_binding, template)),
+        Effect::DeferredReplace(payload) => Some((
+            &payload.deletes,
+            &payload.id,
+            &payload.upstream_binding,
+            &payload.template,
+        )),
         _ => None,
     });
     let (deletes, id, upstream_binding, template) = deferred_replaces
@@ -2476,7 +2476,7 @@ fn deferred_create_targets_do_not_absorb_unrelated_orphan_deletes() {
         !plan
             .effects()
             .iter()
-            .any(|effect| matches!(effect, Effect::DeferredReplace { .. })),
+            .any(|effect| matches!(effect, Effect::DeferredReplace(_))),
         "unrelated delete must not be falsely absorbed"
     );
 }

@@ -300,15 +300,14 @@ fn effect_required_ops(effect: &Effect) -> Vec<(ResourceId, PlanOp)> {
         Effect::DeferredCreate { template, .. } => effect_required_ops(&Effect::Create(
             ResolvedResource::new(template.template_resource.clone()),
         )),
-        Effect::DeferredReplace {
-            deletes, template, ..
-        } => {
-            let mut ops: Vec<_> = deletes
+        Effect::DeferredReplace(payload) => {
+            let mut ops: Vec<_> = payload
+                .deletes
                 .iter()
                 .map(|delete| (delete.id.clone().into_inner(), PlanOp::Delete))
                 .collect();
             ops.extend(effect_required_ops(&Effect::Create(ResolvedResource::new(
-                template.template_resource.clone(),
+                payload.template.template_resource.clone(),
             ))));
             ops
         }
@@ -327,9 +326,9 @@ fn effect_resource_ids(effect: &Effect) -> Vec<&ResourceId> {
         Effect::Move { from, to } => vec![from.as_inner(), to.as_inner()],
         Effect::Wait { .. } => Vec::new(),
         Effect::DeferredCreate { id, .. } => vec![id.as_inner()],
-        Effect::DeferredReplace { deletes, id, .. } => {
-            let mut ids = vec![id.as_inner()];
-            ids.extend(deletes.iter().map(|delete| delete.id.as_inner()));
+        Effect::DeferredReplace(payload) => {
+            let mut ids = vec![payload.id.as_inner()];
+            ids.extend(payload.deletes.iter().map(|delete| delete.id.as_inner()));
             ids
         }
     }

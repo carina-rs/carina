@@ -879,7 +879,9 @@ mod post_apply_states_tests {
 #[cfg(test)]
 mod apply_state_save_tests {
     use super::*;
-    use carina_core::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes};
+    use carina_core::effect::{
+        DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes,
+    };
     use carina_core::parser::{DeferredForExpression, ForBinding};
     use carina_core::plan::Plan;
     use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
@@ -1066,7 +1068,7 @@ mod apply_state_save_tests {
             id.provider_instance.clone(),
         )
         .with_binding("validation_records");
-        Effect::DeferredReplace {
+        Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(vec![deferred_replace_delete(id)])
                 .expect("fixture has one delete"),
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -1086,7 +1088,7 @@ mod apply_state_save_tests {
                 binding: ForBinding::Simple("opt".to_string()),
                 template_resource,
             }),
-        }
+        }))
     }
 
     #[test]

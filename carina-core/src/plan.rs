@@ -327,7 +327,7 @@ impl Plan {
                         summary.delete += 1;
                     }
                 }
-                Effect::DeferredReplace { .. } => {}
+                Effect::DeferredReplace(_) => {}
                 Effect::Import { .. } => summary.import += 1,
                 Effect::Remove { .. } => summary.remove += 1,
                 Effect::Move { .. } => summary.moved += 1,
@@ -491,7 +491,7 @@ impl ModularPlan {
                 | Effect::Move { .. }
                 | Effect::Wait { .. }
                 | Effect::DeferredCreate { .. }
-                | Effect::DeferredReplace { .. } => ModuleSource::Root,
+                | Effect::DeferredReplace(_) => ModuleSource::Root,
             };
             modular.effect_sources.insert(idx, source);
         }
@@ -622,15 +622,11 @@ fn format_effect_brief(effect: &Effect) -> String {
             id,
             upstream_binding
         ),
-        Effect::DeferredReplace {
-            id,
-            upstream_binding,
-            ..
-        } => format!(
+        Effect::DeferredReplace(payload) => format!(
             "{} {} (deferred for replace: waits on {})",
             effect.display_glyph(),
-            id,
-            upstream_binding
+            payload.id,
+            payload.upstream_binding
         ),
     }
 }
@@ -638,6 +634,7 @@ fn format_effect_brief(effect: &Effect) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effect::DeferredReplacePayload;
     use crate::resource::{
         DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceIdentity,
     };
@@ -951,7 +948,7 @@ mod tests {
             .collect();
 
         let mut plan = Plan::new();
-        plan.add(Effect::DeferredReplace {
+        plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(deletes).expect("fixture has deletes"),
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "route53.RecordSet",
@@ -959,7 +956,7 @@ mod tests {
             )),
             upstream_binding: "cert".to_string(),
             template: Box::new(template),
-        });
+        })));
 
         let summary = plan.summary();
         assert_eq!(summary.replace, 0);

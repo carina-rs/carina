@@ -2,7 +2,7 @@ use super::*;
 
 use colored::Colorize;
 
-use carina_core::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes};
+use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes};
 use carina_core::plan::Plan;
 use carina_core::resource::{
     AccessPath, ConcreteValue, DeferredValue, Directives, ResolvedResource, Resource, ResourceId,
@@ -878,7 +878,7 @@ fn deferred_replace_validation_records_effect() -> Effect {
         unreachable!("helper constructs Delete")
     };
 
-    Effect::DeferredReplace {
+    Effect::DeferredReplace(Box::new(DeferredReplacePayload {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: delete_id,
             identifier,
@@ -892,7 +892,7 @@ fn deferred_replace_validation_records_effect() -> Effect {
         id,
         upstream_binding,
         template,
-    }
+    }))
 }
 
 #[test]

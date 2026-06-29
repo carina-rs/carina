@@ -162,6 +162,19 @@ impl From<NonEmptyDeletes> for Vec<DeferredReplaceDelete> {
     }
 }
 
+/// Payload for [`Effect::DeferredReplace`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeferredReplacePayload {
+    /// Pre-apply iterations being destroyed.
+    pub deletes: NonEmptyDeletes,
+    /// Synthetic id used for plan-tree display and progress.
+    pub id: ResolvedResourceId,
+    /// The iterable's binding name (e.g. "cert").
+    pub upstream_binding: String,
+    /// The for-expression body, replayed against the upstream state.
+    pub template: Box<DeferredForExpression>,
+}
+
 fn deferred_replace_delete_dependencies(deletes: &[DeferredReplaceDelete]) -> BTreeSet<String> {
     deletes
         .iter()
@@ -371,16 +384,7 @@ pub enum Effect {
     /// A deferred-for replacement whose delete side is known at plan time
     /// and whose create side is materialized after the upstream binding is
     /// available at apply time.
-    DeferredReplace {
-        /// Pre-apply iterations being destroyed.
-        deletes: NonEmptyDeletes,
-        /// Synthetic id used for plan-tree display and progress.
-        id: ResolvedResourceId,
-        /// The iterable's binding name (e.g. "cert").
-        upstream_binding: String,
-        /// The for-expression body, replayed against the upstream state.
-        template: Box<DeferredForExpression>,
-    },
+    DeferredReplace(Box<DeferredReplacePayload>),
 }
 
 /// A type-level narrowing of [`Effect`] to the variants the basic
@@ -573,7 +577,7 @@ impl Effect {
                 Effect::DeferredCreate { .. }
             ),
             (
-                Effect::DeferredReplace {
+                Effect::DeferredReplace(Box::new(DeferredReplacePayload {
                     deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                             "route53.Record",
@@ -604,8 +608,8 @@ impl Effect {
                         binding: crate::parser::ForBinding::Simple("opt".to_string()),
                         template_resource: Resource::new("route53.Record", "validation_records"),
                     }),
-                },
-                Effect::DeferredReplace { .. }
+                })),
+                Effect::DeferredReplace(_)
             ),
         ]
     }
@@ -626,7 +630,7 @@ impl Effect {
             Effect::Move { .. } => "->",
             Effect::Wait { .. } => ">",
             Effect::DeferredCreate { .. } => "+",
-            Effect::DeferredReplace { .. } => "+/-",
+            Effect::DeferredReplace(_) => "+/-",
         }
     }
 
@@ -689,7 +693,7 @@ impl Effect {
             | Effect::Move { .. }
             | Effect::Wait { .. }
             | Effect::DeferredCreate { .. }
-            | Effect::DeferredReplace { .. } => None,
+            | Effect::DeferredReplace(_) => None,
         }
     }
 
@@ -713,7 +717,7 @@ impl Effect {
             Effect::Move { .. } => "move",
             Effect::Wait { .. } => "wait",
             Effect::DeferredCreate { .. } => "deferred_create",
-            Effect::DeferredReplace { .. } => "deferred_replace",
+            Effect::DeferredReplace(_) => "deferred_replace",
         }
     }
 
@@ -729,7 +733,7 @@ impl Effect {
             Effect::Move { .. } => true,
             Effect::Wait { .. } => false,
             Effect::DeferredCreate { .. } => true,
-            Effect::DeferredReplace { .. } => true,
+            Effect::DeferredReplace(_) => true,
         }
     }
 
@@ -745,7 +749,7 @@ impl Effect {
             Effect::Move { .. } => true,
             Effect::Wait { .. } => false,
             Effect::DeferredCreate { .. } => false,
-            Effect::DeferredReplace { .. } => true,
+            Effect::DeferredReplace(_) => true,
         }
     }
 
@@ -762,7 +766,7 @@ impl Effect {
             Effect::Move { .. } => false,
             Effect::Wait { .. } => false,
             Effect::DeferredCreate { .. } => true,
-            Effect::DeferredReplace { .. } => true,
+            Effect::DeferredReplace(_) => true,
         }
     }
 
@@ -778,7 +782,7 @@ impl Effect {
             Effect::Move { to, .. } => to,
             Effect::Wait { target_id, .. } => target_id,
             Effect::DeferredCreate { id, .. } => id,
-            Effect::DeferredReplace { id, .. } => id,
+            Effect::DeferredReplace(payload) => &payload.id,
         }
     }
 
@@ -822,7 +826,7 @@ impl Effect {
             | Effect::Move { .. }
             | Effect::Wait { .. }
             | Effect::DeferredCreate { .. }
-            | Effect::DeferredReplace { .. } => None,
+            | Effect::DeferredReplace(_) => None,
         }
     }
 
@@ -845,7 +849,7 @@ impl Effect {
             // `plan.effects().filter_map(|e| e.binding_name())` will see
             // DeferredReplaces and skip DeferredCreates — this is intentional.
             Effect::DeferredCreate { .. } => None,
-            Effect::DeferredReplace { template, .. } => Some(template.binding_name.clone()),
+            Effect::DeferredReplace(payload) => Some(payload.template.binding_name.clone()),
         }
     }
 
@@ -876,7 +880,8 @@ impl Effect {
             Effect::Move { from, .. } => vec![from.clone().into_inner()],
             Effect::Wait { .. } => Vec::new(),
             Effect::DeferredCreate { .. } => Vec::new(),
-            Effect::DeferredReplace { deletes, .. } => deletes
+            Effect::DeferredReplace(payload) => payload
+                .deletes
                 .iter()
                 .filter(|delete| {
                     successfully_deleted.contains(delete.id.as_inner())
@@ -903,9 +908,11 @@ impl Effect {
             Effect::Move { .. } => Vec::new(),
             Effect::Wait { .. } => Vec::new(),
             Effect::DeferredCreate { .. } => Vec::new(),
-            Effect::DeferredReplace { deletes, .. } => {
-                deletes.iter().map(|delete| delete.id.as_inner()).collect()
-            }
+            Effect::DeferredReplace(payload) => payload
+                .deletes
+                .iter()
+                .map(|delete| delete.id.as_inner())
+                .collect(),
         }
     }
 
@@ -939,8 +946,8 @@ impl Effect {
                 ..
             } => explicit_dependencies.clone(),
             Effect::DeferredCreate { .. } => HashSet::new(),
-            Effect::DeferredReplace { deletes, .. } => {
-                deferred_replace_delete_explicit_dependencies(deletes)
+            Effect::DeferredReplace(payload) => {
+                deferred_replace_delete_explicit_dependencies(&payload.deletes)
             }
         }
     }
@@ -991,13 +998,9 @@ impl Effect {
             Effect::DeferredCreate {
                 upstream_binding, ..
             } => vec![upstream_binding.clone()],
-            Effect::DeferredReplace {
-                upstream_binding,
-                deletes,
-                ..
-            } => {
-                let mut deps = deferred_replace_delete_dependencies(deletes);
-                deps.insert(upstream_binding.clone());
+            Effect::DeferredReplace(payload) => {
+                let mut deps = deferred_replace_delete_dependencies(&payload.deletes);
+                deps.insert(payload.upstream_binding.clone());
                 deps.into_iter().collect()
             }
         }
@@ -1029,14 +1032,13 @@ impl Effect {
                 );
                 edges
             }
-            Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
-            | Effect::DeferredReplace { .. } => self
-                .blocking_bindings()
-                .into_iter()
-                .map(ResourceIdentity::new)
-                .map(ScheduleEdge::DependsOn)
-                .collect(),
+            Effect::Wait { .. } | Effect::DeferredCreate { .. } | Effect::DeferredReplace(_) => {
+                self.blocking_bindings()
+                    .into_iter()
+                    .map(ResourceIdentity::new)
+                    .map(ScheduleEdge::DependsOn)
+                    .collect()
+            }
             Effect::Read { .. }
             | Effect::Create(_)
             | Effect::Update { .. }
@@ -1067,7 +1069,7 @@ impl Effect {
             | Effect::Move { .. }
             | Effect::Wait { .. }
             | Effect::DeferredCreate { .. }
-            | Effect::DeferredReplace { .. } => Vec::new(),
+            | Effect::DeferredReplace(_) => Vec::new(),
         }
     }
 }
@@ -1180,7 +1182,7 @@ mod tests {
         let mut template = deferred_for_template();
         template.file = None;
         template.line = 0;
-        Effect::DeferredReplace {
+        Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",
@@ -1200,7 +1202,7 @@ mod tests {
             )),
             upstream_binding: "cert".to_string(),
             template: Box::new(template),
-        }
+        }))
     }
 
     fn every_effect_variant() -> Vec<(&'static str, Effect)> {
@@ -1384,7 +1386,7 @@ mod tests {
         let mut template = deferred_for_template();
         template.file = None;
         template.line = 0;
-        let effect = Effect::DeferredReplace {
+        let effect = Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",
@@ -1404,7 +1406,7 @@ mod tests {
             )),
             upstream_binding: "cert".to_string(),
             template: Box::new(template),
-        };
+        }));
 
         assert_eq!(
             effect.blocking_bindings(),
@@ -1417,7 +1419,7 @@ mod tests {
         let mut template = deferred_for_template();
         template.file = None;
         template.line = 0;
-        let effect = Effect::DeferredReplace {
+        let effect = Effect::DeferredReplace(Box::new(DeferredReplacePayload {
             deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",
@@ -1437,7 +1439,7 @@ mod tests {
             )),
             upstream_binding: "cert".to_string(),
             template: Box::new(template),
-        };
+        }));
 
         assert_eq!(
             effect.explicit_dependencies(),

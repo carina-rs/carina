@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use carina_cli::commands::plan::{CurrentStateEntry, PlanFile};
-use carina_core::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes};
+use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes};
 use carina_core::parser::{BackendConfig, DeferredForExpression, ForBinding, ProviderConfig};
 use carina_core::plan::Plan;
 use carina_core::resource::{
@@ -177,7 +177,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
     let mut plan = Plan::new();
     plan.add(Effect::Create(resolved(lb.clone())));
     plan.add(Effect::Create(resolved(cert.clone())));
-    plan.add(Effect::DeferredReplace {
+    plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: carina_core::resource::ResolvedResourceId::new(validation_id.clone()),
             identifier: "old-validation-id".to_string(),
@@ -194,7 +194,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         )),
         upstream_binding: "cert".to_string(),
         template: Box::new(template),
-    });
+    })));
     plan.add(Effect::Create(resolved(alias.clone())));
 
     let sorted_resources = vec![lb.clone(), cert.clone(), alias.clone()];

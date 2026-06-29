@@ -147,7 +147,7 @@ impl App {
                 Effect::Create(r) if replacement_create_info.contains_key(&idx) => {
                     Some(r.id.clone())
                 }
-                Effect::DeferredReplace { .. } => None,
+                Effect::DeferredReplace(_) => None,
                 _ => None,
             })
             .collect();
@@ -872,21 +872,21 @@ fn effect_to_node(
                 parent: None,
             }
         }
-        Effect::DeferredReplace {
-            upstream_binding,
-            template,
-            ..
-        } => {
-            let verb = deferred_for_verb(plan, upstream_binding);
-            let rows = deferred_for_detail_rows(template, upstream_binding, verb);
+        Effect::DeferredReplace(payload) => {
+            let verb = deferred_for_verb(plan, &payload.upstream_binding);
+            let rows = deferred_for_detail_rows(&payload.template, &payload.upstream_binding, verb);
             TreeNode {
                 effect_label: format!(
                     "{} {}",
-                    template.resource_type,
-                    deferred_for_display_name(template, upstream_binding, verb)
+                    payload.template.resource_type,
+                    deferred_for_display_name(&payload.template, &payload.upstream_binding, verb)
                 ),
-                resource_type: template.resource_type.clone(),
-                name_part: deferred_for_display_name(template, upstream_binding, verb),
+                resource_type: payload.template.resource_type.clone(),
+                name_part: deferred_for_display_name(
+                    &payload.template,
+                    &payload.upstream_binding,
+                    verb,
+                ),
                 symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Replace,
                 detail_rows: rows,
