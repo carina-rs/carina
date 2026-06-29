@@ -1058,6 +1058,7 @@ pub fn redact_secrets_in_effect(
             binding,
             dependencies,
             explicit_dependencies,
+            blocked_by_updates,
         } => Effect::Delete {
             id: id.clone(),
             identifier: identifier.clone(),
@@ -1065,6 +1066,7 @@ pub fn redact_secrets_in_effect(
             binding: binding.clone(),
             dependencies: dependencies.clone(),
             explicit_dependencies: explicit_dependencies.clone(),
+            blocked_by_updates: blocked_by_updates.clone(),
         },
         Effect::Import { id, identifier } => Effect::Import {
             id: id.clone(),

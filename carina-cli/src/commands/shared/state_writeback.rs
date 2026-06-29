@@ -932,6 +932,7 @@ mod apply_state_save_tests {
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::from(["cert".to_string()]),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         }
     }
 

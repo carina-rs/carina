@@ -1149,6 +1149,7 @@ fn delete_record_effect(binding: &str) -> Effect {
         binding: Some(binding.to_string()),
         dependencies: HashSet::from(["cert".to_string()]),
         explicit_dependencies: HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     }
 }
 
@@ -1168,6 +1169,7 @@ fn deferred_replace_validation_records_effect() -> Effect {
         binding,
         dependencies,
         explicit_dependencies,
+        blocked_by_updates,
     } = delete_record_effect("validation_records[0]")
     else {
         unreachable!("helper constructs Delete")
@@ -1181,6 +1183,7 @@ fn deferred_replace_validation_records_effect() -> Effect {
             binding,
             dependencies,
             explicit_dependencies,
+            blocked_by_updates,
         }])
         .expect("fixture has one delete"),
         id,
@@ -1459,6 +1462,7 @@ fn test_mixed_plan_tree_with_delete_effect() {
         binding: Some("subnet".to_string()),
         dependencies: HashSet::from(["vpc".to_string()]),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     };
 
     let mut plan = Plan::new();
@@ -1608,6 +1612,7 @@ fn format_effect_delete_uses_binding_name() {
         binding: Some("my_vpc".to_string()),
         dependencies: HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     };
     assert_eq!(format_effect(&effect), "Delete awscc.ec2.Vpc my_vpc");
 }
@@ -1626,6 +1631,7 @@ fn format_effect_delete_falls_back_to_id_name() {
         binding: None,
         dependencies: HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     };
     assert_eq!(
         format_effect(&effect),
@@ -1994,6 +2000,7 @@ fn delete_pretty_attribute_does_not_strike_indentation() {
         binding: None,
         dependencies: Default::default(),
         explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
     };
 
     // Force ANSI styling on: the test harness' stdout is not a TTY, so

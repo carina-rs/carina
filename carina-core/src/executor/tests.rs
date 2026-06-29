@@ -2641,6 +2641,7 @@ async fn test_simple_delete() {
         binding: None,
         dependencies: HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     });
 
     provider.push_delete(Ok(()));
@@ -4078,6 +4079,7 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
         binding: Some("vpc".to_string()),
         dependencies: HashSet::new(), // vpc has no deps
         explicit_dependencies: HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     });
     plan.add(Effect::Delete {
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -4089,6 +4091,7 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
         binding: Some("subnet".to_string()),
         dependencies: HashSet::from(["vpc".to_string()]), // subnet depends on vpc
         explicit_dependencies: HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     });
 
     let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
@@ -4215,6 +4218,7 @@ fn test_dependency_analysis_respects_delete_dependencies() {
         binding: Some("vpc".to_string()),
         dependencies: HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     });
     plan.add(Effect::Delete {
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -4226,6 +4230,7 @@ fn test_dependency_analysis_respects_delete_dependencies() {
         binding: Some("subnet".to_string()),
         dependencies: HashSet::from(["vpc".to_string()]),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     });
 
     let deps =
@@ -4476,6 +4481,7 @@ async fn test_delete_waits_for_replace_cbd_of_dependent() {
         binding: Some("tgw_a".to_string()),
         dependencies: tgw_a_deps,
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     });
 
     // attachment: Replace (CBD) — from depends on tgw_a
@@ -4575,6 +4581,7 @@ async fn test_delete_waits_for_replace_cbd_even_when_delete_binding_is_none() {
         binding: None,
         dependencies: tgw_a_deps,
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     });
 
     // attachment: Replace (CBD)
@@ -6340,6 +6347,7 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
                 binding: Some("validation_records[0]".to_string()),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
             },
             DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -6351,6 +6359,7 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
                 binding: Some("validation_records[1]".to_string()),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
             },
         ])
         .expect("fixture has deletes"),
@@ -6442,6 +6451,7 @@ async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         }])
         .expect("fixture has one delete"),
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -6540,6 +6550,7 @@ async fn phased_deferred_replace_gate_skips_on_absorbed_delete_failure() {
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         }])
         .expect("fixture has one delete"),
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -7356,6 +7367,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::from(["cert".to_string()]),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         }])
         .expect("fixture has one delete"),
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(

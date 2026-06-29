@@ -143,6 +143,7 @@ fn build_mixed_operations_plan() -> Plan {
         binding: Some("old_subnet".to_string()),
         dependencies: HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     });
     plan
 }
@@ -305,6 +306,7 @@ fn build_deferred_replace_plan() -> Plan {
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::from(["cert".to_string()]),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         }])
         .expect("fixture has one delete"),
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(

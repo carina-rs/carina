@@ -649,6 +649,7 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
         binding: None,
         dependencies: std::collections::HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: std::collections::HashSet::new(),
     });
 
     // `removed` block addresses are routing-agnostic by construction
@@ -2383,6 +2384,7 @@ fn delete_effect_for_binding(binding: &str) -> Effect {
         binding: Some(binding.to_string()),
         dependencies: std::collections::HashSet::from(["cert".to_string()]),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: std::collections::HashSet::new(),
     }
 }
 

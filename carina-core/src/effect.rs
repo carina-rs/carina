@@ -91,6 +91,12 @@ pub struct DeferredReplaceDelete {
     pub dependencies: HashSet<String>,
     #[serde(default)]
     pub explicit_dependencies: HashSet<String>,
+    /// Consumer effects that must complete before this delete may run.
+    ///
+    /// Identities come from [`Effect::identity`] on consumer effects
+    /// (typically `Update`, possibly `Replace` in future).
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub blocked_by_updates: HashSet<ResourceIdentity>,
 }
 
 impl DeferredReplaceDelete {
@@ -102,6 +108,7 @@ impl DeferredReplaceDelete {
             binding: self.binding.clone(),
             dependencies: self.dependencies.clone(),
             explicit_dependencies: self.explicit_dependencies.clone(),
+            blocked_by_updates: self.blocked_by_updates.clone(),
         }
     }
 }
@@ -301,6 +308,12 @@ pub enum Effect {
         /// (#2871). Empty for legacy state files.
         #[serde(default)]
         explicit_dependencies: HashSet<String>,
+        /// Consumer effects that must complete before this delete may run.
+        ///
+        /// Identities come from [`Effect::identity`] on consumer effects
+        /// (typically `Update`, possibly `Replace` in future).
+        #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+        blocked_by_updates: HashSet<ResourceIdentity>,
     },
 
     /// Import an existing resource into state (via provider read)
@@ -533,6 +546,7 @@ impl Effect {
                     binding: None,
                     dependencies: HashSet::new(),
                     explicit_dependencies: HashSet::new(),
+                    blocked_by_updates: HashSet::new(),
                 },
                 Effect::Delete { .. }
             ),
@@ -607,6 +621,7 @@ impl Effect {
                         binding: Some("validation_records[0]".to_string()),
                         dependencies: HashSet::new(),
                         explicit_dependencies: HashSet::new(),
+                        blocked_by_updates: HashSet::new(),
                     }])
                     .expect("test fixture has one delete"),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -1066,12 +1081,25 @@ impl Effect {
     /// responsibility of [`crate::effect::deps::build_effect_dependency_analysis`].
     pub fn apply_edges(&self) -> Vec<ScheduleEdge> {
         match self {
-            Effect::Delete { dependencies, .. } => dependencies
-                .iter()
-                .cloned()
-                .map(ResourceIdentity::new)
-                .map(ScheduleEdge::BlockedBy)
-                .collect(),
+            Effect::Delete {
+                dependencies,
+                blocked_by_updates,
+                ..
+            } => {
+                let mut edges: Vec<ScheduleEdge> = dependencies
+                    .iter()
+                    .cloned()
+                    .map(ResourceIdentity::new)
+                    .map(ScheduleEdge::BlockedByIfDelete)
+                    .collect();
+                edges.extend(
+                    blocked_by_updates
+                        .iter()
+                        .cloned()
+                        .map(ScheduleEdge::DependsOn),
+                );
+                edges
+            }
             Effect::Replace { from, .. } => from
                 .dependency_bindings
                 .iter()
@@ -1250,6 +1278,7 @@ mod tests {
                 binding: Some("validation_records[0]".to_string()),
                 dependencies: HashSet::from(["cert".to_string()]),
                 explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
             }])
             .expect("test fixture has one delete"),
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -1307,6 +1336,7 @@ mod tests {
                     binding: None,
                     dependencies: HashSet::new(),
                     explicit_dependencies: HashSet::new(),
+                    blocked_by_updates: HashSet::new(),
                 },
             ),
             (
@@ -1464,6 +1494,7 @@ mod tests {
                 binding: Some("validation_records[0]".to_string()),
                 dependencies: HashSet::from(["foo".to_string()]),
                 explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
             }])
             .expect("fixture has one delete"),
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -1496,6 +1527,7 @@ mod tests {
                 binding: Some("validation_records[0]".to_string()),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::from(["foo".to_string()]),
+                blocked_by_updates: HashSet::new(),
             }])
             .expect("fixture has one delete"),
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -1617,6 +1649,7 @@ mod tests {
             binding: None,
             dependencies: HashSet::new(),
             explicit_dependencies: std::collections::HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         };
         assert!(effect.as_resource_ref().is_none());
     }
@@ -1710,6 +1743,7 @@ mod tests {
                 binding: None,
                 dependencies: HashSet::new(),
                 explicit_dependencies: std::collections::HashSet::new(),
+                blocked_by_updates: HashSet::new(),
             },
         ];
 
@@ -1817,6 +1851,7 @@ mod tests {
             binding: Some("bucket".to_string()),
             dependencies: HashSet::from(["role".to_string(), "kms".to_string()]),
             explicit_dependencies: HashSet::from(["role".to_string()]),
+            blocked_by_updates: HashSet::new(),
         };
         let got = effect.explicit_dependencies();
         assert!(got.contains("role"));
@@ -1861,8 +1896,9 @@ mod tests {
 
     #[test]
     fn delete_legacy_state_without_explicit_deps_deserialises_to_empty() {
-        // Pre-#2871 state files have no `explicit_dependencies` field.
-        // `#[serde(default)]` must populate it as an empty HashSet so
+        // Pre-#2871 state files have no `explicit_dependencies` field,
+        // and Phase 2 state files may omit `blocked_by_updates`.
+        // `#[serde(default)]` must populate them as empty HashSets so
         // round-tripping legacy state never fails.
         let legacy = serde_json::json!({
             "Delete": {
@@ -1876,10 +1912,12 @@ mod tests {
         let effect: Effect = serde_json::from_value(legacy).unwrap();
         if let Effect::Delete {
             explicit_dependencies,
+            blocked_by_updates,
             ..
         } = &effect
         {
             assert!(explicit_dependencies.is_empty());
+            assert!(blocked_by_updates.is_empty());
         } else {
             panic!("expected Delete, got {:?}", effect);
         }
@@ -2026,6 +2064,7 @@ mod tests {
             binding: None,
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         };
         assert!(matches!(
             delete.as_basic(),

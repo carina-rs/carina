@@ -620,6 +620,7 @@ mod tests {
                 binding: Some("validation_records[0]".to_string()),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
             }])
             .expect("fixture has one delete"),
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -639,6 +640,7 @@ mod tests {
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         });
         plan.add(Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -650,6 +652,7 @@ mod tests {
             binding: Some("validation_records[abc]".to_string()),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         });
 
         assert_eq!(
@@ -691,6 +694,7 @@ mod tests {
                 binding: Some("validation_records[0]".to_string()),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
             }])
             .expect("fixture has one delete"),
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(

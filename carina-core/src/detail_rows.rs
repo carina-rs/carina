@@ -2107,6 +2107,7 @@ mod tests {
             binding: None,
             dependencies: HashSet::new(),
             explicit_dependencies: std::collections::HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         };
         let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
         delete_attrs.insert(
@@ -2325,6 +2326,7 @@ mod tests {
             binding: None,
             dependencies: HashSet::new(),
             explicit_dependencies: std::collections::HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         };
         let mut tags = IndexMap::new();
         tags.insert(
@@ -2371,6 +2373,7 @@ mod tests {
             binding: None,
             dependencies: HashSet::new(),
             explicit_dependencies: std::collections::HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         };
         let mut entry = IndexMap::new();
         entry.insert(
