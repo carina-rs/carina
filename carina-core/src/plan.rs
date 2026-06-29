@@ -3,14 +3,16 @@
 //! A Plan is an ordered list of Effects to be executed.
 //! No side effects occur until the Plan is applied.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::effect::{ChangedCreateOnly, Effect};
+use crate::effect::{ChangedCreateOnly, Effect, TemporaryName};
 use crate::module::DependencyGraph;
 pub use crate::resource::ModuleSource;
-use crate::resource::ResourceId;
+use crate::resource::{
+    Directives, ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity, Value,
+};
 
 /// Error when a plan would violate a directive constraint
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -27,10 +29,68 @@ impl std::fmt::Display for PlanError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ReplaceDisplayMetadata {
+    /// Index into `Plan.effects` for the Create half of this replace.
+    pub create_idx: usize,
+    /// Index into `Plan.effects` for the Delete half of this replace.
+    pub delete_idx: usize,
+    /// Whether this was a create-before-destroy replacement.
+    pub create_before_destroy: bool,
+    /// Create-only attributes whose change drove the replacement.
+    pub changed_create_only: ChangedCreateOnly,
+    /// Hints mapping attribute names to their original ResourceRef
+    /// expressions (e.g. `("vpc_id", "vpc.vpc_id")`). Used by display
+    /// to show the binding reference instead of the resolved value
+    /// for cascade-triggered replacements.
+    pub cascade_ref_hints: Vec<(String, String)>,
+    /// Temporary name when CBD used a name swap. `None` for DBC.
+    pub temporary_name: Option<TemporaryName>,
+    /// Pre-replace state values. Used by display and snapshot tests;
+    /// may contain secrets (the redaction walker visits this field
+    /// in Phase 7).
+    pub previous_attributes: HashMap<String, Value>,
+}
+
+#[allow(dead_code)] // Phase 3 staging API; wired into the differ in Phase 4.
+pub(crate) struct ReplacementGroup {
+    /// Create-side payload (identity-resolved).
+    pub create: ResolvedResource,
+    /// Delete-side payload.
+    pub delete: ReplacementDelete,
+    /// Whether this is a create-before-destroy replacement.
+    pub create_before_destroy: bool,
+    /// Create-only attributes that drove the replacement.
+    pub changed_create_only: ChangedCreateOnly,
+    /// Cascade ref hints for display.
+    pub cascade_ref_hints: Vec<(String, String)>,
+    /// Temporary name when CBD swaps the name attribute. `None` for DBC.
+    pub temporary_name: Option<TemporaryName>,
+    /// Identities of consumer effects (typically Updates) the Delete
+    /// must wait for during apply. Populated into
+    /// `Effect::Delete.blocked_by_updates`.
+    pub consumer_updates: HashSet<ResourceIdentity>,
+    /// Pre-replace attribute values, captured for display + snapshot.
+    /// The redaction walker visits this in Phase 7.
+    pub previous_attributes: HashMap<String, Value>,
+}
+
+#[allow(dead_code)] // Phase 3 staging API; wired into the differ in Phase 4.
+pub(crate) struct ReplacementDelete {
+    pub id: ResolvedResourceId,
+    pub identifier: String,
+    pub directives: Directives,
+    pub binding: Option<String>,
+    pub dependencies: HashSet<String>,
+    pub explicit_dependencies: HashSet<String>,
+}
+
 /// Plan containing Effects to be executed
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Plan {
     effects: Vec<Effect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) replace_display: Vec<ReplaceDisplayMetadata>,
     /// Directive constraint violations detected during plan generation
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     errors: Vec<PlanError>,
@@ -43,6 +103,34 @@ impl Plan {
 
     pub fn add(&mut self, effect: Effect) {
         self.effects.push(effect);
+    }
+
+    #[allow(dead_code)] // Phase 3 staging API; wired into the differ in Phase 4.
+    pub(crate) fn add_replacement(&mut self, group: ReplacementGroup) {
+        let create_idx = self.effects.len();
+        self.effects.push(Effect::Create(group.create));
+
+        let delete_idx = self.effects.len();
+        let delete = group.delete;
+        self.effects.push(Effect::Delete {
+            id: delete.id,
+            identifier: delete.identifier,
+            directives: delete.directives,
+            binding: delete.binding,
+            dependencies: delete.dependencies,
+            explicit_dependencies: delete.explicit_dependencies,
+            blocked_by_updates: group.consumer_updates,
+        });
+
+        self.replace_display.push(ReplaceDisplayMetadata {
+            create_idx,
+            delete_idx,
+            create_before_destroy: group.create_before_destroy,
+            changed_create_only: group.changed_create_only,
+            cascade_ref_hints: group.cascade_ref_hints,
+            temporary_name: group.temporary_name,
+            previous_attributes: group.previous_attributes,
+        });
     }
 
     pub fn effects(&self) -> &[Effect] {
@@ -547,6 +635,54 @@ mod tests {
         ResolvedDataSource::new(resource)
     }
 
+    fn changed_create_only() -> ChangedCreateOnly {
+        ChangedCreateOnly::new(vec!["cidr_block".to_string()]).unwrap()
+    }
+
+    fn cascade_ref_hints() -> Vec<(String, String)> {
+        vec![("vpc_id".to_string(), "vpc.vpc_id".to_string())]
+    }
+
+    fn temporary_name() -> TemporaryName {
+        TemporaryName {
+            attribute: "name".to_string(),
+            original_value: "main".to_string(),
+            temporary_value: "main-cbd".to_string(),
+            can_rename: false,
+        }
+    }
+
+    fn previous_attributes() -> HashMap<String, Value> {
+        HashMap::from([(
+            "cidr_block".to_string(),
+            Value::Concrete(crate::resource::ConcreteValue::String(
+                "10.0.0.0/16".to_string(),
+            )),
+        )])
+    }
+
+    fn replacement_group(consumer_updates: HashSet<ResourceIdentity>) -> ReplacementGroup {
+        ReplacementGroup {
+            create: resolved(Resource::new("ec2.Vpc", "vpc").with_binding("vpc")),
+            delete: ReplacementDelete {
+                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                    "ec2.Vpc", "vpc-old",
+                )),
+                identifier: "vpc-123".to_string(),
+                directives: Directives::default(),
+                binding: Some("vpc".to_string()),
+                dependencies: HashSet::from(["internet_gateway".to_string()]),
+                explicit_dependencies: HashSet::from(["internet_gateway".to_string()]),
+            },
+            create_before_destroy: true,
+            changed_create_only: changed_create_only(),
+            cascade_ref_hints: cascade_ref_hints(),
+            temporary_name: Some(temporary_name()),
+            consumer_updates,
+            previous_attributes: previous_attributes(),
+        }
+    }
+
     #[test]
     fn empty_plan() {
         let plan = Plan::new();
@@ -934,6 +1070,96 @@ mod tests {
             "display should show replace: {}",
             display
         );
+    }
+
+    #[test]
+    fn plan_add_replacement_registers_create_delete_and_display_atomically() {
+        let consumer_updates = HashSet::from([ResourceIdentity::new("subnet_update")]);
+        let group = replacement_group(consumer_updates.clone());
+        let expected_changed_create_only = group.changed_create_only.clone();
+        let expected_cascade_ref_hints = group.cascade_ref_hints.clone();
+        let expected_temporary_name = group.temporary_name.clone();
+        let expected_previous_attributes = group.previous_attributes.clone();
+
+        let mut plan = Plan::new();
+        plan.add_replacement(group);
+
+        assert_eq!(plan.effects().len(), 2);
+        assert!(matches!(plan.effects()[0], Effect::Create(_)));
+        match &plan.effects()[1] {
+            Effect::Delete {
+                blocked_by_updates, ..
+            } => assert_eq!(blocked_by_updates, &consumer_updates),
+            other => panic!("expected Delete effect, got {other:?}"),
+        }
+
+        assert_eq!(plan.replace_display.len(), 1);
+        let metadata = &plan.replace_display[0];
+        assert_eq!(metadata.create_idx, 0);
+        assert_eq!(metadata.delete_idx, 1);
+        assert!(metadata.create_before_destroy);
+        assert_eq!(metadata.changed_create_only, expected_changed_create_only);
+        assert_eq!(metadata.cascade_ref_hints, expected_cascade_ref_hints);
+        assert_eq!(metadata.temporary_name, expected_temporary_name);
+        assert_eq!(metadata.previous_attributes, expected_previous_attributes);
+    }
+
+    #[test]
+    fn plan_add_replacement_preserves_existing_effects_indices() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resolved(Resource::new(
+            "ec2.Subnet",
+            "subnet-a",
+        ))));
+        plan.add(Effect::Create(resolved(Resource::new(
+            "ec2.Subnet",
+            "subnet-b",
+        ))));
+
+        plan.add_replacement(replacement_group(HashSet::new()));
+
+        assert_eq!(plan.effects().len(), 4);
+        assert_eq!(plan.replace_display.len(), 1);
+        assert_eq!(plan.replace_display[0].create_idx, 2);
+        assert_eq!(plan.replace_display[0].delete_idx, 3);
+    }
+
+    #[test]
+    fn plan_replace_display_round_trips_through_serde() {
+        let mut plan = Plan::new();
+        plan.add_replacement(replacement_group(HashSet::from([ResourceIdentity::new(
+            "subnet_update",
+        )])));
+        let expected_replace_display = plan.replace_display.clone();
+
+        let json = serde_json::to_string(&plan).unwrap();
+        let deserialized: Plan = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.effects().len(), 2);
+        assert_eq!(deserialized.replace_display, expected_replace_display);
+    }
+
+    #[test]
+    fn plan_without_replace_display_field_deserializes_to_empty() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resolved(Resource::new(
+            "s3.Bucket",
+            "bucket",
+        ))));
+        plan.add_error(PlanError {
+            resource_id: ResourceId::with_identity("s3.Bucket", "bucket"),
+            message: "fixture error".to_string(),
+        });
+
+        let mut json = serde_json::to_value(&plan).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("replace_display");
+        assert!(!object.contains_key("replace_display"));
+
+        let deserialized: Plan = serde_json::from_value(json).unwrap();
+        assert!(deserialized.replace_display.is_empty());
+        assert_eq!(deserialized.effects().len(), 1);
+        assert_eq!(deserialized.errors().len(), 1);
     }
 
     #[test]
