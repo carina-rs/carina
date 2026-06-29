@@ -2261,6 +2261,10 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         },
         &upstream_binding_names,
     )?;
+    crate::legacy_name_overrides::emit_legacy_override_warnings(
+        &override_aware_resources,
+        state_file.as_ref(),
+    );
     let unresolved_override_aware_resources = OverrideAwareResources::build_for_plan(
         unresolved_resources.to_vec(),
         state_file.as_ref(),

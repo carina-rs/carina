@@ -175,6 +175,72 @@ fn name_override_deserializes_struct_form() {
 }
 
 #[test]
+fn state_file_has_legacy_name_overrides_detects_v7_shape() {
+    let legacy_json = serde_json::json!({
+        "version": StateFile::CURRENT_VERSION,
+        "serial": 0,
+        "lineage": "lineage",
+        "carina_version": "test",
+        "resources": [
+            {
+                "resource_type": "test.resource",
+                "identity": "legacy",
+                "provider": "mock",
+                "identifier": "legacy-id",
+                "attributes": {},
+                "name_overrides": {
+                    "name": "legacy-temp"
+                }
+            },
+            {
+                "resource_type": "test.resource",
+                "identity": "current",
+                "provider": "mock",
+                "identifier": "current-id",
+                "attributes": {},
+                "name_overrides": {
+                    "name": {
+                        "temp_value": "current-temp",
+                        "original_value": "current"
+                    }
+                }
+            }
+        ]
+    });
+    let state: StateFile = serde_json::from_value(legacy_json).unwrap();
+
+    assert!(state.has_legacy_name_overrides());
+    let affected = state.legacy_name_override_resources();
+    assert_eq!(affected.len(), 1);
+    assert_eq!(affected[0].identity, "legacy");
+
+    let typed_only_json = serde_json::json!({
+        "version": StateFile::CURRENT_VERSION,
+        "serial": 0,
+        "lineage": "lineage",
+        "carina_version": "test",
+        "resources": [
+            {
+                "resource_type": "test.resource",
+                "identity": "current",
+                "provider": "mock",
+                "identifier": "current-id",
+                "attributes": {},
+                "name_overrides": {
+                    "name": {
+                        "temp_value": "current-temp",
+                        "original_value": "current"
+                    }
+                }
+            }
+        ]
+    });
+    let typed_only: StateFile = serde_json::from_value(typed_only_json).unwrap();
+    assert!(!typed_only.has_legacy_name_overrides());
+    assert!(typed_only.legacy_name_override_resources().is_empty());
+}
+
+#[test]
 fn should_apply_override_returns_apply_when_dsl_matches_recorded() {
     let override_ = NameOverride {
         temp_value: "foo-cbd".to_string(),

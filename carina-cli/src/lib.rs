@@ -7,6 +7,8 @@ pub mod kms;
 pub mod signal;
 pub mod wiring;
 
+pub(crate) mod legacy_name_overrides;
+
 #[cfg(test)]
 mod module_info_snapshot_tests;
 #[cfg(test)]

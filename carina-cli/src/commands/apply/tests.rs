@@ -1,10 +1,13 @@
 use super::*;
+use carina_core::binding_index::PreApplyInputs;
+use carina_core::override_aware::OverrideAwareResources;
 use carina_core::provider::{
     BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, Provider, ProviderError,
     ProviderFactory, ProviderNormalizer, ProviderResult, ReadRequest, UpdateRequest,
 };
 use carina_core::resource::{DataSource, ResolvedResource, Resource, ResourceId};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+use carina_state::{NameOverride, ResourceState};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -148,6 +151,134 @@ fn apply_parallelism_default_is_eight() {
     assert_eq!(crate::DEFAULT_PARALLELISM.get(), 8);
 }
 
+fn legacy_override_state() -> StateFile {
+    let mut state = StateFile::new();
+    let mut resource =
+        ResourceState::new("test.resource", "legacy", "mock").with_identifier("legacy-id");
+    resource.name_overrides.insert(
+        "name".to_string(),
+        NameOverride {
+            temp_value: "legacy-temp".to_string(),
+            original_value: None,
+        },
+    );
+    state.resources.push(resource);
+    state
+}
+
+fn plan_with_name_override(id: &ResourceId, temp_value: &str, original_value: &str) -> Plan {
+    serde_json::from_value(serde_json::json!({
+        "effects": [],
+        "permanent_name_overrides": [
+            {
+                "resource_id": id,
+                "attribute": "name",
+                "temp_value": temp_value,
+                "original_value": original_value
+            }
+        ]
+    }))
+    .expect("plan with permanent name override should deserialize")
+}
+
+#[test]
+fn apply_refuses_v7_state_without_accept_flag() {
+    let state = legacy_override_state();
+
+    let err =
+        check_legacy_name_overrides(&state, false).expect_err("legacy state must require opt-in");
+
+    assert!(matches!(err, AppError::Validation(_)));
+    let msg = err.to_string();
+    assert!(msg.contains("mock.test.resource.legacy"));
+    assert!(msg.contains("carina plan"));
+    assert!(msg.contains("--accept-legacy-name-overrides"));
+}
+
+#[test]
+fn apply_proceeds_with_accept_flag_against_legacy_state() {
+    let state = legacy_override_state();
+
+    check_legacy_name_overrides(&state, true).expect("accept flag should permit legacy state");
+}
+
+#[test]
+fn apply_emits_legacy_override_warning_to_stderr() {
+    let state = legacy_override_state();
+    let resource = Resource::with_provider("mock", "test.resource", "legacy", None).with_attribute(
+        "name",
+        Value::Concrete(ConcreteValue::String("legacy".to_string())),
+    );
+    let current_states = HashMap::new();
+    let remote_bindings = HashMap::new();
+    let wait_aliases = Vec::new();
+    let override_aware = OverrideAwareResources::build(
+        vec![resource],
+        Some(&state),
+        PreApplyInputs {
+            managed: &[],
+            compositions: &[],
+            data_sources: &[],
+            current_states: &current_states,
+            remote_bindings: &remote_bindings,
+            wait_aliases: &wait_aliases,
+        },
+    )
+    .expect("override-aware resources should build");
+
+    let mut stderr = Vec::new();
+    crate::legacy_name_overrides::write_legacy_override_warnings(
+        &override_aware,
+        Some(&state),
+        &mut stderr,
+    )
+    .expect("warning write should succeed");
+    let stderr = String::from_utf8(stderr).expect("warning should be utf8");
+
+    assert!(stderr.contains("warning: applied legacy name override for mock.test.resource.legacy"));
+    assert!(stderr.contains("override attribute 'name' set to 'legacy-temp'"));
+    assert!(stderr.contains("original DSL"));
+}
+
+#[test]
+fn apply_does_not_require_flag_after_v7_to_v8_migration() {
+    let state_file = legacy_override_state();
+    let mut resource = Resource::with_provider("mock", "test.resource", "legacy", None);
+    resource.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("legacy".to_string())),
+    );
+    let id = resource.id.clone();
+    let sorted_resources = vec![resource];
+    let applied_state = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("legacy-temp".to_string())),
+        )]),
+    )
+    .with_identifier("legacy-id");
+    let applied_states = HashMap::from([(id.clone(), applied_state)]);
+    let plan = plan_with_name_override(&id, "legacy-temp", "legacy");
+
+    let migrated = build_state_after_apply(ApplyStateSave {
+        state_file: Some(state_file),
+        sorted_resources: &sorted_resources,
+        runtime_synthesized_resources: &[],
+        current_states: &HashMap::new(),
+        applied_states: &applied_states,
+        plan: &plan,
+        successfully_deleted: &HashSet::new(),
+        failed_refreshes: &HashSet::new(),
+        schemas: &SchemaRegistry::new(),
+    })
+    .expect("writeback should migrate legacy override");
+
+    assert!(!migrated.has_legacy_name_overrides());
+    check_legacy_name_overrides(&migrated, false)
+        .expect("second apply should not require the legacy accept flag");
+}
+
 #[tokio::test]
 async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases_lock() {
     let fixture = ApplyCancellationFixture::new()
@@ -161,6 +292,7 @@ async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases
         true,
         true,
         NonZeroUsize::new(1).unwrap(),
+        false,
         fixture.provider_context(),
         token,
         &observer_factory,
@@ -215,6 +347,7 @@ async fn apply_cancel_token_integration_persists_completed_state_releases_lock_a
         true,
         true,
         NonZeroUsize::new(1).unwrap(),
+        false,
         fixture.provider_context(),
         token,
         &observer_factory,
@@ -283,6 +416,7 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
         fixture.cancel_token(),
         &observer_factory,
         NonZeroUsize::new(1).unwrap(),
+        false,
     )
     .await
     .unwrap_err();
@@ -381,7 +515,6 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     applied_states.insert(sorted_resources[0].id.clone(), applied_state);
 
     let current_states = HashMap::new();
-    let permanent_name_overrides = HashMap::new();
     let plan = Plan::new();
     let successfully_deleted = HashSet::new();
     let failed_refreshes = HashSet::new();
@@ -392,7 +525,6 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
         runtime_synthesized_resources: &[],
         current_states: &current_states,
         applied_states: &applied_states,
-        permanent_name_overrides: &permanent_name_overrides,
         plan: &plan,
         successfully_deleted: &successfully_deleted,
         failed_refreshes: &failed_refreshes,
@@ -497,7 +629,6 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
     applied_states.insert(sorted_resources[0].id.clone(), applied_state);
 
     let current_states = HashMap::new();
-    let permanent_name_overrides = HashMap::new();
     let plan = Plan::new();
     let successfully_deleted = HashSet::new();
     let failed_refreshes = HashSet::new();
@@ -508,7 +639,6 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
         runtime_synthesized_resources: &[],
         current_states: &current_states,
         applied_states: &applied_states,
-        permanent_name_overrides: &permanent_name_overrides,
         plan: &plan,
         successfully_deleted: &successfully_deleted,
         failed_refreshes: &failed_refreshes,
@@ -743,7 +873,6 @@ fn block_unique_name_attribute_state_roundtrip() {
         runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
-        permanent_name_overrides: &HashMap::new(),
         plan: &Plan::new(),
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &HashSet::new(),
@@ -953,7 +1082,6 @@ fn move_plus_replace_keeps_post_replace_identifier_and_attributes() {
         runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
-        permanent_name_overrides: &HashMap::new(),
         plan: &plan,
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &HashSet::new(),
@@ -1069,7 +1197,6 @@ fn move_plus_update_keeps_post_update_attributes() {
         runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
-        permanent_name_overrides: &HashMap::new(),
         plan: &plan,
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &HashSet::new(),
@@ -1147,7 +1274,6 @@ fn move_alone_carries_attributes_via_current_states() {
         runtime_synthesized_resources: &[],
         current_states: &current_states,
         applied_states: &HashMap::new(),
-        permanent_name_overrides: &HashMap::new(),
         plan: &plan,
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &HashSet::new(),
@@ -1200,7 +1326,6 @@ fn move_with_absent_from_is_no_op() {
         runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &HashMap::new(),
-        permanent_name_overrides: &HashMap::new(),
         plan: &plan,
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &HashSet::new(),
@@ -1247,7 +1372,6 @@ fn failed_refresh_preserves_existing_row() {
         runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &HashMap::new(),
-        permanent_name_overrides: &HashMap::new(),
         plan: &Plan::new(),
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &failed_refreshes,
@@ -1305,7 +1429,6 @@ fn move_from_overlapping_desired_resource_errors() {
         runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied,
-        permanent_name_overrides: &HashMap::new(),
         plan: &plan,
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &HashSet::new(),
@@ -1361,7 +1484,6 @@ fn remove_overlapping_desired_resource_errors() {
         runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied,
-        permanent_name_overrides: &HashMap::new(),
         plan: &plan,
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &HashSet::new(),
@@ -1416,7 +1538,6 @@ fn self_move_overlapping_desired_resource_errors() {
         runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied,
-        permanent_name_overrides: &HashMap::new(),
         plan: &plan,
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &HashSet::new(),
@@ -2414,6 +2535,7 @@ mod saved_plan_version_tests {
             true,
             false,
             std::num::NonZeroUsize::new(8).unwrap(),
+            false,
             &carina_core::parser::ProviderContext::default(),
             tokio_util::sync::CancellationToken::new(),
         )
