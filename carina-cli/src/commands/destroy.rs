@@ -184,6 +184,12 @@ async fn run_destroy_locked(
             &state_block_claims,
         );
     }
+    // destroy operates on the existing state-only resource set and does not run the
+    // differ. The state-side name_overrides are the only thing destroy needs from
+    // this surface; the full resolver -> override -> bindings rebuild ->
+    // second-pass resolver sequence is unnecessary here. Sub-PR B leaves this
+    // call site as-is for that reason. See
+    // notes/specs/2026-06-28-issue-3625-cbd-decompose-clean-design.md Phase 5 T5.8.
     apply_name_overrides(&mut parsed.resources, &state_file);
 
     // Collect all resources (managed + orphans) before sorting.

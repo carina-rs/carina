@@ -870,6 +870,7 @@ moved {
 
     let err = match create_plan_from_parsed_with_upstream(
         &parsed,
+        &parsed.resources,
         &state_file,
         false,
         &HashMap::new(),
@@ -955,6 +956,7 @@ removed {
 
     let err = match create_plan_from_parsed_with_upstream(
         &parsed,
+        &parsed.resources,
         &state_file,
         false,
         &HashMap::new(),
@@ -1585,6 +1587,7 @@ moved {{
     let tmp = tempfile::tempdir().expect("tempdir");
     let ctx = create_plan_from_parsed_with_upstream(
         &parsed,
+        &parsed.resources,
         &Some(state_file),
         false,
         &HashMap::new(),

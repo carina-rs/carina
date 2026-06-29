@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::effect::{ChangedCreateOnly, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
+use crate::override_aware::OverrideAwareResources;
 use crate::parser::WaitBinding;
 use crate::plan::{PermanentNameOverride, Plan, PlanError, ReplacementDelete, ReplacementGroup};
 use crate::provider::Provider;
@@ -298,9 +299,8 @@ pub fn create_plan(
 
 #[allow(clippy::too_many_arguments)]
 pub fn create_plan_with_cascades(
-    managed: &[Resource],
+    managed: &OverrideAwareResources,
     data_sources: &[DataSource],
-    unresolved_managed: &[Resource],
     provider: &dyn Provider,
     current_states: &HashMap<ResourceId, PlanInputState>,
     directives_map: &HashMap<ResourceId, Directives>,
@@ -310,6 +310,8 @@ pub fn create_plan_with_cascades(
     orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
     wait_bindings: &[WaitBinding],
 ) -> Plan {
+    let unresolved_managed = managed.unresolved_resources();
+    let managed = managed.resources();
     let mut build = create_plan_parts(
         managed,
         data_sources,

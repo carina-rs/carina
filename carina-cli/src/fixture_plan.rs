@@ -11,9 +11,9 @@ use carina_core::config_loader::{get_base_dir, load_configuration};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::create_plan_with_cascades;
 use carina_core::executor::normalized::apply_desired_normalization_slice;
+use carina_core::override_aware::OverrideAwareResources;
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
-use carina_core::resolver::resolve_refs_for_plan;
 use carina_core::resource::{ResourceId, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, TypeIdentity,
@@ -213,11 +213,6 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         remote_bindings.insert(us.binding.clone(), bindings);
     }
 
-    // Plan-only resolution: stamps surviving upstream refs for display
-    // as `(known after upstream apply: <ref>)` (#2366). The fixture
-    // loader is already lenient about missing upstream state files (see
-    // the loop above that silently skips them).
-    let mut resources = sorted_resources.clone();
     let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
         .wait_bindings
         .iter()
@@ -229,24 +224,26 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let upstream_binding_names: std::collections::HashSet<&str> =
         remote_bindings.keys().map(String::as_str).collect();
     let pre_apply_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
-    let plan_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+    let mut override_aware_resources = OverrideAwareResources::build_for_plan(
+        sorted_resources.clone(),
+        state_file.as_ref(),
         carina_core::binding_index::PreApplyInputs {
-            managed: &resources,
+            managed: &[],
             compositions: &parsed.compositions,
             data_sources: &data_sources,
             current_states: &pre_apply_input_states,
             remote_bindings: &remote_bindings,
             wait_aliases: &wait_aliases,
         },
-    );
-    resolve_refs_for_plan(&mut resources, &plan_bindings, &upstream_binding_names)
-        .expect("Failed to resolve refs with state");
+        &upstream_binding_names,
+    )
+    .expect("Failed to build override-aware resources");
 
     // Resolve data-source input refs for the plan (carina#3181).
     let mut data_sources_for_plan = data_sources.clone();
     carina_core::resolver::resolve_data_source_refs_for_plan(
         &mut data_sources_for_plan,
-        &plan_bindings,
+        override_aware_resources.bindings(),
         &upstream_binding_names,
     )
     .expect("Failed to resolve data source refs with state");
@@ -280,7 +277,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             router.add_normalizer(rt.block_on(factory.create_normalizer(None, &attrs)));
         }
         rt.block_on(apply_desired_normalization_slice(
-            &mut resources,
+            override_aware_resources.resources_mut(),
             &parsed.providers,
             &router,
             wiring.factories(),
@@ -291,7 +288,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     resolve_enum_aliases_in_states(&wiring, &mut current_states);
     {
         let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
-            &mut resources,
+            override_aware_resources.resources_mut(),
             wiring.schemas(),
         );
         let errors =
@@ -299,10 +296,20 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         assert!(errors.is_empty(), "{errors:?}");
     }
     if let Some(sf) = state_file.as_mut() {
-        reconcile_anonymous_identifiers_with_ctx(&wiring, &mut resources, sf, &state_block_claims);
-        adopt_unique_state_identity_for_unresolved_anonymous(&mut resources, sf);
+        reconcile_anonymous_identifiers_with_ctx(
+            &wiring,
+            override_aware_resources.resources_mut(),
+            sf,
+            &state_block_claims,
+        );
+        adopt_unique_state_identity_for_unresolved_anonymous(
+            override_aware_resources.resources_mut(),
+            sf,
+        );
     }
-    let fallback_renames = assign_fallback_identities_for_unresolved_anonymous(&mut resources);
+    let fallback_renames = assign_fallback_identities_for_unresolved_anonymous(
+        override_aware_resources.resources_mut(),
+    );
     for (from, to) in &fallback_renames {
         if let Some(mut state) = current_states.remove(from) {
             state.id = to.clone();
@@ -317,7 +324,11 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     }
 
     let orphan_dependencies = if let Some(sf) = state_file.as_ref() {
-        let desired_ids: HashSet<ResourceId> = resources.iter().map(|r| r.id.clone()).collect();
+        let desired_ids: HashSet<ResourceId> = override_aware_resources
+            .resources()
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
         sf.build_orphan_dependencies(&desired_ids)
     } else {
         HashMap::new()
@@ -347,7 +358,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     crate::wiring::resolve_enum_aliases_in_wait_bindings(
         &wiring,
         &mut wait_bindings,
-        &resources,
+        override_aware_resources.resources(),
         &data_sources_for_plan,
     );
     let deferred_for_expansion = expand_same_config_deferred_for(
@@ -379,9 +390,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     );
     let plan_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
     let mut plan = create_plan_with_cascades(
-        &resources,
+        &override_aware_resources,
         &data_sources_for_plan,
-        &sorted_resources,
         &carina_core::provider::ProviderRouter::new(),
         &plan_input_states,
         &directives_map,
@@ -398,7 +408,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &state_file,
         &moved_pairs,
         wiring.schemas(),
-        &plan_bindings,
+        override_aware_resources.bindings(),
         &upstream_binding_names,
     );
     add_deferred_create_effects(&mut plan, &deferred_create_targets);
@@ -414,7 +424,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         .collect();
     let resolved_export_params = crate::commands::plan::resolve_export_values_for_display(
         &parsed.export_params,
-        &resources,
+        override_aware_resources.resources(),
         &parsed.compositions,
         &data_sources_for_plan,
         &current_states,

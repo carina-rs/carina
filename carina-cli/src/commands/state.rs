@@ -936,6 +936,12 @@ pub(crate) async fn run_state_refresh_locked(
             &state_block_claims,
         );
     }
+    // state is a read-only inspection command and does not run the differ. The
+    // state-side name_overrides are sufficient for this narrow display path; the
+    // full resolver -> override -> bindings rebuild -> second-pass resolver
+    // sequence is unnecessary here. Sub-PR B leaves this call site as-is for
+    // that reason. See
+    // notes/specs/2026-06-28-issue-3625-cbd-decompose-clean-design.md Phase 5 T5.8.
     apply_name_overrides(&mut parsed.resources, &state_file);
 
     let mut sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;

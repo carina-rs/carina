@@ -21,7 +21,6 @@ use super::{
     BackendDriftStatus, drift_warning, inspect_backend_drift, validate_and_resolve_with_config,
 };
 use crate::DetailLevel;
-use crate::commands::shared::state_writeback::apply_name_overrides;
 use crate::display::{print_plan, refresh_plan_separator};
 use crate::error::AppError;
 use crate::wiring::{
@@ -180,7 +179,6 @@ pub struct CurrentStateEntry {
 fn build_plan_file<E>(
     path: &Path,
     parsed: &carina_core::parser::File<E>,
-    unresolved_resources: &[Resource],
     backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
@@ -221,7 +219,8 @@ fn build_plan_file<E>(
             .iter()
             .map(redact_secrets_in_resource)
             .collect::<Result<Vec<_>, _>>()?,
-        unresolved_resources: unresolved_resources
+        unresolved_resources: ctx
+            .unresolved_resources
             .iter()
             .map(redact_secrets_in_resource)
             .collect::<Result<Vec<_>, _>>()?,
@@ -640,9 +639,6 @@ pub async fn run_plan(
             &state_block_claims,
         );
     }
-    apply_name_overrides(&mut parsed.resources, &state_file);
-    apply_name_overrides(&mut unresolved_parsed.resources, &state_file);
-
     if !refresh {
         eprintln!(
             "{}",
@@ -679,6 +675,7 @@ pub async fn run_plan(
     // loops via `ctx.residual_deferred_for`.
     let ctx = create_plan_from_parsed_with_upstream(
         &parsed,
+        &unresolved_parsed.resources,
         &state_file,
         refresh,
         &remote_bindings,
@@ -761,7 +758,6 @@ pub async fn run_plan(
         let plan_file = build_plan_file(
             path,
             &parsed,
-            &unresolved_parsed.resources,
             plan_file_backend_config.clone(),
             &state_file,
             &ctx,
@@ -840,7 +836,6 @@ pub async fn run_plan(
         let plan_file = build_plan_file(
             path,
             &parsed,
-            &unresolved_parsed.resources,
             plan_file_backend_config.clone(),
             &state_file,
             &ctx,
