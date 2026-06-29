@@ -149,7 +149,7 @@ its eager counterpart:
 | Eager effect       | Deferred counterpart   | When emitted                                                |
 | ------------------ | ---------------------- | ----------------------------------------------------------- |
 | `Effect::Create`   | `Effect::DeferredCreate` | iterable unresolved at plan time, no pre-apply iterations    |
-| `Effect::Replace`  | `Effect::DeferredReplace` | iterable unresolved at plan time AND pre-apply iterations exist that the planner cannot prove will be reused |
+| the legacy replace effect  | `Effect::DeferredReplace` | iterable unresolved at plan time AND pre-apply iterations exist that the planner cannot prove will be reused |
 
 This is preferable to the original `ExpandDeferredFor` name on three
 counts. First, `Expand` is implementation vocabulary (the executor
@@ -182,7 +182,7 @@ existing orphan-delete path emitting plain `Effect::Delete`s.
 /// same logical address. The two halves intentionally share a
 /// `ResourceId` (e.g. `validation_records[0]`), so writeback must
 /// recognise it as one replace, not two writes that collide. The
-/// relationship to `Effect::Replace` is the same as the relationship
+/// relationship to the legacy replace effect is the same as the relationship
 /// of `Effect::DeferredCreate` to `Effect::Create`: same intent at
 /// the resource-level, but the planner cannot enumerate the
 /// `to`-side cardinality until apply time, so the eager
@@ -217,15 +217,15 @@ handle every non-deferred-for orphan. The new variant exists only to
 fuse the two into one effect when both are present for the same
 template.
 
-### Why not extend `Effect::Replace` instead?
+### Why not extend the legacy replace effect instead?
 
-`Effect::Replace { id, from: Box<State>, to: Resource, ... }` carries
+`LegacyReplace { id, from: Box<State>, to: Resource, ... }` carries
 a single `from` state and a single `to` resource. The deferred
 for-loop case is N-to-M at the iteration level (N pre-apply
 iterations destroyed, M new iterations created where M is not known
 until apply time), so neither `from` nor `to` fits its eager shape.
 The two effects also take different paths through the executor —
-`Replace` dispatches the delete and create halves through the basic
+legacy replace dispatches the delete and create halves through the basic
 executor's existing provider arms, while a deferred replace's create
 half must go through the same synchronous template-expansion path
 that `DeferredCreate` uses. The distinction is necessary, not

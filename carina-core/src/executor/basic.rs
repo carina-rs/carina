@@ -475,7 +475,7 @@ pub(super) fn count_actionable_effects(effects: &[Effect]) -> usize {
 
 /// Resolution + dispatch context for a basic effect, bundled to keep
 /// `execute_basic_effect`'s arity in check (clippy `too_many_arguments`)
-/// and mirroring `ReplaceContext`'s shape.
+/// and keeping dispatch context fields grouped consistently.
 pub(super) struct BasicEffectCtx<'a> {
     pub(super) provider: &'a dyn Provider,
     pub(super) bindings: &'a ResolvedBindings,

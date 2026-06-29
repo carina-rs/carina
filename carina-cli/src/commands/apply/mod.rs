@@ -1743,7 +1743,10 @@ async fn run_apply_from_plan_with_observer_factory(
     let plan_file: PlanFile =
         serde_json::from_str(&content).map_err(|e| format!("Failed to parse plan file: {}", e))?;
 
-    // Validate version compatibility. Plan-file version 6
+    // Validate version compatibility. Plan-file version 8 removes the
+    // legacy Replace effect shape; older saved plans must be regenerated.
+    //
+    // Plan-file version 6
     // (carina#3486) persists the pre-resolution resource snapshot used
     // by apply-time dependency analysis and reference re-resolution.
     //
@@ -1762,11 +1765,12 @@ async fn run_apply_from_plan_with_observer_factory(
     // view as the live-apply path (carina#3246). Older plans cannot be
     // applied by the post-#3248 binding-construction path and are
     // rejected outright per the repo's no-backward-compat policy.
-    if plan_file.version != 6 {
+    if plan_file.version != PlanFile::CURRENT_VERSION {
         return Err(AppError::Config(format!(
-            "Unsupported plan file version: {} (expected 6). \
+            "Unsupported plan file version: {} (expected {}). \
              Re-run 'carina plan' to produce a plan in the current format.",
-            plan_file.version
+            plan_file.version,
+            PlanFile::CURRENT_VERSION
         )));
     }
 

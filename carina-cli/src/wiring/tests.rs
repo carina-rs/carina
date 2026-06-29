@@ -2391,29 +2391,10 @@ fn delete_effect_for_binding(binding: &str) -> Effect {
     }
 }
 
-fn cert_replace_effect() -> Effect {
-    let id = ResourceId::with_provider_identity("aws", "acm.Certificate", "cert", None);
-    Effect::Replace {
-        from: Box::new(State::existing(id, HashMap::new()).with_identifier("cert-old-id")),
-        to: resolved(
-            Resource::with_provider("aws", "acm.Certificate", "cert", None).with_binding("cert"),
-        ),
-        directives: Directives::default(),
-        changed_create_only: carina_core::effect::ChangedCreateOnly::new(vec![
-            "domain_name".to_string(),
-        ])
-        .unwrap(),
-        cascading_updates: vec![],
-        temporary_name: None,
-        cascade_ref_hints: vec![],
-    }
-}
-
 #[test]
 fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace() {
     let target = deferred_replace_test_target();
     let mut plan = Plan::new();
-    plan.add(cert_replace_effect());
     plan.add(delete_effect_for_binding("validation_records[0]"));
 
     add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));
@@ -2469,7 +2450,6 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
 fn deferred_create_targets_do_not_absorb_unrelated_orphan_deletes() {
     let target = deferred_replace_test_target();
     let mut plan = Plan::new();
-    plan.add(cert_replace_effect());
     plan.add(delete_effect_for_binding("some_other_resource[0]"));
 
     add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));

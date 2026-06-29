@@ -61,19 +61,6 @@ pub struct TemporaryName {
     pub can_rename: bool,
 }
 
-/// A dependent resource that must be updated during a create_before_destroy replacement.
-///
-/// When a resource is replaced with create_before_destroy, dependent resources that
-/// reference the replaced resource's computed attributes need to be updated between
-/// the create (new) and delete (old) steps. The `to` field retains unresolved
-/// `ResourceRef` values so that the apply phase can re-resolve them using the
-/// newly created resource's state.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CascadingUpdate {
-    pub from: Box<State>,
-    pub to: ResolvedResource,
-}
-
 /// Delete payload absorbed into [`Effect::DeferredReplace`].
 ///
 /// This carries the exact fields from [`Effect::Delete`]. Keeping the
@@ -191,7 +178,7 @@ fn deferred_replace_delete_explicit_dependencies(
         .collect()
 }
 
-/// Non-empty create-only attribute list for [`Effect::Replace`].
+/// Non-empty create-only attribute list for replacement display metadata.
 ///
 /// An empty list would render a destroy-and-recreate plan with no visible
 /// reason: the unexplained-replacement bug class (carina#3471) this type makes
@@ -238,7 +225,7 @@ impl TryFrom<Vec<String>> for ChangedCreateOnly {
 
     fn try_from(attrs: Vec<String>) -> Result<Self, Self::Error> {
         Self::new(attrs).ok_or_else(|| {
-            "Replace effect requires at least one changed create-only attribute".to_string()
+            "Replacement requires at least one changed create-only attribute".to_string()
         })
     }
 }
@@ -264,27 +251,6 @@ pub enum Effect {
         to: ResolvedResource,
         /// Attribute names that changed (including removed attributes)
         changed_attributes: Vec<String>,
-    },
-
-    /// Replace a resource (delete then create) due to create-only property changes
-    Replace {
-        from: Box<State>,
-        to: ResolvedResource,
-        #[serde(default)]
-        directives: Directives,
-        /// Which create-only attributes forced the replacement
-        changed_create_only: ChangedCreateOnly,
-        /// Dependent resources to update between create and delete (create_before_destroy only)
-        #[serde(default)]
-        cascading_updates: Vec<CascadingUpdate>,
-        /// Temporary name for create-before-destroy when the resource has a unique name constraint
-        #[serde(default)]
-        temporary_name: Option<TemporaryName>,
-        /// Hints mapping attribute names to their original ResourceRef expressions
-        /// (e.g., `("vpc_id", "vpc.vpc_id")`). Used by display to show the binding
-        /// reference instead of the resolved value for cascade-triggered replacements.
-        #[serde(default)]
-        cascade_ref_hints: Vec<(String, String)>,
     },
 
     /// Delete a resource
@@ -368,7 +334,7 @@ pub enum Effect {
         /// Surface form of the `until` expression as the user wrote it
         /// (e.g. `"cert.status == aws.acm.Certificate.Status.Issued"`).
         /// Carried so plan-display never re-stringifies the parsed AST —
-        /// same pattern as `Effect::Replace::cascade_ref_hints`.
+        /// same pattern as replacement-display cascade reference hints.
         until_surface: String,
         /// Hard cap on total wait time. Resolved by the differ from the
         /// user-provided override or the target schema's default.
@@ -423,7 +389,7 @@ pub enum Effect {
 ///
 /// The basic executor was previously typed on `&Effect` and used a
 /// `_ => unreachable!("execute_basic_effect called with non-basic
-/// effect")` arm to reject `Replace`/`Read`/`Import`/`Remove`/`Move`/
+/// effect")` arm to reject `Read`/`Import`/`Remove`/`Move`/
 /// `Wait`. Callers' filters were the *only* thing keeping non-basic
 /// effects out; a single missed filter (#3164) panicked apply at
 /// runtime and left the state lock acquired.
@@ -480,9 +446,10 @@ impl Effect {
 
     #[cfg(test)]
     pub fn all_display_glyphs() -> Vec<&'static str> {
-        let mut effects = Self::display_glyph_effects();
-        effects.push(Self::synthetic_replace_effect(true));
-        effects.iter().map(Self::display_glyph).collect()
+        Self::display_glyph_effects()
+            .iter()
+            .map(Self::display_glyph)
+            .collect()
     }
 
     #[cfg(test)]
@@ -508,7 +475,7 @@ impl Effect {
                 }
                 assert_eq!(
                     effects.len(),
-                    11,
+                    10,
                     "display_glyph_effects must list every Effect variant exactly once"
                 );
                 effects
@@ -533,10 +500,6 @@ impl Effect {
                     changed_attributes: vec![],
                 },
                 Effect::Update { .. }
-            ),
-            (
-                Self::synthetic_replace_effect(false),
-                Effect::Replace { .. }
             ),
             (
                 Effect::Delete {
@@ -647,25 +610,6 @@ impl Effect {
         ]
     }
 
-    #[cfg(test)]
-    fn synthetic_replace_effect(create_before_destroy: bool) -> Self {
-        let id = ResourceId::with_identity("test", "x");
-        let directives = Directives {
-            create_before_destroy,
-            ..Directives::default()
-        };
-
-        Effect::Replace {
-            from: Box::new(State::not_found(id)),
-            to: ResolvedResource::new(Resource::new("test", "x")),
-            directives,
-            changed_create_only: ChangedCreateOnly::new(vec!["attr".to_string()]).unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        }
-    }
-
     /// Plain display glyph for this effect.
     ///
     /// Color and text styling stay in each UI sink; this method owns the
@@ -675,9 +619,6 @@ impl Effect {
         match self {
             Effect::Create(_) => "+",
             Effect::Update { .. } => "~",
-            Effect::Replace { directives, .. } => {
-                Self::replace_display_glyph(directives.create_before_destroy)
-            }
             Effect::Delete { .. } => "-",
             Effect::Read { .. } => "<=",
             Effect::Import { .. } => "<-",
@@ -691,7 +632,7 @@ impl Effect {
 
     /// Narrow this effect to a [`BasicEffect`] if it is one of the
     /// variants the basic executor handles (`Create`, `Update`,
-    /// `Delete`). Returns `None` for `Replace`, `Read`, `Import`,
+    /// `Delete`). Returns `None` for `Read`, `Import`,
     /// `Remove`, `Move`, and `Wait` — those route through other
     /// executor paths or are state-only (applied by the CLI's
     /// `execute_state_only_effects` step).
@@ -742,8 +683,7 @@ impl Effect {
                 identifier,
                 directives,
             }),
-            Effect::Replace { .. }
-            | Effect::Read { .. }
+            Effect::Read { .. }
             | Effect::Import { .. }
             | Effect::Remove { .. }
             | Effect::Move { .. }
@@ -767,7 +707,6 @@ impl Effect {
             Effect::Read { .. } => "read",
             Effect::Create(_) => "create",
             Effect::Update { .. } => "update",
-            Effect::Replace { .. } => "replace",
             Effect::Delete { .. } => "delete",
             Effect::Import { .. } => "import",
             Effect::Remove { .. } => "remove",
@@ -784,7 +723,6 @@ impl Effect {
             Effect::Read { .. } => false,
             Effect::Create(_) => true,
             Effect::Update { .. } => true,
-            Effect::Replace { .. } => true,
             Effect::Delete { .. } => true,
             Effect::Import { .. } => true,
             Effect::Remove { .. } => true,
@@ -801,7 +739,6 @@ impl Effect {
             Effect::Read { .. } => false,
             Effect::Create(_) => false,
             Effect::Update { .. } => false,
-            Effect::Replace { .. } => false,
             Effect::Delete { .. } => false,
             Effect::Import { .. } => true,
             Effect::Remove { .. } => true,
@@ -819,7 +756,6 @@ impl Effect {
             Effect::Read { .. } => false,
             Effect::Create(_) => false,
             Effect::Update { .. } => false,
-            Effect::Replace { .. } => false,
             Effect::Delete { .. } => false,
             Effect::Import { .. } => false,
             Effect::Remove { .. } => false,
@@ -836,7 +772,6 @@ impl Effect {
             Effect::Read { resource } => &resource.id,
             Effect::Create(r) => &r.id,
             Effect::Update { to, .. } => &to.id,
-            Effect::Replace { to, .. } => &to.id,
             Effect::Delete { id, .. } => id,
             Effect::Import { id, .. } => id,
             Effect::Remove { id, .. } => id,
@@ -871,8 +806,8 @@ impl Effect {
     /// Import, Remove, Move, and Wait effects have no resource.
     ///
     /// carina#3181 / #3308: the underlying payloads are typestate
-    /// structs — `Create`/`Update`/`Replace` carry a [`Resource`],
-    /// `Read` carries a [`DataSource`]. Callers that need a concrete
+    /// structs — `Create`/`Update` carry a [`Resource`], `Read` carries
+    /// a [`DataSource`]. Callers that need a concrete
     /// type match the variant directly; this helper covers the
     /// shared id/attributes/binding/dependency_bindings accessors
     /// through the borrowing `ResourceRef` enum.
@@ -880,7 +815,6 @@ impl Effect {
         match self {
             Effect::Create(resource) => Some(crate::parser::ResourceRef::Resource(resource)),
             Effect::Update { to, .. } => Some(crate::parser::ResourceRef::Resource(to)),
-            Effect::Replace { to, .. } => Some(crate::parser::ResourceRef::Resource(to)),
             Effect::Read { resource } => Some(crate::parser::ResourceRef::DataSource(resource)),
             Effect::Delete { .. }
             | Effect::Import { .. }
@@ -898,7 +832,6 @@ impl Effect {
             Effect::Read { resource } => resource.binding.clone(),
             Effect::Create(resource) => resource.binding.clone(),
             Effect::Update { to, .. } => to.binding.clone(),
-            Effect::Replace { to, .. } => to.binding.clone(),
             Effect::Delete { binding, .. } => binding.clone(),
             Effect::Import { .. } => None,
             Effect::Remove { .. } => None,
@@ -931,7 +864,6 @@ impl Effect {
             Effect::Read { .. } => Vec::new(),
             Effect::Create(_) => Vec::new(),
             Effect::Update { .. } => Vec::new(),
-            Effect::Replace { .. } => Vec::new(),
             Effect::Delete { id, .. } => {
                 if successfully_deleted.contains(id.as_inner()) {
                     vec![id.clone().into_inner()]
@@ -965,7 +897,6 @@ impl Effect {
             Effect::Read { .. } => Vec::new(),
             Effect::Create(_) => Vec::new(),
             Effect::Update { .. } => Vec::new(),
-            Effect::Replace { .. } => Vec::new(),
             Effect::Delete { id, .. } => vec![id],
             Effect::Import { .. } => Vec::new(),
             Effect::Remove { .. } => Vec::new(),
@@ -982,8 +913,8 @@ impl Effect {
     /// `directives { depends_on = [...] }` declarations**, as a snapshot
     /// (cloned).
     ///
-    /// For variants carrying a `Resource` (Create, Update, Replace,
-    /// Read), the answer is derived live from
+    /// For variants carrying a `Resource` (Create, Update, Read), the
+    /// answer is derived live from
     /// `resource.directives.depends_on`. For Delete the answer comes
     /// from a stored `explicit_dependencies` set captured by the differ
     /// at construction time, because the originating resource is gone
@@ -996,7 +927,6 @@ impl Effect {
             Effect::Read { resource } => resource.directives.depends_on.iter().cloned().collect(),
             Effect::Create(resource) => resource.directives.depends_on.iter().cloned().collect(),
             Effect::Update { to, .. } => to.directives.depends_on.iter().cloned().collect(),
-            Effect::Replace { to, .. } => to.directives.depends_on.iter().cloned().collect(),
             Effect::Delete {
                 explicit_dependencies,
                 ..
@@ -1047,7 +977,6 @@ impl Effect {
             Effect::Read { .. }
             | Effect::Create(_)
             | Effect::Update { .. }
-            | Effect::Replace { .. }
             | Effect::Delete { .. }
             | Effect::Import { .. }
             | Effect::Remove { .. }
@@ -1100,13 +1029,6 @@ impl Effect {
                 );
                 edges
             }
-            Effect::Replace { from, .. } => from
-                .dependency_bindings
-                .iter()
-                .cloned()
-                .map(ResourceIdentity::new)
-                .map(ScheduleEdge::BlockedByIfDelete)
-                .collect(),
             Effect::Wait { .. }
             | Effect::DeferredCreate { .. }
             | Effect::DeferredReplace { .. } => self
@@ -1126,21 +1048,12 @@ impl Effect {
 
     /// Scheduling edges this effect contributes when running `destroy`.
     ///
-    /// Differs from [`Self::apply_edges`] in two ways: `Replace.from`
-    /// dependency bindings unconditionally block (rather than only when
-    /// they resolve to deletes), and meta effects (`Wait`, deferred
-    /// variants) contribute no edges because they are not present in
-    /// destroy plans.
+    /// Differs from [`Self::apply_edges`] in that meta effects (`Wait`,
+    /// deferred variants) contribute no edges because they are not present
+    /// in destroy plans.
     pub fn destroy_edges(&self) -> Vec<ScheduleEdge> {
         match self {
             Effect::Delete { dependencies, .. } => dependencies
-                .iter()
-                .cloned()
-                .map(ResourceIdentity::new)
-                .map(ScheduleEdge::BlockedBy)
-                .collect(),
-            Effect::Replace { from, .. } => from
-                .dependency_bindings
                 .iter()
                 .cloned()
                 .map(ResourceIdentity::new)
@@ -1235,7 +1148,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    const EFFECT_VARIANT_COUNT: usize = 11;
+    const EFFECT_VARIANT_COUNT: usize = 10;
 
     fn deferred_for_template() -> crate::parser::DeferredForExpression {
         crate::parser::DeferredForExpression {
@@ -1313,18 +1226,6 @@ mod tests {
                     from: Box::new(State::not_found(rid.clone())),
                     to: ResolvedResource::new(Resource::new("test", "x")),
                     changed_attributes: vec![],
-                },
-            ),
-            (
-                "Replace",
-                Effect::Replace {
-                    from: Box::new(State::not_found(rid.clone())),
-                    to: ResolvedResource::new(Resource::new("test", "x")),
-                    directives: Directives::default(),
-                    changed_create_only: ChangedCreateOnly::new(vec!["attr".to_string()]).unwrap(),
-                    cascading_updates: vec![],
-                    temporary_name: None,
-                    cascade_ref_hints: vec![],
                 },
             ),
             (
@@ -1699,40 +1600,6 @@ mod tests {
                 )),
                 changed_attributes: vec!["versioning".to_string()],
             },
-            Effect::Replace {
-                from: Box::new(State::existing(
-                    ResourceId::with_identity("ec2.Vpc", "my-vpc"),
-                    HashMap::from([(
-                        "cidr_block".to_string(),
-                        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
-                    )]),
-                )),
-                to: ResolvedResource::new(Resource::new("ec2.Vpc", "my-vpc").with_attribute(
-                    "cidr_block",
-                    Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-                )),
-                directives: Directives::default(),
-                changed_create_only: crate::effect::ChangedCreateOnly::new(vec![
-                    "cidr_block".to_string(),
-                ])
-                .unwrap(),
-                // carina#3181 PR D: cover `CascadingUpdate.to` in
-                // the serde round-trip.
-                cascading_updates: vec![CascadingUpdate {
-                    from: Box::new(State::not_found(ResourceId::with_identity(
-                        "ec2.Subnet",
-                        "my-subnet",
-                    ))),
-                    to: ResolvedResource::new(
-                        Resource::new("ec2.Subnet", "my-subnet").with_attribute(
-                            "vpc_id",
-                            Value::Concrete(ConcreteValue::String("vpc.id".to_string())),
-                        ),
-                    ),
-                }],
-                temporary_name: None,
-                cascade_ref_hints: vec![],
-            },
             Effect::Delete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "s3.Bucket",
@@ -1770,59 +1637,6 @@ mod tests {
         assert_eq!(
             &changed[..],
             ["cidr_block".to_string(), "vpc_id".to_string()]
-        );
-    }
-
-    #[test]
-    fn replace_changed_create_only_serializes_as_plain_array() {
-        let effect = Effect::Replace {
-            from: Box::new(State::not_found(ResourceId::with_identity("test", "x"))),
-            to: ResolvedResource::new(Resource::new("test", "x")),
-            directives: Directives::default(),
-            changed_create_only: ChangedCreateOnly::new(vec!["x".to_string()]).unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
-
-        let json = serde_json::to_value(&effect).unwrap();
-        assert_eq!(
-            json["Replace"]["changed_create_only"],
-            serde_json::json!(["x"])
-        );
-        let decoded: Effect = serde_json::from_value(json).unwrap();
-        assert_eq!(decoded, effect);
-    }
-
-    #[test]
-    fn replace_deserialize_rejects_empty_changed_create_only() {
-        let json = serde_json::json!({
-            "Replace": {
-                "from": {
-                    "id": {"provider": "", "resource_type": "test", "name": "x"},
-                    "identifier": "x-1",
-                    "attributes": {},
-                    "exists": true,
-                    "dependency_bindings": []
-                },
-                "to": {
-                    "id": {"provider": "", "resource_type": "test", "name": "x"},
-                    "attributes": {}
-                },
-                "directives": {},
-                "changed_create_only": [],
-                "cascading_updates": [],
-                "temporary_name": null,
-                "cascade_ref_hints": []
-            }
-        });
-
-        let err = serde_json::from_value::<Effect>(json)
-            .expect_err("empty changed_create_only must not deserialize as Replace");
-        assert!(
-            err.to_string()
-                .contains("Replace effect requires at least one changed create-only attribute"),
-            "unexpected error: {err}"
         );
     }
 
@@ -2032,8 +1846,8 @@ mod tests {
     /// `as_basic()` must return `Some` for the three variants the
     /// basic executor handles, and `None` for every other variant.
     /// This is the carina#3164 type-level contract: filters used to
-    /// be caller-side, and a missed filter (Move slipping into Phase
-    /// 1 of the phased executor) panicked apply.
+    /// be caller-side, and a missed filter (Move slipping into the
+    /// basic executor) panicked apply.
     #[test]
     fn as_basic_narrows_to_create_update_and_delete_only() {
         use crate::resource::State as ResState;
@@ -2078,15 +1892,6 @@ mod tests {
         let read = Effect::Read {
             resource: ResolvedDataSource::new(DataSource::new("test", "x")),
         };
-        let replace = Effect::Replace {
-            from: Box::new(ResState::not_found(rid.clone())),
-            to: ResolvedResource::new(Resource::new("test", "x")),
-            directives: Directives::default(),
-            changed_create_only: ChangedCreateOnly::new(vec!["attr".to_string()]).unwrap(),
-            cascading_updates: vec![],
-            temporary_name: None,
-            cascade_ref_hints: vec![],
-        };
         let import = Effect::Import {
             id: crate::resource::ResolvedResourceId::new(rid.clone()),
             identifier: crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
@@ -2116,7 +1921,6 @@ mod tests {
         };
         for (label, e) in [
             ("Read", read),
-            ("Replace", replace),
             ("Import", import),
             ("Remove", remove),
             ("Move", mov),

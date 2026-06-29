@@ -92,7 +92,7 @@ with the existing `type_aware_equal` — fixes the root cause once:
 build_detail_rows(effect, registry: Option<&SchemaRegistry>, …)
   ├─ Effect::Create  → build_create_rows(r, registry, …)   ← already schema-aware (Full mode)
   ├─ Effect::Update  → build_update_rows(from, to, changed_attributes, …)   ← registry DROPPED
-  └─ Effect::Replace → build_replace_rows(from, to, …)                      ← registry DROPPED
+  └─ the legacy replace effect → build_replace_rows(from, to, …)                      ← registry DROPPED
 ```
 
 - `build_detail_rows` already has `registry: Option<&SchemaRegistry>`
@@ -133,7 +133,7 @@ behavior for existing callers.
 // build_detail_rows
 Effect::Update { from, to, changed_attributes, .. } =>
     build_update_rows(from, to, changed_attributes, registry, detail, explicit),
-Effect::Replace { from, to, .. } =>
+LegacyReplace { from, to, .. } =>
     build_replace_rows(from, to, …, registry, detail, explicit),
 ```
 

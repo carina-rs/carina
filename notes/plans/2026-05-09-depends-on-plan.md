@@ -363,7 +363,7 @@ Each task is one TDD cycle. Goal: write failing test → run → see fail → mi
           match self {
               Effect::Create { explicit_dependencies, .. }
               | Effect::Update { explicit_dependencies, .. }
-              | Effect::Replace { explicit_dependencies, .. }
+              | LegacyReplace { explicit_dependencies, .. }
               | Effect::Delete { explicit_dependencies, .. }
               | Effect::Read { explicit_dependencies, .. }
               | Effect::Wait { explicit_dependencies, .. }     // pending #2825

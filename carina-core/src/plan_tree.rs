@@ -193,14 +193,11 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
 
         let (resource, mut deps): (Option<crate::parser::ResourceRef<'_>>, HashSet<String>) =
             match effect {
-                // carina#3181 PR D / #3308: `Create`/`Update`/`Replace`/`Read`
+                // carina#3181 PR D / #3308: `Create`/`Update`/`Read`
                 // all carry a typestate struct — reach them through the
                 // shared `ResourceRef` view, and assemble the dependency
                 // set from value refs + the effect's explicit depends_on.
-                Effect::Create(_)
-                | Effect::Update { .. }
-                | Effect::Replace { .. }
-                | Effect::Read { .. } => {
+                Effect::Create(_) | Effect::Update { .. } | Effect::Read { .. } => {
                     let rl = effect
                         .as_resource_ref()
                         .expect("variant carries a resource");

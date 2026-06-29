@@ -410,36 +410,6 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, is_selecte
             }
             lines.push(line);
         }
-        DetailRow::CascadingUpdates { count, updates } => {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  # Cascading updates ({} dependent {}):",
-                    count,
-                    if *count == 1 { "resource" } else { "resources" }
-                ),
-                dim_style,
-            )));
-            for update in updates {
-                lines.push(Line::from(Span::styled(
-                    format!("  #   ~ {} {}", update.display_type, update.name),
-                    dim_style,
-                )));
-                for attr in &update.changed_attrs {
-                    lines.push(Line::from(vec![
-                        Span::styled("  #       ", dim_style),
-                        Span::styled(format!("{}: ", attr.key), dim_style),
-                        Span::styled(
-                            attr.old.clone(),
-                            Style::default()
-                                .fg(Color::Red)
-                                .add_modifier(Modifier::CROSSED_OUT),
-                        ),
-                        Span::raw(" -> "),
-                        Span::styled(attr.new.clone(), Style::default().fg(Color::Yellow)),
-                    ]));
-                }
-            }
-        }
     }
 }
 

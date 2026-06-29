@@ -85,7 +85,7 @@ this class is "make the wrong call unrepresentable".
 - `ResourceKind::DataSource` is already handled by call-site
   filters in `executor`, `differ`, `destroy`, `apply`; the type
   isn't enforced but the convention is consistent.
-- `Effect::Replace`'s `from: Box<State>` typestate-encodes "we have
+- the legacy replace effect's `from: Box<State>` typestate-encodes "we have
   a pre-apply state" (vs `Effect::Create(Resource)` which doesn't).
 - `WritebackPlan<'a>` from carina#3170 encodes the at-most-one-write
   invariant on state writeback.
@@ -210,7 +210,7 @@ is one function in `state_writeback.rs`).
 ### `Plan`/`Effect` keep their existing typed shape
 
 `Effect::Create(Resource)`, `Effect::Update { to: Resource, … }`,
-`Effect::Replace { to: Resource, … }`: these continue to carry
+`LegacyReplace { to: Resource, ... }`: these continue to carry
 `Resource`, not `ManagedResource`. The reason is that effects are
 constructed by the differ, which only emits effects for managed
 resources anyway (`if resource.is_virtual() { continue; }` —
