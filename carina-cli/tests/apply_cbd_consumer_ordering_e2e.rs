@@ -141,7 +141,6 @@ let distribution = mock.test.resource {{
 }
 
 #[test]
-#[ignore = "Issue #3625 Phase 0 red regression; turns green in Phase 4"]
 fn cbd_replace_orders_consumer_update_between_create_and_delete() {
     let scenario = Scenario::new();
     scenario.write_config();

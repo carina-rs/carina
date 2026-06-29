@@ -3,6 +3,16 @@ use super::*;
 use crate::resource::ConcreteValue;
 use indexmap::IndexMap;
 
+fn replacement_metadata<'a>(
+    plan: &'a Plan,
+    id: &ResourceId,
+) -> &'a crate::plan::ReplaceDisplayMetadata {
+    plan.replace_display
+        .iter()
+        .find(|metadata| plan.effects()[metadata.create_idx].resource_id() == id)
+        .unwrap_or_else(|| panic!("replacement metadata for {id} not found"))
+}
+
 #[test]
 fn diff_create_when_not_exists() {
     let desired = Resource::new("bucket", "test");
@@ -405,16 +415,12 @@ fn replace_when_create_only_attr_changed() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace {
-            changed_create_only,
-            ..
-        } => {
-            assert_eq!(&changed_create_only[..], &["cidr_block".to_string()]);
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert_eq!(plan.effects().len(), 2);
+    let metadata = replacement_metadata(&plan, &ResourceId::with_identity("ec2.Vpc", "my-vpc"));
+    assert_eq!(
+        &metadata.changed_create_only[..],
+        &["cidr_block".to_string()]
+    );
 }
 
 #[test]
@@ -525,32 +531,37 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace {
-            changed_create_only,
-            ..
-        } => {
-            assert_eq!(&changed_create_only[..], &["cidr_block".to_string()]);
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert_eq!(plan.effects().len(), 2);
+    let metadata = replacement_metadata(&plan, &ResourceId::with_identity("ec2.Vpc", "my-vpc"));
+    assert_eq!(
+        &metadata.changed_create_only[..],
+        &["cidr_block".to_string()]
+    );
 }
 
 #[test]
 fn replace_carries_create_before_destroy_directives() {
     use crate::schema::{AttributeSchema, AttributeType};
 
-    let mut resource = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
-        "cidr_block",
-        Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
-    );
+    let mut resource = Resource::new("ec2.Vpc", "my-vpc")
+        .with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("my-vpc".to_string())),
+        )
+        .with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
     resource.directives.create_before_destroy = true;
 
     let resources = vec![resource];
 
     let mut current_states = HashMap::new();
     let mut attrs = HashMap::new();
+    attrs.insert(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("my-vpc".to_string())),
+    );
     attrs.insert(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -564,7 +575,9 @@ fn replace_carries_create_before_destroy_directives() {
     schemas.insert(
         "",
         crate::schema::ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only()),
+            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
+            .with_unique_name_attribute("name"),
     );
 
     let plan = create_plan(
@@ -580,18 +593,13 @@ fn replace_carries_create_before_destroy_directives() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    match &plan.effects()[0] {
-        Effect::Replace {
-            directives,
-            changed_create_only,
-            ..
-        } => {
-            assert!(directives.create_before_destroy);
-            assert_eq!(&changed_create_only[..], &["cidr_block".to_string()]);
-        }
-        other => panic!("Expected Replace, got {:?}", other),
-    }
+    assert_eq!(plan.effects().len(), 2);
+    let metadata = replacement_metadata(&plan, &ResourceId::with_identity("ec2.Vpc", "my-vpc"));
+    assert!(metadata.create_before_destroy);
+    assert_eq!(
+        &metadata.changed_create_only[..],
+        &["cidr_block".to_string()]
+    );
 }
 
 #[test]
@@ -703,11 +711,11 @@ fn replace_with_provider_prefixed_schema_key() {
         &[],
     );
 
-    assert_eq!(plan.effects().len(), 1);
-    assert!(
-        matches!(plan.effects()[0], Effect::Replace { .. }),
-        "Expected Replace with awscc-prefixed schema key, got {:?}",
-        plan.effects()[0]
+    assert_eq!(plan.effects().len(), 2);
+    assert_eq!(plan.replace_display.len(), 1);
+    replacement_metadata(
+        &plan,
+        &ResourceId::with_provider_identity("awscc", "ec2.Vpc", "my-vpc", None),
     );
 }
 

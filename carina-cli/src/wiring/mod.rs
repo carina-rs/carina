@@ -15,7 +15,7 @@ use futures::stream::{self, StreamExt};
 use carina_core::binding_index::{PreApplyInputs, ResolvedBindings, WaitAliasSpec};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::binding_matches_deferred_template;
-use carina_core::differ::{cascade_dependent_updates, create_plan};
+use carina_core::differ::create_plan_with_cascades;
 use carina_core::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes};
 use carina_core::executor::normalized::{
     is_value_fully_concrete_for_expansion, restore_stripped_attributes,
@@ -122,7 +122,8 @@ impl WiringContext {
                         AttributeSchema::new("identifier", AttributeType::string()).read_only(),
                     )
                     .attribute(AttributeSchema::new("comment", AttributeType::string()))
-                    .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string())),
+                    .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string()))
+                    .with_unique_name_attribute("name"),
             );
         }
         Self {
@@ -2353,9 +2354,10 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         .as_ref()
         .map(|sf| sf.build_directives())
         .unwrap_or_default();
-    let mut plan = create_plan(
+    let mut plan = create_plan_with_cascades(
         &resources,
         &data_sources_for_plan,
+        &sorted_resources,
         &provider,
         &plan_input_states,
         &directives_map,
@@ -2364,16 +2366,6 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         &prev_explicit,
         &orphan_dependencies,
         &wait_bindings,
-    );
-
-    // Populate cascading updates for Replace effects with create_before_destroy.
-    // Uses unresolved resources (sorted_resources) so dependent Update effects
-    // retain ResourceRef values for re-resolution at apply time.
-    cascade_dependent_updates(
-        &mut plan,
-        &sorted_resources,
-        &plan_input_states,
-        ctx.schemas(),
     );
 
     // Add state block effects (import/removed/moved) to the plan.

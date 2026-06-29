@@ -239,14 +239,38 @@ impl DependencyAnalysis {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct IdentityTargets {
+    preferred: Option<usize>,
+    delete: Option<usize>,
+}
+
+impl IdentityTargets {
+    fn insert_preferred(&mut self, idx: usize) {
+        self.preferred.get_or_insert(idx);
+    }
+
+    fn insert_delete(&mut self, idx: usize) {
+        self.delete = Some(idx);
+    }
+
+    fn lookup(&self) -> Option<usize> {
+        self.preferred.or(self.delete)
+    }
+
+    fn lookup_delete(&self) -> Option<usize> {
+        self.delete
+    }
+}
+
 struct DependencyAnalyzer {
-    identity_to_idx: HashMap<ResourceIdentity, usize>,
+    identity_to_idx: HashMap<ResourceIdentity, IdentityTargets>,
     compositions_by_binding: HashMap<String, crate::resource::Composition>,
 }
 
 impl DependencyAnalyzer {
     fn new(
-        identity_to_idx: HashMap<ResourceIdentity, usize>,
+        identity_to_idx: HashMap<ResourceIdentity, IdentityTargets>,
         compositions: &[crate::resource::Composition],
     ) -> Self {
         let compositions_by_binding = compositions
@@ -265,7 +289,15 @@ impl DependencyAnalyzer {
     }
 
     fn lookup_by_identity(&self, identity: &ResourceIdentity) -> Option<usize> {
-        self.identity_to_idx.get(identity).copied()
+        self.identity_to_idx
+            .get(identity)
+            .and_then(IdentityTargets::lookup)
+    }
+
+    fn lookup_delete_by_identity(&self, identity: &ResourceIdentity) -> Option<usize> {
+        self.identity_to_idx
+            .get(identity)
+            .and_then(IdentityTargets::lookup_delete)
     }
 
     fn lookup_by_string_ref(&self, binding: &str) -> Option<usize> {
@@ -292,7 +324,7 @@ impl DependencyAnalyzer {
                     }
                 }
                 ScheduleEdge::BlockedByIfDelete(identity) => {
-                    if let Some(blocked_idx) = self.lookup_by_identity(&identity)
+                    if let Some(blocked_idx) = self.lookup_delete_by_identity(&identity)
                         && blocked_idx < effects.len()
                         && matches!(effects[blocked_idx], Effect::Delete { .. })
                     {
@@ -406,24 +438,30 @@ pub fn build_effect_dependency_analysis(
     compositions: &[crate::resource::Composition],
     inputs: ScheduleInputs<'_>,
 ) -> DependencyAnalysis {
-    let mut identity_to_idx: HashMap<ResourceIdentity, usize> = HashMap::new();
+    let mut identity_to_idx: HashMap<ResourceIdentity, IdentityTargets> = HashMap::new();
     let aliases = match inputs {
         ScheduleInputs::Apply => &[][..],
         ScheduleInputs::Destroy { aliases } => aliases,
     };
     for (idx, effect) in effects.iter().enumerate() {
-        identity_to_idx.insert(effect.identity(), idx);
+        let targets = identity_to_idx.entry(effect.identity()).or_default();
+        if matches!(effect, Effect::Delete { .. }) {
+            targets.insert_delete(idx);
+        } else {
+            targets.insert_preferred(idx);
+        }
     }
     let alias_offset = effects.len();
     for (alias_idx, alias) in aliases.iter().enumerate() {
-        identity_to_idx.insert(
-            ResourceIdentity::new(alias.binding.clone()),
-            alias_offset + alias_idx,
-        );
+        identity_to_idx
+            .entry(ResourceIdentity::new(alias.binding.clone()))
+            .or_default()
+            .insert_preferred(alias_offset + alias_idx);
     }
 
     let analyzer = DependencyAnalyzer::new(identity_to_idx, compositions);
     let mut analysis = DependencyAnalysis::new(effects.len() + aliases.len());
+    add_same_identity_replacement_order_edges(effects, &mut analysis);
 
     for (idx, effect) in effects.iter().enumerate() {
         match inputs {
@@ -477,6 +515,23 @@ pub fn build_effect_dependency_analysis(
     }
 
     analysis
+}
+
+fn add_same_identity_replacement_order_edges(
+    effects: &[Effect],
+    analysis: &mut DependencyAnalysis,
+) {
+    let mut previous_by_identity: HashMap<ResourceIdentity, usize> = HashMap::new();
+    for (idx, effect) in effects.iter().enumerate() {
+        if !matches!(effect, Effect::Create(_) | Effect::Delete { .. }) {
+            continue;
+        }
+
+        let identity = effect.identity();
+        if let Some(previous) = previous_by_identity.insert(identity, idx) {
+            analysis.add_edge(idx, previous, ReadsSet::unknown());
+        }
+    }
 }
 
 pub fn relax_update_update_edges(effects: &[Effect], analysis: &mut DependencyAnalysis) {
@@ -588,8 +643,15 @@ mod tests {
     fn scheduler_index_keys_on_identity_not_string() {
         let first = ResourceIdentity::new("first");
         let second = ResourceIdentity::new("second");
+        let mut first_targets = IdentityTargets::default();
+        first_targets.insert_preferred(0);
+        let mut second_targets = IdentityTargets::default();
+        second_targets.insert_preferred(1);
         let analyzer = DependencyAnalyzer::new(
-            HashMap::from([(first.clone(), 0), (second.clone(), 1)]),
+            HashMap::from([
+                (first.clone(), first_targets),
+                (second.clone(), second_targets),
+            ]),
             &[],
         );
 
@@ -733,8 +795,12 @@ mod tests {
         blocker_resource.binding = Some("blocker".to_string());
         let blocker = Effect::Create(ResolvedResource::new(blocker_resource));
         let effects = vec![delete, blocker];
-        let analyzer =
-            DependencyAnalyzer::new(HashMap::from([(ResourceIdentity::new("foo"), 0)]), &[]);
+        let mut foo_targets = IdentityTargets::default();
+        foo_targets.insert_delete(0);
+        let analyzer = DependencyAnalyzer::new(
+            HashMap::from([(ResourceIdentity::new("foo"), foo_targets)]),
+            &[],
+        );
         let mut analysis = DependencyAnalysis::new(effects.len());
 
         analyzer.collect_from_schedule_edges(

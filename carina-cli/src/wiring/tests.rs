@@ -3757,6 +3757,8 @@ mod wait_until_enum_alias {
     /// plan path uses.
     #[test]
     fn create_plan_elides_already_satisfied_wait_after_enum_alias_resolution() {
+        use carina_core::differ::create_plan;
+
         let ctx = WiringContext::new(vec![Box::new(AcmAliasFactory) as Box<dyn ProviderFactory>]);
         let resources = vec![cert_resource(), changed_consumer()];
         let states = cert_state();
