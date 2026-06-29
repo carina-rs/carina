@@ -2,6 +2,7 @@ use super::*;
 
 use std::collections::HashSet;
 
+use crate::override_aware::OverrideAwareResources;
 use crate::resource::{ConcreteValue, DeferredValue, ResourceIdentity};
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
@@ -101,10 +102,10 @@ fn plan_for(
     current_states: HashMap<ResourceId, State>,
     schemas: &SchemaRegistry,
 ) -> Plan {
+    let managed = OverrideAwareResources::from_parts_for_tests(managed, unresolved);
     create_plan_with_cascades(
         &managed,
         &[],
-        &unresolved,
         &crate::provider::ProviderRouter::new(),
         &crate::resource::into_plan_input_map(current_states),
         &HashMap::new(),

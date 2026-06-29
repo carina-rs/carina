@@ -25,13 +25,13 @@ use carina_core::identifier::{
     self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
 };
 use carina_core::module_resolver;
+use carina_core::override_aware::OverrideAwareResources;
 use carina_core::parser::{ProviderConfig, StateBlock, StateBlockAddress};
 use carina_core::plan::Plan;
 use carina_core::provider::{
     self as provider_mod, Provider, ProviderError, ProviderFactory, ProviderNormalizer,
     ProviderRouter,
 };
-use carina_core::resolver::resolve_refs_for_plan;
 use carina_core::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, resolve_block_names,
@@ -48,6 +48,7 @@ pub struct PlanContext {
     pub plan: Plan,
     pub provider: ProviderRouter,
     pub sorted_resources: Vec<Resource>,
+    pub unresolved_resources: Vec<Resource>,
     pub current_states: HashMap<ResourceId, State>,
     /// Maps moved-to resource IDs to their original (moved-from) IDs.
     /// Used by display to show "(moved from: ...)" annotations on Update/Replace effects.
@@ -1812,6 +1813,7 @@ pub async fn create_plan_from_parsed<E: Clone>(
 ) -> Result<PlanContext, AppError> {
     create_plan_from_parsed_with_upstream(
         parsed,
+        &parsed.resources,
         state_file,
         refresh,
         &HashMap::new(),
@@ -1822,8 +1824,10 @@ pub async fn create_plan_from_parsed<E: Clone>(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     parsed: &carina_core::parser::File<E>,
+    unresolved_resources: &[Resource],
     state_file: &Option<StateFile>,
     refresh: bool,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
@@ -2216,12 +2220,6 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // separator + plan render below it instead of being swallowed (#3150).
     finish_refresh_bar_region(refresh_printed_bars);
 
-    // Resolve ResourceRef values and enum identifiers using AWS state.
-    // Plan-only: surviving upstream refs are stamped for display as
-    // `(known after upstream apply: <ref>)` (#2366). `apply` calls
-    // `resolve_refs_with_state_and_remote` and still errors on
-    // unresolved upstream references.
-    let mut resources = sorted_resources.clone();
     // awscc#251 (follow-up to #3055): #3055 lifted only `saved_attrs`.
     // On a refresh the live value comes from `provider.read()` into
     // `current_states`, a different map. A provider returning an IAM
@@ -2250,24 +2248,39 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     let upstream_binding_names: std::collections::HashSet<&str> =
         remote_bindings.keys().map(String::as_str).collect();
     let pre_apply_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
-    let plan_bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
-        carina_core::binding_index::PreApplyInputs {
-            managed: &resources,
+    let mut override_aware_resources = OverrideAwareResources::build_for_plan(
+        sorted_resources,
+        state_file.as_ref(),
+        PreApplyInputs {
+            managed: &[],
             compositions: &parsed.compositions,
             data_sources: &data_sources,
             current_states: &pre_apply_input_states,
             remote_bindings,
             wait_aliases: &wait_aliases,
         },
-    );
-    resolve_refs_for_plan(&mut resources, &plan_bindings, &upstream_binding_names)?;
+        &upstream_binding_names,
+    )?;
+    let unresolved_override_aware_resources = OverrideAwareResources::build_for_plan(
+        unresolved_resources.to_vec(),
+        state_file.as_ref(),
+        PreApplyInputs {
+            managed: &[],
+            compositions: &parsed.compositions,
+            data_sources: &data_sources,
+            current_states: &pre_apply_input_states,
+            remote_bindings,
+            wait_aliases: &wait_aliases,
+        },
+        &upstream_binding_names,
+    )?;
     // Resolve data-source input refs for the plan and canonicalize, so
     // each `read` resource flows into `create_plan` with concrete
     // attribute values (carina#3181).
     let mut data_sources_for_plan = data_sources.clone();
     carina_core::resolver::resolve_data_source_refs_for_plan(
         &mut data_sources_for_plan,
-        &plan_bindings,
+        override_aware_resources.bindings(),
         &upstream_binding_names,
     )?;
     carina_core::value::canonicalize_data_sources_with_schemas(
@@ -2291,7 +2304,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     let preprocessor = PlanPreprocessor::new(&provider, &ctx);
     preprocessor
         .prepare(
-            &mut resources,
+            override_aware_resources.resources_mut(),
             &mut current_states,
             &parsed.providers,
             &data_sources_for_plan,
@@ -2305,8 +2318,10 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // the desired resources; the earlier mutable-state reconciliation still
     // owns state-file rename migration.
     {
-        let canonical_resources =
-            carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
+        let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
+            override_aware_resources.resources_mut(),
+            ctx.schemas(),
+        );
         let errors =
             compute_anonymous_identifiers_with_ctx(&ctx, canonical_resources, &parsed.providers);
         if let Some(error) = errors.into_iter().next() {
@@ -2317,13 +2332,18 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         let mut state_for_late_reconcile = sf.clone();
         reconcile_anonymous_identifiers_with_ctx(
             &ctx,
-            &mut resources,
+            override_aware_resources.resources_mut(),
             &mut state_for_late_reconcile,
             state_block_claims,
         );
-        adopt_unique_state_identity_for_unresolved_anonymous(&mut resources, sf);
+        adopt_unique_state_identity_for_unresolved_anonymous(
+            override_aware_resources.resources_mut(),
+            sf,
+        );
     }
-    let fallback_renames = assign_fallback_identities_for_unresolved_anonymous(&mut resources);
+    let fallback_renames = assign_fallback_identities_for_unresolved_anonymous(
+        override_aware_resources.resources_mut(),
+    );
     for (from, to) in &fallback_renames {
         if let Some(mut state) = current_states.remove(from) {
             state.id = to.clone();
@@ -2341,7 +2361,11 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // after late anonymous reconciliation, so an anonymous desired resource
     // matched from state is not also treated as an orphan.
     let orphan_dependencies = if let Some(sf) = state_file.as_ref() {
-        let desired_ids: HashSet<ResourceId> = resources.iter().map(|r| r.id.clone()).collect();
+        let desired_ids: HashSet<ResourceId> = override_aware_resources
+            .resources()
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
         sf.build_orphan_dependencies(&desired_ids)
     } else {
         HashMap::new()
@@ -2355,9 +2379,8 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         .map(|sf| sf.build_directives())
         .unwrap_or_default();
     let mut plan = create_plan_with_cascades(
-        &resources,
+        &override_aware_resources,
         &data_sources_for_plan,
-        &sorted_resources,
         &provider,
         &plan_input_states,
         &directives_map,
@@ -2369,7 +2392,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     );
 
     // Add state block effects (import/removed/moved) to the plan.
-    // carina#3329: pass the same plan_bindings + upstream_binding_names
+    // carina#3329: pass the same override-aware bindings + upstream_binding_names
     // the resource-attribute resolver uses so an `import { id = "${…}|…" }`
     // expression is folded into a concrete cloud identifier (when the
     // referenced binding is in scope) or stamped for display as
@@ -2381,7 +2404,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         state_file,
         &moved_pairs,
         ctx.schemas(),
-        &plan_bindings,
+        override_aware_resources.bindings(),
         &upstream_binding_names,
     );
     add_deferred_create_effects(&mut plan, &deferred_create_targets);
@@ -2394,7 +2417,10 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     Ok(PlanContext {
         plan,
         provider,
-        sorted_resources,
+        sorted_resources: override_aware_resources.unresolved_resources().to_vec(),
+        unresolved_resources: unresolved_override_aware_resources
+            .unresolved_resources()
+            .to_vec(),
         current_states,
         moved_origins,
         upstream_snapshot: remote_bindings.clone(),

@@ -16,9 +16,9 @@ use carina_core::executor::normalized::apply_desired_normalization;
 use carina_core::executor::{
     ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult, UnresolvedResource,
 };
+use carina_core::override_aware::OverrideAwareResources;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
-use carina_core::resolver::resolve_refs_with_state_and_remote;
 #[cfg(test)]
 use carina_core::resource::ConcreteValue;
 use carina_core::resource::{Resource, ResourceId, State, Value};
@@ -40,8 +40,7 @@ use crate::commands::shared::progress::{
     RefreshProgress, emit_newline_on_interrupt, format_duration, refresh_multi_progress,
 };
 use crate::commands::shared::state_writeback::{
-    ApplyStateSave, FinalizeApplyInput, PostApplyStates, apply_name_overrides,
-    build_state_after_apply, resolve_exports,
+    ApplyStateSave, FinalizeApplyInput, PostApplyStates, build_state_after_apply, resolve_exports,
 };
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
@@ -984,9 +983,6 @@ async fn run_apply_locked(
             &state_block_claims,
         );
     }
-    apply_name_overrides(&mut parsed.resources, &state_file);
-    apply_name_overrides(&mut unresolved_parsed.resources, &state_file);
-
     // Upstream state bindings are loaded up front so refs that target
     // `upstream_state` blocks can be resolved during refresh (#1683) and
     // so that provider configuration refs (`assume_role.role_arn =
@@ -1315,31 +1311,40 @@ async fn run_apply_locked(
     let pre_resolve_compositions: Vec<carina_core::resource::Composition> =
         parsed.compositions.clone();
 
-    // Build the unified pre-apply bindings view (carina#3248): every
-    // kind of binding the configuration declares (managed, composition,
-    // data source) is in the same view, so a managed attribute
-    // referencing `<module_instance>.<attr>` chains through the
-    // composition's attribute map to the managed sibling literal
-    // (carina#3246).
     let pre_apply_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
-    let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
-        managed: &sorted_resources,
-        compositions: &pre_resolve_compositions,
-        data_sources: &data_sources,
-        current_states: &pre_apply_input_states,
-        remote_bindings: &remote_bindings,
-        wait_aliases: &wait_aliases,
-    });
-
-    // Resolve references and enum identifiers, then create initial plan for display
-    let mut resources_for_plan = sorted_resources.clone();
-    resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings)?;
+    let mut override_aware_resources = OverrideAwareResources::build(
+        sorted_resources,
+        state_file.as_ref(),
+        carina_core::binding_index::PreApplyInputs {
+            managed: &[],
+            compositions: &pre_resolve_compositions,
+            data_sources: &data_sources,
+            current_states: &pre_apply_input_states,
+            remote_bindings: &remote_bindings,
+            wait_aliases: &wait_aliases,
+        },
+    )?;
+    let unresolved_override_aware_resources = OverrideAwareResources::build(
+        unresolved_parsed.resources.clone(), // allow: direct — parser-internal, pre-expansion
+        state_file.as_ref(),
+        carina_core::binding_index::PreApplyInputs {
+            managed: &[],
+            compositions: &pre_resolve_compositions,
+            data_sources: &data_sources,
+            current_states: &pre_apply_input_states,
+            remote_bindings: &remote_bindings,
+            wait_aliases: &wait_aliases,
+        },
+    )?;
 
     // Resolve data-source input refs and canonicalize, so each `read`
     // resource flows into `create_plan` with concrete attribute values
     // (carina#3181).
     let mut data_sources_for_plan = data_sources.clone();
-    carina_core::resolver::resolve_data_source_refs(&mut data_sources_for_plan, &bindings)?;
+    carina_core::resolver::resolve_data_source_refs(
+        &mut data_sources_for_plan,
+        override_aware_resources.bindings(),
+    )?;
 
     // Desired resource canonicalization runs inside PlanPreprocessor's
     // shared desired-side normalization pipeline.
@@ -1358,7 +1363,7 @@ async fn run_apply_locked(
     let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);
     preprocessor
         .prepare(
-            &mut resources_for_plan,
+            override_aware_resources.resources_mut(),
             &mut current_states,
             &parsed.providers,
             &data_sources_for_plan,
@@ -1373,9 +1378,8 @@ async fn run_apply_locked(
         .unwrap_or_default();
     let schemas = ctx.schemas();
     let mut plan = create_plan_with_cascades(
-        &resources_for_plan,
+        &override_aware_resources,
         &data_sources_for_plan,
-        &sorted_resources,
         &provider,
         &plan_input_states,
         &directives_map,
@@ -1404,7 +1408,7 @@ async fn run_apply_locked(
         &state_file,
         &moved_pairs,
         schemas,
-        &bindings,
+        override_aware_resources.bindings(),
         &no_unresolved_upstreams,
     );
     crate::wiring::add_deferred_create_effects(&mut plan, &deferred_create_targets);
@@ -1432,7 +1436,7 @@ async fn run_apply_locked(
         // change(s) to state.` banner never prints (carina#3270).
         let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
             &parsed.export_params,
-            &sorted_resources,
+            override_aware_resources.unresolved_resources(),
             &parsed.compositions,
             &parsed.data_sources,
             &current_states,
@@ -1488,7 +1492,7 @@ async fn run_apply_locked(
             backend,
             lock,
             state_file,
-            &sorted_resources,
+            override_aware_resources.unresolved_resources(),
             &data_sources,
             &pre_resolve_compositions_noop,
             &parsed.export_params,
@@ -1509,7 +1513,7 @@ async fn run_apply_locked(
 
     let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
         &parsed.export_params,
-        &sorted_resources,
+        override_aware_resources.unresolved_resources(),
         &parsed.compositions,
         &parsed.data_sources,
         &current_states,
@@ -1543,16 +1547,18 @@ async fn run_apply_locked(
     println!();
 
     // Build unresolved resource map for re-resolution at apply time
-    let unresolved_resources: HashMap<ResourceId, UnresolvedResource> = unresolved_parsed
-        .resources
-        .iter()
-        .map(|r| {
-            (
-                r.id.clone(),
-                UnresolvedResource::from_pre_resolve(r.clone()),
-            )
-        })
-        .collect();
+    let unresolved_resources: HashMap<ResourceId, UnresolvedResource> =
+        unresolved_override_aware_resources
+            .unresolved_resources()
+            .iter()
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    UnresolvedResource::from_pre_resolve(r.clone()),
+                )
+            })
+            .collect();
+    let mut bindings = override_aware_resources.bindings().clone();
 
     // `provider` is a `ProviderRouter`, which impls both `Provider` and
     // `ProviderNormalizer`; the same object is passed in both positions
@@ -1584,7 +1590,7 @@ async fn run_apply_locked(
     execute_state_only_effects(&plan, &mut result);
     let resources_finished = Instant::now();
 
-    // Use `resources_for_plan` (post-default_tags merge, post-canonicalize)
+    // Use override-aware resources (post-default_tags merge, post-canonicalize)
     // for state writeback so the per-resource `explicit` tree includes
     // provider-level default tags. Otherwise the next plan projects the
     // tags out of `current` and surfaces a spurious `tags: (none) → ...`
@@ -1592,7 +1598,7 @@ async fn run_apply_locked(
     let finalize_result = finalize_apply(FinalizeApplyInput {
         result: &result,
         state_file,
-        sorted_resources: &resources_for_plan,
+        sorted_resources: override_aware_resources.resources(),
         data_sources: &data_sources_for_plan,
         current_states: &current_states,
         plan: &plan,
