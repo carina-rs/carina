@@ -14,6 +14,68 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::backend::BackendError;
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct NameOverride {
+    pub temp_value: String,
+    /// The DSL value at the time the override was recorded. `None`
+    /// indicates a state file migrated from v7 or earlier where the
+    /// original was not captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_value: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum NameOverrideDeserialize {
+    Legacy(String),
+    Current {
+        temp_value: String,
+        #[serde(default)]
+        original_value: Option<String>,
+    },
+}
+
+impl<'de> Deserialize<'de> for NameOverride {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match NameOverrideDeserialize::deserialize(deserializer)? {
+            NameOverrideDeserialize::Legacy(temp_value) => Ok(Self {
+                temp_value,
+                original_value: None,
+            }),
+            NameOverrideDeserialize::Current {
+                temp_value,
+                original_value,
+            } => Ok(Self {
+                temp_value,
+                original_value,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyDecision {
+    Apply,
+    Skip,
+    ApplyWithUnknownDsl,
+    ApplyLegacy,
+}
+
+pub fn should_apply_override(
+    current_dsl_value: Option<&str>,
+    override_: &NameOverride,
+) -> ApplyDecision {
+    match (&override_.original_value, current_dsl_value) {
+        (Some(orig), Some(cur)) if orig == cur => ApplyDecision::Apply,
+        (Some(_), Some(_)) => ApplyDecision::Skip,
+        (Some(_), None) => ApplyDecision::ApplyWithUnknownDsl,
+        (None, _) => ApplyDecision::ApplyLegacy,
+    }
+}
+
 /// The main state file structure that persists to the backend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateFile {
@@ -342,7 +404,12 @@ impl StateFile {
         for rs in &self.resources {
             if !rs.name_overrides.is_empty() {
                 let id = Self::id_for_resource_state(rs);
-                result.insert(id, rs.name_overrides.clone());
+                let overrides = rs
+                    .name_overrides
+                    .iter()
+                    .map(|(attribute, override_)| (attribute.clone(), override_.temp_value.clone()))
+                    .collect();
+                result.insert(id, overrides);
             }
         }
         result
@@ -670,9 +737,9 @@ pub struct ResourceState {
     #[serde(default)]
     pub prefixes: HashMap<String, String>,
     /// Permanent name overrides from create_before_destroy with non-renameable attributes.
-    /// Maps attribute name to the permanent temporary name (e.g., {"role_name": "my-role-abc123"}).
+    /// Maps attribute name to the temporary cloud-side name and the DSL value recorded with it.
     #[serde(default)]
-    pub name_overrides: HashMap<String, String>,
+    pub name_overrides: HashMap<String, NameOverride>,
     /// Tree of fields the user explicitly wrote in their `.crn` for
     /// this resource. Used by the differ both to detect attribute
     /// removals and to project actual-state through the authoring

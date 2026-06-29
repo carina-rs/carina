@@ -30,6 +30,19 @@ impl std::fmt::Display for PlanError {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PermanentNameOverride {
+    /// Identifies which resource the override targets.
+    pub resource_id: ResolvedResourceId,
+    /// The schema unique-name attribute whose value is overridden.
+    pub attribute: String,
+    /// The temporary value used on the cloud side.
+    pub temp_value: String,
+    /// The DSL value at the time the override was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ReplaceDisplayMetadata {
     /// Index into `Plan.effects` for the Create half of this replace.
     pub create_idx: usize,
@@ -66,6 +79,9 @@ pub(crate) struct ReplacementGroup {
     pub cascade_ref_hints: Vec<(String, String)>,
     /// Temporary name when CBD swaps the name attribute. `None` for DBC.
     pub temporary_name: Option<TemporaryName>,
+    /// Permanent name override recorded when CBD swaps the name attribute.
+    /// `None` for DBC and CBD paths that did not need a temporary name.
+    pub permanent_name_override: Option<PermanentNameOverride>,
     /// Identities of consumer effects (typically Updates) the Delete
     /// must wait for during apply. Populated into
     /// `Effect::Delete.blocked_by_updates`.
@@ -86,11 +102,13 @@ pub(crate) struct ReplacementDelete {
 }
 
 /// Plan containing Effects to be executed
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
     effects: Vec<Effect>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) replace_display: Vec<ReplaceDisplayMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) permanent_name_overrides: Vec<PermanentNameOverride>,
     /// Directive constraint violations detected during plan generation
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     errors: Vec<PlanError>,
@@ -141,6 +159,10 @@ impl Plan {
             temporary_name: group.temporary_name,
             previous_attributes: group.previous_attributes,
         });
+
+        if let Some(override_) = group.permanent_name_override {
+            self.permanent_name_overrides.push(override_);
+        }
     }
 
     pub fn effects(&self) -> &[Effect] {
@@ -681,6 +703,15 @@ mod tests {
         )])
     }
 
+    fn permanent_name_override() -> PermanentNameOverride {
+        PermanentNameOverride {
+            resource_id: ResolvedResourceId::new(ResourceId::with_identity("ec2.Vpc", "vpc")),
+            attribute: "name".to_string(),
+            temp_value: "main-cbd".to_string(),
+            original_value: Some("main".to_string()),
+        }
+    }
+
     fn replacement_group(consumer_updates: HashSet<ResourceIdentity>) -> ReplacementGroup {
         ReplacementGroup {
             create: resolved(Resource::new("ec2.Vpc", "vpc").with_binding("vpc")),
@@ -698,6 +729,7 @@ mod tests {
             changed_create_only: changed_create_only(),
             cascade_ref_hints: cascade_ref_hints(),
             temporary_name: Some(temporary_name()),
+            permanent_name_override: None,
             consumer_updates,
             previous_attributes: previous_attributes(),
         }
@@ -1157,6 +1189,67 @@ mod tests {
 
         assert_eq!(deserialized.effects().len(), 2);
         assert_eq!(deserialized.replace_display, expected_replace_display);
+    }
+
+    #[test]
+    fn plan_add_replacement_pushes_permanent_name_override_on_cbd() {
+        let override_ = permanent_name_override();
+        let mut group = replacement_group(HashSet::new());
+        group.permanent_name_override = Some(override_.clone());
+
+        let mut plan = Plan::new();
+        plan.add_replacement(group);
+
+        assert_eq!(plan.permanent_name_overrides, vec![override_]);
+    }
+
+    #[test]
+    fn plan_add_replacement_skips_permanent_name_override_on_dbc() {
+        let mut group = replacement_group(HashSet::new());
+        group.create_before_destroy = false;
+        group.temporary_name = None;
+        group.permanent_name_override = None;
+
+        let mut plan = Plan::new();
+        plan.add_replacement(group);
+
+        assert!(plan.permanent_name_overrides.is_empty());
+    }
+
+    #[test]
+    fn plan_permanent_name_overrides_round_trips_through_serde() {
+        let mut group = replacement_group(HashSet::new());
+        group.permanent_name_override = Some(permanent_name_override());
+        let mut plan = Plan::new();
+        plan.add_replacement(group);
+
+        let json = serde_json::to_string(&plan).unwrap();
+        let deserialized: Plan = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized, plan);
+    }
+
+    #[test]
+    fn plan_without_permanent_name_overrides_field_deserializes_to_empty() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resolved(Resource::new(
+            "s3.Bucket",
+            "bucket",
+        ))));
+        plan.add_error(PlanError {
+            resource_id: ResourceId::with_identity("s3.Bucket", "bucket"),
+            message: "fixture error".to_string(),
+        });
+
+        let mut json = serde_json::to_value(&plan).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("permanent_name_overrides");
+        assert!(!object.contains_key("permanent_name_overrides"));
+
+        let deserialized: Plan = serde_json::from_value(json).unwrap();
+        assert!(deserialized.permanent_name_overrides.is_empty());
+        assert_eq!(deserialized.effects().len(), 1);
+        assert_eq!(deserialized.errors().len(), 1);
     }
 
     #[test]
