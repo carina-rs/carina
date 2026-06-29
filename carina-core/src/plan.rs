@@ -66,6 +66,43 @@ pub(crate) struct ReplaceDisplayMetadata {
     pub previous_attributes: HashMap<String, Value>,
 }
 
+/// Borrowed public view of replacement display metadata.
+///
+/// The plan still owns the serializable metadata internally, but display
+/// frontends in other crates need enough information to render decomposed
+/// replacement Create/Delete pairs as a single replacement row.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplaceDisplayInfo<'a> {
+    /// Index into `Plan.effects` for the Create half of this replace.
+    pub create_idx: usize,
+    /// Index into `Plan.effects` for the Delete half of this replace.
+    pub delete_idx: usize,
+    /// Whether this was a create-before-destroy replacement.
+    pub create_before_destroy: bool,
+    /// Create-only attributes whose change drove the replacement.
+    pub changed_create_only: &'a [String],
+    /// Hints mapping attribute names to their original ResourceRef expressions.
+    pub cascade_ref_hints: &'a [(String, String)],
+    /// Temporary name when CBD used a name swap. `None` for DBC.
+    pub temporary_name: Option<&'a TemporaryName>,
+    /// Pre-replace state values used as the "from" side of display diffs.
+    pub previous_attributes: &'a HashMap<String, Value>,
+}
+
+impl<'a> ReplaceDisplayInfo<'a> {
+    fn from_metadata(metadata: &'a ReplaceDisplayMetadata) -> Self {
+        Self {
+            create_idx: metadata.create_idx,
+            delete_idx: metadata.delete_idx,
+            create_before_destroy: metadata.create_before_destroy,
+            changed_create_only: &metadata.changed_create_only,
+            cascade_ref_hints: &metadata.cascade_ref_hints,
+            temporary_name: metadata.temporary_name.as_ref(),
+            previous_attributes: &metadata.previous_attributes,
+        }
+    }
+}
+
 #[allow(dead_code)] // Phase 3 staging API; wired into the differ in Phase 4.
 pub(crate) struct ReplacementGroup {
     /// Create-side payload (identity-resolved).
@@ -168,6 +205,13 @@ impl Plan {
 
     pub fn effects(&self) -> &[Effect] {
         &self.effects
+    }
+
+    /// Replacement display metadata for decomposed Create/Delete replacement pairs.
+    pub fn replace_display_info(&self) -> impl Iterator<Item = ReplaceDisplayInfo<'_>> {
+        self.replace_display
+            .iter()
+            .map(ReplaceDisplayInfo::from_metadata)
     }
 
     pub fn permanent_name_overrides_for_state(
@@ -355,10 +399,27 @@ impl Plan {
     pub fn summary(&self) -> PlanSummary {
         let mut summary = PlanSummary::default();
         let deferred_summary = crate::plan_tree::deferred_summary_for_plan(self);
-        for effect in &self.effects {
+        let replacement_create_indices: HashSet<usize> = self
+            .replace_display
+            .iter()
+            .map(|metadata| metadata.create_idx)
+            .collect();
+        let replacement_delete_indices: HashSet<usize> = self
+            .replace_display
+            .iter()
+            .map(|metadata| metadata.delete_idx)
+            .collect();
+
+        summary.replace += self.replace_display.len();
+
+        for (idx, effect) in self.effects.iter().enumerate() {
             match effect {
                 Effect::Read { .. } => summary.read += 1,
-                Effect::Create(_) => summary.create += 1,
+                Effect::Create(_) => {
+                    if !replacement_create_indices.contains(&idx) {
+                        summary.create += 1;
+                    }
+                }
                 Effect::Update { .. } => summary.update += 1,
                 Effect::Replace {
                     cascading_updates, ..
@@ -366,7 +427,11 @@ impl Plan {
                     summary.replace += 1;
                     summary.update += cascading_updates.len();
                 }
-                Effect::Delete { .. } => {}
+                Effect::Delete { .. } => {
+                    if !replacement_delete_indices.contains(&idx) {
+                        summary.delete += 1;
+                    }
+                }
                 Effect::DeferredReplace { .. } => {}
                 Effect::Import { .. } => summary.import += 1,
                 Effect::Remove { .. } => summary.remove += 1,
@@ -375,11 +440,6 @@ impl Plan {
                 Effect::DeferredCreate { .. } => {}
             }
         }
-        summary.delete += self
-            .effects
-            .iter()
-            .filter(|effect| matches!(effect, Effect::Delete { .. }))
-            .count();
         summary.deferred = deferred_summary.entries;
         summary
     }
@@ -905,6 +965,21 @@ mod tests {
     }
 
     #[test]
+    fn plan_summary_counts_decomposed_replacement_as_replace() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resolved(Resource::new(
+            "ec2.Subnet",
+            "subnet",
+        ))));
+        plan.add_replacement(replacement_group(HashSet::new()));
+
+        let summary = plan.summary();
+        assert_eq!(summary.create, 1);
+        assert_eq!(summary.replace, 1);
+        assert_eq!(summary.delete, 0);
+    }
+
+    #[test]
     fn plan_summary_records_deferred_adds() {
         use crate::parser::ForBinding;
         use crate::resource::ResourceId;
@@ -1174,6 +1249,29 @@ mod tests {
         assert_eq!(metadata.cascade_ref_hints, expected_cascade_ref_hints);
         assert_eq!(metadata.temporary_name, expected_temporary_name);
         assert_eq!(metadata.previous_attributes, expected_previous_attributes);
+    }
+
+    #[test]
+    fn replace_display_info_exposes_display_fields_without_metadata_visibility() {
+        let mut plan = Plan::new();
+        plan.add_replacement(replacement_group(HashSet::new()));
+
+        let info = plan
+            .replace_display_info()
+            .next()
+            .expect("replacement display info");
+        let expected_changed = changed_create_only();
+        let expected_hints = cascade_ref_hints();
+        let expected_temporary_name = temporary_name();
+        let expected_previous_attributes = previous_attributes();
+
+        assert_eq!(info.create_idx, 0);
+        assert_eq!(info.delete_idx, 1);
+        assert!(info.create_before_destroy);
+        assert_eq!(info.changed_create_only, &*expected_changed);
+        assert_eq!(info.cascade_ref_hints, expected_hints.as_slice());
+        assert_eq!(info.temporary_name, Some(&expected_temporary_name));
+        assert_eq!(info.previous_attributes, &expected_previous_attributes);
     }
 
     #[test]

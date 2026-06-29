@@ -2,9 +2,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use carina_core::detail_rows::{DetailLevel, DetailRow, build_detail_rows};
+use carina_core::detail_rows::{
+    DetailLevel, DetailRow, build_detail_rows, build_replace_detail_rows_from_display,
+};
 use carina_core::effect::Effect;
-use carina_core::plan::{Plan, PlanSummary};
+use carina_core::plan::{Plan, PlanSummary, ReplaceDisplayInfo};
 use carina_core::plan_tree::{
     build_dependency_graph, build_single_parent_tree, deferred_for_detail_rows,
     deferred_for_display_name, deferred_for_verb, extract_compact_hint,
@@ -101,10 +103,27 @@ impl App {
         } else {
             Some(schemas)
         };
+        let replacement_display: Vec<_> = plan.replace_display_info().collect();
+        let replacement_delete_indices: HashSet<_> = replacement_display
+            .iter()
+            .map(|metadata| metadata.delete_idx)
+            .collect();
+        let replacement_create_info: HashMap<_, _> = replacement_display
+            .iter()
+            .map(|metadata| (metadata.create_idx, *metadata))
+            .collect();
         let mut nodes: Vec<TreeNode> = plan
             .effects()
             .iter()
-            .map(|e| effect_to_node(plan, e, schemas_opt))
+            .enumerate()
+            .map(|(idx, e)| {
+                effect_to_node(
+                    plan,
+                    e,
+                    schemas_opt,
+                    replacement_create_info.get(&idx).copied(),
+                )
+            })
             .collect();
         let plan_summary = plan.summary();
         let summary = format!("{}", plan_summary);
@@ -122,12 +141,18 @@ impl App {
         let update_or_replace_targets: HashSet<ResourceId> = plan
             .effects()
             .iter()
-            .filter_map(|e| match e {
+            .enumerate()
+            .filter_map(|(idx, e)| match e {
                 Effect::Update { to, .. } | Effect::Replace { to, .. } => Some(to.id.clone()),
+                Effect::Create(r) if replacement_create_info.contains_key(&idx) => {
+                    Some(r.id.clone())
+                }
                 Effect::DeferredReplace { .. } => None,
                 _ => None,
             })
             .collect();
+
+        suppressed.extend(replacement_delete_indices.iter().copied());
 
         suppressed.extend(
             plan.effects()
@@ -677,8 +702,24 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
     }
 }
 
-fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>) -> TreeNode {
-    let detail_rows = build_detail_rows(effect, schemas, DetailLevel::Full, None, None);
+fn effect_to_node(
+    plan: &Plan,
+    effect: &Effect,
+    schemas: Option<&SchemaRegistry>,
+    replacement_info: Option<ReplaceDisplayInfo<'_>>,
+) -> TreeNode {
+    let detail_rows =
+        if let (Effect::Create(resource), Some(replacement)) = (effect, replacement_info) {
+            build_replace_detail_rows_from_display(
+                resource,
+                replacement,
+                schemas,
+                DetailLevel::Full,
+                None,
+            )
+        } else {
+            build_detail_rows(effect, schemas, DetailLevel::Full, None, None)
+        };
 
     match effect {
         Effect::Read { resource } => TreeNode {
@@ -696,8 +737,16 @@ fn effect_to_node(plan: &Plan, effect: &Effect, schemas: Option<&SchemaRegistry>
             effect_label: format!("{}", resource.id.human()),
             resource_type: resource.id.display_type(),
             name_part: resource.id.identity_or_empty().to_string(),
-            symbol: effect.display_glyph().to_string(),
-            kind: EffectKind::Create,
+            symbol: replacement_info
+                .map(|metadata| {
+                    Effect::replace_display_glyph(metadata.create_before_destroy).to_string()
+                })
+                .unwrap_or_else(|| effect.display_glyph().to_string()),
+            kind: if replacement_info.is_some() {
+                EffectKind::Replace
+            } else {
+                EffectKind::Create
+            },
             detail_rows,
             children: Vec::new(),
             depth: 0,

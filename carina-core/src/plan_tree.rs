@@ -176,9 +176,22 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
     let mut effect_deps: HashMap<usize, HashSet<String>> = HashMap::new();
     let mut effect_bindings: HashMap<usize, String> = HashMap::new();
     let mut effect_types: HashMap<usize, String> = HashMap::new();
+    let replacement_display: Vec<_> = plan.replace_display_info().collect();
+    let replacement_delete_indices: HashSet<_> = replacement_display
+        .iter()
+        .map(|metadata| metadata.delete_idx)
+        .collect();
+    let replacement_create_info: HashMap<_, _> = replacement_display
+        .iter()
+        .map(|metadata| (metadata.create_idx, *metadata))
+        .collect();
 
     for (idx, effect) in plan.effects().iter().enumerate() {
-        let (resource, deps): (Option<crate::parser::ResourceRef<'_>>, HashSet<String>) =
+        if replacement_delete_indices.contains(&idx) {
+            continue;
+        }
+
+        let (resource, mut deps): (Option<crate::parser::ResourceRef<'_>>, HashSet<String>) =
             match effect {
                 // carina#3181 PR D / #3308: `Create`/`Update`/`Replace`/`Read`
                 // all carry a typestate struct — reach them through the
@@ -285,10 +298,37 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
             };
 
         if let Some(r) = resource {
-            let binding = r
-                .binding()
-                .map(str::to_string)
+            let mut replacement_binding = None;
+            let mut replacement_binding_aliases = Vec::new();
+            if let Some(metadata) = replacement_create_info.get(&idx)
+                && let Some(Effect::Delete {
+                    id,
+                    binding,
+                    dependencies,
+                    ..
+                }) = plan.effects().get(metadata.delete_idx)
+            {
+                deps.extend(dependencies.iter().cloned());
+                if let Some(binding) = binding {
+                    replacement_binding = Some(binding.clone());
+                    replacement_binding_aliases.push(binding.clone());
+                } else {
+                    replacement_binding_aliases.push(id.to_string());
+                }
+            }
+
+            let resource_binding = r.binding().map(str::to_string);
+            let binding = replacement_binding
+                .or_else(|| resource_binding.clone())
                 .unwrap_or_else(|| r.id().to_string());
+            for alias in replacement_binding_aliases {
+                binding_to_effect.insert(alias, idx);
+            }
+            if let Some(resource_binding) = resource_binding
+                && resource_binding != binding
+            {
+                binding_to_effect.insert(resource_binding, idx);
+            }
             binding_to_effect.insert(binding.clone(), idx);
             effect_bindings.insert(idx, binding);
             effect_types.insert(idx, r.id().resource_type.clone());
@@ -552,9 +592,9 @@ pub fn shorten_service_name<'a>(attr_name: &str, value: &'a str) -> Cow<'a, str>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::{DeferredReplaceDelete, NonEmptyDeletes};
+    use crate::effect::{ChangedCreateOnly, DeferredReplaceDelete, NonEmptyDeletes};
     use crate::parser::{DeferredForExpression, ForBinding};
-    use crate::plan::Plan;
+    use crate::plan::{Plan, ReplacementDelete, ReplacementGroup};
     use crate::resource::{
         ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, ResourceIdentity, Value,
     };
@@ -589,6 +629,61 @@ mod tests {
             "explicit depends_on edge should be in dependency graph; got {:?}",
             bucket_deps
         );
+    }
+
+    #[test]
+    fn replacement_delete_dependencies_and_binding_merge_into_create_node() {
+        let igw = Resource::new("ec2.InternetGateway", "igw").with_binding("internet_gateway");
+        let create = Resource::new("ec2.Vpc", "vpc").with_binding("vpc_new");
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resolved(igw)));
+        plan.add_replacement(ReplacementGroup {
+            create: resolved(create),
+            delete: ReplacementDelete {
+                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                    "ec2.Vpc", "vpc-old",
+                )),
+                identifier: "vpc-123".to_string(),
+                directives: Directives::default(),
+                binding: Some("vpc_old".to_string()),
+                dependencies: HashSet::from(["internet_gateway".to_string()]),
+                explicit_dependencies: HashSet::from(["internet_gateway".to_string()]),
+            },
+            create_before_destroy: true,
+            changed_create_only: ChangedCreateOnly::new(vec!["cidr_block".to_string()]).unwrap(),
+            cascade_ref_hints: Vec::new(),
+            temporary_name: None,
+            permanent_name_override: None,
+            consumer_updates: HashSet::new(),
+            previous_attributes: HashMap::from([(
+                "cidr_block".to_string(),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            )]),
+        });
+
+        let graph = build_dependency_graph(&plan);
+
+        assert!(
+            !graph.effect_deps.contains_key(&2),
+            "replacement delete should not be a graph entry"
+        );
+        assert_eq!(graph.binding_to_effect.get("vpc_old"), Some(&1));
+        assert_eq!(graph.binding_to_effect.get("vpc_new"), Some(&1));
+        assert_eq!(
+            graph.effect_bindings.get(&1).map(String::as_str),
+            Some("vpc_old")
+        );
+        assert!(
+            graph
+                .effect_deps
+                .get(&1)
+                .is_some_and(|deps| deps.contains("internet_gateway")),
+            "delete-side dependencies should be merged into create deps"
+        );
+
+        let (roots, dependents) = build_single_parent_tree(&plan, &graph);
+        assert_eq!(roots, vec![0]);
+        assert_eq!(dependents.get(&0), Some(&vec![1]));
     }
 
     #[test]
