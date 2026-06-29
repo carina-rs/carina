@@ -185,6 +185,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::from(["cert".to_string()]),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         }])
         .expect("fixture has one delete"),
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(

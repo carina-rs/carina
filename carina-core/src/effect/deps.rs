@@ -527,6 +527,35 @@ mod tests {
         }
     }
 
+    fn create_effect(binding: &str) -> Effect {
+        let mut resource = Resource::new("test", binding);
+        resource.binding = Some(binding.to_string());
+        Effect::Create(ResolvedResource::new(resource))
+    }
+
+    fn delete_effect(identity: &str, dependencies: &[&str], blocked_by_updates: &[&str]) -> Effect {
+        Effect::Delete {
+            id: ResolvedResourceId::new(ResourceId::with_identity("test", identity)),
+            identifier: format!("{identity}-id"),
+            directives: Default::default(),
+            binding: Some(identity.to_string()),
+            dependencies: dependencies
+                .iter()
+                .map(|dependency| (*dependency).to_string())
+                .collect(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: blocked_by_updates
+                .iter()
+                .cloned()
+                .map(ResourceIdentity::new)
+                .collect(),
+        }
+    }
+
+    fn total_edges(deps: &HashMap<usize, HashSet<usize>>) -> usize {
+        deps.values().map(HashSet::len).sum()
+    }
+
     #[test]
     fn effect_identity_returns_let_binding_for_named_effect() {
         let mut resource = Resource::new("test", "named");
@@ -545,6 +574,7 @@ mod tests {
             binding: None,
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         };
         let mut named_resource = Resource::new("test", "named");
         named_resource.binding = Some("named".to_string());
@@ -570,6 +600,125 @@ mod tests {
     }
 
     #[test]
+    fn delete_apply_edge_for_dependency_uses_blocked_by_if_delete() {
+        let delete_target = delete_effect("foo", &[], &[]);
+        let dependent_delete = delete_effect("dependent", &["foo"], &[]);
+        let deps = build_effect_dependency_analysis(
+            &[delete_target, dependent_delete],
+            &HashMap::new(),
+            &[],
+            ScheduleInputs::Apply,
+        )
+        .into_deps_of();
+
+        assert_eq!(total_edges(&deps), 1);
+        assert!(
+            deps[&0].contains(&1),
+            "dependency delete must wait for the dependent delete"
+        );
+
+        let create_target = create_effect("foo");
+        let dependent_delete = delete_effect("dependent", &["foo"], &[]);
+        let deps = build_effect_dependency_analysis(
+            &[create_target, dependent_delete],
+            &HashMap::new(),
+            &[],
+            ScheduleInputs::Apply,
+        )
+        .into_deps_of();
+        assert_eq!(
+            total_edges(&deps),
+            0,
+            "create targets must not be blocked by delete dependencies on apply"
+        );
+
+        let update_target = update_effect("foo", &[], &["tags"]);
+        let dependent_delete = delete_effect("dependent", &["foo"], &[]);
+        let deps = build_effect_dependency_analysis(
+            &[update_target, dependent_delete],
+            &HashMap::new(),
+            &[],
+            ScheduleInputs::Apply,
+        )
+        .into_deps_of();
+        assert_eq!(
+            total_edges(&deps),
+            0,
+            "update targets must not be blocked by delete dependencies on apply"
+        );
+    }
+
+    #[test]
+    fn delete_apply_edge_for_blocked_by_updates_uses_depends_on() {
+        let consumer = update_effect("consumer", &[], &["acl_id"]);
+        let delete = delete_effect("old_web_acl", &[], &["consumer"]);
+
+        let deps = build_effect_dependency_analysis(
+            &[consumer, delete],
+            &HashMap::new(),
+            &[],
+            ScheduleInputs::Apply,
+        )
+        .into_deps_of();
+
+        assert_eq!(total_edges(&deps), 1);
+        assert!(
+            deps[&1].contains(&0),
+            "delete must wait for the consumer update"
+        );
+    }
+
+    #[test]
+    fn delete_destroy_edge_ignores_blocked_by_updates() {
+        let parent = delete_effect("parent", &[], &[]);
+        let consumer = update_effect("consumer", &[], &["acl_id"]);
+        let child = delete_effect("child", &["parent"], &["consumer"]);
+
+        let deps = build_effect_dependency_analysis(
+            &[parent, consumer, child],
+            &HashMap::new(),
+            &[],
+            ScheduleInputs::Destroy { aliases: &[] },
+        )
+        .into_deps_of();
+
+        assert_eq!(total_edges(&deps), 1);
+        assert!(
+            deps[&0].contains(&2),
+            "destroy dependencies must remain unconditional"
+        );
+        assert!(
+            deps[&2].is_empty(),
+            "blocked_by_updates must not contribute destroy edges"
+        );
+    }
+
+    #[test]
+    fn cbd_ordering_unit_test_via_scheduler_edges() {
+        let create = create_effect("new_web_acl");
+        let consumer = update_effect("consumer", &[], &["web_acl_id"]);
+        let delete = delete_effect("old_web_acl", &[], &["consumer"]);
+
+        let deps = build_effect_dependency_analysis(
+            &[create, consumer, delete],
+            &HashMap::new(),
+            &[],
+            ScheduleInputs::Apply,
+        )
+        .into_deps_of();
+
+        assert!(
+            deps[&1].is_empty(),
+            "consumer update should have no create/delete dependency in this fixture"
+        );
+        assert!(
+            deps[&2].contains(&1),
+            "old web ACL delete must wait for the consumer update"
+        );
+        assert_eq!(total_edges(&deps), 1);
+    }
+
+    #[test]
     fn blocked_by_if_delete_resolves_anonymous_delete_through_identity_index() {
         let delete = Effect::Delete {
             id: ResolvedResourceId::new(ResourceId::with_identity("test", "foo")),
@@ -578,6 +727,7 @@ mod tests {
             binding: None,
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         };
         let mut blocker_resource = Resource::new("test", "blocker");
         blocker_resource.binding = Some("blocker".to_string());
@@ -611,6 +761,7 @@ mod tests {
             binding: None,
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         };
         let mut consumer_resource = Resource::new("test", "consumer");
         consumer_resource.binding = Some("consumer".to_string());
@@ -644,6 +795,7 @@ mod tests {
             binding: Some("parent".to_string()),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         };
         let child = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -654,6 +806,7 @@ mod tests {
             binding: Some("child".to_string()),
             dependencies: HashSet::from(["parent".to_string()]),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         };
         let effects = vec![parent, child];
 
@@ -677,6 +830,7 @@ mod tests {
             binding: Some("cert".to_string()),
             dependencies: HashSet::new(),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         };
         let listener = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -687,6 +841,7 @@ mod tests {
             binding: Some("listener".to_string()),
             dependencies: HashSet::from(["cert_issued".to_string()]),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         };
         let wait = DestroyWaitAlias::new(
             "cert_issued".to_string(),
@@ -761,6 +916,7 @@ mod tests {
             binding: Some("listener".to_string()),
             dependencies: HashSet::from(["missing_wait".to_string()]),
             explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
         };
         let deps = build_effect_dependency_analysis(
             &[orphan],

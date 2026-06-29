@@ -408,6 +408,7 @@ pub fn create_plan(
                     binding,
                     dependencies,
                     explicit_dependencies,
+                    blocked_by_updates: HashSet::new(),
                 });
             }
         }
@@ -465,6 +466,7 @@ pub fn create_plan(
                 // empty set here is correct and serde-stable for
                 // pre-#2871 state files.
                 explicit_dependencies: std::collections::HashSet::new(),
+                blocked_by_updates: HashSet::new(),
             });
         }
     }

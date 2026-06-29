@@ -308,6 +308,7 @@ fn plan_file_serde_round_trip() {
         binding: None,
         dependencies: HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     });
 
     let sorted_resources = vec![

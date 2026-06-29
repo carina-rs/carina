@@ -2913,6 +2913,7 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
                     binding: Some(binding),
                     dependencies,
                     explicit_dependencies,
+                    blocked_by_updates,
                 } = effect
                 else {
                     return None;
@@ -2928,6 +2929,7 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
                         binding: Some(binding.clone()),
                         dependencies: dependencies.clone(),
                         explicit_dependencies: explicit_dependencies.clone(),
+                        blocked_by_updates: blocked_by_updates.clone(),
                     })
                 } else {
                     None

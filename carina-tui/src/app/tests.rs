@@ -35,6 +35,7 @@ fn app_from_plan_with_effects() {
         binding: None,
         dependencies: HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: HashSet::new(),
     });
 
     let app = App::new(&plan, &SchemaRegistry::new());

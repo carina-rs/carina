@@ -401,6 +401,7 @@ async fn run_destroy_locked(
             binding: resource.binding.clone(),
             dependencies,
             explicit_dependencies,
+            blocked_by_updates: HashSet::new(),
         });
     }
 

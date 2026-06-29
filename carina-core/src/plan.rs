@@ -688,6 +688,7 @@ mod tests {
             binding: None,
             dependencies: std::collections::HashSet::new(),
             explicit_dependencies: std::collections::HashSet::new(),
+            blocked_by_updates: std::collections::HashSet::new(),
         });
 
         let summary = plan.summary();
@@ -769,6 +770,7 @@ mod tests {
                 binding: Some(format!("validation_records[{idx}]")),
                 dependencies: HashSet::new(),
                 explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
             })
             .collect();
 
@@ -950,6 +952,7 @@ mod tests {
             binding: None,
             dependencies: std::collections::HashSet::new(),
             explicit_dependencies: std::collections::HashSet::new(),
+            blocked_by_updates: std::collections::HashSet::new(),
         });
 
         let json = serde_json::to_string(&plan).unwrap();

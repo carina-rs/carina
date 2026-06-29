@@ -862,6 +862,7 @@ mod tests {
             binding: None,
             dependencies: Default::default(),
             explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
         });
         plan.add(Effect::Import {
             id: carina_core::resource::ResolvedResourceId::new(import_id),
