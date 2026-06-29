@@ -112,7 +112,7 @@ pub(super) fn effect_style(kind: EffectKind) -> Style {
     match kind {
         EffectKind::Create => Style::default().fg(Color::Green),
         EffectKind::Update => Style::default().fg(Color::Yellow),
-        EffectKind::Replace => Style::default().fg(Color::Yellow),
+        EffectKind::Replace => Style::default().fg(Color::Magenta),
         EffectKind::Delete => Style::default().fg(Color::Red),
         EffectKind::Read => Style::default().fg(Color::Cyan),
         EffectKind::Wait => Style::default().fg(Color::Magenta),

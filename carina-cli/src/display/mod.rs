@@ -5,12 +5,13 @@ use colored::{ColoredString, Colorize};
 
 use carina_core::detail_rows::{
     DetailRow, ListOfMapsDiffField, ListOfMapsDiffItem, ListOfMapsDiffItemKind,
-    ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows, hidden_unchanged_summary,
+    ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows,
+    build_replace_detail_rows_from_display, hidden_unchanged_summary,
 };
 #[cfg(test)]
 use carina_core::effect::CascadingUpdate;
 use carina_core::effect::Effect;
-use carina_core::plan::{DeferredSummaryAction, Plan, PlanSummaryPart};
+use carina_core::plan::{DeferredSummaryAction, Plan, PlanSummaryPart, ReplaceDisplayInfo};
 #[cfg(test)]
 use carina_core::plan_tree::shorten_attr_name;
 use carina_core::plan_tree::{
@@ -83,6 +84,14 @@ impl Sigil {
             Effect::Wait { .. } => raw.magenta().bold(),
         };
         Self { raw, rendered }
+    }
+
+    fn replacement(create_before_destroy: bool) -> Self {
+        let raw = Effect::replace_display_glyph(create_before_destroy);
+        Self {
+            raw,
+            rendered: raw.magenta().bold(),
+        }
     }
 
     fn module_header() -> Self {
@@ -546,6 +555,8 @@ struct TreeRenderContext<'a> {
     printed: HashSet<usize>,
     plan: &'a Plan,
     dependents: HashMap<usize, Vec<usize>>,
+    replacement_create_info: HashMap<usize, ReplaceDisplayInfo<'a>>,
+    replacement_delete_indices: HashSet<usize>,
     detail: DetailLevel,
     delete_attributes: Option<&'a HashMap<ResourceId, HashMap<String, Value>>>,
     schemas: Option<&'a SchemaRegistry>,
@@ -571,10 +582,17 @@ impl<'a> TreeRenderContext<'a> {
         if self.printed.contains(&idx) {
             return false;
         }
+        if self.replacement_delete_indices.contains(&idx) {
+            self.printed.insert(idx);
+            return false;
+        }
         self.printed.insert(idx);
 
         let effect = &self.plan.effects()[idx];
-        let sigil = Sigil::from_effect(effect);
+        let replacement_info = self.replacement_create_info.get(&idx).copied();
+        let sigil = replacement_info
+            .map(|metadata| Sigil::replacement(metadata.create_before_destroy))
+            .unwrap_or_else(|| Sigil::from_effect(effect));
         let line_prefix = tree_sigil_prefix(indent, is_last, prefix, &sigil);
         let base_indent = LEFT_MARGIN;
         let attr_base = ATTR_BASE;
@@ -584,7 +602,46 @@ impl<'a> TreeRenderContext<'a> {
         // --- Resource header line ---
         match effect {
             Effect::Create(r) => {
-                if self.detail == DetailLevel::None {
+                if let Some(metadata) = replacement_info {
+                    let id = &r.id;
+                    let replace_note = if metadata.create_before_destroy {
+                        "(must be replaced, create before destroy)"
+                    } else {
+                        "(must be replaced)"
+                    };
+                    let moved_note = self
+                        .moved_origins
+                        .get(id)
+                        .map(|from| format!(" (moved from: {})", from.identity_or_empty()));
+                    if self.detail == DetailLevel::None {
+                        let name_part = format_compact_name(
+                            carina_core::parser::ResourceRef::Resource(r),
+                            id.identity_or_empty(),
+                            parent_binding,
+                        );
+                        writeln!(
+                            self.out,
+                            "{}{} {} {}{}",
+                            line_prefix,
+                            id.display_type().cyan().bold(),
+                            name_part.magenta().bold(),
+                            replace_note.magenta(),
+                            moved_note.as_deref().unwrap_or("").magenta()
+                        )
+                        .unwrap();
+                    } else {
+                        writeln!(
+                            self.out,
+                            "{}{} {} {}{}",
+                            line_prefix,
+                            id.display_type().cyan().bold(),
+                            id.identity_or_empty().magenta().bold(),
+                            replace_note.magenta(),
+                            moved_note.as_deref().unwrap_or("").magenta()
+                        )
+                        .unwrap();
+                    }
+                } else if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(
                         carina_core::parser::ResourceRef::Resource(r),
                         r.id.identity_or_empty(),
@@ -842,13 +899,25 @@ impl<'a> TreeRenderContext<'a> {
                 format!("{}{}{}", base_indent, continuation, SPACE_CONTINUATION)
             };
 
-            let detail_rows = build_detail_rows(
-                effect,
-                self.schemas,
-                self.detail.to_core(),
-                self.delete_attributes,
-                self.prev_explicit,
-            );
+            let detail_rows =
+                if let (Effect::Create(r), Some(replacement)) = (effect, replacement_info) {
+                    let explicit = self.prev_explicit.and_then(|map| map.get(&r.id));
+                    build_replace_detail_rows_from_display(
+                        r,
+                        replacement,
+                        self.schemas,
+                        self.detail.to_core(),
+                        explicit,
+                    )
+                } else {
+                    build_detail_rows(
+                        effect,
+                        self.schemas,
+                        self.detail.to_core(),
+                        self.delete_attributes,
+                        self.prev_explicit,
+                    )
+                };
 
             if !detail_rows.is_empty() {
                 has_displayed_attrs = true;
@@ -922,6 +991,9 @@ impl<'a> TreeRenderContext<'a> {
         if self.printed.contains(&idx) {
             return false;
         }
+        if self.replacement_delete_indices.contains(&idx) {
+            return false;
+        }
 
         let Some(effect) = self.plan.effects().get(idx) else {
             return false;
@@ -945,6 +1017,10 @@ impl<'a> TreeRenderContext<'a> {
     fn consume_suppressed_item(&mut self, item: &ChildRenderItem) {
         match item {
             ChildRenderItem::Normal(idx) => {
+                if self.replacement_delete_indices.contains(idx) {
+                    self.printed.insert(*idx);
+                    return;
+                }
                 if !self.will_render_effect_tree(*idx)
                     && !self.printed.contains(idx)
                     && matches!(
@@ -1052,13 +1128,24 @@ fn format_plan_tree<'a>(
 
     // Build the single-parent tree with sorted siblings
     let (roots, dependents) = build_single_parent_tree(plan, &graph);
+    let replacement_display: Vec<_> = plan.replace_display_info().collect();
+    let replacement_delete_indices: HashSet<_> = replacement_display
+        .iter()
+        .map(|metadata| metadata.delete_idx)
+        .collect();
+    let replacement_create_info: HashMap<_, _> = replacement_display
+        .iter()
+        .map(|metadata| (metadata.create_idx, *metadata))
+        .collect();
 
     let update_or_replace_targets: HashSet<ResourceId> = plan
         .effects()
         .iter()
-        .filter_map(|e| match e {
+        .enumerate()
+        .filter_map(|(idx, e)| match e {
             Effect::Update { to, .. } => Some(to.id.clone()),
             Effect::Replace { to, .. } => Some(to.id.clone()),
+            Effect::Create(r) if replacement_create_info.contains_key(&idx) => Some(r.id.clone()),
             Effect::DeferredReplace { .. } => None,
             _ => None,
         })
@@ -1069,6 +1156,8 @@ fn format_plan_tree<'a>(
         printed: HashSet::new(),
         plan,
         dependents,
+        replacement_create_info,
+        replacement_delete_indices,
         detail,
         delete_attributes,
         schemas,
@@ -1131,6 +1220,7 @@ fn format_plan_tree<'a>(
     // (e.g., circular dependencies or isolated resources)
     let remaining: Vec<_> = (0..plan.effects().len())
         .filter(|idx| !ctx.printed.contains(idx))
+        .filter(|idx| !ctx.replacement_delete_indices.contains(idx))
         .collect();
     let remaining_items = ctx.child_render_items(&remaining);
     for (i, item) in remaining_items.iter().enumerate() {

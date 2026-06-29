@@ -4,10 +4,9 @@ expression: output
 ---
 Execution Plan:
 
-  - test.test.Widget alpha
-  + test.test.Widget alpha
-      external_name: "new"
-  - test.test.Widget beta
-  + test.test.Widget beta
+  -/+ test.test.Widget alpha (must be replaced)
+      external_name: "old" → "new" (forces replacement)
+  -/+ test.test.Widget beta (must be replaced)
+      legacy_token: "tok" → (removed) (forces replacement)
 
-Plan: 2 to add, 0 to change, 2 to destroy.
+Plan: 0 to add, 0 to change, 2 to replace, 0 to destroy.

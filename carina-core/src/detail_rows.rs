@@ -11,6 +11,7 @@ use indexmap::IndexMap;
 use crate::diff_helpers::{compute_map_diff, compute_unchanged_count, schema_aware_equal};
 use crate::effect::Effect;
 use crate::non_empty::NonEmptyVec;
+use crate::plan::ReplaceDisplayInfo;
 use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
 use crate::schema::{AttributeType, ResourceSchema, SchemaRegistry, empty_defs_for_schema_walks};
 use crate::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
@@ -796,6 +797,18 @@ fn project_from_attrs(
     }
 }
 
+fn project_previous_attrs(
+    previous_attributes: &HashMap<String, Value>,
+    explicit: Option<&crate::explicit::ExplicitFields>,
+) -> HashMap<String, Value> {
+    // Same projection as `project_from_attrs`, but sourced from
+    // replacement-display metadata instead of an `Effect::Replace` State.
+    match explicit {
+        Some(e) => crate::explicit::project_attributes(previous_attributes.clone(), e),
+        None => previous_attributes.clone(),
+    }
+}
+
 fn build_attribute_diff_rows(
     to: &crate::resource::Resource,
     ctx: AttributeDiffContext<'_>,
@@ -960,17 +973,70 @@ fn build_replace_rows(
     detail: DetailLevel,
     explicit: Option<&crate::explicit::ExplicitFields>,
 ) -> Vec<DetailRow> {
+    build_replace_rows_from_attributes(
+        &from.attributes,
+        to,
+        changed_create_only,
+        cascading_updates,
+        temporary_name.as_ref(),
+        cascade_ref_hints,
+        schema,
+        detail,
+        explicit,
+    )
+}
+
+/// Build replacement detail rows for a decomposed Create/Delete replacement.
+///
+/// Phase 4 stores replacement display metadata separately from the Create
+/// effect. This helper reconstructs the replacement diff by using metadata
+/// `previous_attributes` as the old side and the Create resource attributes as
+/// the new side.
+#[allow(clippy::too_many_arguments)]
+pub fn build_replace_detail_rows_from_display(
+    to: &crate::resource::Resource,
+    replacement: ReplaceDisplayInfo<'_>,
+    registry: Option<&SchemaRegistry>,
+    detail: DetailLevel,
+    explicit: Option<&crate::explicit::ExplicitFields>,
+) -> Vec<DetailRow> {
+    let schema = registry.and_then(|reg| reg.get_for(to));
+    build_replace_rows_from_attributes(
+        replacement.previous_attributes,
+        to,
+        replacement.changed_create_only,
+        &[],
+        replacement.temporary_name,
+        replacement.cascade_ref_hints,
+        schema,
+        detail,
+        explicit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_replace_rows_from_attributes(
+    previous_attributes: &HashMap<String, Value>,
+    to: &crate::resource::Resource,
+    changed_create_only: &[String],
+    cascading_updates: &[crate::effect::CascadingUpdate],
+    temporary_name: Option<&crate::effect::TemporaryName>,
+    cascade_ref_hints: &[(String, String)],
+    schema: Option<&ResourceSchema>,
+    detail: DetailLevel,
+    explicit: Option<&crate::explicit::ExplicitFields>,
+) -> Vec<DetailRow> {
     let mut rows = Vec::new();
     let defs = schema
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
-    let from_attrs_projected = project_from_attrs(from, explicit);
+    let from_attrs_projected = project_previous_attrs(previous_attributes, explicit);
     let force_keys: HashSet<&str> = changed_create_only.iter().map(|s| s.as_str()).collect();
 
     let attr_rows = build_attribute_diff_rows(
         to,
         AttributeDiffContext::for_replace(
-            &from.attributes,
+            previous_attributes,
             &from_attrs_projected,
             schema,
             defs,
@@ -988,7 +1054,7 @@ fn build_replace_rows(
         .collect();
     removed_force_keys.sort();
     for key in removed_force_keys {
-        let old_value = from.attributes.get(key.as_str());
+        let old_value = previous_attributes.get(key.as_str());
         let attr_type = schema
             .and_then(|s| s.attributes.get(key.as_str()))
             .map(|a| &a.attr_type);
@@ -1887,6 +1953,7 @@ fn cascade_key_hint(path: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::ReplaceDisplayInfo;
     use crate::resource::{ResolvedResource, Resource, ResourceId, State};
     use std::collections::HashSet;
 
@@ -2153,6 +2220,45 @@ mod tests {
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
         assert_eq!(rows.len(), 1);
         assert!(matches!(&rows[0], DetailRow::Removed { key, .. } if key == "removed_attr"));
+    }
+
+    #[test]
+    fn replace_detail_rows_from_display_diff_previous_attributes_against_create() {
+        let to = Resource::new("ec2.Vpc", "vpc").with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
+        let previous_attributes = HashMap::from([(
+            "cidr_block".to_string(),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        )]);
+        let changed_create_only = vec!["cidr_block".to_string()];
+        let replacement = ReplaceDisplayInfo {
+            create_idx: 0,
+            delete_idx: 1,
+            create_before_destroy: false,
+            changed_create_only: &changed_create_only,
+            cascade_ref_hints: &[],
+            temporary_name: None,
+            previous_attributes: &previous_attributes,
+        };
+
+        let rows = build_replace_detail_rows_from_display(
+            &to,
+            replacement,
+            None,
+            DetailLevel::Explicit,
+            None,
+        );
+
+        assert_eq!(
+            rows,
+            vec![DetailRow::ChangedForcesReplacement {
+                key: "cidr_block".to_string(),
+                old: "\"10.0.0.0/16\"".to_string(),
+                new: "\"10.1.0.0/16\"".to_string(),
+            }]
+        );
     }
 
     #[test]
