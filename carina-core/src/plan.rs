@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::effect::{ChangedCreateOnly, Effect, TemporaryName};
 use crate::module::DependencyGraph;
+use crate::name_override::NameOverride;
 pub use crate::resource::ModuleSource;
 use crate::resource::{
     Directives, ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity, Value,
@@ -167,6 +168,25 @@ impl Plan {
 
     pub fn effects(&self) -> &[Effect] {
         &self.effects
+    }
+
+    pub fn permanent_name_overrides_for_state(
+        &self,
+    ) -> HashMap<ResourceId, HashMap<String, NameOverride>> {
+        let mut overrides: HashMap<ResourceId, HashMap<String, NameOverride>> = HashMap::new();
+        for override_ in &self.permanent_name_overrides {
+            overrides
+                .entry(override_.resource_id.as_inner().clone())
+                .or_default()
+                .insert(
+                    override_.attribute.clone(),
+                    NameOverride {
+                        temp_value: override_.temp_value.clone(),
+                        original_value: override_.original_value.clone(),
+                    },
+                );
+        }
+        overrides
     }
 
     pub fn is_replacement_delete_index(&self, idx: usize) -> bool {

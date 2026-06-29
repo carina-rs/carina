@@ -355,6 +355,17 @@ impl StateFile {
         result
     }
 
+    pub fn has_legacy_name_overrides(&self) -> bool {
+        self.resources.iter().any(has_legacy_name_override)
+    }
+
+    pub fn legacy_name_override_resources(&self) -> Vec<&ResourceState> {
+        self.resources
+            .iter()
+            .filter(|rs| has_legacy_name_override(rs))
+            .collect()
+    }
+
     /// Build a map of resource bindings for use as a remote state data source.
     ///
     /// Returns a map where each key is a resource binding name and the value is a
@@ -413,6 +424,13 @@ impl Default for StateFile {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn has_legacy_name_override(resource: &ResourceState) -> bool {
+    resource
+        .name_overrides
+        .values()
+        .any(|override_| override_.original_value.is_none())
 }
 
 impl NameOverrideSource for StateFile {

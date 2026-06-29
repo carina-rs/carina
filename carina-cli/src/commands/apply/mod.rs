@@ -73,6 +73,32 @@ fn split_execution_outcome(outcome: ExecutionOutcome) -> (ExecutionResult, bool)
     }
 }
 
+fn check_legacy_name_overrides(state_file: &StateFile, accept: bool) -> Result<(), AppError> {
+    if !state_file.has_legacy_name_overrides() || accept {
+        return Ok(());
+    }
+
+    let mut affected: Vec<String> = state_file
+        .legacy_name_override_resources()
+        .into_iter()
+        .map(|resource| {
+            format!(
+                "{}.{}.{}",
+                resource.provider, resource.resource_type, resource.identity
+            )
+        })
+        .collect();
+    affected.sort();
+    affected.dedup();
+
+    Err(AppError::Validation(format!(
+        "State file contains pre-Phase-5 legacy name overrides without recorded original DSL values for: {}.\n\
+         Run `carina plan` first to inspect the drift, or re-run `carina apply` with \
+         `--accept-legacy-name-overrides` to proceed.",
+        affected.join(", ")
+    )))
+}
+
 /// Execute all effects in a plan, resolving references dynamically.
 ///
 /// This delegates to `carina_core::executor::execute_plan()` with a `CliObserver`
@@ -354,7 +380,6 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
         runtime_synthesized_resources: &input.result.runtime_synthesized_resources,
         current_states: input.current_states,
         applied_states: &input.result.applied_states,
-        permanent_name_overrides: &input.result.permanent_name_overrides,
         plan: input.plan,
         successfully_deleted: &input.result.successfully_deleted,
         failed_refreshes: &input.result.failed_refreshes,
@@ -606,6 +631,7 @@ pub async fn run_apply(
     auto_approve: bool,
     lock: bool,
     parallelism: NonZeroUsize,
+    accept_legacy_name_overrides: bool,
     provider_context: &ProviderContext,
     cancel: CancellationToken,
 ) -> Result<(), AppError> {
@@ -614,6 +640,7 @@ pub async fn run_apply(
         auto_approve,
         lock,
         parallelism,
+        accept_legacy_name_overrides,
         provider_context,
         cancel,
         &cli_observer_factory,
@@ -628,6 +655,7 @@ async fn run_apply_with_observer_factory(
     auto_approve: bool,
     lock: bool,
     parallelism: NonZeroUsize,
+    accept_legacy_name_overrides: bool,
     provider_context: &ProviderContext,
     cancel: CancellationToken,
     observer_factory: &ObserverFactory<'_>,
@@ -888,6 +916,7 @@ async fn run_apply_with_observer_factory(
         cancel,
         observer_factory,
         parallelism,
+        accept_legacy_name_overrides,
     )
     .await;
 
@@ -928,6 +957,7 @@ async fn run_apply_locked(
     cancel: CancellationToken,
     observer_factory: &ObserverFactory<'_>,
     parallelism: NonZeroUsize,
+    accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
     // Read current state from backend. carina#3315: if `check_and_migrate`
     // lifted an older on-disk schema in memory, persist the upgrade
@@ -935,6 +965,9 @@ async fn run_apply_locked(
     // — otherwise the carina#3283 warning text ("Disk state will be
     // rewritten on the next `carina apply`...") becomes a lie.
     let mut state_file = load_state_persist_if_migrated(backend, lock).await?;
+    if let Some(state) = state_file.as_ref() {
+        check_legacy_name_overrides(state, accept_legacy_name_overrides)?;
+    }
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
     reconcile_prefixed_names(&mut unresolved_parsed.resources, &state_file);
@@ -1324,6 +1357,10 @@ async fn run_apply_locked(
             wait_aliases: &wait_aliases,
         },
     )?;
+    crate::legacy_name_overrides::emit_legacy_override_warnings(
+        &override_aware_resources,
+        state_file.as_ref(),
+    );
     let unresolved_override_aware_resources = OverrideAwareResources::build(
         unresolved_parsed.resources.clone(), // allow: direct — parser-internal, pre-expansion
         state_file.as_ref(),
@@ -1671,6 +1708,7 @@ pub async fn run_apply_from_plan(
     auto_approve: bool,
     lock: bool,
     parallelism: NonZeroUsize,
+    accept_legacy_name_overrides: bool,
     provider_context: &ProviderContext,
     cancel: CancellationToken,
 ) -> Result<(), AppError> {
@@ -1679,6 +1717,7 @@ pub async fn run_apply_from_plan(
         auto_approve,
         lock,
         parallelism,
+        accept_legacy_name_overrides,
         provider_context,
         cancel,
         &cli_observer_factory,
@@ -1693,6 +1732,7 @@ async fn run_apply_from_plan_with_observer_factory(
     auto_approve: bool,
     lock: bool,
     parallelism: NonZeroUsize,
+    accept_legacy_name_overrides: bool,
     provider_context: &ProviderContext,
     cancel: CancellationToken,
     observer_factory: &ObserverFactory<'_>,
@@ -1802,6 +1842,7 @@ async fn run_apply_from_plan_with_observer_factory(
         cancel,
         observer_factory,
         parallelism,
+        accept_legacy_name_overrides,
     )
     .await;
 
@@ -1839,6 +1880,7 @@ async fn run_apply_from_plan_locked(
     cancel: CancellationToken,
     observer_factory: &ObserverFactory<'_>,
     parallelism: NonZeroUsize,
+    accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
     // Read current state and validate lineage. carina#3315: a
     // pending in-memory schema migration must be persisted under
@@ -1853,6 +1895,9 @@ async fn run_apply_from_plan_locked(
             Some(carina_state::LoadedState::Pristine(state)) => (Some(state), None),
             Some(carina_state::LoadedState::Migrated { state, info }) => (Some(state), Some(info)),
         };
+    if let Some(state) = state_file.as_ref() {
+        check_legacy_name_overrides(state, accept_legacy_name_overrides)?;
+    }
 
     if let Some(ref state) = state_file {
         // Validate state lineage

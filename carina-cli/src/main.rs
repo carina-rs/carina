@@ -101,6 +101,14 @@ enum Commands {
         /// Maximum concurrent provider operations
         #[arg(long, default_value_t = DEFAULT_PARALLELISM)]
         parallelism: NonZeroUsize,
+
+        /// Accept a state file that still uses the pre-Phase-5 name override
+        /// format. Without this flag, `carina apply` refuses to run against a
+        /// state file that has any name_overrides entry missing the recorded
+        /// original DSL value, to ensure the operator has reviewed the drift.
+        /// Run `carina plan` first to inspect, then re-run with this flag.
+        #[arg(long)]
+        accept_legacy_name_overrides: bool,
     },
     /// Destroy all resources defined in the configuration file
     Destroy {
@@ -367,6 +375,7 @@ async fn main() {
             auto_approve,
             lock,
             parallelism,
+            accept_legacy_name_overrides,
         } => {
             if path.extension().is_some_and(|ext| ext == "json") {
                 run_apply_from_plan(
@@ -374,6 +383,7 @@ async fn main() {
                     auto_approve,
                     lock,
                     parallelism,
+                    accept_legacy_name_overrides,
                     &provider_context,
                     cancel_token.clone(),
                 )
@@ -384,6 +394,7 @@ async fn main() {
                     auto_approve,
                     lock,
                     parallelism,
+                    accept_legacy_name_overrides,
                     &provider_context,
                     cancel_token.clone(),
                 )

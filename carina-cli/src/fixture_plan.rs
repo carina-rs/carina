@@ -238,6 +238,10 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &upstream_binding_names,
     )
     .expect("Failed to build override-aware resources");
+    crate::legacy_name_overrides::emit_legacy_override_warnings(
+        &override_aware_resources,
+        state_file.as_ref(),
+    );
 
     // Resolve data-source input refs for the plan (carina#3181).
     let mut data_sources_for_plan = data_sources.clone();

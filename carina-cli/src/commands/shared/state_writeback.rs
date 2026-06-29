@@ -10,7 +10,7 @@ use carina_core::executor::ExecutionResult;
 use carina_core::plan::Plan;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::schema::SchemaRegistry;
-use carina_state::{LockInfo, NameOverride, ResourceState, StateBackend, StateFile};
+use carina_state::{LockInfo, ResourceState, StateBackend, StateFile};
 use colored::Colorize;
 
 use crate::error::AppError;
@@ -532,7 +532,6 @@ pub(crate) struct ApplyStateSave<'a> {
     pub runtime_synthesized_resources: &'a [Resource],
     pub current_states: &'a HashMap<ResourceId, State>,
     pub applied_states: &'a HashMap<ResourceId, State>,
-    pub permanent_name_overrides: &'a HashMap<ResourceId, HashMap<String, String>>,
     pub plan: &'a Plan,
     pub successfully_deleted: &'a HashSet<ResourceId>,
     pub failed_refreshes: &'a HashSet<ResourceId>,
@@ -699,7 +698,6 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
         runtime_synthesized_resources,
         current_states,
         applied_states,
-        permanent_name_overrides,
         plan,
         successfully_deleted,
         failed_refreshes,
@@ -716,6 +714,7 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
         successfully_deleted,
         failed_refreshes,
     )?;
+    let permanent_name_overrides = plan.permanent_name_overrides_for_state();
 
     for (id, planned) in &writeback.upserts {
         let resource = planned.resource;
@@ -739,21 +738,7 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
         let mut resource_state =
             ResourceState::from_provider_state(resource, applied_state, existing)?;
         if is_applied && let Some(overrides) = permanent_name_overrides.get(id) {
-            resource_state.name_overrides = overrides
-                .iter()
-                .map(|(attribute, temp_value)| {
-                    let original_value = existing
-                        .and_then(|rs| rs.name_overrides.get(attribute))
-                        .and_then(|override_| override_.original_value.clone());
-                    (
-                        attribute.clone(),
-                        NameOverride {
-                            temp_value: temp_value.clone(),
-                            original_value,
-                        },
-                    )
-                })
-                .collect();
+            resource_state.name_overrides = overrides.clone();
         }
         if !write_only_keys.is_empty() {
             resource_state.merge_write_only_attributes(resource, &write_only_keys);
@@ -898,6 +883,127 @@ mod apply_state_save_tests {
     use carina_core::parser::{DeferredForExpression, ForBinding};
     use carina_core::plan::Plan;
     use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
+    use carina_state::NameOverride;
+
+    fn plan_with_name_override(id: &ResourceId, temp_value: &str, original_value: &str) -> Plan {
+        serde_json::from_value(serde_json::json!({
+            "effects": [],
+            "permanent_name_overrides": [
+                {
+                    "resource_id": id,
+                    "attribute": "name",
+                    "temp_value": temp_value,
+                    "original_value": original_value
+                }
+            ]
+        }))
+        .expect("plan with permanent name override should deserialize")
+    }
+
+    fn applied_name_state(id: &ResourceId, name: &str) -> State {
+        State::existing(
+            id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String(name.to_string())),
+            )]),
+        )
+        .with_identifier(format!("{name}-id"))
+    }
+
+    #[test]
+    fn writeback_persists_typed_name_override_from_plan() {
+        let mut resource = Resource::with_provider("mock", "test.resource", "thing", None);
+        resource.set_attr(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("dsl-new".to_string())),
+        );
+        let id = resource.id.clone();
+        let sorted_resources = vec![resource];
+        let mut existing = ResourceState::new("test.resource", "thing", "mock");
+        existing.name_overrides.insert(
+            "name".to_string(),
+            NameOverride {
+                temp_value: "old-temp".to_string(),
+                original_value: Some("stale-dsl".to_string()),
+            },
+        );
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+        let applied_states = HashMap::from([(id.clone(), applied_name_state(&id, "new-temp"))]);
+        let plan = plan_with_name_override(&id, "new-temp", "dsl-new");
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: &sorted_resources,
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &applied_states,
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &carina_core::schema::SchemaRegistry::new(),
+        })
+        .expect("state writeback should succeed");
+
+        let saved = state
+            .find_resource("mock", "test.resource", "thing")
+            .expect("resource should be persisted");
+        assert_eq!(
+            saved.name_overrides.get("name"),
+            Some(&NameOverride {
+                temp_value: "new-temp".to_string(),
+                original_value: Some("dsl-new".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn writeback_overwrites_legacy_original_value_with_plan_data() {
+        let mut resource = Resource::with_provider("mock", "test.resource", "thing", None);
+        resource.set_attr(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("dsl-value".to_string())),
+        );
+        let id = resource.id.clone();
+        let sorted_resources = vec![resource];
+        let mut existing = ResourceState::new("test.resource", "thing", "mock");
+        existing.name_overrides.insert(
+            "name".to_string(),
+            NameOverride {
+                temp_value: "legacy-temp".to_string(),
+                original_value: None,
+            },
+        );
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+        let applied_states = HashMap::from([(id.clone(), applied_name_state(&id, "legacy-temp"))]);
+        let plan = plan_with_name_override(&id, "legacy-temp", "dsl-value");
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: &sorted_resources,
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &applied_states,
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &carina_core::schema::SchemaRegistry::new(),
+        })
+        .expect("state writeback should succeed");
+
+        let saved = state
+            .find_resource("mock", "test.resource", "thing")
+            .expect("resource should be persisted");
+        assert_eq!(
+            saved.name_overrides.get("name"),
+            Some(&NameOverride {
+                temp_value: "legacy-temp".to_string(),
+                original_value: Some("dsl-value".to_string()),
+            })
+        );
+    }
 
     #[test]
     fn build_state_after_apply_persists_runtime_synthesized_resources() {
@@ -922,7 +1028,6 @@ mod apply_state_save_tests {
             current_states: &HashMap::new(),
             applied_states: &HashMap::from([(child_id.clone(), child_state)]),
             runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
-            permanent_name_overrides: &HashMap::new(),
             plan: &Plan::new(),
             successfully_deleted: &HashSet::new(),
             failed_refreshes: &HashSet::new(),
