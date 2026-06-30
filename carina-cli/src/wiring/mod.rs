@@ -866,6 +866,14 @@ impl<'a> PlanPreprocessor<'a> {
         )
         .await;
         self.normalizer.normalize_state(current_states).await;
+        // Re-lift state enum leaves after normalize_state, which
+        // round-trips through WASM and converts CanonicalEnum to
+        // String (carina#3660).
+        carina_core::utils::lift_current_state_enum_leaves(
+            current_states,
+            resources,
+            self.ctx.schemas(),
+        );
         resolve_enum_aliases_in_states(self.ctx, current_states);
         // carina#3358: the `until` predicate RHS is the third enum-alias
         // axis. Resolve it here, beside the resource/state passes, so the

@@ -4939,6 +4939,137 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonicalize_pipeline_iam_policy_effect_enum_state_string_has_no_diff() {
+        use crate::differ::{Diff, diff};
+        use crate::resource::{Resource, ResourceId, State};
+        use crate::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+        };
+        use std::collections::HashMap;
+
+        // Build the IAM policy effect enum type
+        let effect_enum = AttributeType::enum_(
+            crate::schema::enum_identity("Effect", Some("aws.iam.PolicyDocument.Statement")),
+            Some(vec!["Allow".to_string(), "Deny".to_string()]),
+            vec![
+                ("Allow".to_string(), "allow".to_string()),
+                ("Deny".to_string(), "deny".to_string()),
+            ],
+            None,
+            None,
+        );
+
+        // Build Statement struct with effect field
+        let statement = AttributeType::struct_(
+            "Statement".to_string(),
+            vec![
+                StructField::new("effect", effect_enum).with_provider_name("Effect"),
+                StructField::new("action", string_or_list_of_strings())
+                    .with_provider_name("Action"),
+                StructField::new("principal", AttributeType::string())
+                    .with_provider_name("Principal"),
+            ],
+        );
+
+        // Build PolicyDocument struct
+        let policy_document = AttributeType::struct_(
+            "PolicyDocument".to_string(),
+            vec![
+                StructField::new("statement", AttributeType::list(statement))
+                    .with_provider_name("Statement"),
+            ],
+        );
+
+        let schema = ResourceSchema::new("iam.Role").attribute(AttributeSchema::new(
+            "assume_role_policy_document",
+            policy_document,
+        ));
+        let mut registry = SchemaRegistry::new();
+        registry.insert("awscc", schema.clone());
+
+        // Desired side: DSL writes effect as a fully-qualified EnumIdentifier
+        let id = ResourceId::with_provider_identity("awscc", "iam.Role", "role", None);
+        let mut stmt_desired = IndexMap::new();
+        stmt_desired.insert(
+            "effect".to_string(),
+            Value::Concrete(ConcreteValue::enum_identifier(
+                "aws.iam.PolicyDocument.Statement.Effect.allow".to_string(),
+            )),
+        );
+        stmt_desired.insert(
+            "action".to_string(),
+            Value::Concrete(ConcreteValue::StringList(vec![
+                "sts:AssumeRole".to_string(),
+            ])),
+        );
+        stmt_desired.insert(
+            "principal".to_string(),
+            Value::Concrete(ConcreteValue::String("lambda.amazonaws.com".to_string())),
+        );
+        let mut doc_desired = IndexMap::new();
+        doc_desired.insert(
+            "statement".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(stmt_desired),
+            )])),
+        );
+
+        let mut desired = vec![
+            Resource::with_provider("awscc", "iam.Role", "role", None).with_attribute(
+                "assume_role_policy_document",
+                Value::Concrete(ConcreteValue::Map(doc_desired)),
+            ),
+        ];
+        canonicalize_resources_with_schemas(&mut desired, &registry);
+
+        // State side: provider returns effect as a plain String
+        let mut stmt_state = IndexMap::new();
+        stmt_state.insert(
+            "effect".to_string(),
+            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+        );
+        stmt_state.insert(
+            "action".to_string(),
+            Value::Concrete(ConcreteValue::StringList(vec![
+                "sts:AssumeRole".to_string(),
+            ])),
+        );
+        stmt_state.insert(
+            "principal".to_string(),
+            Value::Concrete(ConcreteValue::String("lambda.amazonaws.com".to_string())),
+        );
+        let mut doc_state = IndexMap::new();
+        doc_state.insert(
+            "statement".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(stmt_state),
+            )])),
+        );
+
+        let mut state_attrs = HashMap::new();
+        state_attrs.insert(
+            "assume_role_policy_document".to_string(),
+            Value::Concrete(ConcreteValue::Map(doc_state)),
+        );
+        let mut states = HashMap::new();
+        states.insert(id.clone(), State::existing(id.clone(), state_attrs));
+        canonicalize_states_with_schemas(&mut states, &registry);
+
+        let result = diff(
+            &desired[0],
+            states.values().next().expect("state exists"),
+            None,
+            None,
+            Some(&schema),
+        );
+        assert!(
+            matches!(result, Diff::NoChange(_)),
+            "IAM policy document effect enum (desired EnumIdentifier 'allow') vs state String('Allow') \
+             must produce no diff after canonicalization; got {result:?}"
+        );
+    }
+
     // ---- LSP / display catch-up tests (#2481, #2514) ----
 
     #[test]
