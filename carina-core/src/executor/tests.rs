@@ -18,7 +18,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::{Barrier, Mutex as AsyncMutex, Notify};
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 fn resolved(resource: Resource) -> ResolvedResource {
@@ -218,6 +218,13 @@ impl Provider for MockProvider {
     fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
         Vec::new()
     }
+}
+
+fn call_position(calls: &[(String, String)], op: &str, id: &str) -> usize {
+    calls
+        .iter()
+        .position(|(call_op, call_id)| call_op == op && call_id == id)
+        .unwrap_or_else(|| panic!("expected {op} call for {id}; calls: {calls:?}"))
 }
 
 // -----------------------------------------------------------------------
@@ -4685,74 +4692,8 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
 }
 
 #[tokio::test]
-async fn dispatch_deferred_replace_runs_deletes_concurrently() {
-    struct ConcurrentDeleteProvider {
-        create_results: Mutex<Vec<ProviderResult<crate::provider::CreateOutcome>>>,
-        entered_deletes: Arc<AtomicUsize>,
-        delete_barrier: Arc<Barrier>,
-    }
-
-    impl Provider for ConcurrentDeleteProvider {
-        fn name(&self) -> &str {
-            "concurrent-delete"
-        }
-
-        fn read(
-            &self,
-            id: &ResourceId,
-            _identifier: Option<&str>,
-            _request: ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
-            let id = id.clone();
-            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
-        }
-
-        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
-            self.read(&resource.id, None, ReadRequest)
-        }
-
-        fn create(
-            &self,
-            _id: &ResourceId,
-            _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
-            let result = self.create_results.lock().unwrap().remove(0);
-            Box::pin(async move { result })
-        }
-
-        fn update(
-            &self,
-            _id: &ResourceId,
-            _identifier: &str,
-            _request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
-            unreachable!("test does not update")
-        }
-
-        fn delete(
-            &self,
-            _id: &ResourceId,
-            _identifier: &str,
-            _request: DeleteRequest,
-        ) -> BoxFuture<'_, ProviderResult<()>> {
-            self.entered_deletes.fetch_add(1, Ordering::SeqCst);
-            let barrier = Arc::clone(&self.delete_barrier);
-            Box::pin(async move {
-                barrier.wait().await;
-                Ok(())
-            })
-        }
-
-        fn required_permissions(
-            &self,
-            _id: &ResourceId,
-            _op: crate::effect::PlanOp,
-        ) -> Vec<String> {
-            Vec::new()
-        }
-    }
-
-    let cert_id = ResourceId::with_identity("test", "cert_concurrent_deferred_replace");
+async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_create() {
+    let cert_id = ResourceId::with_identity("test", "cert");
     let cert_state = State::existing(
         cert_id.clone(),
         HashMap::from([(
@@ -4777,20 +4718,13 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
     let validation_id = ResourceId::with_identity("test", "validation_records[0]");
     let validation_state =
         State::existing(validation_id.clone(), HashMap::new()).with_identifier("new-validation");
-    let entered_deletes = Arc::new(AtomicUsize::new(0));
-    let delete_barrier = Arc::new(Barrier::new(3));
-    let provider = ConcurrentDeleteProvider {
-        create_results: Mutex::new(vec![
-            Ok(crate::provider::CreateOutcome::Success { state: cert_state }),
-            Ok(crate::provider::CreateOutcome::Success {
-                state: validation_state,
-            }),
-        ]),
-        entered_deletes: Arc::clone(&entered_deletes),
-        delete_barrier: Arc::clone(&delete_barrier),
-    };
+    let provider = MockProvider::new();
+    provider.push_create(Ok(cert_state));
+    provider.push_create(Ok(validation_state));
+    provider.push_delete(Ok(()));
+    provider.push_delete(Ok(()));
 
-    let mut cert = Resource::new("test", "cert_concurrent_deferred_replace");
+    let mut cert = Resource::new("test", "cert");
     cert.binding = Some("cert".to_string());
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
@@ -4843,29 +4777,35 @@ async fn dispatch_deferred_replace_runs_deletes_concurrently() {
         parallelism: crate::executor::TEST_UNCAPPED,
     };
     let observer = MockObserver::new();
-    let wait_for_concurrent_deletes = async {
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while entered_deletes.load(Ordering::SeqCst) < 2 {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("both deletes must enter before either is released");
-        delete_barrier.wait().await;
-    };
 
-    let (outcome, _) = tokio::join!(
-        execute_plan(&provider, input, &observer, CancellationToken::new()),
-        wait_for_concurrent_deletes
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+    assert_eq!(
+        result.failure_count,
+        0,
+        "events: {:?}; calls: {:?}",
+        observer.events(),
+        provider.calls()
     );
-    let result = completed_result(outcome);
-    assert_eq!(result.failure_count, 0);
-    assert_eq!(entered_deletes.load(Ordering::SeqCst), 2);
+
+    let calls = provider.calls();
+    let create_validation_pos = call_position(&calls, "create", "test.validation_records[0]");
+    let delete_validation_0_pos = call_position(&calls, "delete", "test.validation_records[0]");
+    let delete_validation_1_pos = call_position(&calls, "delete", "test.validation_records[1]");
+
+    assert!(
+        create_validation_pos < delete_validation_0_pos,
+        "matching DeferredReplace delete must wait for the materialized create; calls: {calls:?}"
+    );
+    assert_ne!(
+        delete_validation_0_pos, delete_validation_1_pos,
+        "both absorbed deletes must dispatch; calls: {calls:?}"
+    );
 }
 
 #[tokio::test]
-async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
-    let cert_id = ResourceId::with_identity("test", "cert_delete_failure");
+async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails() {
+    let cert_id = ResourceId::with_identity("test", "cert");
     let cert_state = State::existing(
         cert_id.clone(),
         HashMap::from([(
@@ -4889,13 +4829,9 @@ async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
     );
     let provider = MockProvider::new();
     provider.push_create(Ok(cert_state));
-    provider.push_delete(Err(ProviderError::api_error("delete failed")));
-    provider.push_read(Ok(State::not_found(ResourceId::with_identity(
-        "test",
-        "validation_records[0]",
-    ))));
+    provider.push_create(Err(ProviderError::api_error("create failed")));
 
-    let mut cert = Resource::new("test", "cert_delete_failure");
+    let mut cert = Resource::new("test", "cert");
     cert.binding = Some("cert".to_string());
     let mut plan = Plan::new();
     plan.add(create_effect(cert));
@@ -4939,11 +4875,19 @@ async fn dispatch_deferred_replace_short_circuits_on_delete_failure() {
 
     assert_eq!(result.failure_count, 1);
     assert!(
-        !provider
+        provider
             .calls()
             .iter()
             .any(|(op, id)| op == "create" && id == "test.validation_records[0]"),
-        "create half must not dispatch after delete failure; calls: {:?}",
+        "test setup must dispatch the materialized create; calls: {:?}",
+        provider.calls()
+    );
+    assert!(
+        !provider
+            .calls()
+            .iter()
+            .any(|(op, id)| op == "delete" && id == "test.validation_records[0]"),
+        "old delete must not dispatch after materialized create failure; calls: {:?}",
         provider.calls()
     );
 }

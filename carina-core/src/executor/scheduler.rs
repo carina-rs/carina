@@ -98,7 +98,7 @@ pub(super) fn build_scheduler_deps(
     );
     relax_update_update_edges(effects, &mut analysis);
     let mut deps_of = analysis.into_deps_of();
-    apply_deferred_replace_delete_deps(&mut deps_of, deferred_replace_delete_deps);
+    apply_deferred_replace_delete_deps(effects, &mut deps_of, deferred_replace_delete_deps);
     deps_of
 }
 
