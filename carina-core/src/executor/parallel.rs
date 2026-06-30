@@ -66,12 +66,32 @@ pub(super) fn expand_deferred_replace_effects(plan_effects: &[Effect]) -> Expand
 }
 
 pub(super) fn apply_deferred_replace_delete_deps(
+    effects: &[Effect],
     deps_of: &mut HashMap<usize, HashSet<usize>>,
     deferred_replace_delete_deps: &[(usize, usize)],
 ) {
     for &(gate_idx, delete_idx) in deferred_replace_delete_deps {
-        if deps_of.contains_key(&gate_idx) {
-            deps_of.entry(gate_idx).or_default().insert(delete_idx);
+        if deps_of.contains_key(&delete_idx) {
+            deps_of.entry(delete_idx).or_default().insert(gate_idx);
+        }
+
+        let Some(delete_id) = effects.get(delete_idx).map(Effect::resource_id) else {
+            continue;
+        };
+        for (create_idx, effect) in effects.iter().enumerate() {
+            let Effect::Create(resource) = effect else {
+                continue;
+            };
+            if resource.id != *delete_id {
+                continue;
+            }
+            // DeferredReplace materializes the replacement create after the
+            // delete placeholder is already in the scheduler. The generic
+            // same-identity rule would otherwise order create after delete.
+            if let Some(create_deps) = deps_of.get_mut(&create_idx) {
+                create_deps.remove(&delete_idx);
+            }
+            deps_of.entry(delete_idx).or_default().insert(create_idx);
         }
     }
 }
