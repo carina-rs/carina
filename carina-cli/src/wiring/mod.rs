@@ -866,14 +866,13 @@ impl<'a> PlanPreprocessor<'a> {
         )
         .await;
         self.normalizer.normalize_state(current_states).await;
-        // Re-lift state enum leaves after normalize_state, which
-        // round-trips through WASM and converts CanonicalEnum to
-        // String (carina#3660).
-        carina_core::utils::lift_current_state_enum_leaves(
-            current_states,
-            resources,
-            self.ctx.schemas(),
-        );
+        // Re-canonicalize state after normalize_state, which
+        // round-trips through WASM and degrades typed value variants:
+        // CanonicalEnum → String, StringList → List([String]).
+        // Without this, the differ sees e.g. StringList (desired) vs
+        // List (state) and reports a phantom diff (carina#3660).
+        carina_core::value::canonicalize_states_with_schemas(current_states, schemas);
+        carina_core::utils::lift_current_state_enum_leaves(current_states, resources, schemas);
         resolve_enum_aliases_in_states(self.ctx, current_states);
         // carina#3358: the `until` predicate RHS is the third enum-alias
         // axis. Resolve it here, beside the resource/state passes, so the
