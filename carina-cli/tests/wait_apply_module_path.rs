@@ -415,10 +415,14 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .collect();
     let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
         carina_core::binding_index::PreApplyInputs {
-            managed: &resources_for_plan.clone(),
+            managed: &resources_for_plan,
             compositions: &parsed.compositions,
             data_sources: &[],
-            current_states: &carina_core::resource::into_plan_input_map(current_states.clone()),
+            current_states: &carina_core::resource::into_plan_input_map(
+                current_states.clone(),
+                ctx.schemas(),
+                &resources_for_plan,
+            ),
             remote_bindings: &remote_bindings,
             wait_aliases: &wait_aliases,
         },
@@ -427,7 +431,6 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .expect("resolve_refs");
 
     carina_core::value::canonicalize_resources_with_schemas(&mut resources_for_plan, ctx.schemas());
-    carina_core::value::canonicalize_states_with_schemas(&mut current_states, ctx.schemas());
 
     let provider = NoopProvider { cert_publishes_arn };
     let mut wait_bindings = parsed.wait_bindings.clone();
@@ -446,7 +449,11 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         &resources_for_plan,
         &parsed.data_sources,
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(current_states.clone()),
+        &carina_core::resource::into_plan_input_map(
+            current_states.clone(),
+            ctx.schemas(),
+            &resources_for_plan,
+        ),
         &HashMap::new(),
         ctx.schemas(),
         &HashMap::new(),

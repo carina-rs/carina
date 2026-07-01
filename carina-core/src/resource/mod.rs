@@ -2574,8 +2574,12 @@ impl PlanInputState {
 }
 
 pub fn into_plan_input_map(
-    states: HashMap<ResourceId, State>,
+    mut states: HashMap<ResourceId, State>,
+    schemas: &crate::schema::SchemaRegistry,
+    resources: &[Resource],
 ) -> HashMap<ResourceId, PlanInputState> {
+    crate::value::canonicalize_states_with_schemas(&mut states, schemas);
+    crate::utils::lift_current_state_enum_leaves(&mut states, resources, schemas);
     states
         .into_iter()
         .map(|(id, state)| (id, state.into_plan_input()))
@@ -2634,7 +2638,7 @@ impl State {
         self
     }
 
-    pub fn into_plan_input(mut self) -> PlanInputState {
+    pub(crate) fn into_plan_input(mut self) -> PlanInputState {
         self.materialize_partial_read_unknowns();
         PlanInputState(self)
     }

@@ -1359,7 +1359,11 @@ fn orphaned_state_resource_produces_delete_effect() {
         &desired,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(current_states.clone()),
+        &carina_core::resource::into_plan_input_map(
+            current_states.clone(),
+            &carina_core::schema::SchemaRegistry::new(),
+            &[],
+        ),
         &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
@@ -1934,7 +1938,11 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
         &desired,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(current_states.clone()),
+        &carina_core::resource::into_plan_input_map(
+            current_states.clone(),
+            &carina_core::schema::SchemaRegistry::new(),
+            &[],
+        ),
         &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
@@ -2021,7 +2029,11 @@ fn refresh_false_uses_cached_state_from_state_file() {
         &desired,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(current_states.clone()),
+        &carina_core::resource::into_plan_input_map(
+            current_states.clone(),
+            &carina_core::schema::SchemaRegistry::new(),
+            &[],
+        ),
         &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
@@ -2070,7 +2082,11 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
         &desired,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(current_states.clone()),
+        &carina_core::resource::into_plan_input_map(
+            current_states.clone(),
+            &carina_core::schema::SchemaRegistry::new(),
+            &[],
+        ),
         &directives_map,
         &SchemaRegistry::new(),
         &saved_attrs,
@@ -2117,7 +2133,11 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
         &desired,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(current_states.clone()),
+        &carina_core::resource::into_plan_input_map(
+            current_states.clone(),
+            &carina_core::schema::SchemaRegistry::new(),
+            &[],
+        ),
         &HashMap::new(),
         &SchemaRegistry::new(),
         &HashMap::new(),
@@ -2365,11 +2385,16 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
     .unwrap();
     let reloaded = PostApplyStates::from_current_and_state(&HashMap::new(), &saved);
 
+    let resources = [resource];
     let plan = create_plan(
-        &[resource],
+        &resources,
         &[],
         &carina_core::provider::ProviderRouter::new(),
-        &carina_core::resource::into_plan_input_map(reloaded.as_map().clone()),
+        &carina_core::resource::into_plan_input_map(
+            reloaded.as_map().clone(),
+            &schemas,
+            &resources,
+        ),
         &HashMap::new(),
         &schemas,
         &HashMap::new(),
@@ -2610,6 +2635,7 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
         &[],
         &[],
         &[],
+        &carina_core::schema::SchemaRegistry::new(),
         &[],
         &std::collections::HashMap::new(),
     )
@@ -2653,6 +2679,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
         &[],
         &[],
         &export_params,
+        &carina_core::schema::SchemaRegistry::new(),
         &[],
         &std::collections::HashMap::new(),
     )

@@ -1208,6 +1208,7 @@ pub(crate) async fn run_state_refresh_locked(
             &parsed.data_sources,
             &parsed.compositions,
             &post_apply_states,
+            ctx.schemas(),
             &wait_aliases,
         )?;
         resolution.write_into(&mut state);

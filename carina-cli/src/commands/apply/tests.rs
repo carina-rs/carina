@@ -1437,6 +1437,7 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
         &[],
         &[],
         &post_apply_states,
+        &carina_core::schema::SchemaRegistry::new(),
         &[],
     )
     .unwrap()
@@ -1536,6 +1537,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         &[],
         &pre_resolve_compositions,
         &post_apply_states,
+        &carina_core::schema::SchemaRegistry::new(),
         &[],
     )
     .unwrap()
@@ -1655,6 +1657,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
         &[],
         &pre_resolve_compositions,
         &post_apply_states,
+        &carina_core::schema::SchemaRegistry::new(),
         &[],
     )
     .unwrap()
@@ -1813,6 +1816,8 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
             data_sources: &[],
             current_states: &carina_core::resource::into_plan_input_map(
                 pre_apply_current_states.clone(),
+                &carina_core::schema::SchemaRegistry::new(),
+                &sorted_resources,
             ),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
@@ -1839,6 +1844,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         &[],
         &pre_resolve_compositions,
         &post_apply_states,
+        &carina_core::schema::SchemaRegistry::new(),
         &[],
     )
     .unwrap()
@@ -1949,6 +1955,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
         &data_sources,
         &[],
         &post_apply_states,
+        &carina_core::schema::SchemaRegistry::new(),
         &[],
     )
     .unwrap()
@@ -2131,6 +2138,7 @@ mod apply_deferred_for_parity {
             &parsed,
             &sorted,
             &states,
+            &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -2191,6 +2199,7 @@ mod apply_deferred_for_parity {
             &parsed,
             &sorted,
             &empty,
+            &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -2243,6 +2252,7 @@ mod apply_deferred_for_parity {
             &parsed,
             &sorted,
             &states,
+            &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
@@ -2269,6 +2279,7 @@ mod apply_deferred_for_parity {
             &parsed,
             &sorted,
             &states,
+            &carina_core::schema::SchemaRegistry::new(),
             &HashMap::new(),
             &[] as &[WaitAliasSpec],
             &moved_targets,
