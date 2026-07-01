@@ -575,7 +575,11 @@ mod tests {
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         wait_aliases: &[crate::binding_index::WaitAliasSpec],
     ) -> Result<(), String> {
-        let plan_input_states = crate::resource::into_plan_input_map(current_states.clone());
+        let plan_input_states = crate::resource::into_plan_input_map(
+            current_states.clone(),
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        );
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: resources,
             compositions: &[],
@@ -595,7 +599,11 @@ mod tests {
         remote_bindings: &HashMap<String, HashMap<String, Value>>,
         wait_aliases: &[crate::binding_index::WaitAliasSpec],
     ) -> Result<(), String> {
-        let plan_input_states = crate::resource::into_plan_input_map(current_states.clone());
+        let plan_input_states = crate::resource::into_plan_input_map(
+            current_states.clone(),
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        );
         let bindings = ResolvedBindings::pre_apply(crate::binding_index::PreApplyInputs {
             managed: resources,
             compositions: &[],
@@ -1353,7 +1361,11 @@ mod tests {
 
         resolve_refs_with_state(
             &mut resources,
-            &crate::resource::into_plan_input_map(current_states.clone()),
+            &crate::resource::into_plan_input_map(
+                current_states.clone(),
+                &crate::schema::SchemaRegistry::new(),
+                &[],
+            ),
         )
         .unwrap();
 
@@ -1587,7 +1599,11 @@ mod tests {
         let current_states: HashMap<ResourceId, State> = HashMap::new();
         let result = resolve_refs_with_state(
             &mut resources,
-            &crate::resource::into_plan_input_map(current_states.clone()),
+            &crate::resource::into_plan_input_map(
+                current_states.clone(),
+                &crate::schema::SchemaRegistry::new(),
+                &[],
+            ),
         );
         assert!(
             result.is_err(),

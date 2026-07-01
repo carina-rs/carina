@@ -1538,10 +1538,12 @@ pub struct DeferredForExpansion {
 /// (carina#3145). The decision is made here, once, alongside the
 /// moved-target exclusion, and carried in the typed `RefreshableChildIds`
 /// so the plan and apply paths cannot diverge.
+#[allow(clippy::too_many_arguments)]
 pub fn expand_same_config_deferred_for<E: Clone>(
     parsed: &carina_core::parser::File<E>,
     sorted_resources: &[Resource],
     current_states: &HashMap<ResourceId, State>,
+    schemas: &carina_core::schema::SchemaRegistry,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     wait_aliases: &[WaitAliasSpec],
     moved_targets: &HashSet<ResourceId>,
@@ -1568,7 +1570,11 @@ pub fn expand_same_config_deferred_for<E: Clone>(
         managed: sorted_resources,
         compositions: &parsed.compositions,
         data_sources: &parsed.data_sources,
-        current_states: &carina_core::resource::into_plan_input_map(current_states.clone()),
+        current_states: &carina_core::resource::into_plan_input_map(
+            current_states.clone(),
+            schemas,
+            sorted_resources,
+        ),
         remote_bindings,
         wait_aliases,
     })
@@ -1746,6 +1752,7 @@ pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNorm
         inputs.parsed,
         inputs.sorted_resources,
         inputs.current_states,
+        inputs.schemas,
         inputs.remote_bindings,
         inputs.wait_aliases,
         inputs.moved_targets,
@@ -2148,6 +2155,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         parsed,
         &sorted_resources,
         &current_states,
+        ctx.schemas(),
         remote_bindings,
         &wait_aliases,
         &moved_targets,
@@ -2220,20 +2228,8 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // separator + plan render below it instead of being swallowed (#3150).
     finish_refresh_bar_region(refresh_printed_bars);
 
-    // awscc#251 (follow-up to #3055): #3055 lifted only `saved_attrs`.
-    // On a refresh the live value comes from `provider.read()` into
-    // `current_states`, a different map. A provider returning an IAM
-    // policy doc with plain `String` `version`/`effect` (the wire shape
-    // for a field that was `Custom` at create time, now `Enum`
-    // after awscc#250) flows un-lifted into the differ and the strict
-    // carina#2986 validator rejects it. Lift `current_states` here —
-    // both refresh branches have populated it by now, before the
-    // resolver / differ consume it.
-    carina_core::utils::lift_current_state_enum_leaves(
-        &mut current_states,
-        &sorted_resources,
-        ctx.schemas(),
-    );
+    // awscc#251 (follow-up to #3055): data-source lifting stays here
+    // because data sources do not flow through `into_plan_input_map`.
     carina_core::utils::lift_current_state_enum_leaves_for_data_sources(
         &mut current_states,
         &data_sources,
@@ -2247,7 +2243,11 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     // surviving as an unresolved `ResourceRef` (carina#3246).
     let upstream_binding_names: std::collections::HashSet<&str> =
         remote_bindings.keys().map(String::as_str).collect();
-    let pre_apply_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
+    let pre_apply_input_states = carina_core::resource::into_plan_input_map(
+        current_states.clone(),
+        ctx.schemas(),
+        &sorted_resources,
+    );
     let mut override_aware_resources = OverrideAwareResources::build_for_plan(
         sorted_resources,
         state_file.as_ref(),
@@ -2291,15 +2291,6 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         &mut data_sources_for_plan,
         ctx.schemas(),
     );
-
-    // Desired resource canonicalization runs inside PlanPreprocessor before
-    // its strip/restore wrapper; data sources and states remain separate.
-    // Same canonicalization for the actual-side state values (#2481, #2513).
-    // Existing state files written before this change come back from
-    // serde with the legacy `String` / `List` shape; converging both
-    // sides on `StringList` lets the differ produce no diff against a
-    // canonical desired side.
-    carina_core::value::canonicalize_states_with_schemas(&mut current_states, ctx.schemas());
 
     // Run the normalization pipeline: normalize_desired → normalize_state →
     // merge_default_tags → resolve_enum_aliases (resources, states, and
@@ -2375,7 +2366,11 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         HashMap::new()
     };
 
-    let plan_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
+    let plan_input_states = carina_core::resource::into_plan_input_map(
+        current_states.clone(),
+        ctx.schemas(),
+        override_aware_resources.resources(),
+    );
 
     // Build directives map from state file for orphaned resource deletion
     let directives_map = state_file
@@ -3226,7 +3221,11 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
         managed,
         compositions,
         data_sources,
-        current_states: &carina_core::resource::into_plan_input_map(current_states.clone()),
+        current_states: &carina_core::resource::into_plan_input_map(
+            current_states.clone(),
+            schemas,
+            managed,
+        ),
         remote_bindings,
         wait_aliases,
     });

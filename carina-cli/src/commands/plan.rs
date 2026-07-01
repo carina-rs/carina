@@ -796,6 +796,7 @@ pub async fn run_plan(
             &parsed.compositions,
             &parsed.data_sources,
             &ctx.current_states,
+            wiring.schemas(),
             &export_wait_aliases,
         );
         let current_exports = state_file
@@ -886,12 +887,14 @@ pub(crate) fn resolve_export_values_for_display(
     compositions: &[carina_core::resource::Composition],
     data_sources: &[carina_core::resource::DataSource],
     current_states: &HashMap<ResourceId, State>,
+    schemas: &carina_core::schema::SchemaRegistry,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
 ) -> Vec<carina_core::parser::InferredExportParam> {
     // carina#3248: build the unified pre-apply bindings view so an
     // export referencing `<module_instance>.<attr>` chains through the
     // composition to the managed sibling literal (carina#3246).
-    let plan_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
+    let plan_input_states =
+        carina_core::resource::into_plan_input_map(current_states.clone(), schemas, resources);
     let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
         carina_core::binding_index::PreApplyInputs {
             managed: resources,

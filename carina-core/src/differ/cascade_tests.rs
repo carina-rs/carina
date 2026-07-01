@@ -107,7 +107,11 @@ fn plan_for(
         &managed,
         &[],
         &crate::provider::ProviderRouter::new(),
-        &crate::resource::into_plan_input_map(current_states),
+        &crate::resource::into_plan_input_map(
+            current_states,
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        ),
         &HashMap::new(),
         schemas,
         &HashMap::new(),

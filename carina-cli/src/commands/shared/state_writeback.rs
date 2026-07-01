@@ -326,6 +326,7 @@ pub(crate) fn resolve_exports(
     data_sources: &[carina_core::resource::DataSource],
     pre_resolve_compositions: &[carina_core::resource::Composition],
     post_apply_states: &PostApplyStates,
+    schemas: &SchemaRegistry,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
 ) -> Result<ExportResolution, AppError> {
     use carina_core::binding_index::ResolvedBindings;
@@ -355,8 +356,11 @@ pub(crate) fn resolve_exports(
     // with `compositions: &[]` here, then call
     // `layer_compositions_post_apply` once the re-resolution is done.
     // (carina#3181, carina#3248)
-    let plan_input_states =
-        carina_core::resource::into_plan_input_map(post_apply_states.as_map().clone());
+    let plan_input_states = carina_core::resource::into_plan_input_map(
+        post_apply_states.as_map().clone(),
+        schemas,
+        sorted_resources,
+    );
     let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
         managed: sorted_resources,
         compositions: &[],
@@ -1228,9 +1232,17 @@ mod resolve_exports_tests {
     ) -> (HashMap<String, serde_json::Value>, Vec<SkippedExport>) {
         let state = StateFile::new();
         let post_apply_states = PostApplyStates::from_current_and_state(&HashMap::new(), &state);
-        resolve_exports(export_params, &[], &[], &[], &post_apply_states, &[])
-            .expect("unresolved exports should be skipped, not abort writeback")
-            .into_parts()
+        resolve_exports(
+            export_params,
+            &[],
+            &[],
+            &[],
+            &post_apply_states,
+            &carina_core::schema::SchemaRegistry::new(),
+            &[],
+        )
+        .expect("unresolved exports should be skipped, not abort writeback")
+        .into_parts()
     }
 
     #[test]

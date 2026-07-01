@@ -400,6 +400,7 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
             input.data_sources,
             input.pre_resolve_compositions,
             &post_apply_states,
+            input.schemas,
             input.wait_aliases,
         )?;
         resolution.write_into(&mut state);
@@ -498,6 +499,7 @@ pub(crate) async fn persist_exports_only(
     data_sources: &[carina_core::resource::DataSource],
     pre_resolve_compositions: &[carina_core::resource::Composition],
     export_params: &[carina_core::parser::InferredExportParam],
+    schemas: &carina_core::schema::SchemaRegistry,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
     current_states: &HashMap<ResourceId, carina_core::resource::State>,
 ) -> Result<(), AppError> {
@@ -509,6 +511,7 @@ pub(crate) async fn persist_exports_only(
         data_sources,
         pre_resolve_compositions,
         &post_apply_states,
+        schemas,
         wait_aliases,
     )?;
     resolution.write_into(&mut state);
@@ -1344,7 +1347,11 @@ async fn run_apply_locked(
     let pre_resolve_compositions: Vec<carina_core::resource::Composition> =
         parsed.compositions.clone();
 
-    let pre_apply_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
+    let pre_apply_input_states = carina_core::resource::into_plan_input_map(
+        current_states.clone(),
+        ctx.schemas(),
+        &sorted_resources,
+    );
     let mut override_aware_resources = OverrideAwareResources::build(
         sorted_resources,
         state_file.as_ref(),
@@ -1389,9 +1396,6 @@ async fn run_apply_locked(
         &mut data_sources_for_plan,
         ctx.schemas(),
     );
-    // Same for actual-state side (#2481, #2513).
-    carina_core::value::canonicalize_states_with_schemas(&mut current_states, ctx.schemas());
-
     // Run the normalization pipeline (same as plan path in wiring.rs).
     // `prepare` also canonicalizes the wait `until` predicate enum
     // aliases (carina#3358); the apply path is a separate pipeline that
@@ -1407,7 +1411,11 @@ async fn run_apply_locked(
             &mut wait_bindings,
         )
         .await;
-    let plan_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
+    let plan_input_states = carina_core::resource::into_plan_input_map(
+        current_states.clone(),
+        ctx.schemas(),
+        override_aware_resources.resources(),
+    );
 
     let directives_map = state_file
         .as_ref()
@@ -1477,6 +1485,7 @@ async fn run_apply_locked(
             &parsed.compositions,
             &parsed.data_sources,
             &current_states,
+            ctx.schemas(),
             &wait_aliases,
         );
         let empty_exports = HashMap::new();
@@ -1533,6 +1542,7 @@ async fn run_apply_locked(
             &data_sources,
             &pre_resolve_compositions_noop,
             &parsed.export_params,
+            ctx.schemas(),
             &wait_aliases,
             &current_states,
         )
@@ -1554,6 +1564,7 @@ async fn run_apply_locked(
         &parsed.compositions,
         &parsed.data_sources,
         &current_states,
+        ctx.schemas(),
         &wait_aliases,
     );
     let current_exports = state_file
@@ -2065,7 +2076,11 @@ async fn run_apply_from_plan_locked(
     // resolves through the data source's attribute map.
     let plan_compositions: &[carina_core::resource::Composition] = &plan_file.compositions;
     let plan_data_sources: &[carina_core::resource::DataSource] = &plan_file.data_sources;
-    let pre_apply_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
+    let pre_apply_input_states = carina_core::resource::into_plan_input_map(
+        current_states.clone(),
+        ctx.schemas(),
+        sorted_resources,
+    );
     let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
         managed: sorted_resources,
         compositions: plan_compositions,

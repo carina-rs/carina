@@ -1325,6 +1325,61 @@ fn union_string_or_list_compares_string_list() {
     ));
 }
 
+#[test]
+fn into_plan_input_map_canonicalizes_string_or_list_state() {
+    use crate::schema::{AttributeSchema, ResourceSchema};
+
+    let mut schema = ResourceSchema::new("iam.policy");
+    schema.attributes.insert(
+        "action".to_string(),
+        AttributeSchema::new("action", string_or_list_of_strings_type()),
+    );
+    let mut registry = SchemaRegistry::new();
+    registry.insert("aws", schema);
+
+    let mut desired = Resource::new("iam.policy", "assume-role-policy").with_attribute(
+        "action",
+        Value::Concrete(ConcreteValue::StringList(vec![
+            "sts:AssumeRole".to_string(),
+        ])),
+    );
+    desired.id.provider = "aws".to_string();
+    let resources = vec![desired];
+
+    let mut state_attrs = HashMap::new();
+    state_attrs.insert(
+        "action".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("sts:AssumeRole".to_string()),
+        )])),
+    );
+    let mut id = ResourceId::with_identity("iam.policy", "assume-role-policy");
+    id.provider = "aws".to_string();
+    let mut states = HashMap::new();
+    states.insert(id.clone(), State::existing(id, state_attrs));
+
+    let plan_input_states = crate::resource::into_plan_input_map(states, &registry, &resources);
+    let plan = create_plan(
+        &resources,
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &plan_input_states,
+        &HashMap::new(),
+        &registry,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+    );
+
+    assert!(
+        plan.effects().is_empty(),
+        "into_plan_input_map must canonicalize degraded List[String] state \
+         to StringList before diffing; effects were {:?}",
+        plan.effects()
+    );
+}
+
 /// carina#3080 differ parity (design Test plan item 2+3): the
 /// `principal` `Union[Struct{ service: Union[String, List<String>] },
 /// String]` phantom must vanish at the **differ verdict**, and it must

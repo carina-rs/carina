@@ -1067,7 +1067,11 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &crate::resource::into_plan_input_map(states.clone()),
+            current_states: &crate::resource::into_plan_input_map(
+                states.clone(),
+                &crate::schema::SchemaRegistry::new(),
+                &[],
+            ),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -1124,7 +1128,11 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &crate::resource::into_plan_input_map(states.clone()),
+            current_states: &crate::resource::into_plan_input_map(
+                states.clone(),
+                &crate::schema::SchemaRegistry::new(),
+                &[],
+            ),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -1171,7 +1179,11 @@ mod resolved_bindings_tests {
         ]
         .into_iter()
         .collect();
-        let plan_input_states = crate::resource::into_plan_input_map(states);
+        let plan_input_states = crate::resource::into_plan_input_map(
+            states,
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        );
         let remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
         let mut resources = vec![a, b];
 
@@ -1229,7 +1241,11 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &crate::resource::into_plan_input_map(states.clone()),
+            current_states: &crate::resource::into_plan_input_map(
+                states.clone(),
+                &crate::schema::SchemaRegistry::new(),
+                &[],
+            ),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -1264,7 +1280,11 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &crate::resource::into_plan_input_map(states.clone()),
+            current_states: &crate::resource::into_plan_input_map(
+                states.clone(),
+                &crate::schema::SchemaRegistry::new(),
+                &[],
+            ),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -1301,7 +1321,11 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &crate::resource::into_plan_input_map(states.clone()),
+            current_states: &crate::resource::into_plan_input_map(
+                states.clone(),
+                &crate::schema::SchemaRegistry::new(),
+                &[],
+            ),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -1357,7 +1381,11 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &crate::resource::into_plan_input_map(states.clone()),
+            current_states: &crate::resource::into_plan_input_map(
+                states.clone(),
+                &crate::schema::SchemaRegistry::new(),
+                &[],
+            ),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -1476,7 +1504,11 @@ mod resolved_bindings_tests {
             managed: &resources,
             compositions: &[],
             data_sources: &[],
-            current_states: &crate::resource::into_plan_input_map(states.clone()),
+            current_states: &crate::resource::into_plan_input_map(
+                states.clone(),
+                &crate::schema::SchemaRegistry::new(),
+                &[],
+            ),
             remote_bindings: &remote,
             wait_aliases: &[],
         });
@@ -1787,7 +1819,11 @@ mod resolved_bindings_tests {
             managed: &[],
             compositions: &[],
             data_sources: &[ds],
-            current_states: &crate::resource::into_plan_input_map(states.clone()),
+            current_states: &crate::resource::into_plan_input_map(
+                states.clone(),
+                &crate::schema::SchemaRegistry::new(),
+                &[],
+            ),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -1860,7 +1896,11 @@ mod resolved_bindings_tests {
             managed: &[],
             compositions: &[],
             data_sources: &[ds],
-            current_states: &crate::resource::into_plan_input_map(states.clone()),
+            current_states: &crate::resource::into_plan_input_map(
+                states.clone(),
+                &crate::schema::SchemaRegistry::new(),
+                &[],
+            ),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });
@@ -1911,7 +1951,11 @@ mod resolved_bindings_tests {
             managed: &[],
             compositions: &[],
             data_sources: &[ds],
-            current_states: &crate::resource::into_plan_input_map(states.clone()),
+            current_states: &crate::resource::into_plan_input_map(
+                states.clone(),
+                &crate::schema::SchemaRegistry::new(),
+                &[],
+            ),
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         });

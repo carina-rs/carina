@@ -223,7 +223,11 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     // resolve through the composition layer to the managed sibling.
     let upstream_binding_names: std::collections::HashSet<&str> =
         remote_bindings.keys().map(String::as_str).collect();
-    let pre_apply_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
+    let pre_apply_input_states = carina_core::resource::into_plan_input_map(
+        current_states.clone(),
+        wiring.schemas(),
+        &sorted_resources,
+    );
     let mut override_aware_resources = OverrideAwareResources::build_for_plan(
         sorted_resources.clone(),
         state_file.as_ref(),
@@ -256,17 +260,11 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &mut data_sources_for_plan,
         wiring.schemas(),
     );
-    carina_core::utils::lift_current_state_enum_leaves(
-        &mut current_states,
-        &sorted_resources,
-        wiring.schemas(),
-    );
     carina_core::utils::lift_current_state_enum_leaves_for_data_sources(
         &mut current_states,
         &data_sources,
         wiring.schemas(),
     );
-    carina_core::value::canonicalize_states_with_schemas(&mut current_states, wiring.schemas());
 
     normalize_state_with_ctx(&wiring, &mut current_states);
 
@@ -369,6 +367,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &parsed,
         &sorted_resources,
         &current_states,
+        wiring.schemas(),
         &remote_bindings,
         &wait_aliases,
         &HashSet::new(),
@@ -392,7 +391,11 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             .filter(|deferred| !managed_bindings.contains(&deferred.iterable_binding))
             .cloned(),
     );
-    let plan_input_states = carina_core::resource::into_plan_input_map(current_states.clone());
+    let plan_input_states = carina_core::resource::into_plan_input_map(
+        current_states.clone(),
+        wiring.schemas(),
+        override_aware_resources.resources(),
+    );
     let mut plan = create_plan_with_cascades(
         &override_aware_resources,
         &data_sources_for_plan,
@@ -432,6 +435,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &parsed.compositions,
         &data_sources_for_plan,
         &current_states,
+        wiring.schemas(),
         &export_wait_aliases,
     );
 

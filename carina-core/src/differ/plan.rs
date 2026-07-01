@@ -242,9 +242,9 @@ pub fn generate_temporary_name(
 /// ```
 ///
 /// Raw [`State`] maps cannot be passed to planning. Callers must convert
-/// through [`State::into_plan_input`](crate::resource::State::into_plan_input)
-/// or [`into_plan_input_map`](crate::resource::into_plan_input_map), which
-/// materializes partial-create unknowns before diffing.
+/// through [`into_plan_input_map`](crate::resource::into_plan_input_map),
+/// which canonicalizes state values and materializes partial-create
+/// unknowns before diffing.
 ///
 /// ```compile_fail
 /// use std::collections::HashMap;

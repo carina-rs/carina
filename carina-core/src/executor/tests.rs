@@ -3134,7 +3134,11 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> (std::time::Duration, usize
         managed: &resources,
         compositions: &[],
         data_sources: &[],
-        current_states: &crate::resource::into_plan_input_map(current_states.clone()),
+        current_states: &crate::resource::into_plan_input_map(
+            current_states.clone(),
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        ),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -3202,7 +3206,11 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
         managed: &resources,
         compositions: &[],
         data_sources: &[],
-        current_states: &crate::resource::into_plan_input_map(current_states.clone()),
+        current_states: &crate::resource::into_plan_input_map(
+            current_states.clone(),
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        ),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
@@ -5279,7 +5287,11 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
         managed: &[role],
         compositions: &[],
         data_sources: &[ds],
-        current_states: &crate::resource::into_plan_input_map(current_states.clone()),
+        current_states: &crate::resource::into_plan_input_map(
+            current_states.clone(),
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        ),
         remote_bindings: &HashMap::new(),
         wait_aliases: &[],
     });
