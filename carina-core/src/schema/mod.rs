@@ -4039,6 +4039,18 @@ fn enum_identity_matches_input(
     false
 }
 
+/// How a managed resource handles create-before-destroy name conflicts.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum UniqueNameSpec {
+    /// User-chosen unique name attribute; CBD renames the replacement temporarily during the overlap window.
+    Attribute(String),
+    /// No unique name; a replacement coexists with the original, so CBD needs no temporary name.
+    Coexisting,
+    /// No unique name and the replacement conflicts with the original (server-side uniqueness/scoping); create_before_destroy is a plan-time error.
+    #[default]
+    Conflicting,
+}
+
 /// Resource schema
 #[derive(Debug, Clone)]
 pub struct ResourceSchema {
@@ -4051,10 +4063,8 @@ pub struct ResourceSchema {
     /// Whether this is a managed resource or a data source.
     /// Data sources must be used with the `read` keyword.
     pub kind: SchemaKind,
-    /// The attribute that serves as the unique name for this resource type.
-    /// Used for automatic unique name generation during create-before-destroy replacement.
-    /// (e.g., "bucket_name" for s3.bucket, "log_group_name" for logs.log_group)
-    pub unique_name_attribute: Option<String>,
+    /// How this resource handles create-before-destroy name conflicts.
+    pub unique_name: UniqueNameSpec,
     /// Per-resource operational config (timeouts, retries).
     /// When None, provider defaults are used.
     pub operation_config: Option<OperationConfig>,
@@ -4104,7 +4114,7 @@ impl ResourceSchema {
             description: None,
             validator: None,
             kind: SchemaKind::Resource,
-            unique_name_attribute: None,
+            unique_name: UniqueNameSpec::Conflicting,
             operation_config: None,
             exclusive_required: Vec::new(),
             default_wait_timeout: None,
@@ -4277,7 +4287,17 @@ impl ResourceSchema {
     }
 
     pub fn with_unique_name_attribute(mut self, attr: impl Into<String>) -> Self {
-        self.unique_name_attribute = Some(attr.into());
+        self.unique_name = UniqueNameSpec::Attribute(attr.into());
+        self
+    }
+
+    pub fn with_coexisting_replacement(mut self) -> Self {
+        self.unique_name = UniqueNameSpec::Coexisting;
+        self
+    }
+
+    pub fn with_conflicting_replacement(mut self) -> Self {
+        self.unique_name = UniqueNameSpec::Conflicting;
         self
     }
 

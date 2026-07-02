@@ -555,7 +555,7 @@ fn make_schema(resource_type: &str, attrs: Vec<(&str, AttributeType)>) -> Resour
         description: None,
         validator: None,
         kind: crate::schema::SchemaKind::Resource,
-        unique_name_attribute: None,
+        unique_name: crate::schema::UniqueNameSpec::Conflicting,
         operation_config: None,
         exclusive_required: Vec::new(),
         default_wait_timeout: None,

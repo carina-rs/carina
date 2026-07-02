@@ -64,7 +64,7 @@ fn provider_schema_decode_error(
     detail: wasm_convert::SchemaDecodeError,
 ) -> String {
     format!(
-        "provider '{provider_name}' {provider_version} emitted an attribute type this host cannot decode: {detail}; the provider revision may predate this host — bump the provider lock with `carina init --upgrade`"
+        "provider '{provider_name}' {provider_version} emitted schema metadata this host cannot decode: {detail}; the provider revision may predate this host; bump the provider lock with `carina init --upgrade`"
     )
 }
 
@@ -2496,6 +2496,23 @@ mod tests {
         assert!(keys.contains(&"HOME"));
         assert!(!keys.contains(&"AWS_ACCESS_KEY_ID"));
         assert!(!keys.contains(&"GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn malformed_schema_json_is_reported_as_provider_load_error() {
+        let detail = wasm_convert::json_to_schemas(
+            r#"[{
+                "resource_type":"s3.Bucket",
+                "attributes":{},
+                "unique_name_attribute":{"type":"attribute"}
+            }]"#,
+        )
+        .unwrap_err();
+        let err = provider_schema_decode_error("bad-provider", "9.9.9", detail);
+
+        assert!(err.contains("provider 'bad-provider' 9.9.9"), "{err}");
+        assert!(err.contains("schema JSON parse error"), "{err}");
+        assert!(err.contains("missing field `value`"), "{err}");
     }
 
     #[test]

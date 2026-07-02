@@ -23,7 +23,8 @@ fn plan_error_summary(errors: &[PlanError]) -> String {
     for err in errors {
         match &err.kind {
             PlanErrorKind::PreventDestroy { .. } => prevent_destroy_count += 1,
-            PlanErrorKind::MissingNameAttribute(_)
+            PlanErrorKind::SchemaNotRegistered(_)
+            | PlanErrorKind::ReplacementCannotCoexist(_)
             | PlanErrorKind::WaitTargetMissing { .. }
             | PlanErrorKind::WaitPredicateInvalid { .. } => other_count += 1,
         }
@@ -48,7 +49,9 @@ fn plan_error_summary(errors: &[PlanError]) -> String {
 mod tests {
     use super::*;
 
-    use carina_core::plan::{MissingNameAttributeError, PreventDestroyAction};
+    use carina_core::plan::{
+        PreventDestroyAction, ReplacementCannotCoexistError, SchemaNotRegisteredError,
+    };
     use carina_core::resource::ResourceId;
 
     fn error(kind: PlanErrorKind) -> PlanError {
@@ -78,9 +81,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_name_attribute_plan_aborts_with_generic_summary() {
-        let plan = plan_with_errors(vec![error(PlanErrorKind::MissingNameAttribute(
-            MissingNameAttributeError {
+    fn schema_not_registered_plan_aborts_with_generic_summary() {
+        let plan = plan_with_errors(vec![error(PlanErrorKind::SchemaNotRegistered(
+            SchemaNotRegisteredError {
                 resource_type: "mock.test.resource".to_string(),
                 resource_identity: "example".to_string(),
             },
@@ -90,7 +93,24 @@ mod tests {
         assert_eq!(summary, "plan failed with 1 error(s)");
         assert!(
             !summary.contains("prevent_destroy set"),
-            "missing-name failures must not be summarized as prevent_destroy"
+            "schema registration failures must not be summarized as prevent_destroy"
+        );
+    }
+
+    #[test]
+    fn replacement_cannot_coexist_plan_aborts_with_generic_summary() {
+        let plan = plan_with_errors(vec![error(PlanErrorKind::ReplacementCannotCoexist(
+            ReplacementCannotCoexistError {
+                resource_type: "mock.test.resource".to_string(),
+                resource_identity: "example".to_string(),
+            },
+        ))]);
+        let summary = abort_summary(&plan);
+
+        assert_eq!(summary, "plan failed with 1 error(s)");
+        assert!(
+            !summary.contains("prevent_destroy set"),
+            "conflicting create_before_destroy failures must not be summarized as prevent_destroy"
         );
     }
 
@@ -113,8 +133,8 @@ mod tests {
             error(PlanErrorKind::PreventDestroy {
                 action: PreventDestroyAction::Delete,
             }),
-            error(PlanErrorKind::MissingNameAttribute(
-                MissingNameAttributeError {
+            error(PlanErrorKind::SchemaNotRegistered(
+                SchemaNotRegisteredError {
                     resource_type: "mock.test.resource".to_string(),
                     resource_identity: "example".to_string(),
                 },

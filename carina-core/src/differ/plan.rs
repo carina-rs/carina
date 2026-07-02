@@ -9,8 +9,9 @@ use crate::identifier::generate_random_suffix;
 use crate::override_aware::OverrideAwareResources;
 use crate::parser::WaitBinding;
 use crate::plan::{
-    MissingNameAttributeError, PermanentNameOverride, Plan, PlanError, PlanErrorKind,
-    PreventDestroyAction, ReplacementDelete, ReplacementGroup,
+    CreateBeforeDestroyError, PermanentNameOverride, Plan, PlanError, PlanErrorKind,
+    PreventDestroyAction, ReplacementCannotCoexistError, ReplacementDelete, ReplacementGroup,
+    SchemaNotRegisteredError,
 };
 use crate::provider::Provider;
 use crate::resource::{
@@ -18,7 +19,8 @@ use crate::resource::{
     ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
 };
 use crate::schema::{
-    ResourceSchema, SchemaKind, SchemaRegistry, WAIT_DEFAULT_INTERVAL, WAIT_DEFAULT_TIMEOUT,
+    ResourceSchema, SchemaKind, SchemaRegistry, UniqueNameSpec, WAIT_DEFAULT_INTERVAL,
+    WAIT_DEFAULT_TIMEOUT,
 };
 use crate::wait::augment::satisfier_augmentation;
 use crate::wait::predicate::{AttrPath, WaitPredicate};
@@ -131,26 +133,30 @@ fn filter_non_removable_removals(
 
 /// Generate a temporary name for create-before-destroy replacement.
 ///
-/// A schema that lacks `unique_name_attribute` is a plan-time error on every
-/// CBD path. Other cases can still legitimately avoid a temporary name: a
-/// `name_prefix` already produces a non-conflicting cloud name, and a direct
-/// change to the unique-name value is already distinct from the old resource.
+/// `Conflicting` resources are a plan-time error on every CBD path.
+/// Other cases can still legitimately avoid a temporary name: a `Coexisting`
+/// resource has no server-side create-first conflict, a `name_prefix` already
+/// produces a non-conflicting cloud name, and a direct change to the
+/// unique-name value is already distinct from the old resource.
 pub fn generate_temporary_name(
     resource: &Resource,
     from: &State,
     schema: &ResourceSchema,
-) -> Result<Option<TemporaryName>, MissingNameAttributeError> {
-    let name_attr =
-        schema
-            .unique_name_attribute
-            .as_ref()
-            .ok_or_else(|| MissingNameAttributeError {
+) -> Result<Option<TemporaryName>, CreateBeforeDestroyError> {
+    let name_attr = match &schema.unique_name {
+        UniqueNameSpec::Attribute(name_attr) => name_attr,
+        UniqueNameSpec::Coexisting => return Ok(None),
+        UniqueNameSpec::Conflicting => {
+            return Err(ReplacementCannotCoexistError {
                 resource_type: resource.id.display_type(),
                 resource_identity: resource
                     .binding
                     .clone()
                     .unwrap_or_else(|| resource.id.identity_or_empty().to_string()),
-            })?;
+            }
+            .into());
+        }
+    };
 
     // Skip if the resource uses name_prefix for this attribute
     if resource.prefixes.contains_key(name_attr) {
@@ -722,7 +728,7 @@ fn pending_replace_from_parts(
     changed_create_only: ChangedCreateOnly,
     cascade_ref_hints: Vec<(String, String)>,
     registry: &SchemaRegistry,
-) -> Result<PendingReplace, MissingNameAttributeError> {
+) -> Result<PendingReplace, CreateBeforeDestroyError> {
     let create_before_destroy = directives.create_before_destroy;
     let previous_attributes = from.attributes.clone();
     let temporary_name = if create_before_destroy {
@@ -754,18 +760,18 @@ fn pending_replace_from_parts(
     })
 }
 
-fn temporary_name_for_cbd(
+pub(super) fn temporary_name_for_cbd(
     resource: &Resource,
     from: &State,
     registry: &SchemaRegistry,
-) -> Result<Option<TemporaryName>, MissingNameAttributeError> {
+) -> Result<Option<TemporaryName>, CreateBeforeDestroyError> {
     let schema = registry
         .get(
             &resource.id.provider,
             &resource.id.resource_type,
             SchemaKind::Resource,
         )
-        .ok_or_else(|| MissingNameAttributeError {
+        .ok_or_else(|| SchemaNotRegisteredError {
             resource_type: resource.id.display_type(),
             resource_identity: resource
                 .binding
@@ -904,7 +910,7 @@ fn promote_referenced_replaces_to_cbd(
 fn mark_pending_create_before_destroy(
     pending: &mut PendingReplace,
     registry: &SchemaRegistry,
-) -> Result<(), MissingNameAttributeError> {
+) -> Result<(), CreateBeforeDestroyError> {
     if pending.create_before_destroy {
         return Ok(());
     }
