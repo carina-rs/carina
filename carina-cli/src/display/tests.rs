@@ -1297,6 +1297,15 @@ fn strip_ansi(s: &str) -> String {
 
 #[test]
 fn colored_value_preserves_vertical_list_layout() {
+    struct ColorOverrideGuard;
+    impl Drop for ColorOverrideGuard {
+        fn drop(&mut self) {
+            colored::control::unset_override();
+        }
+    }
+    colored::control::set_override(true);
+    let _guard = ColorOverrideGuard;
+
     // `format_value_pretty` emits a multi-line bracketed form for lists that
     // exceed the 80-col threshold. `colored_value` must NOT collapse the
     // layout back to inline — it should color atoms in place and keep

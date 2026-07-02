@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+use crate::effect::deps::UnresolvedResource;
 use crate::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use crate::resource::{ConcreteValue, Resource, ResourceId, Value};
 
@@ -164,6 +165,87 @@ impl OverrideAwareResources {
         &mut self.resources
     }
 
+    /// Return pre-resolution snapshots with IDs copied from their paired
+    /// resolved resources.
+    ///
+    /// [`OverrideAwareResources`] constructs both vectors from the same input
+    /// list and only mutates the resolved side during later identity passes.
+    /// Zipping here preserves that construction pairing instead of trusting the
+    /// unresolved snapshot's own identity.
+    pub fn paired_unresolved_resources(&self) -> Vec<Resource> {
+        assert_eq!(
+            self.resources.len(),
+            self.unresolved_resources.len(),
+            "override-aware resources keep resolved and unresolved snapshots paired"
+        );
+        self.resources
+            .iter()
+            .zip(&self.unresolved_resources)
+            .map(|(resource, unresolved)| paired_unresolved_resource(resource, unresolved))
+            .collect()
+    }
+
+    pub fn unresolved_by_resolved_id(&self) -> HashMap<ResourceId, UnresolvedResource> {
+        unresolved_map_from_paired(self.resources(), self.paired_unresolved_resources())
+    }
+
+    /// Like [`Self::paired_unresolved_resources`], but prefers a separately
+    /// built pre-parser-resolution snapshot for named resources when it can be
+    /// matched by binding.
+    ///
+    /// The separately built snapshot preserves attr-level `ResourceRef`s that
+    /// parser resolution may have collapsed into `dependency_bindings`; update
+    /// scheduling needs those known read attrs for update-update relaxation.
+    /// Module expansion can change counts and anonymous resources have no
+    /// unique binding to pair on, so those resources intentionally fall back to
+    /// this object's construction pairing unless the source also carries the
+    /// same module source.
+    pub fn paired_unresolved_resources_with_binding_sources(
+        &self,
+        binding_sources: &OverrideAwareResources,
+    ) -> Vec<Resource> {
+        let mut by_binding: HashMap<&str, &Resource> = HashMap::new();
+        let mut duplicate_bindings: HashSet<&str> = HashSet::new();
+        for source in binding_sources.unresolved_resources() {
+            let Some(binding) = source.binding.as_deref() else {
+                continue;
+            };
+            if by_binding.insert(binding, source).is_some() {
+                duplicate_bindings.insert(binding);
+            }
+        }
+
+        self.resources()
+            .iter()
+            .zip(self.paired_unresolved_resources())
+            .map(|(resource, fallback)| {
+                let Some(binding) = resource.binding.as_deref() else {
+                    return fallback;
+                };
+                if duplicate_bindings.contains(binding) {
+                    return fallback;
+                }
+                let Some(source) = by_binding.get(binding) else {
+                    return fallback;
+                };
+                if can_pair_by_binding(resource, source) {
+                    paired_unresolved_resource(resource, source)
+                } else {
+                    fallback
+                }
+            })
+            .collect()
+    }
+
+    pub fn unresolved_by_resolved_id_with_binding_sources(
+        &self,
+        binding_sources: &OverrideAwareResources,
+    ) -> HashMap<ResourceId, UnresolvedResource> {
+        let paired_unresolved =
+            self.paired_unresolved_resources_with_binding_sources(binding_sources);
+        unresolved_map_from_paired(self.resources(), paired_unresolved)
+    }
+
     pub fn unresolved_resources(&self) -> &[Resource] {
         &self.unresolved_resources
     }
@@ -206,6 +288,55 @@ impl OverrideAwareResources {
             skipped_overrides: Vec::new(),
         }
     }
+}
+
+fn paired_unresolved_resource(resource: &Resource, unresolved: &Resource) -> Resource {
+    assert_eq!(
+        resource.id.provider, unresolved.id.provider,
+        "paired override-aware resources must keep provider order stable"
+    );
+    assert_eq!(
+        resource.id.resource_type, unresolved.id.resource_type,
+        "paired override-aware resources must keep type order stable"
+    );
+    assert_eq!(
+        resource.id.provider_instance, unresolved.id.provider_instance,
+        "paired override-aware resources must keep provider instance order stable"
+    );
+    let mut unresolved = unresolved.clone();
+    unresolved.id = resource.id.clone();
+    unresolved
+}
+
+fn can_pair_by_binding(resource: &Resource, source: &Resource) -> bool {
+    resource.binding == source.binding
+        && resource.module_source == source.module_source
+        && resource.id.provider == source.id.provider
+        && resource.id.resource_type == source.id.resource_type
+        && resource.id.provider_instance == source.id.provider_instance
+}
+
+fn unresolved_map_from_paired(
+    resources: &[Resource],
+    paired_unresolved: Vec<Resource>,
+) -> HashMap<ResourceId, UnresolvedResource> {
+    assert_eq!(
+        resources.len(),
+        paired_unresolved.len(),
+        "paired unresolved resources must match resolved resource count"
+    );
+    let mut by_id = HashMap::with_capacity(paired_unresolved.len());
+    for (resource, unresolved) in resources.iter().zip(paired_unresolved) {
+        let previous = by_id.insert(
+            resource.id.clone(),
+            UnresolvedResource::from_pre_resolve(unresolved),
+        );
+        assert!(
+            previous.is_none(),
+            "override-aware resources must not contain duplicate resolved ids"
+        );
+    }
+    by_id
 }
 
 fn resolve_resources(

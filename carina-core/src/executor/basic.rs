@@ -162,6 +162,67 @@ pub(super) async fn resolve_resource(
     resolved_normalized_resource(normalized).map_err(|err| err.to_string())
 }
 
+fn needs_apply_resolution(value: &Value) -> bool {
+    match value {
+        Value::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Interpolation(_)
+            | DeferredValue::FunctionCall { .. }
+            | DeferredValue::Unknown(_),
+        ) => true,
+        Value::Deferred(DeferredValue::Secret(inner)) => needs_apply_resolution(inner),
+        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(needs_apply_resolution),
+        Value::Concrete(ConcreteValue::Map(map)) => map.values().any(needs_apply_resolution),
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        ) => false,
+    }
+}
+
+async fn resolve_create_resource_with_source(
+    target: &Resource,
+    source: &Resource,
+    bindings: &ResolvedBindings,
+    pipeline: &RenormalizePipeline<'_>,
+) -> Result<ResolvedResource, String> {
+    let mut resolved = target.clone();
+    for (key, target_expr) in &target.attributes {
+        let expr = source
+            .attributes
+            .get(key)
+            .filter(|source_expr| needs_apply_resolution(source_expr))
+            .unwrap_or(target_expr);
+        let resolved_value = unwrap_secret(resolve_ref_value(expr, bindings)?);
+        assert_fully_resolved(&resolved_value, key, bindings)?;
+        resolved.attributes.insert(key.clone(), resolved_value);
+    }
+    for (key, source_expr) in &source.attributes {
+        if target.attributes.contains_key(key) {
+            continue;
+        }
+        let resolved_value = unwrap_secret(resolve_ref_value(source_expr, bindings)?);
+        assert_fully_resolved(&resolved_value, key, bindings)?;
+        resolved.attributes.insert(key.clone(), resolved_value);
+    }
+    let normalized = apply_desired_normalization(
+        resolved,
+        pipeline.provider_configs,
+        pipeline.normalizer,
+        pipeline.factories,
+        pipeline.schemas,
+    )
+    .await;
+    resolved_normalized_resource(normalized).map_err(|err| err.to_string())
+}
+
 /// Resolve a resource, preferring unresolved source for re-resolution.
 /// Secret values are unwrapped so the provider receives the plain inner value.
 ///
@@ -514,7 +575,17 @@ pub(super) async fn execute_basic_effect<'a>(
 
     match basic {
         BasicEffect::Create { resource, .. } => {
-            let resolved = match resolve_resource(resource, bindings, pipeline).await {
+            let resolved = match if let Some(resolve_source) = unresolved.get(&resource.id) {
+                resolve_create_resource_with_source(
+                    resource,
+                    resolve_source.as_resource(),
+                    bindings,
+                    pipeline,
+                )
+                .await
+            } else {
+                resolve_resource(resource, bindings, pipeline).await
+            } {
                 Ok(r) => r,
                 Err(e) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {

@@ -219,6 +219,199 @@ struct ApplyTimeReadProvider {
     shared: ApplyTimeReadShared,
 }
 
+#[derive(Clone, Default)]
+struct ApplyCascadeShared {
+    creates: Arc<Mutex<ApplyCascadeCreateCalls>>,
+}
+
+type ApplyCascadeCreateCalls = Vec<(String, HashMap<String, Value>)>;
+
+impl ApplyCascadeShared {
+    fn create_calls(&self) -> ApplyCascadeCreateCalls {
+        self.creates.lock().unwrap().clone()
+    }
+}
+
+struct ApplyCascadeAwsccFactory {
+    shared: ApplyCascadeShared,
+}
+
+impl ProviderFactory for ApplyCascadeAwsccFactory {
+    fn name(&self) -> &str {
+        "awscc"
+    }
+
+    fn display_name(&self) -> &str {
+        "AWSCC apply cascade test provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::new()
+    }
+
+    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        "ap-northeast-1".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &IndexMap<String, Value>,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        let shared = self.shared.clone();
+        Box::pin(async move { Ok(Box::new(ApplyCascadeProvider { shared }) as Box<dyn Provider>) })
+    }
+
+    fn create_normalizer(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &IndexMap<String, Value>,
+    ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
+        Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
+    }
+
+    fn schemas(&self) -> Vec<ResourceSchema> {
+        vec![
+            ResourceSchema::new("ec2.Vpc")
+                .attribute(
+                    AttributeSchema::new("cidr_block", AttributeType::string()).create_only(),
+                )
+                .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).read_only())
+                .with_coexisting_replacement(),
+            ResourceSchema::new("ec2.Subnet")
+                .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).create_only())
+                .attribute(
+                    AttributeSchema::new("cidr_block", AttributeType::string()).create_only(),
+                )
+                .attribute(
+                    AttributeSchema::new("availability_zone", AttributeType::string())
+                        .create_only(),
+                )
+                .attribute(AttributeSchema::new("subnet_id", AttributeType::string()).read_only())
+                .with_coexisting_replacement(),
+        ]
+    }
+}
+
+struct ApplyCascadeProvider {
+    shared: ApplyCascadeShared,
+}
+
+impl Provider for ApplyCascadeProvider {
+    fn name(&self) -> &str {
+        "awscc"
+    }
+
+    fn read(
+        &self,
+        id: &ResourceId,
+        identifier: Option<&str>,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        let identifier = identifier.map(ToOwned::to_owned);
+        Box::pin(async move {
+            match (id.resource_type.as_str(), identifier.as_deref()) {
+                ("ec2.Vpc", Some("vpc-old")) => Ok(State::existing(
+                    id,
+                    HashMap::from([
+                        ("cidr_block".to_string(), string_value("10.220.0.0/16")),
+                        ("vpc_id".to_string(), string_value("vpc-old")),
+                    ]),
+                )
+                .with_identifier("vpc-old")),
+                ("ec2.Subnet", Some("subnet-old")) => Ok(State::existing(
+                    id,
+                    HashMap::from([
+                        ("vpc_id".to_string(), string_value("vpc-old")),
+                        ("cidr_block".to_string(), string_value("10.220.1.0/24")),
+                        (
+                            "availability_zone".to_string(),
+                            string_value("ap-northeast-1c"),
+                        ),
+                    ]),
+                )
+                .with_identifier("subnet-old")),
+                _ => Ok(State::not_found(id)),
+            }
+        })
+    }
+
+    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = resource.id.clone();
+        Box::pin(async move { Ok(State::not_found(id)) })
+    }
+
+    fn create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
+        let id = id.clone();
+        let attrs = request.resource.as_resource().resolved_attributes();
+        self.shared
+            .creates
+            .lock()
+            .unwrap()
+            .push((id.to_string(), attrs.clone()));
+
+        Box::pin(async move {
+            match id.resource_type.as_str() {
+                "ec2.Vpc" => Ok(carina_core::provider::CreateOutcome::Success {
+                    state: State::existing(
+                        id,
+                        HashMap::from([("vpc_id".to_string(), string_value("vpc-new"))]),
+                    )
+                    .with_identifier("vpc-new"),
+                }),
+                "ec2.Subnet" => Ok(carina_core::provider::CreateOutcome::Success {
+                    state: State::existing(
+                        id,
+                        HashMap::from([("subnet_id".to_string(), string_value("subnet-new"))]),
+                    )
+                    .with_identifier("subnet-new"),
+                }),
+                _ => Err(ProviderError::internal(format!("unexpected create {id}"))),
+            }
+        })
+    }
+
+    fn update(
+        &self,
+        id: &ResourceId,
+        _identifier: &str,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
+        let id = id.clone();
+        Box::pin(async move { Err(ProviderError::internal("unexpected update").for_resource(id)) })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: carina_core::effect::PlanOp,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+fn string_value(value: &str) -> Value {
+    Value::Concrete(ConcreteValue::String(value.to_string()))
+}
+
 impl Provider for ApplyTimeReadProvider {
     fn name(&self) -> &str {
         "mock"
@@ -796,6 +989,11 @@ async fn apply_cancel_token_integration_persists_completed_state_releases_lock_a
 
 #[tokio::test]
 async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
+    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
+    unsafe {
+        std::env::remove_var("CARINA_MOCK_STATE_FILE");
+        std::env::remove_var("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA");
+    }
     let fixture = ApplyCancellationFixture::new()
         .with_resources_and_exports(["a", "b"], &[("ax", "a.name"), ("bx", "b.id")]);
     let loaded = load_configuration_with_config(
@@ -805,7 +1003,7 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
     )
     .expect("fixture must load");
     let mut parsed = loaded.parsed;
-    let mut unresolved_parsed = loaded.unresolved_parsed;
+    let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
         &mut parsed,
@@ -823,7 +1021,7 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
     let err = run_apply_locked(
         &ctx,
         &mut parsed,
-        &mut unresolved_parsed,
+        &unresolved_parsed,
         true,
         fixture.backend(),
         None,
@@ -871,7 +1069,7 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
     )
     .expect("fixture must load");
     let mut parsed = loaded.parsed;
-    let mut unresolved_parsed = loaded.unresolved_parsed;
+    let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
     let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
@@ -895,7 +1093,7 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
     run_apply_locked(
         &ctx,
         &mut parsed,
-        &mut unresolved_parsed,
+        &unresolved_parsed,
         true,
         fixture.backend(),
         None,
@@ -943,6 +1141,124 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
 }
 
 #[tokio::test]
+async fn run_apply_locked_rekeys_anonymous_child_unresolved_source_by_effect_id() {
+    fn concrete_subnet_identity(ctx: &WiringContext, providers: &[ProviderConfig]) -> String {
+        let mut resources = vec![
+            Resource::with_provider("awscc", "ec2.Subnet", "", None)
+                .with_attribute("vpc_id", string_value("vpc-old"))
+                .with_attribute("cidr_block", string_value("10.220.1.0/24"))
+                .with_attribute("availability_zone", string_value("ap-northeast-1c")),
+        ];
+        let canonical =
+            carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
+        let errors =
+            crate::wiring::compute_anonymous_identifiers_with_ctx(ctx, canonical, providers);
+        assert!(errors.is_empty(), "state id setup failed: {errors:?}");
+        resources[0].id.identity_or_empty().to_string()
+    }
+
+    let fixture = ApplyCancellationFixture::new();
+    let crn = format!(
+        r#"backend local {{ path = "{}" }}
+provider awscc {{}}
+
+let vpc = awscc.ec2.Vpc {{
+  cidr_block = "10.221.0.0/16"
+  directives {{
+    create_before_destroy = true
+  }}
+}}
+
+awscc.ec2.Subnet {{
+  vpc_id = vpc.vpc_id
+  cidr_block = "10.221.1.0/24"
+  availability_zone = "ap-northeast-1c"
+}}
+"#,
+        fixture.state_path().display()
+    );
+    let fixture = fixture.with_raw_config(crn);
+    let shared = ApplyCascadeShared::default();
+    let ctx = WiringContext::new(vec![Box::new(ApplyCascadeAwsccFactory {
+        shared: shared.clone(),
+    })]);
+
+    let loaded = load_configuration_with_config(
+        fixture.config_path(),
+        fixture.provider_context(),
+        &SchemaRegistry::new(),
+    )
+    .expect("fixture must load");
+    let mut parsed = loaded.parsed;
+    let unresolved_parsed = loaded.unresolved_parsed;
+    let base_dir = get_base_dir(fixture.config_path());
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+        &mut parsed,
+        base_dir,
+        false,
+        vec![Box::new(ApplyCascadeAwsccFactory {
+            shared: shared.clone(),
+        })],
+        HashMap::new(),
+    );
+    assert!(
+        validation_errors.is_empty(),
+        "fixture must validate, got: {validation_errors:?}"
+    );
+
+    let mut vpc_state = ResourceState::new("ec2.Vpc", "vpc", "awscc")
+        .with_identifier("vpc-old")
+        .with_attribute("cidr_block", serde_json::json!("10.220.0.0/16"))
+        .with_attribute("vpc_id", serde_json::json!("vpc-old"));
+    vpc_state.binding = Some("vpc".to_string());
+
+    let mut subnet_state = ResourceState::new(
+        "ec2.Subnet",
+        concrete_subnet_identity(&ctx, &parsed.providers),
+        "awscc",
+    )
+    .with_identifier("subnet-old")
+    .with_attribute("vpc_id", serde_json::json!("vpc-old"))
+    .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
+    .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
+    subnet_state.dependency_bindings.insert("vpc".to_string());
+
+    let mut state_file = carina_state::StateFile::new();
+    state_file.resources.push(vpc_state);
+    state_file.resources.push(subnet_state);
+    fixture.write_state(&state_file);
+
+    let observer_factory = fixture.observer_factory();
+    run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &unresolved_parsed,
+        true,
+        fixture.backend(),
+        None,
+        base_dir,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect("apply should replace the VPC and anonymous subnet");
+
+    let create_calls = shared.create_calls();
+    let subnet_call = create_calls
+        .iter()
+        .find(|(id, _)| id.contains(".ec2.Subnet."))
+        .unwrap_or_else(|| panic!("subnet create missing from calls: {create_calls:?}"));
+    assert_eq!(
+        subnet_call.1.get("vpc_id"),
+        Some(&string_value("vpc-new")),
+        "anonymous subnet create must re-resolve vpc.vpc_id from the replacement VPC state; calls: {create_calls:?}"
+    );
+}
+
+#[tokio::test]
 async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempotent() {
     let fixture = ApplyCancellationFixture::new();
     let crn = apply_time_read_crn(fixture.state_path());
@@ -955,7 +1271,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
     )
     .expect("fixture must load");
     let mut parsed = loaded.parsed;
-    let mut unresolved_parsed = loaded.unresolved_parsed;
+    let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
     let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
@@ -979,7 +1295,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
     run_apply_locked(
         &ctx,
         &mut parsed,
-        &mut unresolved_parsed,
+        &unresolved_parsed,
         true,
         fixture.backend(),
         None,
@@ -1098,7 +1414,7 @@ let consumer = mock.iam.Role {{
     )
     .expect("fixture must load");
     let mut parsed = loaded.parsed;
-    let mut unresolved_parsed = loaded.unresolved_parsed;
+    let unresolved_parsed = loaded.unresolved_parsed;
     let base_dir = get_base_dir(fixture.config_path());
     let shared = ApplyTimeReadShared::default();
     let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
@@ -1122,7 +1438,7 @@ let consumer = mock.iam.Role {{
     run_apply_locked(
         &ctx,
         &mut parsed,
-        &mut unresolved_parsed,
+        &unresolved_parsed,
         true,
         fixture.backend(),
         None,

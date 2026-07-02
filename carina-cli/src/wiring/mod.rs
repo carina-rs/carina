@@ -736,6 +736,58 @@ pub(crate) fn assign_fallback_identities_for_unresolved_anonymous(
     renames
 }
 
+pub(crate) struct LateAnonymousIdentityInputs<'a> {
+    pub resources: &'a mut OverrideAwareResources,
+    pub state_file: Option<&'a StateFile>,
+    pub state_block_claims: &'a StateBlockClaims,
+    pub current_states: &'a mut HashMap<ResourceId, State>,
+    pub saved_attrs: &'a mut HashMap<ResourceId, HashMap<String, Value>>,
+    pub prev_explicit: &'a mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    pub providers: &'a [ProviderConfig],
+}
+
+pub(crate) fn reconcile_late_anonymous_identities(
+    ctx: &WiringContext,
+    inputs: LateAnonymousIdentityInputs<'_>,
+) -> Result<(), AppError> {
+    let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
+        inputs.resources.resources_mut(),
+        ctx.schemas(),
+    );
+    let errors = compute_anonymous_identifiers_with_ctx(ctx, canonical_resources, inputs.providers);
+    if let Some(error) = errors.into_iter().next() {
+        return Err(error);
+    }
+
+    if let Some(sf) = inputs.state_file {
+        let mut state_for_late_reconcile = sf.clone();
+        reconcile_anonymous_identifiers_with_ctx(
+            ctx,
+            inputs.resources.resources_mut(),
+            &mut state_for_late_reconcile,
+            inputs.state_block_claims,
+        );
+        adopt_unique_state_identity_for_unresolved_anonymous(inputs.resources.resources_mut(), sf);
+    }
+
+    let fallback_renames =
+        assign_fallback_identities_for_unresolved_anonymous(inputs.resources.resources_mut());
+    for (from, to) in &fallback_renames {
+        if let Some(mut state) = inputs.current_states.remove(from) {
+            state.id = to.clone();
+            inputs.current_states.insert(to.clone(), state);
+        }
+        if let Some(attrs) = inputs.saved_attrs.remove(from) {
+            inputs.saved_attrs.insert(to.clone(), attrs);
+        }
+        if let Some(explicit) = inputs.prev_explicit.remove(from) {
+            inputs.prev_explicit.insert(to.clone(), explicit);
+        }
+    }
+
+    Ok(())
+}
+
 fn fallback_anonymous_hash(resource: &Resource) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     resource.id.provider.hash(&mut hasher);
@@ -2360,45 +2412,18 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // have made those create-only values concrete. Keep this late pass local to
     // the desired resources; the earlier mutable-state reconciliation still
     // owns state-file rename migration.
-    {
-        let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
-            override_aware_resources.resources_mut(),
-            ctx.schemas(),
-        );
-        let errors =
-            compute_anonymous_identifiers_with_ctx(ctx, canonical_resources, &parsed.providers);
-        if let Some(error) = errors.into_iter().next() {
-            return Err(error);
-        }
-    }
-    if let Some(sf) = state_file.as_ref() {
-        let mut state_for_late_reconcile = sf.clone();
-        reconcile_anonymous_identifiers_with_ctx(
-            ctx,
-            override_aware_resources.resources_mut(),
-            &mut state_for_late_reconcile,
+    reconcile_late_anonymous_identities(
+        ctx,
+        LateAnonymousIdentityInputs {
+            resources: &mut override_aware_resources,
+            state_file: state_file.as_ref(),
             state_block_claims,
-        );
-        adopt_unique_state_identity_for_unresolved_anonymous(
-            override_aware_resources.resources_mut(),
-            sf,
-        );
-    }
-    let fallback_renames = assign_fallback_identities_for_unresolved_anonymous(
-        override_aware_resources.resources_mut(),
-    );
-    for (from, to) in &fallback_renames {
-        if let Some(mut state) = current_states.remove(from) {
-            state.id = to.clone();
-            current_states.insert(to.clone(), state);
-        }
-        if let Some(attrs) = saved_attrs.remove(from) {
-            saved_attrs.insert(to.clone(), attrs);
-        }
-        if let Some(explicit) = prev_explicit.remove(from) {
-            prev_explicit.insert(to.clone(), explicit);
-        }
-    }
+            current_states: &mut current_states,
+            saved_attrs: &mut saved_attrs,
+            prev_explicit: &mut prev_explicit,
+            providers: &parsed.providers,
+        },
+    )?;
 
     // Build orphan dependency bindings from state file for tree structure
     // after late anonymous reconciliation, so an anonymous desired resource
@@ -2460,14 +2485,14 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         .iter()
         .map(|(from, to)| (to.clone(), from.clone()))
         .collect();
+    let paired_unresolved_resources = override_aware_resources
+        .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
 
     Ok(PlanContext {
         plan,
         provider,
-        sorted_resources: override_aware_resources.unresolved_resources().to_vec(),
-        unresolved_resources: unresolved_override_aware_resources
-            .unresolved_resources()
-            .to_vec(),
+        sorted_resources: paired_unresolved_resources.clone(),
+        unresolved_resources: paired_unresolved_resources,
         data_sources: data_sources_for_plan,
         current_states,
         moved_origins,

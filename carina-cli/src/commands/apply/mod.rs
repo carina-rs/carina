@@ -49,9 +49,10 @@ use crate::cursor::CursorReveal;
 use crate::display::print_plan;
 use crate::error::AppError;
 use crate::wiring::{
-    DataSourceRefreshResolution, WiringContext, build_factories_from_providers,
-    create_providers_from_configs, get_provider_with_ctx, prepare_data_sources_for_plan,
-    read_data_source_with_retry, read_with_retry, reconcile_anonymous_identifiers_with_ctx,
+    DataSourceRefreshResolution, LateAnonymousIdentityInputs, WiringContext,
+    build_factories_from_providers, create_providers_from_configs, get_provider_with_ctx,
+    prepare_data_sources_for_plan, read_data_source_with_retry, read_with_retry,
+    reconcile_anonymous_identifiers_with_ctx, reconcile_late_anonymous_identities,
     reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
 };
 
@@ -86,6 +87,49 @@ fn deferred_data_source_reads_from_data_sources(
         }
     }
     deferred_data_source_reads
+}
+
+fn saved_plan_unresolved_by_resolved_id(
+    sorted_resources: &[Resource],
+    unresolved_resources: &[Resource],
+) -> Result<HashMap<ResourceId, UnresolvedResource>, AppError> {
+    if sorted_resources.len() != unresolved_resources.len() {
+        return Err(AppError::Config(format!(
+            "Saved plan resource snapshot mismatch: {} sorted resources but {} unresolved resources. Re-run `carina plan`.",
+            sorted_resources.len(),
+            unresolved_resources.len()
+        )));
+    }
+
+    let mut by_id = HashMap::with_capacity(sorted_resources.len());
+    for (resolved, unresolved) in sorted_resources.iter().zip(unresolved_resources) {
+        if resolved.id.provider != unresolved.id.provider
+            || resolved.id.resource_type != unresolved.id.resource_type
+            || resolved.id.provider_instance != unresolved.id.provider_instance
+        {
+            return Err(AppError::Config(format!(
+                "Saved plan resource snapshot mismatch for {} and {}. Re-run `carina plan`.",
+                resolved.id, unresolved.id
+            )));
+        }
+
+        let mut source = unresolved.clone();
+        source.id = resolved.id.clone();
+        if by_id
+            .insert(
+                resolved.id.clone(),
+                UnresolvedResource::from_pre_resolve(source),
+            )
+            .is_some()
+        {
+            return Err(AppError::Config(format!(
+                "Saved plan contains duplicate resource id {}. Re-run `carina plan`.",
+                resolved.id
+            )));
+        }
+    }
+
+    Ok(by_id)
 }
 
 fn can_use_export_only_fast_path(
@@ -694,7 +738,7 @@ async fn run_apply_with_observer_factory(
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let mut parsed = loaded.parsed;
-    let mut unresolved_parsed = loaded.unresolved_parsed;
+    let unresolved_parsed = loaded.unresolved_parsed;
     let backend_file = loaded.backend_file;
 
     let base_dir = get_base_dir(path);
@@ -935,7 +979,7 @@ async fn run_apply_with_observer_factory(
     let op_result = run_apply_locked(
         &ctx,
         &mut parsed,
-        &mut unresolved_parsed,
+        &unresolved_parsed,
         auto_approve,
         backend.as_ref(),
         lock_info.as_ref(),
@@ -976,7 +1020,7 @@ async fn run_apply_with_observer_factory(
 async fn run_apply_locked(
     ctx: &WiringContext,
     parsed: &mut carina_core::parser::InferredFile,
-    unresolved_parsed: &mut carina_core::parser::ParsedFile,
+    unresolved_parsed: &carina_core::parser::ParsedFile,
     auto_approve: bool,
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
@@ -998,7 +1042,6 @@ async fn run_apply_locked(
     }
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    reconcile_prefixed_names(&mut unresolved_parsed.resources, &state_file);
     let crate::wiring::StateBlockResolution {
         claims: state_block_claims,
         targets: resolved_state_block_targets,
@@ -1019,27 +1062,11 @@ async fn run_apply_locked(
             },
             &state_block_claims,
         );
-        carina_core::module_resolver::reconcile_anonymous_module_instances(
-            &mut unresolved_parsed.resources,
-            &|provider, resource_type| {
-                sf.resources_by_type(provider, resource_type)
-                    .into_iter()
-                    .map(|r| r.identity.clone())
-                    .collect()
-            },
-            &state_block_claims,
-        );
     }
     if let Some(sf) = state_file.as_mut() {
         reconcile_anonymous_identifiers_with_ctx(
             ctx,
             &mut parsed.resources,
-            sf,
-            &state_block_claims,
-        );
-        reconcile_anonymous_identifiers_with_ctx(
-            ctx,
-            &mut unresolved_parsed.resources,
             sf,
             &state_block_claims,
         );
@@ -1421,7 +1448,6 @@ async fn run_apply_locked(
             wait_aliases: &wait_aliases,
         },
     )?;
-
     // Resolve and canonicalize only refresh-time data sources. Deferred
     // reads keep their original input refs so the plan/executor dependency
     // graph still contains the upstream create edge.
@@ -1452,6 +1478,20 @@ async fn run_apply_locked(
             &mut wait_bindings,
         )
         .await;
+    reconcile_late_anonymous_identities(
+        ctx,
+        LateAnonymousIdentityInputs {
+            resources: &mut override_aware_resources,
+            state_file: state_file.as_ref(),
+            state_block_claims: &state_block_claims,
+            current_states: &mut current_states,
+            saved_attrs: &mut saved_attrs,
+            prev_explicit: &mut prev_explicit,
+            providers: &parsed.providers,
+        },
+    )?;
+    let paired_unresolved_resources = override_aware_resources
+        .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
     let plan_input_states = carina_core::resource::into_plan_input_map(
         current_states.clone(),
         ctx.schemas(),
@@ -1513,7 +1553,7 @@ async fn run_apply_locked(
         // change(s) to state.` banner never prints (carina#3270).
         let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
             &parsed.export_params,
-            override_aware_resources.unresolved_resources(),
+            &paired_unresolved_resources,
             &parsed.compositions,
             &parsed.data_sources,
             &current_states,
@@ -1570,7 +1610,7 @@ async fn run_apply_locked(
             backend,
             lock,
             state_file,
-            override_aware_resources.unresolved_resources(),
+            &paired_unresolved_resources,
             &data_sources,
             &pre_resolve_compositions_noop,
             &parsed.export_params,
@@ -1592,7 +1632,7 @@ async fn run_apply_locked(
 
     let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
         &parsed.export_params,
-        override_aware_resources.unresolved_resources(),
+        &paired_unresolved_resources,
         &parsed.compositions,
         &parsed.data_sources,
         &current_states,
@@ -1627,17 +1667,8 @@ async fn run_apply_locked(
     println!();
 
     // Build unresolved resource map for re-resolution at apply time
-    let unresolved_resources: HashMap<ResourceId, UnresolvedResource> =
-        unresolved_override_aware_resources
-            .unresolved_resources()
-            .iter()
-            .map(|r| {
-                (
-                    r.id.clone(),
-                    UnresolvedResource::from_pre_resolve(r.clone()),
-                )
-            })
-            .collect();
+    let unresolved_resources = override_aware_resources
+        .unresolved_by_resolved_id_with_binding_sources(&unresolved_override_aware_resources);
     let mut bindings = override_aware_resources.bindings().clone();
 
     // `provider` is a `ProviderRouter`, which impls both `Provider` and
@@ -2121,18 +2152,10 @@ async fn run_apply_from_plan_locked(
     println!();
 
     // Build unresolved resource map for re-resolution at apply time from
-    // the saved pre-resolution snapshot. `sorted_resources` has already
-    // had ResourceRef values substituted during plan creation.
-    let unresolved_resources: HashMap<ResourceId, UnresolvedResource> = plan_file
-        .unresolved_resources
-        .iter()
-        .map(|r| {
-            (
-                r.id.clone(),
-                UnresolvedResource::from_pre_resolve(r.clone()),
-            )
-        })
-        .collect();
+    // the saved pre-resolution snapshot, keyed by the paired sorted
+    // resource IDs rather than the unresolved snapshot's own identity.
+    let unresolved_resources =
+        saved_plan_unresolved_by_resolved_id(sorted_resources, &plan_file.unresolved_resources)?;
     // Same object in both positions: `ProviderRouter` is both the
     // `Provider` and the `ProviderNormalizer`, so apply re-normalizes
     // with the plan-time normalizer (carina#3060).
