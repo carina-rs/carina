@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::effect::Effect;
+use carina_core::executor::UnresolvedDataSourceInput;
 use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
@@ -30,8 +31,8 @@ use super::{
 use crate::commands::shared::state_writeback::apply_name_overrides;
 use crate::error::AppError;
 use crate::wiring::{
-    WiringContext, build_factories_from_providers, get_provider_with_ctx,
-    read_data_source_with_retry, reconcile_anonymous_identifiers_with_ctx,
+    DataSourceRefreshResolution, WiringContext, build_factories_from_providers,
+    get_provider_with_ctx, read_data_source_with_retry, reconcile_anonymous_identifiers_with_ctx,
     reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
 };
 
@@ -52,6 +53,29 @@ pub fn map_lock_error(e: BackendError) -> AppError {
         )),
         other => AppError::Backend(other),
     }
+}
+
+fn format_deferred_state_refresh_warning(
+    resource_id: &ResourceId,
+    unresolved: &[UnresolvedDataSourceInput],
+) -> String {
+    let refs = unresolved
+        .iter()
+        .flat_map(|input| {
+            let paths = input.paths.iter().map(|path| path.to_dot_string());
+            let bindings = input.bindings.iter().cloned();
+            let unknowns = input
+                .unknowns
+                .iter()
+                .map(|reason| format!("unknown({reason})"));
+            paths.chain(bindings).chain(unknowns)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Warning: skipped refreshing data source {resource_id} because its inputs depend on \
+         missing or deferred state bindings: {refs}"
+    )
 }
 
 /// Read local state file for shell completion.
@@ -1093,7 +1117,7 @@ pub(crate) async fn run_state_refresh_locked(
             .iter()
             .map(carina_core::binding_index::WaitAliasSpec::from)
             .collect();
-        let resolved_data_sources = resolve_data_source_refs_for_refresh(
+        let data_source_refreshes = resolve_data_source_refs_for_refresh(
             &sorted_resources,
             &parsed.compositions,
             &parsed.data_sources,
@@ -1102,11 +1126,24 @@ pub(crate) async fn run_state_refresh_locked(
             ctx.schemas(),
             &wait_aliases,
         )?;
-        for resource in &resolved_data_sources {
+        for resolution in data_source_refreshes {
+            let resource = match resolution {
+                DataSourceRefreshResolution::Resolved(resource) => resource,
+                DataSourceRefreshResolution::DeferredToApply {
+                    resource,
+                    unresolved,
+                } => {
+                    eprintln!(
+                        "{}",
+                        format_deferred_state_refresh_warning(&resource.id, &unresolved).yellow()
+                    );
+                    continue;
+                }
+            };
             if cancel.is_cancelled() {
                 return Err(AppError::Interrupted);
             }
-            let fresh_state = read_data_source_with_retry(&provider, resource)
+            let fresh_state = read_data_source_with_retry(&provider, &resource)
                 .await
                 .map_err(AppError::Provider)?;
             if cancel.is_cancelled() {
@@ -1777,6 +1814,27 @@ mod tests {
             subnet_resource.dependency_bindings(),
             &std::collections::BTreeSet::from(["vpc".to_string()])
         );
+    }
+
+    #[test]
+    fn deferred_data_source_state_refresh_warning_names_read_and_missing_upstream() {
+        let id = ResourceId::with_provider_identity("mock", "iam.Roles", "roles", None);
+        let warning = format_deferred_state_refresh_warning(
+            &id,
+            &[UnresolvedDataSourceInput {
+                attribute: "name_regex".to_string(),
+                paths: vec![carina_core::resource::AccessPath::new(
+                    "target_role",
+                    "role_name",
+                )],
+                bindings: Vec::new(),
+                unknowns: Vec::new(),
+            }],
+        );
+
+        assert!(warning.contains("mock.iam.Roles.roles"));
+        assert!(warning.contains("target_role.role_name"));
+        assert!(warning.contains("skipped refreshing data source"));
     }
 
     // --- carina#3338: module-prefixed bindings + exports.<key> ---

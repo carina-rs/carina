@@ -31,8 +31,8 @@ use carina_core::config_loader::parse_directory;
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::create_plan;
 use carina_core::executor::{
-    ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult, UnresolvedResource,
-    execute_plan,
+    DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
+    UnresolvedResource, execute_plan,
 };
 use carina_core::module_resolver::resolve_modules;
 use carina_core::parser::ProviderContext;
@@ -311,6 +311,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         compositions: &[],
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         current_states,
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -468,6 +469,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         compositions: &[],
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         current_states,
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],

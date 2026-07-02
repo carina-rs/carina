@@ -5,17 +5,23 @@ use carina_core::provider::{
     BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, Provider, ProviderError,
     ProviderFactory, ProviderNormalizer, ProviderResult, ReadRequest, UpdateRequest,
 };
-use carina_core::resource::{DataSource, ResolvedResource, Resource, ResourceId};
+use carina_core::resource::{
+    DataSource, DeferredValue, ResolvedDataSource, ResolvedResource, Resource, ResourceId,
+};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use carina_state::{NameOverride, ResourceState};
 use indexmap::IndexMap;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[path = "tests/cancellation_fixture.rs"]
 mod cancellation_fixture;
 
 use cancellation_fixture::ApplyCancellationFixture;
+
+static MOCK_PROVIDER_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
@@ -138,6 +144,245 @@ impl Provider for FailBCreateProvider {
     }
 }
 
+#[derive(Clone, Default)]
+struct ApplyTimeReadShared {
+    created_roles: Arc<Mutex<HashMap<String, HashMap<String, Value>>>>,
+    operations: Arc<Mutex<Vec<String>>>,
+    consumer_description: Arc<Mutex<Option<Value>>>,
+    read_calls: Arc<AtomicUsize>,
+}
+
+struct ApplyTimeReadFactory {
+    shared: ApplyTimeReadShared,
+}
+
+impl ProviderFactory for ApplyTimeReadFactory {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn display_name(&self) -> &str {
+        "Mock provider for apply-time data-source reads"
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::new()
+    }
+
+    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        "test-region".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &IndexMap<String, Value>,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        let shared = self.shared.clone();
+        Box::pin(async move { Ok(Box::new(ApplyTimeReadProvider { shared }) as Box<dyn Provider>) })
+    }
+
+    fn create_normalizer(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &IndexMap<String, Value>,
+    ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
+        Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
+    }
+
+    fn schemas(&self) -> Vec<ResourceSchema> {
+        vec![
+            ResourceSchema::new("iam.Role")
+                .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
+                .attribute(AttributeSchema::new("path", AttributeType::string()).create_only())
+                .attribute(
+                    AttributeSchema::new("max_session_duration", AttributeType::int())
+                        .create_only(),
+                )
+                .attribute(AttributeSchema::new("description", AttributeType::string())),
+            ResourceSchema::new("iam.Roles")
+                .attribute(AttributeSchema::new("name_regex", AttributeType::string()))
+                .attribute(AttributeSchema::new(
+                    "names",
+                    AttributeType::list(AttributeType::string()),
+                ))
+                .as_data_source(),
+        ]
+    }
+}
+
+struct ApplyTimeReadProvider {
+    shared: ApplyTimeReadShared,
+}
+
+impl Provider for ApplyTimeReadProvider {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn read(
+        &self,
+        id: &ResourceId,
+        _identifier: Option<&str>,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        let shared = self.shared.clone();
+        Box::pin(async move {
+            let roles = shared.created_roles.lock().unwrap();
+            if let Some(attrs) = roles.get(id.identity_or_empty()) {
+                Ok(State::existing(id, attrs.clone()).with_identifier("mock-id"))
+            } else {
+                Ok(State::not_found(id))
+            }
+        })
+    }
+
+    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        let resource = resource.clone();
+        let shared = self.shared.clone();
+        Box::pin(async move {
+            shared.read_calls.fetch_add(1, Ordering::SeqCst);
+            shared
+                .operations
+                .lock()
+                .unwrap()
+                .push(format!("read:{}", resource.id.identity_or_empty()));
+
+            let expected = resource
+                .attributes
+                .get("name_regex")
+                .and_then(value_string)
+                .and_then(exact_regex_literal)
+                .unwrap_or_default();
+
+            let names = shared
+                .created_roles
+                .lock()
+                .unwrap()
+                .values()
+                .filter_map(|attrs| attrs.get("role_name").and_then(value_string))
+                .filter(|role_name| role_name == &expected)
+                .map(|role_name| Value::Concrete(ConcreteValue::String(role_name)))
+                .collect();
+
+            Ok(State::existing(
+                resource.id,
+                HashMap::from([(
+                    "names".to_string(),
+                    Value::Concrete(ConcreteValue::List(names)),
+                )]),
+            )
+            .with_identifier("mock-id"))
+        })
+    }
+
+    fn create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
+        let id = id.clone();
+        let shared = self.shared.clone();
+        Box::pin(async move {
+            let mut attrs = request.resource.as_resource().resolved_attributes();
+            if id.resource_type == "iam.Role" {
+                attrs
+                    .entry("path".to_string())
+                    .or_insert_with(|| Value::Concrete(ConcreteValue::String("/".to_string())));
+                attrs
+                    .entry("max_session_duration".to_string())
+                    .or_insert_with(|| Value::Concrete(ConcreteValue::Int(3600)));
+            }
+            if id.identity_or_empty() == "consumer" {
+                *shared.consumer_description.lock().unwrap() = attrs.get("description").cloned();
+            }
+            shared
+                .created_roles
+                .lock()
+                .unwrap()
+                .insert(id.identity_or_empty().to_string(), attrs.clone());
+            shared
+                .operations
+                .lock()
+                .unwrap()
+                .push(format!("create:{}", id.identity_or_empty()));
+
+            Ok(carina_core::provider::CreateOutcome::Success {
+                state: State::existing(id, attrs).with_identifier("mock-id"),
+            })
+        })
+    }
+
+    fn update(
+        &self,
+        id: &ResourceId,
+        _identifier: &str,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
+        let id = id.clone();
+        Box::pin(async move { Err(ProviderError::internal("unexpected update").for_resource(id)) })
+    }
+
+    fn delete(
+        &self,
+        id: &ResourceId,
+        _identifier: &str,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        let id = id.clone();
+        Box::pin(async move { Err(ProviderError::internal("unexpected delete").for_resource(id)) })
+    }
+
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: carina_core::effect::PlanOp,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+fn value_string(value: &Value) -> Option<String> {
+    match value {
+        Value::Concrete(ConcreteValue::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn exact_regex_literal(value: String) -> Option<String> {
+    value
+        .strip_prefix('^')
+        .and_then(|value| value.strip_suffix('$'))
+        .map(ToString::to_string)
+}
+
+fn apply_time_read_crn(state_path: &std::path::Path) -> String {
+    format!(
+        r#"backend local {{ path = "{}" }}
+provider mock {{}}
+
+let target_role = mock.iam.Role {{
+  role_name = "carina-acc-test-3666-target"
+}}
+
+let roles = read mock.iam.Roles {{
+  name_regex = "^${{target_role.role_name}}$"
+}}
+
+let consumer = mock.iam.Role {{
+  role_name = "carina-acc-test-3666-consumer"
+  description = roles.names[0]
+}}
+"#,
+        state_path.display()
+    )
+}
+
 #[test]
 fn total_apply_line_formats_duration() {
     assert_eq!(
@@ -179,6 +424,177 @@ fn plan_with_name_override(id: &ResourceId, temp_value: &str, original_value: &s
         ]
     }))
     .expect("plan with permanent name override should deserialize")
+}
+
+#[test]
+fn export_only_fast_path_is_disabled_when_deferred_reads_exist() {
+    let mut data_source = DataSource::with_provider("mock", "iam.Roles", "roles", None);
+    data_source.binding = Some("roles".to_string());
+    data_source.attributes.insert(
+        "name_regex".to_string(),
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: carina_core::resource::AccessPath::new("target_role", "role_name"),
+        }),
+    );
+    let mut plan = Plan::new();
+    plan.add(carina_core::effect::Effect::Read {
+        resource: carina_core::resource::ResolvedDataSource::new(data_source.clone()),
+    });
+    let deferred_reads = deferred_data_source_reads_from_data_sources(&[data_source]);
+
+    assert!(
+        !can_use_export_only_fast_path(&plan, &deferred_reads),
+        "deferred reads are executable effects and must not be silently skipped"
+    );
+}
+
+#[tokio::test]
+async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read() {
+    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
+    let fixture = ApplyCancellationFixture::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mock_state_path = tmp.path().join("mock-provider-state.json");
+    std::fs::write(
+        &mock_state_path,
+        serde_json::json!({
+            "test.resource.lookup": {
+                "name": "target"
+            }
+        })
+        .to_string(),
+    )
+    .expect("mock provider state");
+
+    unsafe {
+        std::env::set_var("CARINA_MOCK_STATE_FILE", &mock_state_path);
+        std::env::set_var("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1");
+    }
+
+    let target_id = ResourceId::with_provider_identity("mock", "test.resource", "target", None);
+    let mut target = Resource::with_provider("mock", "test.resource", "target", None);
+    target.id = target_id.clone();
+    target.binding = Some("target".to_string());
+    target.set_attr(
+        "name",
+        Value::Concrete(ConcreteValue::String("target".to_string())),
+    );
+
+    let lookup_id = ResourceId::with_provider_identity("mock", "test.resource", "lookup", None);
+    let mut lookup = DataSource::with_provider("mock", "test.resource", "lookup", None);
+    lookup.id = lookup_id.clone();
+    lookup.binding = Some("lookup".to_string());
+    lookup.set_attr(
+        "filter",
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: carina_core::resource::AccessPath::new("target", "name"),
+        }),
+    );
+
+    let consumer_id = ResourceId::with_provider_identity("mock", "test.resource", "consumer", None);
+    let mut consumer = Resource::with_provider("mock", "test.resource", "consumer", None);
+    consumer.id = consumer_id.clone();
+    consumer.binding = Some("consumer".to_string());
+    consumer.set_attr(
+        "name",
+        Value::Concrete(ConcreteValue::String("consumer".to_string())),
+    );
+    consumer.set_attr(
+        "comment",
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: carina_core::resource::AccessPath::new("lookup", "name"),
+        }),
+    );
+
+    let mut plan = Plan::new();
+    plan.add(carina_core::effect::Effect::Create(resolved(
+        target.clone(),
+    )));
+    plan.add(carina_core::effect::Effect::Read {
+        resource: ResolvedDataSource::new(lookup.clone()),
+    });
+    plan.add(carina_core::effect::Effect::Create(resolved(
+        consumer.clone(),
+    )));
+
+    let provider_configs = vec![ProviderConfig {
+        name: "mock".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
+    }];
+    let plan_file = PlanFile {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-07-02T00:00:00Z".to_string(),
+        source_path: fixture.config_path().display().to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs,
+        backend_config: None,
+        plan,
+        sorted_resources: vec![target.clone(), consumer.clone()],
+        unresolved_resources: vec![target, consumer],
+        compositions: Vec::new(),
+        data_sources: vec![lookup],
+        current_states: vec![
+            crate::commands::plan::CurrentStateEntry {
+                id: target_id,
+                state: State::not_found(ResourceId::with_provider_identity(
+                    "mock",
+                    "test.resource",
+                    "target",
+                    None,
+                )),
+            },
+            crate::commands::plan::CurrentStateEntry {
+                id: consumer_id,
+                state: State::not_found(ResourceId::with_provider_identity(
+                    "mock",
+                    "test.resource",
+                    "consumer",
+                    None,
+                )),
+            },
+        ],
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    };
+
+    let observer_factory = fixture.observer_factory();
+    let result = run_apply_from_plan_locked(
+        plan_file,
+        true,
+        fixture.backend(),
+        None,
+        tmp.path(),
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(4).unwrap(),
+        false,
+    )
+    .await;
+
+    unsafe {
+        std::env::remove_var("CARINA_MOCK_STATE_FILE");
+        std::env::remove_var("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA");
+    }
+
+    result.expect("saved-plan apply should execute the deferred read before consumer create");
+    let state = fixture.read_state().await;
+    let consumer = state
+        .find_resource("mock", "test.resource", "consumer")
+        .expect("consumer should be persisted");
+    assert_eq!(
+        consumer.attributes.get("comment"),
+        Some(&serde_json::json!("target")),
+        "consumer must receive the value published by the apply-time read"
+    );
 }
 
 #[test]
@@ -439,6 +855,309 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
     assert_eq!(state.exports.get("ax"), Some(&serde_json::json!("a")));
     assert!(!state.exports.contains_key("bx"));
     assert_eq!(state.serial, 1);
+}
+
+#[tokio::test]
+async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referenced_create_exists()
+{
+    let fixture = ApplyCancellationFixture::new();
+    let crn = apply_time_read_crn(fixture.state_path());
+    let fixture = fixture.with_raw_config(crn);
+
+    let loaded = load_configuration_with_config(
+        fixture.config_path(),
+        fixture.provider_context(),
+        &SchemaRegistry::new(),
+    )
+    .expect("fixture must load");
+    let mut parsed = loaded.parsed;
+    let mut unresolved_parsed = loaded.unresolved_parsed;
+    let base_dir = get_base_dir(fixture.config_path());
+    let shared = ApplyTimeReadShared::default();
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+        &mut parsed,
+        base_dir,
+        false,
+        vec![Box::new(ApplyTimeReadFactory {
+            shared: shared.clone(),
+        })],
+        HashMap::new(),
+    );
+    assert!(
+        validation_errors.is_empty(),
+        "fixture must validate, got: {validation_errors:?}"
+    );
+    let ctx = WiringContext::new(vec![Box::new(ApplyTimeReadFactory {
+        shared: shared.clone(),
+    })]);
+    let observer_factory = fixture.observer_factory();
+
+    run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &mut unresolved_parsed,
+        true,
+        fixture.backend(),
+        None,
+        base_dir,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(4).unwrap(),
+        false,
+    )
+    .await
+    .expect("apply should defer the read until target_role has been created");
+
+    assert_eq!(
+        shared.operations.lock().unwrap().as_slice(),
+        ["create:target_role", "read:roles", "create:consumer"],
+        "apply-time read must run between the upstream create and downstream consumer create"
+    );
+    assert_eq!(
+        shared.read_calls.load(Ordering::SeqCst),
+        1,
+        "read must execute exactly once at apply time, not once during refresh and again at apply"
+    );
+    assert_eq!(
+        *shared.consumer_description.lock().unwrap(),
+        Some(Value::Concrete(ConcreteValue::String(
+            "carina-acc-test-3666-target".to_string()
+        ))),
+        "consumer create must receive the data-source output resolved from the apply-time read"
+    );
+
+    let state = fixture.read_state().await;
+    assert!(
+        state
+            .find_resource("mock", "iam.Role", "target_role")
+            .is_some(),
+        "target role must be persisted"
+    );
+    assert!(
+        state
+            .find_resource("mock", "iam.Role", "consumer")
+            .is_some(),
+        "consumer role must be persisted"
+    );
+}
+
+#[tokio::test]
+async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempotent() {
+    let fixture = ApplyCancellationFixture::new();
+    let crn = apply_time_read_crn(fixture.state_path());
+    let fixture = fixture.with_raw_config(crn);
+
+    let loaded = load_configuration_with_config(
+        fixture.config_path(),
+        fixture.provider_context(),
+        &SchemaRegistry::new(),
+    )
+    .expect("fixture must load");
+    let mut parsed = loaded.parsed;
+    let mut unresolved_parsed = loaded.unresolved_parsed;
+    let base_dir = get_base_dir(fixture.config_path());
+    let shared = ApplyTimeReadShared::default();
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+        &mut parsed,
+        base_dir,
+        false,
+        vec![Box::new(ApplyTimeReadFactory {
+            shared: shared.clone(),
+        })],
+        HashMap::new(),
+    );
+    assert!(
+        validation_errors.is_empty(),
+        "fixture must validate, got: {validation_errors:?}"
+    );
+    let ctx = WiringContext::new(vec![Box::new(ApplyTimeReadFactory {
+        shared: shared.clone(),
+    })]);
+    let observer_factory = fixture.observer_factory();
+
+    run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &mut unresolved_parsed,
+        true,
+        fixture.backend(),
+        None,
+        base_dir,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(4).unwrap(),
+        false,
+    )
+    .await
+    .expect("initial apply should succeed");
+
+    assert_eq!(
+        shared.read_calls.load(Ordering::SeqCst),
+        1,
+        "first run should read at apply time exactly once"
+    );
+
+    let loaded = load_configuration_with_config(
+        fixture.config_path(),
+        fixture.provider_context(),
+        &SchemaRegistry::new(),
+    )
+    .expect("fixture must reload");
+    let mut parsed = loaded.parsed;
+    let unresolved_parsed = loaded.unresolved_parsed;
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+        &mut parsed,
+        base_dir,
+        false,
+        vec![Box::new(ApplyTimeReadFactory {
+            shared: shared.clone(),
+        })],
+        HashMap::new(),
+    );
+    assert!(
+        validation_errors.is_empty(),
+        "fixture must validate for plan, got: {validation_errors:?}"
+    );
+
+    let state_file = Some(fixture.read_state().await);
+    let target_state = state_file
+        .as_ref()
+        .and_then(|state| state.find_resource("mock", "iam.Role", "target_role"))
+        .expect("target role must be persisted before post-apply plan");
+    assert_eq!(
+        target_state.attributes.get("path"),
+        Some(&serde_json::json!("/")),
+        "fixture must mirror AWS read-back defaults that are absent from config"
+    );
+    assert_eq!(
+        target_state.attributes.get("max_session_duration"),
+        Some(&serde_json::json!(3600)),
+        "fixture must mirror AWS read-back defaults that are absent from config"
+    );
+
+    let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
+        &ctx,
+        &parsed,
+        &unresolved_parsed.resources,
+        &unresolved_parsed.data_sources,
+        &state_file,
+        true,
+        &HashMap::new(),
+        &carina_core::identifier::StateBlockClaims::empty(),
+        &crate::wiring::ResolvedStateBlockTargets::default(),
+        base_dir,
+    )
+    .await
+    .expect("post-apply plan should succeed");
+
+    assert!(
+        !plan_ctx.plan.has_mutations(),
+        "post-apply plan must be idempotent"
+    );
+    assert_eq!(
+        shared.read_calls.load(Ordering::SeqCst),
+        2,
+        "post-apply plan must refresh the data source instead of deferring it"
+    );
+}
+
+#[tokio::test]
+async fn run_apply_locked_orders_deferred_data_source_read_chain() {
+    let fixture = ApplyCancellationFixture::new();
+    let crn = format!(
+        r#"backend local {{ path = "{}" }}
+provider mock {{}}
+
+let target_role = mock.iam.Role {{
+  role_name = "carina-acc-test-3666-target"
+}}
+
+let roles = read mock.iam.Roles {{
+  name_regex = "^${{target_role.role_name}}$"
+}}
+
+let roles_again = read mock.iam.Roles {{
+  name_regex = "^${{roles.names[0]}}$"
+}}
+
+let consumer = mock.iam.Role {{
+  role_name = "carina-acc-test-3666-consumer"
+  description = roles_again.names[0]
+}}
+"#,
+        fixture.state_path().display()
+    );
+    let fixture = fixture.with_raw_config(crn);
+
+    let loaded = load_configuration_with_config(
+        fixture.config_path(),
+        fixture.provider_context(),
+        &SchemaRegistry::new(),
+    )
+    .expect("fixture must load");
+    let mut parsed = loaded.parsed;
+    let mut unresolved_parsed = loaded.unresolved_parsed;
+    let base_dir = get_base_dir(fixture.config_path());
+    let shared = ApplyTimeReadShared::default();
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+        &mut parsed,
+        base_dir,
+        false,
+        vec![Box::new(ApplyTimeReadFactory {
+            shared: shared.clone(),
+        })],
+        HashMap::new(),
+    );
+    assert!(
+        validation_errors.is_empty(),
+        "fixture must validate, got: {validation_errors:?}"
+    );
+    let ctx = WiringContext::new(vec![Box::new(ApplyTimeReadFactory {
+        shared: shared.clone(),
+    })]);
+    let observer_factory = fixture.observer_factory();
+
+    run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &mut unresolved_parsed,
+        true,
+        fixture.backend(),
+        None,
+        base_dir,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(4).unwrap(),
+        false,
+    )
+    .await
+    .expect("apply should order chained deferred reads before the consumer");
+
+    assert_eq!(
+        shared.operations.lock().unwrap().as_slice(),
+        [
+            "create:target_role",
+            "read:roles",
+            "read:roles_again",
+            "create:consumer"
+        ],
+        "read chain must run target create -> read A -> read B -> consumer create"
+    );
+    assert_eq!(
+        shared.read_calls.load(Ordering::SeqCst),
+        2,
+        "both deferred reads should execute exactly once at apply time"
+    );
+    assert_eq!(
+        *shared.consumer_description.lock().unwrap(),
+        Some(Value::Concrete(ConcreteValue::String(
+            "carina-acc-test-3666-target".to_string()
+        ))),
+        "consumer create must receive the second read's output"
+    );
 }
 
 fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::BackendConfig {
