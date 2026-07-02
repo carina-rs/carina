@@ -2500,9 +2500,9 @@ fn deferred_create_targets_do_not_absorb_unrelated_orphan_deletes() {
 mod expand_same_config_deferred_for_tests {
     use super::*;
     use carina_core::binding_index::WaitAliasSpec;
-    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::parser::{ProviderContext, WarningKind, parse};
     use carina_core::resource::{ConcreteValue, DeferredValue, State, UnknownReason, Value};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     /// `let cert` (same-config) + a `for` over its provider-read
     /// `account_ids`, plus a plain independent resource so re-sort
@@ -2562,6 +2562,37 @@ mod expand_same_config_deferred_for_tests {
 
     fn unknown_account_ids() -> Value {
         Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue))
+    }
+
+    #[test]
+    fn deferred_for_warning_filter_preserves_single_quoted_warning_on_same_line() {
+        let src = "for k in upstream.ids { awscc.s3.Bucket { name = 'a-${k}' } }\n";
+        let parsed = parse(src, &ProviderContext::default()).expect("fixture parses");
+        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+        assert!(
+            parsed
+                .warnings
+                .iter()
+                .any(|w| w.kind == WarningKind::SingleQuotedInterpolation),
+            "fixture should carry the single-quoted interpolation-like warning"
+        );
+
+        let out = expand_same_config_deferred_for(
+            &parsed,
+            &[],
+            &HashMap::new(),
+            &carina_core::schema::SchemaRegistry::new(),
+            &HashMap::new(),
+            &[] as &[WaitAliasSpec],
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .expect("deferred-for expansion should succeed");
+
+        assert!(
+            out.printed_warnings,
+            "same-line deferred-for filtering must not delete unrelated parse warnings"
+        );
     }
 
     /// Direct unit test of `RefreshableChildIds::select` — the sole

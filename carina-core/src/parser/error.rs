@@ -4,6 +4,8 @@
 
 use super::Rule;
 
+pub const SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE: &str = "single-quoted string contains '${...}' which is not interpolated; use double quotes (\"...\") for interpolation, or keep single quotes if the literal text is intended";
+
 /// Parse error
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
@@ -97,13 +99,33 @@ fn format_undefined_identifier(
 }
 
 /// A structured warning emitted during parsing (non-fatal).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WarningKind {
+    DeferredFor,
+    SingleQuotedInterpolation,
+    UnusedForBinding,
+}
+
+/// 1-indexed source span for a parse warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseWarningSpan {
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_line: usize,
+    /// 1-indexed exclusive end column for single-line spans.
+    pub end_column: usize,
+}
+
+/// A structured warning emitted during parsing (non-fatal).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseWarning {
     /// Full source path of the file this warning originated from
     /// (stamped by `config_loader` after parsing). `None` at parse time;
     /// always `Some` once the warning reaches CLI/LSP callers.
     pub file: Option<String>,
     pub line: usize,
+    pub kind: WarningKind,
+    pub span: Option<ParseWarningSpan>,
     pub message: String,
 }
 

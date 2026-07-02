@@ -67,8 +67,16 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
         crate::config_loader::parse_directory_files(&files, &ProviderContext::default()).ok()?;
 
     let mut merged = ParsedFile::default();
-    for (_, parsed) in parsed_files {
-        crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
+    for (file, parsed) in parsed_files {
+        let mut parsed = parsed.into_inner();
+        let file_path = Some(file.display().to_string());
+        for w in &mut parsed.warnings {
+            w.file = file_path.clone();
+        }
+        for d in &mut parsed.deferred_for_expressions {
+            d.file = file_path.clone();
+        }
+        crate::config_loader::merge_parsed_file(&mut merged, parsed);
     }
 
     if merged.arguments.is_empty() && merged.attribute_params.is_empty() {
@@ -134,8 +142,16 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
             .map_err(|e| format!("Failed to parse directory {}: {}", dir.display(), e))?;
 
     let mut merged = ParsedFile::default();
-    for (_, parsed) in parsed_files {
-        crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
+    for (file, parsed) in parsed_files {
+        let mut parsed = parsed.into_inner();
+        let file_path = Some(file.display().to_string());
+        for w in &mut parsed.warnings {
+            w.file = file_path.clone();
+        }
+        for d in &mut parsed.deferred_for_expressions {
+            d.file = file_path.clone();
+        }
+        crate::config_loader::merge_parsed_file(&mut merged, parsed);
     }
 
     Ok(merged)

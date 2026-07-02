@@ -276,17 +276,16 @@ pub fn run_validate(
         error_reports.push(msg);
     }
 
+    let printed_warning_count = parsed.warnings.len();
     parsed.print_warnings();
 
     if !json {
         println!("{}", "Validating...".cyan());
     }
 
-    error_reports.extend(
-        validate_and_resolve_errors(&mut parsed, base_dir, false)
-            .iter()
-            .map(ToString::to_string),
-    );
+    let validation_errors = validate_and_resolve_errors(&mut parsed, base_dir, false);
+    parsed.print_warnings_from(printed_warning_count);
+    error_reports.extend(validation_errors.iter().map(ToString::to_string));
 
     if !error_reports.is_empty() {
         return Err(AppError::Validation(error_reports.join("\n")));

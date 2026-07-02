@@ -12,7 +12,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
 use crate::position;
-use carina_core::parser::{ParseError, ParsedFile, ResourceRef};
+use carina_core::parser::{ParseError, ParsedFile, ResourceRef, WarningKind};
 use carina_core::provider::ProviderFactory;
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
@@ -985,6 +985,7 @@ impl DiagnosticEngine {
             // upstream_state "validate does not inspect" note) are informational
             // context meant for CLI output only and are not elevated here.
             diagnostics.extend(self.check_unused_for_bindings(doc, parsed));
+            diagnostics.extend(self.check_single_quoted_interpolation_warnings(parsed));
 
             // Check for unknown attributes on resource references (typo detection)
             diagnostics.extend(self.check_resource_ref_attributes(
@@ -1073,6 +1074,9 @@ impl DiagnosticEngine {
             .warnings
             .iter()
             .filter_map(|w| {
+                if w.kind != WarningKind::UnusedForBinding {
+                    return None;
+                }
                 let rest = w.message.strip_prefix(prefix)?;
                 let name = rest.split('\'').next()?;
                 let line_idx = w.line.checked_sub(1)?;
@@ -1083,6 +1087,27 @@ impl DiagnosticEngine {
                     line_idx as u32,
                     col,
                     col + name.chars().count() as u32,
+                    DiagnosticSeverity::WARNING,
+                    w.message.clone(),
+                ))
+            })
+            .collect()
+    }
+
+    fn check_single_quoted_interpolation_warnings(&self, parsed: &ParsedFile) -> Vec<Diagnostic> {
+        parsed
+            .warnings
+            .iter()
+            .filter(|w| w.kind == WarningKind::SingleQuotedInterpolation)
+            .filter_map(|w| {
+                let span = w.span.as_ref()?;
+                let line = span.start_line.checked_sub(1)? as u32;
+                let start_col = span.start_column.checked_sub(1)? as u32;
+                let end_col = span.end_column.checked_sub(1)? as u32;
+                Some(carina_diagnostic(
+                    line,
+                    start_col,
+                    end_col,
                     DiagnosticSeverity::WARNING,
                     w.message.clone(),
                 ))

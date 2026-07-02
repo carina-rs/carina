@@ -7401,6 +7401,48 @@ fn parse_single_quoted_string_no_interpolation() {
 }
 
 #[test]
+fn parse_single_quoted_interpolation_like_sequence_warns_for_each_occurrence() {
+    let input = "let policy = '${a} and ${b}'";
+
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    let warnings: Vec<_> = result
+        .warnings
+        .iter()
+        .filter(|w| w.kind == WarningKind::SingleQuotedInterpolation)
+        .collect();
+
+    assert_eq!(
+        warnings.len(),
+        2,
+        "expected one warning per interpolation-like sequence, got: {:?}",
+        result.warnings
+    );
+}
+
+#[test]
+fn parse_single_quoted_interpolation_warning_uses_original_line_after_heredoc() {
+    let input = r#"let doc = <<EOF
+alpha
+beta
+EOF
+let env = "prod"
+let policy = 'arn:${env}:root'
+"#;
+
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    let warning = result
+        .warnings
+        .iter()
+        .find(|w| w.kind == WarningKind::SingleQuotedInterpolation)
+        .expect("single-quoted interpolation-like warning");
+
+    assert_eq!(
+        warning.line, 6,
+        "warning should report the original source line after heredoc preprocessing"
+    );
+}
+
+#[test]
 fn parse_single_quoted_string_escape_sequences() {
     let input = r#"
         let vpc = aws.ec2.Vpc {

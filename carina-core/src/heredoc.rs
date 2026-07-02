@@ -18,6 +18,10 @@ pub struct PreprocessResult {
     /// Original heredoc texts, in order of replacement.
     /// Each entry is the full heredoc text from `<<MARKER` through the closing `MARKER` line.
     pub heredocs: Vec<String>,
+    /// Maps each 1-indexed line in `source` back to the original 1-indexed
+    /// input line. A multi-line heredoc replacement maps to the line where
+    /// the heredoc started.
+    pub line_map: Vec<usize>,
 }
 
 /// Preprocess heredocs in the input, replacing them with double-quoted strings.
@@ -28,12 +32,14 @@ pub fn preprocess_heredocs(input: &str) -> Result<PreprocessResult, HeredocError
     let lines: Vec<&str> = input.split('\n').collect();
     let mut result = String::with_capacity(input.len());
     let mut heredocs = Vec::new();
+    let mut line_map = Vec::new();
     let mut i = 0;
 
     while i < lines.len() {
         let line = lines[i];
 
         if let Some(heredoc_start) = find_heredoc_start(line) {
+            line_map.push(i + 1);
             // Emit the part of the line before the heredoc
             result.push_str(&line[..heredoc_start.prefix_end]);
 
@@ -100,6 +106,7 @@ pub fn preprocess_heredocs(input: &str) -> Result<PreprocessResult, HeredocError
                 result.push('\n');
             }
         } else {
+            line_map.push(i + 1);
             result.push_str(line);
             i += 1;
             if i < lines.len() {
@@ -111,6 +118,7 @@ pub fn preprocess_heredocs(input: &str) -> Result<PreprocessResult, HeredocError
     Ok(PreprocessResult {
         source: result,
         heredocs,
+        line_map,
     })
 }
 
