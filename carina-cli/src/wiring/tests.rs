@@ -21,6 +21,7 @@ fn resolved(resource: Resource) -> ResolvedResource {
 struct ReadWithRetryProvider {
     behavior: ReadBehavior,
     read_calls: AtomicUsize,
+    data_source_read_calls: AtomicUsize,
 }
 
 impl ReadWithRetryProvider {
@@ -28,11 +29,16 @@ impl ReadWithRetryProvider {
         Self {
             behavior,
             read_calls: AtomicUsize::new(0),
+            data_source_read_calls: AtomicUsize::new(0),
         }
     }
 
     fn read_calls(&self) -> usize {
         self.read_calls.load(Ordering::SeqCst)
+    }
+
+    fn data_source_read_calls(&self) -> usize {
+        self.data_source_read_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -67,6 +73,7 @@ impl Provider for ReadWithRetryProvider {
         &self,
         resource: &carina_core::resource::DataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
+        self.data_source_read_calls.fetch_add(1, Ordering::SeqCst);
         let id = resource.id.clone();
         Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
     }
@@ -887,6 +894,7 @@ moved {
     let err = match create_plan_from_parsed_with_upstream(
         &parsed,
         &parsed.resources,
+        &parsed.data_sources,
         &state_file,
         false,
         &HashMap::new(),
@@ -973,6 +981,7 @@ removed {
     let err = match create_plan_from_parsed_with_upstream(
         &parsed,
         &parsed.resources,
+        &parsed.data_sources,
         &state_file,
         false,
         &HashMap::new(),
@@ -1604,6 +1613,7 @@ moved {{
     let ctx = create_plan_from_parsed_with_upstream(
         &parsed,
         &parsed.resources,
+        &parsed.data_sources,
         &Some(state_file),
         false,
         &HashMap::new(),
@@ -1691,7 +1701,9 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
     .expect("resolution should succeed");
 
     assert_eq!(resolved.len(), 1, "only the data source should be returned");
-    let resolved_mizzy = &resolved[0];
+    let DataSourceRefreshResolution::Resolved(resolved_mizzy) = &resolved[0] else {
+        panic!("current-state-backed data source must be refreshable: {resolved:?}");
+    };
     assert_eq!(
         resolved_mizzy.get_attr("identity_store_id"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -1706,6 +1718,416 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
             "gosukenator@gmail.com".into()
         ))),
         "literal inputs should pass through untouched"
+    );
+}
+
+#[test]
+fn resolve_data_source_refs_for_refresh_defers_unresolved_apply_time_input() {
+    use carina_core::resource::{AccessPath, DataSource};
+
+    let mut target = Resource::with_provider("test", "Upstream", "target", None);
+    target.binding = Some("target".to_string());
+    target.set_attr(
+        "name",
+        Value::Concrete(ConcreteValue::String("target".to_string())),
+    );
+
+    let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
+    lookup.attributes.insert(
+        "filter".to_string(),
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("target", "generated"),
+        }),
+    );
+
+    let empty_registry = carina_core::schema::SchemaRegistry::new();
+    let resolved = resolve_data_source_refs_for_refresh(
+        &[target],
+        &[],
+        &[lookup],
+        &HashMap::new(),
+        &HashMap::new(),
+        &empty_registry,
+        &[],
+    )
+    .expect("resolution should classify deferred refs");
+
+    assert_eq!(resolved.len(), 1);
+    let DataSourceRefreshResolution::DeferredToApply {
+        resource,
+        unresolved,
+    } = &resolved[0]
+    else {
+        panic!("unresolved input must be deferred, got {resolved:?}");
+    };
+    assert_eq!(resource.id.resource_type, "Lookup");
+    assert_eq!(unresolved.len(), 1);
+    assert_eq!(unresolved[0].attribute, "filter");
+    assert_eq!(unresolved[0].paths[0].to_dot_string(), "target.generated");
+}
+
+#[test]
+fn resolve_data_source_refs_for_refresh_defers_bare_binding_ref_to_new_resource() {
+    use carina_core::resource::DataSource;
+
+    let mut target = Resource::with_provider("test", "Upstream", "target", None);
+    target.binding = Some("target".to_string());
+
+    let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
+    lookup.attributes.insert(
+        "filter".to_string(),
+        Value::Deferred(DeferredValue::BindingRef {
+            binding: "target".to_string(),
+        }),
+    );
+
+    let empty_registry = carina_core::schema::SchemaRegistry::new();
+    let resolved = resolve_data_source_refs_for_refresh(
+        &[target],
+        &[],
+        &[lookup],
+        &HashMap::new(),
+        &HashMap::new(),
+        &empty_registry,
+        &[],
+    )
+    .expect("resolution should classify bare binding refs");
+
+    let DataSourceRefreshResolution::DeferredToApply { unresolved, .. } = &resolved[0] else {
+        panic!("bare BindingRef to a new resource must defer: {resolved:?}");
+    };
+    assert_eq!(unresolved[0].attribute, "filter");
+    assert_eq!(unresolved[0].bindings, vec!["target".to_string()]);
+}
+
+#[test]
+fn resolve_data_source_refs_for_refresh_defers_unknown_input_instead_of_calling_provider() {
+    use carina_core::resource::{DataSource, UnknownReason};
+
+    let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
+    lookup.attributes.insert(
+        "filter".to_string(),
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+    );
+
+    let empty_registry = carina_core::schema::SchemaRegistry::new();
+    let resolved = resolve_data_source_refs_for_refresh(
+        &[],
+        &[],
+        &[lookup],
+        &HashMap::new(),
+        &HashMap::new(),
+        &empty_registry,
+        &[],
+    )
+    .expect("resolution should classify unknown inputs");
+
+    let DataSourceRefreshResolution::DeferredToApply { unresolved, .. } = &resolved[0] else {
+        panic!("Unknown input must not be treated as provider-ready: {resolved:?}");
+    };
+    assert_eq!(unresolved[0].attribute, "filter");
+    assert_eq!(unresolved[0].unknowns, vec![UnknownReason::ForValue]);
+}
+
+#[test]
+fn resolve_data_source_refs_for_refresh_defers_resolvable_interpolation_when_target_is_new() {
+    use carina_core::resource::{AccessPath, DataSource, InterpolationPart};
+
+    let mut target = Resource::with_provider("test", "Upstream", "target", None);
+    target.binding = Some("target".to_string());
+    target.set_attr(
+        "role_name",
+        Value::Concrete(ConcreteValue::String("target-role".to_string())),
+    );
+
+    let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
+    lookup.attributes.insert(
+        "name_regex".to_string(),
+        Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("^".to_string()),
+            InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new("target", "role_name"),
+            })),
+            InterpolationPart::Literal("$".to_string()),
+        ])),
+    );
+
+    let empty_registry = carina_core::schema::SchemaRegistry::new();
+    let resolved = resolve_data_source_refs_for_refresh(
+        &[target],
+        &[],
+        &[lookup],
+        &HashMap::new(),
+        &HashMap::new(),
+        &empty_registry,
+        &[],
+    )
+    .expect("resolution should classify new-target input as deferred");
+
+    let DataSourceRefreshResolution::DeferredToApply { unresolved, .. } = &resolved[0] else {
+        panic!("value-resolvable input that references a new resource must defer: {resolved:?}");
+    };
+    assert_eq!(unresolved[0].paths[0].to_dot_string(), "target.role_name");
+}
+
+#[test]
+fn resolve_data_source_refs_for_refresh_does_not_treat_missing_create_only_readback_as_replace() {
+    use carina_core::resource::{AccessPath, DataSource};
+
+    let mut target = Resource::with_provider("test", "Role", "target", None);
+    target.binding = Some("target".to_string());
+    target.set_attr(
+        "role_name",
+        Value::Concrete(ConcreteValue::String("same-name".to_string())),
+    );
+
+    let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
+    lookup.attributes.insert(
+        "filter".to_string(),
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("target", "role_name"),
+        }),
+    );
+
+    let mut current_states = HashMap::new();
+    current_states.insert(
+        target.id.clone(),
+        State::existing(target.id.clone(), HashMap::new()).with_identifier("old-id"),
+    );
+    let mut registry = carina_core::schema::SchemaRegistry::new();
+    registry.insert(
+        "test",
+        ResourceSchema::new("Role")
+            .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only()),
+    );
+
+    let resolved = resolve_data_source_refs_for_refresh(
+        &[target],
+        &[],
+        &[lookup],
+        &current_states,
+        &HashMap::new(),
+        &registry,
+        &[],
+    )
+    .expect("resolution should not infer replacement from a missing read-back value");
+
+    assert!(
+        matches!(resolved[0], DataSourceRefreshResolution::Resolved(_)),
+        "an existing resource with a missing read-back create-only attr should refresh, not defer: {resolved:?}"
+    );
+}
+
+#[test]
+fn resolve_data_source_refs_for_refresh_defers_when_any_input_references_new_resource() {
+    use carina_core::resource::{AccessPath, DataSource};
+
+    let mut existing = Resource::with_provider("test", "Upstream", "existing", None);
+    existing.binding = Some("existing".to_string());
+    let mut target = Resource::with_provider("test", "Upstream", "target", None);
+    target.binding = Some("target".to_string());
+
+    let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
+    lookup.attributes.insert(
+        "existing_filter".to_string(),
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("existing", "name"),
+        }),
+    );
+    lookup.attributes.insert(
+        "new_filter".to_string(),
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("target", "name"),
+        }),
+    );
+
+    let mut current_states = HashMap::new();
+    current_states.insert(
+        existing.id.clone(),
+        State::existing(
+            existing.id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("existing".to_string())),
+            )]),
+        ),
+    );
+
+    let empty_registry = carina_core::schema::SchemaRegistry::new();
+    let resolved = resolve_data_source_refs_for_refresh(
+        &[existing, target],
+        &[],
+        &[lookup],
+        &current_states,
+        &HashMap::new(),
+        &empty_registry,
+        &[],
+    )
+    .expect("resolution should classify mixed existing/new refs");
+
+    assert!(
+        matches!(
+            resolved[0],
+            DataSourceRefreshResolution::DeferredToApply { .. }
+        ),
+        "any new-resource input must defer the whole read: {resolved:?}"
+    );
+}
+
+#[test]
+fn resolve_data_source_refs_for_refresh_defers_read_chain_from_new_resource() {
+    use carina_core::resource::{AccessPath, DataSource};
+
+    let mut target = Resource::with_provider("test", "Upstream", "target", None);
+    target.binding = Some("target".to_string());
+
+    let mut first = DataSource::with_provider("test", "Lookup", "first", None);
+    first.binding = Some("first".to_string());
+    first.attributes.insert(
+        "filter".to_string(),
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("target", "name"),
+        }),
+    );
+
+    let mut second = DataSource::with_provider("test", "Lookup", "second", None);
+    second.binding = Some("second".to_string());
+    second.attributes.insert(
+        "filter".to_string(),
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("first", "names"),
+        }),
+    );
+
+    let empty_registry = carina_core::schema::SchemaRegistry::new();
+    let resolved = resolve_data_source_refs_for_refresh(
+        &[target],
+        &[],
+        &[first, second],
+        &HashMap::new(),
+        &HashMap::new(),
+        &empty_registry,
+        &[],
+    )
+    .expect("resolution should propagate deferred read chains");
+
+    assert!(
+        resolved.iter().all(|resolution| matches!(
+            resolution,
+            DataSourceRefreshResolution::DeferredToApply { .. }
+        )),
+        "read B must defer when it depends on deferred read A: {resolved:?}"
+    );
+}
+
+#[test]
+fn resolve_data_source_refs_for_refresh_reads_existing_resource_even_when_replaced() {
+    use carina_core::resource::{AccessPath, DataSource};
+
+    let mut target = Resource::with_provider("test", "Role", "target", None);
+    target.binding = Some("target".to_string());
+    target.set_attr(
+        "role_name",
+        Value::Concrete(ConcreteValue::String("new-name".to_string())),
+    );
+
+    let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
+    lookup.attributes.insert(
+        "filter".to_string(),
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("target", "arn"),
+        }),
+    );
+
+    let mut current_states = HashMap::new();
+    current_states.insert(
+        target.id.clone(),
+        State::existing(
+            target.id.clone(),
+            HashMap::from([
+                (
+                    "role_name".to_string(),
+                    Value::Concrete(ConcreteValue::String("old-name".to_string())),
+                ),
+                (
+                    "arn".to_string(),
+                    Value::Concrete(ConcreteValue::String("old-arn".to_string())),
+                ),
+            ]),
+        )
+        .with_identifier("old-id"),
+    );
+    let mut registry = carina_core::schema::SchemaRegistry::new();
+    registry.insert(
+        "test",
+        ResourceSchema::new("Role")
+            .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
+            .attribute(AttributeSchema::new("arn", AttributeType::string()).read_only()),
+    );
+
+    let resolved = resolve_data_source_refs_for_refresh(
+        &[target],
+        &[],
+        &[lookup],
+        &current_states,
+        &HashMap::new(),
+        &registry,
+        &[],
+    )
+    .expect("resolution should classify refs to existing resources");
+
+    // The refresh classifier is intentionally existence-only. Predicting
+    // whether the differ will replace an existing upstream requires duplicating
+    // differ semantics for provider defaults, absent attributes, and removable
+    // fields. Refreshing the pre-replace state is ordinary plan-time staleness;
+    // apply can re-read only for reads deferred because an upstream did not
+    // exist at refresh time.
+    assert!(
+        matches!(resolved[0], DataSourceRefreshResolution::Resolved(_)),
+        "read must refresh when the referenced binding already exists in state: {resolved:?}"
+    );
+}
+
+#[tokio::test]
+async fn literal_input_data_source_refresh_reads_provider_once() {
+    use carina_core::resource::DataSource;
+
+    let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
+    lookup.attributes.insert(
+        "filter".to_string(),
+        Value::Concrete(ConcreteValue::String("literal".to_string())),
+    );
+
+    let empty_registry = carina_core::schema::SchemaRegistry::new();
+    let resolved = resolve_data_source_refs_for_refresh(
+        &[],
+        &[],
+        &[lookup],
+        &HashMap::new(),
+        &HashMap::new(),
+        &empty_registry,
+        &[],
+    )
+    .expect("literal inputs should be refreshable");
+
+    let provider = ReadWithRetryProvider::new(ReadBehavior::NotFound);
+    for resolution in resolved {
+        match resolution {
+            DataSourceRefreshResolution::Resolved(resource) => {
+                read_data_source_with_retry(&provider, &resource)
+                    .await
+                    .expect("literal input read should succeed");
+            }
+            DataSourceRefreshResolution::DeferredToApply { .. } => {
+                panic!("literal input read must not be deferred");
+            }
+        }
+    }
+
+    assert_eq!(
+        provider.data_source_read_calls(),
+        1,
+        "literal-input data source should be read exactly once during refresh",
     );
 }
 

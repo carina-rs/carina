@@ -128,7 +128,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 8;
+    pub const CURRENT_VERSION: u32 = 9;
 }
 
 pub(crate) fn collect_delete_attributes(
@@ -194,6 +194,12 @@ fn build_plan_file<E>(
         .to_string();
 
     Ok(PlanFile {
+        // Phase 9: bumped 8→9 — `data_sources` now stores the exact
+        // differ/executor view: resolved refresh-time reads and unresolved
+        // apply-time reads. Older v8 files may have serialized deferred reads
+        // after parser resolution, which loses the metadata needed by
+        // `apply --plan`.
+        //
         // Phase 7: bumped 6→8 — saved plans no longer support the
         // legacy Replace effect shape and replacement display metadata
         // must survive plan redaction.
@@ -237,7 +243,7 @@ fn build_plan_file<E>(
             .iter()
             .map(carina_core::value::redact_secrets_in_virtual)
             .collect::<Result<Vec<_>, _>>()?,
-        data_sources: parsed
+        data_sources: ctx
             .data_sources
             .iter()
             .map(carina_core::value::redact_secrets_in_data_source)
@@ -684,6 +690,7 @@ pub async fn run_plan(
     let ctx = create_plan_from_parsed_with_upstream(
         &parsed,
         &unresolved_parsed.resources,
+        &unresolved_parsed.data_sources,
         &state_file,
         refresh,
         &remote_bindings,
@@ -1667,6 +1674,8 @@ exports { region: String = "ap-northeast-1" }"#,
 #[cfg(test)]
 mod run_plan_out_tests {
     use super::*;
+    use carina_core::provider::ProviderRouter;
+    use carina_core::resource::{AccessPath, DataSource, DeferredValue, Value};
     use std::fs;
 
     // Pin the byte-level shape so plan files written by `plan --out`
@@ -1705,6 +1714,61 @@ mod run_plan_out_tests {
             Some(b'\n'),
             "plan --out file must end with a trailing newline; got {:?}",
             bytes.last().map(|b| *b as char),
+        );
+    }
+
+    #[test]
+    fn saved_plan_file_persists_deferred_data_source_inputs_from_plan_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("main.crn");
+        fs::write(&path, "provider mock {}\n").unwrap();
+
+        let mut parsed_data_source = DataSource::with_provider("mock", "iam.Roles", "roles", None);
+        parsed_data_source.binding = Some("roles".to_string());
+        parsed_data_source.set_attr(
+            "name_regex".to_string(),
+            Value::Concrete(carina_core::resource::ConcreteValue::String(
+                "^target$".to_string(),
+            )),
+        );
+
+        let mut deferred_data_source =
+            DataSource::with_provider("mock", "iam.Roles", "roles", None);
+        deferred_data_source.binding = Some("roles".to_string());
+        deferred_data_source.set_attr(
+            "name_regex".to_string(),
+            Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new("target_role", "role_name"),
+            }),
+        );
+
+        let parsed = carina_core::parser::ParsedFile {
+            data_sources: vec![parsed_data_source],
+            ..Default::default()
+        };
+        let ctx = crate::wiring::PlanContext {
+            plan: Plan::new(),
+            provider: ProviderRouter::new(),
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            data_sources: vec![deferred_data_source],
+            current_states: HashMap::new(),
+            moved_origins: HashMap::new(),
+            upstream_snapshot: HashMap::new(),
+            prev_explicit: HashMap::new(),
+            residual_deferred_for: Vec::new(),
+            expansion_trace: carina_core::resource::ExpansionTrace::new(),
+        };
+
+        let plan_file = build_plan_file(&path, &parsed, None, &None, &ctx)
+            .expect("saved plan should serialize");
+
+        let saved = plan_file.data_sources[0]
+            .get_attr("name_regex")
+            .expect("saved data source attr");
+        assert!(
+            matches!(saved, Value::Deferred(DeferredValue::ResourceRef { .. })),
+            "saved plans must preserve deferred data-source refs for apply --plan, got {saved:?}"
         );
     }
 }

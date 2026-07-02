@@ -77,6 +77,16 @@ impl ApplyCancellationFixture {
         self
     }
 
+    pub(super) fn with_raw_config(self, crn: impl AsRef<str>) -> Self {
+        self.base.write_crn(crn);
+        self.base.write_backend_lock();
+        self
+    }
+
+    pub(super) fn state_path(&self) -> &std::path::Path {
+        self.base.state_path()
+    }
+
     pub(super) fn cancel_after_successes(mut self, count: usize) -> Self {
         self.cancel_after_successes = Some(count);
         self

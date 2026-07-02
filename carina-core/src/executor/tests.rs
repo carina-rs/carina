@@ -88,6 +88,8 @@ struct MockProvider {
     /// `UpdateRequest`s passed in to `update()` in call order — lets a
     /// test assert the patch carries re-normalized attribute values.
     update_requests: Arc<Mutex<Vec<UpdateRequest>>>,
+    /// Data sources passed to `read_data_source()` in call order.
+    data_source_reads: Arc<Mutex<Vec<DataSource>>>,
 }
 
 impl MockProvider {
@@ -100,6 +102,7 @@ impl MockProvider {
             call_log: Arc::new(Mutex::new(Vec::new())),
             create_resources: Arc::new(Mutex::new(Vec::new())),
             update_requests: Arc::new(Mutex::new(Vec::new())),
+            data_source_reads: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -140,6 +143,10 @@ impl MockProvider {
     fn captured_update_requests(&self) -> Vec<UpdateRequest> {
         self.update_requests.lock().unwrap().clone()
     }
+
+    fn captured_data_source_reads(&self) -> Vec<DataSource> {
+        self.data_source_reads.lock().unwrap().clone()
+    }
 }
 
 impl Provider for MockProvider {
@@ -163,6 +170,10 @@ impl Provider for MockProvider {
     }
 
     fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        self.data_source_reads
+            .lock()
+            .unwrap()
+            .push(resource.clone());
         self.read(&resource.id, None, ReadRequest)
     }
 
@@ -1136,6 +1147,7 @@ async fn execute_plan_returns_completed_when_not_cancelled() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -1171,6 +1183,7 @@ async fn execute_plan_with_pre_cancelled_token_returns_cancelled_at_t4_or_later(
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -1204,6 +1217,7 @@ async fn execute_plan_with_empty_plan_and_pre_cancelled_token_returns_completed(
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -1237,6 +1251,7 @@ async fn execute_plan_cancelled_after_three_completed_keeps_in_flight_and_drops_
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -1292,6 +1307,7 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -1360,6 +1376,7 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -1418,6 +1435,7 @@ async fn execute_plan_cancelled_while_effect_in_flight_records_that_effect() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -1456,6 +1474,7 @@ async fn test_simple_create() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -1503,6 +1522,7 @@ async fn partial_create_records_state_and_diagnostic() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -1554,6 +1574,7 @@ async fn test_apply_renormalizes_after_resolution() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &CanonicalizingNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -1612,6 +1633,7 @@ async fn test_apply_reapplies_enum_alias_stage() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &factories,
@@ -1674,6 +1696,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &factories,
@@ -1729,6 +1752,7 @@ async fn test_apply_reapplies_canonicalize_stage() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -1789,6 +1813,7 @@ async fn test_apply_renormalizes_update_path() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &CanonicalizingNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -1875,6 +1900,7 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &DefaultTagsNormalizer,
         provider_configs: &provider_configs,
         factories: &[],
@@ -1984,6 +2010,7 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -2043,6 +2070,7 @@ async fn test_apply_effective_changed_skips_internal_and_write_only_attributes()
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -2106,6 +2134,7 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -2174,6 +2203,7 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &SecretListToScalarNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -2231,6 +2261,7 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &CanonicalizingNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -2370,6 +2401,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &normalizer,
         provider_configs: &[],
         factories: &[],
@@ -2436,6 +2468,7 @@ async fn test_simple_delete() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -2471,6 +2504,7 @@ async fn test_failed_effect_propagates_to_dependent() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -2510,6 +2544,7 @@ async fn test_observer_events_emitted_correctly() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -2543,6 +2578,7 @@ async fn test_read_effect_is_no_op() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -2587,6 +2623,7 @@ async fn test_independent_effects_run_in_parallel() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -2641,6 +2678,7 @@ async fn test_parallel_failure_skips_dependents() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -2692,6 +2730,7 @@ async fn test_dependency_levels_sequential_chain() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -2932,6 +2971,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -3150,6 +3190,7 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> (std::time::Duration, usize
         compositions: &[],
         bindings,
         current_states,
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -3223,6 +3264,7 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
         compositions: &[],
         bindings,
         current_states,
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -3297,6 +3339,7 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -3481,6 +3524,7 @@ async fn test_update_effect_binding_map_propagation() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -3610,6 +3654,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -3797,6 +3842,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -3947,6 +3993,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -4028,6 +4075,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -4148,6 +4196,7 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -4331,6 +4380,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -4540,6 +4590,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -4589,6 +4640,7 @@ async fn deferred_create_returns_error_when_upstream_binding_missing() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -4631,6 +4683,7 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -4681,6 +4734,7 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -4778,6 +4832,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -4871,6 +4926,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -5114,6 +5170,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &normalizer,
         provider_configs: &[],
         factories: &[],
@@ -5302,6 +5359,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
         compositions: &[],
         bindings,
         current_states,
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
@@ -5338,5 +5396,448 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
         )])),
         "the ResourceRef must resolve to the data source's read-state \
          `arns`; got {resolved:?}",
+    );
+}
+
+/// carina#3666: a data-source read whose input depends on a value
+/// produced by an earlier apply effect must execute during apply and
+/// publish its read state before downstream consumers run.
+#[tokio::test]
+async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::resource::{AccessPath, PathSegment, ResourceId, State, Subscript};
+
+    let provider = MockProvider::new();
+
+    let upstream_id = ResourceId::with_provider_identity("test", "Upstream", "target", None);
+    let mut upstream = Resource::with_provider("test", "Upstream", "target", None);
+    upstream.id = upstream_id.clone();
+    upstream.binding = Some("target".to_string());
+    upstream.set_attr(
+        "name",
+        Value::Concrete(ConcreteValue::String("target".to_string())),
+    );
+
+    let ds_id = ResourceId::with_provider_identity("test", "Lookup", "roles", None);
+    let mut data_source = DataSource::with_provider("test", "Lookup", "roles", None);
+    data_source.id = ds_id.clone();
+    data_source.binding = Some("roles".to_string());
+    data_source.attributes.insert(
+        "filter".to_string(),
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("target", "generated"),
+        }),
+    );
+
+    let consumer_id = ResourceId::with_provider_identity("test", "Consumer", "consumer", None);
+    let mut consumer = Resource::with_provider("test", "Consumer", "consumer", None);
+    consumer.id = consumer_id.clone();
+    consumer.binding = Some("consumer".to_string());
+    consumer.set_attr(
+        "description",
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::with_segments(
+                "roles",
+                "names",
+                vec![PathSegment::Subscript {
+                    index: Subscript::Int { index: 0 },
+                }],
+            ),
+        }),
+    );
+
+    let upstream_state = State::existing(
+        upstream_id.clone(),
+        HashMap::from([(
+            "generated".to_string(),
+            Value::Concrete(ConcreteValue::String("target-generated".to_string())),
+        )]),
+    )
+    .with_identifier("target-id");
+    provider.push_create(Ok(upstream_state));
+
+    let read_state = State::existing(
+        ds_id.clone(),
+        HashMap::from([(
+            "names".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("target-generated".to_string()),
+            )])),
+        )]),
+    )
+    .with_identifier("roles-id");
+    provider.push_read(Ok(read_state));
+
+    let consumer_state =
+        State::existing(consumer_id.clone(), HashMap::new()).with_identifier("consumer-id");
+    provider.push_create(Ok(consumer_state));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(upstream.clone()));
+    plan.add(Effect::Read {
+        resource: resolved_data_source(data_source.clone()),
+    });
+    plan.add(create_effect(consumer.clone()));
+
+    let current_states: HashMap<ResourceId, State> = HashMap::new();
+    let mut deferred_reads = DeferredDataSourceReads::none();
+    deferred_reads.insert(ds_id.clone(), unresolved_data_source_inputs(&data_source));
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: &[upstream, consumer],
+        compositions: &[],
+        data_sources: &[data_source],
+        current_states: &crate::resource::into_plan_input_map(
+            current_states.clone(),
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        ),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings,
+        current_states,
+        deferred_data_source_reads: deferred_reads,
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+
+    assert_eq!(
+        result.failure_count,
+        0,
+        "apply-time read must publish before the consumer runs; events: {:?}",
+        observer.events(),
+    );
+    assert_eq!(result.success_count, 3);
+
+    let calls = provider.calls();
+    let upstream_pos = call_position(&calls, "create", &upstream_id.to_string());
+    let read_pos = call_position(&calls, "read", &ds_id.to_string());
+    let consumer_pos = call_position(&calls, "create", &consumer_id.to_string());
+    assert!(
+        upstream_pos < read_pos && read_pos < consumer_pos,
+        "expected upstream -> read -> consumer provider calls, got {calls:?}",
+    );
+
+    let read_requests = provider.captured_data_source_reads();
+    assert_eq!(read_requests.len(), 1);
+    assert_eq!(
+        read_requests[0].get_attr("filter"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "target-generated".to_string()
+        ))),
+        "apply-time read input must resolve from the upstream create output",
+    );
+
+    let creates = provider.captured_create_resources();
+    let consumer_create = creates
+        .iter()
+        .find(|resource| resource.id == consumer_id)
+        .expect("consumer create request should be captured");
+    assert_eq!(
+        consumer_create.get_attr("description"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "target-generated".to_string()
+        ))),
+        "consumer input must resolve from the read output",
+    );
+}
+
+#[tokio::test]
+async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::resource::{AccessPath, PathSegment, ResourceId, State, Subscript};
+
+    let provider = MockProvider::new();
+
+    let upstream_id = ResourceId::with_provider_identity("test", "Upstream", "target", None);
+    let mut upstream = Resource::with_provider("test", "Upstream", "target", None);
+    upstream.id = upstream_id.clone();
+    upstream.binding = Some("target".to_string());
+    upstream.set_attr(
+        "name",
+        Value::Concrete(ConcreteValue::String("target".to_string())),
+    );
+
+    let ds_id = ResourceId::with_provider_identity("test", "Lookup", "roles", None);
+    let mut data_source = DataSource::with_provider("test", "Lookup", "roles", None);
+    data_source.id = ds_id.clone();
+    data_source.binding = Some("roles".to_string());
+    data_source.attributes.insert(
+        "filter".to_string(),
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("target", "generated"),
+        }),
+    );
+
+    let consumer_id = ResourceId::with_provider_identity("test", "Consumer", "consumer", None);
+    let mut consumer = Resource::with_provider("test", "Consumer", "consumer", None);
+    consumer.id = consumer_id.clone();
+    consumer.binding = Some("consumer".to_string());
+    consumer.set_attr(
+        "description",
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::with_segments(
+                "roles",
+                "names",
+                vec![PathSegment::Subscript {
+                    index: Subscript::Int { index: 0 },
+                }],
+            ),
+        }),
+    );
+
+    provider.push_create(Ok(State::existing(
+        upstream_id.clone(),
+        HashMap::from([(
+            "generated".to_string(),
+            Value::Concrete(ConcreteValue::String("target-generated".to_string())),
+        )]),
+    )
+    .with_identifier("target-id")));
+    provider.push_read(Err(ProviderError::api_error("lookup failed")));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(upstream.clone()));
+    plan.add(Effect::Read {
+        resource: resolved_data_source(data_source.clone()),
+    });
+    plan.add(create_effect(consumer.clone()));
+
+    let current_states: HashMap<ResourceId, State> = HashMap::new();
+    let mut deferred_reads = DeferredDataSourceReads::none();
+    deferred_reads.insert(ds_id.clone(), unresolved_data_source_inputs(&data_source));
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: &[upstream, consumer],
+        compositions: &[],
+        data_sources: &[data_source],
+        current_states: &crate::resource::into_plan_input_map(
+            current_states.clone(),
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        ),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings,
+        current_states,
+        deferred_data_source_reads: deferred_reads,
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+
+    assert_eq!(result.success_count, 1);
+    assert_eq!(result.failure_count, 1);
+    assert_eq!(result.skip_count, 1);
+    let events = observer.events();
+    assert!(
+        events.iter().any(|event| {
+            event.contains(&format!("failed:{ds_id}"))
+                && event.contains("data source read failed")
+                && event.contains("lookup failed")
+        }),
+        "read failure must be surfaced clearly; events: {events:?}",
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.contains(&format!("skipped:{consumer_id}"))),
+        "consumer must be skipped after read failure; events: {events:?}",
+    );
+    assert!(
+        provider
+            .captured_create_resources()
+            .iter()
+            .all(|resource| resource.id != consumer_id),
+        "consumer create must not run after the read fails",
+    );
+}
+
+#[tokio::test]
+async fn test_apply_time_data_source_read_retries_throttling_errors() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::resource::ResourceId;
+
+    let provider = MockProvider::new();
+    let ds_id = ResourceId::with_provider_identity("test", "Lookup", "roles", None);
+    let mut data_source = DataSource::with_provider("test", "Lookup", "roles", None);
+    data_source.id = ds_id.clone();
+    data_source.binding = Some("roles".to_string());
+    data_source.set_attr(
+        "filter".to_string(),
+        Value::Concrete(ConcreteValue::String("literal".to_string())),
+    );
+
+    provider.push_read(Err(ProviderError::api_error("ThrottlingException")));
+    provider.push_read(Err(ProviderError::api_error("Rate exceeded")));
+    provider.push_read(Ok(
+        State::existing(ds_id.clone(), HashMap::new()).with_identifier("roles-id")
+    ));
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Read {
+        resource: resolved_data_source(data_source.clone()),
+    });
+
+    let current_states: HashMap<ResourceId, State> = HashMap::new();
+    let mut deferred_reads = DeferredDataSourceReads::none();
+    deferred_reads.insert(ds_id.clone(), Vec::new());
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: &[],
+        compositions: &[],
+        data_sources: &[data_source],
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings,
+        current_states,
+        deferred_data_source_reads: deferred_reads,
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+
+    assert_eq!(result.failure_count, 0);
+    assert_eq!(result.success_count, 1);
+    assert_eq!(
+        provider.captured_data_source_reads().len(),
+        3,
+        "apply-time reads must use the same retry policy as refresh reads"
+    );
+}
+
+#[tokio::test]
+async fn test_pre_apply_data_source_read_remains_noop_in_executor() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::resource::{AccessPath, PathSegment, ResourceId, State, Subscript};
+
+    let provider = MockProvider::new();
+
+    let ds_id = ResourceId::with_provider_identity("test", "Lookup", "roles", None);
+    let mut data_source = DataSource::with_provider("test", "Lookup", "roles", None);
+    data_source.id = ds_id.clone();
+    data_source.binding = Some("roles".to_string());
+    data_source.attributes.insert(
+        "filter".to_string(),
+        Value::Concrete(ConcreteValue::String("literal".to_string())),
+    );
+
+    let consumer_id = ResourceId::with_provider_identity("test", "Consumer", "consumer", None);
+    let mut consumer = Resource::with_provider("test", "Consumer", "consumer", None);
+    consumer.id = consumer_id.clone();
+    consumer.binding = Some("consumer".to_string());
+    consumer.set_attr(
+        "description",
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::with_segments(
+                "roles",
+                "names",
+                vec![PathSegment::Subscript {
+                    index: Subscript::Int { index: 0 },
+                }],
+            ),
+        }),
+    );
+
+    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    current_states.insert(
+        ds_id.clone(),
+        State::existing(
+            ds_id.clone(),
+            HashMap::from([(
+                "names".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("literal-result".to_string()),
+                )])),
+            )]),
+        ),
+    );
+    provider.push_create(Ok(
+        State::existing(consumer_id.clone(), HashMap::new()).with_identifier("consumer-id")
+    ));
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Read {
+        resource: resolved_data_source(data_source.clone()),
+    });
+    plan.add(create_effect(consumer.clone()));
+
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: &[consumer],
+        compositions: &[],
+        data_sources: &[data_source],
+        current_states: &crate::resource::into_plan_input_map(
+            current_states.clone(),
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        ),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings,
+        current_states,
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+
+    assert_eq!(result.failure_count, 0, "events: {:?}", observer.events());
+    assert_eq!(result.success_count, 1);
+    assert_eq!(
+        provider.captured_data_source_reads().len(),
+        0,
+        "pre-apply reads are already refreshed and must not be double-read by the executor",
+    );
+    let calls = provider.calls();
+    assert!(
+        calls.iter().all(|(op, _)| op != "read"),
+        "executor should only create the consumer, got {calls:?}",
     );
 }

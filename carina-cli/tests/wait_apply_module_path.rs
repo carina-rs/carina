@@ -33,8 +33,8 @@ use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::create_plan;
 use carina_core::executor::{
-    ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult, UnresolvedResource,
-    execute_plan,
+    DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
+    UnresolvedResource, execute_plan,
 };
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
@@ -489,6 +489,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         compositions: &parsed.compositions,
         bindings: ResolvedBindings::default(),
         current_states,
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         // carina#3063 (#3069): the executor re-applies the full

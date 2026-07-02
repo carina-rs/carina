@@ -31,8 +31,11 @@ use std::time::Duration;
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
 use crate::parser::ProviderConfig;
-use crate::provider::{PartialReadDiagnostic, Provider, ProviderNormalizer};
-use crate::resource::{ResolvedResource, Resource, ResourceId, State};
+use crate::provider::{PartialReadDiagnostic, Provider, ProviderError, ProviderNormalizer};
+use crate::resource::{
+    AccessPath, ConcreteValue, DataSource, DeferredValue, InterpolationPart, ResolvedResource,
+    Resource, ResourceId, State, UnknownReason, Value,
+};
 use crate::value::SerializationError;
 use crate::wait::WaitObservation;
 
@@ -54,6 +57,10 @@ pub struct ExecutionInput<'a> {
     pub compositions: &'a [crate::resource::Composition],
     pub bindings: ResolvedBindings,
     pub current_states: HashMap<ResourceId, State>,
+    /// Data-source `Read` effects whose input refs depend on upstream
+    /// apply-time publication, even when the referenced attribute value was
+    /// computable from desired config during refresh.
+    pub deferred_data_source_reads: DeferredDataSourceReads,
     /// The same provider normalizer that ran at plan time
     /// (`PlanPreprocessor`). Apply-time reference re-resolution rebuilds
     /// attributes from the un-normalized source, so the executor must
@@ -79,6 +86,128 @@ pub struct ExecutionInput<'a> {
     pub schemas: &'a crate::schema::SchemaRegistry,
     /// Maximum concurrent provider operations.
     pub parallelism: NonZeroUsize,
+}
+
+/// A data-source input attribute whose unresolved value shapes make the read
+/// apply-time dependent or unsafe to hand to a provider.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnresolvedDataSourceInput {
+    pub attribute: String,
+    pub paths: Vec<AccessPath>,
+    pub bindings: Vec<String>,
+    pub unknowns: Vec<UnknownReason>,
+}
+
+/// Explicit classification for data-source reads that the apply
+/// executor must run at runtime. A read absent from this set is a
+/// pre-apply read: refresh has already populated `current_states`, so
+/// the executor should keep treating its `Effect::Read` as a no-op.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DeferredDataSourceReads {
+    by_id: HashMap<ResourceId, Vec<UnresolvedDataSourceInput>>,
+}
+
+impl DeferredDataSourceReads {
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, id: ResourceId, unresolved: Vec<UnresolvedDataSourceInput>) {
+        self.by_id.insert(id, unresolved);
+    }
+
+    pub fn contains(&self, id: &ResourceId) -> bool {
+        self.by_id.contains_key(id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
+}
+
+fn visit_unknowns(value: &Value, f: &mut impl FnMut(&UnknownReason)) {
+    match value {
+        Value::Deferred(DeferredValue::Unknown(reason)) => f(reason),
+        Value::Concrete(ConcreteValue::List(items)) => {
+            for item in items {
+                visit_unknowns(item, f);
+            }
+        }
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            for item in map.values() {
+                visit_unknowns(item, f);
+            }
+        }
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            for part in parts {
+                if let InterpolationPart::Expr(value) = part {
+                    visit_unknowns(value, f);
+                }
+            }
+        }
+        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            for arg in args {
+                visit_unknowns(arg, f);
+            }
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => visit_unknowns(inner, f),
+        Value::Concrete(_)
+        | Value::Deferred(DeferredValue::ResourceRef { .. })
+        | Value::Deferred(DeferredValue::BindingRef { .. }) => {}
+    }
+}
+
+pub fn unresolved_data_source_inputs(resource: &DataSource) -> Vec<UnresolvedDataSourceInput> {
+    resource
+        .attributes
+        .iter()
+        .filter_map(|(attribute, value)| {
+            let mut paths = Vec::new();
+            let mut bindings = Vec::new();
+            let mut unknowns = Vec::new();
+            value.visit_resource_refs(&mut |path| paths.push(path.clone()));
+            value.visit_binding_refs(&mut |binding| bindings.push(binding.to_string()));
+            visit_unknowns(value, &mut |reason| unknowns.push(reason.clone()));
+            (!paths.is_empty() || !bindings.is_empty() || !unknowns.is_empty()).then(|| {
+                UnresolvedDataSourceInput {
+                    attribute: attribute.clone(),
+                    paths,
+                    bindings,
+                    unknowns,
+                }
+            })
+        })
+        .collect()
+}
+
+fn is_throttling_error(err: &ProviderError) -> bool {
+    let msg = err.to_string();
+    msg.contains("ThrottlingException") || msg.contains("Rate exceeded")
+}
+
+/// Read a data source through the provider with the same throttling retry
+/// policy the CLI refresh path uses.
+pub async fn read_data_source_with_retry(
+    provider: &dyn Provider,
+    resource: &DataSource,
+) -> Result<State, ProviderError> {
+    let max_retries = 3;
+    for attempt in 0..=max_retries {
+        match provider.read_data_source(resource).await {
+            Ok(state) => return Ok(state),
+            Err(e) if attempt < max_retries && is_throttling_error(&e) => {
+                let delay = Duration::from_secs(1 << attempt);
+                eprintln!(
+                    "  Throttled reading {}, retrying in {}s...",
+                    resource.id,
+                    delay.as_secs()
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
 }
 
 /// Result of executing a plan's effects.

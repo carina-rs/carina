@@ -14,14 +14,15 @@ use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::create_plan_with_cascades;
 use carina_core::executor::normalized::apply_desired_normalization;
 use carina_core::executor::{
-    ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult, UnresolvedResource,
+    DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
+    UnresolvedResource, unresolved_data_source_inputs,
 };
 use carina_core::override_aware::OverrideAwareResources;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
 #[cfg(test)]
 use carina_core::resource::ConcreteValue;
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{DataSource, Resource, ResourceId, State, Value};
 use carina_core::value::format_value;
 use carina_state::{BackendLock, LockInfo, StateBackend, StateFile};
 use tokio_util::sync::CancellationToken;
@@ -47,10 +48,10 @@ use crate::cursor::CursorReveal;
 use crate::display::print_plan;
 use crate::error::AppError;
 use crate::wiring::{
-    WiringContext, build_factories_from_providers, create_providers_from_configs,
-    get_provider_with_ctx, read_data_source_with_retry, read_with_retry,
-    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
-    resolve_data_source_refs_for_refresh,
+    DataSourceRefreshResolution, WiringContext, build_factories_from_providers,
+    create_providers_from_configs, get_provider_with_ctx, prepare_data_sources_for_plan,
+    read_data_source_with_retry, read_with_retry, reconcile_anonymous_identifiers_with_ctx,
+    reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
 };
 
 /// Re-export ExecutionResult as the public API for apply results.
@@ -71,6 +72,26 @@ fn split_execution_outcome(outcome: ExecutionOutcome) -> (ExecutionResult, bool)
         ExecutionOutcome::Completed(result) => (result, false),
         ExecutionOutcome::Cancelled(result) => (result, true),
     }
+}
+
+fn deferred_data_source_reads_from_data_sources(
+    data_sources: &[DataSource],
+) -> DeferredDataSourceReads {
+    let mut deferred_data_source_reads = DeferredDataSourceReads::none();
+    for data_source in data_sources {
+        let unresolved = unresolved_data_source_inputs(data_source);
+        if !unresolved.is_empty() {
+            deferred_data_source_reads.insert(data_source.id.clone(), unresolved);
+        }
+    }
+    deferred_data_source_reads
+}
+
+fn can_use_export_only_fast_path(
+    plan: &Plan,
+    deferred_data_source_reads: &DeferredDataSourceReads,
+) -> bool {
+    !plan.has_mutations() && deferred_data_source_reads.is_empty()
 }
 
 fn check_legacy_name_overrides(state_file: &StateFile, accept: bool) -> Result<(), AppError> {
@@ -130,6 +151,7 @@ pub async fn execute_effects(
         current_states,
         unresolved_resources,
         compositions,
+        DeferredDataSourceReads::none(),
         cancel,
         parallelism,
         observer,
@@ -149,6 +171,7 @@ async fn execute_effects_with_observer(
     current_states: &mut HashMap<ResourceId, State>,
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     compositions: &[carina_core::resource::Composition],
+    deferred_data_source_reads: DeferredDataSourceReads,
     cancel: CancellationToken,
     parallelism: NonZeroUsize,
     observer: Box<dyn ExecutionObserver>,
@@ -159,6 +182,7 @@ async fn execute_effects_with_observer(
         compositions,
         bindings: bindings.clone(),
         current_states: std::mem::take(current_states),
+        deferred_data_source_reads,
         normalizer,
         provider_configs,
         factories,
@@ -1061,7 +1085,8 @@ async fn run_apply_locked(
     // managed resources are dependency-sorted; data sources are
     // refreshed in a later phase against the populated `current_states`.
     let mut sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
-    let data_sources: Vec<carina_core::resource::DataSource> = parsed.data_sources.clone();
+    let data_sources: Vec<carina_core::resource::DataSource> =
+        unresolved_parsed.data_sources.clone();
 
     // Build state-file-derived maps up front so anonymous → let-bound
     // rename transfer (#1685) can run between refresh phases 1 and 2.
@@ -1233,7 +1258,7 @@ async fn run_apply_locked(
 
     // Phase 2: resolve data source inputs against the consolidated state
     // and refresh them via `read_data_source` (#1683, #1685).
-    let resolved_data_sources = resolve_data_source_refs_for_refresh(
+    let data_source_refreshes = resolve_data_source_refs_for_refresh(
         &sorted_resources,
         &parsed.compositions,
         &data_sources,
@@ -1242,6 +1267,21 @@ async fn run_apply_locked(
         ctx.schemas(),
         &wait_aliases,
     )?;
+    let mut deferred_data_source_reads = DeferredDataSourceReads::none();
+    let mut resolved_data_sources = Vec::new();
+    for resolution in data_source_refreshes {
+        match resolution {
+            DataSourceRefreshResolution::Resolved(resource) => {
+                resolved_data_sources.push(resource);
+            }
+            DataSourceRefreshResolution::DeferredToApply {
+                resource,
+                unresolved,
+            } => {
+                deferred_data_source_reads.insert(resource.id.clone(), unresolved);
+            }
+        }
+    }
     let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
         stream::iter(resolved_data_sources.iter())
             .map(|resource| {
@@ -1381,21 +1421,21 @@ async fn run_apply_locked(
         },
     )?;
 
-    // Resolve data-source input refs and canonicalize, so each `read`
-    // resource flows into `create_plan` with concrete attribute values
-    // (carina#3181).
-    let mut data_sources_for_plan = data_sources.clone();
-    carina_core::resolver::resolve_data_source_refs(
-        &mut data_sources_for_plan,
+    // Resolve and canonicalize only refresh-time data sources. Deferred
+    // reads keep their original input refs so the plan/executor dependency
+    // graph still contains the upstream create edge.
+    let deferred_data_source_ids: HashSet<ResourceId> = data_sources
+        .iter()
+        .filter(|resource| deferred_data_source_reads.contains(&resource.id))
+        .map(|resource| resource.id.clone())
+        .collect();
+    let data_sources_for_plan = prepare_data_sources_for_plan(
+        &data_sources,
+        &deferred_data_source_ids,
         override_aware_resources.bindings(),
-    )?;
-
-    // Desired resource canonicalization runs inside PlanPreprocessor's
-    // shared desired-side normalization pipeline.
-    carina_core::value::canonicalize_data_sources_with_schemas(
-        &mut data_sources_for_plan,
+        None,
         ctx.schemas(),
-    );
+    )?;
     // Run the normalization pipeline (same as plan path in wiring.rs).
     // `prepare` also canonicalizes the wait `until` predicate enum
     // aliases (carina#3358); the apply path is a separate pipeline that
@@ -1469,7 +1509,7 @@ async fn run_apply_locked(
         )));
     }
 
-    if !plan.has_mutations() {
+    if can_use_export_only_fast_path(&plan, &deferred_data_source_reads) {
         // No mutating effects — the plan only holds `Read` (data-source
         // reads) or `Wait` effects, or is entirely empty. Either way no
         // resource apply pipeline needs to run; route through the
@@ -1624,6 +1664,7 @@ async fn run_apply_locked(
         &mut current_states,
         &unresolved_resources,
         &parsed.compositions,
+        deferred_data_source_reads,
         cancel,
         parallelism,
         observer,
@@ -1957,6 +1998,10 @@ async fn run_apply_from_plan_locked(
 
     let plan = &plan_file.plan;
     let sorted_resources = &plan_file.sorted_resources;
+    let plan_compositions: &[carina_core::resource::Composition] = &plan_file.compositions;
+    let plan_data_sources: &[carina_core::resource::DataSource] = &plan_file.data_sources;
+    let deferred_data_source_reads =
+        deferred_data_source_reads_from_data_sources(plan_data_sources);
 
     // Rebuild planned current_states HashMap from plan file
     let planned_states: HashMap<ResourceId, State> = plan_file
@@ -2011,7 +2056,7 @@ async fn run_apply_from_plan_locked(
         )));
     }
 
-    if !plan.has_mutations() {
+    if can_use_export_only_fast_path(plan, &deferred_data_source_reads) {
         // Saved plans serialize every `Effect::Read` produced by the
         // differ; gating on `is_empty()` would skip this branch for
         // any data-source-bearing config, even when no managed
@@ -2074,8 +2119,6 @@ async fn run_apply_from_plan_locked(
     // to the managed sibling literal (carina#3246), and includes data
     // sources so a managed attribute referencing `<read_binding>.<attr>`
     // resolves through the data source's attribute map.
-    let plan_compositions: &[carina_core::resource::Composition] = &plan_file.compositions;
-    let plan_data_sources: &[carina_core::resource::DataSource] = &plan_file.data_sources;
     let pre_apply_input_states = carina_core::resource::into_plan_input_map(
         current_states.clone(),
         ctx.schemas(),
@@ -2107,7 +2150,6 @@ async fn run_apply_from_plan_locked(
             )
         })
         .collect();
-
     // Same object in both positions: `ProviderRouter` is both the
     // `Provider` and the `ProviderNormalizer`, so apply re-normalizes
     // with the plan-time normalizer (carina#3060).
@@ -2123,6 +2165,7 @@ async fn run_apply_from_plan_locked(
         &mut current_states,
         &unresolved_resources,
         plan_compositions,
+        deferred_data_source_reads,
         cancel,
         parallelism,
         observer,

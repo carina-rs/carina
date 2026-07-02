@@ -1,12 +1,13 @@
 //! Shared replacement/update patch helpers.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::differ::{
     AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
 };
 use crate::provider::{PatchOp, PatchOpKind, UpdatePatch, build_update_patch};
-use crate::resource::{ResolvedResource, Resource, ResourceId, State, Value};
+use crate::resource::{DataSource, ResolvedResource, Resource, ResourceId, State, Value};
 use crate::schema::SchemaRegistry;
 use crate::value::SecretHashContext;
 
@@ -88,6 +89,16 @@ pub(super) enum SingleEffectResult {
     /// Create/Update/Delete completed (wraps BasicEffectResult)
     Basic(BasicEffectResult),
     ReadNoOp,
+    /// Apply-time data-source read outcome. Successful reads publish
+    /// their returned state under the data-source binding before
+    /// downstream effects are scheduled.
+    Read {
+        resource: Box<DataSource>,
+        resolved_attrs: HashMap<String, Value>,
+        outcome: Result<State, String>,
+        duration: Duration,
+        progress: ProgressInfo,
+    },
     /// `Effect::Wait` execution outcome. On success carries the
     /// captured target state so the parallel scheduler can register it
     /// under the wait binding for downstream resolution. On failure

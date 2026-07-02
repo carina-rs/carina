@@ -28,7 +28,10 @@ use super::wait::{
     count_effectively_undispatched, resolve_wait_identifier, unsatisfiable_reason_message,
     wait_failure_message,
 };
-use super::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo};
+use super::{
+    DeferredDataSourceReads, ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult,
+    ProgressInfo, unresolved_data_source_inputs,
+};
 
 pub(super) struct ExpandedEffects {
     pub(super) effects: Vec<Effect>,
@@ -96,14 +99,55 @@ pub(super) fn apply_deferred_replace_delete_deps(
     }
 }
 
-pub(super) fn is_runtime_dispatchable(effect: &Effect) -> bool {
-    !matches!(effect, Effect::Read { .. })
-        && (!effect.is_state_operation() || effect.is_scheduler_meta())
+pub(super) fn is_runtime_dispatchable(
+    effect: &Effect,
+    deferred_reads: &DeferredDataSourceReads,
+) -> bool {
+    is_deferred_read(effect, deferred_reads)
+        || (!matches!(effect, Effect::Read { .. })
+            && (!effect.is_state_operation() || effect.is_scheduler_meta()))
 }
 
-pub(super) fn is_runtime_noop(effect: &Effect) -> bool {
-    matches!(effect, Effect::Read { .. })
-        || (effect.is_state_operation() && !effect.is_scheduler_meta())
+pub(super) fn is_runtime_noop(effect: &Effect, deferred_reads: &DeferredDataSourceReads) -> bool {
+    match effect {
+        Effect::Read { .. } => !is_deferred_read(effect, deferred_reads),
+        _ => effect.is_state_operation() && !effect.is_scheduler_meta(),
+    }
+}
+
+fn count_runtime_effects(effects: &[Effect], deferred_reads: &DeferredDataSourceReads) -> usize {
+    count_actionable_effects(effects)
+        + effects
+            .iter()
+            .filter(|effect| is_deferred_read(effect, deferred_reads))
+            .count()
+}
+
+fn is_deferred_read(effect: &Effect, deferred_reads: &DeferredDataSourceReads) -> bool {
+    matches!(effect, Effect::Read { resource } if deferred_reads.contains(&resource.id))
+}
+
+fn format_unresolved_read_inputs(unresolved: &[super::UnresolvedDataSourceInput]) -> String {
+    unresolved
+        .iter()
+        .map(|input| {
+            let mut refs = input
+                .paths
+                .iter()
+                .map(|path| path.to_dot_string())
+                .collect::<Vec<_>>();
+            refs.extend(input.bindings.iter().cloned());
+            refs.extend(
+                input
+                    .unknowns
+                    .iter()
+                    .map(|reason| format!("unknown({reason})")),
+            );
+            let refs = refs.join(", ");
+            format!("{} -> {}", input.attribute, refs)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[cfg(test)]
@@ -191,7 +235,7 @@ pub(super) async fn execute_effects_sequential(
         deferred_replace_delete_deps,
     } = expand_deferred_replace_effects(input.plan.effects());
     let mut effects = expanded_effects;
-    let mut total = count_actionable_effects(&effects);
+    let mut total = count_runtime_effects(&effects, &input.deferred_data_source_reads);
     let completed = AtomicUsize::new(0);
 
     let mut deps_of = build_scheduler_deps(
@@ -216,14 +260,15 @@ pub(super) async fn execute_effects_sequential(
     let mut dispatched: HashSet<usize> = HashSet::new();
     // All actionable effect indices (excluding Read and state operations)
     let mut actionable_indices: Vec<usize> = (0..effects.len())
-        .filter(|&idx| is_runtime_dispatchable(&effects[idx]))
+        .filter(|&idx| is_runtime_dispatchable(&effects[idx], &input.deferred_data_source_reads))
         .collect();
 
-    // Mark Read and plain state operation effects as completed (they are no-ops in the executor).
+    // Mark pre-apply Read and plain state operation effects as completed
+    // (they are no-ops in the executor).
     // DeferredCreate is state-only for progress/provider purposes, but it is a scheduler
     // dispatch point that materializes dynamic Create effects.
     for (idx, effect) in effects.iter().enumerate() {
-        if is_runtime_noop(effect) {
+        if is_runtime_noop(effect, &input.deferred_data_source_reads) {
             completed_indices.insert(idx);
             dispatched.insert(idx);
         }
@@ -404,7 +449,64 @@ pub(super) async fn execute_effects_sequential(
                             // arm above.
                             unreachable!("Create/Update/Delete are narrowed by as_basic()")
                         }
-                        Effect::Read { .. } => SingleEffectResult::ReadNoOp,
+                        Effect::Read { resource } => {
+                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                            let started = Instant::now();
+                            observer.on_event(&ExecutionEvent::EffectStarted {
+                                effect: &effect_for_future,
+                            });
+                            let progress = ProgressInfo {
+                                completed: c,
+                                total,
+                            };
+                            let mut resolved = resource.as_inner().clone();
+                            let outcome = {
+                                let resolved_slice = std::slice::from_mut(&mut resolved);
+                                match crate::resolver::resolve_data_source_refs(
+                                    resolved_slice,
+                                    &binding_snapshot,
+                                ) {
+                                    Ok(()) => {
+                                        crate::value::canonicalize_data_sources_with_schemas(
+                                            resolved_slice,
+                                            pipeline.schemas,
+                                        );
+                                        let unresolved = unresolved_data_source_inputs(&resolved);
+                                        if unresolved.is_empty() {
+                                            super::read_data_source_with_retry(provider, &resolved)
+                                                .await
+                                                .map_err(|err| {
+                                                    format!(
+                                                        "data source read failed for {}: {err}",
+                                                        resolved.id
+                                                    )
+                                                })
+                                        } else {
+                                            Err(format!(
+                                                "data source inputs for {} still contain \
+                                                 unresolved references after dependencies \
+                                                 completed: {}",
+                                                resolved.id,
+                                                format_unresolved_read_inputs(&unresolved)
+                                            ))
+                                        }
+                                    }
+                                    Err(error) => Err(format!(
+                                        "failed to resolve data source inputs for {}: {error}",
+                                        resolved.id
+                                    )),
+                                }
+                            };
+                            let resolved_attrs =
+                                crate::resource::attrs_to_hashmap(&resolved.attributes);
+                            SingleEffectResult::Read {
+                                resource: Box::new(resolved),
+                                resolved_attrs,
+                                outcome,
+                                duration: started.elapsed(),
+                                progress,
+                            }
+                        }
                         // State operations are handled separately during apply
                         Effect::Import { .. } | Effect::Remove { .. } | Effect::Move { .. } => {
                             SingleEffectResult::ReadNoOp
@@ -564,6 +666,42 @@ pub(super) async fn execute_effects_sequential(
                 );
             }
             SingleEffectResult::ReadNoOp => {}
+            SingleEffectResult::Read {
+                resource,
+                resolved_attrs,
+                outcome,
+                duration,
+                progress,
+            } => match outcome {
+                Ok(state) => {
+                    observer.on_event(&ExecutionEvent::EffectSucceeded {
+                        effect: &effects[finished_idx],
+                        state: Some(&state),
+                        duration,
+                        progress,
+                    });
+                    success_count += 1;
+                    input.bindings.record_applied(
+                        resource.binding.as_deref(),
+                        &resolved_attrs,
+                        &state,
+                    );
+                    input
+                        .current_states
+                        .insert(resource.id.clone(), state.clone());
+                    applied_states.insert(resource.id.clone(), state);
+                }
+                Err(error) => {
+                    observer.on_event(&ExecutionEvent::EffectFailed {
+                        effect: &effects[finished_idx],
+                        error: &error,
+                        duration,
+                        progress,
+                    });
+                    failure_count += 1;
+                    failed_indices.insert(finished_idx);
+                }
+            },
             SingleEffectResult::Wait {
                 binding,
                 outcome,
@@ -912,6 +1050,7 @@ mod tests {
             compositions: &[],
             bindings: Default::default(),
             current_states: HashMap::new(),
+            deferred_data_source_reads: DeferredDataSourceReads::none(),
             normalizer: &NoopNormalizer,
             provider_configs: &[],
             factories: &[],
@@ -1021,6 +1160,7 @@ mod tests {
             compositions: &[],
             bindings: Default::default(),
             current_states: HashMap::new(),
+            deferred_data_source_reads: DeferredDataSourceReads::none(),
             normalizer: &NoopNormalizer,
             provider_configs: &[],
             factories: &[],
