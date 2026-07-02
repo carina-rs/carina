@@ -414,7 +414,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &parsed.state_blocks,
         &state_file,
         &moved_pairs,
-        wiring.schemas(),
+        override_aware_resources.resources(),
         override_aware_resources.bindings(),
         &upstream_binding_names,
     );

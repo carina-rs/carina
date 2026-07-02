@@ -11,7 +11,7 @@ use carina_core::resource::{
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use carina_state::{NameOverride, ResourceState};
 use indexmap::IndexMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -222,13 +222,27 @@ struct ApplyTimeReadProvider {
 #[derive(Clone, Default)]
 struct ApplyCascadeShared {
     creates: Arc<Mutex<ApplyCascadeCreateCalls>>,
+    deletes: Arc<Mutex<ApplyCascadeDeleteCalls>>,
+    fail_delete_identifiers: Arc<Mutex<HashSet<String>>>,
 }
 
 type ApplyCascadeCreateCalls = Vec<(String, HashMap<String, Value>)>;
+type ApplyCascadeDeleteCalls = Vec<(String, String)>;
 
 impl ApplyCascadeShared {
     fn create_calls(&self) -> ApplyCascadeCreateCalls {
         self.creates.lock().unwrap().clone()
+    }
+
+    fn delete_calls(&self) -> ApplyCascadeDeleteCalls {
+        self.deletes.lock().unwrap().clone()
+    }
+
+    fn fail_delete_identifier(&self, identifier: &str) {
+        self.fail_delete_identifiers
+            .lock()
+            .unwrap()
+            .insert(identifier.to_string());
     }
 }
 
@@ -392,11 +406,33 @@ impl Provider for ApplyCascadeProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &str,
+        id: &ResourceId,
+        identifier: &str,
         _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
-        Box::pin(async { Ok(()) })
+        let id = id.clone();
+        let identifier = identifier.to_string();
+        let shared = self.shared.clone();
+        Box::pin(async move {
+            shared
+                .deletes
+                .lock()
+                .unwrap()
+                .push((id.to_string(), identifier.clone()));
+            if shared
+                .fail_delete_identifiers
+                .lock()
+                .unwrap()
+                .contains(&identifier)
+            {
+                Err(
+                    ProviderError::api_error(format!("delete failed for {identifier}"))
+                        .for_resource(id),
+                )
+            } else {
+                Ok(())
+            }
+        })
     }
 
     fn required_permissions(
@@ -410,6 +446,114 @@ impl Provider for ApplyCascadeProvider {
 
 fn string_value(value: &str) -> Value {
     Value::Concrete(ConcreteValue::String(value.to_string()))
+}
+
+fn apply_cascade_crn(state_path: &std::path::Path, include_subnet: bool) -> String {
+    let subnet = if include_subnet {
+        r#"
+awscc.ec2.Subnet {
+  vpc_id = vpc.vpc_id
+  cidr_block = "10.221.1.0/24"
+  availability_zone = "ap-northeast-1c"
+  directives {
+    create_before_destroy = true
+  }
+}
+"#
+    } else {
+        ""
+    };
+    format!(
+        r#"backend local {{ path = "{}" }}
+provider awscc {{}}
+
+let vpc = awscc.ec2.Vpc {{
+  cidr_block = "10.221.0.0/16"
+  directives {{
+    create_before_destroy = true
+  }}
+}}
+{subnet}"#,
+        state_path.display()
+    )
+}
+
+fn concrete_subnet_identity(ctx: &WiringContext, providers: &[ProviderConfig]) -> String {
+    let mut resources = vec![
+        Resource::with_provider("awscc", "ec2.Subnet", "", None)
+            .with_attribute("vpc_id", string_value("vpc-old"))
+            .with_attribute("cidr_block", string_value("10.220.1.0/24"))
+            .with_attribute("availability_zone", string_value("ap-northeast-1c")),
+    ];
+    let canonical =
+        carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
+    let errors = crate::wiring::compute_anonymous_identifiers_with_ctx(ctx, canonical, providers);
+    assert!(errors.is_empty(), "state id setup failed: {errors:?}");
+    resources[0].id.identity_or_empty().to_string()
+}
+
+fn seed_apply_cascade_state(
+    fixture: &ApplyCancellationFixture,
+    ctx: &WiringContext,
+    providers: &[ProviderConfig],
+    include_subnet: bool,
+) {
+    let mut vpc_state = ResourceState::new("ec2.Vpc", "vpc", "awscc")
+        .with_identifier("vpc-old")
+        .with_attribute("cidr_block", serde_json::json!("10.220.0.0/16"))
+        .with_attribute("vpc_id", serde_json::json!("vpc-old"));
+    vpc_state.binding = Some("vpc".to_string());
+
+    let mut state_file = carina_state::StateFile::new();
+    state_file.resources.push(vpc_state);
+
+    if include_subnet {
+        let mut subnet_state = ResourceState::new(
+            "ec2.Subnet",
+            concrete_subnet_identity(ctx, providers),
+            "awscc",
+        )
+        .with_identifier("subnet-old")
+        .with_attribute("vpc_id", serde_json::json!("vpc-old"))
+        .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
+        .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
+        subnet_state.dependency_bindings.insert("vpc".to_string());
+        state_file.resources.push(subnet_state);
+    }
+
+    fixture.write_state(&state_file);
+}
+
+fn state_json_resource<'a>(
+    state: &'a serde_json::Value,
+    provider: &str,
+    resource_type: &str,
+    identity: &str,
+) -> &'a serde_json::Value {
+    state["resources"]
+        .as_array()
+        .expect("state resources must be an array")
+        .iter()
+        .find(|row| {
+            row["provider"] == provider
+                && row["resource_type"] == resource_type
+                && row["identity"] == identity
+        })
+        .unwrap_or_else(|| panic!("missing state row {provider}.{resource_type}.{identity}"))
+}
+
+fn assert_vpc_new_current_and_old_deposed(state_path: &std::path::Path) {
+    let raw = std::fs::read_to_string(state_path).expect("state file must be written");
+    let state: serde_json::Value = serde_json::from_str(&raw).expect("state must be valid JSON");
+    let vpc = state_json_resource(&state, "awscc", "ec2.Vpc", "vpc");
+    assert_eq!(vpc["identifier"], serde_json::json!("vpc-new"));
+
+    let deposed = vpc
+        .get("deposed")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("expected vpc-old to be recorded as deposed; row: {vpc:#?}"));
+    assert_eq!(deposed.len(), 1, "expected exactly one deposed VPC");
+    assert_eq!(deposed[0]["identifier"], serde_json::json!("vpc-old"));
 }
 
 impl Provider for ApplyTimeReadProvider {
@@ -1141,22 +1285,160 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
 }
 
 #[tokio::test]
-async fn run_apply_locked_rekeys_anonymous_child_unresolved_source_by_effect_id() {
-    fn concrete_subnet_identity(ctx: &WiringContext, providers: &[ProviderConfig]) -> String {
-        let mut resources = vec![
-            Resource::with_provider("awscc", "ec2.Subnet", "", None)
-                .with_attribute("vpc_id", string_value("vpc-old"))
-                .with_attribute("cidr_block", string_value("10.220.1.0/24"))
-                .with_attribute("availability_zone", string_value("ap-northeast-1c")),
-        ];
-        let canonical =
-            carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
-        let errors =
-            crate::wiring::compute_anonymous_identifiers_with_ctx(ctx, canonical, providers);
-        assert!(errors.is_empty(), "state id setup failed: {errors:?}");
-        resources[0].id.identity_or_empty().to_string()
-    }
+async fn run_apply_locked_deposes_old_cbd_instance_when_delete_fails() {
+    let fixture = ApplyCancellationFixture::new();
+    let crn = apply_cascade_crn(fixture.state_path(), false);
+    let fixture = fixture.with_raw_config(crn);
+    let shared = ApplyCascadeShared::default();
+    shared.fail_delete_identifier("vpc-old");
+    let ctx = WiringContext::new(vec![Box::new(ApplyCascadeAwsccFactory {
+        shared: shared.clone(),
+    })]);
 
+    let loaded = load_configuration_with_config(
+        fixture.config_path(),
+        fixture.provider_context(),
+        &SchemaRegistry::new(),
+    )
+    .expect("fixture must load");
+    let mut parsed = loaded.parsed;
+    let unresolved_parsed = loaded.unresolved_parsed;
+    let base_dir = get_base_dir(fixture.config_path());
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+        &mut parsed,
+        base_dir,
+        false,
+        vec![Box::new(ApplyCascadeAwsccFactory {
+            shared: shared.clone(),
+        })],
+        HashMap::new(),
+    );
+    assert!(
+        validation_errors.is_empty(),
+        "fixture must validate, got: {validation_errors:?}"
+    );
+    seed_apply_cascade_state(&fixture, &ctx, &parsed.providers, false);
+
+    let observer_factory = fixture.observer_factory();
+    let err = run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &unresolved_parsed,
+        true,
+        fixture.backend(),
+        None,
+        base_dir,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect_err("old VPC delete should fail after replacement create succeeds");
+
+    assert!(
+        err.to_string()
+            .contains("Apply failed. 1 succeeded, 1 failed."),
+        "partial apply must surface the delete failure, got {err:?}"
+    );
+    assert_eq!(
+        shared.delete_calls(),
+        vec![("awscc.ec2.Vpc.vpc".to_string(), "vpc-old".to_string())]
+    );
+    assert_vpc_new_current_and_old_deposed(fixture.state_path());
+}
+
+#[tokio::test]
+async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dependency_failure() {
+    let fixture = ApplyCancellationFixture::new();
+    let crn = apply_cascade_crn(fixture.state_path(), true);
+    let fixture = fixture.with_raw_config(crn);
+    let shared = ApplyCascadeShared::default();
+    shared.fail_delete_identifier("subnet-old");
+    let ctx = WiringContext::new(vec![Box::new(ApplyCascadeAwsccFactory {
+        shared: shared.clone(),
+    })]);
+
+    let loaded = load_configuration_with_config(
+        fixture.config_path(),
+        fixture.provider_context(),
+        &SchemaRegistry::new(),
+    )
+    .expect("fixture must load");
+    let mut parsed = loaded.parsed;
+    let unresolved_parsed = loaded.unresolved_parsed;
+    let base_dir = get_base_dir(fixture.config_path());
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+        &mut parsed,
+        base_dir,
+        false,
+        vec![Box::new(ApplyCascadeAwsccFactory {
+            shared: shared.clone(),
+        })],
+        HashMap::new(),
+    );
+    assert!(
+        validation_errors.is_empty(),
+        "fixture must validate, got: {validation_errors:?}"
+    );
+    seed_apply_cascade_state(&fixture, &ctx, &parsed.providers, true);
+
+    let observer_factory = fixture.observer_factory();
+    let err = run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &unresolved_parsed,
+        true,
+        fixture.backend(),
+        None,
+        base_dir,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect_err("old subnet delete failure should skip old VPC delete");
+
+    assert!(
+        err.to_string().contains("1 skipped"),
+        "partial apply must include a dependency-failure skip, got {err:?}"
+    );
+    let delete_calls = shared.delete_calls();
+    assert_eq!(
+        delete_calls.len(),
+        1,
+        "old VPC delete should be skipped after old subnet delete fails; calls: {delete_calls:?}"
+    );
+    assert_eq!(delete_calls[0].1, "subnet-old");
+    assert_vpc_new_current_and_old_deposed(fixture.state_path());
+
+    let raw = std::fs::read_to_string(fixture.state_path()).expect("state file must be written");
+    let state: serde_json::Value = serde_json::from_str(&raw).expect("state must be valid JSON");
+    let subnet_identity = concrete_subnet_identity(&ctx, &parsed.providers);
+    let subnet = state_json_resource(&state, "awscc", "ec2.Subnet", &subnet_identity);
+    assert_eq!(subnet["identifier"], serde_json::json!("subnet-new"));
+    let subnet_deposed = subnet
+        .get("deposed")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| {
+            panic!("expected subnet-old to be recorded as deposed; row: {subnet:#?}")
+        });
+    assert_eq!(
+        subnet_deposed.len(),
+        1,
+        "expected exactly one deposed subnet"
+    );
+    assert_eq!(
+        subnet_deposed[0]["identifier"],
+        serde_json::json!("subnet-old")
+    );
+}
+
+#[tokio::test]
+async fn run_apply_locked_rekeys_anonymous_child_unresolved_source_by_effect_id() {
     let fixture = ApplyCancellationFixture::new();
     let crn = format!(
         r#"backend local {{ path = "{}" }}
@@ -3405,6 +3687,258 @@ mod saved_plan_version_tests {
         assert!(
             msg.contains("Re-run 'carina plan'"),
             "error must point the user at the supported migration path, got: {msg}",
+        );
+    }
+
+    fn replacement_plan_json() -> (TempDir, std::path::PathBuf, serde_json::Value) {
+        use carina_core::provider::ProviderRouter;
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("plan.json");
+        let resource = carina_core::resource::Resource::new("ec2.Vpc", "main").with_attribute(
+            "cidr_block",
+            carina_core::resource::Value::Concrete(carina_core::resource::ConcreteValue::String(
+                "10.1.0.0/16".to_string(),
+            )),
+        );
+        let id = resource.id.clone();
+        let current_state = carina_core::resource::State::existing(
+            id.clone(),
+            std::collections::HashMap::from([(
+                "cidr_block".to_string(),
+                carina_core::resource::Value::Concrete(
+                    carina_core::resource::ConcreteValue::String("10.0.0.0/16".to_string()),
+                ),
+            )]),
+        )
+        .with_identifier("vpc-old");
+        let current_states = std::collections::HashMap::from([(id.clone(), current_state.clone())]);
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "",
+            ResourceSchema::new("ec2.Vpc").attribute(
+                AttributeSchema::new("cidr_block", AttributeType::string()).create_only(),
+            ),
+        );
+        let plan_input_states = carina_core::resource::into_plan_input_map(
+            current_states.clone(),
+            &SchemaRegistry::new(),
+            &[],
+        );
+        let plan = carina_core::differ::create_plan(
+            std::slice::from_ref(&resource),
+            &[],
+            &ProviderRouter::new(),
+            &plan_input_states,
+            &std::collections::HashMap::new(),
+            &schemas,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &[],
+        );
+        assert_eq!(plan.replace_display_info().count(), 1);
+        let plan_file = crate::commands::plan::PlanFile {
+            version: crate::commands::plan::PlanFile::CURRENT_VERSION,
+            carina_version: "test".to_string(),
+            timestamp: "2026-07-02T00:00:00Z".to_string(),
+            source_path: "missing.crn".to_string(),
+            state_lineage: None,
+            state_serial: None,
+            provider_configs: Vec::new(),
+            backend_config: None,
+            plan,
+            sorted_resources: vec![resource.clone()],
+            unresolved_resources: vec![resource],
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            current_states: vec![crate::commands::plan::CurrentStateEntry {
+                id,
+                state: current_state,
+            }],
+            upstream_snapshot: std::collections::HashMap::new(),
+            upstream_sources: Vec::new(),
+            wait_bindings: Vec::new(),
+        };
+        let json = serde_json::to_value(&plan_file).expect("plan file should serialize");
+        (dir, plan_path, json)
+    }
+
+    async fn rejected_saved_plan_message(
+        plan_path: &std::path::PathBuf,
+        json: &serde_json::Value,
+        expectation: &str,
+    ) -> String {
+        std::fs::write(plan_path, serde_json::to_string(json).unwrap()).expect("write plan");
+
+        let result = crate::commands::apply::run_apply_from_plan(
+            plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        result.expect_err(expectation).to_string()
+    }
+
+    fn replace_first_resource_identity(value: &mut serde_json::Value, identity: &str) -> bool {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.contains_key("resource_type") && map.contains_key("identity") {
+                    map.insert(
+                        "identity".to_string(),
+                        serde_json::Value::String(identity.to_string()),
+                    );
+                    return true;
+                }
+                map.values_mut()
+                    .any(|child| replace_first_resource_identity(child, identity))
+            }
+            serde_json::Value::Array(items) => items
+                .iter_mut()
+                .any(|child| replace_first_resource_identity(child, identity)),
+            _ => false,
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_plan_with_out_of_range_replace_display_create_idx_is_rejected() {
+        let (_dir, plan_path, mut json) = replacement_plan_json();
+        json["plan"]["replace_display"][0]["create_idx"] = serde_json::json!(999);
+        let msg = rejected_saved_plan_message(
+            &plan_path,
+            &json,
+            "corrupt replace_display metadata must be rejected",
+        )
+        .await;
+        assert!(
+            msg.contains("Invalid saved plan replacement metadata"),
+            "error must name replacement metadata, got: {msg}",
+        );
+        assert!(
+            msg.contains("create_idx 999 is out of bounds"),
+            "error must name the bad create_idx, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_plan_with_out_of_range_replace_display_delete_idx_is_rejected() {
+        let (_dir, plan_path, mut json) = replacement_plan_json();
+        json["plan"]["replace_display"][0]["delete_idx"] = serde_json::json!(999);
+        let msg = rejected_saved_plan_message(
+            &plan_path,
+            &json,
+            "corrupt replace_display metadata must be rejected",
+        )
+        .await;
+        assert!(
+            msg.contains("Invalid saved plan replacement metadata"),
+            "error must name replacement metadata, got: {msg}",
+        );
+        assert!(
+            msg.contains("delete_idx 999 is out of bounds"),
+            "error must name the bad delete_idx, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_plan_with_replace_display_create_idx_kind_mismatch_is_rejected() {
+        let (_dir, plan_path, mut json) = replacement_plan_json();
+        let delete_idx = json["plan"]["replace_display"][0]["delete_idx"]
+            .as_u64()
+            .expect("delete_idx should be numeric");
+        json["plan"]["replace_display"][0]["create_idx"] = serde_json::json!(delete_idx);
+        let msg = rejected_saved_plan_message(
+            &plan_path,
+            &json,
+            "create_idx kind mismatch must be rejected",
+        )
+        .await;
+        assert!(
+            msg.contains("expected Create"),
+            "error must name the create_idx kind mismatch, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_plan_with_replace_display_delete_idx_kind_mismatch_is_rejected() {
+        let (_dir, plan_path, mut json) = replacement_plan_json();
+        let create_idx = json["plan"]["replace_display"][0]["create_idx"]
+            .as_u64()
+            .expect("create_idx should be numeric");
+        json["plan"]["replace_display"][0]["delete_idx"] = serde_json::json!(create_idx);
+        let msg = rejected_saved_plan_message(
+            &plan_path,
+            &json,
+            "delete_idx kind mismatch must be rejected",
+        )
+        .await;
+        assert!(
+            msg.contains("expected Delete"),
+            "error must name the delete_idx kind mismatch, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_plan_with_cross_wired_replace_display_indices_is_rejected() {
+        let (_dir, plan_path, mut json) = replacement_plan_json();
+        let create_idx = json["plan"]["replace_display"][0]["create_idx"]
+            .as_u64()
+            .expect("create_idx should be numeric") as usize;
+        let effects = json["plan"]["effects"]
+            .as_array_mut()
+            .expect("effects should be an array");
+        let mut other_create = effects[create_idx].clone();
+        assert!(
+            replace_first_resource_identity(&mut other_create, "other"),
+            "fixture create effect should contain a resource identity"
+        );
+        effects.push(other_create);
+        let other_create_idx = effects.len() - 1;
+        json["plan"]["replace_display"][0]["create_idx"] = serde_json::json!(other_create_idx);
+
+        let msg = rejected_saved_plan_message(
+            &plan_path,
+            &json,
+            "cross-wired replacement metadata must be rejected",
+        )
+        .await;
+        assert!(
+            msg.contains("cross-wires"),
+            "error must name cross-wired replacement metadata, got: {msg}",
+        );
+        assert!(
+            msg.contains("expected both halves to address the same resource"),
+            "error must describe same-resource invariant, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_plan_with_duplicate_replace_display_index_is_rejected() {
+        let (_dir, plan_path, mut json) = replacement_plan_json();
+        let first = json["plan"]["replace_display"][0].clone();
+        json["plan"]["replace_display"]
+            .as_array_mut()
+            .expect("replace_display should be an array")
+            .push(first);
+        let msg = rejected_saved_plan_message(
+            &plan_path,
+            &json,
+            "duplicate replace_display metadata must be rejected",
+        )
+        .await;
+        assert!(
+            msg.contains("Invalid saved plan replacement metadata"),
+            "error must name replacement metadata, got: {msg}",
+        );
+        assert!(
+            msg.contains("duplicates or overlaps"),
+            "error must name duplicate replacement metadata, got: {msg}",
         );
     }
 }

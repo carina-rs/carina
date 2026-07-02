@@ -353,12 +353,6 @@ impl Plan {
         overrides
     }
 
-    pub fn is_replacement_delete_index(&self, idx: usize) -> bool {
-        self.replace_display
-            .iter()
-            .any(|metadata| metadata.delete_idx == idx)
-    }
-
     pub(crate) fn effects_mut(&mut self) -> &mut Vec<Effect> {
         &mut self.effects
     }
@@ -392,7 +386,29 @@ impl Plan {
     where
         F: FnMut(&Effect) -> bool,
     {
-        self.effects.retain(f);
+        let mut keep = f;
+        let mut old_to_new = vec![None; self.effects.len()];
+        let mut retained = Vec::with_capacity(self.effects.len());
+
+        for (old_idx, effect) in self.effects.drain(..).enumerate() {
+            if keep(&effect) {
+                old_to_new[old_idx] = Some(retained.len());
+                retained.push(effect);
+            }
+        }
+
+        self.effects = retained;
+        self.replace_display = self
+            .replace_display
+            .drain(..)
+            .filter_map(|mut metadata| {
+                let create_idx = old_to_new.get(metadata.create_idx).copied().flatten()?;
+                let delete_idx = old_to_new.get(metadata.delete_idx).copied().flatten()?;
+                metadata.create_idx = create_idx;
+                metadata.delete_idx = delete_idx;
+                Some(metadata)
+            })
+            .collect();
     }
 
     /// Number of mutating Effects
@@ -1218,6 +1234,42 @@ mod tests {
         assert_eq!(plan.replace_display.len(), 1);
         assert_eq!(plan.replace_display[0].create_idx, 2);
         assert_eq!(plan.replace_display[0].delete_idx, 3);
+    }
+
+    #[test]
+    fn plan_retain_remaps_replace_display_after_preceding_effect_removed() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resolved(Resource::new(
+            "ec2.Subnet",
+            "subnet-a",
+        ))));
+        plan.add_replacement(replacement_group(HashSet::new()));
+
+        plan.retain(|effect| {
+            !matches!(
+                effect,
+                Effect::Create(resource) if resource.id.resource_type == "ec2.Subnet"
+            )
+        });
+
+        assert_eq!(plan.effects().len(), 2);
+        assert_eq!(plan.replace_display.len(), 1);
+        assert_eq!(plan.replace_display[0].create_idx, 0);
+        assert_eq!(plan.replace_display[0].delete_idx, 1);
+        assert!(matches!(plan.effects()[0], Effect::Create(_)));
+        assert!(matches!(plan.effects()[1], Effect::Delete { .. }));
+    }
+
+    #[test]
+    fn plan_retain_drops_replace_display_when_one_half_removed() {
+        let mut plan = Plan::new();
+        plan.add_replacement(replacement_group(HashSet::new()));
+
+        plan.retain(|effect| !matches!(effect, Effect::Delete { .. }));
+
+        assert_eq!(plan.effects().len(), 1);
+        assert!(matches!(plan.effects()[0], Effect::Create(_)));
+        assert!(plan.replace_display.is_empty());
     }
 
     #[test]

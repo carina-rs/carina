@@ -7,9 +7,10 @@ use carina_core::override_aware::NameOverrideSource;
 use carina_core::resource::{
     ConcreteValue, Directives, PartialReadMarker, Resource, ResourceId, State, Value,
 };
+use carina_core::schema::ResourceSchema;
 use carina_core::value::{
     SecretHashContext, contains_secret, json_to_dsl_value, merge_secrets_into_provider_json,
-    value_to_json,
+    value_to_json, value_to_json_with_context,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -48,7 +49,11 @@ impl StateFile {
     /// v7: Replaced top-level empty `ExplicitFields::Struct` with
     ///     `ExplicitFields::Unrecorded`.
     /// v8: Renamed `ResourceState.name` to `ResourceState.identity`.
-    pub const CURRENT_VERSION: u32 = 8;
+    /// v9: Added `ResourceState.deposed` (pre-replacement instances
+    ///     pending delete, including provider-instance routing); rows
+    ///     with `identifier: None` are retained while `deposed` is
+    ///     non-empty.
+    pub const CURRENT_VERSION: u32 = 9;
 
     /// Create a new empty state file
     pub fn new() -> Self {
@@ -155,15 +160,25 @@ impl StateFile {
         })
     }
 
-    /// Add or update a resource in the state
-    pub fn upsert_resource(&mut self, resource: ResourceState) {
-        if let Some(existing) = self.find_resource_mut(
-            &resource.provider,
-            &resource.resource_type,
-            &resource.identity,
-        ) {
-            *existing = resource;
+    /// Add or update a resource in the state.
+    ///
+    /// Existing deposed generations are carried through this single row-write
+    /// seam so callers cannot accidentally drop still-live old instances.
+    /// Incoming deposed entries win on `(identifier, provider_instance)`, and
+    /// any entry matching the current identifier is removed so the live current
+    /// instance cannot also be scheduled as deposed.
+    pub fn upsert_resource(&mut self, mut resource: ResourceState) {
+        if let Some(pos) = self.resources.iter().position(|existing| {
+            existing.provider == resource.provider
+                && existing.resource_type == resource.resource_type
+                && existing.identity == resource.identity
+        }) {
+            let existing_deposed = self.resources[pos].deposed.clone();
+            merge_deposed_generations(&mut resource, existing_deposed);
+            remove_current_identifier_from_deposed(&mut resource);
+            self.resources[pos] = resource;
         } else {
+            remove_current_identifier_from_deposed(&mut resource);
             self.resources.push(resource);
         }
     }
@@ -403,7 +418,10 @@ impl StateFile {
         }
     }
 
-    /// Remove a resource from the state
+    /// Remove a resource's current instance from the state.
+    ///
+    /// Rows with deposed generations are retained so those still-live
+    /// instances remain recorded until their own Deletes succeed.
     pub fn remove_resource(
         &mut self,
         provider: &str,
@@ -413,7 +431,21 @@ impl StateFile {
         if let Some(pos) = self.resources.iter().position(|r| {
             r.provider == provider && r.resource_type == resource_type && r.identity == identity
         }) {
-            Some(self.resources.remove(pos))
+            if self.resources[pos].deposed.is_empty() {
+                Some(self.resources.remove(pos))
+            } else {
+                let removed = self.resources[pos].clone();
+                let deposed = std::mem::take(&mut self.resources[pos].deposed);
+                self.resources[pos] = ResourceState::new(
+                    removed.resource_type.clone(),
+                    removed.identity.clone(),
+                    removed.provider.clone(),
+                );
+                self.resources[pos].directives.provider_instance =
+                    removed.directives.provider_instance.clone();
+                self.resources[pos].deposed = deposed;
+                Some(removed)
+            }
         } else {
             None
         }
@@ -423,6 +455,26 @@ impl StateFile {
 impl Default for StateFile {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn merge_deposed_generations(resource: &mut ResourceState, existing_deposed: Vec<DeposedInstance>) {
+    for existing in existing_deposed {
+        let exists_in_incoming = resource.deposed.iter().any(|incoming| {
+            incoming.identifier == existing.identifier
+                && incoming.provider_instance == existing.provider_instance
+        });
+        if !exists_in_incoming {
+            resource.deposed.push(existing);
+        }
+    }
+}
+
+fn remove_current_identifier_from_deposed(resource: &mut ResourceState) {
+    if let Some(identifier) = resource.identifier.as_deref() {
+        resource
+            .deposed
+            .retain(|deposed| deposed.identifier != identifier);
     }
 }
 
@@ -668,11 +720,13 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
     // Dropping these rows at the single read seam restores the
     // managed-only invariant for every downstream consumer in one
     // place; no per-site filter or post-write cleanup is required.
-    // A managed resource that has never returned an identifier from
-    // the provider never reaches state writeback (it lands as
-    // `add_cleanup` instead), so identifier=None in `state.resources`
-    // is exclusively a historical-artifact shape.
-    state.resources.retain(|rs| rs.identifier.is_some());
+    //
+    // v9 adds a legitimate identifier=None shape: the current instance
+    // has been removed, but one or more deposed generations still need
+    // delete tracking. Keep those rows until their deposed list is empty.
+    state
+        .resources
+        .retain(|rs| rs.identifier.is_some() || !rs.deposed.is_empty());
     Ok(MigratedStateFile { state, migration })
 }
 
@@ -685,6 +739,44 @@ pub fn check_and_migrate_bytes(bytes: &[u8]) -> Result<MigratedStateFile, Backen
     let content = std::str::from_utf8(bytes)
         .map_err(|e| BackendError::InvalidState(format!("State file is not valid UTF-8: {}", e)))?;
     check_and_migrate(content)
+}
+
+/// System-assigned key for one deposed generation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DeposedKey(String);
+
+impl DeposedKey {
+    pub fn new_unique() -> Self {
+        let uuid = uuid::Uuid::new_v4().simple().to_string();
+        Self(uuid[..12].to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for DeposedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Pre-replacement instance that still needs a successful Delete.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeposedInstance {
+    /// System-assigned unique key for this generation.
+    pub key: DeposedKey,
+    /// Provider-side identifier of the still-live old instance.
+    pub identifier: String,
+    /// Provider instance routing used when this generation was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_instance: Option<String>,
+    /// Last known attributes of the old instance.
+    pub attributes: HashMap<String, serde_json::Value>,
+    /// Binding dependencies inherited from the old row.
+    pub dependency_bindings: BTreeSet<String>,
 }
 
 /// State of a single managed resource
@@ -703,6 +795,9 @@ pub struct ResourceState {
     pub identifier: Option<String>,
     /// All attributes of the resource as JSON values
     pub attributes: HashMap<String, serde_json::Value>,
+    /// Old replacement generations that still need a successful Delete.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deposed: Vec<DeposedInstance>,
     /// Whether this resource is protected from deletion (e.g., state bucket)
     #[serde(default)]
     pub protected: bool,
@@ -765,6 +860,7 @@ impl ResourceState {
             provider: provider.into(),
             identifier: None,
             attributes: HashMap::new(),
+            deposed: Vec::new(),
             protected: false,
             directives: Directives::default(),
             prefixes: HashMap::new(),
@@ -863,6 +959,101 @@ impl ResourceState {
         self.write_only_attributes = merged;
     }
 
+    fn attribute_to_state_json(
+        resource_display_type: &str,
+        identity: &str,
+        key: &str,
+        value: &Value,
+    ) -> Result<serde_json::Value, String> {
+        if contains_secret(value) {
+            let ctx = SecretHashContext::new(resource_display_type, identity, key);
+            value_to_json_with_context(value, Some(&ctx)).map_err(|e| e.to_string())
+        } else {
+            value_to_json(value).map_err(|e| e.to_string())
+        }
+    }
+
+    /// Serialize best-effort provider attributes into the state-file JSON shape.
+    ///
+    /// Secret values use the same context-aware hashing as `from_provider_state`.
+    /// Attributes that cannot be represented in state, such as unresolved
+    /// `Unknown` placeholders, are skipped instead of aborting state writeback.
+    fn attributes_to_state_json_lossy(
+        resource_display_type: &str,
+        identity: &str,
+        attributes: &HashMap<String, Value>,
+    ) -> HashMap<String, serde_json::Value> {
+        attributes
+            .iter()
+            .filter_map(|(key, value)| {
+                Self::attribute_to_state_json(resource_display_type, identity, key, value)
+                    .ok()
+                    .map(|json| (key.clone(), json))
+            })
+            .collect()
+    }
+
+    /// Serialize provider attributes with desired-resource and schema-derived
+    /// secret overrides.
+    ///
+    /// When the new desired resource no longer contains an old protected key,
+    /// the schema still prevents persisting provider-returned plaintext for
+    /// write-only attributes. Such keys are dropped unless the desired value
+    /// carries a `Secret(_)` wrapper that can be merged into a hash.
+    pub fn attributes_to_state_json_lossy_for_resource_and_schema(
+        resource: &Resource,
+        schema: Option<&ResourceSchema>,
+        attributes: &HashMap<String, Value>,
+    ) -> HashMap<String, serde_json::Value> {
+        let resource_display_type = resource.id.display_type();
+        let identity = resource.id.identity_or_empty();
+        let serialized =
+            Self::attributes_to_state_json_lossy(&resource_display_type, identity, attributes);
+        Self::protect_state_json_for_resource_and_schema(resource, schema, serialized)
+    }
+
+    /// Apply desired-resource and schema-derived secret protection to an
+    /// already serialized state attribute map.
+    pub fn protect_state_json_for_resource_and_schema(
+        resource: &Resource,
+        schema: Option<&ResourceSchema>,
+        mut serialized: HashMap<String, serde_json::Value>,
+    ) -> HashMap<String, serde_json::Value> {
+        let resource_display_type = resource.id.display_type();
+        let identity = resource.id.identity_or_empty();
+        let mut desired_secret_keys = std::collections::HashSet::new();
+
+        for (key, desired_value) in &resource.attributes {
+            if !contains_secret(desired_value) {
+                continue;
+            }
+
+            let ctx = SecretHashContext::new(&resource_display_type, identity, key);
+            let masked = if let Some(provider_json) = serialized.get(key).cloned() {
+                merge_secrets_into_provider_json(desired_value, &provider_json, Some(&ctx))
+            } else {
+                value_to_json_with_context(desired_value, Some(&ctx))
+            };
+
+            if let Ok(masked) = masked {
+                serialized.insert(key.clone(), masked);
+                desired_secret_keys.insert(key.clone());
+            } else {
+                serialized.remove(key);
+            }
+        }
+
+        if let Some(schema) = schema {
+            for (key, attr) in &schema.attributes {
+                if attr.write_only && !desired_secret_keys.contains(key) {
+                    serialized.remove(key);
+                }
+            }
+        }
+
+        serialized
+    }
+
     /// Build a ResourceState from a Resource and its provider-returned State.
     ///
     /// If `existing` is provided, the `protected` flag is preserved from it.
@@ -881,9 +1072,13 @@ impl ResourceState {
         );
         rs.identifier = state.identifier.clone();
         rs.partial_read = state.partial_read.clone();
+        let resource_display_type = resource.id.display_type();
+        let identity = resource.id.identity_or_empty();
         for (k, v) in &state.attributes {
-            rs.attributes
-                .insert(k.clone(), value_to_json(v).map_err(|e| e.to_string())?);
+            rs.attributes.insert(
+                k.clone(),
+                Self::attribute_to_state_json(&resource_display_type, identity, k, v)?,
+            );
         }
         // For secret attributes, override the provider-returned plain value
         // with the Argon2id hash. The provider returns the actual value (since
@@ -893,11 +1088,7 @@ impl ResourceState {
         // the provider-returned structure to preserve extra keys from the provider.
         for (k, v) in &resource.attributes {
             if contains_secret(v) {
-                let ctx = SecretHashContext::new(
-                    resource.id.display_type(),
-                    resource.id.identity_or_empty(),
-                    k,
-                );
+                let ctx = SecretHashContext::new(&resource_display_type, identity, k);
                 if let Some(provider_json) = rs.attributes.get(k).cloned() {
                     rs.attributes.insert(
                         k.clone(),
@@ -907,8 +1098,7 @@ impl ResourceState {
                 } else {
                     rs.attributes.insert(
                         k.clone(),
-                        carina_core::value::value_to_json_with_context(v, Some(&ctx))
-                            .map_err(|e| e.to_string())?,
+                        Self::attribute_to_state_json(&resource_display_type, identity, k, v)?,
                     );
                 }
             }
@@ -918,6 +1108,9 @@ impl ResourceState {
             rs.name_overrides = existing.name_overrides.clone();
         }
         rs.directives = resource.directives.clone();
+        if rs.directives.provider_instance.is_none() {
+            rs.directives.provider_instance = resource.id.provider_instance.clone();
+        }
         rs.prefixes = resource.prefixes.clone();
         // Record the structural shape the user wrote in their .crn,
         // so the differ can project actual-state through it and skip

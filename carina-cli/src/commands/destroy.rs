@@ -1663,6 +1663,45 @@ mod tests {
         assert!(state.exports.is_empty(), "exports should be cleared");
     }
 
+    #[test]
+    fn apply_destroy_to_state_preserves_deposed_generations() {
+        use carina_state::{DeposedInstance, DeposedKey, ResourceState};
+        use std::collections::{BTreeSet, HashMap};
+
+        let mut state = carina_state::StateFile::new();
+        let mut resource = ResourceState::new("ec2.Vpc", "main", "awscc")
+            .with_identifier("vpc-new")
+            .with_attribute("cidr_block", serde_json::json!("10.1.0.0/16"));
+        resource.deposed.push(DeposedInstance {
+            key: DeposedKey::new_unique(),
+            identifier: "vpc-old".to_string(),
+            provider_instance: None,
+            attributes: HashMap::from([(
+                "cidr_block".to_string(),
+                serde_json::json!("10.0.0.0/16"),
+            )]),
+            dependency_bindings: BTreeSet::from(["network".to_string()]),
+        });
+        state.resources.push(resource);
+        state
+            .exports
+            .insert("vpc_id".to_string(), serde_json::json!("vpc-new"));
+
+        let destroyed = vec![ResourceId::with_provider_identity(
+            "awscc", "ec2.Vpc", "main", None,
+        )];
+        apply_destroy_to_state(&mut state, &destroyed);
+
+        let retained = state
+            .find_resource("awscc", "ec2.Vpc", "main")
+            .expect("row with deposed generations should be retained");
+        assert_eq!(retained.identifier, None);
+        assert!(retained.attributes.is_empty());
+        assert_eq!(retained.deposed.len(), 1);
+        assert_eq!(retained.deposed[0].identifier, "vpc-old");
+        assert!(state.exports.is_empty(), "exports should be cleared");
+    }
+
     #[tokio::test]
     async fn wait_for_deletion_succeeds_when_resource_disappears() {
         let id = ResourceId::with_identity("s3.Bucket", "test");
