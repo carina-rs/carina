@@ -1380,6 +1380,67 @@ fn into_plan_input_map_canonicalizes_string_or_list_state() {
     );
 }
 
+#[test]
+fn into_plan_input_map_canonicalizes_separator_folded_enum_state_before_diffing() {
+    use crate::schema::{AttributeSchema, ResourceSchema, enum_identity};
+
+    let mut schema = ResourceSchema::new("acm.Certificate");
+    schema.attributes.insert(
+        "key_algorithm".to_string(),
+        AttributeSchema::new(
+            "key_algorithm",
+            AttributeType::enum_(
+                enum_identity("KeyAlgorithm", Some("aws.acm.Certificate")),
+                Some(vec!["RSA_2048".to_string()]),
+                vec![],
+                None,
+                None,
+            ),
+        )
+        .create_only(),
+    );
+    let mut registry = SchemaRegistry::new();
+    registry.insert("aws", schema);
+
+    let mut desired = Resource::new("acm.Certificate", "cert").with_attribute(
+        "key_algorithm",
+        Value::Concrete(ConcreteValue::enum_identifier("rsa_2048".to_string())),
+    );
+    desired.id.provider = "aws".to_string();
+    let resources = vec![desired];
+
+    let mut state_attrs = HashMap::new();
+    state_attrs.insert(
+        "key_algorithm".to_string(),
+        Value::Concrete(ConcreteValue::String("RSA-2048".to_string())),
+    );
+    let mut id = ResourceId::with_identity("acm.Certificate", "cert");
+    id.provider = "aws".to_string();
+    let mut states = HashMap::new();
+    states.insert(id.clone(), State::existing(id, state_attrs));
+
+    let plan_input_states = crate::resource::into_plan_input_map(states, &registry, &resources);
+    let plan = create_plan(
+        &resources,
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &plan_input_states,
+        &HashMap::new(),
+        &registry,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+    );
+
+    assert!(
+        plan.effects().is_empty(),
+        "separator-folded enum state must canonicalize to schema spelling before diffing; \
+         effects were {:?}",
+        plan.effects()
+    );
+}
+
 /// carina#3080 differ parity (design Test plan item 2+3): the
 /// `principal` `Union[Struct{ service: Union[String, List<String>] },
 /// String]` phantom must vanish at the **differ verdict**, and it must

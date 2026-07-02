@@ -239,12 +239,19 @@ impl<'a> EnumValueResolver<'a> {
         } else {
             None
         };
+        let state_text_direct_match = if phase == EnumInputPhase::StateText {
+            state_text_valid_value_match(text, &valid)
+        } else {
+            StateTextValidValueMatch::NoMatch
+        };
         let direct_match = valid.iter().any(|v| enum_value_matches(text, v));
         let variant = if let Some(value) = prefix_escaped_value {
             value.to_string()
         } else if phase == EnumInputPhase::StateText && values.is_none() {
             state_text_open_enum_value(text, identity)
-        } else if direct_match {
+        } else if let StateTextValidValueMatch::Unique(value) = state_text_direct_match {
+            value.to_string()
+        } else if phase != EnumInputPhase::StateText && direct_match {
             text.to_string()
         } else {
             extract_enum_value_with_values(text, &valid).to_string()
@@ -272,13 +279,12 @@ impl<'a> EnumValueResolver<'a> {
 
         let api_value = match phase {
             EnumInputPhase::RawDsl => dsl_map.api_for(&variant),
-            EnumInputPhase::StateText => {
-                if valid.contains(&text) {
-                    text.to_string()
-                } else {
+            EnumInputPhase::StateText => match state_text_direct_match {
+                StateTextValidValueMatch::Unique(value) => value.to_string(),
+                StateTextValidValueMatch::NoMatch | StateTextValidValueMatch::Ambiguous => {
                     dsl_map.api_for(&variant)
                 }
-            }
+            },
         };
 
         let enumerated = values.is_some();
@@ -286,12 +292,18 @@ impl<'a> EnumValueResolver<'a> {
             .into_iter()
             .flatten()
             .find(|v| v.as_str() == api_value);
-        let matched_value = exact_value.or_else(|| {
-            values
-                .into_iter()
-                .flatten()
-                .find(|v| enum_value_matches(&api_value, v))
-        });
+        let matched_value = if phase == EnumInputPhase::StateText
+            && state_text_direct_match == StateTextValidValueMatch::Ambiguous
+        {
+            None
+        } else {
+            exact_value.or_else(|| {
+                values
+                    .into_iter()
+                    .flatten()
+                    .find(|v| enum_value_matches(&api_value, v))
+            })
+        };
         let valid_value = matched_value.is_some();
         let api_value = matched_value.map_or(api_value, Clone::clone);
         // Provider validators at this boundary receive the canonical API
@@ -345,6 +357,70 @@ fn state_text_open_enum_value(text: &str, identity: &TypeIdentity) -> String {
             type_name, value, ..
         } if type_name == &identity.kind => value.clone(),
         _ => text.to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateTextValidValueMatch<'a> {
+    NoMatch,
+    Unique(&'a str),
+    Ambiguous,
+}
+
+fn state_text_valid_value_match<'a>(text: &str, valid: &[&'a str]) -> StateTextValidValueMatch<'a> {
+    let exact = unique_state_text_match_tier(valid, |value| text == value);
+    if exact != StateTextValidValueMatch::NoMatch {
+        return exact;
+    }
+
+    let case_only = unique_state_text_match_tier(valid, |value| text.eq_ignore_ascii_case(value));
+    if case_only != StateTextValidValueMatch::NoMatch {
+        return case_only;
+    }
+
+    let separator_fold = unique_state_text_match_tier(valid, |value| {
+        state_text_separator_fold_matches(text, value)
+    });
+    if separator_fold != StateTextValidValueMatch::NoMatch {
+        return separator_fold;
+    }
+
+    StateTextValidValueMatch::NoMatch
+}
+
+fn unique_state_text_match_tier<'a, F>(
+    valid: &[&'a str],
+    mut matches: F,
+) -> StateTextValidValueMatch<'a>
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut found = None;
+    for value in valid.iter().copied().filter(|value| matches(value)) {
+        match found {
+            None => found = Some(value),
+            Some(existing) if existing == value => {}
+            Some(_) => return StateTextValidValueMatch::Ambiguous,
+        }
+    }
+    found.map_or(
+        StateTextValidValueMatch::NoMatch,
+        StateTextValidValueMatch::Unique,
+    )
+}
+
+fn state_text_separator_fold_matches(input: &str, expected: &str) -> bool {
+    input
+        .bytes()
+        .map(fold_state_text_enum_match_byte)
+        .eq(expected.bytes().map(fold_state_text_enum_match_byte))
+}
+
+fn fold_state_text_enum_match_byte(byte: u8) -> u8 {
+    match byte {
+        b'_' | b'-' => b'-',
+        b'A'..=b'Z' => byte.to_ascii_lowercase(),
+        _ => byte,
     }
 }
 
@@ -526,6 +602,54 @@ mod tests {
     }
 
     #[test]
+    fn resolve_raw_preserves_exact_valid_value_over_case_matched_alias() {
+        let attr = AttributeType::enum_(
+            enum_identity("Example", Some("aws")),
+            Some(vec!["API_A".to_string(), "FOO".to_string()]),
+            vec![("API_A".to_string(), "foo".to_string())],
+            None,
+            None,
+        );
+
+        let canonical = EnumValueResolver::new(&attr)
+            .resolve_raw(&RawEnumIdentifier::parse("FOO"))
+            .unwrap();
+        assert_eq!(canonical.api_value(), "FOO");
+    }
+
+    #[test]
+    fn resolve_raw_rejects_api_spelling_that_separator_folds_to_alias() {
+        let attr = AttributeType::enum_(
+            enum_identity("Example", Some("aws")),
+            Some(vec!["FOO-BAR".to_string()]),
+            vec![("FOO-BAR".to_string(), "foo_bar".to_string())],
+            None,
+            None,
+        );
+
+        assert!(matches!(
+            EnumValueResolver::new(&attr).resolve_raw(&RawEnumIdentifier::parse("FOO-BAR")),
+            Err(TypeError::InvalidEnumVariant { .. })
+        ));
+    }
+
+    #[test]
+    fn resolve_raw_keeps_legacy_fold_variant_accepted_before_alias_rejection() {
+        let attr = AttributeType::enum_(
+            enum_identity("Example", Some("aws")),
+            Some(vec!["-1".to_string()]),
+            vec![("-1".to_string(), "all".to_string())],
+            None,
+            None,
+        );
+
+        let canonical = EnumValueResolver::new(&attr)
+            .resolve_raw(&RawEnumIdentifier::parse("_1"))
+            .unwrap();
+        assert_eq!(canonical.api_value(), "-1");
+    }
+
+    #[test]
     fn resolve_text_normalizes_fuzzy_matches_to_values_list_entry() {
         let effect = AttributeType::enum_(
             enum_identity("Effect", Some("aws.iam.PolicyDocument")),
@@ -558,6 +682,50 @@ mod tests {
     }
 
     #[test]
+    fn state_text_valid_value_match_folds_separators_symmetrically() {
+        assert_eq!(
+            state_text_valid_value_match("RSA_2048", &["RSA-2048"]),
+            StateTextValidValueMatch::Unique("RSA-2048")
+        );
+        assert_eq!(
+            state_text_valid_value_match("RSA-2048", &["RSA_2048"]),
+            StateTextValidValueMatch::Unique("RSA_2048")
+        );
+        assert_eq!(
+            state_text_valid_value_match("rsa-2048", &["RSA_2048"]),
+            StateTextValidValueMatch::Unique("RSA_2048")
+        );
+        assert_eq!(
+            state_text_valid_value_match("RSA_2048", &["rsa-2048"]),
+            StateTextValidValueMatch::Unique("rsa-2048")
+        );
+        assert_eq!(
+            state_text_valid_value_match("RSA-4096", &["RSA_2048"]),
+            StateTextValidValueMatch::NoMatch
+        );
+        assert_eq!(
+            state_text_valid_value_match("RSA2048", &["RSA_2048"]),
+            StateTextValidValueMatch::NoMatch
+        );
+    }
+
+    #[test]
+    fn resolve_state_text_canonicalizes_separator_folded_match_to_schema_value() {
+        let key_algorithm = AttributeType::enum_(
+            enum_identity("KeyAlgorithm", Some("aws.acm.Certificate")),
+            Some(vec!["RSA_2048".to_string()]),
+            vec![],
+            None,
+            None,
+        );
+
+        let canonical = EnumValueResolver::new(&key_algorithm)
+            .resolve_state_text("RSA-2048")
+            .unwrap();
+        assert_eq!(canonical.api_value(), "RSA_2048");
+    }
+
+    #[test]
     fn resolve_text_keeps_exact_member_before_fuzzy_sibling() {
         let attr = AttributeType::enum_(
             enum_identity("Example", Some("aws")),
@@ -571,6 +739,22 @@ mod tests {
             .resolve_state_text("foo_bar")
             .unwrap();
         assert_eq!(canonical.api_value(), "foo_bar");
+    }
+
+    #[test]
+    fn resolve_state_text_keeps_exact_separator_member_before_folded_sibling() {
+        let attr = AttributeType::enum_(
+            enum_identity("Example", Some("aws")),
+            Some(vec!["RSA_2048".to_string(), "RSA-2048".to_string()]),
+            vec![],
+            None,
+            None,
+        );
+
+        let canonical = EnumValueResolver::new(&attr)
+            .resolve_state_text("RSA-2048")
+            .unwrap();
+        assert_eq!(canonical.api_value(), "RSA-2048");
     }
 
     #[test]

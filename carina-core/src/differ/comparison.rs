@@ -248,6 +248,13 @@ pub(crate) fn type_aware_equal(
                 // paths can still surface unresolved strings. Once every
                 // enum-typed state leaf is resolver-lifted, comparison above
                 // should be CanonicalEnum × CanonicalEnum.
+                //
+                // Provider response spellings must pass through
+                // `into_plan_input_map` before planning; that StateText
+                // canonicalization is where separator-equivalent enum
+                // response values converge to schema spellings. Keep this
+                // string fallback on the legacy alias round-trip only so DSL
+                // validation semantics are not widened here.
                 let dsl_map = crate::schema::DslMap::new(dsl_aliases, to_dsl);
                 let canonical = |s: &str| -> String {
                     let valid_values: Vec<&str> =
