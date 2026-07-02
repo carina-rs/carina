@@ -3,6 +3,7 @@ use super::*;
 use indexmap::IndexMap;
 
 use crate::explicit::ExplicitFields;
+use crate::plan::{MissingNameAttributeError, PlanErrorKind, PreventDestroyAction};
 use crate::resource::{ConcreteValue, DataSource};
 
 /// Build an `ExplicitFields::Struct` whose children are all `Leaf` —
@@ -460,10 +461,16 @@ fn create_before_destroy_without_unique_name_attribute_emits_plan_error() {
         plan.errors()[0].resource_id,
         ResourceId::with_identity("ec2.Vpc", "my-vpc")
     );
-    assert!(
-        plan.errors()[0]
-            .message
-            .contains("has no unique_name_attribute")
+    assert_eq!(
+        &plan.errors()[0].kind,
+        &PlanErrorKind::MissingNameAttribute(MissingNameAttributeError {
+            resource_type: "ec2.Vpc".to_string(),
+            resource_identity: "my-vpc".to_string(),
+        })
+    );
+    assert_eq!(
+        plan.errors()[0].to_string(),
+        "ec2.Vpc.my-vpc: resource type 'ec2.Vpc' has no unique_name_attribute; create_before_destroy needs one to generate a temporary name"
     );
 }
 
@@ -1054,10 +1061,11 @@ fn prevent_destroy_blocks_delete_for_orphaned_resource() {
     // Should have an error
     assert!(plan.has_errors(), "Should have prevent_destroy error");
     assert_eq!(plan.errors().len(), 1);
-    assert!(
-        plan.errors()[0].message.contains("prevent_destroy"),
-        "Error message should mention prevent_destroy: {}",
-        plan.errors()[0].message
+    assert_eq!(
+        &plan.errors()[0].kind,
+        &PlanErrorKind::PreventDestroy {
+            action: PreventDestroyAction::DeleteRemovedFromConfiguration
+        }
     );
     assert_eq!(
         plan.errors()[0].resource_id,
@@ -1127,10 +1135,11 @@ fn prevent_destroy_blocks_replace() {
         "Should have prevent_destroy error for replace"
     );
     assert_eq!(plan.errors().len(), 1);
-    assert!(
-        plan.errors()[0].message.contains("prevent_destroy"),
-        "Error message should mention prevent_destroy: {}",
-        plan.errors()[0].message
+    assert_eq!(
+        &plan.errors()[0].kind,
+        &PlanErrorKind::PreventDestroy {
+            action: PreventDestroyAction::Replace
+        }
     );
 }
 
@@ -1462,9 +1471,13 @@ fn create_plan_records_error_for_empty_predicate_attr_path() {
 
     assert!(
         plan.errors().iter().any(|err| {
-            err.message.contains("cert_issued")
-                && err.message.contains("invalid predicate attribute path")
-                && err.message.contains("empty")
+            matches!(
+                &err.kind,
+                PlanErrorKind::WaitPredicateInvalid {
+                    wait_binding,
+                    reason,
+                } if wait_binding == "cert_issued" && reason.contains("empty")
+            )
         }),
         "expected invalid empty predicate attr path error, got {:?}",
         plan.errors()
@@ -1691,9 +1704,12 @@ fn wait_with_unknown_target_emits_plan_error() {
         "missing-target wait should surface a plan error"
     );
     assert!(
-        plan.errors()[0].message.contains("nonexistent"),
+        matches!(
+            &plan.errors()[0].kind,
+            PlanErrorKind::WaitTargetMissing { target, .. } if target == "nonexistent"
+        ),
         "error message should mention the missing target, got: {}",
-        plan.errors()[0].message
+        plan.errors()[0]
     );
 }
 

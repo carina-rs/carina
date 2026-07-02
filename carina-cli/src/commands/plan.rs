@@ -21,6 +21,7 @@ use super::{
     BackendDriftStatus, drift_warning, inspect_backend_drift, validate_and_resolve_with_config,
 };
 use crate::DetailLevel;
+use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::display::{print_plan, refresh_plan_separator};
 use crate::error::AppError;
 use crate::wiring::{
@@ -736,16 +737,7 @@ pub async fn run_plan(
         }
     }
 
-    // Check for prevent_destroy violations
-    if ctx.plan.has_errors() {
-        for err in ctx.plan.errors() {
-            eprintln!("{} {}", "Error:".red().bold(), err);
-        }
-        return Err(AppError::Validation(format!(
-            "{} resource(s) have prevent_destroy set and cannot be deleted or replaced",
-            ctx.plan.errors().len()
-        )));
-    }
+    render_plan_errors_and_abort(&ctx.plan)?;
 
     let iam_preflight_result = if check_iam {
         let result =

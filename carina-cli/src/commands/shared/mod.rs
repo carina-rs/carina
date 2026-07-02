@@ -11,6 +11,7 @@ pub(crate) mod cancellation_test_support;
 pub(crate) mod effect_execution;
 pub(crate) mod finalize;
 pub(crate) mod observer;
+pub(crate) mod plan_errors;
 pub(crate) mod progress;
 pub(crate) mod retry;
 pub(crate) mod state_writeback;

@@ -37,6 +37,7 @@ use crate::commands::shared::effect_execution::{
 };
 use crate::commands::shared::finalize::handle_finalize_after_execute;
 use crate::commands::shared::observer::CliObserver;
+use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::{
     RefreshProgress, emit_newline_on_interrupt, format_duration, refresh_multi_progress,
 };
@@ -1498,16 +1499,7 @@ async fn run_apply_locked(
     );
     crate::wiring::add_deferred_create_effects(&mut plan, &deferred_create_targets);
 
-    // Check for prevent_destroy violations
-    if plan.has_errors() {
-        for err in plan.errors() {
-            eprintln!("{} {}", "Error:".red().bold(), err);
-        }
-        return Err(AppError::Validation(format!(
-            "{} resource(s) have prevent_destroy set and cannot be deleted or replaced",
-            plan.errors().len()
-        )));
-    }
+    render_plan_errors_and_abort(&plan)?;
 
     if can_use_export_only_fast_path(&plan, &deferred_data_source_reads) {
         // No mutating effects — the plan only holds `Read` (data-source
@@ -2045,16 +2037,7 @@ async fn run_apply_from_plan_locked(
     // Use the actual states (freshly read) as current_states for apply
     let mut current_states = planned_states;
 
-    // Check for prevent_destroy violations
-    if plan.has_errors() {
-        for err in plan.errors() {
-            eprintln!("{} {}", "Error:".red().bold(), err);
-        }
-        return Err(AppError::Validation(format!(
-            "{} resource(s) have prevent_destroy set and cannot be deleted or replaced",
-            plan.errors().len()
-        )));
-    }
+    render_plan_errors_and_abort(plan)?;
 
     if can_use_export_only_fast_path(plan, &deferred_data_source_reads) {
         // Saved plans serialize every `Effect::Read` produced by the
