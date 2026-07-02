@@ -445,7 +445,8 @@ pub fn parse_directory_files(
     let mut pass1_union = ParsedFile::default();
     let mut pass_1a_local_variables = Vec::with_capacity(files.len());
     for (_, content) in files {
-        let parsed = parser::parse(content, config)?;
+        let parsed =
+            parser::parse_with_seeded_bindings_without_literal_warnings(content, config, &[])?;
         pass_1a_local_variables.push(local_variable_names(&parsed));
         merge_parsed_file(&mut pass1_union, parsed);
     }
@@ -506,7 +507,8 @@ fn parse_local_variable_union(
 ) -> Result<IndexMap<String, Value>, parser::ParseError> {
     let mut variables = IndexMap::new();
     for ((_, content), local_variables) in files.iter().zip(local_variables_by_file.iter()) {
-        let mut parsed = parser::parse_with_seeded_bindings(content, config, seeds)?;
+        let mut parsed =
+            parser::parse_with_seeded_bindings_without_literal_warnings(content, config, seeds)?;
         parsed
             .variables
             .retain(|name, _| local_variables.contains(name));

@@ -402,8 +402,8 @@ impl ModuleResolver<'_> {
             //   - `requires`: evaluated against this call's args here.
             //   - `state_blocks` / `backend`: a module does not own
             //     caller state/backend config.
-            //   - `structural_bindings` / `warnings`: scoped to the
-            //     module's own parse, not merged upward.
+            //   - `structural_bindings`: scoped to the module's own
+            //     parse, not merged upward.
             providers: Vec::new(),
             variables: IndexMap::new(),
             uses: Vec::new(),
@@ -417,7 +417,7 @@ impl ModuleResolver<'_> {
             upstream_states: Vec::new(),
             requires: Vec::new(),
             structural_bindings: HashSet::new(),
-            warnings: Vec::new(),
+            warnings: module.warnings.clone(),
 
             // ExpansionTrace (#3306): pre-built above against the
             // call's leaves before the struct literal moved them.

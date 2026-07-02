@@ -2920,6 +2920,98 @@ for _, id in orgs.xs {
 }
 
 #[test]
+fn single_quoted_interpolation_like_sequence_emits_warning_at_span() {
+    let engine = test_engine();
+    let buffer = "let env = \"prod\"\nlet policy = 'arn:${env}:${account}:root'\n";
+    let doc = create_document(buffer);
+    let diagnostics = engine.analyze(&doc, None);
+
+    let warnings: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.message.contains("single-quoted string contains '${...}'"))
+        .collect();
+
+    assert_eq!(
+        warnings.len(),
+        2,
+        "expected one single-quoted interpolation warning per occurrence; got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let line = buffer.lines().nth(1).unwrap();
+    let first_start = line.find("${env}").unwrap() as u32;
+    let end = (line.find("${env}").unwrap() + "${env}".len()) as u32;
+    assert_eq!(
+        warnings[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+    );
+    assert_eq!(warnings[0].range.start.line, 1);
+    assert_eq!(warnings[0].range.start.character, first_start);
+    assert_eq!(warnings[0].range.end.character, end);
+
+    let second_start = line.find("${account}").unwrap() as u32;
+    let second_end = (line.find("${account}").unwrap() + "${account}".len()) as u32;
+    assert_eq!(
+        warnings[1].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+    );
+    assert_eq!(warnings[1].range.start.line, 1);
+    assert_eq!(warnings[1].range.start.character, second_start);
+    assert_eq!(warnings[1].range.end.character, second_end);
+}
+
+#[test]
+fn single_quoted_interpolation_warning_uses_original_line_after_heredoc() {
+    let engine = test_engine();
+    let buffer = r#"let doc = <<EOF
+alpha
+beta
+EOF
+let env = "prod"
+let policy = 'arn:${env}:root'
+"#;
+    let doc = create_document(buffer);
+    let diagnostics = engine.analyze(&doc, None);
+
+    let warning = diagnostics
+        .iter()
+        .find(|d| d.message.contains("single-quoted string contains '${...}'"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a single-quoted interpolation warning; got: {:?}",
+                diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+            )
+        });
+
+    assert_eq!(
+        warning.range.start.line, 5,
+        "LSP diagnostics are zero-based and should use original source lines"
+    );
+}
+
+#[test]
+fn single_quoted_interpolation_like_sequence_negative_cases_do_not_warn() {
+    let engine = test_engine();
+    let buffer = r#"
+let env = "prod"
+let double_quoted = "arn:${env}:root"
+let plain_single = 'arn:env:root'
+let lone_dollar = '$'
+let dollar_name = '$env'
+let missing_close = '${env'
+"#;
+    let doc = create_document(buffer);
+    let diagnostics = engine.analyze(&doc, None);
+
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.message.contains("single-quoted string contains '${...}'")),
+        "negative cases must not warn, got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn enum_mismatch_inside_for_body_surfaces_as_diagnostic() {
     let provider = test_engine_with_enum_attr();
     let source = r#"

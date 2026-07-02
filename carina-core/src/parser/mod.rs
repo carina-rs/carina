@@ -25,10 +25,15 @@ pub use ast::{
     WaitBinding, expand_deferred_children,
 };
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
-pub(crate) use entry::{BindingSeed, parse_with_seeded_bindings};
+pub(crate) use entry::{
+    BindingSeed, parse_with_seeded_bindings, parse_with_seeded_bindings_without_literal_warnings,
+};
 pub use entry::{parse, parse_and_resolve};
 pub(crate) use entry::{parse_expression, parse_expression_eval};
-pub use error::{ParseError, ParseWarning};
+pub use error::{
+    ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,
+    WarningKind,
+};
 pub(crate) use functions::evaluate_user_function;
 pub use functions::{provider_context_lookup, validate_custom_type};
 pub use resolve::{

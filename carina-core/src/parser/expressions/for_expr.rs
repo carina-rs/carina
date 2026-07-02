@@ -9,7 +9,7 @@
 
 use crate::parser::expressions::primary::parse_primary_eval;
 use crate::parser::{
-    DeferredForExpression, ModuleCall, ParseContext, ParseError, ParseWarning, Rule,
+    DeferredForExpression, ModuleCall, ParseContext, ParseError, ParseWarning, Rule, WarningKind,
     evaluate_static_value, first_inner, next_pair, parse_expression, parse_module_call,
     parse_read_resource_expr, parse_resource_expr,
 };
@@ -155,6 +155,8 @@ pub(crate) fn parse_for_expr(
         ctx.warnings.push(ParseWarning {
             file: None,
             line: for_line,
+            kind: WarningKind::UnusedForBinding,
+            span: None,
             message: format!(
                 "for-loop binding '{}' is unused. Rename to '_' to suppress this warning.",
                 var

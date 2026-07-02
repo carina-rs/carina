@@ -26,7 +26,7 @@ use carina_core::identifier::{
 };
 use carina_core::module_resolver;
 use carina_core::override_aware::OverrideAwareResources;
-use carina_core::parser::{ProviderConfig, StateBlock, StateBlockAddress};
+use carina_core::parser::{ProviderConfig, StateBlock, StateBlockAddress, WarningKind};
 use carina_core::plan::Plan;
 use carina_core::provider::{
     self as provider_mod, Provider, ProviderError, ProviderFactory, ProviderNormalizer,
@@ -1607,9 +1607,11 @@ pub fn expand_same_config_deferred_for<E: Clone>(
     // the augmented resource set / residual deferred list back out.
     let mut expanded: carina_core::parser::File<E> = (*parsed).clone();
     for target in &deferred_create_targets {
-        expanded
-            .warnings
-            .retain(|w| w.line != target.template.line || w.file != target.template.file);
+        expanded.warnings.retain(|w| {
+            w.kind != WarningKind::DeferredFor
+                || w.line != target.template.line
+                || w.file != target.template.file
+        });
     }
     expanded.deferred_for_expressions = pre_expandable_deferred_for;
     expanded.expand_deferred_for_expressions(&iterable_bindings);

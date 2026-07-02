@@ -136,8 +136,16 @@ impl<'cfg> ModuleResolver<'cfg> {
         let parsed_files = crate::config_loader::parse_directory_files(&files, self.config)?;
 
         let mut merged = ParsedFile::default();
-        for (_, parsed) in parsed_files {
-            crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
+        for (file, parsed) in parsed_files {
+            let mut parsed = parsed.into_inner();
+            let file_path = Some(file.display().to_string());
+            for w in &mut parsed.warnings {
+                w.file = file_path.clone();
+            }
+            for d in &mut parsed.deferred_for_expressions {
+                d.file = file_path.clone();
+            }
+            crate::config_loader::merge_parsed_file(&mut merged, parsed);
         }
         let type_errors = crate::validation::resolve_file_type_exprs(&mut merged, self.config);
         if let Some(first) = type_errors.into_iter().next() {

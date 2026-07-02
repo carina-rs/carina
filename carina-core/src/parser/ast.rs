@@ -2,7 +2,7 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
-use super::error::ParseWarning;
+use super::error::{ParseWarning, WarningKind};
 use super::expressions::for_expr::ForBinding;
 use super::expressions::validate_expr::CompareOp;
 use super::util::snake_to_pascal;
@@ -1290,14 +1290,30 @@ impl<E> File<E> {
     /// (not an open spinner bar) — see
     /// `carina-cli`'s `finish_refresh_bar_region`.
     pub fn print_warnings(&self) -> bool {
-        for w in &self.warnings {
+        self.print_warnings_from(0)
+    }
+
+    /// Print collected warnings from `start` onward.
+    ///
+    /// This lets callers that already printed early parse warnings surface
+    /// warnings added by later phases, such as module expansion, without
+    /// duplicating the earlier lines.
+    pub fn print_warnings_from(&self, start: usize) -> bool {
+        let warnings = self.warnings.get(start..).unwrap_or_default();
+        for w in warnings {
             let location = match &w.file {
-                Some(f) => format!("{}:{}", f, w.line),
-                None => format!("line {}", w.line),
+                Some(f) => match &w.span {
+                    Some(span) => format!("{}:{}:{}", f, span.start_line, span.start_column),
+                    None => format!("{}:{}", f, w.line),
+                },
+                None => match &w.span {
+                    Some(span) => format!("line {}:{}", span.start_line, span.start_column),
+                    None => format!("line {}", w.line),
+                },
             };
             eprintln!("  ⚠ {}: {}", location, w.message);
         }
-        !self.warnings.is_empty()
+        !warnings.is_empty()
     }
 
     /// Expand deferred for-expressions against the resolved binding view.
@@ -1368,6 +1384,8 @@ impl<E> File<E> {
                     new_warnings.push(ParseWarning {
                         file: deferred.file.clone(),
                         line: deferred.line,
+                        kind: WarningKind::DeferredFor,
+                        span: None,
                         message: format!(
                             "for binding expected map iterable but `{}.{}` resolved to a list. \
                              Fix either the upstream export shape or the downstream binding.",
@@ -1381,6 +1399,8 @@ impl<E> File<E> {
                     new_warnings.push(ParseWarning {
                         file: deferred.file.clone(),
                         line: deferred.line,
+                        kind: WarningKind::DeferredFor,
+                        span: None,
                         message: format!(
                             "for binding expected list iterable but `{}.{}` resolved to a map. \
                              Fix either the upstream export shape or the downstream binding.",
@@ -1398,16 +1418,14 @@ impl<E> File<E> {
         // shape-mismatch warning replaces the generic "not yet available" one).
         for idx in &mismatched_indices {
             let deferred = &self.deferred_for_expressions[*idx];
-            self.warnings
-                .retain(|w| w.line != deferred.line || w.file != deferred.file);
+            retain_non_matching_deferred_for_warnings(&mut self.warnings, deferred);
         }
 
         // Remove resolved deferred entries (reverse order to preserve indices)
         for idx in resolved_indices.into_iter().rev() {
             // Also remove the corresponding warning
             let deferred = &self.deferred_for_expressions[idx];
-            self.warnings
-                .retain(|w| w.line != deferred.line || w.file != deferred.file);
+            retain_non_matching_deferred_for_warnings(&mut self.warnings, deferred);
             self.deferred_for_expressions.remove(idx);
         }
 
@@ -1418,6 +1436,15 @@ impl<E> File<E> {
         self.resources.extend(expanded_resources);
         self.warnings.extend(new_warnings);
     }
+}
+
+fn retain_non_matching_deferred_for_warnings(
+    warnings: &mut Vec<ParseWarning>,
+    deferred: &DeferredForExpression,
+) {
+    warnings.retain(|w| {
+        w.kind != WarningKind::DeferredFor || w.line != deferred.line || w.file != deferred.file
+    });
 }
 
 pub fn expand_deferred_children(

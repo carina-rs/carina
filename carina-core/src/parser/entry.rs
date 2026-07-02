@@ -16,7 +16,10 @@ use super::blocks::provider::{parse_provider_block, parse_require_statement};
 use super::blocks::resource::parse_anonymous_resource;
 use super::blocks::state::{parse_import_state_block, parse_moved_block, parse_removed_block};
 use super::context::{ParseContext, first_inner};
-use super::error::ParseError;
+use super::error::{
+    ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,
+    WarningKind,
+};
 use super::expressions::for_expr::{extract_for_iterable_name, parse_for_expr};
 use super::expressions::if_expr::parse_if_expr;
 use super::expressions::pipe::parse_coalesce_expr;
@@ -29,6 +32,7 @@ use crate::eval_value::EvalValue;
 use crate::resource::{DataSource, DeferredValue, Resource, Value};
 use indexmap::IndexMap;
 use pest::Parser;
+use pest::error::LineColLocation;
 
 #[derive(Clone, Copy)]
 pub(crate) struct BindingSeed<'a> {
@@ -114,14 +118,38 @@ pub fn parse_with_seeded_bindings(
     config: &ProviderContext,
     seeds: &[BindingSeed<'_>],
 ) -> Result<ParsedFile, ParseError> {
+    parse_with_seeded_bindings_inner(input, config, seeds, true)
+}
+
+pub(crate) fn parse_with_seeded_bindings_without_literal_warnings(
+    input: &str,
+    config: &ProviderContext,
+    seeds: &[BindingSeed<'_>],
+) -> Result<ParsedFile, ParseError> {
+    parse_with_seeded_bindings_inner(input, config, seeds, false)
+}
+
+fn parse_with_seeded_bindings_inner(
+    input: &str,
+    config: &ProviderContext,
+    seeds: &[BindingSeed<'_>],
+    collect_literal_warnings: bool,
+) -> Result<ParsedFile, ParseError> {
     let preprocess_result =
         crate::heredoc::preprocess_heredocs(input).map_err(|e| ParseError::InvalidExpression {
             line: 0,
             message: e.to_string(),
         })?;
-    let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)?;
+    let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)
+        .map_err(|e| map_pest_error_lines(e, &preprocess_result.line_map))?;
+    let single_quote_warnings = if collect_literal_warnings {
+        collect_single_quoted_interpolation_warnings(pairs.clone(), &preprocess_result.line_map)
+    } else {
+        Vec::new()
+    };
 
     let mut ctx = ParseContext::new(config);
+    ctx.warnings.extend(single_quote_warnings);
     seed_bindings(&mut ctx, seeds);
     let mut providers = Vec::new();
     let mut resources = Vec::new();
@@ -449,6 +477,110 @@ pub fn parse_with_seeded_bindings(
         // populated by `module_resolver::expander` (#3306).
         expansion_trace: crate::resource::ExpansionTrace::new(),
     })
+}
+
+fn collect_single_quoted_interpolation_warnings(
+    pairs: pest::iterators::Pairs<'_, Rule>,
+    line_map: &[usize],
+) -> Vec<ParseWarning> {
+    let mut warnings = Vec::new();
+    for pair in pairs {
+        collect_single_quoted_interpolation_warnings_from_pair(pair, line_map, &mut warnings);
+    }
+    warnings
+}
+
+fn collect_single_quoted_interpolation_warnings_from_pair(
+    pair: pest::iterators::Pair<'_, Rule>,
+    line_map: &[usize],
+    warnings: &mut Vec<ParseWarning>,
+) {
+    if pair.as_rule() == Rule::single_quoted_string
+        && let Some(content_pair) = pair.clone().into_inner().next()
+    {
+        let content = content_pair.as_str();
+        for (start, end) in interpolation_like_spans(content) {
+            let (preprocessed_line, column) = line_column_after_prefix(
+                content_pair.as_span().start_pos().line_col(),
+                &content[..start],
+            );
+            let snippet = &content[start..end];
+            let (preprocessed_end_line, end_column) =
+                line_column_after_prefix((preprocessed_line, column), snippet);
+            let span = ParseWarningSpan {
+                start_line: original_line(preprocessed_line, line_map),
+                start_column: column,
+                end_line: original_line(preprocessed_end_line, line_map),
+                end_column,
+            };
+            warnings.push(ParseWarning {
+                file: None,
+                line: span.start_line,
+                kind: WarningKind::SingleQuotedInterpolation,
+                span: Some(span),
+                message: SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE.to_string(),
+            });
+        }
+    }
+
+    for child in pair.into_inner() {
+        collect_single_quoted_interpolation_warnings_from_pair(child, line_map, warnings);
+    }
+}
+
+fn interpolation_like_spans(content: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut search_start = 0;
+    while let Some(relative_start) = content[search_start..].find("${") {
+        let start = search_start + relative_start;
+        let Some(relative_close) = content[start + 2..].find('}') else {
+            break;
+        };
+        let end = start + 2 + relative_close + 1;
+        spans.push((start, end));
+        search_start = end;
+    }
+    spans
+}
+
+fn line_column_after_prefix(
+    (base_line, base_column): (usize, usize),
+    prefix: &str,
+) -> (usize, usize) {
+    prefix
+        .chars()
+        .fold((base_line, base_column), |(line, column), ch| {
+            if ch == '\n' {
+                (line + 1, 1)
+            } else {
+                (line, column + 1)
+            }
+        })
+}
+
+fn original_line(preprocessed_line: usize, line_map: &[usize]) -> usize {
+    line_map
+        .get(preprocessed_line.saturating_sub(1))
+        .copied()
+        .unwrap_or(preprocessed_line)
+}
+
+fn map_pest_error_lines(
+    mut error: pest::error::Error<Rule>,
+    line_map: &[usize],
+) -> pest::error::Error<Rule> {
+    error.line_col = match error.line_col {
+        LineColLocation::Pos((line, column)) => {
+            LineColLocation::Pos((original_line(line, line_map), column))
+        }
+        LineColLocation::Span((start_line, start_column), (end_line, end_column)) => {
+            LineColLocation::Span(
+                (original_line(start_line, line_map), start_column),
+                (original_line(end_line, line_map), end_column),
+            )
+        }
+    };
+    error
 }
 
 /// Pre-register `seeds` as lexical bindings in `ctx`.
