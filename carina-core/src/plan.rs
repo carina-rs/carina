@@ -34,13 +34,32 @@ pub enum PreventDestroyAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 #[error(
-    "resource type '{resource_type}' has no unique_name_attribute; create_before_destroy needs one to generate a temporary name"
+    "no schema registered for resource type '{resource_type}'; cannot plan create_before_destroy"
 )]
-pub struct MissingNameAttributeError {
+pub struct SchemaNotRegisteredError {
     pub resource_type: String,
     /// The binding name (let-bound) or resolver identity (anonymous)
     /// of the resource that triggered the CBD path. For diagnostics only.
     pub resource_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
+#[error(
+    "resource type '{resource_type}' does not support create_before_destroy: the replacement cannot coexist with the original"
+)]
+pub struct ReplacementCannotCoexistError {
+    pub resource_type: String,
+    /// The binding name (let-bound) or resolver identity (anonymous)
+    /// of the resource that triggered the CBD path. For diagnostics only.
+    pub resource_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
+pub enum CreateBeforeDestroyError {
+    #[error(transparent)]
+    SchemaNotRegistered(#[from] SchemaNotRegisteredError),
+    #[error(transparent)]
+    ReplacementCannotCoexist(#[from] ReplacementCannotCoexistError),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -48,7 +67,8 @@ pub enum PlanErrorKind {
     PreventDestroy {
         action: PreventDestroyAction,
     },
-    MissingNameAttribute(MissingNameAttributeError),
+    SchemaNotRegistered(SchemaNotRegisteredError),
+    ReplacementCannotCoexist(ReplacementCannotCoexistError),
     WaitTargetMissing {
         wait_binding: String,
         target: String,
@@ -69,9 +89,14 @@ impl PlanError {
     }
 }
 
-impl From<MissingNameAttributeError> for PlanErrorKind {
-    fn from(err: MissingNameAttributeError) -> Self {
-        Self::MissingNameAttribute(err)
+impl From<CreateBeforeDestroyError> for PlanErrorKind {
+    fn from(err: CreateBeforeDestroyError) -> Self {
+        match err {
+            CreateBeforeDestroyError::SchemaNotRegistered(err) => Self::SchemaNotRegistered(err),
+            CreateBeforeDestroyError::ReplacementCannotCoexist(err) => {
+                Self::ReplacementCannotCoexist(err)
+            }
+        }
     }
 }
 
@@ -98,7 +123,8 @@ impl std::fmt::Display for PlanErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PreventDestroy { action } => f.write_str(Self::prevent_destroy_message(*action)),
-            Self::MissingNameAttribute(err) => write!(f, "{err}"),
+            Self::SchemaNotRegistered(err) => write!(f, "{err}"),
+            Self::ReplacementCannotCoexist(err) => write!(f, "{err}"),
             Self::WaitTargetMissing {
                 wait_binding,
                 target,
@@ -1264,20 +1290,38 @@ mod tests {
     }
 
     #[test]
-    fn plan_error_kind_display_delegates_missing_name_attribute_error() {
-        let error = MissingNameAttributeError {
+    fn plan_error_kind_display_delegates_schema_not_registered_error() {
+        let error = SchemaNotRegisteredError {
             resource_type: "ec2.Vpc".to_string(),
             resource_identity: "vpc".to_string(),
         };
         let expected = error.to_string();
 
         assert_eq!(
-            PlanErrorKind::MissingNameAttribute(error).to_string(),
+            PlanErrorKind::SchemaNotRegistered(error).to_string(),
             expected
         );
         assert_eq!(
             expected,
-            "resource type 'ec2.Vpc' has no unique_name_attribute; create_before_destroy needs one to generate a temporary name"
+            "no schema registered for resource type 'ec2.Vpc'; cannot plan create_before_destroy"
+        );
+    }
+
+    #[test]
+    fn plan_error_kind_display_delegates_replacement_cannot_coexist_error() {
+        let error = ReplacementCannotCoexistError {
+            resource_type: "ec2.Vpc".to_string(),
+            resource_identity: "vpc".to_string(),
+        };
+        let expected = error.to_string();
+
+        assert_eq!(
+            PlanErrorKind::ReplacementCannotCoexist(error).to_string(),
+            expected
+        );
+        assert_eq!(
+            expected,
+            "resource type 'ec2.Vpc' does not support create_before_destroy: the replacement cannot coexist with the original"
         );
     }
 

@@ -135,6 +135,6 @@ mod tests {
         let version = params
             .get("protocol_version")
             .expect("params should have protocol_version");
-        assert_eq!(version, &serde_json::Value::Number(1.into()));
+        assert_eq!(version, &serde_json::json!(crate::PROTOCOL_VERSION));
     }
 }

@@ -3,7 +3,9 @@ use super::*;
 use indexmap::IndexMap;
 
 use crate::explicit::ExplicitFields;
-use crate::plan::{MissingNameAttributeError, PlanErrorKind, PreventDestroyAction};
+use crate::plan::{
+    PlanErrorKind, PreventDestroyAction, ReplacementCannotCoexistError, SchemaNotRegisteredError,
+};
 use crate::resource::{ConcreteValue, DataSource};
 
 /// Build an `ExplicitFields::Struct` whose children are all `Leaf` —
@@ -434,7 +436,8 @@ fn create_before_destroy_without_unique_name_attribute_emits_plan_error() {
     schemas.insert(
         "",
         ResourceSchema::new("ec2.Vpc")
-            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only()),
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
+            .with_conflicting_replacement(),
         // No unique_name_attribute set
     );
 
@@ -463,14 +466,109 @@ fn create_before_destroy_without_unique_name_attribute_emits_plan_error() {
     );
     assert_eq!(
         &plan.errors()[0].kind,
-        &PlanErrorKind::MissingNameAttribute(MissingNameAttributeError {
+        &PlanErrorKind::ReplacementCannotCoexist(ReplacementCannotCoexistError {
             resource_type: "ec2.Vpc".to_string(),
             resource_identity: "my-vpc".to_string(),
         })
     );
     assert_eq!(
         plan.errors()[0].to_string(),
-        "ec2.Vpc.my-vpc: resource type 'ec2.Vpc' has no unique_name_attribute; create_before_destroy needs one to generate a temporary name"
+        "ec2.Vpc.my-vpc: resource type 'ec2.Vpc' does not support create_before_destroy: the replacement cannot coexist with the original"
+    );
+}
+
+#[test]
+fn create_before_destroy_with_coexisting_replacement_uses_no_temporary_name() {
+    use crate::schema::{AttributeSchema, AttributeType};
+
+    let mut resource = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
+        "cidr_block",
+        Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+    );
+    resource.directives.create_before_destroy = true;
+
+    let resources = vec![resource];
+
+    let mut current_states = HashMap::new();
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "cidr_block".to_string(),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+    );
+    current_states.insert(
+        ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+        State::existing(ResourceId::with_identity("ec2.Vpc", "my-vpc"), attrs),
+    );
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("ec2.Vpc")
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
+            .with_coexisting_replacement(),
+    );
+
+    let plan = create_plan(
+        &resources,
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_map(
+            current_states.clone(),
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        ),
+        &HashMap::new(),
+        &schemas,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+    );
+
+    assert!(!plan.has_errors(), "unexpected errors: {:?}", plan.errors());
+    assert_eq!(plan.effects().len(), 2);
+    let metadata = replacement_metadata(&plan, &ResourceId::with_identity("ec2.Vpc", "my-vpc"));
+    assert!(metadata.create_before_destroy);
+    assert!(
+        metadata.create_idx < metadata.delete_idx,
+        "create effect must be ordered before delete for CBD"
+    );
+    assert!(
+        metadata.temporary_name.is_none(),
+        "coexisting replacements must not generate a temporary name"
+    );
+    match &plan.effects()[metadata.create_idx] {
+        Effect::Create(to) => assert_eq!(
+            to.get_attr("cidr_block"),
+            Some(&Value::Concrete(ConcreteValue::String(
+                "10.1.0.0/16".to_string()
+            )))
+        ),
+        other => panic!("Expected replacement Create, got {:?}", other),
+    }
+    assert!(matches!(
+        &plan.effects()[metadata.delete_idx],
+        Effect::Delete { .. }
+    ));
+}
+
+#[test]
+fn create_before_destroy_with_missing_schema_reports_schema_not_registered() {
+    let resource = Resource::new("ec2.Vpc", "my-vpc");
+    let from = State::existing(
+        ResourceId::with_identity("ec2.Vpc", "my-vpc"),
+        HashMap::new(),
+    );
+    let schemas = SchemaRegistry::new();
+
+    let err = plan::temporary_name_for_cbd(&resource, &from, &schemas).unwrap_err();
+
+    assert_eq!(
+        PlanErrorKind::from(err),
+        PlanErrorKind::SchemaNotRegistered(SchemaNotRegisteredError {
+            resource_type: "ec2.Vpc".to_string(),
+            resource_identity: "my-vpc".to_string(),
+        })
     );
 }
 

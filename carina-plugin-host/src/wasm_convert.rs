@@ -17,7 +17,8 @@ use carina_core::resource::{
 };
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
-    ResourceSchema as CoreResourceSchema, StructField as CoreStructField, legacy_validator,
+    ResourceSchema as CoreResourceSchema, StructField as CoreStructField,
+    UniqueNameSpec as CoreUniqueNameSpec, legacy_validator,
 };
 use carina_core::value::{SerializationContext, SerializationError};
 use carina_core::wait::BindingPattern as CoreBindingPattern;
@@ -39,6 +40,12 @@ pub struct SchemaDecodeError {
 }
 
 impl SchemaDecodeError {
+    fn schema_json_parse(err: serde_json::Error) -> Self {
+        Self {
+            detail: format!("schema JSON parse error: {err}"),
+        }
+    }
+
     fn unsupported_custom_base(enclosing_custom_name: &str, base: &proto::AttributeType) -> Self {
         Self {
             detail: format!(
@@ -710,21 +717,28 @@ pub fn json_to_provider_info(json: &str) -> (String, String, String) {
     }
 }
 
-/// Reject a provider whose protocol is older than this host's
-/// carina_provider_protocol::PROTOCOL_VERSION. The SDK stamps the
-/// version it was compiled against into the info() envelope, so this is a
-/// compile-time fact of the provider's protocol crate, not a value the
-/// author sets. A provider predating the envelope omits the field ->
+/// Reject a provider whose protocol is outside this host's supported range.
+/// The SDK stamps the version it was compiled against into the info() envelope,
+/// so this is a compile-time fact of the provider's protocol crate, not a value
+/// the author sets. A provider predating the envelope omits the field ->
 /// deserializes to 0 -> below any host minimum (the carina#3364 class).
 /// carina#3365.
 pub fn check_protocol_version(info_json: &str) -> Result<(), String> {
     let envelope: proto::ProviderInfoEnvelope =
         serde_json::from_str(info_json).map_err(|e| format!("invalid provider info: {e}"))?;
     let host = carina_provider_protocol::PROTOCOL_VERSION;
-    if envelope.protocol_version < host {
+    let min = carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION;
+    if envelope.protocol_version < min {
         return Err(format!(
             "provider '{}' was built against protocol version {} but this host \
-             requires version {}; rebuild the provider against the current carina protocol",
+             requires at least version {}; rebuild the provider against the current carina protocol",
+            envelope.info.name, envelope.protocol_version, min
+        ));
+    }
+    if envelope.protocol_version > host {
+        return Err(format!(
+            "provider '{}' was built against protocol version {} but this host \
+             supports up to version {}; upgrade carina to load this provider",
             envelope.info.name, envelope.protocol_version, host
         ));
     }
@@ -733,7 +747,8 @@ pub fn check_protocol_version(info_json: &str) -> Result<(), String> {
 
 /// Deserialize JSON to a Vec of core ResourceSchemas.
 pub fn json_to_schemas(json: &str) -> Result<Vec<CoreResourceSchema>, SchemaDecodeError> {
-    let proto_schemas: Vec<proto::ResourceSchema> = serde_json::from_str(json).unwrap_or_default();
+    let proto_schemas: Vec<proto::ResourceSchema> =
+        serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
     proto_schemas.iter().map(proto_schema_to_core).collect()
 }
 
@@ -768,7 +783,7 @@ fn proto_schema_to_core(
             proto::SchemaKind::Managed => carina_core::schema::SchemaKind::Resource,
             proto::SchemaKind::DataSource => carina_core::schema::SchemaKind::DataSource,
         },
-        unique_name_attribute: s.unique_name_attribute.clone(),
+        unique_name: proto_unique_name_to_core(&s.unique_name),
         operation_config: s.operation_config.as_ref().map(|c| {
             carina_core::schema::OperationConfig {
                 delete_timeout_secs: c.delete_timeout_secs,
@@ -794,6 +809,16 @@ fn proto_schema_to_core(
             .map(|(k, v)| proto_attr_type_to_core(v).map(|attr_type| (k.clone(), attr_type)))
             .collect::<Result<_, _>>()?,
     })
+}
+
+fn proto_unique_name_to_core(spec: &proto::UniqueNameSpec) -> CoreUniqueNameSpec {
+    match spec {
+        proto::UniqueNameSpec::Attribute(attribute) => {
+            CoreUniqueNameSpec::Attribute(attribute.clone())
+        }
+        proto::UniqueNameSpec::Coexisting => CoreUniqueNameSpec::Coexisting,
+        proto::UniqueNameSpec::Conflicting => CoreUniqueNameSpec::Conflicting,
+    }
 }
 
 /// Reconstruct a validator function from serializable `ValidatorType` declarations.
@@ -1772,6 +1797,18 @@ mod tests {
     }
 
     #[test]
+    fn test_check_protocol_version_accepts_previous_supported_version() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 2);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 1);
+        let json = format!(
+            r#"{{"name":"aws","display_name":"AWS Provider","version":"1.0.0","protocol_version":{}}}"#,
+            carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION
+        );
+
+        assert!(check_protocol_version(&json).is_ok());
+    }
+
+    #[test]
     fn test_check_protocol_version_rejects_lower_version() {
         let err = check_protocol_version(
             r#"{"name":"aws","display_name":"AWS Provider","version":"1.0.0","protocol_version":0}"#,
@@ -1781,7 +1818,26 @@ mod tests {
         assert!(err.contains("provider 'aws'"));
         assert!(err.contains("protocol version 0"));
         assert!(err.contains(&format!(
-            "requires version {}",
+            "requires at least version {}",
+            carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION
+        )));
+    }
+
+    #[test]
+    fn test_check_protocol_version_rejects_future_version() {
+        let json = format!(
+            r#"{{"name":"aws","display_name":"AWS Provider","version":"1.0.0","protocol_version":{}}}"#,
+            carina_provider_protocol::PROTOCOL_VERSION + 1
+        );
+        let err = check_protocol_version(&json).unwrap_err();
+
+        assert!(err.contains("provider 'aws'"));
+        assert!(err.contains(&format!(
+            "protocol version {}",
+            carina_provider_protocol::PROTOCOL_VERSION + 1
+        )));
+        assert!(err.contains(&format!(
+            "supports up to version {}",
             carina_provider_protocol::PROTOCOL_VERSION
         )));
     }
@@ -1796,8 +1852,8 @@ mod tests {
         assert!(err.contains("provider 'old'"));
         assert!(err.contains("protocol version 0"));
         assert!(err.contains(&format!(
-            "requires version {}",
-            carina_provider_protocol::PROTOCOL_VERSION
+            "requires at least version {}",
+            carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION
         )));
     }
 
@@ -1805,6 +1861,28 @@ mod tests {
     fn test_json_to_schemas_empty() {
         let schemas = json_to_schemas("[]").unwrap();
         assert!(schemas.is_empty());
+    }
+
+    #[test]
+    fn test_json_to_schemas_malformed_unique_name_spec_returns_error() {
+        let err = json_to_schemas(
+            r#"[{
+                "resource_type":"s3.Bucket",
+                "attributes":{},
+                "unique_name_attribute":{"type":"attribute"}
+            }]"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("schema JSON parse error"),
+            "error should identify schema JSON parsing: {err}"
+        );
+        assert!(
+            err.contains("missing field `value`"),
+            "error should include serde detail: {err}"
+        );
     }
 
     #[test]
@@ -1896,7 +1974,10 @@ mod tests {
         assert_eq!(schema.resource_type, "ec2.SecurityGroup");
         assert_eq!(schema.description.as_deref(), Some("EC2 Security Group"));
         assert!(!schema.is_data_source());
-        assert_eq!(schema.unique_name_attribute.as_deref(), Some("group_name"));
+        assert_eq!(
+            schema.unique_name,
+            CoreUniqueNameSpec::Attribute("group_name".to_string())
+        );
 
         // Basic attribute types
         let desc_attr = schema
@@ -2095,7 +2176,7 @@ mod tests {
             attributes: HashMap::new(),
             description: None,
             kind: proto::SchemaKind::Managed,
-            unique_name_attribute: None,
+            unique_name: proto::UniqueNameSpec::Conflicting,
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
             exclusive_required: vec![],
@@ -2112,7 +2193,7 @@ mod tests {
             attributes: HashMap::new(),
             description: None,
             kind: proto::SchemaKind::Managed,
-            unique_name_attribute: None,
+            unique_name: proto::UniqueNameSpec::Conflicting,
             operation_config: None,
             validators: vec![],
             exclusive_required: vec![],
@@ -2131,7 +2212,7 @@ mod tests {
             attributes: HashMap::new(),
             description: None,
             kind: proto::SchemaKind::Managed,
-            unique_name_attribute: None,
+            unique_name: proto::UniqueNameSpec::Conflicting,
             operation_config: None,
             validators: vec![],
             exclusive_required: vec![vec![
@@ -2169,7 +2250,7 @@ mod tests {
             attributes: HashMap::new(),
             description: None,
             kind: proto::SchemaKind::Managed,
-            unique_name_attribute: None,
+            unique_name: proto::UniqueNameSpec::Conflicting,
             operation_config: None,
             validators: vec![],
             exclusive_required: vec![vec!["a".to_string(), "b".to_string()]],
@@ -2824,7 +2905,7 @@ mod tests {
             attributes: HashMap::new(),
             description: None,
             kind: proto::SchemaKind::Managed,
-            unique_name_attribute: None,
+            unique_name: proto::UniqueNameSpec::Conflicting,
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
             exclusive_required: vec![],

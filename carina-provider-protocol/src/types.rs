@@ -2,7 +2,9 @@
 //!
 //! These mirror carina-core types but are JSON-serializable across the process boundary.
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as DeError;
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -359,6 +361,88 @@ pub enum SchemaKind {
     DataSource,
 }
 
+/// Create-before-destroy uniqueness declaration for a resource schema.
+///
+/// Wire compatibility matrix:
+/// - `Attribute(name)` serializes as the legacy string form and deserializes
+///   from either that string or `{"type":"attribute","value":name}`.
+/// - `Conflicting` serializes as legacy `null`; absent/null legacy payloads
+///   also deserialize to `Conflicting`.
+/// - `Coexisting` has no legacy representation, so it serializes as
+///   `{"type":"coexisting"}`. Hosts that do not understand this version
+///   cannot honor that behavior and must fail through protocol/version checks.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum UniqueNameSpec {
+    /// User-chosen unique name attribute; CBD renames the replacement temporarily during the overlap window.
+    Attribute(String),
+    /// No unique name; a replacement coexists with the original, so CBD needs no temporary name.
+    Coexisting,
+    /// No unique name and the replacement conflicts with the original (server-side uniqueness/scoping); create_before_destroy is a plan-time error.
+    #[default]
+    Conflicting,
+}
+
+impl Serialize for UniqueNameSpec {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Attribute(attribute) => serializer.serialize_str(attribute),
+            Self::Coexisting => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("type", "coexisting")?;
+                map.end()
+            }
+            Self::Conflicting => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for UniqueNameSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::Null => Ok(Self::Conflicting),
+            serde_json::Value::String(attribute) => Ok(Self::Attribute(attribute)),
+            serde_json::Value::Object(map) => {
+                let tag = map
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        D::Error::custom(
+                            "unique_name_attribute tagged form missing string field `type`",
+                        )
+                    })?;
+                match tag {
+                    "attribute" => {
+                        let value = map
+                            .get("value")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                D::Error::custom(
+                                    "unique_name_attribute type `attribute` missing field `value`",
+                                )
+                            })?;
+                        Ok(Self::Attribute(value.to_string()))
+                    }
+                    "coexisting" => Ok(Self::Coexisting),
+                    "conflicting" => Ok(Self::Conflicting),
+                    other => Err(D::Error::custom(format!(
+                        "unknown unique_name_attribute type `{other}`; expected `attribute`, `coexisting`, or `conflicting`"
+                    ))),
+                }
+            }
+            other => Err(D::Error::custom(format!(
+                "unique_name_attribute must be a string, null, or tagged object; got {other}"
+            ))),
+        }
+    }
+}
+
 /// Schema types for resource validation and completion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceSchema {
@@ -368,8 +452,8 @@ pub struct ResourceSchema {
     pub description: Option<String>,
     #[serde(default)]
     pub kind: SchemaKind,
-    #[serde(default, alias = "name_attribute")]
-    pub unique_name_attribute: Option<String>,
+    #[serde(default, rename = "unique_name_attribute", alias = "name_attribute")]
+    pub unique_name: UniqueNameSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_config: Option<OperationConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -890,6 +974,162 @@ mod tests {
     }
 
     #[test]
+    fn resource_schema_unique_name_spec_deserializes_legacy_shapes() {
+        let string_schema: ResourceSchema = serde_json::from_str(
+            r#"{
+                "resource_type":"ec2.SecurityGroup",
+                "attributes":{},
+                "unique_name_attribute":"group_name"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            string_schema.unique_name,
+            UniqueNameSpec::Attribute("group_name".to_string())
+        );
+
+        let null_schema: ResourceSchema = serde_json::from_str(
+            r#"{
+                "resource_type":"ec2.Vpc",
+                "attributes":{},
+                "unique_name_attribute":null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(null_schema.unique_name, UniqueNameSpec::Conflicting);
+
+        let absent_schema: ResourceSchema = serde_json::from_str(
+            r#"{
+                "resource_type":"ec2.Vpc",
+                "attributes":{}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(absent_schema.unique_name, UniqueNameSpec::Conflicting);
+
+        let alias_schema: ResourceSchema = serde_json::from_str(
+            r#"{
+                "resource_type":"logs.LogGroup",
+                "attributes":{},
+                "name_attribute":"log_group_name"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            alias_schema.unique_name,
+            UniqueNameSpec::Attribute("log_group_name".to_string())
+        );
+    }
+
+    #[test]
+    fn resource_schema_unique_name_spec_deserializes_new_tagged_shapes() {
+        let attribute_schema: ResourceSchema = serde_json::from_str(
+            r#"{
+                "resource_type":"s3.Bucket",
+                "attributes":{},
+                "unique_name_attribute":{"type":"attribute","value":"bucket_name"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            attribute_schema.unique_name,
+            UniqueNameSpec::Attribute("bucket_name".to_string())
+        );
+
+        let coexists_schema: ResourceSchema = serde_json::from_str(
+            r#"{
+                "resource_type":"ec2.Vpc",
+                "attributes":{},
+                "unique_name_attribute":{"type":"coexisting"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(coexists_schema.unique_name, UniqueNameSpec::Coexisting);
+
+        let conflicting_schema: ResourceSchema = serde_json::from_str(
+            r#"{
+                "resource_type":"organizations.Organization",
+                "attributes":{},
+                "unique_name_attribute":{"type":"conflicting"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(conflicting_schema.unique_name, UniqueNameSpec::Conflicting);
+    }
+
+    #[test]
+    fn resource_schema_unique_name_spec_serializes_legacy_compatible_shapes() {
+        let cases = [
+            (
+                UniqueNameSpec::Attribute("bucket_name".to_string()),
+                serde_json::json!("bucket_name"),
+            ),
+            (
+                UniqueNameSpec::Coexisting,
+                serde_json::json!({"type":"coexisting"}),
+            ),
+            (UniqueNameSpec::Conflicting, serde_json::Value::Null),
+        ];
+
+        for (unique_name, expected) in cases {
+            let schema = ResourceSchema {
+                resource_type: "s3.Bucket".into(),
+                attributes: HashMap::new(),
+                description: None,
+                kind: SchemaKind::Managed,
+                unique_name,
+                operation_config: None,
+                validators: vec![],
+                exclusive_required: vec![],
+                defs: std::collections::BTreeMap::new(),
+            };
+
+            let json = serde_json::to_value(&schema).unwrap();
+            assert_eq!(json["unique_name_attribute"], expected);
+        }
+    }
+
+    #[test]
+    fn resource_schema_unique_name_spec_missing_attribute_value_reports_field() {
+        let err = serde_json::from_str::<ResourceSchema>(
+            r#"{
+                "resource_type":"s3.Bucket",
+                "attributes":{},
+                "unique_name_attribute":{"type":"attribute"}
+            }"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("unique_name_attribute"),
+            "error should name the field: {err}"
+        );
+        assert!(
+            err.contains("missing field `value`"),
+            "error should name the missing value field: {err}"
+        );
+    }
+
+    #[test]
+    fn resource_schema_unique_name_spec_unknown_tag_reports_tag() {
+        let err = serde_json::from_str::<ResourceSchema>(
+            r#"{
+                "resource_type":"ec2.Vpc",
+                "attributes":{},
+                "unique_name_attribute":{"type":"coexists"}
+            }"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("unknown unique_name_attribute type `coexists`"),
+            "error should name the unknown tag: {err}"
+        );
+    }
+
+    #[test]
     fn resource_schema_defs_roundtrip() {
         // carina#3340: the `defs` map carries cyclic struct definitions
         // (`Statement` -> `AndStatement` -> `List<Statement>` ...).
@@ -900,7 +1140,7 @@ mod tests {
             attributes: HashMap::new(),
             description: None,
             kind: SchemaKind::Managed,
-            unique_name_attribute: None,
+            unique_name: UniqueNameSpec::Conflicting,
             operation_config: None,
             validators: vec![],
             exclusive_required: vec![],

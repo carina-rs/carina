@@ -3,7 +3,7 @@ use super::*;
 use std::collections::HashSet;
 
 use crate::override_aware::OverrideAwareResources;
-use crate::plan::{MissingNameAttributeError, PlanErrorKind, PreventDestroyAction};
+use crate::plan::{PlanErrorKind, PreventDestroyAction, ReplacementCannotCoexistError};
 use crate::resource::{ConcreteValue, DeferredValue, ResourceIdentity};
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
@@ -409,14 +409,14 @@ fn auto_promote_with_missing_unique_name_attribute_emits_plan_error() {
     assert_eq!(plan.errors()[0].resource_id, vpc_id);
     assert_eq!(
         &plan.errors()[0].kind,
-        &PlanErrorKind::MissingNameAttribute(MissingNameAttributeError {
+        &PlanErrorKind::ReplacementCannotCoexist(ReplacementCannotCoexistError {
             resource_type: "ec2.Vpc".to_string(),
             resource_identity: "vpc".to_string(),
         })
     );
     assert_eq!(
         plan.errors()[0].to_string(),
-        "ec2.Vpc.my-vpc: resource type 'ec2.Vpc' has no unique_name_attribute; create_before_destroy needs one to generate a temporary name"
+        "ec2.Vpc.my-vpc: resource type 'ec2.Vpc' does not support create_before_destroy: the replacement cannot coexist with the original"
     );
 }
 
