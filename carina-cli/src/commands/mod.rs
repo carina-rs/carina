@@ -23,8 +23,7 @@ use carina_core::parser::{BackendConfig, ProviderContext};
 use carina_core::resource::{ConcreteValue, Value};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_state::{
-    BackendConfig as StateBackendConfig, BackendError, BackendLock, StateBackend,
-    resolve_backend_anchored,
+    BackendConfig as StateBackendConfig, BackendError, BackendLock, StateBackend, create_backend,
 };
 
 use crate::error::AppError;
@@ -92,7 +91,7 @@ pub struct VerifiedBackend {
 
 impl VerifiedBackend {
     pub async fn resolve(&self) -> Result<Box<dyn StateBackend>, BackendError> {
-        resolve_backend_anchored(self.state_config.as_ref(), &self.base_dir).await
+        create_backend(self.state_config.as_ref(), &self.base_dir).await
     }
 
     pub fn is_configured(&self) -> bool {

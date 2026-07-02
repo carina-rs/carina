@@ -20,7 +20,7 @@ use carina_core::resource::{
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
-    StateFile, StateUrl, create_backend, load_state_from_url, resolve_backend_anchored,
+    StateFile, StateUrl, create_backend, create_remote_backend, load_state_from_url,
     resolve_backend_for_read,
 };
 
@@ -324,10 +324,9 @@ pub async fn run_force_unlock(
     };
 
     // Bypasses verify_for_mutation by design. On drift, targets the OLD locked backend so users can unlock a stale migration.
-    let backend: Box<dyn StateBackend> =
-        resolve_backend_anchored(backend_config.as_ref(), base_dir)
-            .await
-            .map_err(AppError::Backend)?;
+    let backend: Box<dyn StateBackend> = create_backend(backend_config.as_ref(), base_dir)
+        .await
+        .map_err(AppError::Backend)?;
 
     println!("{}", "Force unlocking state...".yellow().bold());
     println!("Lock ID: {}", lock_id);
@@ -376,9 +375,11 @@ async fn load_state_file(
     )?;
     let parsed = loaded.parsed;
 
-    let backend: Box<dyn StateBackend> = resolve_backend_for_read(parsed.backend.as_ref())
-        .await
-        .map_err(AppError::Backend)?;
+    let base_dir = get_base_dir(path);
+    let backend: Box<dyn StateBackend> =
+        resolve_backend_for_read(parsed.backend.as_ref(), base_dir)
+            .await
+            .map_err(AppError::Backend)?;
 
     let state_file = backend.read_state().await.map_err(AppError::Backend)?;
     state_file
@@ -783,7 +784,7 @@ async fn run_state_bucket_delete(
     // Bypasses verify_for_mutation by design. The configured-bucket-name guard pins this to the NEW backend; for an orphaned OLD bucket, delete manually via the cloud console.
     // Create backend to get provider metadata
     let state_config = StateBackendConfig::from(backend_config);
-    let backend = create_backend(&state_config)
+    let backend = create_remote_backend(&state_config)
         .await
         .map_err(AppError::Backend)?;
 
@@ -1732,7 +1733,7 @@ mod tests {
     #[tokio::test]
     async fn force_unlock_without_backend_uses_local_backend() {
         // When no backend block is configured, run_force_unlock should
-        // fall back to create_local_backend() instead of erroring with
+        // fall back to the anchored default local backend instead of erroring with
         // "No backend configuration found. force-unlock requires a backend."
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         // Use the state fixture which has no backend block

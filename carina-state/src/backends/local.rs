@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::time::sleep as async_sleep;
@@ -47,11 +47,6 @@ impl LocalBackend {
     /// Default state file name
     pub const DEFAULT_STATE_FILE: &'static str = "carina.state.json";
 
-    /// Create a new LocalBackend with default paths (carina.state.json in current directory)
-    pub fn new() -> Self {
-        Self::with_path(PathBuf::from(Self::DEFAULT_STATE_FILE))
-    }
-
     /// Create a new LocalBackend with a specific state file path
     pub fn with_path(state_path: PathBuf) -> Self {
         let lock_path = state_path.with_extension("lock");
@@ -62,12 +57,17 @@ impl LocalBackend {
         }
     }
 
-    /// Create a LocalBackend from configuration
-    pub fn from_config(config: &BackendConfig) -> BackendResult<Self> {
+    /// Create a LocalBackend from configuration, anchoring relative paths at `base_dir`.
+    pub fn from_config(config: &BackendConfig, base_dir: &Path) -> BackendResult<Self> {
         let path = config
             .get_string("path")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(Self::DEFAULT_STATE_FILE));
+        let path = if path.is_absolute() {
+            path
+        } else {
+            base_dir.join(path)
+        };
 
         Ok(Self::with_path(path))
     }
@@ -222,12 +222,6 @@ impl LocalBackend {
                 err
             ))),
         }
-    }
-}
-
-impl Default for LocalBackend {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -743,15 +737,21 @@ mod tests {
             attributes: HashMap::new(),
         };
 
-        let backend = LocalBackend::from_config(&config).unwrap();
-        assert_eq!(backend.state_path(), &PathBuf::from("carina.state.json"));
+        let base_dir = tempdir().unwrap();
+        let backend = LocalBackend::from_config(&config, base_dir.path()).unwrap();
+        assert_eq!(
+            backend.state_path(),
+            &base_dir.path().join("carina.state.json")
+        );
     }
 
     #[tokio::test]
-    async fn test_local_backend_custom_path() {
+    async fn test_local_backend_relative_path_is_anchored() {
         use carina_core::resource::{ConcreteValue, Value};
         use std::collections::HashMap;
 
+        let cwd = std::env::current_dir().unwrap();
+        let base_dir = tempdir().unwrap();
         let mut attributes = HashMap::new();
         attributes.insert(
             "path".to_string(),
@@ -763,8 +763,36 @@ mod tests {
             attributes,
         };
 
-        let backend = LocalBackend::from_config(&config).unwrap();
-        assert_eq!(backend.state_path(), &PathBuf::from("custom.state.json"));
+        let backend = LocalBackend::from_config(&config, base_dir.path()).unwrap();
+        assert_eq!(
+            backend.state_path(),
+            &base_dir.path().join("custom.state.json")
+        );
+        assert_ne!(backend.state_path(), &cwd.join("custom.state.json"));
+    }
+
+    #[tokio::test]
+    async fn test_local_backend_absolute_path_is_preserved() {
+        use carina_core::resource::{ConcreteValue, Value};
+        use std::collections::HashMap;
+
+        let base_dir = tempdir().unwrap();
+        let state_path = tempdir().unwrap().path().join("absolute.state.json");
+        let mut attributes = HashMap::new();
+        attributes.insert(
+            "path".to_string(),
+            Value::Concrete(ConcreteValue::String(
+                state_path.to_string_lossy().into_owned(),
+            )),
+        );
+
+        let config = BackendConfig {
+            backend_type: "local".to_string(),
+            attributes,
+        };
+
+        let backend = LocalBackend::from_config(&config, base_dir.path()).unwrap();
+        assert_eq!(backend.state_path(), &state_path);
     }
 
     #[tokio::test]
@@ -905,7 +933,7 @@ mod tests {
 
     #[test]
     fn test_local_backend_provider_metadata() {
-        let backend = LocalBackend::new();
+        let backend = LocalBackend::with_path(PathBuf::from("test.state.json"));
         assert_eq!(backend.provider_name(), None);
         assert_eq!(backend.resource_type(), None);
         assert_eq!(backend.resource_definition("test"), None);
