@@ -83,6 +83,10 @@ impl ApplyCancellationFixture {
         self
     }
 
+    pub(super) fn write_state(&self, state: &carina_state::StateFile) {
+        self.base.write_state(state);
+    }
+
     pub(super) fn state_path(&self) -> &std::path::Path {
         self.base.state_path()
     }

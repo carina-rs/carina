@@ -3771,6 +3771,304 @@ impl Provider for RecordingMockProvider {
     }
 }
 
+struct CascadeReplaceProvider {
+    create_log: Arc<Mutex<CreateLog>>,
+    call_log: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl CascadeReplaceProvider {
+    fn new() -> Self {
+        Self {
+            create_log: Arc::new(Mutex::new(Vec::new())),
+            call_log: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn create_calls(&self) -> Vec<(String, HashMap<String, Value>)> {
+        self.create_log.lock().unwrap().clone()
+    }
+
+    fn calls(&self) -> Vec<(String, String)> {
+        self.call_log.lock().unwrap().clone()
+    }
+}
+
+impl Provider for CascadeReplaceProvider {
+    fn name(&self) -> &str {
+        "cascade_replace"
+    }
+
+    fn read(
+        &self,
+        _id: &ResourceId,
+        _identifier: Option<&str>,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { Err(ProviderError::internal("read not used")) })
+    }
+
+    fn read_data_source(&self, _resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
+    }
+
+    fn create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
+        let id = id.clone();
+        let attrs = request.resource.as_resource().resolved_attributes();
+        self.call_log
+            .lock()
+            .unwrap()
+            .push(("create".to_string(), id.to_string()));
+        self.create_log
+            .lock()
+            .unwrap()
+            .push((id.to_string(), attrs.clone()));
+
+        Box::pin(async move {
+            if id.resource_type == "ec2.Vpc" {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                return Ok(crate::provider::CreateOutcome::Success {
+                    state: State::existing(
+                        id,
+                        HashMap::from([(
+                            "vpc_id".to_string(),
+                            Value::Concrete(ConcreteValue::String("vpc-new".to_string())),
+                        )]),
+                    )
+                    .with_identifier("vpc-new"),
+                });
+            }
+
+            if id.resource_type == "ec2.Subnet" {
+                return Ok(crate::provider::CreateOutcome::Success {
+                    state: State::existing(
+                        id,
+                        HashMap::from([(
+                            "subnet_id".to_string(),
+                            Value::Concrete(ConcreteValue::String("subnet-new".to_string())),
+                        )]),
+                    )
+                    .with_identifier("subnet-new"),
+                });
+            }
+
+            Err(ProviderError::internal(format!("unexpected create {id}")))
+        })
+    }
+
+    fn update(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
+        Box::pin(async { Err(ProviderError::internal("update not used")) })
+    }
+
+    fn delete(
+        &self,
+        id: &ResourceId,
+        _identifier: &str,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        let id = id.clone();
+        self.call_log
+            .lock()
+            .unwrap()
+            .push(("delete".to_string(), id.to_string()));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+#[tokio::test]
+async fn cascading_replacement_child_create_uses_new_parent_binding() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::differ::create_plan_with_cascades;
+    use crate::override_aware::OverrideAwareResources;
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+
+    fn string(value: &str) -> Value {
+        Value::Concrete(ConcreteValue::String(value.to_string()))
+    }
+
+    fn state(id: &ResourceId, attrs: &[(&str, Value)], identifier: &str) -> State {
+        State::existing(
+            id.clone(),
+            attrs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), value.clone()))
+                .collect(),
+        )
+        .with_identifier(identifier)
+    }
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("ec2.Vpc")
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
+            .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).read_only())
+            .with_coexisting_replacement(),
+    );
+    schemas.insert(
+        "",
+        ResourceSchema::new("ec2.Subnet")
+            .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).create_only())
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only())
+            .attribute(
+                AttributeSchema::new("availability_zone", AttributeType::string()).create_only(),
+            )
+            .attribute(AttributeSchema::new("subnet_id", AttributeType::string()).read_only())
+            .with_coexisting_replacement(),
+    );
+
+    let mut managed_vpc = Resource::new("ec2.Vpc", "vpc")
+        .with_binding("vpc")
+        .with_attribute("cidr_block", string("10.221.0.0/16"));
+    managed_vpc.directives.create_before_destroy = true;
+    let unresolved_vpc = managed_vpc.clone();
+
+    let managed_subnet = Resource::new("ec2.Subnet", "subnet")
+        .with_binding("subnet")
+        .with_attribute("vpc_id", string("vpc-old"))
+        .with_attribute("cidr_block", string("10.221.1.0/24"))
+        .with_attribute("availability_zone", string("ap-northeast-1c"));
+    let unresolved_subnet = Resource::new("ec2.Subnet", "subnet")
+        .with_binding("subnet")
+        .with_attribute("vpc_id", Value::resource_ref("vpc", "vpc_id", vec![]))
+        .with_attribute("cidr_block", string("10.221.1.0/24"))
+        .with_attribute("availability_zone", string("ap-northeast-1c"));
+
+    let vpc_id = managed_vpc.id.clone();
+    let subnet_id = managed_subnet.id.clone();
+    let current_states = HashMap::from([
+        (
+            vpc_id.clone(),
+            state(
+                &vpc_id,
+                &[
+                    ("cidr_block", string("10.220.0.0/16")),
+                    ("vpc_id", string("vpc-old")),
+                ],
+                "vpc-old",
+            ),
+        ),
+        (
+            subnet_id.clone(),
+            state(
+                &subnet_id,
+                &[
+                    ("vpc_id", string("vpc-old")),
+                    ("cidr_block", string("10.220.1.0/24")),
+                    ("availability_zone", string("ap-northeast-1a")),
+                ],
+                "subnet-old",
+            ),
+        ),
+    ]);
+    let plan_input_states = crate::resource::into_plan_input_map(
+        current_states.clone(),
+        &schemas,
+        &[managed_vpc.clone(), managed_subnet.clone()],
+    );
+    let override_aware = OverrideAwareResources::from_parts_for_tests(
+        vec![managed_vpc, managed_subnet],
+        vec![unresolved_vpc, unresolved_subnet],
+    );
+    let plan = create_plan_with_cascades(
+        &override_aware,
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &plan_input_states,
+        &HashMap::new(),
+        &schemas,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+    );
+    assert_eq!(plan.replace_display_info().count(), 2);
+
+    let unresolved_resources = override_aware.unresolved_by_resolved_id();
+    let deps = build_dependency_analysis(
+        plan.effects(),
+        &unresolved_resources,
+        &[],
+        ScheduleInputs::Apply,
+    )
+    .into_deps_of();
+    let vpc_create_idx = plan
+        .effects()
+        .iter()
+        .position(|effect| matches!(effect, Effect::Create(resource) if resource.id == vpc_id))
+        .expect("plan should contain replacement VPC create");
+    let subnet_create_idx = plan
+        .effects()
+        .iter()
+        .position(|effect| matches!(effect, Effect::Create(resource) if resource.id == subnet_id))
+        .expect("plan should contain replacement subnet create");
+    assert!(
+        deps[&subnet_create_idx].contains(&vpc_create_idx),
+        "subnet create must depend on replacement VPC create; deps: {deps:?}; effects: {:?}",
+        plan.effects()
+    );
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: override_aware.resources(),
+        compositions: &[],
+        data_sources: &[],
+        current_states: &plan_input_states,
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+    let provider = CascadeReplaceProvider::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &unresolved_resources,
+        compositions: &[],
+        bindings,
+        current_states,
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+    let observer = MockObserver::new();
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+    assert_eq!(result.failure_count, 0, "events: {:?}", observer.events());
+
+    let calls = provider.create_calls();
+    let subnet_create = calls
+        .iter()
+        .find(|(id, _)| id == "ec2.Subnet.subnet")
+        .unwrap_or_else(|| panic!("subnet create missing from calls: {calls:?}"));
+    assert_eq!(
+        subnet_create.1.get("vpc_id"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "vpc-new".to_string()
+        ))),
+        "subnet create must resolve vpc.vpc_id from the replacement VPC state; calls: {calls:?}"
+    );
+
+    let call_log = provider.calls();
+    let vpc_create_pos = call_position(&call_log, "create", "ec2.Vpc.vpc");
+    let subnet_create_pos = call_position(&call_log, "create", "ec2.Subnet.subnet");
+    assert!(
+        vpc_create_pos < subnet_create_pos,
+        "replacement parent create must dispatch before dependent child create; calls: {call_log:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_wait_effect_polls_then_unblocks_downstream() {
     use crate::wait::predicate::{AttrPath, WaitPredicate};

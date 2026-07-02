@@ -1,12 +1,18 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use carina_core::effect::PlanOp;
-use carina_core::provider::{
-    BoxFuture, CreateOutcome, DeleteRequest, ProviderResult, ReadRequest, UpdateOutcome,
-    UpdateRequest,
+use carina_core::executor::{
+    DeferredDataSourceReads, ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionOutcome,
+    UnresolvedResource, execute_plan,
 };
-use carina_core::resource::{Directives, ResolvedResource, Resource};
+use carina_core::provider::{
+    BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, ProviderResult, ReadRequest,
+    UpdateOutcome, UpdateRequest,
+};
+use carina_core::resource::{Directives, ResolvedResource, Resource, Value};
+use carina_core::value::canonicalize_resources_with_schemas;
 
 enum ReadBehavior {
     NotFound,
@@ -22,6 +28,167 @@ struct ReadWithRetryProvider {
     behavior: ReadBehavior,
     read_calls: AtomicUsize,
     data_source_read_calls: AtomicUsize,
+}
+
+struct NoopExecutionObserver;
+
+impl ExecutionObserver for NoopExecutionObserver {
+    fn on_event(&self, _event: &ExecutionEvent) {}
+}
+
+struct CascadeAwsccFactory;
+
+impl ProviderFactory for CascadeAwsccFactory {
+    fn name(&self) -> &str {
+        "awscc"
+    }
+
+    fn display_name(&self) -> &str {
+        "AWSCC cascade test provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::new()
+    }
+
+    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        "ap-northeast-1".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &IndexMap<String, Value>,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async { Ok(Box::new(CascadeCreateProvider::default()) as Box<dyn Provider>) })
+    }
+
+    fn schemas(&self) -> Vec<ResourceSchema> {
+        vec![
+            ResourceSchema::new("ec2.Vpc")
+                .attribute(
+                    AttributeSchema::new("cidr_block", AttributeType::string()).create_only(),
+                )
+                .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).read_only())
+                .with_coexisting_replacement(),
+            ResourceSchema::new("ec2.Subnet")
+                .attribute(AttributeSchema::new("vpc_id", AttributeType::string()).create_only())
+                .attribute(
+                    AttributeSchema::new("cidr_block", AttributeType::string()).create_only(),
+                )
+                .attribute(
+                    AttributeSchema::new("availability_zone", AttributeType::string())
+                        .create_only(),
+                )
+                .attribute(AttributeSchema::new("subnet_id", AttributeType::string()).read_only())
+                .with_coexisting_replacement(),
+        ]
+    }
+}
+
+#[derive(Clone, Default)]
+struct CascadeCreateProvider {
+    creates: CreateCalls,
+}
+
+type CreateCall = (String, HashMap<String, Value>);
+type CreateCalls = Arc<Mutex<Vec<CreateCall>>>;
+
+impl CascadeCreateProvider {
+    fn create_calls(&self) -> Vec<CreateCall> {
+        self.creates.lock().unwrap().clone()
+    }
+}
+
+impl Provider for CascadeCreateProvider {
+    fn name(&self) -> &str {
+        "cascade_create"
+    }
+
+    fn read(
+        &self,
+        _id: &ResourceId,
+        _identifier: Option<&str>,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { Err(ProviderError::internal("read not used")) })
+    }
+
+    fn read_data_source(
+        &self,
+        _resource: &carina_core::resource::DataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
+    }
+
+    fn create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
+        let id = id.clone();
+        let attrs = request.resource.as_resource().resolved_attributes();
+        self.creates
+            .lock()
+            .unwrap()
+            .push((id.to_string(), attrs.clone()));
+
+        Box::pin(async move {
+            if id.resource_type == "ec2.Vpc" {
+                return Ok(CreateOutcome::Success {
+                    state: State::existing(
+                        id,
+                        HashMap::from([(
+                            "vpc_id".to_string(),
+                            Value::Concrete(ConcreteValue::String("vpc-new".to_string())),
+                        )]),
+                    )
+                    .with_identifier("vpc-new"),
+                });
+            }
+
+            if id.resource_type == "ec2.Subnet" {
+                return Ok(CreateOutcome::Success {
+                    state: State::existing(
+                        id,
+                        HashMap::from([(
+                            "subnet_id".to_string(),
+                            Value::Concrete(ConcreteValue::String("subnet-new".to_string())),
+                        )]),
+                    )
+                    .with_identifier("subnet-new"),
+                });
+            }
+
+            Err(ProviderError::internal(format!("unexpected create {id}")))
+        })
+    }
+
+    fn update(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
+        Box::pin(async { Err(ProviderError::internal("update not used")) })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 impl ReadWithRetryProvider {
@@ -1557,6 +1724,196 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
             "desired state key must exist after materialized move"
         );
     }
+}
+
+#[tokio::test]
+async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_identity_reconcile() {
+    use carina_core::binding_index::ResolvedBindings;
+    use carina_core::effect::Effect;
+    use carina_core::parser::{ProviderContext, parse};
+    use carina_state::state::{ResourceState, StateFile};
+    use tokio_util::sync::CancellationToken;
+
+    fn string(value: &str) -> Value {
+        Value::Concrete(ConcreteValue::String(value.to_string()))
+    }
+
+    fn compute_initial_anonymous_ids(
+        ctx: &WiringContext,
+        parsed: &mut carina_core::parser::ParsedFile,
+    ) {
+        let canonical = canonicalize_resources_with_schemas(&mut parsed.resources, ctx.schemas());
+        let errors = compute_anonymous_identifiers_with_ctx(ctx, canonical, &parsed.providers);
+        assert!(errors.is_empty(), "anonymous id setup failed: {errors:?}");
+    }
+
+    fn concrete_subnet_identity(ctx: &WiringContext, providers: &[ProviderConfig]) -> String {
+        let mut resources = vec![
+            Resource::with_provider("awscc", "ec2.Subnet", "", None)
+                .with_attribute("vpc_id", string("vpc-old"))
+                .with_attribute("cidr_block", string("10.220.1.0/24"))
+                .with_attribute("availability_zone", string("ap-northeast-1c")),
+        ];
+        let canonical = canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
+        let errors = compute_anonymous_identifiers_with_ctx(ctx, canonical, providers);
+        assert!(errors.is_empty(), "state id setup failed: {errors:?}");
+        resources[0].id.identity_or_empty().to_string()
+    }
+
+    let source = r#"
+        provider awscc {
+        }
+
+        let vpc = awscc.ec2.Vpc {
+            cidr_block = "10.221.0.0/16"
+            directives {
+                create_before_destroy = true
+            }
+        }
+
+        awscc.ec2.Subnet {
+            vpc_id = vpc.vpc_id
+            cidr_block = "10.221.1.0/24"
+            availability_zone = "ap-northeast-1c"
+        }
+    "#;
+
+    let ctx = WiringContext::new(vec![Box::new(CascadeAwsccFactory)]);
+    let mut parsed = parse(source, &ProviderContext::default()).expect("parse fixture");
+    let mut unresolved_parsed = parsed.clone();
+    compute_initial_anonymous_ids(&ctx, &mut parsed);
+    compute_initial_anonymous_ids(&ctx, &mut unresolved_parsed);
+
+    let unresolved_subnet_key_before_plan = unresolved_parsed
+        .resources
+        .iter()
+        .find(|resource| resource.id.resource_type == "ec2.Subnet")
+        .expect("anonymous subnet should parse")
+        .id
+        .clone();
+    let state_subnet_identity = concrete_subnet_identity(&ctx, &parsed.providers);
+
+    let mut vpc_state = ResourceState::new("ec2.Vpc", "vpc", "awscc")
+        .with_identifier("vpc-old")
+        .with_attribute("cidr_block", serde_json::json!("10.220.0.0/16"))
+        .with_attribute("vpc_id", serde_json::json!("vpc-old"));
+    vpc_state.binding = Some("vpc".to_string());
+
+    let mut subnet_state = ResourceState::new("ec2.Subnet", &state_subnet_identity, "awscc")
+        .with_identifier("subnet-old")
+        .with_attribute("vpc_id", serde_json::json!("vpc-old"))
+        .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
+        .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
+    subnet_state.dependency_bindings.insert("vpc".to_string());
+
+    let mut state_file = StateFile::new();
+    state_file.resources.push(vpc_state);
+    state_file.resources.push(subnet_state);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan_ctx = create_plan_from_parsed_with_upstream_with_ctx(
+        &ctx,
+        &parsed,
+        &unresolved_parsed.resources,
+        &unresolved_parsed.data_sources,
+        &Some(state_file),
+        false,
+        &HashMap::new(),
+        &StateBlockClaims::empty(),
+        &ResolvedStateBlockTargets::default(),
+        tmp.path(),
+    )
+    .await
+    .expect("plan should build");
+
+    let subnet_create = plan_ctx
+        .plan
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Create(resource) if resource.id.resource_type == "ec2.Subnet" => {
+                Some(resource.id.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "plan should contain anonymous subnet replacement create; summary: {:?}; effects: {:?}; errors: {:?}",
+                plan_ctx.plan.summary(),
+                plan_ctx.plan.effects(),
+                plan_ctx.plan.errors()
+            )
+        });
+    let unresolved_keys: Vec<String> = plan_ctx
+        .unresolved_resources
+        .iter()
+        .map(|resource| resource.id.to_string())
+        .collect();
+
+    let unresolved_resources: HashMap<ResourceId, UnresolvedResource> = plan_ctx
+        .unresolved_resources
+        .iter()
+        .map(|resource| {
+            (
+                resource.id.clone(),
+                UnresolvedResource::from_pre_resolve(resource.clone()),
+            )
+        })
+        .collect();
+    let plan_input_states = carina_core::resource::into_plan_input_map(
+        plan_ctx.current_states.clone(),
+        ctx.schemas(),
+        &plan_ctx.sorted_resources,
+    );
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: &plan_ctx.sorted_resources,
+        compositions: &[],
+        data_sources: &plan_ctx.data_sources,
+        current_states: &plan_input_states,
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+
+    let provider = CascadeCreateProvider::default();
+    let input = ExecutionInput {
+        plan: &plan_ctx.plan,
+        unresolved_resources: &unresolved_resources,
+        compositions: &[],
+        bindings,
+        current_states: plan_ctx.current_states,
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &carina_core::provider::NoopNormalizer,
+        provider_configs: &parsed.providers,
+        factories: ctx.factories(),
+        schemas: ctx.schemas(),
+        parallelism: carina_core::executor::TEST_UNCAPPED,
+    };
+    let outcome = execute_plan(
+        &provider,
+        input,
+        &NoopExecutionObserver,
+        CancellationToken::new(),
+    )
+    .await;
+    let result = match outcome {
+        ExecutionOutcome::Completed(result) => result,
+        ExecutionOutcome::Cancelled(_) => panic!("test plan should not be cancelled"),
+    };
+    assert_eq!(result.failure_count, 0);
+
+    let create_calls = provider.create_calls();
+    let subnet_call = create_calls
+        .iter()
+        .find(|(id, _)| id.contains(".ec2.Subnet."))
+        .unwrap_or_else(|| panic!("subnet create missing from calls: {create_calls:?}"));
+    assert_eq!(
+        subnet_call.1.get("vpc_id"),
+        Some(&string("vpc-new")),
+        "anonymous subnet create must re-resolve vpc.vpc_id from the replacement VPC state. \
+         unresolved key before plan: {unresolved_subnet_key_before_plan}; \
+         state identity: {state_subnet_identity}; effect id: {subnet_create}; \
+         unresolved map keys: {unresolved_keys:?}; calls: {create_calls:?}"
+    );
 }
 
 #[tokio::test]

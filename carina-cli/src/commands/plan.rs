@@ -50,14 +50,15 @@ pub struct PlanFile {
     pub backend_config: Option<BackendConfig>,
     /// The plan (effects)
     pub plan: Plan,
-    /// Resources sorted by dependencies (for post-apply state saving)
+    /// Pre-resolution resources sorted by dependencies and keyed with their
+    /// paired resolved IDs (for post-apply state saving).
     pub sorted_resources: Vec<Resource>,
-    /// Pre-resolution resources captured before ResourceRef substitution.
+    /// Pre-resolution resources captured before ResourceRef substitution and
+    /// stored in the same order as `sorted_resources`.
     ///
-    /// The saved-plan apply path uses this snapshot for dependency analysis
-    /// and apply-time reference re-resolution. `sorted_resources` is already
-    /// resolved by plan time, so using it here would erase attribute-level
-    /// read information and disable update-update relaxation.
+    /// The saved-plan apply path zips this snapshot with `sorted_resources`
+    /// and keys by the sorted resource ID for dependency analysis and
+    /// apply-time reference re-resolution.
     pub unresolved_resources: Vec<Resource>,
     /// Virtual resources (module-call attribute containers) emitted
     /// by module expansion at plan time (carina#3248). Persisted so
@@ -451,7 +452,7 @@ pub async fn run_plan(
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let mut parsed = loaded.parsed;
-    let mut unresolved_parsed = loaded.unresolved_parsed;
+    let unresolved_parsed = loaded.unresolved_parsed;
 
     let base_dir = get_base_dir(path);
     validate_and_resolve_with_config(&mut parsed, base_dir, false)?;
@@ -608,7 +609,6 @@ pub async fn run_plan(
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let wiring = WiringContext::new(factories);
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    reconcile_prefixed_names(&mut unresolved_parsed.resources, &state_file);
     let crate::wiring::StateBlockResolution {
         claims: state_block_claims,
         targets: resolved_state_block_targets,
@@ -629,27 +629,11 @@ pub async fn run_plan(
             },
             &state_block_claims,
         );
-        carina_core::module_resolver::reconcile_anonymous_module_instances(
-            &mut unresolved_parsed.resources,
-            &|provider, resource_type| {
-                sf.resources_by_type(provider, resource_type)
-                    .into_iter()
-                    .map(|r| r.identity.clone())
-                    .collect()
-            },
-            &state_block_claims,
-        );
     }
     if let Some(sf) = state_file.as_mut() {
         reconcile_anonymous_identifiers_with_ctx(
             &wiring,
             &mut parsed.resources,
-            sf,
-            &state_block_claims,
-        );
-        reconcile_anonymous_identifiers_with_ctx(
-            &wiring,
-            &mut unresolved_parsed.resources,
             sf,
             &state_block_claims,
         );

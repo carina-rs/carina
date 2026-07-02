@@ -307,7 +307,7 @@ pub fn create_plan_with_cascades(
     orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
     wait_bindings: &[WaitBinding],
 ) -> Plan {
-    let unresolved_managed = managed.unresolved_resources();
+    let unresolved_managed = managed.paired_unresolved_resources();
     let managed = managed.resources();
     let mut build = create_plan_parts(
         managed,
@@ -324,7 +324,7 @@ pub fn create_plan_with_cascades(
     cascade_dependent_updates(
         &mut build.plan,
         &mut build.pending_replaces,
-        unresolved_managed,
+        &unresolved_managed,
         current_states,
         registry,
     );
