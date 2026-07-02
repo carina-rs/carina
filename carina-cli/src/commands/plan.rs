@@ -12,10 +12,7 @@ use carina_core::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, 
 use carina_core::value::{
     redact_secrets_in_plan, redact_secrets_in_resource, redact_secrets_in_state,
 };
-use carina_state::{
-    BackendConfig as StateBackendConfig, StateBackend, StateFile, create_backend,
-    create_local_backend, resolve_backend_anchored,
-};
+use carina_state::{BackendConfig as StateBackendConfig, StateBackend, StateFile, create_backend};
 
 use super::{
     BackendDriftStatus, drift_warning, inspect_backend_drift, validate_and_resolve_with_config,
@@ -492,13 +489,9 @@ pub async fn run_plan(
     let mut state_file: Option<StateFile> = None;
 
     let plan_backend: Box<dyn StateBackend> = if let Some(config) = plan_backend_config.as_ref() {
-        let backend = if use_locked_backend {
-            resolve_backend_anchored(Some(config), base_dir)
-                .await
-                .map_err(AppError::Backend)?
-        } else {
-            create_backend(config).await.map_err(AppError::Backend)?
-        };
+        let backend = create_backend(Some(config), base_dir)
+            .await
+            .map_err(AppError::Backend)?;
 
         let bucket_exists = backend.bucket_exists().await.map_err(AppError::Backend)?;
 
@@ -568,7 +561,9 @@ pub async fn run_plan(
         // Use local backend by default. Plan is read-only; drop any
         // pending-migration token (carina#3315 — lock-held callers
         // persist instead).
-        let backend = create_local_backend();
+        let backend = create_backend(None, base_dir)
+            .await
+            .map_err(AppError::Backend)?;
         state_file = backend
             .read_state()
             .await
@@ -1180,7 +1175,7 @@ async fn build_upstream_backend(
     // downstream process's CWD.
     let upstream_backend_config = loaded.parsed.backend.as_ref().map(StateBackendConfig::from);
     let backend: Box<dyn StateBackend> =
-        resolve_backend_anchored(upstream_backend_config.as_ref(), source_abs)
+        create_backend(upstream_backend_config.as_ref(), source_abs)
             .await
             .map_err(AppError::Backend)?;
 

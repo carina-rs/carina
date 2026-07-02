@@ -8,20 +8,39 @@ pub use local::LocalBackend;
 pub use s3::S3Backend;
 pub use url::{StateUrl, load_state_from_url};
 
+use std::path::Path;
+
 use crate::backend::{BackendConfig, BackendError, BackendResult, StateBackend};
 
-/// Create a backend from configuration
+/// Create a backend from configuration, anchoring local state paths at `base_dir`.
 ///
 /// This function dispatches to the appropriate backend implementation
-/// based on the backend_type in the configuration.
-pub async fn create_backend(config: &BackendConfig) -> BackendResult<Box<dyn StateBackend>> {
+/// based on the backend_type in the configuration. Relative local backend
+/// paths, including the default when no backend is configured, are resolved
+/// relative to `base_dir`.
+pub async fn create_backend(
+    config: Option<&BackendConfig>,
+    base_dir: &Path,
+) -> BackendResult<Box<dyn StateBackend>> {
+    match config {
+        Some(config) => create_configured_backend(config, base_dir).await,
+        None => Ok(Box::new(LocalBackend::with_path(
+            base_dir.join(LocalBackend::DEFAULT_STATE_FILE),
+        ))),
+    }
+}
+
+async fn create_configured_backend(
+    config: &BackendConfig,
+    base_dir: &Path,
+) -> BackendResult<Box<dyn StateBackend>> {
     match config.backend_type.as_str() {
         "s3" => {
             let backend = S3Backend::from_config(config).await?;
             Ok(Box::new(backend))
         }
         "local" => {
-            let backend = LocalBackend::from_config(config)?;
+            let backend = LocalBackend::from_config(config, base_dir)?;
             Ok(Box::new(backend))
         }
         // Future backends:
@@ -31,11 +50,18 @@ pub async fn create_backend(config: &BackendConfig) -> BackendResult<Box<dyn Sta
     }
 }
 
-/// Create a default local backend
+/// Create a non-local backend from configuration.
 ///
-/// This is used when no backend is configured in the .crn file.
-pub fn create_local_backend() -> Box<dyn StateBackend> {
-    Box::new(LocalBackend::new())
+/// Use this for metadata-only paths, such as backend bucket management, where
+/// the operation is meaningful only for remote backends and should reject a
+/// local backend instead of constructing one.
+pub async fn create_remote_backend(config: &BackendConfig) -> BackendResult<Box<dyn StateBackend>> {
+    if config.is_local() {
+        return Err(BackendError::Configuration(
+            "Local backend does not manage a remote state bucket".to_string(),
+        ));
+    }
+    create_configured_backend(config, Path::new(".")).await
 }
 
 /// Resolve a backend from an optional parser BackendConfig for read-only use.
@@ -44,47 +70,19 @@ pub fn create_local_backend() -> Box<dyn StateBackend> {
 /// appropriate backend. If no config is provided, falls back to a local backend.
 pub async fn resolve_backend_for_read(
     backend_config: Option<&carina_core::parser::BackendConfig>,
+    base_dir: &Path,
 ) -> BackendResult<Box<dyn StateBackend>> {
     if let Some(config) = backend_config {
         let state_config = BackendConfig::from(config);
-        create_backend(&state_config).await
+        create_backend(Some(&state_config), base_dir).await
     } else {
-        Ok(create_local_backend())
-    }
-}
-
-/// Resolve a backend, anchoring a local backend's relative state `path`
-/// (or the unset default) at `base_dir` instead of the process CWD.
-///
-/// `resolve_backend_for_read` / `create_backend` treat a local `path` as
-/// CWD-relative, which is correct only when the command is run from the
-/// project directory. Commands that accept an explicit directory
-/// argument (`carina init <dir>`, upstream `remote_state` resolution)
-/// must reach the state next to *that* directory's `.crn` files
-/// regardless of where the binary was invoked from — they use this.
-/// Remote backends carry their own absolute address and are delegated
-/// unchanged to `create_backend`.
-pub async fn resolve_backend_anchored(
-    backend_config: Option<&BackendConfig>,
-    base_dir: &std::path::Path,
-) -> BackendResult<Box<dyn StateBackend>> {
-    match backend_config {
-        Some(config) if config.is_local() => Ok(Box::new(LocalBackend::with_path(
-            anchored_local_path(config, base_dir),
-        ))),
-        Some(config) => create_backend(config).await,
-        None => Ok(Box::new(LocalBackend::with_path(
-            base_dir.join(LocalBackend::DEFAULT_STATE_FILE),
-        ))),
+        create_backend(None, base_dir).await
     }
 }
 
 /// Resolve a local backend's state file path, anchoring a relative
 /// `path` (or the unset default) at `base_dir`.
-pub fn anchored_local_path(
-    config: &BackendConfig,
-    base_dir: &std::path::Path,
-) -> std::path::PathBuf {
+pub fn anchored_local_path(config: &BackendConfig, base_dir: &Path) -> std::path::PathBuf {
     let path = config
         .get_string("path")
         .map(std::path::PathBuf::from)
@@ -108,7 +106,7 @@ mod tests {
             attributes: HashMap::new(),
         };
 
-        let result = create_backend(&config).await;
+        let result = create_backend(Some(&config), Path::new(".")).await;
         assert!(result.is_err());
 
         if let Err(BackendError::UnsupportedBackend(name)) = result {
@@ -120,7 +118,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_backend_for_read_none_returns_local() {
-        let backend = resolve_backend_for_read(None).await;
+        let base_dir = tempfile::tempdir().unwrap();
+        let backend = resolve_backend_for_read(None, base_dir.path()).await;
         assert!(backend.is_ok(), "None config should return a local backend");
         // Local backend read_state returns Ok(None) when no state file exists
         let state = backend.unwrap().read_state().await;
@@ -136,7 +135,7 @@ mod tests {
             attributes: HashMap::new(),
         };
 
-        let result = resolve_backend_for_read(Some(&config)).await;
+        let result = resolve_backend_for_read(Some(&config), Path::new(".")).await;
         assert!(result.is_err());
 
         if let Err(BackendError::UnsupportedBackend(name)) = result {
