@@ -3,7 +3,7 @@ use std::path::Path;
 
 use colored::Colorize;
 
-use carina_core::config_loader::load_configuration_with_config;
+use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::parser::ProviderContext;
 use carina_state::{StateBackend, resolve_backend_for_read};
 
@@ -33,9 +33,11 @@ pub async fn run_export(
     )?
     .parsed;
 
-    let backend: Box<dyn StateBackend> = resolve_backend_for_read(parsed.backend.as_ref())
-        .await
-        .map_err(AppError::Backend)?;
+    let base_dir = get_base_dir(path);
+    let backend: Box<dyn StateBackend> =
+        resolve_backend_for_read(parsed.backend.as_ref(), base_dir)
+            .await
+            .map_err(AppError::Backend)?;
 
     // `carina export` is read-only; drop the pending-migration token
     // — lock-held callers (apply/destroy/state refresh) persist

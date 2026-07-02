@@ -16,6 +16,7 @@
 //!
 //! ```ignore
 //! use carina_state::{create_backend, BackendConfig};
+//! use std::path::Path;
 //!
 //! let config = BackendConfig {
 //!     backend_type: "s3".to_string(),
@@ -26,7 +27,7 @@
 //!     ].into_iter().collect(),
 //! };
 //!
-//! let backend = create_backend(&config).await?;
+//! let backend = create_backend(Some(&config), Path::new(".")).await?;
 //!
 //! // Acquire lock before modifying state
 //! let lock = backend.acquire_lock("apply").await?;
@@ -53,8 +54,8 @@ pub mod state;
 pub use backend::{BackendConfig, BackendError, BackendResult, LOCAL_BACKEND_TYPE, StateBackend};
 pub use backend_lock::BackendLock;
 pub use backends::{
-    LocalBackend, StateUrl, anchored_local_path, create_backend, create_local_backend,
-    load_state_from_url, resolve_backend_anchored, resolve_backend_for_read,
+    LocalBackend, StateUrl, anchored_local_path, create_backend, create_remote_backend,
+    load_state_from_url, resolve_backend_for_read,
 };
 pub use lock::LockInfo;
 pub use state::{
