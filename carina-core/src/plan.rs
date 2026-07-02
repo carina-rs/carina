@@ -15,18 +15,111 @@ use crate::resource::{
     Directives, ResolvedResource, ResolvedResourceId, ResourceId, ResourceIdentity, Value,
 };
 
-/// Error when a plan would violate a directive constraint
+/// Error detected while constructing a plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanError {
-    /// The resource that triggered the error
+    /// The resource that triggered the error.
     pub resource_id: ResourceId,
-    /// Human-readable description of the violation
-    pub message: String,
+    /// Structured reason for the plan-construction failure.
+    pub kind: PlanErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PreventDestroyAction {
+    Replace,
+    Delete,
+    DeleteRemovedFromConfiguration,
+    CascadeReplace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
+#[error(
+    "resource type '{resource_type}' has no unique_name_attribute; create_before_destroy needs one to generate a temporary name"
+)]
+pub struct MissingNameAttributeError {
+    pub resource_type: String,
+    /// The binding name (let-bound) or resolver identity (anonymous)
+    /// of the resource that triggered the CBD path. For diagnostics only.
+    pub resource_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum PlanErrorKind {
+    PreventDestroy {
+        action: PreventDestroyAction,
+    },
+    MissingNameAttribute(MissingNameAttributeError),
+    WaitTargetMissing {
+        wait_binding: String,
+        target: String,
+    },
+    WaitPredicateInvalid {
+        wait_binding: String,
+        reason: String,
+    },
+}
+
+impl PlanError {
+    pub fn new(resource_id: ResourceId, kind: PlanErrorKind) -> Self {
+        Self { resource_id, kind }
+    }
+
+    pub fn prevent_destroy(resource_id: ResourceId, action: PreventDestroyAction) -> Self {
+        Self::new(resource_id, PlanErrorKind::PreventDestroy { action })
+    }
+}
+
+impl From<MissingNameAttributeError> for PlanErrorKind {
+    fn from(err: MissingNameAttributeError) -> Self {
+        Self::MissingNameAttribute(err)
+    }
+}
+
+impl PlanErrorKind {
+    fn prevent_destroy_message(action: PreventDestroyAction) -> &'static str {
+        match action {
+            PreventDestroyAction::Replace => {
+                "resource has prevent_destroy set, but the plan would replace it (which requires destroying the old resource)"
+            }
+            PreventDestroyAction::Delete => {
+                "resource has prevent_destroy set, but the plan would delete it"
+            }
+            PreventDestroyAction::DeleteRemovedFromConfiguration => {
+                "resource has prevent_destroy set, but the plan would delete it (resource removed from configuration)"
+            }
+            PreventDestroyAction::CascadeReplace => {
+                "resource has prevent_destroy set, but cascade from a replaced dependency would replace it (which requires destroying the old resource)"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PlanErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PreventDestroy { action } => f.write_str(Self::prevent_destroy_message(*action)),
+            Self::MissingNameAttribute(err) => write!(f, "{err}"),
+            Self::WaitTargetMissing {
+                wait_binding,
+                target,
+            } => write!(
+                f,
+                "wait `{wait_binding}`: target binding `{target}` is not a known resource"
+            ),
+            Self::WaitPredicateInvalid {
+                wait_binding,
+                reason,
+            } => write!(
+                f,
+                "wait `{wait_binding}`: invalid predicate attribute path: {reason}"
+            ),
+        }
+    }
 }
 
 impl std::fmt::Display for PlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.resource_id, self.message)
+        write!(f, "{}: {}", self.resource_id, self.kind)
     }
 }
 
@@ -145,7 +238,7 @@ pub struct Plan {
     pub(crate) replace_display: Vec<ReplaceDisplayMetadata>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) permanent_name_overrides: Vec<PermanentNameOverride>,
-    /// Directive constraint violations detected during plan generation
+    /// Errors detected during plan generation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     errors: Vec<PlanError>,
 }
@@ -253,17 +346,17 @@ impl Plan {
     //   - display "no effects at all" → `plan.effects().is_empty()`
     //   - routing "nothing to apply"   → `!plan.has_mutations()`
 
-    /// Add a directive constraint violation error
+    /// Add a plan-construction error.
     pub fn add_error(&mut self, error: PlanError) {
         self.errors.push(error);
     }
 
-    /// Returns directive constraint violation errors
+    /// Returns plan-construction errors.
     pub fn errors(&self) -> &[PlanError] {
         &self.errors
     }
 
-    /// Returns true if there are directive constraint violations
+    /// Returns true if there are plan-construction errors.
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
     }
@@ -1142,6 +1235,73 @@ mod tests {
     }
 
     #[test]
+    fn plan_error_kind_display_pins_prevent_destroy_actions() {
+        let cases = [
+            (
+                PreventDestroyAction::Replace,
+                "resource has prevent_destroy set, but the plan would replace it (which requires destroying the old resource)",
+            ),
+            (
+                PreventDestroyAction::Delete,
+                "resource has prevent_destroy set, but the plan would delete it",
+            ),
+            (
+                PreventDestroyAction::DeleteRemovedFromConfiguration,
+                "resource has prevent_destroy set, but the plan would delete it (resource removed from configuration)",
+            ),
+            (
+                PreventDestroyAction::CascadeReplace,
+                "resource has prevent_destroy set, but cascade from a replaced dependency would replace it (which requires destroying the old resource)",
+            ),
+        ];
+
+        for (action, expected) in cases {
+            assert_eq!(
+                PlanErrorKind::PreventDestroy { action }.to_string(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn plan_error_kind_display_delegates_missing_name_attribute_error() {
+        let error = MissingNameAttributeError {
+            resource_type: "ec2.Vpc".to_string(),
+            resource_identity: "vpc".to_string(),
+        };
+        let expected = error.to_string();
+
+        assert_eq!(
+            PlanErrorKind::MissingNameAttribute(error).to_string(),
+            expected
+        );
+        assert_eq!(
+            expected,
+            "resource type 'ec2.Vpc' has no unique_name_attribute; create_before_destroy needs one to generate a temporary name"
+        );
+    }
+
+    #[test]
+    fn plan_error_kind_display_pins_wait_errors() {
+        assert_eq!(
+            PlanErrorKind::WaitTargetMissing {
+                wait_binding: "cert_issued".to_string(),
+                target: "cert".to_string(),
+            }
+            .to_string(),
+            "wait `cert_issued`: target binding `cert` is not a known resource"
+        );
+        assert_eq!(
+            PlanErrorKind::WaitPredicateInvalid {
+                wait_binding: "cert_issued".to_string(),
+                reason: "empty attribute path".to_string(),
+            }
+            .to_string(),
+            "wait `cert_issued`: invalid predicate attribute path: empty attribute path"
+        );
+    }
+
+    #[test]
     fn plan_permanent_name_overrides_round_trips_through_serde() {
         let mut group = replacement_group(HashSet::new());
         group.permanent_name_override = Some(permanent_name_override());
@@ -1161,10 +1321,13 @@ mod tests {
             "s3.Bucket",
             "bucket",
         ))));
-        plan.add_error(PlanError {
-            resource_id: ResourceId::with_identity("s3.Bucket", "bucket"),
-            message: "fixture error".to_string(),
-        });
+        plan.add_error(PlanError::new(
+            ResourceId::with_identity("s3.Bucket", "bucket"),
+            PlanErrorKind::WaitTargetMissing {
+                wait_binding: "wait_bucket".to_string(),
+                target: "bucket".to_string(),
+            },
+        ));
 
         let mut json = serde_json::to_value(&plan).unwrap();
         let object = json.as_object_mut().unwrap();
@@ -1184,10 +1347,13 @@ mod tests {
             "s3.Bucket",
             "bucket",
         ))));
-        plan.add_error(PlanError {
-            resource_id: ResourceId::with_identity("s3.Bucket", "bucket"),
-            message: "fixture error".to_string(),
-        });
+        plan.add_error(PlanError::new(
+            ResourceId::with_identity("s3.Bucket", "bucket"),
+            PlanErrorKind::WaitTargetMissing {
+                wait_binding: "wait_bucket".to_string(),
+                target: "bucket".to_string(),
+            },
+        ));
 
         let mut json = serde_json::to_value(&plan).unwrap();
         let object = json.as_object_mut().unwrap();

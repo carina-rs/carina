@@ -3,13 +3,15 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::deps::get_resource_dependencies;
-use serde::{Deserialize, Serialize};
 
 use crate::effect::{ChangedCreateOnly, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
 use crate::override_aware::OverrideAwareResources;
 use crate::parser::WaitBinding;
-use crate::plan::{PermanentNameOverride, Plan, PlanError, ReplacementDelete, ReplacementGroup};
+use crate::plan::{
+    MissingNameAttributeError, PermanentNameOverride, Plan, PlanError, PlanErrorKind,
+    PreventDestroyAction, ReplacementDelete, ReplacementGroup,
+};
 use crate::provider::Provider;
 use crate::resource::{
     ConcreteValue, DataSource, Directives, PlanInputState, ResolvedDataSource, ResolvedResource,
@@ -32,17 +34,6 @@ pub(crate) struct PendingReplace {
     pub temporary_name: Option<TemporaryName>,
     pub consumer_updates: HashSet<ResourceIdentity>,
     pub previous_attributes: HashMap<String, Value>,
-}
-
-#[derive(Debug, Clone, thiserror::Error, Serialize, Deserialize)]
-#[error(
-    "resource type '{resource_type}' has no unique_name_attribute; create_before_destroy needs one to generate a temporary name"
-)]
-pub struct MissingNameAttributeError {
-    pub resource_type: String,
-    /// The binding name (let-bound) or resolver identity (anonymous)
-    /// of the resource that triggered the CBD path. For diagnostics only.
-    pub resource_identity: String,
 }
 
 struct RefAttr {
@@ -429,12 +420,10 @@ fn create_plan_parts(
                 if let Some(changed_create_only) = ChangedCreateOnly::new(changed_create_only) {
                     // Replace involves destroying the old resource
                     if resource.directives.prevent_destroy {
-                        plan.add_error(PlanError {
-                            resource_id: id.clone(),
-                            message:
-                                "resource has prevent_destroy set, but the plan would replace it (which requires destroying the old resource)"
-                                    .to_string(),
-                        });
+                        plan.add_error(PlanError::prevent_destroy(
+                            id.clone(),
+                            PreventDestroyAction::Replace,
+                        ));
                         continue;
                     }
                     match pending_replace_from_parts(
@@ -448,10 +437,7 @@ fn create_plan_parts(
                         Ok(pending) => {
                             pending_replaces.insert(resource_identity(&pending.create.id), pending);
                         }
-                        Err(err) => plan.add_error(PlanError {
-                            resource_id: id.clone(),
-                            message: err.to_string(),
-                        }),
+                        Err(err) => plan.add_error(PlanError::new(id.clone(), err.into())),
                     }
                 } else {
                     plan.add(Effect::Update {
@@ -464,11 +450,10 @@ fn create_plan_parts(
             Diff::NoChange(_) => {}
             Diff::Delete(id) => {
                 if resource.directives.prevent_destroy {
-                    plan.add_error(PlanError {
-                        resource_id: id.clone(),
-                        message: "resource has prevent_destroy set, but the plan would delete it"
-                            .to_string(),
-                    });
+                    plan.add_error(PlanError::prevent_destroy(
+                        id.clone(),
+                        PreventDestroyAction::Delete,
+                    ));
                     continue;
                 }
                 let identifier = current_states
@@ -499,12 +484,10 @@ fn create_plan_parts(
         if state.exists && !desired_ids.contains(id) {
             let directives = directives_map.get(id).cloned().unwrap_or_default();
             if directives.prevent_destroy {
-                plan.add_error(PlanError {
-                    resource_id: id.clone(),
-                    message:
-                        "resource has prevent_destroy set, but the plan would delete it (resource removed from configuration)"
-                            .to_string(),
-                });
+                plan.add_error(PlanError::prevent_destroy(
+                    id.clone(),
+                    PreventDestroyAction::DeleteRemovedFromConfiguration,
+                ));
                 continue;
             }
             let identifier = state.identifier.clone().unwrap_or_default();
@@ -586,13 +569,13 @@ fn create_plan_parts(
                     .map(|r| r.id.clone())
             });
         let Some(target_id_resolved) = resolved else {
-            plan.add_error(PlanError {
-                resource_id: ResourceId::with_identity("__wait", wb.binding.as_str()),
-                message: format!(
-                    "wait `{}`: target binding `{}` is not a known resource",
-                    wb.binding, wb.target
-                ),
-            });
+            plan.add_error(PlanError::new(
+                ResourceId::with_identity("__wait", wb.binding.as_str()),
+                PlanErrorKind::WaitTargetMissing {
+                    wait_binding: wb.binding.to_string(),
+                    target: wb.target.to_string(),
+                },
+            ));
             continue;
         };
         // A `wait`'s only purpose is to gate downstream resources that
@@ -634,13 +617,13 @@ fn create_plan_parts(
         let attr = match AttrPath::try_new(wb.until_predicate.lhs_segments[1..].to_vec()) {
             Ok(attr) => attr,
             Err(err) => {
-                plan.add_error(PlanError {
-                    resource_id: target_id_resolved.clone(),
-                    message: format!(
-                        "wait `{}`: invalid predicate attribute path: {err}",
-                        wb.binding
-                    ),
-                });
+                plan.add_error(PlanError::new(
+                    target_id_resolved.clone(),
+                    PlanErrorKind::WaitPredicateInvalid {
+                        wait_binding: wb.binding.to_string(),
+                        reason: err.to_string(),
+                    },
+                ));
                 continue;
             }
         };
@@ -913,10 +896,7 @@ fn promote_referenced_replaces_to_cbd(
         if let Some(Err(err)) = result
             && let Some(pending) = pending_replaces.remove(&identity)
         {
-            plan.add_error(PlanError {
-                resource_id: pending.create.id.clone(),
-                message: err.to_string(),
-            });
+            plan.add_error(PlanError::new(pending.create.id.clone(), err.into()));
         }
     }
 }
@@ -997,12 +977,10 @@ fn promote_pending_replaces_for_dependents(
                         ref_hints,
                     );
                 } else if resource.directives.prevent_destroy {
-                    plan.add_error(PlanError {
-                        resource_id: resource.id.clone(),
-                        message:
-                            "resource has prevent_destroy set, but cascade from a replaced dependency would replace it (which requires destroying the old resource)"
-                                .to_string(),
-                    });
+                    plan.add_error(PlanError::prevent_destroy(
+                        resource.id.clone(),
+                        PreventDestroyAction::CascadeReplace,
+                    ));
                     continue;
                 } else if let Some(pending) = promote_resource_to_pending_replace(
                     plan,
@@ -1095,10 +1073,7 @@ fn promote_resource_to_pending_replace(
     ) {
         Ok(pending) => Some(pending),
         Err(err) => {
-            plan.add_error(PlanError {
-                resource_id: resource.id.clone(),
-                message: err.to_string(),
-            });
+            plan.add_error(PlanError::new(resource.id.clone(), err.into()));
             None
         }
     }

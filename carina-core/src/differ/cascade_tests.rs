@@ -3,6 +3,7 @@ use super::*;
 use std::collections::HashSet;
 
 use crate::override_aware::OverrideAwareResources;
+use crate::plan::{MissingNameAttributeError, PlanErrorKind, PreventDestroyAction};
 use crate::resource::{ConcreteValue, DeferredValue, ResourceIdentity};
 use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
@@ -371,7 +372,12 @@ fn cascade_prevent_destroy_blocks_promotion_to_replace() {
 
     assert!(plan.has_errors());
     assert_eq!(plan.errors()[0].resource_id, subnet_id);
-    assert!(plan.errors()[0].message.contains("prevent_destroy"));
+    assert_eq!(
+        &plan.errors()[0].kind,
+        &PlanErrorKind::PreventDestroy {
+            action: PreventDestroyAction::CascadeReplace
+        }
+    );
     assert!(
         plan.replace_display
             .iter()
@@ -401,10 +407,16 @@ fn auto_promote_with_missing_unique_name_attribute_emits_plan_error() {
 
     assert!(plan.has_errors());
     assert_eq!(plan.errors()[0].resource_id, vpc_id);
-    assert!(
-        plan.errors()[0]
-            .message
-            .contains("has no unique_name_attribute")
+    assert_eq!(
+        &plan.errors()[0].kind,
+        &PlanErrorKind::MissingNameAttribute(MissingNameAttributeError {
+            resource_type: "ec2.Vpc".to_string(),
+            resource_identity: "vpc".to_string(),
+        })
+    );
+    assert_eq!(
+        plan.errors()[0].to_string(),
+        "ec2.Vpc.my-vpc: resource type 'ec2.Vpc' has no unique_name_attribute; create_before_destroy needs one to generate a temporary name"
     );
 }
 
