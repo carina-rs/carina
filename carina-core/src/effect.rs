@@ -862,7 +862,6 @@ impl Effect {
     pub fn writeback_cleanup_ids(
         &self,
         successfully_deleted: &HashSet<ResourceId>,
-        upserts: &impl Fn(&ResourceId) -> bool,
     ) -> Vec<ResourceId> {
         match self {
             Effect::Read { .. } => Vec::new(),
@@ -880,15 +879,11 @@ impl Effect {
             Effect::Move { from, .. } => vec![from.clone().into_inner()],
             Effect::Wait { .. } => Vec::new(),
             Effect::DeferredCreate { .. } => Vec::new(),
-            Effect::DeferredReplace(payload) => payload
-                .deletes
-                .iter()
-                .filter(|delete| {
-                    successfully_deleted.contains(delete.id.as_inner())
-                        && !upserts(delete.id.as_inner())
-                })
-                .map(|delete| delete.id.clone().into_inner())
-                .collect(),
+            // Absorbed deletes are replacement outcomes, not ordinary
+            // cleanups. Apply writeback classifies them exhaustively in
+            // `classify_replacement_outcome`, where the create result is
+            // available alongside the delete result.
+            Effect::DeferredReplace(_) => Vec::new(),
         }
     }
 

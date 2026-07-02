@@ -815,8 +815,6 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
     use carina_core::resource::ResourceId;
     use carina_state::state::{ResourceState, StateFile};
 
-    let schemas = SchemaRegistry::new();
-
     // State has a resource that was originally created via
     // `directives { provider = management }` — `provider_instance =
     // Some("management")`.
@@ -855,7 +853,7 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
         &state_blocks,
         &Some(state_file),
         &[],
-        &schemas,
+        &[],
         &bindings,
         &no_upstreams,
     );
@@ -895,8 +893,6 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
     use carina_core::plan::Plan;
     use carina_core::resource::Resource;
 
-    let schemas = SchemaRegistry::new();
-
     // Let-bound resource with `directives { provider = management }`:
     // the parser stamps `provider_instance = Some("management")` on
     // its ResourceId.
@@ -926,7 +922,7 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
         &state_blocks,
         &None,
         &[],
-        &schemas,
+        &[],
         &bindings,
         &no_upstreams,
     );

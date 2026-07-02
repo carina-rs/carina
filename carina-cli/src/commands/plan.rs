@@ -6,6 +6,7 @@ use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
+use carina_core::effect::Effect;
 use carina_core::parser::{BackendConfig, ProviderConfig, ProviderContext, UpstreamState};
 use carina_core::plan::Plan;
 use carina_core::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
@@ -128,6 +129,65 @@ pub struct PlanFile {
 
 impl PlanFile {
     pub const CURRENT_VERSION: u32 = 9;
+
+    pub(crate) fn validate_replace_display(&self) -> Result<(), String> {
+        let effects = self.plan.effects();
+        let mut seen_replace_indices = HashSet::new();
+        for (metadata_idx, replacement) in self.plan.replace_display_info().enumerate() {
+            let create = effects.get(replacement.create_idx).ok_or_else(|| {
+                format!(
+                    "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].create_idx {} is out of bounds for {} effects",
+                    replacement.create_idx,
+                    effects.len()
+                )
+            })?;
+            if !matches!(create, Effect::Create(_)) {
+                return Err(format!(
+                    "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].create_idx {} points at {}, expected Create",
+                    replacement.create_idx,
+                    create.kind()
+                ));
+            }
+            if !seen_replace_indices.insert(replacement.create_idx) {
+                return Err(format!(
+                    "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].create_idx {} duplicates or overlaps another replacement metadata entry",
+                    replacement.create_idx
+                ));
+            }
+
+            let delete = effects.get(replacement.delete_idx).ok_or_else(|| {
+                format!(
+                    "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].delete_idx {} is out of bounds for {} effects",
+                    replacement.delete_idx,
+                    effects.len()
+                )
+            })?;
+            if !matches!(delete, Effect::Delete { .. }) {
+                return Err(format!(
+                    "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].delete_idx {} points at {}, expected Delete",
+                    replacement.delete_idx,
+                    delete.kind()
+                ));
+            }
+            if create.resource_id() != delete.resource_id() {
+                return Err(format!(
+                    "Invalid saved plan replacement metadata: replace_display[{metadata_idx}] cross-wires create_idx {} ({}) with delete_idx {} ({}), expected both halves to address the same resource",
+                    replacement.create_idx,
+                    create.resource_id(),
+                    replacement.delete_idx,
+                    delete.resource_id()
+                ));
+            }
+            if !seen_replace_indices.insert(replacement.delete_idx) {
+                return Err(format!(
+                    "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].delete_idx {} duplicates or overlaps another replacement metadata entry",
+                    replacement.delete_idx
+                ));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 pub(crate) fn collect_delete_attributes(

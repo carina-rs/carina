@@ -71,21 +71,27 @@ the model matches Terraform's field-proven shape).
 ## State schema v9
 
 `StateFile::CURRENT_VERSION` bumps 8 → 9. Changelog entry: "v9: added
-`ResourceState.deposed` (pre-replacement instances pending delete);
-rows with `identifier: None` are retained while `deposed` is
-non-empty."
+`ResourceState.deposed` (pre-replacement instances pending delete,
+carrying provider-instance routing); rows with `identifier: None` are
+retained while `deposed` is non-empty."
 
 ```rust
 pub struct DeposedInstance {
-    /// System-assigned unique key for this generation (e.g. short UUID).
+    /// System-assigned unique key for this generation (short UUID).
     /// Identifies the entry in plan display, logs, and delete results.
     pub key: DeposedKey,
     /// Provider-side identifier of the still-live old instance.
     /// Required by construction: an instance is only deposed when it
     /// exists remotely under a known identifier.
     pub identifier: String,
-    /// Last known attributes of the old instance (delete calls,
-    /// display, and refresh need them).
+    /// Provider-instance routing the generation was created under,
+    /// sourced from the delete effect's ResourceId at depose time.
+    /// A replacement may change the row's routing; the deposed delete
+    /// must route to where the old instance actually lives.
+    pub provider_instance: Option<String>,
+    /// Last known attributes of the old instance (display and refresh
+    /// need them; provider delete calls take identifier + directives
+    /// only, so dropping an unserializable attribute is safe).
     pub attributes: HashMap<String, serde_json::Value>,
     /// Dependency bindings inherited from the old row, so deposed
     /// deletes keep correct ordering relative to other deletes.
@@ -114,6 +120,28 @@ Notes:
   `check_and_migrate`) to: drop rows with `identifier: None` **and**
   empty `deposed`. That is the "current destroyed, deposed pending"
   state above.
+- Removing a resource whose row still has deposed generations leaves a
+  shell row: identity keys and `directives.provider_instance` are kept
+  (so the row round-trips to the same `ResourceId`), everything else is
+  reset, `deposed` is retained. This lives inside
+  `StateFile::remove_resource` itself so destroy, refresh, and any
+  future caller inherit it — no caller can choose an unsafe removal.
+- Deposed preservation across upserts also lives at the row-write seam:
+  `StateFile::upsert_resource` merges the existing row's generations
+  into the incoming row (incoming wins per `(identifier,
+  provider_instance)`), then drops any generation whose identifier
+  equals the incoming current identifier (invariant 4, enforced where
+  rows are written rather than at each writer). The writeback's own
+  depose application additionally relies on the classification's
+  same-identifier guard; Phase 2's deposed-delete writeback should
+  route every depose write through one filtered helper.
+- Riding along on the shared upsert path: building a row from a
+  provider state now falls back to the `ResourceId`'s provider-instance
+  routing when the directives carry none, so routed rows built from
+  synthetic resources (refresh orphans, deferred-replace children)
+  round-trip to the same `ResourceId` they were written under. This
+  affects every row write, not just deposed ones, and fixes a latent
+  routing loss on the refresh-orphan path.
 
 ## Instance-level effect keying (the typed reshape)
 
@@ -176,12 +204,27 @@ deletes flow through the same code path), producing a typed
 | Create half | Old-instance Delete half | Action |
 | --- | --- | --- |
 | succeeded | succeeded | upsert new row, no deposed entry (today's behavior) |
-| succeeded | failed or skipped | upsert new row **and append a `DeposedInstance`** carrying the old identifier/attributes/dependency bindings |
+| succeeded | failed or skipped | upsert new row **and record a `DeposedInstance`** carrying the old identifier/routing/attributes/dependency bindings |
 | failed / not run | not run (CBD delete waits on create) | keep old row from `current_states` (today's behavior) |
-| n/a (DBC) delete succeeded, create failed | — | row cleanup (today's behavior; nothing live remains) |
+| n/a (DBC) delete succeeded, create failed | — | row cleanup (a behavior fix: the pre-change code kept a stale `current_states` upsert here) |
 
-The old identifier/attributes come from the plan's replacement metadata
-/ `current_states` snapshot — data already in hand at decompose time.
+Recording a generation is a keyed replace, not a blind append: an
+existing entry with the same `(identifier, provider_instance)` is
+refreshed instead of duplicated, so re-running a replacement (e.g. a
+stale saved plan) cannot stack duplicate entries for one remote object.
+
+Deposed attribute sourcing, in order: the existing state row when its
+identifier matches the delete (already secret-hashed), else the plan
+metadata's `previous_attributes`, else the `current_states` snapshot,
+else empty. The fallback sources hold raw provider values, so they are
+serialized through the same secret-masking seam the ordinary row upsert
+uses, with two authorities: the new desired resource's secret-wrapped
+attributes and the schema's `write_only` metadata (covers secrets the
+new config removed). Serialization is lossy-safe per attribute — an
+unserializable value is skipped, never allowed to abort the state save
+after infrastructure was already mutated. The masking step is required
+by the function signature (the depose builder takes the desired
+resource, not an `Option`), so no caller can skip it.
 
 Guard invariant: if the new instance's identifier equals the old one
 (provider returned the same remote object), do **not** depose — there is
@@ -192,10 +235,24 @@ Deposed-delete results feed back the same way: a successful
 `Deposed(key)` delete removes exactly that `DeposedInstance` from the
 row (and the row itself only when `identifier` is `None` and `deposed`
 is empty); a failed one leaves the entry for the next run.
-`WritebackPlan` gains the corresponding typed entries (depose /
-remove-deposed) next to upserts and cleanups, so
-`build_state_after_apply` handles them by destructuring, not by
-convention.
+`WritebackPlan` gains the corresponding typed entries next to upserts
+and cleanups, so `build_state_after_apply` handles them by
+destructuring, not by convention. Phase split: the depose entries land
+with Phase 1 (writeback recording); the remove-deposed entries land
+with Phase 2, which introduces deposed-delete scheduling. Within the
+writeback plan, upserts and cleanups stay mutually exclusive per
+`ResourceId`; a depose intentionally coexists with the same id's upsert
+and is applied after upserts, before cleanups.
+
+Two related plan-construction fixes ride along because they are the
+same invariant-1 class: `Plan::retain` now remaps the replacement
+pairing metadata's effect indices (and drops a pairing whose half was
+removed) instead of leaving them stale, and the moved-block delete
+suppression only suppresses orphan deletes — a replacement delete for a
+desired moved-to resource keeps flowing into classification. Saved
+plans validate the pairing metadata at load (index bounds, effect
+kinds, create/delete identity match, no duplicate indices) before
+anything mutates.
 
 ## Command behavior
 
@@ -244,6 +301,22 @@ it) and refresh (observe it already gone), which cover both directions.
    unrepresentable.
 4. A deposed entry's `identifier` always differs from the row's current
    `identifier`.
+
+## Known residual (fixed by the Phase 2 key reshape)
+
+Re-applying a stale saved plan is allowed past a serial-bump warning
+(lineage still matches). If run 1 partially failed (current `new-1`,
+deposed `old`) and the same plan file is applied again, the re-run
+Create returns `new-2` and the applied upsert overwrites the row's
+current identifier. The classification only compares against the
+plan's delete identifier (`old`), so the displaced `new-1` — live,
+never deleted — is not deposed. An upsert-level "depose the displaced
+current identifier" guard needs delete results keyed by identifier
+/instance rather than `ResourceId` (today's
+`successfully_deleted: HashSet<ResourceId>` cannot distinguish which
+identifier a delete removed), i.e. exactly the `EffectInstanceKey`
+reshape scheduled for Phase 2. Recorded here so Phase 2 closes it
+deliberately rather than by accident.
 
 ## Non-goals / boundary notes
 

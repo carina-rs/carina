@@ -1,5 +1,6 @@
 use super::*;
 use indexmap::IndexMap;
+use std::collections::{BTreeSet, HashMap};
 
 #[test]
 fn test_state_file_new() {
@@ -43,6 +44,78 @@ fn test_state_file_upsert_resource() {
 }
 
 #[test]
+fn upsert_resource_preserves_existing_deposed_generations() {
+    let mut state = StateFile::new();
+    let mut existing = ResourceState::new("ec2.Vpc", "main", "aws")
+        .with_identifier("vpc-old")
+        .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
+    let deposed_key = DeposedKey::new_unique();
+    existing.deposed.push(DeposedInstance {
+        key: deposed_key.clone(),
+        identifier: "vpc-older".to_string(),
+        provider_instance: Some("west".to_string()),
+        attributes: HashMap::from([("cidr_block".to_string(), serde_json::json!("10.255.0.0/16"))]),
+        dependency_bindings: BTreeSet::from(["igw".to_string()]),
+    });
+    state.upsert_resource(existing);
+
+    let incoming = ResourceState::new("ec2.Vpc", "main", "aws")
+        .with_identifier("vpc-new")
+        .with_attribute("cidr_block", serde_json::json!("10.1.0.0/16"));
+    state.upsert_resource(incoming);
+
+    let row = state
+        .find_resource("aws", "ec2.Vpc", "main")
+        .expect("resource should still exist");
+    assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
+    assert_eq!(
+        row.attributes.get("cidr_block"),
+        Some(&serde_json::json!("10.1.0.0/16"))
+    );
+    assert_eq!(row.deposed.len(), 1);
+    assert_eq!(row.deposed[0].key, deposed_key);
+    assert_eq!(row.deposed[0].identifier, "vpc-older");
+    assert_eq!(row.deposed[0].provider_instance.as_deref(), Some("west"));
+}
+
+#[test]
+fn upsert_resource_drops_deposed_generation_matching_current_identifier() {
+    let mut state = StateFile::new();
+    let retained_key = DeposedKey::new_unique();
+    let mut existing = ResourceState::new("ec2.Vpc", "main", "aws")
+        .with_identifier("vpc-current")
+        .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
+    existing.deposed.push(DeposedInstance {
+        key: DeposedKey::new_unique(),
+        identifier: "vpc-reused".to_string(),
+        provider_instance: Some("west".to_string()),
+        attributes: HashMap::from([("cidr_block".to_string(), serde_json::json!("10.2.0.0/16"))]),
+        dependency_bindings: BTreeSet::new(),
+    });
+    existing.deposed.push(DeposedInstance {
+        key: retained_key.clone(),
+        identifier: "vpc-older".to_string(),
+        provider_instance: Some("west".to_string()),
+        attributes: HashMap::from([("cidr_block".to_string(), serde_json::json!("10.255.0.0/16"))]),
+        dependency_bindings: BTreeSet::from(["igw".to_string()]),
+    });
+    state.upsert_resource(existing);
+
+    let incoming = ResourceState::new("ec2.Vpc", "main", "aws")
+        .with_identifier("vpc-reused")
+        .with_attribute("cidr_block", serde_json::json!("10.2.0.0/16"));
+    state.upsert_resource(incoming);
+
+    let row = state
+        .find_resource("aws", "ec2.Vpc", "main")
+        .expect("resource should still exist");
+    assert_eq!(row.identifier.as_deref(), Some("vpc-reused"));
+    assert_eq!(row.deposed.len(), 1);
+    assert_eq!(row.deposed[0].key, retained_key);
+    assert_eq!(row.deposed[0].identifier, "vpc-older");
+}
+
+#[test]
 fn test_state_file_remove_resource() {
     let mut state = StateFile::new();
 
@@ -57,6 +130,80 @@ fn test_state_file_remove_resource() {
     // Removing non-existent resource returns None
     let removed = state.remove_resource("aws", "s3.Bucket", "other-bucket");
     assert!(removed.is_none());
+}
+
+#[test]
+fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
+    let mut state = StateFile::new();
+    let mut resource = ResourceState::new("ec2.Vpc", "main", "aws")
+        .with_identifier("vpc-new")
+        .with_attribute("cidr_block", serde_json::json!("10.1.0.0/16"));
+    resource.protected = true;
+    resource.directives.create_before_destroy = true;
+    resource.directives.provider_instance = Some("west".to_string());
+    resource
+        .prefixes
+        .insert("name".to_string(), "main-".to_string());
+    resource.name_overrides.insert(
+        "name".to_string(),
+        NameOverride {
+            temp_value: "main-cbd".to_string(),
+            original_value: Some("main".to_string()),
+        },
+    );
+    resource.explicit = ExplicitFields::Struct {
+        children: HashMap::from([("cidr_block".to_string(), ExplicitFields::Leaf)]),
+    };
+    resource.binding = Some("vpc".to_string());
+    resource.dependency_bindings.insert("internet".to_string());
+    resource.write_only_attributes.push("token".to_string());
+    resource.partial_read = Some(PartialReadMarker {
+        detail: "partial".to_string(),
+        missing_attributes: BTreeSet::from(["token".to_string()]),
+    });
+    resource.deposed.push(DeposedInstance {
+        key: DeposedKey::new_unique(),
+        identifier: "vpc-old".to_string(),
+        provider_instance: Some("west".to_string()),
+        attributes: HashMap::from([("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))]),
+        dependency_bindings: BTreeSet::from(["network".to_string()]),
+    });
+    state.upsert_resource(resource);
+
+    let removed = state.remove_resource("aws", "ec2.Vpc", "main");
+
+    assert_eq!(
+        removed.and_then(|rs| rs.identifier),
+        Some("vpc-new".to_string())
+    );
+    let retained = state
+        .find_resource("aws", "ec2.Vpc", "main")
+        .expect("row with deposed generations should be retained");
+    assert_eq!(retained.identifier, None);
+    assert!(retained.attributes.is_empty());
+    assert_eq!(retained.deposed.len(), 1);
+    assert_eq!(retained.deposed[0].identifier, "vpc-old");
+    assert_eq!(
+        retained.deposed[0].provider_instance.as_deref(),
+        Some("west")
+    );
+    assert!(!retained.protected);
+    let expected_directives = Directives {
+        provider_instance: Some("west".to_string()),
+        ..Directives::default()
+    };
+    assert_eq!(retained.directives, expected_directives);
+    assert_eq!(
+        StateFile::id_for_resource_state(retained),
+        ResourceId::with_provider_identity("aws", "ec2.Vpc", "main", Some("west".to_string()))
+    );
+    assert!(retained.prefixes.is_empty());
+    assert!(retained.name_overrides.is_empty());
+    assert_eq!(retained.explicit, ExplicitFields::default());
+    assert_eq!(retained.binding, None);
+    assert!(retained.dependency_bindings.is_empty());
+    assert!(retained.write_only_attributes.is_empty());
+    assert_eq!(retained.partial_read, None);
 }
 
 #[test]
@@ -1062,9 +1209,146 @@ fn test_build_orphan_dependencies() {
 }
 
 #[test]
-fn test_state_file_version_is_v8() {
+fn test_state_file_version_is_v9() {
     let state = StateFile::new();
-    assert_eq!(state.version, 8);
+    assert_eq!(state.version, 9);
+}
+
+#[test]
+fn v8_state_migrates_to_v9_with_empty_deposed() {
+    use super::check_and_migrate;
+
+    let json = r#"{
+        "version": 8,
+        "serial": 5,
+        "lineage": "test-lineage",
+        "carina_version": "0.4.0",
+        "resources": [
+            {
+                "resource_type": "ec2.Vpc",
+                "identity": "vpc",
+                "provider": "awscc",
+                "identifier": "vpc-current",
+                "attributes": { "vpc_id": "vpc-current" }
+            }
+        ]
+    }"#;
+
+    let outcome = check_and_migrate(json).expect("v8 state should migrate to v9");
+    let migration = outcome
+        .migration
+        .expect("v8 read should report a v9 migration");
+    assert_eq!(migration.from, 8);
+    assert_eq!(migration.to, StateFile::CURRENT_VERSION);
+    let row = outcome
+        .state
+        .find_resource("awscc", "ec2.Vpc", "vpc")
+        .expect("resource should survive migration");
+    let row_json = serde_json::to_value(row).expect("resource state should serialize");
+    assert!(
+        row_json.get("deposed").is_none(),
+        "empty deposed vec should use serde default and skip serialization"
+    );
+}
+
+#[test]
+fn v9_deposed_entries_round_trip() {
+    use super::check_and_migrate;
+
+    let json = r#"{
+        "version": 9,
+        "serial": 7,
+        "lineage": "test-lineage",
+        "carina_version": "0.4.0",
+        "resources": [
+            {
+                "resource_type": "ec2.Vpc",
+                "identity": "vpc",
+                "provider": "awscc",
+                "identifier": "vpc-new",
+                "attributes": { "vpc_id": "vpc-new" },
+                "deposed": [
+                    {
+                        "key": "deposed-1",
+                        "identifier": "vpc-old",
+                        "provider_instance": "west",
+                        "attributes": { "vpc_id": "vpc-old" },
+                        "dependency_bindings": ["igw"]
+                    }
+                ]
+            }
+        ]
+    }"#;
+
+    let state = check_and_migrate(json)
+        .expect("v9 state with deposed entries should load")
+        .into_state();
+    let serialized = serde_json::to_value(&state).expect("state should serialize");
+    let reloaded: StateFile =
+        serde_json::from_value(serialized.clone()).expect("serialized v9 state should reload");
+    assert_eq!(
+        serde_json::to_value(reloaded).expect("reloaded state should serialize"),
+        serialized
+    );
+    let row = state
+        .find_resource("awscc", "ec2.Vpc", "vpc")
+        .expect("resource should exist");
+    let row_json = serde_json::to_value(row).expect("resource state should serialize");
+    assert_eq!(row_json["deposed"][0]["identifier"], "vpc-old");
+    assert_eq!(row_json["deposed"][0]["provider_instance"], "west");
+    assert_eq!(row_json["deposed"][0]["dependency_bindings"][0], "igw");
+}
+
+#[test]
+fn check_and_migrate_retains_identifier_none_rows_only_when_deposed_is_non_empty() {
+    use super::check_and_migrate;
+
+    let json = r#"{
+        "version": 9,
+        "serial": 7,
+        "lineage": "test-lineage",
+        "carina_version": "0.4.0",
+        "resources": [
+            {
+                "resource_type": "ec2.Vpc",
+                "identity": "deposed_only",
+                "provider": "awscc",
+                "identifier": null,
+                "attributes": {},
+                "deposed": [
+                    {
+                        "key": "deposed-1",
+                        "identifier": "vpc-old",
+                        "attributes": { "vpc_id": "vpc-old" },
+                        "dependency_bindings": []
+                    }
+                ]
+            },
+            {
+                "resource_type": "ec2.Vpc",
+                "identity": "empty_artifact",
+                "provider": "awscc",
+                "identifier": null,
+                "attributes": {}
+            }
+        ]
+    }"#;
+
+    let state = check_and_migrate(json)
+        .expect("v9 deposed-only row should load")
+        .into_state();
+    assert!(
+        state
+            .find_resource("awscc", "ec2.Vpc", "deposed_only")
+            .is_some(),
+        "identifier=None row must survive while deposed entries remain"
+    );
+    assert!(
+        state
+            .find_resource("awscc", "ec2.Vpc", "empty_artifact")
+            .is_none(),
+        "identifier=None row with no deposed entries should still be dropped"
+    );
 }
 
 #[test]
@@ -1725,6 +2009,7 @@ fn build_remote_bindings_ignores_resource_bindings() {
             "vpc_id".to_string(),
             serde_json::Value::String("vpc-123".to_string()),
         )]),
+        deposed: Vec::new(),
         protected: false,
         directives: carina_core::resource::Directives::default(),
         prefixes: HashMap::new(),

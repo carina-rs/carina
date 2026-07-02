@@ -4,13 +4,14 @@
 //! `StateFile`: applying name overrides, building the post-apply state,
 //! resolving exports, and (for destroy) removing destroyed resources.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
+use carina_core::effect::{DeferredReplaceDelete, Effect};
 use carina_core::executor::ExecutionResult;
-use carina_core::plan::Plan;
+use carina_core::plan::{Plan, ReplaceDisplayInfo};
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
-use carina_core::schema::SchemaRegistry;
-use carina_state::{LockInfo, ResourceState, StateBackend, StateFile};
+use carina_core::schema::{ResourceSchema, SchemaRegistry};
+use carina_state::{DeposedInstance, DeposedKey, LockInfo, ResourceState, StateBackend, StateFile};
 use colored::Colorize;
 
 use crate::error::AppError;
@@ -544,10 +545,12 @@ pub(crate) struct ApplyStateSave<'a> {
 
 /// Typed plan of state-file writes computed from an apply result.
 ///
-/// Enforces the invariant that **at most one write lands on any given
-/// `ResourceId`**: `add_upsert` and `add_cleanup` reject overlapping
-/// writes with `WritebackConflict`. The apply step then runs a single
-/// non-overlapping pass over `upserts` and `cleanups`.
+/// Enforces the invariant that **upsert and cleanup are mutually
+/// exclusive for any given `ResourceId`**: `add_upsert` and
+/// `add_cleanup` reject overlapping writes with `WritebackConflict`.
+/// Deposes intentionally coexist with an upsert, are applied after
+/// upserts and before cleanups, and are merged by identifier plus
+/// provider-instance routing.
 ///
 /// `Effect::Move` is a cleanup operation only — the `to` row's
 /// contents always come from Phase 1's `add_upsert`. For
@@ -560,6 +563,7 @@ pub(crate) struct ApplyStateSave<'a> {
 /// prevents.
 pub(crate) struct WritebackPlan<'a> {
     upserts: indexmap::IndexMap<ResourceId, PlannedUpsert<'a>>,
+    deposes: Vec<PlannedDepose>,
     cleanups: HashSet<ResourceId>,
 }
 
@@ -579,6 +583,30 @@ struct PlannedUpsert<'a> {
 enum UpsertSource<'a> {
     Applied(&'a State),
     CurrentState(&'a State),
+}
+
+impl<'a> UpsertSource<'a> {
+    fn state(&self) -> &'a State {
+        match self {
+            Self::Applied(state) | Self::CurrentState(state) => state,
+        }
+    }
+
+    fn is_applied(&self) -> bool {
+        matches!(self, Self::Applied(_))
+    }
+}
+
+struct PlannedDepose {
+    id: ResourceId,
+    instance: DeposedInstance,
+}
+
+enum ReplacementOutcome {
+    CurrentRowOnly,
+    CreateAppliedDeposeOld(PlannedDepose),
+    DeleteSucceededCreateAbsent(ResourceId),
+    KeepOld,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -603,6 +631,7 @@ impl<'a> WritebackPlan<'a> {
     fn new() -> Self {
         Self {
             upserts: indexmap::IndexMap::new(),
+            deposes: Vec::new(),
             cleanups: HashSet::new(),
         }
     }
@@ -637,6 +666,154 @@ impl<'a> WritebackPlan<'a> {
         self.cleanups.insert(id);
         Ok(())
     }
+
+    fn apply_replacement_outcome(
+        &mut self,
+        outcome: ReplacementOutcome,
+    ) -> Result<(), WritebackConflict> {
+        match outcome {
+            ReplacementOutcome::CurrentRowOnly | ReplacementOutcome::KeepOld => Ok(()),
+            ReplacementOutcome::CreateAppliedDeposeOld(depose) => {
+                self.deposes.push(depose);
+                Ok(())
+            }
+            ReplacementOutcome::DeleteSucceededCreateAbsent(id) => {
+                self.upserts.shift_remove(&id);
+                self.add_cleanup(id)
+            }
+        }
+    }
+}
+
+struct ReplacementDeleteInput<'a> {
+    id: &'a ResourceId,
+    identifier: &'a str,
+    fallback_dependency_bindings: BTreeSet<String>,
+    previous_attributes: Option<&'a HashMap<String, Value>>,
+}
+
+fn classify_replacement_outcome(
+    delete: ReplacementDeleteInput<'_>,
+    create_upsert: Option<&PlannedUpsert<'_>>,
+    state_file: &StateFile,
+    current_states: &HashMap<ResourceId, State>,
+    successfully_deleted: &HashSet<ResourceId>,
+    schemas: &SchemaRegistry,
+) -> ReplacementOutcome {
+    let applied_create = create_upsert.filter(|upsert| upsert.source.is_applied());
+    match applied_create {
+        Some(_) if successfully_deleted.contains(delete.id) => ReplacementOutcome::CurrentRowOnly,
+        Some(upsert) => {
+            let new_identifier = upsert.source.state().identifier.as_deref();
+            if new_identifier == Some(delete.identifier) {
+                return ReplacementOutcome::CurrentRowOnly;
+            }
+            ReplacementOutcome::CreateAppliedDeposeOld(planned_depose(
+                delete,
+                upsert.resource,
+                schemas.get_for(upsert.resource),
+                state_file,
+                current_states,
+            ))
+        }
+        None if successfully_deleted.contains(delete.id) => {
+            ReplacementOutcome::DeleteSucceededCreateAbsent(delete.id.clone())
+        }
+        None => ReplacementOutcome::KeepOld,
+    }
+}
+
+fn planned_depose(
+    delete: ReplacementDeleteInput<'_>,
+    desired_resource: &Resource,
+    schema: Option<&ResourceSchema>,
+    state_file: &StateFile,
+    current_states: &HashMap<ResourceId, State>,
+) -> PlannedDepose {
+    let existing = state_file.find_resource(
+        &delete.id.provider,
+        &delete.id.resource_type,
+        delete.id.identity_or_empty(),
+    );
+    let current = current_states.get(delete.id);
+
+    let attributes = if let Some(existing) = existing
+        && existing.identifier.as_deref() == Some(delete.identifier)
+    {
+        // Re-merging desired secrets can store the new secret's hash
+        // on the old snapshot. That is the safe direction: hashes are
+        // compare-only, and this also masks keys that only became
+        // secret in the new config.
+        ResourceState::protect_state_json_for_resource_and_schema(
+            desired_resource,
+            schema,
+            existing.attributes.clone(),
+        )
+    } else {
+        if let Some(previous) = delete.previous_attributes {
+            ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
+                desired_resource,
+                schema,
+                previous,
+            )
+        } else if let Some(current) = current {
+            ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
+                desired_resource,
+                schema,
+                &current.attributes,
+            )
+        } else {
+            HashMap::new()
+        }
+    };
+
+    let dependency_bindings = existing
+        .map(|rs| rs.dependency_bindings.clone())
+        .filter(|bindings| !bindings.is_empty())
+        .or_else(|| current.map(|state| state.dependency_bindings.clone()))
+        .filter(|bindings| !bindings.is_empty())
+        .unwrap_or(delete.fallback_dependency_bindings);
+
+    PlannedDepose {
+        id: delete.id.clone(),
+        instance: DeposedInstance {
+            key: DeposedKey::new_unique(),
+            identifier: delete.identifier.to_string(),
+            provider_instance: delete.id.provider_instance.clone(),
+            attributes,
+            dependency_bindings,
+        },
+    }
+}
+
+fn delete_input_from_effect<'a>(
+    effect: &'a Effect,
+    replacement: &'a ReplaceDisplayInfo<'a>,
+) -> Option<ReplacementDeleteInput<'a>> {
+    let Effect::Delete {
+        id,
+        identifier,
+        dependencies,
+        ..
+    } = effect
+    else {
+        return None;
+    };
+    Some(ReplacementDeleteInput {
+        id: id.as_inner(),
+        identifier,
+        fallback_dependency_bindings: dependencies.iter().cloned().collect(),
+        previous_attributes: Some(replacement.previous_attributes),
+    })
+}
+
+fn delete_input_from_deferred(delete: &DeferredReplaceDelete) -> ReplacementDeleteInput<'_> {
+    ReplacementDeleteInput {
+        id: delete.id.as_inner(),
+        identifier: &delete.identifier,
+        fallback_dependency_bindings: delete.dependencies.iter().cloned().collect(),
+        previous_attributes: None,
+    }
 }
 
 /// Build the typed writeback plan from the raw apply inputs.
@@ -645,18 +822,34 @@ impl<'a> WritebackPlan<'a> {
 /// `applied_states` first, falling back to `current_states` when the
 /// resource exists but had no provider call, and emitting cleanups
 /// when the resource was absent post-refresh. Phase 2 (`plan.effects()`
-/// walk) registers cleanups for `Delete` / `Remove` / `Move`'s `from`.
-/// `Effect::Move` deliberately does **not** touch the `to` slot — that
-/// is Phase 1's job.
-fn decompose<'a>(
+/// walk) classifies replacement outcomes for decomposed replacements
+/// and `DeferredReplace`, then registers ordinary cleanups for
+/// `Delete` / `Remove` / `Move`'s `from`. `Effect::Move` deliberately
+/// does **not** touch the `to` slot — that is Phase 1's job.
+struct DecomposeInput<'a, 's> {
+    state_file: &'s StateFile,
     sorted_resources: &'a [Resource],
     runtime_synthesized_resources: &'a [Resource],
     current_states: &'a HashMap<ResourceId, State>,
     applied_states: &'a HashMap<ResourceId, State>,
-    plan: &Plan,
-    successfully_deleted: &HashSet<ResourceId>,
-    failed_refreshes: &HashSet<ResourceId>,
-) -> Result<WritebackPlan<'a>, WritebackConflict> {
+    plan: &'a Plan,
+    successfully_deleted: &'a HashSet<ResourceId>,
+    failed_refreshes: &'a HashSet<ResourceId>,
+    schemas: &'a SchemaRegistry,
+}
+
+fn decompose<'a>(input: DecomposeInput<'a, '_>) -> Result<WritebackPlan<'a>, WritebackConflict> {
+    let DecomposeInput {
+        state_file,
+        sorted_resources,
+        runtime_synthesized_resources,
+        current_states,
+        applied_states,
+        plan,
+        successfully_deleted,
+        failed_refreshes,
+        schemas,
+    } = input;
     let mut wb = WritebackPlan::new();
 
     for resource in sorted_resources {
@@ -681,13 +874,46 @@ fn decompose<'a>(
         }
     }
 
+    let replacement_by_delete_idx: HashMap<usize, ReplaceDisplayInfo<'_>> = plan
+        .replace_display_info()
+        .map(|replacement| (replacement.delete_idx, replacement))
+        .collect();
+
     for (idx, effect) in plan.effects().iter().enumerate() {
-        for id in
-            effect.writeback_cleanup_ids(successfully_deleted, &|id| wb.upserts.contains_key(id))
-        {
-            if plan.is_replacement_delete_index(idx) && wb.upserts.contains_key(&id) {
-                continue;
+        if let Some(replacement) = replacement_by_delete_idx.get(&idx) {
+            if let Some(delete) = delete_input_from_effect(effect, replacement) {
+                let create_id = plan.effects()[replacement.create_idx].resource_id();
+                let outcome = classify_replacement_outcome(
+                    delete,
+                    wb.upserts.get(create_id),
+                    state_file,
+                    current_states,
+                    successfully_deleted,
+                    schemas,
+                );
+                wb.apply_replacement_outcome(outcome)?;
             }
+            continue;
+        }
+
+        if let Effect::DeferredReplace(payload) = effect {
+            for delete in &payload.deletes {
+                let delete = delete_input_from_deferred(delete);
+                let create_upsert = wb.upserts.get(delete.id);
+                let outcome = classify_replacement_outcome(
+                    delete,
+                    create_upsert,
+                    state_file,
+                    current_states,
+                    successfully_deleted,
+                    schemas,
+                );
+                wb.apply_replacement_outcome(outcome)?;
+            }
+            continue;
+        }
+
+        for id in effect.writeback_cleanup_ids(successfully_deleted) {
             wb.add_cleanup(id)?;
         }
     }
@@ -709,7 +935,8 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
     } = save;
     let mut state = state_file.unwrap_or_default();
 
-    let writeback = decompose(
+    let writeback = decompose(DecomposeInput {
+        state_file: &state,
         sorted_resources,
         runtime_synthesized_resources,
         current_states,
@@ -717,7 +944,8 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
         plan,
         successfully_deleted,
         failed_refreshes,
-    )?;
+        schemas,
+    })?;
     let permanent_name_overrides = plan.permanent_name_overrides_for_state();
 
     for (id, planned) in &writeback.upserts {
@@ -750,11 +978,42 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
         state.upsert_resource(resource_state);
     }
 
+    for planned in writeback.deposes {
+        apply_planned_depose(&mut state, planned);
+    }
+
     for id in &writeback.cleanups {
         state.remove_resource(&id.provider, &id.resource_type, id.identity_or_empty());
     }
 
     Ok(state)
+}
+
+fn apply_planned_depose(state: &mut StateFile, planned: PlannedDepose) {
+    if let Some(row) = state.find_resource_mut(
+        &planned.id.provider,
+        &planned.id.resource_type,
+        planned.id.identity_or_empty(),
+    ) {
+        if let Some(existing) = row.deposed.iter_mut().find(|entry| {
+            entry.identifier == planned.instance.identifier
+                && entry.provider_instance == planned.instance.provider_instance
+        }) {
+            *existing = planned.instance;
+        } else {
+            row.deposed.push(planned.instance);
+        }
+        return;
+    }
+
+    let mut row = ResourceState::new(
+        planned.id.resource_type.clone(),
+        planned.id.identity_or_empty(),
+        planned.id.provider.clone(),
+    );
+    row.directives.provider_instance = planned.id.provider_instance.clone();
+    row.deposed.push(planned.instance);
+    state.upsert_resource(row);
 }
 
 /// Apply destroy results to the state file: remove destroyed resources and
@@ -883,13 +1142,19 @@ mod post_apply_states_tests {
 #[cfg(test)]
 mod apply_state_save_tests {
     use super::*;
+    use carina_core::differ::create_plan;
     use carina_core::effect::{
         DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes,
     };
     use carina_core::parser::{DeferredForExpression, ForBinding};
     use carina_core::plan::Plan;
-    use carina_core::resource::{ConcreteValue, Directives, Resource, ResourceId, State, Value};
-    use carina_state::NameOverride;
+    use carina_core::provider::ProviderRouter;
+    use carina_core::resource::{
+        ConcreteValue, DeferredValue, Directives, Resource, ResourceId, State, UnknownReason, Value,
+    };
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+    use carina_core::value::SECRET_PREFIX;
+    use carina_state::{DeposedInstance, DeposedKey, NameOverride};
 
     fn plan_with_name_override(id: &ResourceId, temp_value: &str, original_value: &str) -> Plan {
         serde_json::from_value(serde_json::json!({
@@ -1114,16 +1379,19 @@ mod apply_state_save_tests {
         let applied_states = HashMap::from([(id.clone(), applied_state)]);
         let successfully_deleted = HashSet::from([id.clone()]);
         let failed_refreshes = HashSet::new();
+        let schemas = SchemaRegistry::new();
 
-        let wb = decompose(
-            &[],
-            std::slice::from_ref(&runtime_child),
-            &current_states,
-            &applied_states,
-            &plan,
-            &successfully_deleted,
-            &failed_refreshes,
-        )
+        let wb = decompose(DecomposeInput {
+            state_file: &StateFile::new(),
+            sorted_resources: &[],
+            runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
+            current_states: &current_states,
+            applied_states: &applied_states,
+            plan: &plan,
+            successfully_deleted: &successfully_deleted,
+            failed_refreshes: &failed_refreshes,
+            schemas: &schemas,
+        })
         .expect("successful DeferredReplace writeback must not collide");
 
         assert_eq!(wb.upserts.len(), 1);
@@ -1133,6 +1401,453 @@ mod apply_state_save_tests {
             "successful create half must suppress cleanup for the replaced id"
         );
         assert!(wb.cleanups.is_empty());
+    }
+
+    #[test]
+    fn deferred_replace_create_success_delete_not_successful_deposes_old_instance() {
+        let id = ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            Some("west".to_string()),
+        );
+        let runtime_child = Resource::with_provider(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            Some("west".to_string()),
+        )
+        .with_binding("validation_records[0]");
+        let applied_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("new.example.com".to_string())),
+            )]),
+        )
+        .with_identifier("new-record-id");
+        let current_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("old.example.com".to_string())),
+            )]),
+        )
+        .with_identifier("old-record-id");
+        let mut existing = ResourceState::new("route53.Record", "validation_records[0]", "aws")
+            .with_identifier("old-record-id")
+            .with_attribute("name", serde_json::json!("old.example.com"));
+        existing.directives.provider_instance = Some("west".to_string());
+        existing.dependency_bindings.insert("cert".to_string());
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+        let mut plan = Plan::new();
+        plan.add(deferred_replace_effect(&id));
+        let current_states = HashMap::from([(id.clone(), current_state)]);
+        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: &[],
+            runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
+            current_states: &current_states,
+            applied_states: &applied_states,
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &carina_core::schema::SchemaRegistry::new(),
+        })
+        .expect("writeback should preserve old absorbed delete as deposed");
+
+        let saved = state
+            .find_resource("aws", "route53.Record", "validation_records[0]")
+            .expect("new child row should be persisted");
+        assert_eq!(saved.identifier.as_deref(), Some("new-record-id"));
+        assert_eq!(saved.directives.provider_instance.as_deref(), Some("west"));
+        let saved_json = serde_json::to_value(saved).expect("resource state should serialize");
+        let deposed = saved_json
+            .get("deposed")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| {
+                panic!("expected old-record-id to be retained as deposed; row: {saved_json:#?}")
+            });
+        assert_eq!(deposed.len(), 1);
+        assert_eq!(deposed[0]["identifier"], serde_json::json!("old-record-id"));
+        assert_eq!(deposed[0]["provider_instance"], serde_json::json!("west"));
+    }
+
+    #[test]
+    fn replacement_create_same_identifier_does_not_depose() {
+        let id = ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            None,
+        );
+        let runtime_child =
+            Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
+                .with_binding("validation_records[0]");
+        let applied_state =
+            State::existing(id.clone(), HashMap::new()).with_identifier("old-record-id");
+        let current_state =
+            State::existing(id.clone(), HashMap::new()).with_identifier("old-record-id");
+        let mut plan = Plan::new();
+        plan.add(deferred_replace_effect(&id));
+        let current_states = HashMap::from([(id.clone(), current_state)]);
+        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(StateFile::new()),
+            sorted_resources: &[],
+            runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
+            current_states: &current_states,
+            applied_states: &applied_states,
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &carina_core::schema::SchemaRegistry::new(),
+        })
+        .expect("same-identifier replacement should write only the current row");
+
+        let saved = state
+            .find_resource("aws", "route53.Record", "validation_records[0]")
+            .expect("current row should be persisted");
+        assert_eq!(saved.identifier.as_deref(), Some("old-record-id"));
+        assert!(
+            saved.deposed.is_empty(),
+            "same remote object must not be recorded as a deposed generation"
+        );
+    }
+
+    #[test]
+    fn deposed_fallback_attributes_hash_secrets_and_skip_unknowns() {
+        let id = ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            None,
+        );
+        let runtime_child =
+            Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
+                .with_binding("validation_records[0]")
+                .with_attribute(
+                    "password",
+                    Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                        ConcreteValue::String("plain-secret".to_string()),
+                    )))),
+                );
+        let applied_state =
+            State::existing(id.clone(), HashMap::new()).with_identifier("new-record-id");
+        let current_state = State::existing(
+            id.clone(),
+            HashMap::from([
+                (
+                    "password".to_string(),
+                    Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+                ),
+                (
+                    "unknown".to_string(),
+                    Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+                ),
+            ]),
+        )
+        .with_identifier("old-record-id");
+        let mut plan = Plan::new();
+        plan.add(deferred_replace_effect(&id));
+        let current_states = HashMap::from([(id.clone(), current_state)]);
+        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(StateFile::new()),
+            sorted_resources: &[],
+            runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
+            current_states: &current_states,
+            applied_states: &applied_states,
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &carina_core::schema::SchemaRegistry::new(),
+        })
+        .expect("unknown deposed fallback attributes should be skipped, not fail writeback");
+
+        let saved = state
+            .find_resource("aws", "route53.Record", "validation_records[0]")
+            .expect("new child row should be persisted");
+        let deposed = saved
+            .deposed
+            .first()
+            .expect("old instance should be deposed");
+        let stored_secret = deposed
+            .attributes
+            .get("password")
+            .and_then(serde_json::Value::as_str)
+            .expect("secret fallback should be stored as a hash");
+        assert!(stored_secret.starts_with(SECRET_PREFIX));
+        assert!(
+            !stored_secret.contains("plain-secret"),
+            "deposed attributes must not persist plaintext secrets"
+        );
+        assert!(
+            !deposed.attributes.contains_key("unknown"),
+            "unserializable fallback attributes should be skipped"
+        );
+    }
+
+    #[test]
+    fn deposed_fallback_drops_schema_write_only_attribute_removed_from_new_desired() {
+        let id = ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            None,
+        );
+        let runtime_child =
+            Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
+                .with_binding("validation_records[0]")
+                .with_attribute(
+                    "name",
+                    Value::Concrete(ConcreteValue::String("new.example.com".to_string())),
+                );
+        let applied_state =
+            State::existing(id.clone(), HashMap::new()).with_identifier("new-record-id");
+        let current_state = State::existing(
+            id.clone(),
+            HashMap::from([
+                (
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("old.example.com".to_string())),
+                ),
+                (
+                    "password".to_string(),
+                    Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+                ),
+            ]),
+        )
+        .with_identifier("old-record-id");
+        let mut plan = Plan::new();
+        plan.add(deferred_replace_effect(&id));
+        let current_states = HashMap::from([(id.clone(), current_state)]);
+        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "aws",
+            ResourceSchema::new("route53.Record")
+                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+        );
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(StateFile::new()),
+            sorted_resources: &[],
+            runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
+            current_states: &current_states,
+            applied_states: &applied_states,
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &schemas,
+        })
+        .expect("schema-protected removed attributes should not fail writeback");
+
+        let row = state
+            .find_resource("aws", "route53.Record", "validation_records[0]")
+            .expect("new child row should be persisted");
+        let deposed = row.deposed.first().expect("old instance should be deposed");
+        assert_eq!(
+            deposed.attributes.get("name"),
+            Some(&serde_json::json!("old.example.com"))
+        );
+        assert!(
+            !deposed.attributes.contains_key("password"),
+            "schema write-only fallback must not persist removed plaintext"
+        );
+        let serialized = serde_json::to_string(&deposed).expect("deposed should serialize");
+        assert!(
+            !serialized.contains("plain-secret"),
+            "deposed entry must not contain plaintext secret"
+        );
+    }
+
+    #[test]
+    fn apply_planned_depose_inserts_shell_when_row_missing() {
+        let id = ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            Some("west".to_string()),
+        );
+        let mut state = StateFile::new();
+
+        apply_planned_depose(
+            &mut state,
+            PlannedDepose {
+                id: id.clone(),
+                instance: DeposedInstance {
+                    key: DeposedKey::new_unique(),
+                    identifier: "old-record-id".to_string(),
+                    provider_instance: Some("west".to_string()),
+                    attributes: HashMap::from([(
+                        "name".to_string(),
+                        serde_json::json!("old.example.com"),
+                    )]),
+                    dependency_bindings: BTreeSet::from(["cert".to_string()]),
+                },
+            },
+        );
+
+        let row = state
+            .find_resource("aws", "route53.Record", "validation_records[0]")
+            .expect("missing row should be created for deposed instance");
+        assert_eq!(row.identifier, None);
+        assert!(row.attributes.is_empty());
+        assert_eq!(row.directives.provider_instance.as_deref(), Some("west"));
+        assert_eq!(row.deposed.len(), 1);
+        assert_eq!(row.deposed[0].identifier, "old-record-id");
+        assert_eq!(row.deposed[0].provider_instance.as_deref(), Some("west"));
+    }
+
+    #[test]
+    fn apply_planned_depose_replaces_existing_entry_with_same_identifier() {
+        let id = ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            Some("west".to_string()),
+        );
+        let east_key = DeposedKey::new_unique();
+        let west_key = DeposedKey::new_unique();
+        let replacement_west_key = DeposedKey::new_unique();
+        let mut row = ResourceState::new("route53.Record", "validation_records[0]", "aws");
+        row.directives.provider_instance = Some("west".to_string());
+        row.deposed.push(DeposedInstance {
+            key: east_key.clone(),
+            identifier: "old-record-id".to_string(),
+            provider_instance: Some("east".to_string()),
+            attributes: HashMap::from([("name".to_string(), serde_json::json!("stale"))]),
+            dependency_bindings: BTreeSet::from(["old".to_string()]),
+        });
+        let mut state = StateFile::new();
+        state.resources.push(row);
+
+        apply_planned_depose(
+            &mut state,
+            PlannedDepose {
+                id: id.clone(),
+                instance: DeposedInstance {
+                    key: west_key.clone(),
+                    identifier: "old-record-id".to_string(),
+                    provider_instance: Some("west".to_string()),
+                    attributes: HashMap::from([("name".to_string(), serde_json::json!("fresh"))]),
+                    dependency_bindings: BTreeSet::from(["new".to_string()]),
+                },
+            },
+        );
+
+        let row = state
+            .find_resource("aws", "route53.Record", "validation_records[0]")
+            .expect("row should still exist");
+        assert_eq!(
+            row.deposed.len(),
+            2,
+            "same identifier under different provider routing should be retained separately"
+        );
+        assert_eq!(row.deposed[0].key, east_key);
+        assert_eq!(row.deposed[0].provider_instance.as_deref(), Some("east"));
+        assert_eq!(row.deposed[1].key, west_key);
+        assert_eq!(row.deposed[1].provider_instance.as_deref(), Some("west"));
+
+        apply_planned_depose(
+            &mut state,
+            PlannedDepose {
+                id,
+                instance: DeposedInstance {
+                    key: replacement_west_key.clone(),
+                    identifier: "old-record-id".to_string(),
+                    provider_instance: Some("west".to_string()),
+                    attributes: HashMap::from([("name".to_string(), serde_json::json!("newer"))]),
+                    dependency_bindings: BTreeSet::from(["newer".to_string()]),
+                },
+            },
+        );
+
+        let row = state
+            .find_resource("aws", "route53.Record", "validation_records[0]")
+            .expect("row should still exist");
+        assert_eq!(row.deposed.len(), 2);
+        let deposed = &row.deposed[1];
+        assert_eq!(deposed.identifier, "old-record-id");
+        assert_eq!(deposed.key, replacement_west_key);
+        assert_eq!(deposed.provider_instance.as_deref(), Some("west"));
+        assert_eq!(
+            deposed.attributes.get("name"),
+            Some(&serde_json::json!("newer"))
+        );
+        assert_eq!(
+            deposed.dependency_bindings,
+            BTreeSet::from(["newer".to_string()])
+        );
+    }
+
+    #[test]
+    fn replacement_writeback_appends_second_deposed_generation() {
+        let id = ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            None,
+        );
+        let runtime_child =
+            Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
+                .with_binding("validation_records[0]");
+        let applied_state =
+            State::existing(id.clone(), HashMap::new()).with_identifier("new-record-id");
+        let current_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("old.example.com".to_string())),
+            )]),
+        )
+        .with_identifier("old-record-id");
+        let first_key = DeposedKey::new_unique();
+        let mut existing = ResourceState::new("route53.Record", "validation_records[0]", "aws")
+            .with_identifier("old-record-id")
+            .with_attribute("name", serde_json::json!("old.example.com"));
+        existing.deposed.push(DeposedInstance {
+            key: first_key.clone(),
+            identifier: "older-record-id".to_string(),
+            provider_instance: None,
+            attributes: HashMap::from([("name".to_string(), serde_json::json!("older"))]),
+            dependency_bindings: BTreeSet::from(["cert".to_string()]),
+        });
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+        let mut plan = Plan::new();
+        plan.add(deferred_replace_effect(&id));
+        let current_states = HashMap::from([(id.clone(), current_state)]);
+        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: &[],
+            runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
+            current_states: &current_states,
+            applied_states: &applied_states,
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &carina_core::schema::SchemaRegistry::new(),
+        })
+        .expect("writeback should preserve existing deposed entries and append the new one");
+
+        let saved = state
+            .find_resource("aws", "route53.Record", "validation_records[0]")
+            .expect("new child row should be persisted");
+        assert_eq!(saved.identifier.as_deref(), Some("new-record-id"));
+        assert_eq!(saved.deposed.len(), 2);
+        assert_eq!(saved.deposed[0].identifier, "older-record-id");
+        assert_eq!(saved.deposed[1].identifier, "old-record-id");
+        assert_ne!(saved.deposed[0].key, saved.deposed[1].key);
+        assert_eq!(saved.deposed[0].key, first_key);
     }
 
     #[test]
@@ -1149,20 +1864,206 @@ mod apply_state_save_tests {
         let applied_states = HashMap::new();
         let successfully_deleted = HashSet::from([id.clone()]);
         let failed_refreshes = HashSet::new();
+        let schemas = SchemaRegistry::new();
 
-        let wb = decompose(
-            &[],
-            &[],
-            &current_states,
-            &applied_states,
-            &plan,
-            &successfully_deleted,
-            &failed_refreshes,
-        )
+        let wb = decompose(DecomposeInput {
+            state_file: &StateFile::new(),
+            sorted_resources: &[],
+            runtime_synthesized_resources: &[],
+            current_states: &current_states,
+            applied_states: &applied_states,
+            plan: &plan,
+            successfully_deleted: &successfully_deleted,
+            failed_refreshes: &failed_refreshes,
+            schemas: &schemas,
+        })
         .expect("delete-only half of DeferredReplace should still write cleanup");
 
         assert!(wb.upserts.is_empty());
         assert_eq!(wb.cleanups, HashSet::from([id]));
+    }
+
+    #[test]
+    fn plain_replacement_delete_success_create_failure_writes_cleanup() {
+        let resource = Resource::new("ec2.Vpc", "main").with_attribute(
+            "cidr_block",
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        );
+        let id = resource.id.clone();
+        let sorted_resources = vec![resource];
+        let current_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "cidr_block".to_string(),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            )]),
+        )
+        .with_identifier("vpc-old");
+        let current_states = HashMap::from([(id.clone(), current_state)]);
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "",
+            ResourceSchema::new("ec2.Vpc").attribute(
+                AttributeSchema::new("cidr_block", AttributeType::string()).create_only(),
+            ),
+        );
+        let plan_input_states = carina_core::resource::into_plan_input_map(
+            current_states.clone(),
+            &SchemaRegistry::new(),
+            &[],
+        );
+        let plan = create_plan(
+            &sorted_resources,
+            &[],
+            &ProviderRouter::new(),
+            &plan_input_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        );
+        assert_eq!(plan.replace_display_info().count(), 1);
+        let applied_states = HashMap::new();
+        let successfully_deleted = HashSet::from([id.clone()]);
+        let failed_refreshes = HashSet::new();
+
+        let wb = decompose(DecomposeInput {
+            state_file: &StateFile::new(),
+            sorted_resources: &sorted_resources,
+            runtime_synthesized_resources: &[],
+            current_states: &current_states,
+            applied_states: &applied_states,
+            plan: &plan,
+            successfully_deleted: &successfully_deleted,
+            failed_refreshes: &failed_refreshes,
+            schemas: &schemas,
+        })
+        .expect("delete-success/create-failure replacement should write cleanup");
+
+        assert!(
+            wb.upserts.is_empty(),
+            "stale current-state fallback must not be written after the old instance was deleted"
+        );
+        assert_eq!(wb.cleanups, HashSet::from([id]));
+    }
+
+    #[test]
+    fn moved_target_replacement_delete_failure_deposes_old_instance() {
+        let from_id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "old_bucket", None);
+        let mut resource = Resource::with_provider("awscc", "s3.Bucket", "new_bucket", None)
+            .with_attribute(
+                "bucket_name",
+                Value::Concrete(ConcreteValue::String("new-name".to_string())),
+            );
+        resource.directives.create_before_destroy = true;
+        let id = resource.id.clone();
+        let sorted_resources = vec![resource];
+        let current_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "bucket_name".to_string(),
+                Value::Concrete(ConcreteValue::String("old-name".to_string())),
+            )]),
+        )
+        .with_identifier("bucket-old-id");
+        let current_states = HashMap::from([(id.clone(), current_state)]);
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "awscc",
+            ResourceSchema::new("s3.Bucket")
+                .attribute(
+                    AttributeSchema::new("bucket_name", AttributeType::string()).create_only(),
+                )
+                .with_coexisting_replacement(),
+        );
+        let plan_input_states =
+            carina_core::resource::into_plan_input_map(current_states.clone(), &schemas, &[]);
+        let mut plan = create_plan(
+            &sorted_resources,
+            &[],
+            &ProviderRouter::new(),
+            &plan_input_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        );
+        let replacement = plan
+            .replace_display_info()
+            .next()
+            .expect("create-only diff should produce replacement metadata");
+        assert!(replacement.create_before_destroy);
+        let state_blocks: Vec<carina_core::parser::StateBlock> = Vec::new();
+        let state_file_for_wiring = Some(StateFile::new());
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let unresolved_upstreams: HashSet<&str> = HashSet::new();
+
+        crate::wiring::add_state_block_effects(
+            &mut plan,
+            &state_blocks,
+            &state_file_for_wiring,
+            &[(from_id.clone(), id.clone())],
+            &sorted_resources,
+            &bindings,
+            &unresolved_upstreams,
+        );
+
+        assert_eq!(
+            plan.replace_display_info().count(),
+            1,
+            "moved target replacement metadata must survive state-block suppression"
+        );
+        assert!(
+            plan.effects()
+                .iter()
+                .any(|effect| matches!(effect, Effect::Delete { id: delete_id, .. } if delete_id.as_ref() == &id)),
+            "replacement Delete for moved target must not be suppressed"
+        );
+
+        let mut existing = ResourceState::new("s3.Bucket", "new_bucket", "awscc")
+            .with_identifier("bucket-old-id")
+            .with_attribute("bucket_name", serde_json::json!("old-name"));
+        existing.dependency_bindings.insert("logs".to_string());
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+        let applied_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "bucket_name".to_string(),
+                Value::Concrete(ConcreteValue::String("new-name".to_string())),
+            )]),
+        )
+        .with_identifier("bucket-new-id");
+        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: &sorted_resources,
+            runtime_synthesized_resources: &[],
+            current_states: &current_states,
+            applied_states: &applied_states,
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &schemas,
+        })
+        .expect("moved replacement writeback should preserve the failed delete as deposed");
+
+        let row = state
+            .find_resource("awscc", "s3.Bucket", "new_bucket")
+            .expect("moved target row should be persisted");
+        assert_eq!(row.identifier.as_deref(), Some("bucket-new-id"));
+        assert_eq!(row.deposed.len(), 1);
+        assert_eq!(row.deposed[0].identifier, "bucket-old-id");
+        assert_eq!(row.deposed[0].provider_instance, None);
+        assert_eq!(
+            row.deposed[0].attributes.get("bucket_name"),
+            Some(&serde_json::json!("old-name"))
+        );
     }
 
     #[test]
@@ -1191,16 +2092,19 @@ mod apply_state_save_tests {
         let applied_states = HashMap::from([(id.clone(), applied_state)]);
         let successfully_deleted = HashSet::new();
         let failed_refreshes = HashSet::new();
+        let schemas = SchemaRegistry::new();
 
-        let result = decompose(
-            std::slice::from_ref(&desired),
-            &[],
-            &current_states,
-            &applied_states,
-            &plan,
-            &successfully_deleted,
-            &failed_refreshes,
-        );
+        let result = decompose(DecomposeInput {
+            state_file: &StateFile::new(),
+            sorted_resources: std::slice::from_ref(&desired),
+            runtime_synthesized_resources: &[],
+            current_states: &current_states,
+            applied_states: &applied_states,
+            plan: &plan,
+            successfully_deleted: &successfully_deleted,
+            failed_refreshes: &failed_refreshes,
+            schemas: &schemas,
+        });
         let err = match result {
             Ok(_) => panic!("Move from-address cleanup must still collide with desired upsert"),
             Err(err) => err,

@@ -1533,7 +1533,7 @@ async fn run_apply_locked(
         &parsed.state_blocks,
         &state_file,
         &moved_pairs,
-        schemas,
+        override_aware_resources.resources(),
         override_aware_resources.bindings(),
         &no_unresolved_upstreams,
     );
@@ -1848,6 +1848,9 @@ async fn run_apply_from_plan_with_observer_factory(
             PlanFile::CURRENT_VERSION
         )));
     }
+    plan_file
+        .validate_replace_display()
+        .map_err(AppError::Config)?;
 
     let current_version = env!("CARGO_PKG_VERSION");
     if plan_file.carina_version != current_version {

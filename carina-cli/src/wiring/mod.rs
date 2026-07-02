@@ -2475,7 +2475,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         &parsed.state_blocks,
         state_file,
         &moved_pairs,
-        ctx.schemas(),
+        override_aware_resources.resources(),
         override_aware_resources.bindings(),
         &upstream_binding_names,
     );
@@ -2860,7 +2860,7 @@ pub fn add_state_block_effects(
     state_blocks: &[StateBlock],
     state_file: &Option<StateFile>,
     moved_pairs: &[(ResourceId, ResourceId)],
-    _registry: &SchemaRegistry,
+    desired_resources: &[Resource],
     // carina#3329: resolved bindings + the set of upstream-state
     // binding names whose surviving refs are stamped as
     // `Value::Deferred(DeferredValue::Unknown(UpstreamRef { … }))`.
@@ -2879,6 +2879,10 @@ pub fn add_state_block_effects(
         std::collections::HashSet::new();
     let mut suppress_create: std::collections::HashSet<ResourceId> =
         std::collections::HashSet::new();
+    let desired_ids: std::collections::HashSet<ResourceId> = desired_resources
+        .iter()
+        .map(|resource| resource.id.clone())
+        .collect();
 
     let mut new_effects: Vec<Effect> = Vec::new();
 
@@ -2961,7 +2965,9 @@ pub fn add_state_block_effects(
     // Also suppress orphan Delete for `to` when there is no desired resource
     // for the target (the moved state entry would otherwise appear as an orphan).
     for (from, to) in moved_pairs {
-        suppress_delete.insert(to.clone());
+        if !desired_ids.contains(to) {
+            suppress_delete.insert(to.clone());
+        }
         new_effects.push(Effect::Move {
             from: carina_core::resource::ResolvedResourceId::new(from.clone()),
             to: carina_core::resource::ResolvedResourceId::new(to.clone()),
