@@ -10,17 +10,20 @@
 //! running sub-second.
 
 use carina_cli::DetailLevel;
-use carina_cli::display::{format_destroy_plan, format_plan};
+use carina_cli::display::{
+    format_destroy_plan_with_delete_instances, format_plan_with_delete_instances,
+};
 use carina_cli::fixture_plan::{
-    build_plan_from_fixture_name, delete_attributes_from_plan, delete_attributes_from_states,
+    build_plan_from_fixture_name, delete_instance_attributes_from_plan,
 };
 
 /// Render a fixture the way the `plan-fixture` example does for a normal
 /// (non-destroy) plan and return the formatted output string.
 fn render_plan(fixture: &str, detail: DetailLevel) -> String {
     let fp = build_plan_from_fixture_name(fixture);
-    let delete_attributes = delete_attributes_from_plan(&fp.plan, &fp.current_states);
-    format_plan(
+    let delete_attributes =
+        delete_instance_attributes_from_plan(&fp.plan, &fp.current_states, fp.state_file.as_ref());
+    format_plan_with_delete_instances(
         &fp.plan,
         detail,
         &delete_attributes,
@@ -36,8 +39,9 @@ fn render_plan(fixture: &str, detail: DetailLevel) -> String {
 /// Render a fixture as a destroy plan, mirroring `plan-fixture --destroy`.
 fn render_destroy_plan(fixture: &str, detail: DetailLevel) -> String {
     let fp = build_plan_from_fixture_name(fixture);
-    let delete_attributes = delete_attributes_from_states(&fp.current_states);
-    format_destroy_plan(&fp.plan, detail, &delete_attributes)
+    let delete_attributes =
+        delete_instance_attributes_from_plan(&fp.plan, &fp.current_states, fp.state_file.as_ref());
+    format_destroy_plan_with_delete_instances(&fp.plan, detail, &delete_attributes)
 }
 
 fn assert_non_empty(output: &str, fixture: &str) {

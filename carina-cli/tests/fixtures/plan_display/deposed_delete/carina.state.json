@@ -1,0 +1,46 @@
+{
+  "version": 9,
+  "serial": 1,
+  "lineage": "test-lineage-deposed-delete",
+  "carina_version": "0.4.0",
+  "exports": {
+    "main_id": "vpc-new"
+  },
+  "resources": [
+    {
+      "resource_type": "ec2.Vpc",
+      "identity": "main",
+      "provider": "awscc",
+      "identifier": "vpc-new",
+      "attributes": {
+        "cidr_block": "10.221.0.0/16",
+        "vpc_id": "vpc-new"
+      },
+      "deposed": [
+        {
+          "key": "deposed001",
+          "identifier": "vpc-old",
+          "attributes": {
+            "cidr_block": "10.220.0.0/16",
+            "vpc_id": "vpc-old"
+          },
+          "dependency_bindings": []
+        }
+      ],
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "main",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}

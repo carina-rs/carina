@@ -474,6 +474,7 @@ fn create_plan_parts(
                 plan.add(Effect::Delete {
                     id: ResolvedResourceId::new(id),
                     identifier,
+                    generation: crate::effect::EffectGeneration::Current,
                     directives,
                     binding,
                     dependencies,
@@ -526,6 +527,7 @@ fn create_plan_parts(
             plan.add(Effect::Delete {
                 id: ResolvedResourceId::new(id.clone()),
                 identifier,
+                generation: crate::effect::EffectGeneration::Current,
                 directives,
                 binding,
                 dependencies,

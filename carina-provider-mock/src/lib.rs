@@ -168,6 +168,28 @@ impl MockProvider {
         })
     }
 
+    fn delete_fail_error_for(id: &ResourceId, identifier: &str) -> Option<ProviderError> {
+        let target = env::var("CARINA_MOCK_DELETE_FAIL_FOR").ok()?;
+        let full = format!(
+            "{}.{}.{}",
+            id.provider,
+            id.resource_type,
+            id.identity_or_empty()
+        );
+        let key = Self::resource_key(id);
+        if target != "*" && target != full && target != key {
+            return None;
+        }
+        if let Ok(target_identifier) = env::var("CARINA_MOCK_DELETE_FAIL_IDENTIFIER")
+            && target_identifier != identifier
+        {
+            return None;
+        }
+        Some(ProviderError::internal(format!(
+            "CARINA_MOCK_DELETE_FAIL_FOR requested delete failure for {key} ({identifier})"
+        )))
+    }
+
     fn test_resource_identifier(id: &ResourceId, name: Option<&str>) -> Option<String> {
         (id.resource_type == "test.resource"
             && env::var_os("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA").is_some())
@@ -441,11 +463,16 @@ impl Provider for MockProvider {
     fn delete(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        identifier: &str,
         _request: DeleteRequest,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         let id = id.clone();
+        let identifier = identifier.to_string();
         Box::pin(async move {
+            if let Some(err) = Self::delete_fail_error_for(&id, &identifier) {
+                return Err(err);
+            }
+
             if let Some(delay) = Self::delete_delay_for(&id) {
                 tokio::time::sleep(delay).await;
             }

@@ -101,9 +101,10 @@ fn upsert_resource_drops_deposed_generation_matching_current_identifier() {
     });
     state.upsert_resource(existing);
 
-    let incoming = ResourceState::new("ec2.Vpc", "main", "aws")
+    let mut incoming = ResourceState::new("ec2.Vpc", "main", "aws")
         .with_identifier("vpc-reused")
         .with_attribute("cidr_block", serde_json::json!("10.2.0.0/16"));
+    incoming.directives.provider_instance = Some("west".to_string());
     state.upsert_resource(incoming);
 
     let row = state
@@ -113,6 +114,39 @@ fn upsert_resource_drops_deposed_generation_matching_current_identifier() {
     assert_eq!(row.deposed.len(), 1);
     assert_eq!(row.deposed[0].key, retained_key);
     assert_eq!(row.deposed[0].identifier, "vpc-older");
+}
+
+#[test]
+fn upsert_resource_keeps_deposed_generation_with_same_identifier_on_other_provider_instance() {
+    let mut state = StateFile::new();
+    let retained_key = DeposedKey::new_unique();
+    let mut existing = ResourceState::new("ec2.Vpc", "main", "aws")
+        .with_identifier("vpc-current")
+        .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
+    existing.deposed.push(DeposedInstance {
+        key: retained_key.clone(),
+        identifier: "vpc-reused".to_string(),
+        provider_instance: Some("west".to_string()),
+        attributes: HashMap::from([("cidr_block".to_string(), serde_json::json!("10.2.0.0/16"))]),
+        dependency_bindings: BTreeSet::new(),
+    });
+    state.upsert_resource(existing);
+
+    let mut incoming = ResourceState::new("ec2.Vpc", "main", "aws")
+        .with_identifier("vpc-reused")
+        .with_attribute("cidr_block", serde_json::json!("10.2.0.0/16"));
+    incoming.directives.provider_instance = Some("east".to_string());
+    state.upsert_resource(incoming);
+
+    let row = state
+        .find_resource("aws", "ec2.Vpc", "main")
+        .expect("resource should still exist");
+    assert_eq!(row.identifier.as_deref(), Some("vpc-reused"));
+    assert_eq!(row.directives.provider_instance.as_deref(), Some("east"));
+    assert_eq!(row.deposed.len(), 1);
+    assert_eq!(row.deposed[0].key, retained_key);
+    assert_eq!(row.deposed[0].identifier, "vpc-reused");
+    assert_eq!(row.deposed[0].provider_instance.as_deref(), Some("west"));
 }
 
 #[test]

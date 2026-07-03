@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use carina_core::effect::{DeferredReplaceDelete, Effect};
+use carina_core::effect::{DeferredReplaceDelete, DeletedInstanceKey, Effect, EffectGeneration};
 use carina_core::executor::ExecutionResult;
 use carina_core::plan::{Plan, ReplaceDisplayInfo};
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
@@ -538,7 +538,7 @@ pub(crate) struct ApplyStateSave<'a> {
     pub current_states: &'a HashMap<ResourceId, State>,
     pub applied_states: &'a HashMap<ResourceId, State>,
     pub plan: &'a Plan,
-    pub successfully_deleted: &'a HashSet<ResourceId>,
+    pub successfully_deleted: &'a HashSet<DeletedInstanceKey>,
     pub failed_refreshes: &'a HashSet<ResourceId>,
     pub schemas: &'a SchemaRegistry,
 }
@@ -564,6 +564,7 @@ pub(crate) struct ApplyStateSave<'a> {
 pub(crate) struct WritebackPlan<'a> {
     upserts: indexmap::IndexMap<ResourceId, PlannedUpsert<'a>>,
     deposes: Vec<PlannedDepose>,
+    remove_deposed: Vec<PlannedRemoveDeposed>,
     cleanups: HashSet<ResourceId>,
 }
 
@@ -602,6 +603,11 @@ struct PlannedDepose {
     instance: DeposedInstance,
 }
 
+struct PlannedRemoveDeposed {
+    id: ResourceId,
+    key: DeposedKey,
+}
+
 enum ReplacementOutcome {
     CurrentRowOnly,
     CreateAppliedDeposeOld(PlannedDepose),
@@ -632,6 +638,7 @@ impl<'a> WritebackPlan<'a> {
         Self {
             upserts: indexmap::IndexMap::new(),
             deposes: Vec::new(),
+            remove_deposed: Vec::new(),
             cleanups: HashSet::new(),
         }
     }
@@ -683,13 +690,48 @@ impl<'a> WritebackPlan<'a> {
             }
         }
     }
+
+    fn add_remove_deposed(&mut self, id: ResourceId, key: DeposedKey) {
+        self.remove_deposed.push(PlannedRemoveDeposed { id, key });
+    }
 }
 
 struct ReplacementDeleteInput<'a> {
     id: &'a ResourceId,
     identifier: &'a str,
+    provider_instance: Option<String>,
+    generation: &'a EffectGeneration,
     fallback_dependency_bindings: BTreeSet<String>,
     previous_attributes: Option<&'a HashMap<String, Value>>,
+}
+
+static CURRENT_GENERATION: EffectGeneration = EffectGeneration::Current;
+
+fn delete_succeeded(
+    successfully_deleted: &HashSet<DeletedInstanceKey>,
+    id: &ResourceId,
+    generation: &EffectGeneration,
+    identifier: &str,
+) -> bool {
+    successfully_deleted.contains(&DeletedInstanceKey::new(
+        id.clone(),
+        generation.clone(),
+        identifier.to_string(),
+    ))
+}
+
+fn identifier_was_successfully_deleted(
+    successfully_deleted: &HashSet<DeletedInstanceKey>,
+    id: &ResourceId,
+    provider_instance: &Option<String>,
+    identifier: &str,
+) -> bool {
+    let mut delete_id = id.clone();
+    delete_id.provider_instance = provider_instance.clone();
+    successfully_deleted.contains(&DeletedInstanceKey::current(
+        delete_id,
+        identifier.to_string(),
+    ))
 }
 
 fn classify_replacement_outcome(
@@ -697,12 +739,21 @@ fn classify_replacement_outcome(
     create_upsert: Option<&PlannedUpsert<'_>>,
     state_file: &StateFile,
     current_states: &HashMap<ResourceId, State>,
-    successfully_deleted: &HashSet<ResourceId>,
+    successfully_deleted: &HashSet<DeletedInstanceKey>,
     schemas: &SchemaRegistry,
 ) -> ReplacementOutcome {
     let applied_create = create_upsert.filter(|upsert| upsert.source.is_applied());
     match applied_create {
-        Some(_) if successfully_deleted.contains(delete.id) => ReplacementOutcome::CurrentRowOnly,
+        Some(_)
+            if delete_succeeded(
+                successfully_deleted,
+                delete.id,
+                delete.generation,
+                delete.identifier,
+            ) =>
+        {
+            ReplacementOutcome::CurrentRowOnly
+        }
         Some(upsert) => {
             let new_identifier = upsert.source.state().identifier.as_deref();
             if new_identifier == Some(delete.identifier) {
@@ -716,7 +767,13 @@ fn classify_replacement_outcome(
                 current_states,
             ))
         }
-        None if successfully_deleted.contains(delete.id) => {
+        None if delete_succeeded(
+            successfully_deleted,
+            delete.id,
+            delete.generation,
+            delete.identifier,
+        ) =>
+        {
             ReplacementOutcome::DeleteSucceededCreateAbsent(delete.id.clone())
         }
         None => ReplacementOutcome::KeepOld,
@@ -779,7 +836,7 @@ fn planned_depose(
         instance: DeposedInstance {
             key: DeposedKey::new_unique(),
             identifier: delete.identifier.to_string(),
-            provider_instance: delete.id.provider_instance.clone(),
+            provider_instance: delete.provider_instance,
             attributes,
             dependency_bindings,
         },
@@ -793,6 +850,7 @@ fn delete_input_from_effect<'a>(
     let Effect::Delete {
         id,
         identifier,
+        generation,
         dependencies,
         ..
     } = effect
@@ -802,6 +860,8 @@ fn delete_input_from_effect<'a>(
     Some(ReplacementDeleteInput {
         id: id.as_inner(),
         identifier,
+        provider_instance: id.as_inner().provider_instance.clone(),
+        generation,
         fallback_dependency_bindings: dependencies.iter().cloned().collect(),
         previous_attributes: Some(replacement.previous_attributes),
     })
@@ -811,8 +871,98 @@ fn delete_input_from_deferred(delete: &DeferredReplaceDelete) -> ReplacementDele
     ReplacementDeleteInput {
         id: delete.id.as_inner(),
         identifier: &delete.identifier,
+        provider_instance: delete.id.as_inner().provider_instance.clone(),
+        generation: &CURRENT_GENERATION,
         fallback_dependency_bindings: delete.dependencies.iter().cloned().collect(),
         previous_attributes: None,
+    }
+}
+
+fn create_side_upsert_ids(plan: &Plan) -> HashSet<ResourceId> {
+    let mut ids = HashSet::new();
+    for effect in plan.effects() {
+        match effect {
+            Effect::Create(resource) => {
+                ids.insert(resource.id.clone());
+            }
+            Effect::DeferredReplace(payload) => {
+                ids.extend(
+                    payload
+                        .deletes
+                        .iter()
+                        .map(|delete| delete.id.clone().into_inner()),
+                );
+            }
+            _ => {}
+        }
+    }
+    ids
+}
+
+fn plan_displaced_identifier_deposes(
+    wb: &mut WritebackPlan<'_>,
+    state_file: &StateFile,
+    current_states: &HashMap<ResourceId, State>,
+    plan: &Plan,
+    successfully_deleted: &HashSet<DeletedInstanceKey>,
+    failed_refreshes: &HashSet<ResourceId>,
+    schemas: &SchemaRegistry,
+) {
+    let create_side_ids = create_side_upsert_ids(plan);
+    for (id, upsert) in &wb.upserts {
+        if !upsert.source.is_applied() {
+            continue;
+        }
+        if !create_side_ids.contains(id) {
+            continue;
+        }
+        let Some(existing) =
+            state_file.find_resource(&id.provider, &id.resource_type, id.identity_or_empty())
+        else {
+            continue;
+        };
+        let Some(displaced_identifier) = existing.identifier.as_deref() else {
+            continue;
+        };
+        if !failed_refreshes.contains(id)
+            && current_states.get(id).is_some_and(|state| !state.exists)
+        {
+            continue;
+        }
+        let new_identifier = upsert.source.state().identifier.as_deref();
+        if new_identifier == Some(displaced_identifier) {
+            continue;
+        }
+        if identifier_was_successfully_deleted(
+            successfully_deleted,
+            id,
+            &existing.directives.provider_instance,
+            displaced_identifier,
+        ) {
+            continue;
+        }
+        if wb.deposes.iter().any(|depose| {
+            &depose.id == id
+                && depose.instance.identifier == displaced_identifier
+                && depose.instance.provider_instance == existing.directives.provider_instance
+        }) {
+            continue;
+        }
+
+        wb.deposes.push(planned_depose(
+            ReplacementDeleteInput {
+                id,
+                identifier: displaced_identifier,
+                provider_instance: existing.directives.provider_instance.clone(),
+                generation: &EffectGeneration::Current,
+                fallback_dependency_bindings: existing.dependency_bindings.clone(),
+                previous_attributes: None,
+            },
+            upsert.resource,
+            schemas.get_for(upsert.resource),
+            state_file,
+            current_states,
+        ));
     }
 }
 
@@ -833,7 +983,7 @@ struct DecomposeInput<'a, 's> {
     current_states: &'a HashMap<ResourceId, State>,
     applied_states: &'a HashMap<ResourceId, State>,
     plan: &'a Plan,
-    successfully_deleted: &'a HashSet<ResourceId>,
+    successfully_deleted: &'a HashSet<DeletedInstanceKey>,
     failed_refreshes: &'a HashSet<ResourceId>,
     schemas: &'a SchemaRegistry,
 }
@@ -913,10 +1063,31 @@ fn decompose<'a>(input: DecomposeInput<'a, '_>) -> Result<WritebackPlan<'a>, Wri
             continue;
         }
 
+        if let Effect::Delete {
+            id,
+            identifier,
+            generation: generation @ EffectGeneration::Deposed(key),
+            ..
+        } = effect
+            && delete_succeeded(successfully_deleted, id.as_inner(), generation, identifier)
+        {
+            wb.add_remove_deposed(id.clone().into_inner(), key.clone());
+        }
+
         for id in effect.writeback_cleanup_ids(successfully_deleted) {
             wb.add_cleanup(id)?;
         }
     }
+
+    plan_displaced_identifier_deposes(
+        &mut wb,
+        state_file,
+        current_states,
+        plan,
+        successfully_deleted,
+        failed_refreshes,
+        schemas,
+    );
 
     Ok(wb)
 }
@@ -982,6 +1153,15 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
         apply_planned_depose(&mut state, planned);
     }
 
+    for planned in writeback.remove_deposed {
+        state.remove_deposed_generation(
+            &planned.id.provider,
+            &planned.id.resource_type,
+            planned.id.identity_or_empty(),
+            &planned.key,
+        );
+    }
+
     for id in &writeback.cleanups {
         state.remove_resource(&id.provider, &id.resource_type, id.identity_or_empty());
     }
@@ -990,42 +1170,48 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
 }
 
 fn apply_planned_depose(state: &mut StateFile, planned: PlannedDepose) {
-    if let Some(row) = state.find_resource_mut(
+    let row_provider_instance = planned.instance.provider_instance.clone();
+    state.upsert_deposed_generation(
         &planned.id.provider,
         &planned.id.resource_type,
         planned.id.identity_or_empty(),
-    ) {
-        if let Some(existing) = row.deposed.iter_mut().find(|entry| {
-            entry.identifier == planned.instance.identifier
-                && entry.provider_instance == planned.instance.provider_instance
-        }) {
-            *existing = planned.instance;
-        } else {
-            row.deposed.push(planned.instance);
-        }
-        return;
-    }
-
-    let mut row = ResourceState::new(
-        planned.id.resource_type.clone(),
-        planned.id.identity_or_empty(),
-        planned.id.provider.clone(),
+        row_provider_instance,
+        planned.instance,
     );
-    row.directives.provider_instance = planned.id.provider_instance.clone();
-    row.deposed.push(planned.instance);
-    state.upsert_resource(row);
 }
 
 /// Apply destroy results to the state file: remove destroyed resources and
 /// clear any exports (since exports reference attributes of destroyed resources).
 pub(crate) fn apply_destroy_to_state(
     state: &mut carina_state::StateFile,
-    destroyed_ids: &[ResourceId],
+    destroyed: &[DestroyedInstance],
 ) {
-    for id in destroyed_ids {
-        state.remove_resource(&id.provider, &id.resource_type, id.identity_or_empty());
+    for destroyed in destroyed {
+        match &destroyed.generation {
+            EffectGeneration::Current => {
+                state.remove_resource(
+                    &destroyed.id.provider,
+                    &destroyed.id.resource_type,
+                    destroyed.id.identity_or_empty(),
+                );
+            }
+            EffectGeneration::Deposed(key) => {
+                state.remove_deposed_generation(
+                    &destroyed.id.provider,
+                    &destroyed.id.resource_type,
+                    destroyed.id.identity_or_empty(),
+                    key,
+                );
+            }
+        }
     }
     state.exports.clear();
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DestroyedInstance {
+    pub id: ResourceId,
+    pub generation: EffectGeneration,
 }
 
 /// Build a minimal `Resource` for an orphaned resource from the state file.
@@ -1317,6 +1503,143 @@ mod apply_state_save_tests {
         );
     }
 
+    #[test]
+    fn successfully_deleted_uses_full_resource_id_not_identity_only() {
+        let id_a = ResourceId::with_provider_identity("mock", "type.A", "shared", None);
+        let id_b = ResourceId::with_provider_identity("mock", "type.B", "shared", None);
+        let mut row_a = ResourceState::new("type.A", "shared", "mock");
+        row_a.identifier = Some("a-old".to_string());
+        let mut row_b = ResourceState::new("type.B", "shared", "mock");
+        row_b.identifier = Some("b-old".to_string());
+        let mut state_file = StateFile::new();
+        state_file.resources.push(row_a);
+        state_file.resources.push(row_b);
+
+        let mut plan = Plan::new();
+        for (id, identifier) in [(&id_a, "a-old"), (&id_b, "b-old")] {
+            plan.add(Effect::Delete {
+                id: carina_core::resource::ResolvedResourceId::new(id.clone()),
+                identifier: identifier.to_string(),
+                generation: EffectGeneration::Current,
+                directives: Directives::default(),
+                binding: None,
+                dependencies: HashSet::new(),
+                explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
+            });
+        }
+        let successfully_deleted =
+            HashSet::from([DeletedInstanceKey::current(id_a.clone(), "a-old")]);
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: &[],
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &HashMap::new(),
+            plan: &plan,
+            successfully_deleted: &successfully_deleted,
+            failed_refreshes: &HashSet::new(),
+            schemas: &SchemaRegistry::new(),
+        })
+        .expect("writeback should accept independent deletes");
+
+        assert!(
+            state.find_resource("mock", "type.A", "shared").is_none(),
+            "the succeeded delete row should be cleaned"
+        );
+        assert!(
+            state.find_resource("mock", "type.B", "shared").is_some(),
+            "the failed delete row with the same identity string must remain"
+        );
+    }
+
+    #[test]
+    fn top_level_deposed_delete_next_to_deferred_create_removes_entry_on_success() {
+        let id = ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            None,
+        );
+        let deposed_key = DeposedKey::new_unique();
+        let mut row = ResourceState::new("route53.Record", "validation_records[0]", "aws");
+        row.identifier = Some("new-record-id".to_string());
+        row.deposed.push(DeposedInstance {
+            key: deposed_key.clone(),
+            identifier: "old-record-id".to_string(),
+            provider_instance: None,
+            attributes: HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
+            dependency_bindings: BTreeSet::from(["cert".to_string()]),
+        });
+        let mut state_file = StateFile::new();
+        state_file.resources.push(row);
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Delete {
+            id: carina_core::resource::ResolvedResourceId::new(id.clone()),
+            identifier: "old-record-id".to_string(),
+            generation: EffectGeneration::Deposed(deposed_key.clone()),
+            directives: Directives::default(),
+            binding: Some("validation_records[0]".to_string()),
+            dependencies: HashSet::from(["cert".to_string()]),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        });
+        plan.add(Effect::DeferredCreate {
+            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "__deferred_for",
+                "validation_records",
+            )),
+            upstream_binding: "cert".to_string(),
+            template: Box::new(DeferredForExpression {
+                file: Some("main.crn".to_string()),
+                line: 1,
+                header: "for opt in cert.domain_validation_options".to_string(),
+                resource_type: "aws.route53.Record".to_string(),
+                attributes: vec![],
+                binding_name: "validation_records".to_string(),
+                iterable_binding: "cert".to_string(),
+                iterable_attr: "domain_validation_options".to_string(),
+                binding: ForBinding::Simple("opt".to_string()),
+                template_resource: Resource::with_provider(
+                    "aws",
+                    "route53.Record",
+                    "validation_records",
+                    None,
+                )
+                .with_binding("validation_records"),
+            }),
+        });
+        let successfully_deleted = HashSet::from([DeletedInstanceKey::new(
+            id.clone(),
+            EffectGeneration::Deposed(deposed_key),
+            "old-record-id",
+        )]);
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: &[],
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &HashMap::new(),
+            plan: &plan,
+            successfully_deleted: &successfully_deleted,
+            failed_refreshes: &HashSet::new(),
+            schemas: &SchemaRegistry::new(),
+        })
+        .expect("writeback should remove successful top-level deposed delete");
+
+        let row = state
+            .find_resource("aws", "route53.Record", "validation_records[0]")
+            .expect("current row should remain");
+        assert_eq!(row.identifier.as_deref(), Some("new-record-id"));
+        assert!(
+            row.deposed.is_empty(),
+            "successful top-level deposed delete must remove its stored generation"
+        );
+    }
+
     fn deferred_replace_delete(id: &ResourceId) -> DeferredReplaceDelete {
         DeferredReplaceDelete {
             id: carina_core::resource::ResolvedResourceId::new(id.clone()),
@@ -1377,7 +1700,8 @@ mod apply_state_save_tests {
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::new();
         let applied_states = HashMap::from([(id.clone(), applied_state)]);
-        let successfully_deleted = HashSet::from([id.clone()]);
+        let successfully_deleted =
+            HashSet::from([DeletedInstanceKey::current(id.clone(), "old-record-id")]);
         let failed_refreshes = HashSet::new();
         let schemas = SchemaRegistry::new();
 
@@ -1516,6 +1840,640 @@ mod apply_state_save_tests {
         assert!(
             saved.deposed.is_empty(),
             "same remote object must not be recorded as a deposed generation"
+        );
+    }
+
+    #[test]
+    fn update_only_applied_identifier_change_does_not_phantom_depose_old_identifier() {
+        let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None)
+            .with_binding("main")
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+            );
+        let id = desired.id.clone();
+        let existing = ResourceState::new("ec2.Vpc", "main", "awscc")
+            .with_identifier("vpc-canonical-old")
+            .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+        let from_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "cidr_block".to_string(),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            )]),
+        )
+        .with_identifier("vpc-canonical-old");
+        let applied_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "cidr_block".to_string(),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+            )]),
+        )
+        .with_identifier("vpc-canonical-new");
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            from: Box::new(from_state),
+            to: carina_core::resource::ResolvedResource::new(desired.clone()),
+            changed_attributes: vec!["cidr_block".to_string()],
+        });
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: std::slice::from_ref(&desired),
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &HashMap::from([(id, applied_state)]),
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &SchemaRegistry::new(),
+        })
+        .expect("update writeback should not depose canonicalized identifiers");
+
+        let row = state
+            .find_resource("awscc", "ec2.Vpc", "main")
+            .expect("current row should remain");
+        assert_eq!(row.identifier.as_deref(), Some("vpc-canonical-new"));
+        assert!(
+            row.deposed.is_empty(),
+            "update-only identifier rewrites are the same live remote object"
+        );
+    }
+
+    #[test]
+    fn applied_upsert_that_displaces_undeleted_current_identifier_deposes_old_identifier() {
+        let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None)
+            .with_binding("main")
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+            );
+        let id = desired.id.clone();
+        let mut existing = ResourceState::new("ec2.Vpc", "main", "awscc")
+            .with_identifier("vpc-old")
+            .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
+        existing.dependency_bindings.insert("igw".to_string());
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+        let applied_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "cidr_block".to_string(),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+            )]),
+        )
+        .with_identifier("vpc-new");
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            carina_core::resource::ResolvedResource::new(desired.clone()),
+        ));
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: std::slice::from_ref(&desired),
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &HashMap::from([(id, applied_state)]),
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &SchemaRegistry::new(),
+        })
+        .expect("writeback should depose the displaced current identifier");
+
+        let row = state
+            .find_resource("awscc", "ec2.Vpc", "main")
+            .expect("current row should remain");
+        assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
+        assert_eq!(row.deposed.len(), 1);
+        assert_eq!(row.deposed[0].identifier, "vpc-old");
+        assert_eq!(
+            row.deposed[0].attributes.get("cidr_block"),
+            Some(&serde_json::json!("10.0.0.0/16"))
+        );
+        assert_eq!(
+            row.deposed[0].dependency_bindings,
+            BTreeSet::from(["igw".to_string()])
+        );
+    }
+
+    #[test]
+    fn applied_recreate_after_confirmed_missing_current_does_not_depose_old_identifier() {
+        let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None)
+            .with_binding("main")
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+            );
+        let id = desired.id.clone();
+        let existing = ResourceState::new("ec2.Vpc", "main", "awscc")
+            .with_identifier("vpc-old")
+            .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+        let current_state = State::not_found(id.clone()).with_identifier("vpc-old");
+        let applied_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "cidr_block".to_string(),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+            )]),
+        )
+        .with_identifier("vpc-new");
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            carina_core::resource::ResolvedResource::new(desired.clone()),
+        ));
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: std::slice::from_ref(&desired),
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::from([(id.clone(), current_state)]),
+            applied_states: &HashMap::from([(id, applied_state)]),
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &SchemaRegistry::new(),
+        })
+        .expect("writeback should treat the old identifier as already absent");
+
+        let row = state
+            .find_resource("awscc", "ec2.Vpc", "main")
+            .expect("current row should remain");
+        assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
+        assert!(
+            row.deposed.is_empty(),
+            "pre-apply exists=false proves the displaced identifier is already gone"
+        );
+    }
+
+    #[test]
+    fn displaced_identifier_depose_records_existing_row_provider_instance() {
+        let desired =
+            Resource::with_provider("awscc", "ec2.Vpc", "main", Some("new-provider".to_string()))
+                .with_binding("main")
+                .with_attribute(
+                    "cidr_block",
+                    Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                );
+        let id = desired.id.clone();
+        let mut existing = ResourceState::new("ec2.Vpc", "main", "awscc")
+            .with_identifier("vpc-old")
+            .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
+        existing.directives.provider_instance = Some("old-provider".to_string());
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+        let applied_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "cidr_block".to_string(),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+            )]),
+        )
+        .with_identifier("vpc-new");
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            carina_core::resource::ResolvedResource::new(desired.clone()),
+        ));
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: std::slice::from_ref(&desired),
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &HashMap::from([(id, applied_state)]),
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &SchemaRegistry::new(),
+        })
+        .expect("writeback should depose the displaced current identifier");
+
+        let row = state
+            .find_resource("awscc", "ec2.Vpc", "main")
+            .expect("current row should remain");
+        assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
+        assert_eq!(row.deposed.len(), 1);
+        assert_eq!(row.deposed[0].identifier, "vpc-old");
+        assert_eq!(
+            row.deposed[0].provider_instance.as_deref(),
+            Some("old-provider"),
+            "the deposed generation must route to the provider instance where the displaced object lived"
+        );
+    }
+
+    #[test]
+    fn rerouted_replacement_with_successful_old_routing_delete_does_not_depose_displaced_identifier()
+     {
+        let desired =
+            Resource::with_provider("awscc", "ec2.Vpc", "main", Some("new-provider".to_string()))
+                .with_binding("main")
+                .with_attribute(
+                    "cidr_block",
+                    Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                );
+        let create_id = desired.id.clone();
+        let delete_id = ResourceId::with_provider_identity(
+            "awscc",
+            "ec2.Vpc",
+            "main",
+            Some("old-provider".to_string()),
+        );
+        let mut existing = ResourceState::new("ec2.Vpc", "main", "awscc")
+            .with_identifier("vpc-old")
+            .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
+        existing.directives.provider_instance = Some("old-provider".to_string());
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+        let applied_state = State::existing(
+            create_id.clone(),
+            HashMap::from([(
+                "cidr_block".to_string(),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+            )]),
+        )
+        .with_identifier("vpc-new");
+        let mut plan = Plan::new();
+        plan.add(Effect::Delete {
+            id: carina_core::resource::ResolvedResourceId::new(delete_id.clone()),
+            identifier: "vpc-old".to_string(),
+            generation: EffectGeneration::Current,
+            directives: Directives::default(),
+            binding: Some("main".to_string()),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        });
+        plan.add(Effect::Create(
+            carina_core::resource::ResolvedResource::new(desired.clone()),
+        ));
+        let previous_attributes = HashMap::from([(
+            "cidr_block".to_string(),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        )]);
+        let mut plan_json = serde_json::to_value(&plan).expect("plan should serialize");
+        plan_json["replace_display"] = serde_json::json!([
+            {
+                "create_idx": 1,
+                "delete_idx": 0,
+                "create_before_destroy": false,
+                "changed_create_only": ["cidr_block"],
+                "cascade_ref_hints": [],
+                "temporary_name": null,
+                "previous_attributes": previous_attributes,
+            }
+        ]);
+        let plan: Plan =
+            serde_json::from_value(plan_json).expect("replacement metadata should deserialize");
+        let successfully_deleted =
+            HashSet::from([DeletedInstanceKey::current(delete_id, "vpc-old")]);
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: std::slice::from_ref(&desired),
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &HashMap::from([(create_id, applied_state)]),
+            plan: &plan,
+            successfully_deleted: &successfully_deleted,
+            failed_refreshes: &HashSet::new(),
+            schemas: &SchemaRegistry::new(),
+        })
+        .expect("writeback should treat the old routed delete as successful");
+
+        let row = state
+            .find_resource("awscc", "ec2.Vpc", "main")
+            .expect("current row should remain");
+        assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
+        assert!(
+            row.deposed.is_empty(),
+            "a displaced identifier that was deleted through the old provider routing must not be phantom-deposed"
+        );
+    }
+
+    #[test]
+    fn successful_delete_on_other_provider_instance_does_not_suppress_displaced_depose() {
+        let desired =
+            Resource::with_provider("awscc", "ec2.Vpc", "main", Some("new-provider".to_string()))
+                .with_binding("main")
+                .with_attribute(
+                    "cidr_block",
+                    Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                );
+        let create_id = desired.id.clone();
+        let mut existing = ResourceState::new("ec2.Vpc", "main", "awscc")
+            .with_identifier("shared-name")
+            .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
+        existing.directives.provider_instance = Some("old-provider".to_string());
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+        let applied_state = State::existing(
+            create_id.clone(),
+            HashMap::from([(
+                "cidr_block".to_string(),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+            )]),
+        )
+        .with_identifier("vpc-new");
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            carina_core::resource::ResolvedResource::new(desired.clone()),
+        ));
+        let successfully_deleted = HashSet::from([DeletedInstanceKey::current(
+            create_id.clone(),
+            "shared-name",
+        )]);
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: std::slice::from_ref(&desired),
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &HashMap::from([(create_id, applied_state)]),
+            plan: &plan,
+            successfully_deleted: &successfully_deleted,
+            failed_refreshes: &HashSet::new(),
+            schemas: &SchemaRegistry::new(),
+        })
+        .expect("writeback should not confuse provider-instance-local identifiers");
+
+        let row = state
+            .find_resource("awscc", "ec2.Vpc", "main")
+            .expect("current row should remain");
+        assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
+        assert_eq!(row.deposed.len(), 1);
+        assert_eq!(row.deposed[0].identifier, "shared-name");
+        assert_eq!(
+            row.deposed[0].provider_instance.as_deref(),
+            Some("old-provider")
+        );
+    }
+
+    #[test]
+    fn replacement_rerun_deposes_displaced_current_even_when_failed_delete_already_deposed_same_id()
+    {
+        let desired = Resource::with_provider(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            Some("west".to_string()),
+        )
+        .with_binding("validation_records[0]")
+        .with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("new-2.example.com".to_string())),
+        );
+        let id = desired.id.clone();
+        let mut existing = ResourceState::new("route53.Record", "validation_records[0]", "aws")
+            .with_identifier("new-1-record-id")
+            .with_attribute("name", serde_json::json!("new-1.example.com"));
+        existing.directives.provider_instance = Some("west".to_string());
+        existing.deposed.push(DeposedInstance {
+            key: DeposedKey::new_unique(),
+            identifier: "old-record-id".to_string(),
+            provider_instance: Some("west".to_string()),
+            attributes: HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
+            dependency_bindings: BTreeSet::new(),
+        });
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+
+        let applied_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("new-2.example.com".to_string())),
+            )]),
+        )
+        .with_identifier("new-2-record-id");
+        let mut plan = Plan::new();
+        plan.add(Effect::Delete {
+            id: carina_core::resource::ResolvedResourceId::new(id.clone()),
+            identifier: "old-record-id".to_string(),
+            generation: EffectGeneration::Current,
+            directives: Directives::default(),
+            binding: Some("validation_records[0]".to_string()),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        });
+        plan.add(Effect::Create(
+            carina_core::resource::ResolvedResource::new(desired.clone()),
+        ));
+        let previous_attributes = HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("old.example.com".to_string())),
+        )]);
+        let mut plan_json = serde_json::to_value(&plan).expect("plan should serialize");
+        plan_json["replace_display"] = serde_json::json!([
+            {
+                "create_idx": 1,
+                "delete_idx": 0,
+                "create_before_destroy": false,
+                "changed_create_only": ["name"],
+                "cascade_ref_hints": [],
+                "temporary_name": null,
+                "previous_attributes": previous_attributes,
+            }
+        ]);
+        let plan: Plan =
+            serde_json::from_value(plan_json).expect("replacement metadata should deserialize");
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: std::slice::from_ref(&desired),
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &HashMap::from([(id, applied_state)]),
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &SchemaRegistry::new(),
+        })
+        .expect("writeback should preserve both failed old delete and displaced current");
+
+        let row = state
+            .find_resource("aws", "route53.Record", "validation_records[0]")
+            .expect("current row should remain");
+        assert_eq!(row.identifier.as_deref(), Some("new-2-record-id"));
+        let mut deposed: Vec<_> = row
+            .deposed
+            .iter()
+            .map(|entry| {
+                (
+                    entry.identifier.as_str(),
+                    entry.provider_instance.as_deref(),
+                )
+            })
+            .collect();
+        deposed.sort_unstable();
+        assert_eq!(
+            deposed,
+            vec![
+                ("new-1-record-id", Some("west")),
+                ("old-record-id", Some("west"))
+            ],
+            "same-id dedup must only skip the exact displaced generation, not a different failed delete"
+        );
+    }
+
+    #[test]
+    fn replacement_rerun_deposes_displaced_current_and_retains_old_deposed_after_current_delete_success()
+     {
+        let desired = Resource::with_provider(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            Some("west".to_string()),
+        )
+        .with_binding("validation_records[0]")
+        .with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("new-2.example.com".to_string())),
+        );
+        let id = desired.id.clone();
+        let mut existing = ResourceState::new("route53.Record", "validation_records[0]", "aws")
+            .with_identifier("new-1-record-id")
+            .with_attribute("name", serde_json::json!("new-1.example.com"));
+        existing.directives.provider_instance = Some("west".to_string());
+        existing.deposed.push(DeposedInstance {
+            key: DeposedKey::new_unique(),
+            identifier: "old-record-id".to_string(),
+            provider_instance: Some("west".to_string()),
+            attributes: HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
+            dependency_bindings: BTreeSet::new(),
+        });
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+
+        let applied_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::Concrete(ConcreteValue::String("new-2.example.com".to_string())),
+            )]),
+        )
+        .with_identifier("new-2-record-id");
+        let mut plan = Plan::new();
+        plan.add(Effect::Delete {
+            id: carina_core::resource::ResolvedResourceId::new(id.clone()),
+            identifier: "old-record-id".to_string(),
+            generation: EffectGeneration::Current,
+            directives: Directives::default(),
+            binding: Some("validation_records[0]".to_string()),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        });
+        plan.add(Effect::Create(
+            carina_core::resource::ResolvedResource::new(desired.clone()),
+        ));
+        let previous_attributes = HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("old.example.com".to_string())),
+        )]);
+        let mut plan_json = serde_json::to_value(&plan).expect("plan should serialize");
+        plan_json["replace_display"] = serde_json::json!([
+            {
+                "create_idx": 1,
+                "delete_idx": 0,
+                "create_before_destroy": false,
+                "changed_create_only": ["name"],
+                "cascade_ref_hints": [],
+                "temporary_name": null,
+                "previous_attributes": previous_attributes,
+            }
+        ]);
+        let plan: Plan =
+            serde_json::from_value(plan_json).expect("replacement metadata should deserialize");
+        let successfully_deleted =
+            HashSet::from([DeletedInstanceKey::current(id.clone(), "old-record-id")]);
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: std::slice::from_ref(&desired),
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &HashMap::from([(id, applied_state)]),
+            plan: &plan,
+            successfully_deleted: &successfully_deleted,
+            failed_refreshes: &HashSet::new(),
+            schemas: &SchemaRegistry::new(),
+        })
+        .expect("writeback should depose displaced current and retain existing deposed entry");
+
+        let row = state
+            .find_resource("aws", "route53.Record", "validation_records[0]")
+            .expect("current row should remain");
+        assert_eq!(row.identifier.as_deref(), Some("new-2-record-id"));
+        let mut deposed: Vec<_> = row
+            .deposed
+            .iter()
+            .map(|entry| {
+                (
+                    entry.identifier.as_str(),
+                    entry.provider_instance.as_deref(),
+                )
+            })
+            .collect();
+        deposed.sort_unstable();
+        assert_eq!(
+            deposed,
+            vec![
+                ("new-1-record-id", Some("west")),
+                ("old-record-id", Some("west"))
+            ],
+            "a Current-generation delete result must not remove an existing deposed generation"
+        );
+    }
+
+    #[test]
+    fn refresh_current_state_upsert_does_not_phantom_depose_displaced_identifier() {
+        let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None)
+            .with_binding("main")
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+            );
+        let id = desired.id.clone();
+        let existing = ResourceState::new("ec2.Vpc", "main", "awscc")
+            .with_identifier("vpc-old")
+            .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+        let refreshed_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "cidr_block".to_string(),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+            )]),
+        )
+        .with_identifier("vpc-new");
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: std::slice::from_ref(&desired),
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::from([(id, refreshed_state)]),
+            applied_states: &HashMap::new(),
+            plan: &Plan::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &SchemaRegistry::new(),
+        })
+        .expect("refresh writeback should update the current row only");
+
+        let row = state
+            .find_resource("awscc", "ec2.Vpc", "main")
+            .expect("current row should remain");
+        assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
+        assert!(
+            row.deposed.is_empty(),
+            "refresh-only current-state upserts must not depose the previous identifier"
         );
     }
 
@@ -1862,7 +2820,8 @@ mod apply_state_save_tests {
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::new();
         let applied_states = HashMap::new();
-        let successfully_deleted = HashSet::from([id.clone()]);
+        let successfully_deleted =
+            HashSet::from([DeletedInstanceKey::current(id.clone(), "old-record-id")]);
         let failed_refreshes = HashSet::new();
         let schemas = SchemaRegistry::new();
 
@@ -1926,7 +2885,8 @@ mod apply_state_save_tests {
         );
         assert_eq!(plan.replace_display_info().count(), 1);
         let applied_states = HashMap::new();
-        let successfully_deleted = HashSet::from([id.clone()]);
+        let successfully_deleted =
+            HashSet::from([DeletedInstanceKey::current(id.clone(), "vpc-old")]);
         let failed_refreshes = HashSet::new();
 
         let wb = decompose(DecomposeInput {

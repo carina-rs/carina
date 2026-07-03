@@ -8,15 +8,18 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use carina_core::config_loader::load_configuration;
-use carina_core::effect::Effect;
+use carina_core::effect::{DeletedInstanceKey, Effect};
 use carina_core::plan::Plan;
 use carina_core::resource::{
-    DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceId, State,
+    DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::SchemaRegistry;
 
 use crate::DetailLevel;
-use crate::display::{format_destroy_plan, format_plan};
+use crate::display::{
+    format_destroy_plan_with_delete_instances as format_destroy_plan,
+    format_plan_with_delete_instances as format_plan,
+};
 use crate::fixture_plan::build_plan_from_fixture_name;
 
 fn resolved(resource: Resource) -> ResolvedResource {
@@ -56,6 +59,13 @@ fn build_plan_and_states_from_fixture(
 ) {
     let fp = build_plan_from_fixture_name(fixture_dir);
     (fp.plan, fp.current_states, fp.schemas, fp.moved_origins)
+}
+
+fn delete_attributes_for_plan(
+    plan: &Plan,
+    current_states: &HashMap<ResourceId, State>,
+) -> HashMap<DeletedInstanceKey, HashMap<String, Value>> {
+    crate::commands::plan::collect_delete_attributes(plan, current_states, None)
 }
 
 /// Plan-display gate for `directives.depends_on` (#2823). The bucket
@@ -514,22 +524,9 @@ fn snapshot_replace_with_non_forcing_diffs() {
 
 #[test]
 fn snapshot_delete_orphan() {
-    use carina_core::resource::Value;
     let (plan, current_states, schemas, _moved) =
         build_plan_and_states_from_fixture("delete_orphan");
-    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = plan
-        .effects()
-        .iter()
-        .filter_map(|e| {
-            if let carina_core::effect::Effect::Delete { id, .. } = e {
-                current_states
-                    .get(id)
-                    .map(|s| (id.clone().into_inner(), s.attributes.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Full,
@@ -544,6 +541,55 @@ fn snapshot_delete_orphan() {
     insta::assert_snapshot!(output);
 }
 
+#[test]
+fn snapshot_deposed_delete() {
+    let fp = build_plan_from_fixture_name("deposed_delete");
+    let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
+        &fp.plan,
+        &fp.current_states,
+        fp.state_file.as_ref(),
+    );
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &delete_attributes,
+        Some(&fp.schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_deposed_delete_update_dependency() {
+    let fp = build_plan_from_fixture_name("deposed_delete_update_dependency");
+    let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
+        &fp.plan,
+        &fp.current_states,
+        fp.state_file.as_ref(),
+    );
+    let output = strip_ansi(&format_plan(
+        &fp.plan,
+        DetailLevel::Full,
+        &delete_attributes,
+        Some(&fp.schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    assert!(
+        output.contains("  ~ awscc.ec2.Vpc main\n")
+            && output.contains("        └─ ~ awscc.ec2.Subnet subnet"),
+        "dependent subnet must render under the current main update, not under the deposed delete:\n{output}"
+    );
+    insta::assert_snapshot!(output);
+}
+
 /// A deleted orphan whose state carries a list-of-maps attribute
 /// (`domain_validation_options`) must render that attribute vertically
 /// (multi-line), not on one long unreadable line. Regression for the
@@ -551,22 +597,9 @@ fn snapshot_delete_orphan() {
 /// `build_detail_rows` / `build_delete_rows`.
 #[test]
 fn snapshot_delete_orphan_list_of_maps() {
-    use carina_core::resource::Value;
     let (plan, current_states, schemas, _moved) =
         build_plan_and_states_from_fixture("delete_orphan_list_of_maps");
-    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = plan
-        .effects()
-        .iter()
-        .filter_map(|e| {
-            if let carina_core::effect::Effect::Delete { id, .. } = e {
-                current_states
-                    .get(id)
-                    .map(|s| (id.clone().into_inner(), s.attributes.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Full,
@@ -734,14 +767,9 @@ fn route53_hosted_zone_name_strip_suffix_no_diff() {
 
 #[test]
 fn snapshot_destroy_full() {
-    use carina_core::resource::Value;
     let (plan, current_states, _schemas, _moved) =
         build_plan_and_states_from_fixture("destroy_full");
-    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = current_states
-        .into_iter()
-        .filter(|(_, state)| state.exists)
-        .map(|(id, state)| (id, state.attributes))
-        .collect();
+    let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
     let output = strip_ansi(&format_destroy_plan(
         &plan,
         DetailLevel::Full,
@@ -758,14 +786,9 @@ fn snapshot_destroy_full() {
 /// (cf. #3115).
 #[test]
 fn snapshot_destroy_list_struct_child_gutter() {
-    use carina_core::resource::Value;
     let (plan, current_states, _schemas, _moved) =
         build_plan_and_states_from_fixture("destroy_list_struct_child_gutter");
-    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = current_states
-        .into_iter()
-        .filter(|(_, state)| state.exists)
-        .map(|(id, state)| (id, state.attributes))
-        .collect();
+    let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
     let output = strip_ansi(&format_destroy_plan(
         &plan,
         DetailLevel::Full,
@@ -776,14 +799,9 @@ fn snapshot_destroy_list_struct_child_gutter() {
 
 #[test]
 fn snapshot_destroy_orphans() {
-    use carina_core::resource::Value;
     let (plan, current_states, _schemas, _moved) =
         build_plan_and_states_from_fixture("destroy_orphans");
-    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = current_states
-        .into_iter()
-        .filter(|(_, state)| state.exists)
-        .map(|(id, state)| (id, state.attributes))
-        .collect();
+    let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
     let output = strip_ansi(&format_destroy_plan(
         &plan,
         DetailLevel::Full,
@@ -879,22 +897,9 @@ fn snapshot_state_blocks() {
 
 #[test]
 fn snapshot_secret_values() {
-    use carina_core::resource::Value;
     let (plan, current_states, schemas, _moved) =
         build_plan_and_states_from_fixture("secret_values");
-    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = plan
-        .effects()
-        .iter()
-        .filter_map(|e| {
-            if let carina_core::effect::Effect::Delete { id, .. } = e {
-                current_states
-                    .get(id)
-                    .map(|s| (id.clone().into_inner(), s.attributes.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let delete_attributes = delete_attributes_for_plan(&plan, &current_states);
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Full,
@@ -1959,8 +1964,11 @@ fn snapshot_deferred_for() {
 #[test]
 fn snapshot_deferred_for_create_solo() {
     let fp = build_plan_from_fixture_name("deferred_for_create_solo");
-    let delete_attributes =
-        crate::fixture_plan::delete_attributes_from_plan(&fp.plan, &fp.current_states);
+    let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
+        &fp.plan,
+        &fp.current_states,
+        fp.state_file.as_ref(),
+    );
     let output = strip_ansi(&format_plan(
         &fp.plan,
         DetailLevel::Full,
@@ -1995,8 +2003,11 @@ fn snapshot_deferred_for_anonymous() {
 #[test]
 fn snapshot_deferred_for_with_paired_destroy() {
     let fp = build_plan_from_fixture_name("deferred_for_with_paired_destroy");
-    let delete_attributes =
-        crate::fixture_plan::delete_attributes_from_plan(&fp.plan, &fp.current_states);
+    let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
+        &fp.plan,
+        &fp.current_states,
+        fp.state_file.as_ref(),
+    );
     let output = strip_ansi(&format_plan(
         &fp.plan,
         DetailLevel::Full,
@@ -2032,8 +2043,11 @@ fn snapshot_deferred_for_with_dependent_wait() {
         plan.add(effect);
     }
     fp.plan = plan;
-    let delete_attributes =
-        crate::fixture_plan::delete_attributes_from_plan(&fp.plan, &fp.current_states);
+    let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
+        &fp.plan,
+        &fp.current_states,
+        fp.state_file.as_ref(),
+    );
     let output = strip_ansi(&format_plan(
         &fp.plan,
         DetailLevel::Full,
@@ -2051,8 +2065,11 @@ fn snapshot_deferred_for_with_dependent_wait() {
 #[test]
 fn snapshot_deferred_for_with_unrelated_delete() {
     let fp = build_plan_from_fixture_name("deferred_for_with_unrelated_delete");
-    let delete_attributes =
-        crate::fixture_plan::delete_attributes_from_plan(&fp.plan, &fp.current_states);
+    let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
+        &fp.plan,
+        &fp.current_states,
+        fp.state_file.as_ref(),
+    );
     let output = strip_ansi(&format_plan(
         &fp.plan,
         DetailLevel::Full,

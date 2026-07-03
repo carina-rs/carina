@@ -168,27 +168,52 @@ generation being addressed —
 ```rust
 pub struct EffectInstanceKey {
     identity: ResourceIdentity,
-    generation: Generation,      // Current | Deposed(DeposedKey)
+    generation: EffectGeneration,   // Current | Deposed(DeposedKey)
 }
 ```
 
-— and move the scheduler's effect index, same-identity edge derivation,
-and the executor's deleted-set (`successfully_deleted`) onto it.
-`Effect::Delete` carries the generation it targets (current deletes say
-`Current`; deposed deletes say `Deposed(key)`). Because the key type
+— and move the scheduler's effect index and same-identity edge
+derivation onto it. `Effect::Delete` carries the generation it targets
+(current deletes say `Current`; deposed deletes say `Deposed(key)`;
+the field is serde-defaulted to `Current`). Because the key type
 changes, the compiler surfaces every map, set, and comparison that must
 now distinguish generations; no consumer can silently keep conflating
-them. Create/Update effects always target `Current` by construction.
+them. Create/Update effects always target `Current` by construction,
+and `DeferredReplaceDelete` has no generation slot at all — absorbed
+deletes are `Current` by type, so a deposed delete can never be
+absorbed into a `DeferredReplace` (it stays top-level, where the
+remove-deposed writeback can observe its result).
+
+The executor's delete-result set is a separate, richer key —
+`DeletedInstanceKey { id: ResourceId, generation, identifier }`. The
+scheduler key deliberately stays identity-scoped (matching the
+pre-existing scheduler semantics), but delete results must be at least
+as strong as the pre-change `HashSet<ResourceId>`: the full
+`ResourceId` prevents identity-string collisions across resource
+types/providers/routings, and carrying the deleted identifier lets
+writeback answer "was this exact remote object deleted?" as a direct
+lookup instead of re-deriving it by matching identifier strings
+against plan effects.
 
 The same-identity replacement edge derivation keys on
 `EffectInstanceKey`, so a deposed Delete never pairs with a current
-Create as a pseudo-replacement. Deposed deletes get ordinary
-delete-ordering edges from their stored `dependency_bindings` and
-nothing else.
+Create as a pseudo-replacement. Deposed deletes get delete-ordering
+edges from their stored `dependency_bindings`; identity-level delete
+ordering fans out across generations (a parent's delete waits for
+every generation's delete of a dependent identity), and destroy
+wait-alias edges include deposed generations in both directions
+(a deposed consumer is deleted before its wait target; a deposed wait
+target waits for its consumers).
 
 Serialization note: `Effect` flows through saved plans
-(`plan --out` → apply). The added generation field must round-trip
-through plan serialization; it is additive.
+(`plan --out` → apply). The generation field round-trips through plan
+serialization, but it is deliberately NOT treated as cross-version
+additive: the plan file version bumps 9 → 10 and the loader rejects
+other versions, because an older binary reading a newer plan would
+silently degrade a deposed delete to a current delete via the serde
+default — and its writeback would then remove the whole row. Saved-plan
+pairing-metadata validation also rejects a `Deposed`-generation delete
+as a replacement half.
 
 ## Writeback: exhaustive replacement outcomes
 
@@ -241,8 +266,25 @@ destructuring, not by convention. Phase split: the depose entries land
 with Phase 1 (writeback recording); the remove-deposed entries land
 with Phase 2, which introduces deposed-delete scheduling. Within the
 writeback plan, upserts and cleanups stay mutually exclusive per
-`ResourceId`; a depose intentionally coexists with the same id's upsert
-and is applied after upserts, before cleanups.
+`ResourceId`; a depose intentionally coexists with the same id's upsert.
+Application order is upserts → deposes → remove-deposed → cleanups.
+
+Invariant-4 scoping note: "a deposed entry's identifier differs from
+the row's current identifier" is enforced per provider instance — a
+generation with the same identifier string under a different
+`provider_instance` is a different remote object and is retained.
+
+The displaced-current guard (closing the known residual below) deposes
+the identifier an applied create displaced from the row, under four
+restrictions: only ids on the plan's create side (an update-only
+identifier change is the same remote object and never deposes); skipped
+when the pre-apply refresh proved the displaced instance gone
+(`exists == false` — the manual-deletion recreate flow must not
+phantom-depose a confirmed-dead identifier; a failed refresh stays
+conservative and deposes); suppressed when the delete-result set shows
+that exact row identifier was successfully deleted (routing-aware via
+`DeletedInstanceKey`); and deduplicated against an already-planned
+depose of the same `(identifier, provider_instance)`.
 
 Two related plan-construction fixes ride along because they are the
 same invariant-1 class: `Plan::retain` now remaps the replacement
@@ -256,36 +298,58 @@ anything mutates.
 
 ## Command behavior
 
-**plan / apply.** Every plan sources delete-pending work from state:
-each `DeposedInstance` yields an `Effect::Delete` targeting
-`Deposed(key)`, displayed with a deposed marker, e.g.
+**plan / apply.** Every plan sources delete-pending work from state
+through one shared seam (used by the plan pipeline, the apply pipeline,
+and the display fixture harness): each `DeposedInstance` yields an
+`Effect::Delete` targeting `Deposed(key)`, with the identifier, routing,
+and delete-ordering dependencies taken from the entry, displayed with a
+deposed marker, e.g.
 
 ```
-- awscc.ec2.Vpc "main" (deposed vpc-0b8150caa42035bcd)
+- awscc.ec2.Vpc main (deposed vpc-0b8150caa42035bcd)
 ```
+
+The marker appears in CLI plan output, plan-brief lines, and TUI node
+labels; detail rows come from the entry's stored attributes, matched by
+key + identifier + routing. Deposed deletes count as deletes in the
+plan summary. In the plan tree they render as their own root and never
+claim the row binding's node — the binding slot belongs to the current
+instance's effect, so dependents keep hanging under the current node.
+Plan surgery leaves them alone: removed-block suppression only
+suppresses current deletes (a removed block speaks about the current
+instance; deposed generations are delete-pending work carina itself
+created), and deferred-create absorption never absorbs them.
 
 Apply executes them like any delete; success drops the entry, failure
 keeps it — the orphan is retried on every subsequent apply until it is
-gone, matching Terraform. Display work touches `display.rs` /
-`carina-tui` and gets a plan-display fixture + snapshot per the repo's
-fixture policy.
+gone, matching Terraform. A failed deposed delete does not enqueue a
+state refresh for the row (the old instance's read must never clobber
+the current row's state).
 
 **destroy.** Destroy already builds deletes from state rows; it
 additionally emits deposed deletes per entry, ordered by the stored
-dependency bindings alongside the current-instance deletes.
-`apply_destroy_to_state` removes deposed entries only on their own
-delete success, same rule as apply.
+dependency bindings alongside the current-instance deletes. Destroy
+result writeback is per instance (`DestroyedInstance { id, generation }`)
+and removes exactly the succeeded generation. The plan count and the
+emptiness/short-circuit decisions use the actual delete effects, so
+deposed-only work still runs and is counted. Backend-protected rows
+(the state bucket) shield their deposed generations too; a
+`prevent_destroy` row deliberately does not — that directive speaks
+about the current instance, and the replacement that deposed the old
+one already carried approval to delete it.
 
-**state refresh.** Refresh reads each deposed instance via the provider
-(synthetic resource from the stored identifier/attributes, like the
-orphan path). Gone remotely (e.g. the user deleted it manually) → drop
-the entry; still present → update its stored attributes. This makes
-manual cleanup converge without any new subcommand.
+**state refresh** (Phase 3 — not yet implemented). Refresh reads each
+deposed instance via the provider (synthetic resource from the stored
+identifier/attributes, like the orphan path). Gone remotely (e.g. the
+user deleted it manually) → drop the entry; still present → update its
+stored attributes. This makes manual cleanup converge without any new
+subcommand.
 
-**state list / show / lookup.** Display deposed entries under their row
-with the deposed marker and key. No new manipulation subcommands
-(no `state rm` equivalent) — recovery paths are apply/destroy (delete
-it) and refresh (observe it already gone), which cover both directions.
+**state list / show / lookup** (Phase 3 — not yet implemented). Display
+deposed entries under their row with the deposed marker and key. No new
+manipulation subcommands (no `state rm` equivalent) — recovery paths
+are apply/destroy (delete it) and refresh (observe it already gone),
+which cover both directions.
 
 ## Invariants after this change
 
@@ -296,27 +360,38 @@ it) and refresh (observe it already gone), which cover both directions.
 2. One row per `(provider, resource_type, identity)`; coexisting old
    instances live inside the row as `DeposedInstance`s, each with a
    unique `DeposedKey`.
-3. Every effect-keyed map/set distinguishes generations via
-   `EffectInstanceKey`; identity-only keying of deletes is
-   unrepresentable.
+3. Every effect-keyed map/set distinguishes generations —
+   `EffectInstanceKey` in the scheduler, `DeletedInstanceKey` (full id +
+   generation + identifier) in delete results; identity-only keying of
+   deletes is unrepresentable.
 4. A deposed entry's `identifier` always differs from the row's current
-   `identifier`.
+   `identifier` under the same provider-instance routing (the same
+   identifier string under different routing is a different remote
+   object and is retained).
 
-## Known residual (fixed by the Phase 2 key reshape)
+## Known residual (closed in Phase 2)
 
 Re-applying a stale saved plan is allowed past a serial-bump warning
 (lineage still matches). If run 1 partially failed (current `new-1`,
 deposed `old`) and the same plan file is applied again, the re-run
 Create returns `new-2` and the applied upsert overwrites the row's
-current identifier. The classification only compares against the
+current identifier; the classification only compares against the
 plan's delete identifier (`old`), so the displaced `new-1` — live,
-never deleted — is not deposed. An upsert-level "depose the displaced
-current identifier" guard needs delete results keyed by identifier
-/instance rather than `ResourceId` (today's
-`successfully_deleted: HashSet<ResourceId>` cannot distinguish which
-identifier a delete removed), i.e. exactly the `EffectInstanceKey`
-reshape scheduled for Phase 2. Recorded here so Phase 2 closes it
-deliberately rather than by accident.
+never deleted — would be dropped. Phase 2 closes this with the
+displaced-current guard described in the writeback section, enabled by
+`DeletedInstanceKey` carrying the deleted identifier (the pre-reshape
+`successfully_deleted: HashSet<ResourceId>` could not distinguish
+which identifier a delete removed). Both re-run variants are pinned by
+tests: delete-succeeds (guard deposes `new-1`) and delete-fails-again
+(guard deposes `new-1` next to the re-deposed `old`).
+
+One deliberate over-retention remains in the delete-succeeds variant:
+the run-1 deposed entry for `old` survives even though the re-run's
+Current-generation delete destroyed that object, because only a
+`Deposed(key)` delete result removes a deposed entry. Retaining a
+dead identifier is the safe direction under invariant 1; it converges
+via Phase 3 refresh (observes it gone) or an idempotent provider
+delete.
 
 ## Non-goals / boundary notes
 

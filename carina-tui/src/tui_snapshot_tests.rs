@@ -139,10 +139,30 @@ fn build_mixed_operations_plan() -> Plan {
             "old-subnet",
         )),
         identifier: "subnet-12345678".to_string(),
+        generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some("old_subnet".to_string()),
         dependencies: HashSet::new(),
         explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: HashSet::new(),
+    });
+    plan
+}
+
+fn build_deposed_delete_plan() -> Plan {
+    let mut plan = Plan::new();
+    plan.add(Effect::Delete {
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "ec2.Vpc", "main",
+        )),
+        identifier: "vpc-old".to_string(),
+        generation: carina_core::effect::EffectGeneration::Deposed(
+            carina_core::resource::DeposedKey::new_unique(),
+        ),
+        directives: Directives::default(),
+        binding: Some("main".to_string()),
+        dependencies: HashSet::new(),
+        explicit_dependencies: HashSet::new(),
         blocked_by_updates: HashSet::new(),
     });
     plan
@@ -369,6 +389,14 @@ fn snapshot_all_create() {
 fn snapshot_mixed_operations() {
     let plan = build_mixed_operations_plan();
     let output = render_tui(&plan, 120, 40, 0);
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_deposed_delete() {
+    let plan = build_deposed_delete_plan();
+    let output = render_tui(&plan, 120, 24, 0);
+    assert!(output.contains("main (deposed vpc-old)"));
     insta::assert_snapshot!(output);
 }
 

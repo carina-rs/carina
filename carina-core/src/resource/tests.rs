@@ -148,6 +148,18 @@ fn resolved_resource_id_try_new_returns_some_with_identity() {
 }
 
 #[test]
+fn resolved_resource_id_identity_returns_resolved_identity() {
+    let resolved = ResolvedResourceId::new(ResourceId::with_provider_identity(
+        "aws",
+        "s3.Bucket",
+        "logs",
+        None,
+    ));
+
+    assert_eq!(resolved.identity(), &ResourceIdentity::new("logs"));
+}
+
+#[test]
 fn resolved_resource_id_serde_round_trips_as_resource_id() {
     let resolved = ResolvedResourceId::new(ResourceId::with_provider_identity(
         "aws",

@@ -5,10 +5,10 @@ use colored::{ColoredString, Colorize};
 
 use carina_core::detail_rows::{
     DetailRow, ListOfMapsDiffField, ListOfMapsDiffItem, ListOfMapsDiffItemKind,
-    ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows,
+    ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows_by_instance,
     build_replace_detail_rows_from_display, hidden_unchanged_summary,
 };
-use carina_core::effect::Effect;
+use carina_core::effect::{DeletedInstanceKey, Effect};
 use carina_core::plan::{DeferredSummaryAction, Plan, PlanSummaryPart, ReplaceDisplayInfo};
 #[cfg(test)]
 use carina_core::plan_tree::shorten_attr_name;
@@ -312,7 +312,7 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
 pub fn print_plan(
     plan: &Plan,
     detail: DetailLevel,
-    delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
+    delete_attributes: &HashMap<DeletedInstanceKey, HashMap<String, Value>>,
     schemas: Option<&SchemaRegistry>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
     export_changes: &[crate::commands::plan::ExportChange],
@@ -322,7 +322,7 @@ pub fn print_plan(
 ) {
     print!(
         "{}",
-        format_plan(
+        format_plan_with_delete_instances(
             plan,
             detail,
             delete_attributes,
@@ -346,10 +346,10 @@ pub fn print_plan(
 /// unchanged-attribute counting (refs awscc#206), so server-side default
 /// fields the user never wrote do not inflate the plan output.
 #[allow(clippy::too_many_arguments)]
-pub fn format_plan(
+pub fn format_plan_with_delete_instances(
     plan: &Plan,
     detail: DetailLevel,
-    delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
+    delete_attributes: &HashMap<DeletedInstanceKey, HashMap<String, Value>>,
     schemas: Option<&SchemaRegistry>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
     export_changes: &[crate::commands::plan::ExportChange],
@@ -508,17 +508,10 @@ fn format_deferred_for_expression(deferred: &carina_core::parser::DeferredForExp
     out
 }
 
-/// Format a destroy plan for display.
-///
-/// Uses the same tree-building logic as `format_plan` but with a
-/// "Destroy Plan:" header and no summary line.
-///
-/// `delete_attributes` maps each resource's `ResourceId` to its current state
-/// attributes, so the display can show what will be deleted.
-pub fn format_destroy_plan(
+pub fn format_destroy_plan_with_delete_instances(
     plan: &Plan,
     detail: DetailLevel,
-    delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
+    delete_attributes: &HashMap<DeletedInstanceKey, HashMap<String, Value>>,
 ) -> String {
     let mut out = String::new();
 
@@ -554,7 +547,7 @@ struct TreeRenderContext<'a> {
     replacement_create_info: HashMap<usize, ReplaceDisplayInfo<'a>>,
     replacement_delete_indices: HashSet<usize>,
     detail: DetailLevel,
-    delete_attributes: Option<&'a HashMap<ResourceId, HashMap<String, Value>>>,
+    delete_attributes: Option<&'a HashMap<DeletedInstanceKey, HashMap<String, Value>>>,
     schemas: Option<&'a SchemaRegistry>,
     moved_origins: &'a HashMap<ResourceId, ResourceId>,
     /// Per-resource user-authoring trees, used by `build_detail_rows`
@@ -695,14 +688,29 @@ impl<'a> TreeRenderContext<'a> {
                     .unwrap();
                 }
             }
-            Effect::Delete { id, binding, .. } => {
+            Effect::Delete {
+                id,
+                identifier,
+                generation,
+                binding,
+                ..
+            } => {
                 let display_name = binding.as_deref().unwrap_or(id.identity_or_empty());
+                let deposed_note = if matches!(
+                    generation,
+                    carina_core::effect::EffectGeneration::Deposed(_)
+                ) {
+                    format!(" (deposed {identifier})")
+                } else {
+                    String::new()
+                };
                 writeln!(
                     self.out,
-                    "{}{} {}",
+                    "{}{} {}{}",
                     line_prefix,
                     id.display_type().cyan().bold(),
-                    display_name.red().bold().strikethrough()
+                    display_name.red().bold().strikethrough(),
+                    deposed_note.yellow()
                 )
                 .unwrap();
             }
@@ -887,7 +895,7 @@ impl<'a> TreeRenderContext<'a> {
                         explicit,
                     )
                 } else {
-                    build_detail_rows(
+                    build_detail_rows_by_instance(
                         effect,
                         self.schemas,
                         self.detail.to_core(),
@@ -1093,7 +1101,7 @@ fn child_prefix_for_parent(
 fn format_plan_tree<'a>(
     plan: &Plan,
     detail: DetailLevel,
-    delete_attributes: Option<&'a HashMap<ResourceId, HashMap<String, Value>>>,
+    delete_attributes: Option<&'a HashMap<DeletedInstanceKey, HashMap<String, Value>>>,
     schemas: Option<&'a SchemaRegistry>,
     moved_origins: &'a HashMap<ResourceId, ResourceId>,
     prev_explicit: Option<&'a HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
@@ -2229,9 +2237,28 @@ pub fn format_effect(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("Create {}", r.id.human()),
         Effect::Update { to, .. } => format!("Update {}", to.id.human()),
-        Effect::Delete { id, binding, .. } => {
+        Effect::Delete {
+            id,
+            identifier,
+            generation,
+            binding,
+            ..
+        } => {
             let display_name = binding.as_deref().unwrap_or(id.identity_or_empty());
-            format!("Delete {} {}", id.display_type(), display_name)
+            let deposed_note = if matches!(
+                generation,
+                carina_core::effect::EffectGeneration::Deposed(_)
+            ) {
+                format!(" (deposed {identifier})")
+            } else {
+                String::new()
+            };
+            format!(
+                "Delete {} {}{}",
+                id.display_type(),
+                display_name,
+                deposed_note
+            )
         }
         Effect::Read { resource } => {
             format!("Read {}", resource.id.human())

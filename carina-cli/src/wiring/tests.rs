@@ -833,6 +833,7 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
             Some("management".to_string()),
         )),
         identifier: String::new(),
+        generation: carina_core::effect::EffectGeneration::Current,
         directives: carina_core::resource::Directives::default(),
         binding: None,
         dependencies: std::collections::HashSet::new(),
@@ -877,6 +878,90 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
         }
         other => panic!("expected Remove effect, got {other:?}"),
     }
+}
+
+#[test]
+fn removed_block_does_not_suppress_deposed_generation_delete() {
+    use carina_core::effect::{Effect, EffectGeneration};
+    use carina_core::plan::Plan;
+    use carina_core::resource::ResourceId;
+    use carina_state::state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
+    use std::collections::{BTreeSet, HashMap};
+
+    let deposed_key = DeposedKey::new_unique();
+    let mut state_file = StateFile::new();
+    let mut rs = ResourceState::new("route53.RecordSet", "r.delegation_ns", "aws")
+        .with_identifier("record-current");
+    rs.deposed.push(DeposedInstance {
+        key: deposed_key.clone(),
+        identifier: "record-deposed".to_string(),
+        provider_instance: None,
+        attributes: HashMap::new(),
+        dependency_bindings: BTreeSet::new(),
+    });
+    state_file.resources.push(rs);
+
+    let id =
+        ResourceId::with_provider_identity("aws", "route53.RecordSet", "r.delegation_ns", None);
+    let mut plan = Plan::new();
+    plan.add(Effect::Delete {
+        id: carina_core::resource::ResolvedResourceId::new(id.clone()),
+        identifier: "record-current".to_string(),
+        generation: EffectGeneration::Current,
+        directives: carina_core::resource::Directives::default(),
+        binding: None,
+        dependencies: std::collections::HashSet::new(),
+        explicit_dependencies: std::collections::HashSet::new(),
+        blocked_by_updates: std::collections::HashSet::new(),
+    });
+    add_deposed_delete_effects(&mut plan, &Some(state_file.clone()));
+
+    let state_blocks = vec![StateBlock::Removed {
+        from: StateBlockAddress::new("aws", "route53.RecordSet", "r.delegation_ns"),
+    }];
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let no_upstreams: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    add_state_block_effects(
+        &mut plan,
+        &state_blocks,
+        &Some(state_file),
+        &[],
+        &[],
+        &bindings,
+        &no_upstreams,
+    );
+
+    assert!(
+        !plan.effects().iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Delete {
+                    generation: EffectGeneration::Current,
+                    ..
+                }
+            )
+        }),
+        "removed block must suppress only the current-instance orphan delete"
+    );
+    assert!(
+        plan.effects().iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Delete {
+                    identifier,
+                    generation: EffectGeneration::Deposed(key),
+                    ..
+                } if identifier == "record-deposed" && key == &deposed_key
+            )
+        }),
+        "deposed generation delete must stay in the plan"
+    );
+    assert!(
+        plan.effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Remove { .. })),
+        "removed block must still emit the Remove state operation"
+    );
 }
 
 /// carina#3324 regression: an import block targeting a let-bound
@@ -3174,6 +3259,7 @@ fn delete_effect_for_binding(binding: &str) -> Effect {
             None,
         )),
         identifier: format!("{binding}-old-id"),
+        generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some(binding.to_string()),
         dependencies: std::collections::HashSet::from(["cert".to_string()]),
@@ -3234,6 +3320,55 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
             .iter()
             .any(|effect| matches!(effect, Effect::DeferredCreate { .. })),
         "absorbed target must not also remain as DeferredCreate"
+    );
+}
+
+#[test]
+fn deferred_create_targets_do_not_absorb_deposed_deletes() {
+    let target = deferred_replace_test_target();
+    let deposed_key = carina_state::DeposedKey::new_unique();
+    let mut deposed_delete = delete_effect_for_binding("validation_records[0]");
+    if let Effect::Delete {
+        generation,
+        identifier,
+        ..
+    } = &mut deposed_delete
+    {
+        *generation = carina_core::effect::EffectGeneration::Deposed(deposed_key.clone());
+        *identifier = "deposed-old-id".to_string();
+    } else {
+        unreachable!("helper builds Delete");
+    }
+    let mut plan = Plan::new();
+    plan.add(deposed_delete);
+
+    add_deferred_create_effects(&mut plan, std::slice::from_ref(&target));
+
+    assert!(
+        plan.effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::DeferredCreate { .. })),
+        "deposed delete must not turn the deferred create into DeferredReplace"
+    );
+    assert!(
+        !plan
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::DeferredReplace(_))),
+        "deposed delete must not be absorbed into DeferredReplace"
+    );
+    assert!(
+        plan.effects().iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Delete {
+                    binding: Some(binding),
+                    generation: carina_core::effect::EffectGeneration::Deposed(key),
+                    ..
+                } if binding == "validation_records[0]" && key == &deposed_key
+            )
+        }),
+        "deposed delete must remain top-level so remove-deposed writeback can observe it"
     );
 }
 

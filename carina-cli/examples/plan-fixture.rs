@@ -15,9 +15,9 @@
 use std::process::ExitCode;
 
 use carina_cli::DetailLevel;
-use carina_cli::display::{format_destroy_plan, print_plan};
+use carina_cli::display::{format_destroy_plan_with_delete_instances, print_plan};
 use carina_cli::fixture_plan::{
-    build_plan_from_fixture_name, delete_attributes_from_plan, delete_attributes_from_states,
+    build_plan_from_fixture_name, delete_instance_attributes_from_plan,
 };
 
 fn print_usage() {
@@ -96,13 +96,21 @@ fn main() -> ExitCode {
     }
 
     if destroy {
-        let delete_attributes = delete_attributes_from_states(&fp.current_states);
+        let delete_attributes = delete_instance_attributes_from_plan(
+            &fp.plan,
+            &fp.current_states,
+            fp.state_file.as_ref(),
+        );
         print!(
             "{}",
-            format_destroy_plan(&fp.plan, detail, &delete_attributes)
+            format_destroy_plan_with_delete_instances(&fp.plan, detail, &delete_attributes)
         );
     } else {
-        let delete_attributes = delete_attributes_from_plan(&fp.plan, &fp.current_states);
+        let delete_attributes = delete_instance_attributes_from_plan(
+            &fp.plan,
+            &fp.current_states,
+            fp.state_file.as_ref(),
+        );
         print_plan(
             &fp.plan,
             detail,

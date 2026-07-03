@@ -1,0 +1,11 @@
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let main = awscc.ec2.Vpc {
+  cidr_block = '10.221.0.0/16'
+}
+
+exports {
+  main_id = main.vpc_id
+}

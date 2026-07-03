@@ -300,6 +300,7 @@ fn plan_file_serde_round_trip() {
             None,
         )),
         identifier: "old-bucket".to_string(),
+        generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: None,
         dependencies: HashSet::new(),

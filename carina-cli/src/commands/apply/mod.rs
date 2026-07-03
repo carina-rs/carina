@@ -1515,6 +1515,7 @@ async fn run_apply_locked(
         &orphan_dependencies,
         &wait_bindings,
     );
+    crate::wiring::add_deposed_delete_effects(&mut plan, &state_file);
 
     // Add state block effects (import/removed/moved) to the plan.
     // carina#3329: resolve `import { id = "${…}|…" }` interpolations
@@ -1623,7 +1624,7 @@ async fn run_apply_locked(
     }
 
     // Build delete attributes map from current states for display
-    let delete_attributes = collect_delete_attributes(&plan, &current_states);
+    let delete_attributes = collect_delete_attributes(&plan, &current_states, state_file.as_ref());
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
         .iter()
@@ -1818,7 +1819,12 @@ async fn run_apply_from_plan_with_observer_factory(
     let plan_file: PlanFile =
         serde_json::from_str(&content).map_err(|e| format!("Failed to parse plan file: {}", e))?;
 
-    // Validate version compatibility. Plan-file version 8 removes the
+    // Validate version compatibility. Plan-file version 10 persists
+    // `Effect::Delete.generation`; older binaries would silently
+    // degrade deposed deletes to current deletes through serde's
+    // additive default, so v9 plans must not cross this boundary.
+    //
+    // Plan-file version 8 removes the
     // legacy Replace effect shape; older saved plans must be regenerated.
     //
     // Plan-file version 6
@@ -2086,7 +2092,7 @@ async fn run_apply_from_plan_locked(
     }
 
     // Build delete attributes map from current states for display
-    let delete_attributes = collect_delete_attributes(plan, &current_states);
+    let delete_attributes = collect_delete_attributes(plan, &current_states, state_file.as_ref());
 
     print_plan(
         plan,

@@ -29,7 +29,7 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::binding_index::ResolvedBindings;
-use crate::effect::Effect;
+use crate::effect::{DeletedInstanceKey, Effect};
 use crate::parser::ProviderConfig;
 use crate::provider::{PartialReadDiagnostic, Provider, ProviderError, ProviderNormalizer};
 use crate::resource::{
@@ -219,7 +219,7 @@ pub struct ExecutionResult {
     pub skip_count: usize,
     pub applied_states: std::collections::HashMap<ResourceId, State>,
     pub runtime_synthesized_resources: Vec<Resource>,
-    pub successfully_deleted: HashSet<ResourceId>,
+    pub successfully_deleted: HashSet<DeletedInstanceKey>,
     pub permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
     pub current_states: HashMap<ResourceId, State>,
     pub bindings: ResolvedBindings,

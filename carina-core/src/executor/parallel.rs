@@ -6,9 +6,9 @@ use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::effect::Effect;
 #[cfg(test)]
 use crate::effect::deps::UnresolvedResource;
+use crate::effect::{DeletedInstanceKey, Effect};
 use crate::provider::Provider;
 use crate::resource::{Resource, ResourceId, Value};
 
@@ -225,7 +225,7 @@ pub(super) async fn execute_effects_sequential(
     let mut partial_diagnostics = Vec::new();
     let mut skip_count = 0;
     let (mut applied_states, wait_identifiers) = AppliedStates::with_initial(&input.current_states);
-    let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
+    let mut successfully_deleted: HashSet<DeletedInstanceKey> = HashSet::new();
     let permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
     let mut runtime_synthesized_resources: Vec<Resource> = Vec::new();

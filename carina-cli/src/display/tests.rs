@@ -780,7 +780,7 @@ fn test_deferred_create_renders_deferred_until_apply_marker() {
         template: Box::new(deferred),
     });
 
-    let output = strip_ansi(&format_plan(
+    let output = strip_ansi(&format_plan_with_delete_instances(
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -848,6 +848,7 @@ fn delete_record_effect(binding: &str) -> Effect {
             binding,
         )),
         identifier: format!("{binding}-id"),
+        generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some(binding.to_string()),
         dependencies: HashSet::from(["cert".to_string()]),
@@ -873,6 +874,7 @@ fn deferred_replace_validation_records_effect() -> Effect {
         dependencies,
         explicit_dependencies,
         blocked_by_updates,
+        ..
     } = delete_record_effect("validation_records[0]")
     else {
         unreachable!("helper constructs Delete")
@@ -900,7 +902,7 @@ fn test_deferred_replace_renders_top_level() {
     let mut plan = Plan::new();
     plan.add(deferred_replace_validation_records_effect());
 
-    let output = strip_ansi(&format_plan(
+    let output = strip_ansi(&format_plan_with_delete_instances(
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -941,7 +943,7 @@ fn test_deferred_replace_renders_dependent_children() {
     plan.add(deferred_replace_validation_records_effect());
     plan.add(Effect::Create(resolved(dependent)));
 
-    let output = strip_ansi(&format_plan(
+    let output = strip_ansi(&format_plan_with_delete_instances(
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -977,7 +979,7 @@ fn test_deferred_replace_keeps_unrelated_same_type_delete() {
     plan.add(delete_record_effect("old_record"));
     plan.add(deferred_replace_validation_records_effect());
 
-    let output = strip_ansi(&format_plan(
+    let output = strip_ansi(&format_plan_with_delete_instances(
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
@@ -1093,6 +1095,7 @@ fn format_effect_delete_uses_binding_name() {
             None,
         )),
         identifier: "vpc-12345".to_string(),
+        generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some("my_vpc".to_string()),
         dependencies: HashSet::new(),
@@ -1112,6 +1115,7 @@ fn format_effect_delete_falls_back_to_id_name() {
             None,
         )),
         identifier: "vpc-12345".to_string(),
+        generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: None,
         dependencies: HashSet::new(),
@@ -1419,6 +1423,7 @@ fn delete_pretty_attribute_does_not_strike_indentation() {
             carina_core::resource::ResourceId::with_identity("cloudfront.Distribution", "dist"),
         ),
         identifier: "E123".to_string(),
+        generation: carina_core::effect::EffectGeneration::Current,
         directives: Default::default(),
         binding: None,
         dependencies: Default::default(),
@@ -1649,7 +1654,7 @@ fn module_children_render_with_tree_connectors() {
     trace.record(PersistentId::new(inner_id), vec![cluster_site.clone()]);
     trace.record(PersistentId::new(role_id), vec![cluster_site]);
 
-    let output = strip_ansi(&format_plan(
+    let output = strip_ansi(&format_plan_with_delete_instances(
         &plan,
         DetailLevel::None,
         &HashMap::new(),
@@ -1693,7 +1698,7 @@ fn module_child_connector_gutter_extends_through_nested_dependents() {
     trace.record(PersistentId::new(cluster_id), vec![cluster_site.clone()]);
     trace.record(PersistentId::new(bucket_id), vec![cluster_site]);
 
-    let output = strip_ansi(&format_plan(
+    let output = strip_ansi(&format_plan_with_delete_instances(
         &plan,
         DetailLevel::None,
         &HashMap::new(),

@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use indexmap::IndexMap;
 
 use crate::diff_helpers::{compute_map_diff, compute_unchanged_count, schema_aware_equal};
-use crate::effect::Effect;
+use crate::effect::{DeletedInstanceKey, Effect, EffectGeneration};
 use crate::non_empty::NonEmptyVec;
 use crate::plan::ReplaceDisplayInfo;
 use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
@@ -381,6 +381,26 @@ pub fn build_detail_rows(
     delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
     prev_explicit: Option<&HashMap<ResourceId, crate::explicit::ExplicitFields>>,
 ) -> Vec<DetailRow> {
+    let keyed_delete_attributes =
+        delete_attributes.map(|attrs| current_delete_attributes_by_instance(effect, attrs));
+    build_detail_rows_by_instance(
+        effect,
+        registry,
+        detail,
+        keyed_delete_attributes.as_ref(),
+        prev_explicit,
+    )
+}
+
+/// Build detail rows for an effect using delete attributes keyed by resource
+/// id plus generation.
+pub fn build_detail_rows_by_instance(
+    effect: &Effect,
+    registry: Option<&SchemaRegistry>,
+    detail: DetailLevel,
+    delete_attributes: Option<&HashMap<DeletedInstanceKey, HashMap<String, Value>>>,
+    prev_explicit: Option<&HashMap<ResourceId, crate::explicit::ExplicitFields>>,
+) -> Vec<DetailRow> {
     if detail == DetailLevel::NamesOnly {
         return Vec::new();
     }
@@ -404,7 +424,12 @@ pub fn build_detail_rows(
             let schema = registry.and_then(|r| r.get_for(to));
             build_update_rows(from, to, changed_attributes, schema, detail, explicit)
         }
-        Effect::Delete { id, .. } => build_delete_rows(id, delete_attributes),
+        Effect::Delete {
+            id,
+            identifier,
+            generation,
+            ..
+        } => build_delete_rows(id, identifier, generation, delete_attributes),
         Effect::Read { resource } => {
             let schema = registry.and_then(|reg| reg.get_for_data_source(resource));
             build_create_rows(&resource.attributes, schema, detail)
@@ -430,6 +455,22 @@ pub fn build_detail_rows(
         | Effect::DeferredCreate { .. }
         | Effect::DeferredReplace(_) => Vec::new(),
     }
+}
+
+fn current_delete_attributes_by_instance(
+    effect: &Effect,
+    delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
+) -> HashMap<DeletedInstanceKey, HashMap<String, Value>> {
+    effect
+        .deleted_resource_attribute_keys()
+        .into_iter()
+        .filter(|key| matches!(key.generation(), EffectGeneration::Current))
+        .filter_map(|key| {
+            delete_attributes
+                .get(key.id())
+                .map(|attrs| (key, attrs.clone()))
+        })
+        .collect()
 }
 
 fn build_create_rows(
@@ -1112,11 +1153,14 @@ fn build_removed_attr_row(
 
 fn build_delete_rows(
     id: &ResourceId,
-    delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
+    identifier: &str,
+    generation: &EffectGeneration,
+    delete_attributes: Option<&HashMap<DeletedInstanceKey, HashMap<String, Value>>>,
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
 
-    if let Some(attrs) = delete_attributes.and_then(|da| da.get(id)) {
+    let key = DeletedInstanceKey::new(id.clone(), generation.clone(), identifier.to_string());
+    if let Some(attrs) = delete_attributes.and_then(|da| da.get(&key)) {
         let mut keys: Vec<_> = attrs.keys().filter(|k| !k.starts_with('_')).collect();
         keys.sort();
         for key in keys {
@@ -1994,6 +2038,7 @@ mod tests {
         let effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(id.clone()),
             identifier: "old-bucket".to_string(),
+            generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
             dependencies: HashSet::new(),
@@ -2252,6 +2297,7 @@ mod tests {
         let effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(id.clone()),
             identifier: "old-bucket".to_string(),
+            generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
             dependencies: HashSet::new(),
@@ -2299,6 +2345,7 @@ mod tests {
         let effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(id.clone()),
             identifier: "cert".to_string(),
+            generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
             dependencies: HashSet::new(),
