@@ -2,7 +2,10 @@ use super::*;
 use crate::effect::deps::{
     ScheduleInputs, build_effect_dependency_analysis as build_dependency_analysis,
 };
-use crate::effect::{DeferredReplaceDelete, DeferredReplacePayload, NonEmptyDeletes};
+use crate::effect::{
+    DeferredReplaceDelete, DeferredReplacePayload, DeletedInstanceKey, EffectGeneration,
+    NonEmptyDeletes,
+};
 use crate::plan::Plan;
 use crate::provider::{
     BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError, ProviderResult,
@@ -2453,6 +2456,7 @@ async fn test_simple_delete() {
     plan.add(Effect::Delete {
         id: crate::resource::ResolvedResourceId::new(rid.clone()),
         identifier: "id-123".to_string(),
+        generation: EffectGeneration::Current,
         directives: Directives::default(),
         binding: None,
         dependencies: HashSet::new(),
@@ -2481,7 +2485,11 @@ async fn test_simple_delete() {
         completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
 
     assert_eq!(result.success_count, 1);
-    assert!(result.successfully_deleted.contains(&rid));
+    assert!(
+        result
+            .successfully_deleted
+            .contains(&DeletedInstanceKey::current(rid.clone(), "id-123"))
+    );
 }
 
 #[tokio::test]
@@ -3412,6 +3420,7 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
     plan.add(Effect::Delete {
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("ec2.Vpc", "vpc")),
         identifier: "vpc-123".to_string(),
+        generation: EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some("vpc".to_string()),
         dependencies: HashSet::new(), // vpc has no deps
@@ -3424,6 +3433,7 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
             "subnet",
         )),
         identifier: "subnet-456".to_string(),
+        generation: EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some("subnet".to_string()),
         dependencies: HashSet::from(["vpc".to_string()]), // subnet depends on vpc
@@ -3552,6 +3562,7 @@ fn test_dependency_analysis_respects_delete_dependencies() {
     plan.add(Effect::Delete {
         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("ec2.Vpc", "vpc")),
         identifier: "vpc-123".to_string(),
+        generation: EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some("vpc".to_string()),
         dependencies: HashSet::new(),
@@ -3564,6 +3575,7 @@ fn test_dependency_analysis_respects_delete_dependencies() {
             "subnet",
         )),
         identifier: "subnet-456".to_string(),
+        generation: EffectGeneration::Current,
         directives: Directives::default(),
         binding: Some("subnet".to_string()),
         dependencies: HashSet::from(["vpc".to_string()]),

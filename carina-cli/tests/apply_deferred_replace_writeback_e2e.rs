@@ -4,13 +4,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use carina_cli::commands::plan::{CurrentStateEntry, PlanFile};
-use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes};
+use carina_core::effect::{
+    DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration, NonEmptyDeletes,
+};
 use carina_core::parser::{BackendConfig, DeferredForExpression, ForBinding, ProviderConfig};
 use carina_core::plan::Plan;
 use carina_core::resource::{
     ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, State, Value,
 };
-use carina_state::{ResourceState, StateFile};
+use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
 use indexmap::IndexMap;
 use tempfile::TempDir;
 
@@ -264,4 +266,113 @@ fn apply_saved_plan_deferred_replace_persists_new_child_and_siblings() {
             .unwrap_or_else(|| panic!("sibling resource {name} must be persisted"));
         assert_eq!(row.identifier.as_deref(), Some("mock-id"));
     }
+}
+
+#[test]
+fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
+    let scenario = Scenario::new();
+    scenario.write_config();
+    scenario.init();
+
+    let deposed_key = DeposedKey::new_unique();
+    let mut state = StateFile::new();
+    state.serial = 1;
+    let mut row = ResourceState::new("test.resource", "main", "mock")
+        .with_identifier("main-current")
+        .with_attribute("name", serde_json::json!("main-current"))
+        .with_attribute("status", serde_json::json!("ACTIVE"));
+    row.binding = Some("main".to_string());
+    row.deposed.push(DeposedInstance {
+        key: deposed_key.clone(),
+        identifier: "main-old".to_string(),
+        provider_instance: None,
+        attributes: HashMap::from([
+            ("name".to_string(), serde_json::json!("main-old")),
+            ("status".to_string(), serde_json::json!("STALE")),
+        ]),
+        dependency_bindings: std::collections::BTreeSet::new(),
+    });
+    state.upsert_resource(row);
+    fs::write(
+        &scenario.state_path,
+        carina_core::utils::pretty_with_newline(&state).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &scenario.mock_state_path,
+        carina_core::utils::pretty_with_newline(&serde_json::json!({
+            "test.resource.main": {
+                "name": "main-current",
+                "status": "ACTIVE"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "main", None);
+    let mut plan = Plan::new();
+    plan.add(Effect::Delete {
+        id: carina_core::resource::ResolvedResourceId::new(id),
+        identifier: "main-old".to_string(),
+        generation: EffectGeneration::Deposed(deposed_key),
+        directives: Directives::default(),
+        binding: Some("main".to_string()),
+        dependencies: HashSet::new(),
+        explicit_dependencies: HashSet::new(),
+        blocked_by_updates: HashSet::new(),
+    });
+    let plan_file = PlanFile {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: env!("CARGO_PKG_VERSION").to_string(),
+        timestamp: "2026-07-03T00:00:00Z".to_string(),
+        source_path: scenario.project.display().to_string(),
+        state_lineage: Some(state.lineage.clone()),
+        state_serial: Some(state.serial),
+        provider_configs: vec![ProviderConfig {
+            name: "mock".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+            is_default: true,
+        }],
+        backend_config: Some(BackendConfig {
+            backend_type: "local".to_string(),
+            attributes: HashMap::from([(
+                "path".to_string(),
+                Value::Concrete(ConcreteValue::String("carina.state.json".to_string())),
+            )]),
+        }),
+        plan,
+        sorted_resources: vec![],
+        unresolved_resources: vec![],
+        compositions: vec![],
+        data_sources: vec![],
+        current_states: vec![],
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: vec![],
+        wait_bindings: vec![],
+    };
+    let plan_path = scenario.project.join("deposed-plan.json");
+    fs::write(
+        &plan_path,
+        carina_core::utils::pretty_with_newline(&plan_file).unwrap(),
+    )
+    .unwrap();
+
+    let output = scenario.apply_plan(&plan_path);
+    assert_success("carina apply plan", &output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("(deposed main-old)"),
+        "saved-plan display should mark the deposed delete:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("name: \"main-old\"") && stdout.contains("status: \"STALE\""),
+        "saved-plan display should render deposed attributes from state:\n{stdout}"
+    );
 }

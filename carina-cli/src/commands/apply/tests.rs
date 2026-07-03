@@ -9,9 +9,9 @@ use carina_core::resource::{
     DataSource, DeferredValue, ResolvedDataSource, ResolvedResource, Resource, ResourceId,
 };
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
-use carina_state::{NameOverride, ResourceState};
+use carina_state::{DeposedInstance, DeposedKey, NameOverride, ResourceState};
 use indexmap::IndexMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -330,14 +330,25 @@ impl Provider for ApplyCascadeProvider {
         let identifier = identifier.map(ToOwned::to_owned);
         Box::pin(async move {
             match (id.resource_type.as_str(), identifier.as_deref()) {
-                ("ec2.Vpc", Some("vpc-old")) => Ok(State::existing(
+                ("ec2.Vpc", Some("vpc-new")) => Ok(State::existing(
+                    id,
+                    HashMap::from([
+                        ("cidr_block".to_string(), string_value("10.221.0.0/16")),
+                        ("vpc_id".to_string(), string_value("vpc-new")),
+                    ]),
+                )
+                .with_identifier("vpc-new")),
+                ("ec2.Vpc", Some("vpc-old" | "vpc-older" | "vpc-oldest")) => Ok(State::existing(
                     id,
                     HashMap::from([
                         ("cidr_block".to_string(), string_value("10.220.0.0/16")),
-                        ("vpc_id".to_string(), string_value("vpc-old")),
+                        (
+                            "vpc_id".to_string(),
+                            string_value(identifier.as_deref().unwrap()),
+                        ),
                     ]),
                 )
-                .with_identifier("vpc-old")),
+                .with_identifier(identifier.as_deref().unwrap())),
                 ("ec2.Subnet", Some("subnet-old")) => Ok(State::existing(
                     id,
                     HashMap::from([
@@ -522,6 +533,97 @@ fn seed_apply_cascade_state(
     }
 
     fixture.write_state(&state_file);
+}
+
+fn seed_apply_cascade_state_with_deposed(
+    fixture: &ApplyCancellationFixture,
+    deposed_identifiers: &[&str],
+) {
+    let mut vpc_state = ResourceState::new("ec2.Vpc", "vpc", "awscc")
+        .with_identifier("vpc-new")
+        .with_attribute("cidr_block", serde_json::json!("10.221.0.0/16"))
+        .with_attribute("vpc_id", serde_json::json!("vpc-new"));
+    vpc_state.binding = Some("vpc".to_string());
+    for identifier in deposed_identifiers {
+        vpc_state.deposed.push(DeposedInstance {
+            key: DeposedKey::new_unique(),
+            identifier: (*identifier).to_string(),
+            provider_instance: None,
+            attributes: HashMap::from([
+                ("cidr_block".to_string(), serde_json::json!("10.220.0.0/16")),
+                ("vpc_id".to_string(), serde_json::json!(identifier)),
+            ]),
+            dependency_bindings: BTreeSet::new(),
+        });
+    }
+
+    let mut state_file = carina_state::StateFile::new();
+    state_file.resources.push(vpc_state);
+    fixture.write_state(&state_file);
+}
+
+fn deposed_identifiers(state_path: &std::path::Path) -> Vec<String> {
+    let raw = std::fs::read_to_string(state_path).expect("state file must be written");
+    let state: serde_json::Value = serde_json::from_str(&raw).expect("state must be valid JSON");
+    let vpc = state_json_resource(&state, "awscc", "ec2.Vpc", "vpc");
+    vpc.get("deposed")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            entry["identifier"]
+                .as_str()
+                .expect("deposed identifier must be a string")
+                .to_string()
+        })
+        .collect()
+}
+
+async fn run_apply_cascade_fixture(
+    fixture: &ApplyCancellationFixture,
+    shared: &ApplyCascadeShared,
+) -> Result<Option<Duration>, AppError> {
+    let ctx = WiringContext::new(vec![Box::new(ApplyCascadeAwsccFactory {
+        shared: shared.clone(),
+    })]);
+    let loaded = load_configuration_with_config(
+        fixture.config_path(),
+        fixture.provider_context(),
+        &SchemaRegistry::new(),
+    )
+    .expect("fixture must load");
+    let mut parsed = loaded.parsed;
+    let unresolved_parsed = loaded.unresolved_parsed;
+    let base_dir = get_base_dir(fixture.config_path());
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+        &mut parsed,
+        base_dir,
+        false,
+        vec![Box::new(ApplyCascadeAwsccFactory {
+            shared: shared.clone(),
+        })],
+        HashMap::new(),
+    );
+    assert!(
+        validation_errors.is_empty(),
+        "fixture must validate, got: {validation_errors:?}"
+    );
+    let observer_factory = fixture.observer_factory();
+    run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &unresolved_parsed,
+        true,
+        fixture.backend(),
+        None,
+        base_dir,
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
 }
 
 fn state_json_resource<'a>(
@@ -1434,6 +1536,102 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
     assert_eq!(
         subnet_deposed[0]["identifier"],
         serde_json::json!("subnet-old")
+    );
+}
+
+#[tokio::test]
+async fn run_apply_locked_deletes_successful_deposed_generation_and_keeps_current_row() {
+    let fixture = ApplyCancellationFixture::new();
+    let crn = apply_cascade_crn(fixture.state_path(), false);
+    let fixture = fixture.with_raw_config(crn);
+    let shared = ApplyCascadeShared::default();
+    seed_apply_cascade_state_with_deposed(&fixture, &["vpc-old"]);
+
+    run_apply_cascade_fixture(&fixture, &shared)
+        .await
+        .expect("deposed-only delete should succeed");
+
+    assert_eq!(
+        shared.delete_calls(),
+        vec![("awscc.ec2.Vpc.vpc".to_string(), "vpc-old".to_string())],
+        "apply must execute the deposed generation delete, not the current instance"
+    );
+    let state = fixture.read_state().await;
+    let row = state
+        .find_resource("awscc", "ec2.Vpc", "vpc")
+        .expect("current row must survive a successful deposed delete");
+    assert_eq!(row.identifier.as_deref(), Some("vpc-new"));
+    assert!(
+        row.deposed.is_empty(),
+        "successful deposed delete should remove exactly that generation"
+    );
+}
+
+#[tokio::test]
+async fn run_apply_locked_keeps_failed_deposed_generation_and_replans_it() {
+    let fixture = ApplyCancellationFixture::new();
+    let crn = apply_cascade_crn(fixture.state_path(), false);
+    let fixture = fixture.with_raw_config(crn);
+    let shared = ApplyCascadeShared::default();
+    shared.fail_delete_identifier("vpc-old");
+    seed_apply_cascade_state_with_deposed(&fixture, &["vpc-old"]);
+
+    let first = run_apply_cascade_fixture(&fixture, &shared)
+        .await
+        .expect_err("failed deposed delete should fail apply");
+    assert!(
+        first.to_string().contains("Apply failed"),
+        "unexpected first apply error: {first:?}"
+    );
+    assert_eq!(deposed_identifiers(fixture.state_path()), vec!["vpc-old"]);
+
+    let second = run_apply_cascade_fixture(&fixture, &shared)
+        .await
+        .expect_err("failed deposed delete should be planned again");
+    assert!(
+        second.to_string().contains("Apply failed"),
+        "unexpected second apply error: {second:?}"
+    );
+    assert_eq!(
+        shared.delete_calls(),
+        vec![
+            ("awscc.ec2.Vpc.vpc".to_string(), "vpc-old".to_string()),
+            ("awscc.ec2.Vpc.vpc".to_string(), "vpc-old".to_string()),
+        ],
+        "the failed deposed generation must be retried on the next apply"
+    );
+    assert_eq!(deposed_identifiers(fixture.state_path()), vec!["vpc-old"]);
+}
+
+#[tokio::test]
+async fn run_apply_locked_removes_only_successful_deposed_generation() {
+    let fixture = ApplyCancellationFixture::new();
+    let crn = apply_cascade_crn(fixture.state_path(), false);
+    let fixture = fixture.with_raw_config(crn);
+    let shared = ApplyCascadeShared::default();
+    shared.fail_delete_identifier("vpc-older");
+    seed_apply_cascade_state_with_deposed(&fixture, &["vpc-old", "vpc-older"]);
+
+    let err = run_apply_cascade_fixture(&fixture, &shared)
+        .await
+        .expect_err("one failed deposed delete should fail apply");
+    assert!(
+        err.to_string().contains("Apply failed"),
+        "unexpected apply error: {err:?}"
+    );
+
+    assert_eq!(
+        shared.delete_calls(),
+        vec![
+            ("awscc.ec2.Vpc.vpc".to_string(), "vpc-old".to_string()),
+            ("awscc.ec2.Vpc.vpc".to_string(), "vpc-older".to_string()),
+        ],
+        "each deposed generation should be independently deletable"
+    );
+    assert_eq!(
+        deposed_identifiers(fixture.state_path()),
+        vec!["vpc-older"],
+        "only the successful deposed generation should be removed"
     );
 }
 
@@ -3690,6 +3888,54 @@ mod saved_plan_version_tests {
         );
     }
 
+    #[tokio::test]
+    async fn version_9_saved_plan_is_rejected_after_delete_generation_bump() {
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("plan.json");
+        let v9 = serde_json::json!({
+            "version": 9,
+            "carina_version": "0.4.0",
+            "timestamp": "2026-07-02T00:00:00Z",
+            "source_path": "test.crn",
+            "state_lineage": null,
+            "state_serial": null,
+            "provider_configs": [],
+            "backend_config": null,
+            "plan": { "effects": [] },
+            "sorted_resources": [],
+            "unresolved_resources": [],
+            "compositions": [],
+            "data_sources": [],
+            "current_states": [],
+            "upstream_snapshot": {},
+            "upstream_sources": [],
+            "wait_bindings": [],
+        });
+        std::fs::write(&plan_path, serde_json::to_string(&v9).unwrap()).expect("write plan");
+
+        let result = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        let err = result.expect_err("v9 saved plan must be rejected after v10 bump");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unsupported plan file version: 9"),
+            "error must name the rejected version, got: {msg}",
+        );
+        assert!(
+            msg.contains("expected 10"),
+            "error must name the v10 expected version, got: {msg}",
+        );
+    }
+
     fn replacement_plan_json() -> (TempDir, std::path::PathBuf, serde_json::Value) {
         use carina_core::provider::ProviderRouter;
         use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
@@ -3806,6 +4052,34 @@ mod saved_plan_version_tests {
         }
     }
 
+    fn set_replace_display_delete_generation_to_deposed(json: &mut serde_json::Value) {
+        let delete_idx = json["plan"]["replace_display"][0]["delete_idx"]
+            .as_u64()
+            .expect("delete_idx should be numeric") as usize;
+        let delete_effect = &mut json["plan"]["effects"][delete_idx];
+        let deposed = serde_json::to_value(carina_core::effect::EffectGeneration::Deposed(
+            carina_core::resource::DeposedKey::new_unique(),
+        ))
+        .expect("deposed generation should serialize");
+
+        if let serde_json::Value::Object(effect) = delete_effect {
+            if let Some(serde_json::Value::Object(delete)) = effect.get_mut("Delete") {
+                delete.insert("generation".to_string(), deposed);
+                return;
+            }
+            if effect
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind == "Delete")
+            {
+                effect.insert("generation".to_string(), deposed);
+                return;
+            }
+        }
+
+        panic!("fixture delete effect has an unexpected serde shape: {delete_effect:#?}");
+    }
+
     #[tokio::test]
     async fn saved_plan_with_out_of_range_replace_display_create_idx_is_rejected() {
         let (_dir, plan_path, mut json) = replacement_plan_json();
@@ -3881,6 +4155,22 @@ mod saved_plan_version_tests {
         assert!(
             msg.contains("expected Delete"),
             "error must name the delete_idx kind mismatch, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_plan_with_replace_display_deposed_delete_half_is_rejected() {
+        let (_dir, plan_path, mut json) = replacement_plan_json();
+        set_replace_display_delete_generation_to_deposed(&mut json);
+        let msg = rejected_saved_plan_message(
+            &plan_path,
+            &json,
+            "deposed replacement delete half must be rejected",
+        )
+        .await;
+        assert!(
+            msg.contains("expected Current Delete"),
+            "error must require a current-generation delete half, got: {msg}",
         );
     }
 

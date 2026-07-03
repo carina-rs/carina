@@ -283,6 +283,7 @@ impl Plan {
         let delete_effect = Effect::Delete {
             id: delete.id,
             identifier: delete.identifier,
+            generation: crate::effect::EffectGeneration::Current,
             directives: delete.directives,
             binding: delete.binding,
             dependencies: delete.dependencies,
@@ -721,7 +722,20 @@ fn format_effect_brief(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("{} {}", effect.display_glyph(), r.id),
         Effect::Update { to, .. } => format!("{} {}", effect.display_glyph(), to.id),
-        Effect::Delete { id, .. } => format!("{} {}", effect.display_glyph(), id),
+        Effect::Delete {
+            id,
+            identifier,
+            generation,
+            ..
+        } => {
+            let deposed_note = if matches!(generation, crate::effect::EffectGeneration::Deposed(_))
+            {
+                format!(" (deposed {identifier})")
+            } else {
+                String::new()
+            };
+            format!("{} {}{}", effect.display_glyph(), id, deposed_note)
+        }
         Effect::Read { resource } => {
             format!("{} {} (data source)", effect.display_glyph(), resource.id)
         }
@@ -977,6 +991,7 @@ mod tests {
                 crate::resource::ResourceId::with_identity("s3.Bucket", "c"),
             ),
             identifier: String::new(),
+            generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
             dependencies: std::collections::HashSet::new(),
@@ -1474,6 +1489,7 @@ mod tests {
                 "b",
             )),
             identifier: "b-id".to_string(),
+            generation: crate::effect::EffectGeneration::Current,
             directives: crate::resource::Directives::default(),
             binding: None,
             dependencies: std::collections::HashSet::new(),

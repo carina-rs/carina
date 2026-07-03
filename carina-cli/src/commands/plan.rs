@@ -6,7 +6,7 @@ use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
-use carina_core::effect::Effect;
+use carina_core::effect::{DeletedInstanceKey, Effect, EffectGeneration};
 use carina_core::parser::{BackendConfig, ProviderConfig, ProviderContext, UpstreamState};
 use carina_core::plan::Plan;
 use carina_core::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
@@ -128,7 +128,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 9;
+    pub const CURRENT_VERSION: u32 = 10;
 
     pub(crate) fn validate_replace_display(&self) -> Result<(), String> {
         let effects = self.plan.effects();
@@ -162,12 +162,24 @@ impl PlanFile {
                     effects.len()
                 )
             })?;
-            if !matches!(delete, Effect::Delete { .. }) {
-                return Err(format!(
-                    "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].delete_idx {} points at {}, expected Delete",
-                    replacement.delete_idx,
-                    delete.kind()
-                ));
+            match delete {
+                Effect::Delete {
+                    generation: EffectGeneration::Current,
+                    ..
+                } => {}
+                Effect::Delete { generation, .. } => {
+                    return Err(format!(
+                        "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].delete_idx {} points at Delete({generation:?}), expected Current Delete",
+                        replacement.delete_idx
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].delete_idx {} points at {}, expected Delete",
+                        replacement.delete_idx,
+                        delete.kind()
+                    ));
+                }
             }
             if create.resource_id() != delete.resource_id() {
                 return Err(format!(
@@ -193,18 +205,53 @@ impl PlanFile {
 pub(crate) fn collect_delete_attributes(
     plan: &Plan,
     current_states: &HashMap<ResourceId, State>,
-) -> HashMap<ResourceId, HashMap<String, Value>> {
+    state_file: Option<&StateFile>,
+) -> HashMap<DeletedInstanceKey, HashMap<String, Value>> {
     let mut delete_attributes = HashMap::new();
 
     for effect in plan.effects() {
-        for id in effect.deleted_resource_attributes_ids() {
-            if let Some(state) = current_states.get(id) {
-                delete_attributes.insert(id.clone(), state.attributes.clone());
+        for key in effect.deleted_resource_attribute_keys() {
+            match key.generation() {
+                carina_core::effect::EffectGeneration::Current => {
+                    if let Some(state) = current_states.get(key.id()) {
+                        delete_attributes.insert(key, state.attributes.clone());
+                    }
+                }
+                carina_core::effect::EffectGeneration::Deposed(deposed_key) => {
+                    if let Some(attrs) = state_file.and_then(|sf| {
+                        deposed_attributes_for_display(sf, key.id(), key.identifier(), deposed_key)
+                    }) {
+                        delete_attributes.insert(key, attrs);
+                    }
+                }
             }
         }
     }
 
     delete_attributes
+}
+
+fn deposed_attributes_for_display(
+    state_file: &StateFile,
+    id: &ResourceId,
+    identifier: &str,
+    key: &carina_state::DeposedKey,
+) -> Option<HashMap<String, Value>> {
+    let row = state_file.find_resource(&id.provider, &id.resource_type, id.identity_or_empty())?;
+    let deposed = row.deposed.iter().find(|deposed| {
+        deposed.key == *key
+            && deposed.identifier == identifier
+            && deposed.provider_instance == id.provider_instance
+    })?;
+    Some(
+        deposed
+            .attributes
+            .iter()
+            .filter_map(|(k, v)| {
+                carina_core::value::json_to_dsl_value(v).map(|value| (k.clone(), value))
+            })
+            .collect(),
+    )
 }
 
 /// Serializable `(binding, target)` pair for a `wait` declaration —
@@ -792,7 +839,8 @@ pub async fn run_plan(
             .is_some_and(crate::commands::iam_preflight::should_fail_strict);
 
     // Build delete attributes map from current states for display
-    let delete_attributes = collect_delete_attributes(&ctx.plan, &ctx.current_states);
+    let delete_attributes =
+        collect_delete_attributes(&ctx.plan, &ctx.current_states, state_file.as_ref());
 
     if json {
         if let Some(note) = drift_note.as_ref() {

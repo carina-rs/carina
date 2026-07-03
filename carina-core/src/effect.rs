@@ -21,7 +21,7 @@ use crate::parser::DeferredForExpression;
 #[cfg(test)]
 use crate::resource::{DataSource, Resource};
 use crate::resource::{
-    Directives, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
+    DeposedKey, Directives, ResolvedDataSource, ResolvedResource, ResolvedResourceId, ResourceId,
     ResourceIdentity, State,
 };
 use crate::wait::predicate::WaitPredicate;
@@ -45,6 +45,98 @@ pub enum ScheduleEdge {
     BlockedByIfDelete(ResourceIdentity),
 }
 
+/// Generation addressed by an effect.
+///
+/// Create and Update effects always address [`EffectGeneration::Current`].
+/// Delete carries this explicitly so a delete of a deposed generation cannot
+/// be mistaken for a delete of the current instance.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EffectGeneration {
+    #[default]
+    Current,
+    Deposed(DeposedKey),
+}
+
+impl EffectGeneration {
+    pub fn is_current(&self) -> bool {
+        matches!(self, Self::Current)
+    }
+}
+
+/// Scheduler key for the exact instance generation an effect addresses.
+///
+/// This deliberately keys on user identity plus generation only. It is for
+/// same-address scheduling relationships, not provider result accounting.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EffectInstanceKey {
+    identity: ResourceIdentity,
+    generation: EffectGeneration,
+}
+
+impl EffectInstanceKey {
+    pub fn new(identity: ResourceIdentity, generation: EffectGeneration) -> Self {
+        Self {
+            identity,
+            generation,
+        }
+    }
+
+    pub fn current(identity: ResourceIdentity) -> Self {
+        Self::new(identity, EffectGeneration::Current)
+    }
+
+    pub fn identity(&self) -> &ResourceIdentity {
+        &self.identity
+    }
+
+    pub fn generation(&self) -> &EffectGeneration {
+        &self.generation
+    }
+}
+
+/// Delete-result key for the exact resource instance generation that was
+/// destroyed.
+///
+/// Unlike [`EffectInstanceKey`], this carries the full [`ResourceId`] so result
+/// accounting cannot conflate resources whose identity strings collide across
+/// providers, types, or provider instances.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DeletedInstanceKey {
+    id: ResourceId,
+    generation: EffectGeneration,
+    identifier: String,
+}
+
+impl DeletedInstanceKey {
+    pub fn new(
+        id: ResourceId,
+        generation: EffectGeneration,
+        identifier: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            generation,
+            identifier: identifier.into(),
+        }
+    }
+
+    pub fn current(id: ResourceId, identifier: impl Into<String>) -> Self {
+        Self::new(id, EffectGeneration::Current, identifier)
+    }
+
+    pub fn id(&self) -> &ResourceId {
+        &self.id
+    }
+
+    pub fn generation(&self) -> &EffectGeneration {
+        &self.generation
+    }
+
+    pub fn identifier(&self) -> &str {
+        &self.identifier
+    }
+}
+
 /// Temporary name used during create-before-destroy replacement.
 ///
 /// When a resource with a unique name constraint is replaced with create-before-destroy,
@@ -63,9 +155,9 @@ pub struct TemporaryName {
 
 /// Delete payload absorbed into [`Effect::DeferredReplace`].
 ///
-/// This carries the exact fields from [`Effect::Delete`]. Keeping the
-/// delete half in a named struct lets the deletes slot grow new fields later
-/// without re-shaping `DeferredReplace` itself.
+/// This carries the current-generation delete fields from [`Effect::Delete`].
+/// Keeping the delete half in a named struct lets the deletes slot grow new
+/// fields later without re-shaping `DeferredReplace` itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeferredReplaceDelete {
     pub id: ResolvedResourceId,
@@ -91,6 +183,7 @@ impl DeferredReplaceDelete {
         Effect::Delete {
             id: self.id.clone(),
             identifier: self.identifier.clone(),
+            generation: EffectGeneration::Current,
             directives: self.directives.clone(),
             binding: self.binding.clone(),
             dependencies: self.dependencies.clone(),
@@ -270,6 +363,8 @@ pub enum Effect {
     Delete {
         id: ResolvedResourceId,
         identifier: String,
+        #[serde(default, skip_serializing_if = "EffectGeneration::is_current")]
+        generation: EffectGeneration,
         #[serde(default)]
         directives: Directives,
         /// The binding name of the deleted resource (for plan tree display)
@@ -425,6 +520,7 @@ pub enum BasicEffect<'a> {
         effect: &'a Effect,
         id: &'a ResourceId,
         identifier: &'a str,
+        generation: &'a EffectGeneration,
         directives: &'a Directives,
     },
 }
@@ -509,6 +605,7 @@ impl Effect {
                 Effect::Delete {
                     id: crate::resource::ResolvedResourceId::new(id.clone()),
                     identifier: "x-1".to_string(),
+                    generation: EffectGeneration::Current,
                     directives: Directives::default(),
                     binding: None,
                     dependencies: HashSet::new(),
@@ -679,12 +776,14 @@ impl Effect {
             Effect::Delete {
                 id,
                 identifier,
+                generation,
                 directives,
                 ..
             } => Some(BasicEffect::Delete {
                 effect: self,
                 id,
                 identifier,
+                generation,
                 directives,
             }),
             Effect::Read { .. }
@@ -805,6 +904,19 @@ impl Effect {
             .clone()
     }
 
+    /// Returns the exact instance generation this effect addresses.
+    ///
+    /// Non-delete effects always operate on the current generation. Delete
+    /// effects carry their generation explicitly.
+    pub fn instance_key(&self) -> EffectInstanceKey {
+        match self {
+            Effect::Delete { id, generation, .. } => {
+                EffectInstanceKey::new(id.identity().clone(), generation.clone())
+            }
+            _ => EffectInstanceKey::current(self.identity()),
+        }
+    }
+
     /// Returns a read-only [`ResourceRef`](crate::parser::ResourceRef)
     /// view of the resource for this effect, if it has one. Delete,
     /// Import, Remove, Move, and Wait effects have no resource.
@@ -861,19 +973,31 @@ impl Effect {
     /// up in state instead of relying on downstream `_ => {}` catch-alls.
     pub fn writeback_cleanup_ids(
         &self,
-        successfully_deleted: &HashSet<ResourceId>,
+        successfully_deleted: &HashSet<DeletedInstanceKey>,
     ) -> Vec<ResourceId> {
         match self {
             Effect::Read { .. } => Vec::new(),
             Effect::Create(_) => Vec::new(),
             Effect::Update { .. } => Vec::new(),
-            Effect::Delete { id, .. } => {
-                if successfully_deleted.contains(id.as_inner()) {
+            Effect::Delete {
+                id,
+                identifier,
+                generation: EffectGeneration::Current,
+                ..
+            } => {
+                if successfully_deleted.contains(&DeletedInstanceKey::current(
+                    id.clone().into_inner(),
+                    identifier.clone(),
+                )) {
                     vec![id.clone().into_inner()]
                 } else {
                     Vec::new()
                 }
             }
+            Effect::Delete {
+                generation: EffectGeneration::Deposed(_),
+                ..
+            } => Vec::new(),
             Effect::Import { .. } => Vec::new(),
             Effect::Remove { id } => vec![id.clone().into_inner()],
             Effect::Move { from, .. } => vec![from.clone().into_inner()],
@@ -887,17 +1011,25 @@ impl Effect {
         }
     }
 
-    /// Returns the ResourceIds whose pre-apply attributes should render in
-    /// strike-through deleted form in plan display.
-    ///
-    /// This keeps delete-attribute classification centralized with the Effect
-    /// enum so variants that absorb deletes cannot be missed by display code.
-    pub fn deleted_resource_attributes_ids(&self) -> Vec<&ResourceId> {
+    /// Returns the exact delete instances whose pre-apply attributes should
+    /// render in strike-through deleted form in plan display.
+    pub fn deleted_resource_attribute_keys(&self) -> Vec<DeletedInstanceKey> {
         match self {
             Effect::Read { .. } => Vec::new(),
             Effect::Create(_) => Vec::new(),
             Effect::Update { .. } => Vec::new(),
-            Effect::Delete { id, .. } => vec![id],
+            Effect::Delete {
+                id,
+                identifier,
+                generation,
+                ..
+            } => {
+                vec![DeletedInstanceKey::new(
+                    id.clone().into_inner(),
+                    generation.clone(),
+                    identifier.clone(),
+                )]
+            }
             Effect::Import { .. } => Vec::new(),
             Effect::Remove { .. } => Vec::new(),
             Effect::Move { .. } => Vec::new(),
@@ -906,7 +1038,13 @@ impl Effect {
             Effect::DeferredReplace(payload) => payload
                 .deletes
                 .iter()
-                .map(|delete| delete.id.as_inner())
+                .map(|delete| {
+                    DeletedInstanceKey::new(
+                        delete.id.clone().into_inner(),
+                        EffectGeneration::Current,
+                        delete.identifier.clone(),
+                    )
+                })
                 .collect(),
         }
     }
@@ -1230,6 +1368,7 @@ mod tests {
                 Effect::Delete {
                     id: crate::resource::ResolvedResourceId::new(rid.clone()),
                     identifier: "x-1".to_string(),
+                    generation: EffectGeneration::Current,
                     directives: Directives::default(),
                     binding: None,
                     dependencies: HashSet::new(),
@@ -1485,6 +1624,52 @@ mod tests {
     }
 
     #[test]
+    fn delete_generation_serde_roundtrip_preserves_deposed_generation() {
+        let original = Effect::Delete {
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "s3.Bucket",
+                "old-bucket",
+            )),
+            identifier: "old-bucket".to_string(),
+            generation: EffectGeneration::Deposed(DeposedKey::new_unique()),
+            directives: Directives::default(),
+            binding: Some("bucket".to_string()),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        };
+
+        let json = serde_json::to_string(&original).expect("serialize");
+        assert!(json.contains("\"generation\""), "got: {json}");
+        let decoded: Effect = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn delete_generation_defaults_to_current_for_pre_field_saved_plans() {
+        let legacy = serde_json::json!({
+            "Delete": {
+                "id": {"provider": "aws", "resource_type": "s3.Bucket", "name": "b"},
+                "identifier": "x",
+                "directives": {},
+                "binding": null,
+                "dependencies": [],
+                "explicit_dependencies": [],
+                "blocked_by_updates": [],
+            }
+        });
+
+        let effect: Effect = serde_json::from_value(legacy).expect("legacy delete");
+        match effect {
+            Effect::Delete { generation, .. } => {
+                assert_eq!(generation, EffectGeneration::Current);
+            }
+            other => panic!("expected Delete, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn is_scheduler_meta_only_true_for_deferred_variants() {
         for (label, effect) in every_effect_variant() {
             assert_eq!(
@@ -1543,6 +1728,7 @@ mod tests {
         let effect = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity("test", "a")),
             identifier: "id-123".to_string(),
+            generation: EffectGeneration::Current,
             directives: Directives::default(),
             binding: None,
             dependencies: HashSet::new(),
@@ -1603,6 +1789,7 @@ mod tests {
                     "old-bucket",
                 )),
                 identifier: "old-bucket".to_string(),
+                generation: EffectGeneration::Current,
                 directives: Directives::default(),
                 binding: None,
                 dependencies: HashSet::new(),
@@ -1658,6 +1845,7 @@ mod tests {
                 "b",
             )),
             identifier: "x".to_string(),
+            generation: EffectGeneration::Current,
             directives: Directives::default(),
             binding: Some("bucket".to_string()),
             dependencies: HashSet::from(["role".to_string(), "kms".to_string()]),
@@ -1871,6 +2059,7 @@ mod tests {
         let delete = Effect::Delete {
             id: crate::resource::ResolvedResourceId::new(rid.clone()),
             identifier: "x-1".to_string(),
+            generation: EffectGeneration::Current,
             directives: Directives::default(),
             binding: None,
             dependencies: HashSet::new(),

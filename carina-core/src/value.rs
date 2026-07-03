@@ -1027,6 +1027,7 @@ pub fn redact_secrets_in_effect(
         Effect::Delete {
             id,
             identifier,
+            generation,
             directives,
             binding,
             dependencies,
@@ -1035,6 +1036,7 @@ pub fn redact_secrets_in_effect(
         } => Effect::Delete {
             id: id.clone(),
             identifier: identifier.clone(),
+            generation: generation.clone(),
             directives: directives.clone(),
             binding: binding.clone(),
             dependencies: dependencies.clone(),

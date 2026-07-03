@@ -1,10 +1,11 @@
 //! CLI-level regression coverage for destroy ordering through wait bindings.
 
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use carina_state::{ResourceState, StateFile};
+use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
 use tempfile::TempDir;
 
 const DELETE_DELAY_MS: &str = "1500";
@@ -32,6 +33,24 @@ impl Scenario {
 
     fn write_config(&self) {
         self.write_config_with_cert_name("cert");
+    }
+
+    fn write_single_resource_config(&self) {
+        fs::write(
+            self.project.join("main.crn"),
+            format!(
+                r#"backend local {{ path = "{}" }}
+provider mock {{}}
+
+let main = mock.test.resource {{
+  name = "main"
+  status = "ACTIVE"
+}}
+"#,
+                self.state_path.display()
+            ),
+        )
+        .unwrap();
     }
 
     fn write_config_with_cert_name(&self, cert_name: &str) {
@@ -123,6 +142,49 @@ let lst = mock.test.resource {{
         .unwrap();
     }
 
+    fn seed_single_resource_state_with_deposed(&self) {
+        let mut state = StateFile::new();
+        let mut main = ResourceState::new("test.resource", "main", "mock")
+            .with_identifier("main-current")
+            .with_attribute("name", serde_json::json!("main"))
+            .with_attribute("id", serde_json::json!("main-current"))
+            .with_attribute("status", serde_json::json!("ACTIVE"));
+        main.binding = Some("main".to_string());
+        main.deposed.push(DeposedInstance {
+            key: DeposedKey::new_unique(),
+            identifier: "main-old".to_string(),
+            provider_instance: None,
+            attributes: HashMap::from([
+                ("name".to_string(), serde_json::json!("main-old")),
+                ("id".to_string(), serde_json::json!("main-old")),
+                ("status".to_string(), serde_json::json!("STALE")),
+            ]),
+            dependency_bindings: BTreeSet::new(),
+        });
+        state.upsert_resource(main);
+
+        fs::write(
+            &self.state_path,
+            carina_core::utils::pretty_with_newline(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn seed_single_mock_provider_state(&self) {
+        let provider_state = serde_json::json!({
+            "test.resource.main": {
+                "name": "main",
+                "id": "main-current",
+                "status": "ACTIVE"
+            }
+        });
+        fs::write(
+            &self.mock_state_path,
+            carina_core::utils::pretty_with_newline(&provider_state).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn destroy(&self) -> Output {
         carina(&self.project)
             .args([
@@ -141,12 +203,35 @@ let lst = mock.test.resource {{
             .expect("failed to execute carina destroy")
     }
 
+    fn destroy_failing_deposed_identifier(&self) -> Output {
+        carina(&self.project)
+            .args([
+                "destroy",
+                "--auto-approve",
+                ".",
+                "--lock=false",
+                "--parallelism",
+                "8",
+            ])
+            .env("CARINA_MOCK_STATE_FILE", &self.mock_state_path)
+            .env("CARINA_MOCK_DELETE_LOG", &self.delete_log_path)
+            .env("CARINA_MOCK_DELETE_FAIL_FOR", "test.resource.main")
+            .env("CARINA_MOCK_DELETE_FAIL_IDENTIFIER", "main-old")
+            .output()
+            .expect("failed to execute carina destroy")
+    }
+
     fn delete_log(&self) -> Vec<String> {
         fs::read_to_string(&self.delete_log_path)
             .unwrap()
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    fn written_state(&self) -> StateFile {
+        serde_json::from_str(&fs::read_to_string(&self.state_path).unwrap())
+            .expect("written state should deserialize")
     }
 }
 
@@ -195,6 +280,15 @@ fn assert_success(label: &str, output: &Output) {
     );
 }
 
+fn assert_failure(label: &str, output: &Output) {
+    assert!(
+        !output.status.success(),
+        "{label} unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 #[test]
 fn destroy_wait_ordering_deletes_dependent_before_wait_target() {
     let scenario = Scenario::new();
@@ -220,4 +314,56 @@ fn destroy_wait_ordering_deletes_dependent_before_wait_target() {
         lst_pos < cert_pos,
         "destroy must delete lst before cert when lst depends on wait binding cert_issued; delete log: {delete_log:?}"
     );
+}
+
+#[test]
+fn destroy_deletes_current_and_deposed_generation_and_removes_row() {
+    let scenario = Scenario::new();
+    scenario.write_single_resource_config();
+    scenario.init();
+    scenario.seed_single_resource_state_with_deposed();
+    scenario.seed_single_mock_provider_state();
+
+    let output = scenario.destroy();
+    assert_success("carina destroy", &output);
+
+    let delete_log = scenario.delete_log();
+    assert_eq!(
+        delete_log,
+        vec![
+            "test.resource.main".to_string(),
+            "test.resource.main".to_string()
+        ],
+        "destroy should execute both current and deposed deletes"
+    );
+    assert!(
+        scenario
+            .written_state()
+            .find_resource("mock", "test.resource", "main")
+            .is_none(),
+        "row should be removed after both generations delete successfully"
+    );
+}
+
+#[test]
+fn destroy_failed_deposed_delete_survives_after_current_delete_succeeds() {
+    let scenario = Scenario::new();
+    scenario.write_single_resource_config();
+    scenario.init();
+    scenario.seed_single_resource_state_with_deposed();
+    scenario.seed_single_mock_provider_state();
+
+    let output = scenario.destroy_failing_deposed_identifier();
+    assert_failure("carina destroy", &output);
+
+    let state = scenario.written_state();
+    let row = state
+        .find_resource("mock", "test.resource", "main")
+        .expect("row shell should remain for failed deposed generation");
+    assert!(
+        row.identifier.is_none(),
+        "successful current delete should still be applied to state"
+    );
+    assert_eq!(row.deposed.len(), 1);
+    assert_eq!(row.deposed[0].identifier, "main-old");
 }

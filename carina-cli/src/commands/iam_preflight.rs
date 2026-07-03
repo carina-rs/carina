@@ -842,6 +842,7 @@ mod tests {
         plan.add(Effect::Delete {
             id: carina_core::resource::ResolvedResourceId::new(replace_id.clone()),
             identifier: "bucket-old".to_string(),
+            generation: carina_core::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
             dependencies: Default::default(),
@@ -852,6 +853,7 @@ mod tests {
         plan.add(Effect::Delete {
             id: carina_core::resource::ResolvedResourceId::new(delete_id.clone()),
             identifier: "role-id".to_string(),
+            generation: carina_core::effect::EffectGeneration::Current,
             directives: Default::default(),
             binding: None,
             dependencies: Default::default(),

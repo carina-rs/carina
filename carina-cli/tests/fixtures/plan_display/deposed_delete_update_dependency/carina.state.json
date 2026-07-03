@@ -1,0 +1,111 @@
+{
+  "version": 9,
+  "serial": 1,
+  "lineage": "test-lineage-deposed-delete-update-dependency",
+  "carina_version": "0.4.0",
+  "resources": [
+    {
+      "resource_type": "ec2.Vpc",
+      "identity": "main",
+      "provider": "awscc",
+      "identifier": "vpc-new",
+      "attributes": {
+        "cidr_block": "10.221.0.0/16",
+        "vpc_id": "vpc-new",
+        "tags": {
+          "Name": "main",
+          "Environment": "old"
+        }
+      },
+      "deposed": [
+        {
+          "key": "deposed001",
+          "identifier": "vpc-old",
+          "attributes": {
+            "cidr_block": "10.220.0.0/16",
+            "vpc_id": "vpc-old",
+            "tags": {
+              "Name": "main-old",
+              "Environment": "old"
+            }
+          },
+          "dependency_bindings": []
+        }
+      ],
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "main",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "cidr_block": {
+            "kind": "leaf"
+          },
+          "tags": {
+            "kind": "struct",
+            "children": {
+              "Name": {
+                "kind": "leaf"
+              },
+              "Environment": {
+                "kind": "leaf"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "resource_type": "ec2.Subnet",
+      "identity": "subnet",
+      "provider": "awscc",
+      "identifier": "subnet-new",
+      "attributes": {
+        "subnet_id": "subnet-new",
+        "vpc_id": "vpc-new",
+        "cidr_block": "10.221.1.0/24",
+        "availability_zone": "ap-northeast-1a",
+        "tags": {
+          "Name": "subnet",
+          "Environment": "old"
+        }
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "subnet",
+      "dependency_bindings": [
+        "main"
+      ],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "vpc_id": {
+            "kind": "leaf"
+          },
+          "cidr_block": {
+            "kind": "leaf"
+          },
+          "availability_zone": {
+            "kind": "leaf"
+          },
+          "tags": {
+            "kind": "struct",
+            "children": {
+              "Name": {
+                "kind": "leaf"
+              },
+              "Environment": {
+                "kind": "leaf"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

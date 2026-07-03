@@ -37,6 +37,7 @@ const FIXTURE_SUBPATH: &str = "tests/fixtures/plan_display";
 pub struct FixturePlan {
     pub plan: Plan,
     pub current_states: HashMap<ResourceId, State>,
+    pub state_file: Option<StateFile>,
     pub schemas: SchemaRegistry,
     pub moved_origins: HashMap<ResourceId, ResourceId>,
     pub deferred_for_expressions: Vec<carina_core::parser::DeferredForExpression>,
@@ -408,6 +409,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &orphan_dependencies,
         &wait_bindings,
     );
+    crate::wiring::add_deposed_delete_effects(&mut plan, &state_file);
 
     crate::wiring::add_state_block_effects(
         &mut plan,
@@ -442,6 +444,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     FixturePlan {
         plan,
         current_states,
+        state_file,
         schemas: wiring.schemas().clone(),
         moved_origins,
         deferred_for_expressions: residual_deferred_for,
@@ -730,32 +733,11 @@ impl ProviderFactory for Route53HostedZoneFixtureFactory {
     }
 }
 
-/// Collect `Delete`-effect attributes from `current_states` for display.
-pub fn delete_attributes_from_plan(
+/// Collect `Delete`-effect attributes keyed by resource id plus generation.
+pub fn delete_instance_attributes_from_plan(
     plan: &Plan,
     current_states: &HashMap<ResourceId, State>,
-) -> HashMap<ResourceId, HashMap<String, Value>> {
-    plan.effects()
-        .iter()
-        .filter_map(|e| {
-            if let carina_core::effect::Effect::Delete { id, .. } = e {
-                current_states
-                    .get(id)
-                    .map(|s| (id.clone().into_inner(), s.attributes.clone()))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// Collect the attributes of all live states (for destroy rendering).
-pub fn delete_attributes_from_states(
-    current_states: &HashMap<ResourceId, State>,
-) -> HashMap<ResourceId, HashMap<String, Value>> {
-    current_states
-        .iter()
-        .filter(|(_, state)| state.exists)
-        .map(|(id, state)| (id.clone(), state.attributes.clone()))
-        .collect()
+    state_file: Option<&StateFile>,
+) -> HashMap<carina_core::effect::DeletedInstanceKey, HashMap<String, Value>> {
+    crate::commands::plan::collect_delete_attributes(plan, current_states, state_file)
 }

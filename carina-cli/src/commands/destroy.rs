@@ -11,11 +11,11 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::get_resource_dependencies;
-use carina_core::effect::Effect;
 use carina_core::effect::deps::{
     DependencyAnalysis, DestroyWaitAlias, ScheduleInputs, UnresolvedResource,
     build_effect_dependency_analysis,
 };
+use carina_core::effect::{Effect, EffectGeneration};
 use carina_core::parser::WaitBinding;
 use carina_core::plan::Plan;
 use carina_core::provider::Provider;
@@ -27,17 +27,18 @@ use carina_core::parser::ProviderContext;
 
 use super::{DriftCommand, validate_and_resolve_with_config, verify_for_mutation};
 use crate::DetailLevel;
+use crate::commands::plan::collect_delete_attributes;
 use crate::commands::shared::finalize::handle_finalize_after_execute;
 use crate::commands::shared::progress::{
     RefreshProgress, format_duration, refresh_multi_progress, spinner_style,
 };
 use crate::commands::shared::retry::{WaitResult, is_retryable_delete_error, wait_for_deletion};
 use crate::commands::shared::state_writeback::{
-    apply_destroy_to_state, apply_name_overrides, build_orphan_resource,
+    DestroyedInstance, apply_destroy_to_state, apply_name_overrides, build_orphan_resource,
 };
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
-use crate::display::{format_destroy_plan, format_effect};
+use crate::display::{format_destroy_plan_with_delete_instances, format_effect};
 use crate::error::AppError;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, get_provider_with_ctx, read_with_retry,
@@ -392,26 +393,23 @@ async fn run_destroy_locked(
         left_key.cmp(right_key)
     });
 
-    let mut delete_effects = Vec::with_capacity(resources_to_destroy.len());
-    for resource in &resources_to_destroy {
-        let identifier = current_states
-            .get(&resource.id)
-            .and_then(|s| s.identifier.clone())
-            .unwrap_or_default();
-        let dependencies = get_resource_dependencies(resource);
-        let explicit_dependencies = resource.directives.depends_on.iter().cloned().collect();
-        delete_effects.push(Effect::Delete {
-            id: carina_core::resource::ResolvedResourceId::new(resource.id.clone()),
-            identifier,
-            directives: resource.directives.clone(),
-            binding: resource.binding.clone(),
-            dependencies,
-            explicit_dependencies,
-            blocked_by_updates: HashSet::new(),
-        });
-    }
+    // Backend-bucket protection shields the whole state row, including deposed
+    // generations, because deleting any generation could destroy the state
+    // bucket itself. `prevent_destroy` is intentionally not included here: it
+    // guards the current instance, while a deposed generation already came from
+    // a replacement path that approved deleting the old instance.
+    let protected_row_keys: HashSet<StateRowKey> = protected_resources
+        .iter()
+        .map(|resource| state_row_key_from_id(&resource.id))
+        .collect();
+    let delete_effects = build_destroy_delete_effects(
+        &resources_to_destroy,
+        &current_states,
+        state_file.as_ref(),
+        &protected_row_keys,
+    );
 
-    let wait_aliases = build_destroy_wait_aliases(&parsed.wait_bindings, &resources_to_destroy);
+    let wait_aliases = build_destroy_wait_aliases(&parsed.wait_bindings, &delete_effects);
     let dependency_analysis = build_effect_dependency_analysis(
         &delete_effects,
         &HashMap::<ResourceId, UnresolvedResource>::new(),
@@ -423,13 +421,12 @@ async fn run_destroy_locked(
     let delete_count = delete_effects.len();
     let deletion_deps = transitive_delete_deps(&dependency_analysis, delete_count);
     let delete_depths = compute_delete_depths(delete_count, &deletion_deps);
-    let resource_names: Vec<String> = resources_to_destroy
+    let resource_names: Vec<String> = delete_effects
         .iter()
-        .map(|resource| {
-            resource
-                .binding
-                .clone()
-                .unwrap_or_else(|| resource.id.identity_or_empty().to_string())
+        .map(|effect| {
+            effect
+                .binding_name()
+                .unwrap_or_else(|| effect.resource_id().identity_or_empty().to_string())
         })
         .collect();
     let display_order = topological_delete_order(
@@ -440,7 +437,7 @@ async fn run_destroy_locked(
     )
     .map_err(AppError::Config)?;
 
-    if resources_to_destroy.is_empty()
+    if delete_effects.is_empty()
         && protected_resources.is_empty()
         && prevent_destroy_resources.is_empty()
     {
@@ -454,20 +451,17 @@ async fn run_destroy_locked(
         destroy_plan.add(delete_effects[*idx].clone());
     }
 
-    // Build delete attributes map from current states for display
-    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = resources_to_destroy
-        .iter()
-        .filter_map(|r| {
-            current_states
-                .get(&r.id)
-                .map(|s| (r.id.clone(), s.attributes.clone()))
-        })
-        .collect();
+    let delete_attributes =
+        collect_delete_attributes(&destroy_plan, &current_states, state_file.as_ref());
 
     // Display destroy plan as a dependency tree
     print!(
         "{}",
-        format_destroy_plan(&destroy_plan, DetailLevel::Full, &delete_attributes)
+        format_destroy_plan_with_delete_instances(
+            &destroy_plan,
+            DetailLevel::Full,
+            &delete_attributes
+        )
     );
 
     // Show protected resources
@@ -500,17 +494,19 @@ async fn run_destroy_locked(
     }
 
     println!();
-    let total_count =
-        resources_to_destroy.len() + protected_resources.len() + prevent_destroy_resources.len();
-    if !protected_resources.is_empty() || !prevent_destroy_resources.is_empty() {
-        let guarded_count = protected_resources.len() + prevent_destroy_resources.len();
+    let counts = destroy_plan_counts(
+        delete_effects.len(),
+        protected_resources.len(),
+        prevent_destroy_resources.len(),
+    );
+    if counts.guarded > 0 {
         println!(
             "Plan: {} to destroy, {} protected.",
-            resources_to_destroy.len().to_string().red(),
-            guarded_count.to_string().yellow()
+            counts.to_destroy.to_string().red(),
+            counts.guarded.to_string().yellow()
         );
     } else {
-        println!("Plan: {} to destroy.", total_count.to_string().red());
+        println!("Plan: {} to destroy.", counts.to_destroy.to_string().red());
     }
     println!();
 
@@ -522,7 +518,7 @@ async fn run_destroy_locked(
         )));
     }
 
-    if resources_to_destroy.is_empty() {
+    if should_skip_destroy_execution(delete_effects.len()) {
         println!(
             "{}",
             "All resources are protected. Nothing to destroy.".yellow()
@@ -579,32 +575,25 @@ async fn run_destroy_locked(
     let mut success_count = 0;
     let mut failure_count = 0;
     let mut skip_count = 0;
-    let mut destroyed_ids: Vec<ResourceId> = Vec::new();
+    let mut destroyed_instances: Vec<DestroyedInstance> = Vec::new();
     let mut failed_indices: HashSet<usize> = HashSet::new();
     let mut cancelled = false;
-    // timed_out_resources: delete index -> (ResourceId, identifier)
-    let mut timed_out_resources: HashMap<usize, (ResourceId, String)> = HashMap::new();
+    // timed_out_resources: delete index -> (ResourceId, identifier, generation)
+    let mut timed_out_resources: HashMap<usize, (ResourceId, String, EffectGeneration)> =
+        HashMap::new();
 
-    let destroy_total = resources_to_destroy.len();
+    let destroy_total = delete_effects.len();
     let completed_counter = AtomicUsize::new(0);
 
     // Pre-compute binding and effect for each resource by index
-    let resource_info: Vec<(String, String, Effect)> = resources_to_destroy
+    let resource_info: Vec<(String, Effect)> = delete_effects
         .iter()
-        .zip(delete_effects.iter())
-        .map(|(resource, effect)| {
-            let identifier = match effect {
-                Effect::Delete { identifier, .. } => identifier.clone(),
-                _ => unreachable!("destroy resource_info only contains delete effects"),
-            };
-            let binding = resource.binding.clone().unwrap_or_else(|| {
-                format!(
-                    "{}:{}",
-                    resource.id.resource_type,
-                    resource.id.identity_or_empty()
-                )
+        .map(|effect| {
+            let binding = effect.binding_name().unwrap_or_else(|| {
+                let id = effect.resource_id();
+                format!("{}:{}", id.resource_type, id.identity_or_empty())
             });
-            (binding, identifier, effect.clone())
+            (binding, effect.clone())
         })
         .collect();
 
@@ -658,8 +647,7 @@ async fn run_destroy_locked(
 
                 dispatched.insert(idx);
 
-                let (_binding, identifier, effect) = &resource_info[idx];
-                let resource = resources_to_destroy[idx];
+                let (_binding, effect) = &resource_info[idx];
 
                 // Check if any dependent has actually failed (non-timeout)
                 if let Some(failed_dep_idx) = delete_dependency_in_set(
@@ -700,7 +688,9 @@ async fn run_destroy_locked(
 
                 let mut wait_failed = false;
                 for dep_idx in &timed_out_deps {
-                    if let Some((dep_id, dep_identifier)) = timed_out_resources.remove(dep_idx) {
+                    if let Some((dep_id, dep_identifier, dep_generation)) =
+                        timed_out_resources.remove(dep_idx)
+                    {
                         multi
                             .println(format!(
                                 "  {} Waiting for {} to be deleted...",
@@ -726,7 +716,10 @@ async fn run_destroy_locked(
                                         dep_id
                                     ))
                                     .ok();
-                                destroyed_ids.push(dep_id.clone());
+                                destroyed_instances.push(DestroyedInstance {
+                                    id: dep_id.clone(),
+                                    generation: dep_generation,
+                                });
                                 success_count += 1;
                             }
                             WaitResult::ReadError(msg) => {
@@ -792,9 +785,20 @@ async fn run_destroy_locked(
                 spinners.insert(idx, pb);
 
                 // Spawn the deletion as a concurrent future
-                let resource_id = resource.id.clone();
+                let Effect::Delete {
+                    id,
+                    identifier,
+                    generation,
+                    directives,
+                    ..
+                } = effect
+                else {
+                    unreachable!("destroy dispatch only contains delete effects");
+                };
+                let resource_id = id.clone().into_inner();
                 let identifier = identifier.clone();
-                let directives = resource.directives.clone();
+                let generation = generation.clone();
+                let directives = directives.clone();
 
                 let provider_ref = &provider;
                 in_flight.push(async move {
@@ -808,7 +812,14 @@ async fn run_destroy_locked(
                             },
                         )
                         .await;
-                    (idx, resource_id, identifier, started, delete_result)
+                    (
+                        idx,
+                        resource_id,
+                        identifier,
+                        generation,
+                        started,
+                        delete_result,
+                    )
                 });
             }
         }
@@ -842,7 +853,7 @@ async fn run_destroy_locked(
             let all_retried = remaining.iter().all(|idx| retry_counts.contains_key(idx));
             if all_retried {
                 for &idx in &remaining {
-                    let (_, _, effect) = &resource_info[idx];
+                    let (_, effect) = &resource_info[idx];
                     let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
                     let counter = format!("{}/{}", c, destroy_total).dimmed();
                     let msg = format!(
@@ -874,20 +885,21 @@ async fn run_destroy_locked(
         }
 
         // Wait for the next deletion to complete
-        let (finished_idx, resource_id, identifier, started, delete_result) = if cancelled {
-            in_flight.next().await.unwrap()
-        } else {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    cancelled = true;
-                    continue;
+        let (finished_idx, resource_id, identifier, generation, started, delete_result) =
+            if cancelled {
+                in_flight.next().await.unwrap()
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        cancelled = true;
+                        continue;
+                    }
+                    finished = in_flight.next() => {
+                        finished.unwrap()
+                    }
                 }
-                finished = in_flight.next() => {
-                    finished.unwrap()
-                }
-            }
-        };
+            };
         completed_indices.insert(finished_idx);
 
         // An effect completed — release all retry-pending indices so they
@@ -896,7 +908,7 @@ async fn run_destroy_locked(
 
         let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let counter = format!("{}/{}", c, destroy_total).dimmed();
-        let effect = &resource_info[finished_idx].2;
+        let effect = &resource_info[finished_idx].1;
 
         // Helper to finish the spinner for the completed effect.
         // Always prints via eprintln when stdout is not a terminal,
@@ -928,7 +940,10 @@ async fn run_destroy_locked(
                 finish_spinner(&mut spinners, finished_idx, msg);
                 success_count += 1;
                 observe_destroy_success_for_tests(success_count, &resource_id, &cancel);
-                destroyed_ids.push(resource_id);
+                destroyed_instances.push(DestroyedInstance {
+                    id: resource_id,
+                    generation,
+                });
             }
             Err(carina_core::provider::ProviderError::Timeout(_)) => {
                 let msg = format!(
@@ -937,7 +952,7 @@ async fn run_destroy_locked(
                     format_effect(effect)
                 );
                 finish_spinner(&mut spinners, finished_idx, msg);
-                timed_out_resources.insert(finished_idx, (resource_id, identifier));
+                timed_out_resources.insert(finished_idx, (resource_id, identifier, generation));
             }
             Err(e) => {
                 let retries = retry_counts.get(&finished_idx).copied().unwrap_or(0);
@@ -984,7 +999,7 @@ async fn run_destroy_locked(
 
     // Handle any remaining timed-out resources that no parent waited on.
     if !cancelled {
-        for (dep_idx, (dep_id, dep_identifier)) in &timed_out_resources {
+        for (dep_idx, (dep_id, dep_identifier, dep_generation)) in &timed_out_resources {
             if cancel.is_cancelled() {
                 cancelled = true;
                 break;
@@ -1018,7 +1033,10 @@ async fn run_destroy_locked(
                         "✓".green(),
                         dep_id
                     );
-                    destroyed_ids.push(dep_id.clone());
+                    destroyed_instances.push(DestroyedInstance {
+                        id: dep_id.clone(),
+                        generation: dep_generation.clone(),
+                    });
                     success_count += 1;
                 }
                 WaitResult::ReadError(msg) => {
@@ -1045,7 +1063,7 @@ async fn run_destroy_locked(
         }
     }
 
-    if cancelled && destroyed_ids.is_empty() {
+    if cancelled && destroyed_instances.is_empty() {
         return Err(AppError::Interrupted);
     }
 
@@ -1056,7 +1074,7 @@ async fn run_destroy_locked(
         backend,
         lock,
         state_file,
-        destroyed_ids: &destroyed_ids,
+        destroyed_instances: &destroyed_instances,
     })
     .await;
     handle_finalize_after_execute(finalize_result, cancelled)?;
@@ -1129,17 +1147,27 @@ fn observe_destroy_success_for_tests(
 
 fn build_destroy_wait_aliases(
     wait_bindings: &[WaitBinding],
-    resources_to_destroy: &[&Resource],
+    delete_effects: &[Effect],
 ) -> Vec<DestroyWaitAlias> {
-    let destroy_targets: HashSet<&str> = resources_to_destroy
+    let delete_dependencies: Vec<(String, HashSet<String>)> = delete_effects
         .iter()
-        .filter_map(|resource| resource.binding.as_deref())
+        .filter_map(|effect| match effect {
+            Effect::Delete {
+                id, dependencies, ..
+            } => Some((
+                effect
+                    .binding_name()
+                    .unwrap_or_else(|| id.identity_or_empty().to_string()),
+                dependencies.clone(),
+            )),
+            _ => None,
+        })
         .collect();
-    let resource_dependencies: Vec<(&Resource, HashSet<String>)> = resources_to_destroy
+    let destroy_targets: HashSet<&str> = delete_dependencies
         .iter()
-        .map(|resource| (*resource, get_resource_dependencies(resource)))
+        .map(|(binding, _)| binding.as_str())
         .collect();
-    let referenced_bindings: HashSet<&str> = resource_dependencies
+    let referenced_bindings: HashSet<&str> = delete_dependencies
         .iter()
         .flat_map(|(_, dependencies)| dependencies.iter().map(String::as_str))
         .collect();
@@ -1151,16 +1179,13 @@ fn build_destroy_wait_aliases(
             if !destroy_targets.contains(wait.target.as_str()) {
                 return None;
             }
-            let consumers = resource_dependencies
+            let mut consumers = delete_dependencies
                 .iter()
                 .filter(|(_, dependencies)| dependencies.contains(wait.binding.as_str()))
-                .map(|(resource, _)| {
-                    resource
-                        .binding
-                        .clone()
-                        .unwrap_or_else(|| resource.id.identity_or_empty().to_string())
-                })
+                .map(|(binding, _)| binding.clone())
                 .collect::<Vec<_>>();
+            consumers.sort();
+            consumers.dedup();
 
             DestroyWaitAlias::new(
                 wait.binding.as_str().to_string(),
@@ -1173,6 +1198,81 @@ fn build_destroy_wait_aliases(
             )
         })
         .collect()
+}
+
+fn build_destroy_delete_effects(
+    resources_to_destroy: &[&Resource],
+    current_states: &HashMap<ResourceId, State>,
+    state_file: Option<&StateFile>,
+    protected_row_keys: &HashSet<StateRowKey>,
+) -> Vec<Effect> {
+    let mut delete_effects = Vec::with_capacity(resources_to_destroy.len());
+    for resource in resources_to_destroy {
+        let identifier = current_states
+            .get(&resource.id)
+            .and_then(|s| s.identifier.clone())
+            .unwrap_or_default();
+        let dependencies = get_resource_dependencies(resource);
+        let explicit_dependencies = resource.directives.depends_on.iter().cloned().collect();
+        delete_effects.push(Effect::Delete {
+            id: carina_core::resource::ResolvedResourceId::new(resource.id.clone()),
+            identifier,
+            generation: EffectGeneration::Current,
+            directives: resource.directives.clone(),
+            binding: resource.binding.clone(),
+            dependencies,
+            explicit_dependencies,
+            blocked_by_updates: HashSet::new(),
+        });
+    }
+    if let Some(sf) = state_file {
+        for row in &sf.resources {
+            if protected_row_keys.contains(&state_row_key_from_parts(
+                &row.provider,
+                &row.resource_type,
+                &row.identity,
+            )) {
+                continue;
+            }
+            delete_effects.extend(crate::wiring::deposed_delete_effects_for_row(row));
+        }
+    }
+    delete_effects
+}
+
+type StateRowKey = (String, String, String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DestroyPlanCounts {
+    to_destroy: usize,
+    guarded: usize,
+}
+
+fn destroy_plan_counts(
+    delete_effect_count: usize,
+    protected_count: usize,
+    prevent_destroy_count: usize,
+) -> DestroyPlanCounts {
+    DestroyPlanCounts {
+        to_destroy: delete_effect_count,
+        guarded: protected_count + prevent_destroy_count,
+    }
+}
+
+fn should_skip_destroy_execution(delete_effect_count: usize) -> bool {
+    delete_effect_count == 0
+}
+
+fn state_row_key_from_id(id: &ResourceId) -> StateRowKey {
+    state_row_key_from_parts(&id.provider, &id.resource_type, id.identity_or_empty())
+}
+
+fn state_row_key_from_parts(provider: &str, resource_type: &str, identity: &str) -> StateRowKey {
+    (
+        provider.to_string(),
+        resource_type.to_string(),
+        identity.to_string(),
+    )
 }
 
 fn transitive_delete_deps(
@@ -1392,7 +1492,7 @@ pub(crate) struct FinalizeDestroyInput<'a> {
     pub backend: &'a dyn StateBackend,
     pub lock: Option<&'a LockInfo>,
     pub state_file: Option<StateFile>,
-    pub destroyed_ids: &'a [ResourceId],
+    pub destroyed_instances: &'a [DestroyedInstance],
 }
 
 pub(crate) async fn finalize_destroy(input: FinalizeDestroyInput<'_>) -> Result<(), AppError> {
@@ -1402,7 +1502,7 @@ pub(crate) async fn finalize_destroy(input: FinalizeDestroyInput<'_>) -> Result<
     // On a cancelled partial destroy, exports for resources that survived are
     // also wiped. This is pre-existing behavior; downstream consumers should
     // re-derive exports from a fresh plan. See carina-cli/src/commands/shared/state_writeback.rs.
-    apply_destroy_to_state(&mut state, input.destroyed_ids);
+    apply_destroy_to_state(&mut state, input.destroyed_instances);
 
     if let Some(lock) = input.lock {
         crate::commands::apply::save_state_locked(input.backend, lock, &mut state).await?;
@@ -1641,6 +1741,163 @@ mod tests {
     }
 
     #[test]
+    fn build_destroy_delete_effects_includes_current_and_deposed_instances() {
+        use carina_state::{DeposedInstance, DeposedKey, ResourceState};
+        use std::collections::{BTreeSet, HashMap};
+
+        let resource =
+            Resource::with_provider("awscc", "ec2.Vpc", "main", Some("current".to_string()))
+                .with_binding("main");
+        let current_states = HashMap::from([(
+            resource.id.clone(),
+            State::existing(resource.id.clone(), HashMap::new()).with_identifier("vpc-new"),
+        )]);
+        let deposed_key = DeposedKey::new_unique();
+        let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
+        row.binding = Some("main".to_string());
+        row.deposed.push(DeposedInstance {
+            key: deposed_key.clone(),
+            identifier: "vpc-old".to_string(),
+            provider_instance: Some("deposed".to_string()),
+            attributes: HashMap::new(),
+            dependency_bindings: BTreeSet::from(["subnet".to_string()]),
+        });
+        let mut state_file = StateFile::new();
+        state_file.resources.push(row);
+
+        let effects = build_destroy_delete_effects(
+            &[&resource],
+            &current_states,
+            Some(&state_file),
+            &HashSet::new(),
+        );
+
+        assert_eq!(effects.len(), 2);
+        assert!(matches!(
+            &effects[0],
+            Effect::Delete {
+                identifier,
+                generation: EffectGeneration::Current,
+                ..
+            } if identifier == "vpc-new"
+        ));
+        assert!(matches!(
+            &effects[1],
+            Effect::Delete {
+                id,
+                identifier,
+                generation: EffectGeneration::Deposed(key),
+                dependencies,
+                ..
+            } if id.as_inner().provider_instance.as_deref() == Some("deposed")
+                && identifier == "vpc-old"
+                && key == &deposed_key
+                && dependencies == &HashSet::from(["subnet".to_string()])
+        ));
+    }
+
+    #[test]
+    fn build_destroy_delete_effects_skips_deposed_generations_for_protected_rows() {
+        use carina_state::{DeposedInstance, DeposedKey, ResourceState};
+        use std::collections::{BTreeSet, HashMap};
+
+        let resource =
+            Resource::with_provider("awscc", "s3.Bucket", "state", None).with_binding("state");
+        let mut row = ResourceState::new("s3.Bucket", "state", "awscc");
+        row.binding = Some("state".to_string());
+        row.deposed.push(DeposedInstance {
+            key: DeposedKey::new_unique(),
+            identifier: "old-state-bucket".to_string(),
+            provider_instance: None,
+            attributes: HashMap::new(),
+            dependency_bindings: BTreeSet::new(),
+        });
+        let mut state_file = StateFile::new();
+        state_file.resources.push(row);
+        let protected = HashSet::from([state_row_key_from_id(&resource.id)]);
+
+        let effects =
+            build_destroy_delete_effects(&[], &HashMap::new(), Some(&state_file), &protected);
+
+        assert!(
+            effects.is_empty(),
+            "a protected current row protects its deposed generations too"
+        );
+    }
+
+    #[test]
+    fn build_destroy_delete_effects_keeps_deposed_generations_for_prevent_destroy_rows() {
+        use carina_state::{DeposedInstance, DeposedKey, ResourceState};
+        use std::collections::{BTreeSet, HashMap};
+
+        let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
+        row.binding = Some("main".to_string());
+        row.directives.prevent_destroy = true;
+        let deposed_key = DeposedKey::new_unique();
+        row.deposed.push(DeposedInstance {
+            key: deposed_key.clone(),
+            identifier: "vpc-old".to_string(),
+            provider_instance: None,
+            attributes: HashMap::new(),
+            dependency_bindings: BTreeSet::new(),
+        });
+        let mut state_file = StateFile::new();
+        state_file.resources.push(row);
+
+        let effects =
+            build_destroy_delete_effects(&[], &HashMap::new(), Some(&state_file), &HashSet::new());
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            &effects[0],
+            Effect::Delete {
+                identifier,
+                generation: EffectGeneration::Deposed(key),
+                ..
+            } if identifier == "vpc-old" && key == &deposed_key
+        ));
+    }
+
+    #[test]
+    fn deposed_only_destroy_work_prevents_all_protected_short_circuit() {
+        use carina_state::{DeposedInstance, DeposedKey, ResourceState};
+        use std::collections::{BTreeSet, HashMap};
+
+        let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
+        row.deposed.push(DeposedInstance {
+            key: DeposedKey::new_unique(),
+            identifier: "vpc-old".to_string(),
+            provider_instance: None,
+            attributes: HashMap::new(),
+            dependency_bindings: BTreeSet::new(),
+        });
+        let mut state_file = StateFile::new();
+        state_file.resources.push(row);
+
+        let effects =
+            build_destroy_delete_effects(&[], &HashMap::new(), Some(&state_file), &HashSet::new());
+
+        assert_eq!(effects.len(), 1);
+        assert!(
+            !should_skip_destroy_execution(effects.len()),
+            "deposed-only destroy work must still execute"
+        );
+    }
+
+    #[test]
+    fn destroy_summary_count_uses_actual_delete_effects() {
+        let counts = destroy_plan_counts(2, 1, 0);
+
+        assert_eq!(
+            counts,
+            DestroyPlanCounts {
+                to_destroy: 2,
+                guarded: 1
+            }
+        );
+    }
+
+    #[test]
     fn apply_destroy_to_state_removes_resources_and_clears_exports() {
         // Regression test for #1983: destroy must clear stale exports because
         // they reference attributes of resources that no longer exist.
@@ -1654,9 +1911,10 @@ mod tests {
             .exports
             .insert("vpc_id".to_string(), serde_json::json!("vpc-12345"));
 
-        let destroyed = vec![ResourceId::with_provider_identity(
-            "awscc", "ec2.Vpc", "main", None,
-        )];
+        let destroyed = vec![DestroyedInstance {
+            id: ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None),
+            generation: EffectGeneration::Current,
+        }];
         apply_destroy_to_state(&mut state, &destroyed);
 
         assert!(state.resources.is_empty(), "resource should be removed");
@@ -1687,9 +1945,10 @@ mod tests {
             .exports
             .insert("vpc_id".to_string(), serde_json::json!("vpc-new"));
 
-        let destroyed = vec![ResourceId::with_provider_identity(
-            "awscc", "ec2.Vpc", "main", None,
-        )];
+        let destroyed = vec![DestroyedInstance {
+            id: ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None),
+            generation: EffectGeneration::Current,
+        }];
         apply_destroy_to_state(&mut state, &destroyed);
 
         let retained = state
@@ -1700,6 +1959,95 @@ mod tests {
         assert_eq!(retained.deposed.len(), 1);
         assert_eq!(retained.deposed[0].identifier, "vpc-old");
         assert!(state.exports.is_empty(), "exports should be cleared");
+    }
+
+    #[test]
+    fn apply_destroy_to_state_removes_only_successful_deposed_generation() {
+        use carina_state::{DeposedInstance, DeposedKey, ResourceState};
+        use std::collections::{BTreeSet, HashMap};
+
+        let removed_key = DeposedKey::new_unique();
+        let retained_key = DeposedKey::new_unique();
+        let mut state = carina_state::StateFile::new();
+        let mut resource = ResourceState::new("ec2.Vpc", "main", "awscc")
+            .with_identifier("vpc-new")
+            .with_attribute("cidr_block", serde_json::json!("10.1.0.0/16"));
+        resource.deposed.push(DeposedInstance {
+            key: removed_key.clone(),
+            identifier: "vpc-old".to_string(),
+            provider_instance: None,
+            attributes: HashMap::from([(
+                "cidr_block".to_string(),
+                serde_json::json!("10.0.0.0/16"),
+            )]),
+            dependency_bindings: BTreeSet::from(["network".to_string()]),
+        });
+        resource.deposed.push(DeposedInstance {
+            key: retained_key.clone(),
+            identifier: "vpc-older".to_string(),
+            provider_instance: None,
+            attributes: HashMap::from([(
+                "cidr_block".to_string(),
+                serde_json::json!("10.2.0.0/16"),
+            )]),
+            dependency_bindings: BTreeSet::from(["network".to_string()]),
+        });
+        state.resources.push(resource);
+
+        let destroyed = vec![DestroyedInstance {
+            id: ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None),
+            generation: EffectGeneration::Deposed(removed_key),
+        }];
+        apply_destroy_to_state(&mut state, &destroyed);
+
+        let retained = state
+            .find_resource("awscc", "ec2.Vpc", "main")
+            .expect("current row should remain after deposed-only destroy result");
+        assert_eq!(retained.identifier.as_deref(), Some("vpc-new"));
+        assert_eq!(retained.deposed.len(), 1);
+        assert_eq!(retained.deposed[0].key, retained_key);
+        assert_eq!(retained.deposed[0].identifier, "vpc-older");
+    }
+
+    #[test]
+    fn apply_destroy_to_state_removes_row_after_current_and_deposed_successes() {
+        use carina_state::{DeposedInstance, DeposedKey, ResourceState};
+        use std::collections::{BTreeSet, HashMap};
+
+        let deposed_key = DeposedKey::new_unique();
+        let mut state = carina_state::StateFile::new();
+        let mut resource = ResourceState::new("ec2.Vpc", "main", "awscc")
+            .with_identifier("vpc-new")
+            .with_attribute("cidr_block", serde_json::json!("10.1.0.0/16"));
+        resource.deposed.push(DeposedInstance {
+            key: deposed_key.clone(),
+            identifier: "vpc-old".to_string(),
+            provider_instance: None,
+            attributes: HashMap::from([(
+                "cidr_block".to_string(),
+                serde_json::json!("10.0.0.0/16"),
+            )]),
+            dependency_bindings: BTreeSet::from(["network".to_string()]),
+        });
+        state.resources.push(resource);
+
+        let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
+        let destroyed = vec![
+            DestroyedInstance {
+                id: id.clone(),
+                generation: EffectGeneration::Current,
+            },
+            DestroyedInstance {
+                id,
+                generation: EffectGeneration::Deposed(deposed_key),
+            },
+        ];
+        apply_destroy_to_state(&mut state, &destroyed);
+
+        assert!(
+            state.find_resource("awscc", "ec2.Vpc", "main").is_none(),
+            "row should drop only after both current and deposed generations are removed"
+        );
     }
 
     #[tokio::test]

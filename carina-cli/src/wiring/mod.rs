@@ -16,7 +16,9 @@ use carina_core::binding_index::{PreApplyInputs, ResolvedBindings, WaitAliasSpec
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::binding_matches_deferred_template;
 use carina_core::differ::create_plan_with_cascades;
-use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes};
+use carina_core::effect::{
+    DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration, NonEmptyDeletes,
+};
 use carina_core::executor::normalized::{
     is_value_fully_concrete_for_expansion, restore_stripped_attributes,
     run_desired_normalization_stages, states_contain_unknown, strip_provider_boundary_attributes,
@@ -2462,6 +2464,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         &orphan_dependencies,
         &wait_bindings,
     );
+    add_deposed_delete_effects(&mut plan, state_file);
 
     // Add state block effects (import/removed/moved) to the plan.
     // carina#3329: pass the same override-aware bindings + upstream_binding_names
@@ -2978,7 +2981,15 @@ pub fn add_state_block_effects(
     // and Create effects for import targets (they will be imported, not created)
     if !suppress_delete.is_empty() || !suppress_create.is_empty() {
         plan.retain(|effect| match effect {
-            Effect::Delete { id, .. } => !suppress_delete.contains(id),
+            Effect::Delete {
+                id,
+                generation: EffectGeneration::Current,
+                ..
+            } => !suppress_delete.contains(id),
+            Effect::Delete {
+                generation: EffectGeneration::Deposed(_),
+                ..
+            } => true,
             Effect::Create(resource) => !suppress_create.contains(&resource.id),
             _ => true,
         });
@@ -3006,6 +3017,7 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
                 let Effect::Delete {
                     id,
                     identifier,
+                    generation: EffectGeneration::Current,
                     directives,
                     binding: Some(binding),
                     dependencies,
@@ -3044,7 +3056,11 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
 
     if !deletes_to_absorb.is_empty() {
         plan.retain(|effect| match effect {
-            Effect::Delete { id, .. } => !deletes_to_absorb.contains(id),
+            Effect::Delete {
+                id,
+                generation: EffectGeneration::Current,
+                ..
+            } => !deletes_to_absorb.contains(id),
             _ => true,
         });
     }
@@ -3052,6 +3068,50 @@ pub fn add_deferred_create_effects(plan: &mut Plan, targets: &[DeferredCreateTar
     for effect in deferred_effects {
         plan.add(effect);
     }
+}
+
+/// Add delete-pending deposed generations from state to the plan.
+///
+/// Each entry uses its own provider-instance routing and dependency bindings,
+/// not the row's current-instance routing.
+pub fn add_deposed_delete_effects(plan: &mut Plan, state_file: &Option<StateFile>) {
+    let Some(state_file) = state_file.as_ref() else {
+        return;
+    };
+
+    for row in &state_file.resources {
+        for effect in deposed_delete_effects_for_row(row) {
+            plan.add(effect);
+        }
+    }
+}
+
+/// Build top-level delete effects for every deposed generation on a state row.
+///
+/// Each deposed entry owns its provider-instance routing and dependency
+/// bindings; callers must not substitute the current row's routing here.
+pub(crate) fn deposed_delete_effects_for_row(row: &carina_state::ResourceState) -> Vec<Effect> {
+    row.deposed
+        .iter()
+        .map(|deposed| {
+            let id = ResourceId::with_provider_identity(
+                &row.provider,
+                &row.resource_type,
+                &row.identity,
+                deposed.provider_instance.clone(),
+            );
+            Effect::Delete {
+                id: carina_core::resource::ResolvedResourceId::new(id),
+                identifier: deposed.identifier.clone(),
+                generation: EffectGeneration::Deposed(deposed.key.clone()),
+                directives: Default::default(),
+                binding: row.binding.clone(),
+                dependencies: deposed.dependency_bindings.iter().cloned().collect(),
+                explicit_dependencies: HashSet::new(),
+                blocked_by_updates: HashSet::new(),
+            }
+        })
+        .collect()
 }
 
 /// Resolve an import block's `to` address to a matching resource in the plan or state.

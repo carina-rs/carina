@@ -76,6 +76,28 @@ impl<'de> Deserialize<'de> for ResourceIdentity {
     }
 }
 
+/// System-assigned key for one deposed generation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DeposedKey(String);
+
+impl DeposedKey {
+    pub fn new_unique() -> Self {
+        let uuid = uuid::Uuid::new_v4().simple().to_string();
+        Self(uuid[..12].to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for DeposedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Unique identifier for a resource
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ResourceId {
@@ -275,6 +297,14 @@ impl ResolvedResourceId {
     /// The identity string (always present).
     pub fn identity_str(&self) -> &str {
         self.0.identity_str().unwrap()
+    }
+
+    /// The resolved identity (always present).
+    pub fn identity(&self) -> &ResourceIdentity {
+        self.0
+            .identity
+            .as_ref()
+            .expect("ResolvedResourceId requires identity")
     }
 
     pub fn identity_or_empty(&self) -> &str {

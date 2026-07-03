@@ -692,9 +692,22 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
             nodes[idx].resource_type = display_type.clone();
             nodes[idx].name_part = name_part.clone();
             nodes[idx].effect_label = format!("{} {}", display_type, name_part);
-        } else if let Effect::Delete { id, .. } = effect {
+        } else if let Effect::Delete {
+            id,
+            identifier,
+            generation,
+            ..
+        } = effect
+        {
             let display_type = id.display_type();
-            let name_part = id.identity_or_empty().to_string();
+            let name_part = if matches!(
+                generation,
+                carina_core::effect::EffectGeneration::Deposed(_)
+            ) {
+                format!("{} (deposed {identifier})", id.identity_or_empty())
+            } else {
+                id.identity_or_empty().to_string()
+            };
             nodes[idx].resource_type = display_type.clone();
             nodes[idx].name_part = name_part.clone();
             nodes[idx].effect_label = format!("{} {}", display_type, name_part);
@@ -766,7 +779,12 @@ fn effect_to_node(
                 parent: None,
             }
         }
-        Effect::Delete { id, identifier, .. } => {
+        Effect::Delete {
+            id,
+            identifier,
+            generation,
+            ..
+        } => {
             // build_detail_rows returns empty for Delete without delete_attributes,
             // so add the identifier as a manual attribute row
             let mut rows = detail_rows;
@@ -781,7 +799,14 @@ fn effect_to_node(
             TreeNode {
                 effect_label: format!("{}", id.human()),
                 resource_type: id.display_type(),
-                name_part: id.identity_or_empty().to_string(),
+                name_part: if matches!(
+                    generation,
+                    carina_core::effect::EffectGeneration::Deposed(_)
+                ) {
+                    format!("{} (deposed {identifier})", id.identity_or_empty())
+                } else {
+                    id.identity_or_empty().to_string()
+                },
                 symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Delete,
                 detail_rows: rows,

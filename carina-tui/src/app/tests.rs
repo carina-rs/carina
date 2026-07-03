@@ -31,6 +31,7 @@ fn app_from_plan_with_effects() {
             "old-bucket",
         )),
         identifier: "old-bucket-id".to_string(),
+        generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
         binding: None,
         dependencies: HashSet::new(),

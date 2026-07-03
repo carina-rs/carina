@@ -1,0 +1,25 @@
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let main = awscc.ec2.Vpc {
+  cidr_block = '10.221.0.0/16'
+  tags = {
+    Name        = 'main'
+    Environment = 'new'
+  }
+}
+
+let subnet = awscc.ec2.Subnet {
+  vpc_id            = main.vpc_id
+  cidr_block        = '10.221.1.0/24'
+  availability_zone = 'ap-northeast-1a'
+  tags = {
+    Name        = 'subnet'
+    Environment = 'new'
+  }
+}
+
+exports {
+  subnet_id = subnet.subnet_id
+}

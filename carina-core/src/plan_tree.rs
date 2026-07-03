@@ -205,16 +205,22 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                 Effect::Delete {
                     id,
                     binding,
+                    generation,
                     dependencies,
                     ..
                 } => {
                     let deps = dependencies.clone();
+                    let is_current = generation.is_current();
                     if let Some(b) = binding {
-                        binding_to_effect.insert(b.clone(), idx);
+                        if is_current {
+                            binding_to_effect.insert(b.clone(), idx);
+                        }
                         effect_bindings.insert(idx, b.clone());
                     } else {
                         let fallback = id.to_string();
-                        binding_to_effect.insert(fallback.clone(), idx);
+                        if is_current {
+                            binding_to_effect.insert(fallback.clone(), idx);
+                        }
                         effect_bindings.insert(idx, fallback);
                     }
                     effect_types.insert(idx, id.resource_type.clone());
@@ -587,7 +593,8 @@ mod tests {
     use crate::parser::{DeferredForExpression, ForBinding};
     use crate::plan::{Plan, ReplacementDelete, ReplacementGroup};
     use crate::resource::{
-        ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, ResourceIdentity, Value,
+        ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, ResourceIdentity, State,
+        Value,
     };
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::time::Duration;
@@ -678,6 +685,77 @@ mod tests {
     }
 
     #[test]
+    fn deposed_delete_does_not_steal_current_binding_parentage() {
+        let main = Resource::new("ec2.Vpc", "main")
+            .with_binding("main")
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+            );
+        let subnet = Resource::new("ec2.Subnet", "subnet")
+            .with_binding("subnet")
+            .with_attribute(
+                "vpc_id",
+                Value::resource_ref("main".to_string(), "vpc_id".to_string(), vec![]),
+            )
+            .with_attribute(
+                "cidr_block",
+                Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
+            );
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            from: Box::new(State::existing(main.id.clone(), HashMap::new())),
+            to: resolved(main),
+            changed_attributes: vec!["cidr_block".to_string()],
+        });
+        plan.add(Effect::Update {
+            from: Box::new(State::existing(subnet.id.clone(), HashMap::new())),
+            to: resolved(subnet),
+            changed_attributes: vec!["cidr_block".to_string()],
+        });
+        plan.add(Effect::Delete {
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "ec2.Vpc", "main",
+            )),
+            identifier: "vpc-old".to_string(),
+            generation: crate::effect::EffectGeneration::Deposed(
+                crate::resource::DeposedKey::new_unique(),
+            ),
+            directives: Directives::default(),
+            binding: Some("main".to_string()),
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        });
+
+        let graph = build_dependency_graph(&plan);
+        assert_eq!(
+            graph.binding_to_effect.get("main"),
+            Some(&0),
+            "current instance must keep the binding used by dependents"
+        );
+        assert_eq!(
+            graph.effect_bindings.get(&2).map(String::as_str),
+            Some("main"),
+            "the deposed delete still needs its own display label"
+        );
+
+        let (_roots, dependents) = build_single_parent_tree(&plan, &graph);
+        assert!(
+            dependents
+                .get(&0)
+                .is_some_and(|children| children.contains(&1)),
+            "dependent update should hang under the current main update, not the deposed delete; dependents: {dependents:?}"
+        );
+        assert!(
+            !dependents
+                .get(&2)
+                .is_some_and(|children| children.contains(&1)),
+            "deposed delete must not parent the dependent update"
+        );
+    }
+
+    #[test]
     fn child_render_items_renders_deferred_replace_normally() {
         let template_resource = Resource::new("route53.Record", "validation_records")
             .with_binding("validation_records");
@@ -722,6 +800,7 @@ mod tests {
                 "old-record-0",
             )),
             identifier: "record-0".to_string(),
+            generation: crate::effect::EffectGeneration::Current,
             directives: Directives::default(),
             binding: Some("validation_records[0]".to_string()),
             dependencies: HashSet::new(),
@@ -734,6 +813,7 @@ mod tests {
                 "old-record-abc",
             )),
             identifier: "record-abc".to_string(),
+            generation: crate::effect::EffectGeneration::Current,
             directives: Directives::default(),
             binding: Some("validation_records[abc]".to_string()),
             dependencies: HashSet::new(),

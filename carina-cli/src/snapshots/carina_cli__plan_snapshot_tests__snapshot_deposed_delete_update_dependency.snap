@@ -1,0 +1,23 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  ~ awscc.ec2.Vpc main
+      tags:
+        ~ Environment: "old" → "new"
+      # (1 unchanged attribute hidden)
+        │
+        └─ ~ awscc.ec2.Subnet subnet
+              tags:
+                ~ Environment: "old" → "new"
+              # (3 unchanged attributes hidden)
+  - awscc.ec2.Vpc main (deposed vpc-old)
+      cidr_block: "10.220.0.0/16"
+      tags:
+        Environment: "old"
+        Name: "main-old"
+      vpc_id: "vpc-old"
+
+Plan: 0 to add, 2 to change, 1 to destroy.

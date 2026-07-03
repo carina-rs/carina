@@ -4,6 +4,7 @@ use carina_core::deps::get_resource_dependencies;
 use carina_core::explicit::{self, ExplicitFields};
 pub use carina_core::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use carina_core::override_aware::NameOverrideSource;
+pub use carina_core::resource::DeposedKey;
 use carina_core::resource::{
     ConcreteValue, Directives, PartialReadMarker, Resource, ResourceId, State, Value,
 };
@@ -181,6 +182,65 @@ impl StateFile {
             remove_current_identifier_from_deposed(&mut resource);
             self.resources.push(resource);
         }
+    }
+
+    /// Add or refresh one deposed generation through the row-write seam.
+    ///
+    /// Existing entries are keyed by `(identifier, provider_instance)`. The
+    /// final write uses [`Self::upsert_resource`] so the invariant that a
+    /// current identifier cannot also be deposed is applied uniformly.
+    pub fn upsert_deposed_generation(
+        &mut self,
+        provider: &str,
+        resource_type: &str,
+        identity: &str,
+        row_provider_instance: Option<String>,
+        instance: DeposedInstance,
+    ) {
+        let mut row = self
+            .find_resource(provider, resource_type, identity)
+            .cloned()
+            .unwrap_or_else(|| {
+                let mut row = ResourceState::new(resource_type.to_string(), identity, provider);
+                row.directives.provider_instance = row_provider_instance;
+                row
+            });
+
+        if let Some(existing) = row.deposed.iter_mut().find(|entry| {
+            entry.identifier == instance.identifier
+                && entry.provider_instance == instance.provider_instance
+        }) {
+            *existing = instance;
+        } else {
+            row.deposed.push(instance);
+        }
+        self.upsert_resource(row);
+    }
+
+    /// Remove one deposed generation after that exact generation's Delete
+    /// succeeded. If this leaves a shell row with no current identifier, the
+    /// row is dropped.
+    pub fn remove_deposed_generation(
+        &mut self,
+        provider: &str,
+        resource_type: &str,
+        identity: &str,
+        key: &DeposedKey,
+    ) -> Option<DeposedInstance> {
+        let row_pos = self.resources.iter().position(|r| {
+            r.provider == provider && r.resource_type == resource_type && r.identity == identity
+        })?;
+        let deposed_pos = self.resources[row_pos]
+            .deposed
+            .iter()
+            .position(|entry| &entry.key == key)?;
+        let removed = self.resources[row_pos].deposed.remove(deposed_pos);
+        if self.resources[row_pos].identifier.is_none()
+            && self.resources[row_pos].deposed.is_empty()
+        {
+            self.resources.remove(row_pos);
+        }
+        Some(removed)
     }
 
     /// Get the identifier for a resource from state.
@@ -472,9 +532,10 @@ fn merge_deposed_generations(resource: &mut ResourceState, existing_deposed: Vec
 
 fn remove_current_identifier_from_deposed(resource: &mut ResourceState) {
     if let Some(identifier) = resource.identifier.as_deref() {
-        resource
-            .deposed
-            .retain(|deposed| deposed.identifier != identifier);
+        let provider_instance = resource.directives.provider_instance.clone();
+        resource.deposed.retain(|deposed| {
+            deposed.identifier != identifier || deposed.provider_instance != provider_instance
+        });
     }
 }
 
@@ -739,28 +800,6 @@ pub fn check_and_migrate_bytes(bytes: &[u8]) -> Result<MigratedStateFile, Backen
     let content = std::str::from_utf8(bytes)
         .map_err(|e| BackendError::InvalidState(format!("State file is not valid UTF-8: {}", e)))?;
     check_and_migrate(content)
-}
-
-/// System-assigned key for one deposed generation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct DeposedKey(String);
-
-impl DeposedKey {
-    pub fn new_unique() -> Self {
-        let uuid = uuid::Uuid::new_v4().simple().to_string();
-        Self(uuid[..12].to_string())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for DeposedKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
 }
 
 /// Pre-replacement instance that still needs a successful Delete.

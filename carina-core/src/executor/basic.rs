@@ -9,7 +9,7 @@ use crate::binding_index::ResolvedBindings;
 use crate::differ::{
     AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
 };
-use crate::effect::{BasicEffect, Effect};
+use crate::effect::{BasicEffect, DeletedInstanceKey, Effect, EffectGeneration};
 use crate::executor::UnresolvedResource;
 use crate::executor::normalized::{NormalizedResource, apply_desired_normalization};
 use crate::parser::ProviderConfig;
@@ -53,7 +53,7 @@ pub(super) enum BasicEffectResult {
         refresh: Option<(ResourceId, String)>,
     },
     Deleted {
-        resource_id: ResourceId,
+        instance_key: DeletedInstanceKey,
     },
 }
 
@@ -69,7 +69,7 @@ pub(super) struct ExecutionState<'a> {
     pub(super) partial_diagnostics: &'a mut Vec<(ResourceId, PartialReadDiagnostic)>,
     pub(super) applied_states: &'a mut AppliedStates,
     pub(super) failed_indices: &'a mut std::collections::HashSet<usize>,
-    pub(super) successfully_deleted: &'a mut std::collections::HashSet<ResourceId>,
+    pub(super) successfully_deleted: &'a mut std::collections::HashSet<DeletedInstanceKey>,
     pub(super) pending_refreshes: &'a mut HashMap<ResourceId, String>,
     pub(super) bindings: &'a mut ResolvedBindings,
 }
@@ -511,9 +511,9 @@ pub(super) fn process_basic_result(result: BasicEffectResult, exec: &mut Executi
             exec.applied_states.insert(resource_id.clone(), *state);
             exec.partial_diagnostics.push((resource_id, diagnostic));
         }
-        BasicEffectResult::Deleted { resource_id, .. } => {
+        BasicEffectResult::Deleted { instance_key } => {
             *exec.success_count += 1;
-            exec.successfully_deleted.insert(resource_id);
+            exec.successfully_deleted.insert(instance_key);
         }
     }
 }
@@ -779,6 +779,7 @@ pub(super) async fn execute_basic_effect<'a>(
         BasicEffect::Delete {
             id,
             identifier,
+            generation,
             directives,
             ..
         } => match provider
@@ -799,7 +800,11 @@ pub(super) async fn execute_basic_effect<'a>(
                     progress,
                 });
                 BasicEffectResult::Deleted {
-                    resource_id: id.clone(),
+                    instance_key: DeletedInstanceKey::new(
+                        id.clone(),
+                        generation.clone(),
+                        identifier.to_string(),
+                    ),
                 }
             }
             Err(e) => {
@@ -811,7 +816,10 @@ pub(super) async fn execute_basic_effect<'a>(
                     progress,
                 });
                 BasicEffectResult::Failure {
-                    refresh: Some((id.clone(), identifier.to_string())),
+                    refresh: match generation {
+                        EffectGeneration::Current => Some((id.clone(), identifier.to_string())),
+                        EffectGeneration::Deposed(_) => None,
+                    },
                 }
             }
         },
