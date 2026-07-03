@@ -15,7 +15,10 @@ use carina_core::resource::{
     Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
-use carina_state::{BackendError, LoadedState, LockInfo, ResourceState, StateBackend, StateFile};
+use carina_state::{
+    BackendError, DeposedInstance, DeposedKey, LoadedState, LockInfo, ResourceState, StateBackend,
+    StateFile,
+};
 
 use crate::commands::apply::{
     ApplyResult, detect_drift, finalize_apply, refresh_pending_states, save_state_locked,
@@ -911,8 +914,13 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
     )
     .with_identifier("my-app-abcd1234");
 
-    let resource_state =
-        ResourceState::from_provider_state(&resources_run1[0], &applied_state, None).unwrap();
+    let resource_state = ResourceState::from_provider_state_for_resource_and_schema(
+        &resources_run1[0],
+        &applied_state,
+        None,
+        None,
+    )
+    .unwrap();
 
     let mut state_file = StateFile::new();
     state_file.upsert_resource(resource_state);
@@ -1029,8 +1037,13 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     )
     .with_identifier(run1_role_name.as_str());
 
-    let resource_state =
-        ResourceState::from_provider_state(&resources_run1[0], &applied_state, None).unwrap();
+    let resource_state = ResourceState::from_provider_state_for_resource_and_schema(
+        &resources_run1[0],
+        &applied_state,
+        None,
+        None,
+    )
+    .unwrap();
     let mut state_file = StateFile::new();
     state_file.upsert_resource(resource_state);
 
@@ -1144,8 +1157,13 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
     let applied_state = State::existing(resources_run1[0].id.clone(), HashMap::new())
         .with_identifier("fl-12345678");
 
-    let resource_state =
-        ResourceState::from_provider_state(&resources_run1[0], &applied_state, None).unwrap();
+    let resource_state = ResourceState::from_provider_state_for_resource_and_schema(
+        &resources_run1[0],
+        &applied_state,
+        None,
+        None,
+    )
+    .unwrap();
     let mut state_file = StateFile::new();
     state_file.upsert_resource(resource_state);
 
@@ -1779,6 +1797,113 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
             .find_resource("", "s3.Bucket", "orphan-bucket")
             .is_none(),
         "Orphaned resource should be removed from state after refresh (issue #879)"
+    );
+}
+
+#[tokio::test]
+async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally() {
+    let mut state = StateFile::new();
+    let mut row = ResourceState::new("s3.Bucket", "deposed-bucket", "");
+    row.deposed.push(DeposedInstance {
+        key: DeposedKey::new_unique(),
+        identifier: "old-bucket".to_string(),
+        provider_instance: None,
+        attributes: HashMap::from([("bucket".to_string(), json!("old-bucket"))]),
+        dependency_bindings: BTreeSet::new(),
+    });
+    state.upsert_resource(row);
+
+    let backend = RefreshTestBackend::new(state);
+    let mut parsed = carina_core::parser::InferredFile::default();
+    let lock = LockInfo::new("state-refresh");
+
+    let result = run_state_refresh_locked(
+        &mut parsed,
+        &backend,
+        Some(&lock),
+        std::path::Path::new("."),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    assert!(result.is_ok(), "refresh should succeed: {:?}", result);
+
+    let written = backend
+        .get_written_state()
+        .expect("state should be written");
+    assert!(
+        written
+            .find_resource("", "s3.Bucket", "deposed-bucket")
+            .is_none(),
+        "shell row should be removed after deposed generation is reconciled as gone"
+    );
+}
+
+#[tokio::test]
+async fn state_refresh_locked_updates_alive_deposed_generation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mock_state_path = tmp.path().join("mock-provider-state.json");
+    std::fs::write(
+        &mock_state_path,
+        serde_json::json!({
+            "s3.Bucket.alive-deposed-bucket": {
+                "bucket": "old-bucket",
+                "status": "alive"
+            }
+        })
+        .to_string(),
+    )
+    .expect("mock provider state");
+
+    let previous_mock_state = std::env::var_os("CARINA_MOCK_STATE_FILE");
+    unsafe {
+        std::env::set_var("CARINA_MOCK_STATE_FILE", &mock_state_path);
+    }
+
+    let mut state = StateFile::new();
+    let mut row = ResourceState::new("s3.Bucket", "alive-deposed-bucket", "");
+    row.deposed.push(DeposedInstance {
+        key: DeposedKey::new_unique(),
+        identifier: "old-bucket".to_string(),
+        provider_instance: None,
+        attributes: HashMap::from([
+            ("bucket".to_string(), json!("old-bucket")),
+            ("status".to_string(), json!("stale")),
+        ]),
+        dependency_bindings: BTreeSet::new(),
+    });
+    state.upsert_resource(row);
+
+    let backend = RefreshTestBackend::new(state);
+    let mut parsed = carina_core::parser::InferredFile::default();
+    let lock = LockInfo::new("state-refresh");
+
+    let result = run_state_refresh_locked(
+        &mut parsed,
+        &backend,
+        Some(&lock),
+        std::path::Path::new("."),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+
+    unsafe {
+        match previous_mock_state {
+            Some(value) => std::env::set_var("CARINA_MOCK_STATE_FILE", value),
+            None => std::env::remove_var("CARINA_MOCK_STATE_FILE"),
+        }
+    }
+
+    assert!(result.is_ok(), "refresh should succeed: {:?}", result);
+    let written = backend
+        .get_written_state()
+        .expect("state should be written");
+    let row = written
+        .find_resource("", "s3.Bucket", "alive-deposed-bucket")
+        .expect("shell row should remain while the deposed generation is alive");
+    assert_eq!(row.deposed.len(), 1);
+    assert_eq!(
+        row.deposed[0].attributes.get("status"),
+        Some(&json!("alive"))
     );
 }
 

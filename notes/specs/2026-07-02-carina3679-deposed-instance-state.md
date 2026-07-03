@@ -338,18 +338,57 @@ deposed-only work still runs and is counted. Backend-protected rows
 about the current instance, and the replacement that deposed the old
 one already carried approval to delete it.
 
-**state refresh** (Phase 3 — not yet implemented). Refresh reads each
-deposed instance via the provider (synthetic resource from the stored
-identifier/attributes, like the orphan path). Gone remotely (e.g. the
-user deleted it manually) → drop the entry; still present → update its
-stored attributes. This makes manual cleanup converge without any new
-subcommand.
+**state refresh.** Refresh reads each deposed generation via the
+provider, routed by the generation's own provider-instance. Gone
+remotely (an affirmative `exists == false`, e.g. the user deleted the
+orphan manually) → drop exactly that generation through the row-write
+seam (the shell row disappears when its last generation goes); still
+present → update the entry's stored attributes; a read error leaves the
+entry untouched with a warning. This makes manual cleanup converge
+without any new subcommand. Refreshed attributes go through the same
+read-normalization pipeline as current-row refresh (hydration of
+provider-unreturned attributes, enum-shape lifting), so consecutive
+refreshes of an unchanged remote converge.
 
-**state list / show / lookup** (Phase 3 — not yet implemented). Display
-deposed entries under their row with the deposed marker and key. No new
-manipulation subcommands (no `state rm` equivalent) — recovery paths
-are apply/destroy (delete it) and refresh (observe it already gone),
-which cover both directions.
+Secret handling on refresh writes is governed by a typed authority the
+serialization seam requires from every caller. For a deposed generation
+the previously stored secret hashes are unconditionally authoritative:
+any leaf (top-level or nested) whose stored value is a secret hash is
+re-hashed from the provider's fresh value, never replaced by plaintext
+— the generation is a snapshot of the old instance, so the current
+config's secret declarations say nothing about it. For a current row,
+stored-hash authority applies only to keys absent from the desired
+resource, so an explicit secret-to-plain demotion in config converges
+instead of re-hashing forever. Nested containers merge per leaf:
+provider values are adopted for non-secret leaves (omissions are
+observed as removals); a hash leaf whose provider counterpart is
+missing is retained (write-only hydration ambiguity); a list whose
+positional alignment cannot be corroborated by unchanged non-secret
+sibling fields (reordered, resized, or anchor-less elements) is hashed
+as one secret rather than trusting index alignment. Schema
+`write_only` plaintext is dropped uniformly on both the current-row and
+deposed refresh paths. The refresh summary counts resources and deposed
+generations separately and surfaces read failures when non-zero; the
+no-deposed summary line is unchanged from before this series.
+
+**state list / show / lookup.** State surfaces display deposed entries
+under their row with a canonical marker `(deposed <key> <identifier>)`
+produced by one shared helper (plan display keeps its
+`(deposed <identifier>)` form — the key matters where state entries are
+inspected, the identifier where a delete is approved). `state list`
+marks a shell row with `(no current instance)`. `state show` renders
+each generation's identifier and attributes below the current instance.
+`state lookup` keeps its scalar contract byte-identical to before this
+series: an attribute lookup resolves against the current instance only
+and errors when the current instance lacks the attribute, even if a
+deposed generation carries it — a script must never receive a stale
+deposed value where it expects the live one — and completion offers no
+deposed-only attributes. Deposed data appears only in the
+whole-resource lookup, which switches to a `{current, deposed}` JSON
+shape when (and only when) generations exist. No new manipulation
+subcommands (no `state rm` equivalent) — recovery paths are
+apply/destroy (delete it) and refresh (observe it already gone), which
+cover both directions.
 
 ## Invariants after this change
 
