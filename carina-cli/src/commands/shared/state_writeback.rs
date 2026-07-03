@@ -11,7 +11,10 @@ use carina_core::executor::ExecutionResult;
 use carina_core::plan::{Plan, ReplaceDisplayInfo};
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
-use carina_state::{DeposedInstance, DeposedKey, LockInfo, ResourceState, StateBackend, StateFile};
+use carina_state::{
+    DeposedInstance, DeposedKey, LockInfo, PreviousSecretHashAuthority, ResourceState,
+    StateBackend, StateFile,
+};
 use colored::Colorize;
 
 use crate::error::AppError;
@@ -805,19 +808,25 @@ fn planned_depose(
             desired_resource,
             schema,
             existing.attributes.clone(),
+            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing.attributes),
         )
     } else {
+        let previous_hash_authority = existing
+            .map(|row| PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&row.attributes))
+            .unwrap_or(PreviousSecretHashAuthority::None);
         if let Some(previous) = delete.previous_attributes {
             ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
                 desired_resource,
                 schema,
                 previous,
+                previous_hash_authority,
             )
         } else if let Some(current) = current {
             ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
                 desired_resource,
                 schema,
                 &current.attributes,
+                previous_hash_authority,
             )
         } else {
             HashMap::new()
@@ -1138,8 +1147,12 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
             UpsertSource::Applied(s) => (s, true),
             UpsertSource::CurrentState(s) => (s, false),
         };
-        let mut resource_state =
-            ResourceState::from_provider_state(resource, applied_state, existing)?;
+        let mut resource_state = ResourceState::from_provider_state_for_resource_and_schema(
+            resource,
+            applied_state,
+            existing,
+            schemas.get_for(resource),
+        )?;
         if is_applied && let Some(overrides) = permanent_name_overrides.get(id) {
             resource_state.name_overrides = overrides.clone();
         }
@@ -2478,6 +2491,163 @@ mod apply_state_save_tests {
     }
 
     #[test]
+    fn apply_writeback_secret_to_plain_demotion_converges() {
+        let desired = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
+            "password",
+            Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+        );
+        let id = desired.id.clone();
+        let existing = ResourceState::new("db.Instance", "main", "awscc")
+            .with_identifier("db-1")
+            .with_attribute(
+                "password",
+                serde_json::json!(format!("{SECRET_PREFIX}previous")),
+            );
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+        let from_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "password".to_string(),
+                Value::Concrete(ConcreteValue::String("old-secret".to_string())),
+            )]),
+        )
+        .with_identifier("db-1");
+        let applied_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "password".to_string(),
+                Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+            )]),
+        )
+        .with_identifier("db-1");
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            from: Box::new(from_state),
+            to: carina_core::resource::ResolvedResource::new(desired.clone()),
+            changed_attributes: vec!["password".to_string()],
+        });
+
+        let saved = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: std::slice::from_ref(&desired),
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &HashMap::from([(id.clone(), applied_state)]),
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &SchemaRegistry::new(),
+        })
+        .expect("secret-to-plain demotion should write state");
+
+        let row = saved
+            .find_resource("awscc", "db.Instance", "main")
+            .expect("row should be saved");
+        assert_eq!(
+            row.attributes.get("password"),
+            Some(&serde_json::json!("plain-secret"))
+        );
+
+        let current_states = HashMap::from([(id.clone(), saved.build_state_for_resource(&id))]);
+        let plan_input_states =
+            carina_core::resource::into_plan_input_map(current_states, &SchemaRegistry::new(), &[]);
+        let second_plan = create_plan(
+            std::slice::from_ref(&desired),
+            &[],
+            &ProviderRouter::new(),
+            &plan_input_states,
+            &HashMap::new(),
+            &SchemaRegistry::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        );
+
+        assert_eq!(
+            second_plan.mutation_count(),
+            0,
+            "second plan after secret-to-plain demotion must be empty"
+        );
+    }
+
+    #[test]
+    fn apply_writeback_write_only_secret_to_plain_demotion_converges() {
+        let desired = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
+            "password",
+            Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+        );
+        let id = desired.id.clone();
+        let existing = ResourceState::new("db.Instance", "main", "awscc")
+            .with_identifier("db-1")
+            .with_attribute(
+                "password",
+                serde_json::json!(format!("{SECRET_PREFIX}previous")),
+            );
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+        let from_state = State::existing(id.clone(), HashMap::new()).with_identifier("db-1");
+        let applied_state = State::existing(id.clone(), HashMap::new()).with_identifier("db-1");
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            from: Box::new(from_state),
+            to: carina_core::resource::ResolvedResource::new(desired.clone()),
+            changed_attributes: vec!["password".to_string()],
+        });
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "awscc",
+            ResourceSchema::new("db.Instance")
+                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+        );
+
+        let saved = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: std::slice::from_ref(&desired),
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &HashMap::from([(id.clone(), applied_state)]),
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &schemas,
+        })
+        .expect("write-only secret-to-plain demotion should write state");
+
+        let row = saved
+            .find_resource("awscc", "db.Instance", "main")
+            .expect("row should be saved");
+        assert_eq!(
+            row.attributes.get("password"),
+            Some(&serde_json::json!("plain-secret"))
+        );
+        assert_eq!(row.write_only_attributes, vec!["password"]);
+
+        let current_states = HashMap::from([(id.clone(), saved.build_state_for_resource(&id))]);
+        let plan_input_states =
+            carina_core::resource::into_plan_input_map(current_states, &schemas, &[]);
+        let second_plan = create_plan(
+            std::slice::from_ref(&desired),
+            &[],
+            &ProviderRouter::new(),
+            &plan_input_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        );
+
+        assert_eq!(
+            second_plan.mutation_count(),
+            0,
+            "second plan after write-only secret-to-plain demotion must be empty"
+        );
+    }
+
+    #[test]
     fn deposed_fallback_attributes_hash_secrets_and_skip_unknowns() {
         let id = ResourceId::with_provider_identity(
             "aws",
@@ -2549,6 +2719,80 @@ mod apply_state_save_tests {
             !deposed.attributes.contains_key("unknown"),
             "unserializable fallback attributes should be skipped"
         );
+    }
+
+    #[test]
+    fn deferred_replace_depose_hashes_old_secret_demoted_in_new_desired() {
+        let id = ResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            None,
+        );
+        let runtime_child =
+            Resource::with_provider("aws", "route53.Record", "validation_records[0]", None)
+                .with_binding("validation_records[0]")
+                .with_attribute(
+                    "password",
+                    Value::Concrete(ConcreteValue::String("plain-new".to_string())),
+                );
+        let applied_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "password".to_string(),
+                Value::Concrete(ConcreteValue::String("plain-new".to_string())),
+            )]),
+        )
+        .with_identifier("new-record-id");
+        let current_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "password".to_string(),
+                Value::Concrete(ConcreteValue::String("plain-old".to_string())),
+            )]),
+        )
+        .with_identifier("old-record-id");
+        let existing = ResourceState::new("route53.Record", "validation_records[0]", "aws")
+            .with_identifier("stale-record-id")
+            .with_attribute(
+                "password",
+                serde_json::json!(format!("{SECRET_PREFIX}previous")),
+            );
+        let mut state_file = StateFile::new();
+        state_file.resources.push(existing);
+        let mut plan = Plan::new();
+        plan.add(deferred_replace_effect(&id));
+        let current_states = HashMap::from([(id.clone(), current_state)]);
+        let applied_states = HashMap::from([(id.clone(), applied_state)]);
+
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: Some(state_file),
+            sorted_resources: &[],
+            runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
+            current_states: &current_states,
+            applied_states: &applied_states,
+            plan: &plan,
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &SchemaRegistry::new(),
+        })
+        .expect("deferred replacement should write state");
+
+        let saved = state
+            .find_resource("aws", "route53.Record", "validation_records[0]")
+            .expect("new child row should be persisted");
+        let deposed = saved
+            .deposed
+            .iter()
+            .find(|entry| entry.identifier == "old-record-id")
+            .expect("old instance should be deposed");
+        let stored_secret = deposed
+            .attributes
+            .get("password")
+            .and_then(serde_json::Value::as_str)
+            .expect("old plaintext password should be re-hashed");
+        assert!(stored_secret.starts_with(SECRET_PREFIX));
+        assert!(!stored_secret.contains("plain-old"));
     }
 
     #[test]

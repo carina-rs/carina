@@ -19,9 +19,9 @@ use carina_core::resource::{
 };
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
-    BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
-    StateFile, StateUrl, create_backend, create_remote_backend, load_state_from_url,
-    resolve_backend_for_read,
+    BackendConfig as StateBackendConfig, BackendError, DeposedInstance, DeposedKey, LockInfo,
+    ResourceState, StateBackend, StateFile, StateUrl, create_backend, create_remote_backend,
+    load_state_from_url, resolve_backend_for_read,
 };
 
 use super::{
@@ -406,14 +406,28 @@ fn find_resource_by_query<'a>(state: &'a StateFile, name: &str) -> Option<&'a Re
 
 /// Format state list output. Returns each line as a string.
 fn format_state_list(state: &StateFile) -> Vec<String> {
-    state
-        .resources
-        .iter()
-        .map(|rs| {
-            let display_name = rs.binding.as_deref().unwrap_or(&rs.identity);
-            format!("{}.{} {}", rs.provider, rs.resource_type, display_name)
-        })
-        .collect()
+    let mut lines = Vec::new();
+    for rs in &state.resources {
+        let display_name = rs.binding.as_deref().unwrap_or(&rs.identity);
+        let row_prefix = format!("{}.{} {}", rs.provider, rs.resource_type, display_name);
+        if rs.identifier.is_none() {
+            lines.push(format!("{row_prefix}  (no current instance)"));
+        } else {
+            lines.push(row_prefix.clone());
+        }
+        for deposed in &rs.deposed {
+            lines.push(format!(
+                "{}  {}",
+                row_prefix,
+                deposed_state_marker(&deposed.key, &deposed.identifier)
+            ));
+        }
+    }
+    lines
+}
+
+fn deposed_state_marker(key: &DeposedKey, identifier: &str) -> String {
+    format!("(deposed {key} {identifier})")
 }
 
 /// Run state list command
@@ -576,25 +590,72 @@ fn format_resource_value(
     json_output: bool,
 ) -> Result<String, AppError> {
     match attribute {
-        Some(attr) => {
-            let display_name = rs.binding.as_deref().unwrap_or(&rs.identity);
-            let value = rs.attributes.get(attr).ok_or_else(|| {
-                AppError::Config(format!(
-                    "Attribute '{}' not found on resource '{}'.",
-                    attr, display_name
-                ))
-            })?;
-            if json_output {
-                Ok(serde_json::to_string_pretty(value).unwrap())
-            } else {
-                Ok(format_raw_value(value))
-            }
-        }
+        Some(attr) => format_resource_attribute_value(rs, attr, json_output),
+        None if !rs.deposed.is_empty() => format_resource_full_value_with_deposed(rs),
         None => {
             let sorted: std::collections::BTreeMap<_, _> = rs.attributes.iter().collect();
             Ok(serde_json::to_string_pretty(&sorted).unwrap())
         }
     }
+}
+
+fn format_resource_attribute_value(
+    rs: &ResourceState,
+    attr: &str,
+    json_output: bool,
+) -> Result<String, AppError> {
+    let Some(value) = rs.attributes.get(attr) else {
+        return missing_attribute_error(rs, attr);
+    };
+    if json_output {
+        Ok(serde_json::to_string_pretty(value).unwrap())
+    } else {
+        Ok(format_raw_value(value))
+    }
+}
+
+fn format_resource_full_value_with_deposed(rs: &ResourceState) -> Result<String, AppError> {
+    let current = current_full_value(rs);
+    let deposed: Vec<serde_json::Value> = rs.deposed.iter().map(deposed_full_value).collect();
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "current": current,
+        "deposed": deposed,
+    }))
+    .unwrap())
+}
+
+fn missing_attribute_error<T>(rs: &ResourceState, attr: &str) -> Result<T, AppError> {
+    let display_name = rs.binding.as_deref().unwrap_or(&rs.identity);
+    Err(AppError::Config(format!(
+        "Attribute '{}' not found on resource '{}'.",
+        attr, display_name
+    )))
+}
+
+fn sorted_attributes_value(attributes: &HashMap<String, serde_json::Value>) -> serde_json::Value {
+    let sorted: std::collections::BTreeMap<_, _> = attributes.iter().collect();
+    serde_json::to_value(sorted).unwrap()
+}
+
+fn current_full_value(rs: &ResourceState) -> serde_json::Value {
+    if rs.identifier.is_none() && rs.attributes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!({
+            "identifier": rs.identifier.as_ref(),
+            "attributes": sorted_attributes_value(&rs.attributes),
+        })
+    }
+}
+
+fn deposed_full_value(entry: &DeposedInstance) -> serde_json::Value {
+    serde_json::json!({
+        "key": entry.key.as_str(),
+        "identifier": entry.identifier,
+        "marker": deposed_state_marker(&entry.key, &entry.identifier),
+        "provider_instance": entry.provider_instance,
+        "attributes": sorted_attributes_value(&entry.attributes),
+    })
 }
 
 /// Run state lookup command
@@ -660,17 +721,31 @@ fn format_state_show(state: &StateFile) -> String {
             rs.provider, rs.resource_type, display_name
         ));
 
-        // Sort attributes for deterministic output
-        let mut keys: Vec<&String> = rs.attributes.keys().collect();
-        keys.sort();
-        for key in keys {
-            let value = &rs.attributes[key];
-            if let Some(dsl_val) = json_to_dsl_value(value) {
-                output.push_str(&format!("  {} = {}\n", key, format_value(&dsl_val)));
-            }
+        format_attributes_for_show(&mut output, &rs.attributes, "  ");
+        for deposed in &rs.deposed {
+            output.push_str(&format!(
+                "  {}\n",
+                deposed_state_marker(&deposed.key, &deposed.identifier)
+            ));
+            format_attributes_for_show(&mut output, &deposed.attributes, "    ");
         }
     }
     output
+}
+
+fn format_attributes_for_show(
+    output: &mut String,
+    attributes: &HashMap<String, serde_json::Value>,
+    indent: &str,
+) {
+    let mut keys: Vec<&String> = attributes.keys().collect();
+    keys.sort();
+    for key in keys {
+        let value = &attributes[key];
+        if let Some(dsl_val) = json_to_dsl_value(value) {
+            output.push_str(&format!("{}{} = {}\n", indent, key, format_value(&dsl_val)));
+        }
+    }
 }
 
 /// Run state show command
@@ -1188,8 +1263,7 @@ pub(crate) async fn run_state_refresh_locked(
 
     println!();
 
-    let mut updated_count = 0u32;
-    let mut unchanged_count = 0u32;
+    let mut refresh_counts = StateRefreshCounts::default();
 
     for resource in &sorted_resources {
         let fresh_state = match current_states.get(&resource.id) {
@@ -1201,9 +1275,9 @@ pub(crate) async fn run_state_refresh_locked(
             fresh_state,
             &mut state,
             Some(resource),
+            ctx.schemas(),
             "",
-            &mut updated_count,
-            &mut unchanged_count,
+            &mut refresh_counts,
         )?;
     }
 
@@ -1218,10 +1292,22 @@ pub(crate) async fn run_state_refresh_locked(
             fresh_state,
             &mut state,
             None,
+            ctx.schemas(),
             " (orphan)",
-            &mut updated_count,
-            &mut unchanged_count,
+            &mut refresh_counts,
         )?;
+    }
+
+    let deposed_summary = refresh_deposed_generations_until_cancelled(
+        &provider,
+        &mut state,
+        &sorted_resources,
+        ctx.schemas(),
+        &cancel,
+    )
+    .await?;
+    if cancel.is_cancelled() {
+        return Err(AppError::Interrupted);
     }
 
     // Re-resolve exports using refreshed state
@@ -1261,15 +1347,49 @@ pub(crate) async fn run_state_refresh_locked(
 
     // Summary
     println!(
-        "State refreshed: {} resource{} updated, {} resource{} unchanged.",
+        "{}",
+        format_state_refresh_summary(
+            refresh_counts.updated,
+            refresh_counts.unchanged,
+            &deposed_summary,
+        )
+    );
+    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+
+    Ok(())
+}
+
+fn format_state_refresh_summary(
+    updated_count: u32,
+    unchanged_count: u32,
+    deposed_summary: &DeposedRefreshSummary,
+) -> String {
+    let base = format!(
+        "State refreshed: {} resource{} updated, {} resource{} unchanged",
         updated_count,
         if updated_count == 1 { "" } else { "s" },
         unchanged_count,
         if unchanged_count == 1 { "" } else { "s" },
     );
-    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
-
-    Ok(())
+    if deposed_summary.total_generations == 0 {
+        return format!("{base}.");
+    }
+    let reconciled = deposed_summary.removed_generations + deposed_summary.updated_generations;
+    let unchanged_generations = deposed_summary
+        .total_generations
+        .saturating_sub(reconciled + deposed_summary.failed_generations);
+    let failure_suffix = if deposed_summary.failed_generations == 0 {
+        String::new()
+    } else {
+        format!(", {} failed", deposed_summary.failed_generations,)
+    };
+    format!(
+        "{base}, {reconciled} deposed generation{} reconciled ({} removed, {} updated, {} unchanged){failure_suffix}.",
+        if reconciled == 1 { "" } else { "s" },
+        deposed_summary.removed_generations,
+        deposed_summary.updated_generations,
+        unchanged_generations,
+    )
 }
 
 async fn refresh_existing_resources_until_cancelled(
@@ -1339,6 +1459,242 @@ async fn refresh_existing_resources_until_cancelled(
     Ok((current_states, refreshed))
 }
 
+#[derive(Clone)]
+struct DeposedRefreshTarget {
+    row_provider: String,
+    row_resource_type: String,
+    row_identity: String,
+    row_provider_instance: Option<String>,
+    id: ResourceId,
+    key: DeposedKey,
+    identifier: String,
+    provider_instance: Option<String>,
+    attributes: HashMap<String, serde_json::Value>,
+    dependency_bindings: BTreeSet<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DeposedRefreshSummary {
+    total_generations: u32,
+    removed_generations: u32,
+    updated_generations: u32,
+    failed_generations: u32,
+}
+
+async fn refresh_deposed_generations_until_cancelled<P>(
+    provider: &P,
+    state: &mut carina_state::StateFile,
+    desired_resources: &[Resource],
+    schemas: &carina_core::schema::SchemaRegistry,
+    cancel: &CancellationToken,
+) -> Result<DeposedRefreshSummary, AppError>
+where
+    P: Provider + ProviderNormalizer + ?Sized,
+{
+    let targets = collect_deposed_refresh_targets(state);
+    let mut summary = DeposedRefreshSummary {
+        total_generations: targets.len() as u32,
+        removed_generations: 0,
+        updated_generations: 0,
+        failed_generations: 0,
+    };
+
+    for target in targets {
+        if cancel.is_cancelled() {
+            return Err(AppError::Interrupted);
+        }
+
+        let read_result = provider
+            .read(
+                &target.id,
+                Some(target.identifier.as_str()),
+                carina_core::provider::ReadRequest,
+            )
+            .await;
+        if cancel.is_cancelled() {
+            return Err(AppError::Interrupted);
+        }
+
+        let fresh_state = match read_result {
+            Ok(fresh_state) => fresh_state,
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "Warning: failed refreshing {}.{} {} {}: {}",
+                        target.row_provider,
+                        target.row_resource_type,
+                        target.row_identity,
+                        deposed_state_marker(&target.key, &target.identifier),
+                        err
+                    )
+                    .yellow()
+                );
+                summary.failed_generations += 1;
+                continue;
+            }
+        };
+
+        if !fresh_state.exists {
+            state.remove_deposed_generation(
+                &target.row_provider,
+                &target.row_resource_type,
+                &target.row_identity,
+                &target.key,
+            );
+            summary.removed_generations += 1;
+            println!(
+                "  {} \"{}\" {}:",
+                target.id.display_type().cyan(),
+                target.id.identity_or_empty(),
+                deposed_state_marker(&target.key, &target.identifier)
+            );
+            println!("    {} resource no longer exists", "-".red());
+            println!();
+            continue;
+        }
+
+        let masking_resource = desired_resource_for_deposed(desired_resources, &target)
+            .cloned()
+            .unwrap_or_else(|| synthetic_deposed_resource(&target));
+        let mut fresh_state = fresh_state;
+        normalize_deposed_read_state(
+            provider,
+            &target,
+            &masking_resource,
+            &mut fresh_state,
+            schemas,
+        )
+        .await;
+        if cancel.is_cancelled() {
+            return Err(AppError::Interrupted);
+        }
+        let schema = schemas.get_for(&masking_resource);
+        let attributes = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
+            &masking_resource,
+            schema,
+            &fresh_state.attributes,
+            carina_state::PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&target.attributes),
+        );
+
+        if attributes == target.attributes {
+            continue;
+        }
+        summary.updated_generations += 1;
+
+        let updated = DeposedInstance {
+            key: target.key.clone(),
+            identifier: target.identifier.clone(),
+            provider_instance: target.provider_instance.clone(),
+            attributes,
+            dependency_bindings: target.dependency_bindings.clone(),
+        };
+        state.upsert_deposed_generation(
+            &target.row_provider,
+            &target.row_resource_type,
+            &target.row_identity,
+            target.row_provider_instance.clone(),
+            updated,
+        );
+        println!(
+            "  {} \"{}\" {}:",
+            target.id.display_type().cyan(),
+            target.id.identity_or_empty(),
+            deposed_state_marker(&target.key, &target.identifier)
+        );
+        println!("    {} attributes refreshed", "~".yellow());
+        println!();
+    }
+
+    Ok(summary)
+}
+
+fn collect_deposed_refresh_targets(state: &carina_state::StateFile) -> Vec<DeposedRefreshTarget> {
+    state
+        .resources
+        .iter()
+        .flat_map(|row| {
+            row.deposed.iter().map(|deposed| {
+                let id = ResourceId::with_provider_name_compat(
+                    &row.provider,
+                    &row.resource_type,
+                    &row.identity,
+                    deposed.provider_instance.clone(),
+                );
+                DeposedRefreshTarget {
+                    row_provider: row.provider.clone(),
+                    row_resource_type: row.resource_type.clone(),
+                    row_identity: row.identity.clone(),
+                    row_provider_instance: row.directives.provider_instance.clone(),
+                    id,
+                    key: deposed.key.clone(),
+                    identifier: deposed.identifier.clone(),
+                    provider_instance: deposed.provider_instance.clone(),
+                    attributes: deposed.attributes.clone(),
+                    dependency_bindings: deposed.dependency_bindings.clone(),
+                }
+            })
+        })
+        .collect()
+}
+
+fn desired_resource_for_deposed<'a>(
+    desired_resources: &'a [Resource],
+    target: &DeposedRefreshTarget,
+) -> Option<&'a Resource> {
+    desired_resources.iter().find(|resource| {
+        resource.id.provider == target.row_provider
+            && resource.id.resource_type == target.row_resource_type
+            && resource.id.identity_or_empty() == target.row_identity
+            && resource.id.provider_instance == target.provider_instance
+    })
+}
+
+fn synthetic_deposed_resource(target: &DeposedRefreshTarget) -> Resource {
+    let mut resource = Resource::with_provider(
+        &target.row_provider,
+        &target.row_resource_type,
+        &target.row_identity,
+        target.provider_instance.clone(),
+    );
+    for (key, value) in &target.attributes {
+        if let Some(dsl_value) = json_to_dsl_value(value) {
+            resource.set_attr(key.clone(), dsl_value);
+        }
+    }
+    resource
+}
+
+async fn normalize_deposed_read_state<P>(
+    provider: &P,
+    target: &DeposedRefreshTarget,
+    resource: &Resource,
+    fresh_state: &mut State,
+    schemas: &carina_core::schema::SchemaRegistry,
+) where
+    P: ProviderNormalizer + ?Sized,
+{
+    let mut states = HashMap::from([(target.id.clone(), fresh_state.clone())]);
+    let mut saved_attrs = HashMap::from([(target.id.clone(), deposed_saved_attrs(target))]);
+    let resources = std::slice::from_ref(resource);
+
+    carina_core::utils::lift_saved_state_enum_leaves(&mut saved_attrs, resources, schemas);
+    provider.hydrate_read_state(&mut states, &saved_attrs).await;
+    carina_core::utils::lift_current_state_enum_leaves(&mut states, resources, schemas);
+
+    if let Some(normalized) = states.remove(&target.id) {
+        *fresh_state = normalized;
+    }
+}
+
+fn deposed_saved_attrs(target: &DeposedRefreshTarget) -> HashMap<String, Value> {
+    target
+        .attributes
+        .iter()
+        .filter_map(|(key, value)| json_to_dsl_value(value).map(|dsl| (key.clone(), dsl)))
+        .collect()
+}
+
 /// Compare old state with fresh provider state for a single resource,
 /// display any changes, and update the state file accordingly.
 ///
@@ -1347,19 +1703,66 @@ async fn refresh_existing_resources_until_cancelled(
 /// `Resource` is constructed from the id.
 ///
 /// `label_suffix` is appended to the resource header (e.g., `" (orphan)"`).
+#[derive(Default)]
+struct StateRefreshCounts {
+    updated: u32,
+    unchanged: u32,
+}
+
 fn diff_display_update_resource(
     id: &ResourceId,
     fresh_state: &State,
     state: &mut carina_state::StateFile,
     resource: Option<&Resource>,
+    schemas: &carina_core::schema::SchemaRegistry,
     label_suffix: &str,
-    updated_count: &mut u32,
-    unchanged_count: &mut u32,
+    counts: &mut StateRefreshCounts,
 ) -> Result<(), AppError> {
     let existing = state.find_resource(&id.provider, &id.resource_type, id.identity_or_empty());
     let existing_rs = match existing {
         Some(rs) => rs,
         None => return Ok(()),
+    };
+
+    let refreshed_resource_state = if fresh_state.exists {
+        let owned_resource;
+        let res = match resource {
+            Some(r) => r,
+            None => {
+                owned_resource = Resource::with_provider(
+                    &id.provider,
+                    &id.resource_type,
+                    id.identity_or_empty(),
+                    id.provider_instance.clone(),
+                );
+                &owned_resource
+            }
+        };
+        let schema = schemas.get_for(res);
+        let mut resource_state = ResourceState::from_provider_state_for_resource_and_schema(
+            res,
+            fresh_state,
+            Some(existing_rs),
+            schema,
+        )?;
+        if let Some(resource) = resource {
+            let write_only_keys: Vec<String> = schema
+                .map(|schema| {
+                    schema
+                        .attributes
+                        .iter()
+                        .filter(|(_, attr)| attr.write_only)
+                        .map(|(name, _)| name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !write_only_keys.is_empty() {
+                resource_state.merge_write_only_attributes(resource, &write_only_keys);
+            }
+        }
+        Some(resource_state)
+    } else {
+        None
     };
 
     // Build old attributes as DSL values for comparison
@@ -1368,6 +1771,15 @@ fn diff_display_update_resource(
         .iter()
         .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
         .collect();
+    let refreshed_attrs: HashMap<String, Value> = refreshed_resource_state
+        .as_ref()
+        .map(|rs| {
+            rs.attributes
+                .iter()
+                .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut has_changes = false;
     let mut changes: Vec<String> = Vec::new();
@@ -1379,14 +1791,14 @@ fn diff_display_update_resource(
     } else {
         // Check for modified, added, and removed attributes
         let mut all_keys: HashSet<&String> = old_attrs.keys().collect();
-        all_keys.extend(fresh_state.attributes.keys());
+        all_keys.extend(refreshed_attrs.keys());
 
         let mut sorted_keys: Vec<&&String> = all_keys.iter().collect();
         sorted_keys.sort();
 
         for key in sorted_keys {
             let old_val = old_attrs.get(*key);
-            let new_val = fresh_state.attributes.get(*key);
+            let new_val = refreshed_attrs.get(*key);
 
             match (old_val, new_val) {
                 (Some(old), Some(new)) if old != new => {
@@ -1424,7 +1836,7 @@ fn diff_display_update_resource(
     }
 
     if has_changes {
-        *updated_count += 1;
+        counts.updated += 1;
         println!(
             "  {} \"{}\"{}:",
             id.display_type().cyan(),
@@ -1436,27 +1848,11 @@ fn diff_display_update_resource(
         }
         println!();
     } else {
-        *unchanged_count += 1;
+        counts.unchanged += 1;
     }
 
     // Update state with refreshed data
-    if fresh_state.exists {
-        let owned_resource;
-        let res = match resource {
-            Some(r) => r,
-            None => {
-                owned_resource = Resource::with_provider(
-                    &id.provider,
-                    &id.resource_type,
-                    id.identity_or_empty(),
-                    id.provider_instance.clone(),
-                );
-                &owned_resource
-            }
-        };
-        let existing_rs =
-            state.find_resource(&id.provider, &id.resource_type, id.identity_or_empty());
-        let resource_state = ResourceState::from_provider_state(res, fresh_state, existing_rs)?;
+    if let Some(resource_state) = refreshed_resource_state {
         state.upsert_resource(resource_state);
     } else {
         state.remove_resource(&id.provider, &id.resource_type, id.identity_or_empty());
@@ -1468,8 +1864,213 @@ fn diff_display_update_resource(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::provider::{
+        BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
+        UpdateRequest,
+    };
+    use carina_core::resource::DeferredValue;
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+    use carina_core::value::SECRET_PREFIX;
+    use carina_state::{DeposedInstance, DeposedKey};
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[derive(Default)]
+    struct DeposedRefreshTestProvider {
+        read_results: HashMap<(String, String), Result<State, String>>,
+        hydrate_saved_attrs: bool,
+    }
+
+    impl DeposedRefreshTestProvider {
+        fn with_read_state(mut self, id: &ResourceId, identifier: &str, state: State) -> Self {
+            self.read_results
+                .insert((id.to_string(), identifier.to_string()), Ok(state));
+            self
+        }
+
+        fn with_read_error(
+            mut self,
+            id: &ResourceId,
+            identifier: &str,
+            error: impl Into<String>,
+        ) -> Self {
+            self.read_results
+                .insert((id.to_string(), identifier.to_string()), Err(error.into()));
+            self
+        }
+
+        fn with_saved_attr_hydration(mut self) -> Self {
+            self.hydrate_saved_attrs = true;
+            self
+        }
+    }
+
+    impl Provider for DeposedRefreshTestProvider {
+        fn name(&self) -> &str {
+            "deposed-refresh-test"
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            identifier: Option<&str>,
+            _request: ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let key = (id.to_string(), identifier.unwrap_or("").to_string());
+            let result = self
+                .read_results
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing deposed refresh result for {:?}", key));
+            Box::pin(async move { result.map_err(ProviderError::internal) })
+        }
+
+        fn read_data_source(
+            &self,
+            resource: &carina_core::resource::DataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            self.read(&resource.id, None, ReadRequest)
+        }
+
+        fn create(
+            &self,
+            _id: &ResourceId,
+            _request: CreateRequest,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
+            Box::pin(async { Err(ProviderError::internal("unexpected create")) })
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: UpdateRequest,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
+            Box::pin(async { Err(ProviderError::internal("unexpected update")) })
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: DeleteRequest,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
+        }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: carina_core::effect::PlanOp,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    impl ProviderNormalizer for DeposedRefreshTestProvider {
+        fn normalize_desired<'a>(&'a self, _resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+
+        fn normalize_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+
+        fn hydrate_read_state<'a>(
+            &'a self,
+            current_states: &'a mut HashMap<ResourceId, State>,
+            saved_attrs: &'a carina_core::provider::SavedAttrs,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                if !self.hydrate_saved_attrs {
+                    return;
+                }
+                for (id, state) in current_states.iter_mut() {
+                    let Some(saved) = saved_attrs.get(id) else {
+                        continue;
+                    };
+                    for (key, value) in saved {
+                        state
+                            .attributes
+                            .entry(key.clone())
+                            .or_insert_with(|| value.clone());
+                    }
+                }
+            })
+        }
+
+        fn merge_default_tags<'a>(
+            &'a self,
+            _resources: &'a mut [Resource],
+            _default_tags: &'a indexmap::IndexMap<String, Value>,
+            _registry: &'a SchemaRegistry,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    fn deposed_key(raw: &str) -> DeposedKey {
+        serde_json::from_value(json!(raw)).expect("test deposed key should deserialize")
+    }
+
+    fn deposed_instance(
+        key: DeposedKey,
+        identifier: &str,
+        provider_instance: Option<&str>,
+        attributes: HashMap<String, serde_json::Value>,
+    ) -> DeposedInstance {
+        DeposedInstance {
+            key,
+            identifier: identifier.to_string(),
+            provider_instance: provider_instance.map(str::to_string),
+            attributes,
+            dependency_bindings: BTreeSet::new(),
+        }
+    }
+
+    fn string_value(raw: &str) -> Value {
+        Value::Concrete(ConcreteValue::String(raw.to_string()))
+    }
+
+    fn deposed_format_state() -> StateFile {
+        let mut state = StateFile::new();
+        let mut row = ResourceState::new("ec2.Vpc", "main", "awscc")
+            .with_identifier("vpc-new")
+            .with_attribute("cidr_block", json!("10.0.0.0/16"))
+            .with_attribute("vpc_id", json!("vpc-new"));
+        row.binding = Some("main".to_string());
+        row.deposed.push(deposed_instance(
+            deposed_key("dep-a"),
+            "vpc-old",
+            None,
+            HashMap::from([
+                ("cidr_block".to_string(), json!("10.0.1.0/16")),
+                ("vpc_id".to_string(), json!("vpc-old")),
+            ]),
+        ));
+        row.deposed.push(deposed_instance(
+            deposed_key("dep-b"),
+            "vpc-older",
+            None,
+            HashMap::from([("vpc_id".to_string(), json!("vpc-older"))]),
+        ));
+        state.upsert_resource(row);
+
+        let mut shell = ResourceState::new("ec2.Subnet", "abandoned", "awscc");
+        shell.binding = Some("abandoned".to_string());
+        shell.deposed.push(deposed_instance(
+            deposed_key("dep-shell"),
+            "subnet-old",
+            None,
+            HashMap::from([("subnet_id".to_string(), json!("subnet-old"))]),
+        ));
+        state.upsert_resource(shell);
+
+        state
+    }
 
     /// Load the fixture state file from `tests/fixtures/state_lookup/`.
     fn load_fixture_state() -> StateFile {
@@ -1567,6 +2168,21 @@ mod tests {
         insta::assert_snapshot!(output);
     }
 
+    #[test]
+    fn state_list_includes_deposed_entries_and_shell_rows() {
+        let lines = format_state_list(&deposed_format_state());
+        assert_eq!(
+            lines,
+            vec![
+                "awscc.ec2.Vpc main",
+                "awscc.ec2.Vpc main  (deposed dep-a vpc-old)",
+                "awscc.ec2.Vpc main  (deposed dep-b vpc-older)",
+                "awscc.ec2.Subnet abandoned  (no current instance)",
+                "awscc.ec2.Subnet abandoned  (deposed dep-shell subnet-old)",
+            ]
+        );
+    }
+
     // --- format_state_lookup fixture tests ---
 
     #[test]
@@ -1650,6 +2266,85 @@ mod tests {
         insta::assert_snapshot!(output);
     }
 
+    #[test]
+    fn lookup_full_resource_includes_deposed_generations() {
+        let output = format_state_lookup(&deposed_format_state(), "main", false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["current"]["identifier"], "vpc-new");
+        assert_eq!(parsed["current"]["attributes"]["vpc_id"], "vpc-new");
+        assert_eq!(parsed["deposed"][0]["key"], "dep-a");
+        assert_eq!(parsed["deposed"][0]["identifier"], "vpc-old");
+        assert_eq!(parsed["deposed"][0]["marker"], "(deposed dep-a vpc-old)");
+        assert_eq!(parsed["deposed"][0]["attributes"]["vpc_id"], "vpc-old");
+        assert_eq!(parsed["deposed"][1]["key"], "dep-b");
+        assert_eq!(parsed["deposed"][1]["identifier"], "vpc-older");
+    }
+
+    #[test]
+    fn lookup_attribute_ignores_deposed_generations() {
+        let output = format_state_lookup(&deposed_format_state(), "main.vpc_id", false).unwrap();
+        assert_eq!(output, "vpc-new");
+
+        let output = format_state_lookup(&deposed_format_state(), "main.vpc_id", true).unwrap();
+        assert_eq!(output, "\"vpc-new\"");
+    }
+
+    #[test]
+    fn lookup_attribute_missing_on_current_errors_even_when_deposed_has_it() {
+        let err = format_state_lookup(&deposed_format_state(), "abandoned.subnet_id", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Attribute 'subnet_id' not found on resource 'abandoned'"),
+            "unexpected error: {err}"
+        );
+
+        let err = format_state_lookup(&deposed_format_state(), "abandoned.subnet_id", true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Attribute 'subnet_id' not found on resource 'abandoned'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn lookup_shell_row_returns_deposed_generations() {
+        let output = format_state_lookup(&deposed_format_state(), "abandoned", false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(parsed["current"].is_null());
+        assert_eq!(parsed["deposed"][0]["key"], "dep-shell");
+        assert_eq!(parsed["deposed"][0]["identifier"], "subnet-old");
+        assert_eq!(
+            parsed["deposed"][0]["marker"],
+            "(deposed dep-shell subnet-old)"
+        );
+        assert_eq!(
+            parsed["deposed"][0]["attributes"]["subnet_id"],
+            "subnet-old"
+        );
+    }
+
+    #[test]
+    fn lookup_full_resource_current_keeps_attributes_without_identifier() {
+        let mut state = StateFile::new();
+        let mut row = ResourceState::new("ec2.Vpc", "main", "awscc")
+            .with_attribute("vpc_id", json!("vpc-current"));
+        row.binding = Some("main".to_string());
+        row.deposed.push(deposed_instance(
+            deposed_key("dep-a"),
+            "vpc-old",
+            None,
+            HashMap::from([("vpc_id".to_string(), json!("vpc-old"))]),
+        ));
+        state.upsert_resource(row);
+
+        let output = format_state_lookup(&state, "main", false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(parsed["current"]["identifier"].is_null());
+        assert_eq!(parsed["current"]["attributes"]["vpc_id"], "vpc-current");
+    }
+
     // --- complete_state_lookup_from tests ---
 
     fn candidate_values(candidates: &[CompletionCandidate]) -> Vec<String> {
@@ -1719,6 +2414,12 @@ mod tests {
         assert_eq!(values, vec!["main-rt.route_table_id", "main-rt.vpc_id"]);
     }
 
+    #[test]
+    fn completion_does_not_offer_deposed_only_attributes() {
+        let candidates = complete_state_lookup_from(&deposed_format_state(), "abandoned.");
+        assert!(candidates.is_empty());
+    }
+
     // --- format_state_show tests ---
 
     #[test]
@@ -1726,6 +2427,892 @@ mod tests {
         let state = load_fixture_state();
         let output = format_state_show(&state);
         insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn state_show_includes_deposed_generations_and_shell_rows() {
+        let output = format_state_show(&deposed_format_state());
+        assert_eq!(
+            output,
+            "# awscc.ec2.Vpc (main)\n  cidr_block = \"10.0.0.0/16\"\n  vpc_id = \"vpc-new\"\n  (deposed dep-a vpc-old)\n    cidr_block = \"10.0.1.0/16\"\n    vpc_id = \"vpc-old\"\n  (deposed dep-b vpc-older)\n    vpc_id = \"vpc-older\"\n\n# awscc.ec2.Subnet (abandoned)\n  (deposed dep-shell subnet-old)\n    subnet_id = \"subnet-old\"\n"
+        );
+    }
+
+    #[test]
+    fn state_refresh_summary_reports_deposed_generations_separately() {
+        assert_eq!(
+            format_state_refresh_summary(
+                2,
+                1,
+                &DeposedRefreshSummary {
+                    total_generations: 3,
+                    removed_generations: 1,
+                    updated_generations: 2,
+                    failed_generations: 0,
+                },
+            ),
+            "State refreshed: 2 resources updated, 1 resource unchanged, 3 deposed generations reconciled (1 removed, 2 updated, 0 unchanged)."
+        );
+        assert_eq!(
+            format_state_refresh_summary(
+                1,
+                2,
+                &DeposedRefreshSummary {
+                    total_generations: 1,
+                    removed_generations: 1,
+                    updated_generations: 0,
+                    failed_generations: 0,
+                },
+            ),
+            "State refreshed: 1 resource updated, 2 resources unchanged, 1 deposed generation reconciled (1 removed, 0 updated, 0 unchanged)."
+        );
+        assert_eq!(
+            format_state_refresh_summary(
+                1,
+                2,
+                &DeposedRefreshSummary {
+                    total_generations: 3,
+                    removed_generations: 1,
+                    updated_generations: 1,
+                    failed_generations: 1,
+                },
+            ),
+            "State refreshed: 1 resource updated, 2 resources unchanged, 2 deposed generations reconciled (1 removed, 1 updated, 0 unchanged), 1 failed."
+        );
+        assert_eq!(
+            format_state_refresh_summary(
+                0,
+                1,
+                &DeposedRefreshSummary {
+                    total_generations: 2,
+                    removed_generations: 0,
+                    updated_generations: 0,
+                    failed_generations: 0,
+                },
+            ),
+            "State refreshed: 0 resources updated, 1 resource unchanged, 0 deposed generations reconciled (0 removed, 0 updated, 2 unchanged)."
+        );
+        assert_eq!(
+            format_state_refresh_summary(1, 2, &DeposedRefreshSummary::default()),
+            "State refreshed: 1 resource updated, 2 resources unchanged."
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_deposed_generations_drops_gone_updates_alive_and_preserves_current() {
+        let gone_key = deposed_key("gone-key");
+        let alive_key = deposed_key("alive-key");
+        let mut state = StateFile::new();
+        let mut row = ResourceState::new("ec2.Vpc", "main", "awscc")
+            .with_identifier("vpc-current")
+            .with_attribute("vpc_id", json!("vpc-current"))
+            .with_attribute("cidr_block", json!("10.0.0.0/16"));
+        row.deposed.push(deposed_instance(
+            gone_key.clone(),
+            "vpc-gone",
+            None,
+            HashMap::from([("vpc_id".to_string(), json!("vpc-gone"))]),
+        ));
+        row.deposed.push(deposed_instance(
+            alive_key.clone(),
+            "vpc-alive",
+            Some("west"),
+            HashMap::from([("vpc_id".to_string(), json!("vpc-alive-old"))]),
+        ));
+        state.upsert_resource(row);
+
+        let gone_id = ResourceId::with_provider_name_compat("awscc", "ec2.Vpc", "main", None);
+        let alive_id = ResourceId::with_provider_name_compat(
+            "awscc",
+            "ec2.Vpc",
+            "main",
+            Some("west".to_string()),
+        );
+        let provider = DeposedRefreshTestProvider::default()
+            .with_read_state(&gone_id, "vpc-gone", State::not_found(gone_id.clone()))
+            .with_read_state(
+                &alive_id,
+                "vpc-alive",
+                State::existing(
+                    alive_id.clone(),
+                    HashMap::from([
+                        ("vpc_id".to_string(), string_value("vpc-alive")),
+                        ("cidr_block".to_string(), string_value("10.0.1.0/16")),
+                    ]),
+                )
+                .with_identifier("vpc-alive"),
+            );
+        let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
+
+        let summary = refresh_deposed_generations_until_cancelled(
+            &provider,
+            &mut state,
+            &[desired],
+            &SchemaRegistry::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let row = state.find_resource("awscc", "ec2.Vpc", "main").unwrap();
+        assert_eq!(row.identifier.as_deref(), Some("vpc-current"));
+        assert_eq!(row.attributes.get("vpc_id"), Some(&json!("vpc-current")));
+        assert_eq!(row.deposed.len(), 1);
+        assert_eq!(row.deposed[0].key, alive_key);
+        assert_eq!(row.deposed[0].identifier, "vpc-alive");
+        assert_eq!(row.deposed[0].provider_instance.as_deref(), Some("west"));
+        assert_eq!(
+            row.deposed[0].attributes.get("vpc_id"),
+            Some(&json!("vpc-alive"))
+        );
+        assert_eq!(
+            row.deposed[0].attributes.get("cidr_block"),
+            Some(&json!("10.0.1.0/16"))
+        );
+        assert_eq!(
+            summary,
+            DeposedRefreshSummary {
+                total_generations: 2,
+                removed_generations: 1,
+                updated_generations: 1,
+                failed_generations: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_deposed_generation_removes_shell_row_when_gone() {
+        let mut state = StateFile::new();
+        let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
+        row.deposed.push(deposed_instance(
+            deposed_key("gone-key"),
+            "vpc-gone",
+            None,
+            HashMap::from([("vpc_id".to_string(), json!("vpc-gone"))]),
+        ));
+        state.upsert_resource(row);
+
+        let id = ResourceId::with_provider_name_compat("awscc", "ec2.Vpc", "main", None);
+        let provider = DeposedRefreshTestProvider::default().with_read_state(
+            &id,
+            "vpc-gone",
+            State::not_found(id.clone()),
+        );
+
+        let summary = refresh_deposed_generations_until_cancelled(
+            &provider,
+            &mut state,
+            &[],
+            &SchemaRegistry::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(state.find_resource("awscc", "ec2.Vpc", "main").is_none());
+        assert_eq!(
+            summary,
+            DeposedRefreshSummary {
+                total_generations: 1,
+                removed_generations: 1,
+                updated_generations: 0,
+                failed_generations: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_deposed_generation_masks_plaintext_secret_from_provider_read() {
+        let mut state = StateFile::new();
+        let mut row = ResourceState::new("db.Instance", "main", "awscc");
+        row.deposed.push(deposed_instance(
+            deposed_key("secret-key"),
+            "db-old",
+            None,
+            HashMap::from([("password".to_string(), json!("old-hash"))]),
+        ));
+        state.upsert_resource(row);
+
+        let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
+        let provider = DeposedRefreshTestProvider::default().with_read_state(
+            &id,
+            "db-old",
+            State::existing(
+                id.clone(),
+                HashMap::from([("password".to_string(), string_value("plain-secret"))]),
+            )
+            .with_identifier("db-old"),
+        );
+        let desired = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
+            "password",
+            Value::Deferred(DeferredValue::Secret(Box::new(string_value(
+                "plain-secret",
+            )))),
+        );
+
+        refresh_deposed_generations_until_cancelled(
+            &provider,
+            &mut state,
+            &[desired],
+            &SchemaRegistry::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let stored = state
+            .find_resource("awscc", "db.Instance", "main")
+            .unwrap()
+            .deposed[0]
+            .attributes
+            .get("password")
+            .and_then(|value| value.as_str())
+            .expect("password should be stored as a string hash");
+        assert!(stored.starts_with(SECRET_PREFIX), "got {stored}");
+        assert!(!stored.contains("plain-secret"));
+    }
+
+    #[tokio::test]
+    async fn refresh_deposed_generation_drops_schema_write_only_plaintext_without_desired_secret() {
+        let mut state = StateFile::new();
+        let mut row = ResourceState::new("db.Instance", "main", "awscc");
+        row.deposed.push(deposed_instance(
+            deposed_key("secret-key"),
+            "db-old",
+            None,
+            HashMap::from([("password".to_string(), json!("old-hash"))]),
+        ));
+        state.upsert_resource(row);
+
+        let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
+        let provider = DeposedRefreshTestProvider::default().with_read_state(
+            &id,
+            "db-old",
+            State::existing(
+                id.clone(),
+                HashMap::from([
+                    ("password".to_string(), string_value("plain-secret")),
+                    ("endpoint".to_string(), string_value("db.example")),
+                ]),
+            )
+            .with_identifier("db-old"),
+        );
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "awscc",
+            ResourceSchema::new("db.Instance")
+                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only())
+                .attribute(AttributeSchema::new("endpoint", AttributeType::string())),
+        );
+
+        refresh_deposed_generations_until_cancelled(
+            &provider,
+            &mut state,
+            &[],
+            &schemas,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let attributes = &state
+            .find_resource("awscc", "db.Instance", "main")
+            .unwrap()
+            .deposed[0]
+            .attributes;
+        assert_eq!(attributes.get("endpoint"), Some(&json!("db.example")));
+        assert!(
+            !attributes.contains_key("password"),
+            "schema write_only provider plaintext must not be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_deposed_generation_rehashes_existing_hash_without_desired_secret() {
+        let mut state = StateFile::new();
+        let mut row = ResourceState::new("db.Instance", "main", "awscc");
+        row.deposed.push(deposed_instance(
+            deposed_key("secret-key"),
+            "db-old",
+            None,
+            HashMap::from([(
+                "password".to_string(),
+                json!(format!("{SECRET_PREFIX}previous")),
+            )]),
+        ));
+        state.upsert_resource(row);
+
+        let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
+        let provider = DeposedRefreshTestProvider::default().with_read_state(
+            &id,
+            "db-old",
+            State::existing(
+                id.clone(),
+                HashMap::from([("password".to_string(), string_value("plain-secret"))]),
+            )
+            .with_identifier("db-old"),
+        );
+
+        let summary = refresh_deposed_generations_until_cancelled(
+            &provider,
+            &mut state,
+            &[],
+            &SchemaRegistry::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let stored = state
+            .find_resource("awscc", "db.Instance", "main")
+            .unwrap()
+            .deposed[0]
+            .attributes
+            .get("password")
+            .and_then(|value| value.as_str())
+            .expect("password should remain a stored secret hash");
+        assert!(stored.starts_with(SECRET_PREFIX), "got {stored}");
+        assert!(!stored.contains("plain-secret"));
+        assert_eq!(
+            summary,
+            DeposedRefreshSummary {
+                total_generations: 1,
+                removed_generations: 0,
+                updated_generations: 1,
+                failed_generations: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_deposed_generation_merges_nested_secret_hash_per_leaf_and_converges() {
+        let mut state = StateFile::new();
+        let previous_tags = json!({
+            "Name": "old-name",
+            "SecretTag": format!("{SECRET_PREFIX}previous"),
+        });
+        let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
+        row.deposed.push(deposed_instance(
+            deposed_key("nested-secret-key"),
+            "vpc-old",
+            None,
+            HashMap::from([("tags".to_string(), previous_tags.clone())]),
+        ));
+        state.upsert_resource(row);
+
+        let id = ResourceId::with_provider_name_compat("awscc", "ec2.Vpc", "main", None);
+        let mut provider_tags = indexmap::IndexMap::new();
+        provider_tags.insert("Name".to_string(), string_value("new-name"));
+        provider_tags.insert("SecretTag".to_string(), string_value("plain-secret"));
+        let provider = DeposedRefreshTestProvider::default().with_read_state(
+            &id,
+            "vpc-old",
+            State::existing(
+                id.clone(),
+                HashMap::from([(
+                    "tags".to_string(),
+                    Value::Concrete(ConcreteValue::Map(provider_tags)),
+                )]),
+            )
+            .with_identifier("vpc-old"),
+        );
+
+        refresh_deposed_generations_until_cancelled(
+            &provider,
+            &mut state,
+            &[],
+            &SchemaRegistry::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let stored_tags = state
+            .find_resource("awscc", "ec2.Vpc", "main")
+            .unwrap()
+            .deposed[0]
+            .attributes
+            .get("tags")
+            .cloned()
+            .expect("tags should be stored");
+        assert_eq!(stored_tags["Name"], json!("new-name"));
+        let secret = stored_tags["SecretTag"]
+            .as_str()
+            .expect("secret tag should stay a string");
+        assert!(secret.starts_with(SECRET_PREFIX), "got {secret}");
+        assert!(!secret.contains("plain-secret"));
+
+        refresh_deposed_generations_until_cancelled(
+            &provider,
+            &mut state,
+            &[],
+            &SchemaRegistry::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let stored_again = state
+            .find_resource("awscc", "ec2.Vpc", "main")
+            .unwrap()
+            .deposed[0]
+            .attributes
+            .get("tags")
+            .cloned()
+            .expect("tags should still be stored");
+        assert_eq!(stored_again, stored_tags);
+    }
+
+    #[test]
+    fn current_orphan_refresh_rehashes_existing_hash_without_desired_secret() {
+        let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
+        let mut state = StateFile::new();
+        state.upsert_resource(
+            ResourceState::new("db.Instance", "main", "awscc")
+                .with_identifier("db-current")
+                .with_attribute("password", json!(format!("{SECRET_PREFIX}previous"))),
+        );
+        let fresh = State::existing(
+            id.clone(),
+            HashMap::from([("password".to_string(), string_value("plain-secret"))]),
+        )
+        .with_identifier("db-current");
+        let mut counts = StateRefreshCounts::default();
+
+        diff_display_update_resource(
+            &id,
+            &fresh,
+            &mut state,
+            None,
+            &SchemaRegistry::new(),
+            " (orphan)",
+            &mut counts,
+        )
+        .unwrap();
+
+        let stored = state
+            .find_resource("awscc", "db.Instance", "main")
+            .unwrap()
+            .attributes
+            .get("password")
+            .and_then(|value| value.as_str())
+            .expect("password should remain a stored secret hash");
+        assert!(stored.starts_with(SECRET_PREFIX), "got {stored}");
+        assert!(!stored.contains("plain-secret"));
+        assert_eq!(counts.updated, 1);
+        assert_eq!(counts.unchanged, 0);
+    }
+
+    #[test]
+    fn current_orphan_refresh_merges_nested_secret_hash_per_leaf_and_converges() {
+        let id = ResourceId::with_provider_name_compat("awscc", "ec2.Vpc", "main", None);
+        let previous_tags = json!({
+            "Name": "old-name",
+            "SecretTag": format!("{SECRET_PREFIX}previous"),
+        });
+        let mut state = StateFile::new();
+        state.upsert_resource(
+            ResourceState::new("ec2.Vpc", "main", "awscc")
+                .with_identifier("vpc-current")
+                .with_attribute("tags", previous_tags),
+        );
+        let mut provider_tags = indexmap::IndexMap::new();
+        provider_tags.insert("Name".to_string(), string_value("new-name"));
+        provider_tags.insert("SecretTag".to_string(), string_value("plain-secret"));
+        let fresh = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "tags".to_string(),
+                Value::Concrete(ConcreteValue::Map(provider_tags)),
+            )]),
+        )
+        .with_identifier("vpc-current");
+        let mut counts = StateRefreshCounts::default();
+
+        diff_display_update_resource(
+            &id,
+            &fresh,
+            &mut state,
+            None,
+            &SchemaRegistry::new(),
+            " (orphan)",
+            &mut counts,
+        )
+        .unwrap();
+
+        let stored_tags = state
+            .find_resource("awscc", "ec2.Vpc", "main")
+            .unwrap()
+            .attributes
+            .get("tags")
+            .cloned()
+            .expect("tags should be stored");
+        assert_eq!(stored_tags["Name"], json!("new-name"));
+        let secret = stored_tags["SecretTag"]
+            .as_str()
+            .expect("secret tag should stay a string");
+        assert!(secret.starts_with(SECRET_PREFIX), "got {secret}");
+        assert!(!secret.contains("plain-secret"));
+        assert_eq!(counts.updated, 1);
+        assert_eq!(counts.unchanged, 0);
+
+        diff_display_update_resource(
+            &id,
+            &fresh,
+            &mut state,
+            None,
+            &SchemaRegistry::new(),
+            " (orphan)",
+            &mut counts,
+        )
+        .unwrap();
+
+        let stored_again = state
+            .find_resource("awscc", "ec2.Vpc", "main")
+            .unwrap()
+            .attributes
+            .get("tags")
+            .cloned()
+            .expect("tags should still be stored");
+        assert_eq!(stored_again, stored_tags);
+        assert_eq!(counts.updated, 1);
+        assert_eq!(counts.unchanged, 1);
+    }
+
+    #[test]
+    fn current_refresh_drops_schema_write_only_plaintext_absent_from_desired() {
+        let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
+        let desired = Resource::with_provider("awscc", "db.Instance", "main", None);
+        let mut state = StateFile::new();
+        state.upsert_resource(
+            ResourceState::new("db.Instance", "main", "awscc").with_identifier("db-current"),
+        );
+        let fresh = State::existing(
+            id.clone(),
+            HashMap::from([("password".to_string(), string_value("plain-secret"))]),
+        )
+        .with_identifier("db-current");
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "awscc",
+            ResourceSchema::new("db.Instance")
+                .attribute(AttributeSchema::new("password", AttributeType::string()).write_only()),
+        );
+        let mut counts = StateRefreshCounts::default();
+
+        diff_display_update_resource(
+            &id,
+            &fresh,
+            &mut state,
+            Some(&desired),
+            &schemas,
+            "",
+            &mut counts,
+        )
+        .unwrap();
+
+        let row = state.find_resource("awscc", "db.Instance", "main").unwrap();
+        assert!(
+            !row.attributes.contains_key("password"),
+            "write-only plaintext must not be persisted by refresh"
+        );
+        assert_eq!(counts.updated, 0);
+        assert_eq!(counts.unchanged, 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_deposed_generation_hydrates_unreturned_attributes() {
+        let mut state = StateFile::new();
+        let mut row = ResourceState::new("db.Instance", "main", "awscc");
+        row.deposed.push(deposed_instance(
+            deposed_key("hydrate-key"),
+            "db-old",
+            None,
+            HashMap::from([
+                ("description".to_string(), json!("kept from state")),
+                ("endpoint".to_string(), json!("old.example")),
+            ]),
+        ));
+        state.upsert_resource(row);
+
+        let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
+        let provider = DeposedRefreshTestProvider::default()
+            .with_saved_attr_hydration()
+            .with_read_state(
+                &id,
+                "db-old",
+                State::existing(
+                    id.clone(),
+                    HashMap::from([("endpoint".to_string(), string_value("new.example"))]),
+                )
+                .with_identifier("db-old"),
+            );
+
+        let summary = refresh_deposed_generations_until_cancelled(
+            &provider,
+            &mut state,
+            &[],
+            &SchemaRegistry::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let attrs = &state
+            .find_resource("awscc", "db.Instance", "main")
+            .unwrap()
+            .deposed[0]
+            .attributes;
+        assert_eq!(attrs.get("endpoint"), Some(&json!("new.example")));
+        assert_eq!(attrs.get("description"), Some(&json!("kept from state")));
+        assert_eq!(
+            summary,
+            DeposedRefreshSummary {
+                total_generations: 1,
+                removed_generations: 0,
+                updated_generations: 1,
+                failed_generations: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_deposed_generation_lifts_enum_state_and_is_stable() {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "awscc",
+            ResourceSchema::new("service.Widget").attribute(AttributeSchema::new(
+                "status",
+                AttributeType::enum_(
+                    carina_core::schema::enum_identity("Status", Some("awscc.service.Widget")),
+                    Some(vec!["Enabled".to_string()]),
+                    vec![("Enabled".to_string(), "enabled".to_string())],
+                    None,
+                    None,
+                ),
+            )),
+        );
+
+        let mut state = StateFile::new();
+        let mut row = ResourceState::new("service.Widget", "main", "awscc");
+        row.deposed.push(deposed_instance(
+            deposed_key("enum-key"),
+            "widget-old",
+            None,
+            HashMap::from([("status".to_string(), json!("Enabled"))]),
+        ));
+        state.upsert_resource(row);
+
+        let id = ResourceId::with_provider_name_compat("awscc", "service.Widget", "main", None);
+        let provider = DeposedRefreshTestProvider::default().with_read_state(
+            &id,
+            "widget-old",
+            State::existing(
+                id.clone(),
+                HashMap::from([("status".to_string(), string_value("Enabled"))]),
+            )
+            .with_identifier("widget-old"),
+        );
+        let desired = Resource::with_provider("awscc", "service.Widget", "main", None);
+
+        let first = refresh_deposed_generations_until_cancelled(
+            &provider,
+            &mut state,
+            std::slice::from_ref(&desired),
+            &schemas,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            first,
+            DeposedRefreshSummary {
+                total_generations: 1,
+                removed_generations: 0,
+                updated_generations: 1,
+                failed_generations: 0,
+            }
+        );
+        let after_first = state
+            .find_resource("awscc", "service.Widget", "main")
+            .unwrap()
+            .deposed[0]
+            .attributes
+            .clone();
+        assert!(
+            after_first["status"].get("Enum").is_some(),
+            "enum state should be stored in canonical enum shape"
+        );
+
+        let second = refresh_deposed_generations_until_cancelled(
+            &provider,
+            &mut state,
+            std::slice::from_ref(&desired),
+            &schemas,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let after_second = state
+            .find_resource("awscc", "service.Widget", "main")
+            .unwrap()
+            .deposed[0]
+            .attributes
+            .clone();
+
+        assert_eq!(
+            second,
+            DeposedRefreshSummary {
+                total_generations: 1,
+                removed_generations: 0,
+                updated_generations: 0,
+                failed_generations: 0,
+            }
+        );
+        assert_eq!(after_second, after_first);
+    }
+
+    #[tokio::test]
+    async fn refresh_deposed_generation_matches_masking_authority_by_provider_instance() {
+        let mut state = StateFile::new();
+        let mut row = ResourceState::new("db.Instance", "main", "awscc");
+        row.deposed.push(deposed_instance(
+            deposed_key("west-key"),
+            "db-old",
+            Some("west"),
+            HashMap::from([("password".to_string(), json!("old-plain"))]),
+        ));
+        state.upsert_resource(row);
+
+        let id = ResourceId::with_provider_name_compat(
+            "awscc",
+            "db.Instance",
+            "main",
+            Some("west".to_string()),
+        );
+        let provider = DeposedRefreshTestProvider::default().with_read_state(
+            &id,
+            "db-old",
+            State::existing(
+                id.clone(),
+                HashMap::from([("password".to_string(), string_value("plain-secret"))]),
+            )
+            .with_identifier("db-old"),
+        );
+        let wrong_instance =
+            Resource::with_provider("awscc", "db.Instance", "main", Some("east".to_string()))
+                .with_attribute(
+                    "password",
+                    Value::Deferred(DeferredValue::Secret(Box::new(string_value(
+                        "plain-secret",
+                    )))),
+                );
+        let right_instance =
+            Resource::with_provider("awscc", "db.Instance", "main", Some("west".to_string()));
+
+        refresh_deposed_generations_until_cancelled(
+            &provider,
+            &mut state,
+            &[wrong_instance, right_instance],
+            &SchemaRegistry::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let stored = state
+            .find_resource("awscc", "db.Instance", "main")
+            .unwrap()
+            .deposed[0]
+            .attributes
+            .get("password")
+            .and_then(|value| value.as_str())
+            .expect("password should remain plaintext because west desired is not secret");
+        assert_eq!(stored, "plain-secret");
+    }
+
+    #[tokio::test]
+    async fn refresh_deposed_generation_read_error_leaves_entry_untouched() {
+        let key = deposed_key("error-key");
+        let mut state = StateFile::new();
+        let mut row = ResourceState::new("ec2.Vpc", "main", "awscc");
+        row.deposed.push(deposed_instance(
+            key.clone(),
+            "vpc-old",
+            None,
+            HashMap::from([("vpc_id".to_string(), json!("vpc-old"))]),
+        ));
+        state.upsert_resource(row);
+
+        let id = ResourceId::with_provider_name_compat("awscc", "ec2.Vpc", "main", None);
+        let provider =
+            DeposedRefreshTestProvider::default().with_read_error(&id, "vpc-old", "read failed");
+
+        let summary = refresh_deposed_generations_until_cancelled(
+            &provider,
+            &mut state,
+            &[],
+            &SchemaRegistry::new(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let row = state.find_resource("awscc", "ec2.Vpc", "main").unwrap();
+        assert_eq!(row.deposed.len(), 1);
+        assert_eq!(row.deposed[0].key, key);
+        assert_eq!(
+            row.deposed[0].attributes.get("vpc_id"),
+            Some(&json!("vpc-old"))
+        );
+        assert_eq!(
+            summary,
+            DeposedRefreshSummary {
+                total_generations: 1,
+                removed_generations: 0,
+                updated_generations: 0,
+                failed_generations: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn current_instance_refresh_preserves_deposed_entries() {
+        let key = deposed_key("old-key");
+        let id = ResourceId::with_provider_name_compat("awscc", "ec2.Vpc", "main", None);
+        let mut state = StateFile::new();
+        let mut row = ResourceState::new("ec2.Vpc", "main", "awscc")
+            .with_identifier("vpc-current")
+            .with_attribute("vpc_id", json!("vpc-current"));
+        row.deposed.push(deposed_instance(
+            key.clone(),
+            "vpc-old",
+            None,
+            HashMap::from([("vpc_id".to_string(), json!("vpc-old"))]),
+        ));
+        state.upsert_resource(row);
+        let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
+        let fresh = State::existing(
+            id.clone(),
+            HashMap::from([("vpc_id".to_string(), string_value("vpc-current"))]),
+        )
+        .with_identifier("vpc-current");
+        let mut counts = StateRefreshCounts::default();
+
+        diff_display_update_resource(
+            &id,
+            &fresh,
+            &mut state,
+            Some(&desired),
+            &SchemaRegistry::new(),
+            "",
+            &mut counts,
+        )
+        .unwrap();
+
+        let row = state.find_resource("awscc", "ec2.Vpc", "main").unwrap();
+        assert_eq!(row.deposed.len(), 1);
+        assert_eq!(row.deposed[0].key, key);
+        assert_eq!(row.deposed[0].identifier, "vpc-old");
     }
 
     // --- run_force_unlock tests ---

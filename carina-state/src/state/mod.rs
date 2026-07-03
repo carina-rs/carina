@@ -6,12 +6,12 @@ pub use carina_core::name_override::{ApplyDecision, NameOverride, should_apply_o
 use carina_core::override_aware::NameOverrideSource;
 pub use carina_core::resource::DeposedKey;
 use carina_core::resource::{
-    ConcreteValue, Directives, PartialReadMarker, Resource, ResourceId, State, Value,
+    ConcreteValue, DeferredValue, Directives, PartialReadMarker, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::ResourceSchema;
 use carina_core::value::{
-    SecretHashContext, contains_secret, json_to_dsl_value, merge_secrets_into_provider_json,
-    value_to_json, value_to_json_with_context,
+    SECRET_PREFIX, SecretHashContext, contains_secret, json_to_dsl_value,
+    merge_secrets_into_provider_json, value_to_json, value_to_json_with_context,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -886,6 +886,41 @@ pub struct ResourceState {
     pub partial_read: Option<PartialReadMarker>,
 }
 
+/// Caller intent for treating already-persisted secret hashes as masking
+/// authority when provider reads return plaintext.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviousSecretHashAuthority<'a> {
+    None,
+    /// The prior generation is the authority for every key that already
+    /// contains a stored secret hash. Used for deposed generations and
+    /// replacement snapshots whose old instance state is no longer described
+    /// by the desired resource.
+    AllPreviouslyHashedKeys(&'a HashMap<String, serde_json::Value>),
+    /// The desired resource is authoritative for explicitly-authored keys.
+    /// Previously stored hashes only protect keys now absent from desired
+    /// state, preserving orphan recovery without blocking secret->plain
+    /// demotion.
+    OnlyKeysAbsentFromDesired(&'a HashMap<String, serde_json::Value>),
+}
+
+impl<'a> PreviousSecretHashAuthority<'a> {
+    fn protects_key(self, resource: &Resource, key: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::AllPreviouslyHashedKeys(_) => true,
+            Self::OnlyKeysAbsentFromDesired(_) => !resource.attributes.contains_key(key),
+        }
+    }
+
+    fn attributes(self) -> Option<&'a HashMap<String, serde_json::Value>> {
+        match self {
+            Self::None => None,
+            Self::AllPreviouslyHashedKeys(attributes)
+            | Self::OnlyKeysAbsentFromDesired(attributes) => Some(attributes),
+        }
+    }
+}
+
 impl ResourceState {
     /// Create a new resource state
     pub fn new(
@@ -1014,7 +1049,8 @@ impl ResourceState {
 
     /// Serialize best-effort provider attributes into the state-file JSON shape.
     ///
-    /// Secret values use the same context-aware hashing as `from_provider_state`.
+    /// Secret values use the same context-aware hashing as
+    /// `from_provider_state_for_resource_and_schema`.
     /// Attributes that cannot be represented in state, such as unresolved
     /// `Unknown` placeholders, are skipped instead of aborting state writeback.
     fn attributes_to_state_json_lossy(
@@ -1043,12 +1079,18 @@ impl ResourceState {
         resource: &Resource,
         schema: Option<&ResourceSchema>,
         attributes: &HashMap<String, Value>,
+        previous_hash_authority: PreviousSecretHashAuthority<'_>,
     ) -> HashMap<String, serde_json::Value> {
         let resource_display_type = resource.id.display_type();
         let identity = resource.id.identity_or_empty();
         let serialized =
             Self::attributes_to_state_json_lossy(&resource_display_type, identity, attributes);
-        Self::protect_state_json_for_resource_and_schema(resource, schema, serialized)
+        Self::protect_state_json_for_resource_and_schema(
+            resource,
+            schema,
+            serialized,
+            previous_hash_authority,
+        )
     }
 
     /// Apply desired-resource and schema-derived secret protection to an
@@ -1056,11 +1098,13 @@ impl ResourceState {
     pub fn protect_state_json_for_resource_and_schema(
         resource: &Resource,
         schema: Option<&ResourceSchema>,
-        mut serialized: HashMap<String, serde_json::Value>,
+        serialized: HashMap<String, serde_json::Value>,
+        previous_hash_authority: PreviousSecretHashAuthority<'_>,
     ) -> HashMap<String, serde_json::Value> {
+        let mut serialized = serialized;
         let resource_display_type = resource.id.display_type();
         let identity = resource.id.identity_or_empty();
-        let mut desired_secret_keys = std::collections::HashSet::new();
+        let mut protected_secret_keys = std::collections::HashSet::new();
 
         for (key, desired_value) in &resource.attributes {
             if !contains_secret(desired_value) {
@@ -1076,15 +1120,24 @@ impl ResourceState {
 
             if let Ok(masked) = masked {
                 serialized.insert(key.clone(), masked);
-                desired_secret_keys.insert(key.clone());
+                protected_secret_keys.insert(key.clone());
             } else {
                 serialized.remove(key);
             }
         }
 
+        Self::protect_previously_hashed_secrets(
+            &resource_display_type,
+            identity,
+            resource,
+            previous_hash_authority,
+            &mut serialized,
+            &mut protected_secret_keys,
+        );
+
         if let Some(schema) = schema {
             for (key, attr) in &schema.attributes {
-                if attr.write_only && !desired_secret_keys.contains(key) {
+                if attr.write_only && !protected_secret_keys.contains(key) {
                     serialized.remove(key);
                 }
             }
@@ -1093,16 +1146,72 @@ impl ResourceState {
         serialized
     }
 
-    /// Build a ResourceState from a Resource and its provider-returned State.
+    fn protect_previously_hashed_secrets(
+        resource_display_type: &str,
+        identity: &str,
+        resource: &Resource,
+        previous_hash_authority: PreviousSecretHashAuthority<'_>,
+        serialized: &mut HashMap<String, serde_json::Value>,
+        protected_secret_keys: &mut std::collections::HashSet<String>,
+    ) {
+        let Some(existing_attributes) = previous_hash_authority.attributes() else {
+            return;
+        };
+
+        for (key, previous_value) in existing_attributes {
+            if protected_secret_keys.contains(key)
+                || !previous_hash_authority.protects_key(resource, key)
+            {
+                continue;
+            }
+            let secret_shape = secret_hash_shape(previous_value);
+            if secret_shape == SecretHashShape::None {
+                continue;
+            }
+
+            let ctx = SecretHashContext::new(resource_display_type, identity, key);
+            let masked = match (secret_shape, serialized.get(key)) {
+                (SecretHashShape::TopLevel, Some(provider_json))
+                    if secret_hash_shape(provider_json) == SecretHashShape::TopLevel =>
+                {
+                    provider_json.clone()
+                }
+                (SecretHashShape::TopLevel, Some(provider_json)) => {
+                    hash_provider_json_as_secret(provider_json, &ctx)
+                        .unwrap_or_else(|_| previous_value.clone())
+                }
+                (SecretHashShape::TopLevel, None) => previous_value.clone(),
+                (SecretHashShape::Nested, provider_json) => {
+                    merge_previous_secret_hashes_into_provider_json(
+                        previous_value,
+                        provider_json,
+                        &ctx,
+                    )
+                }
+                (SecretHashShape::None, _) => unreachable!("None shape is filtered above"),
+            };
+            serialized.insert(key.clone(), masked);
+            protected_secret_keys.insert(key.clone());
+        }
+    }
+
+    /// Build a `ResourceState` from a desired resource, provider-returned
+    /// state, optional previous row state, and optional schema.
     ///
-    /// If `existing` is provided, the `protected` flag is preserved from it.
+    /// Provider attributes are serialized into state JSON, desired secret
+    /// values are masked before storage, previously-stored secret hashes can
+    /// protect keys removed from desired state, and schema write-only
+    /// plaintext is removed unless a desired secret already supplied a masked
+    /// value. When `existing` is provided, protected/name override metadata and
+    /// existing deposed generations are preserved by the row-write path.
     ///
-    /// Returns an error if any attribute value cannot be converted to JSON
-    /// (e.g., non-finite float values).
-    pub fn from_provider_state(
+    /// Returns an error if any provider attribute value cannot be converted to
+    /// JSON, such as non-finite float values.
+    pub fn from_provider_state_for_resource_and_schema(
         resource: &Resource,
         state: &State,
         existing: Option<&ResourceState>,
+        schema: Option<&ResourceSchema>,
     ) -> Result<Self, String> {
         let mut rs = Self::new(
             &resource.id.resource_type,
@@ -1125,6 +1234,7 @@ impl ResourceState {
         // the hash to avoid persisting sensitive data.
         // For nested secrets (inside Maps/Lists), merge the hashed values into
         // the provider-returned structure to preserve extra keys from the provider.
+        let mut protected_secret_keys = std::collections::HashSet::new();
         for (k, v) in &resource.attributes {
             if contains_secret(v) {
                 let ctx = SecretHashContext::new(&resource_display_type, identity, k);
@@ -1140,11 +1250,27 @@ impl ResourceState {
                         Self::attribute_to_state_json(&resource_display_type, identity, k, v)?,
                     );
                 }
+                protected_secret_keys.insert(k.clone());
             }
         }
         if let Some(existing) = existing {
+            Self::protect_previously_hashed_secrets(
+                &resource_display_type,
+                identity,
+                resource,
+                PreviousSecretHashAuthority::OnlyKeysAbsentFromDesired(&existing.attributes),
+                &mut rs.attributes,
+                &mut protected_secret_keys,
+            );
             rs.protected = existing.protected;
             rs.name_overrides = existing.name_overrides.clone();
+        }
+        if let Some(schema) = schema {
+            for (key, attr) in &schema.attributes {
+                if attr.write_only && !protected_secret_keys.contains(key) {
+                    rs.attributes.remove(key);
+                }
+            }
         }
         rs.directives = resource.directives.clone();
         if rs.directives.provider_instance.is_none() {
@@ -1242,9 +1368,147 @@ impl ResourceState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretHashShape {
+    None,
+    TopLevel,
+    Nested,
+}
+
+fn secret_hash_shape(value: &serde_json::Value) -> SecretHashShape {
+    match value {
+        serde_json::Value::String(stored) if stored.starts_with(SECRET_PREFIX) => {
+            SecretHashShape::TopLevel
+        }
+        serde_json::Value::Array(items) if items.iter().any(contains_secret_hash_json) => {
+            SecretHashShape::Nested
+        }
+        serde_json::Value::Object(map) if map.values().any(contains_secret_hash_json) => {
+            SecretHashShape::Nested
+        }
+        _ => SecretHashShape::None,
+    }
+}
+
+fn contains_secret_hash_json(value: &serde_json::Value) -> bool {
+    secret_hash_shape(value) != SecretHashShape::None
+}
+
+fn merge_previous_secret_hashes_into_provider_json(
+    previous_value: &serde_json::Value,
+    provider_value: Option<&serde_json::Value>,
+    context: &SecretHashContext,
+) -> serde_json::Value {
+    match previous_value {
+        serde_json::Value::String(stored) if stored.starts_with(SECRET_PREFIX) => {
+            let Some(provider_value) = provider_value else {
+                return previous_value.clone();
+            };
+            if secret_hash_shape(provider_value) == SecretHashShape::TopLevel {
+                return provider_value.clone();
+            }
+            hash_provider_json_as_secret(provider_value, context)
+                .unwrap_or_else(|_| previous_value.clone())
+        }
+        serde_json::Value::Object(previous_object) => {
+            let Some(serde_json::Value::Object(provider_object)) = provider_value else {
+                return previous_value.clone();
+            };
+            let mut merged = provider_object.clone();
+            for (key, previous_child) in previous_object {
+                if contains_secret_hash_json(previous_child) {
+                    let provider_child = provider_object.get(key);
+                    merged.insert(
+                        key.clone(),
+                        merge_previous_secret_hashes_into_provider_json(
+                            previous_child,
+                            provider_child,
+                            context,
+                        ),
+                    );
+                }
+            }
+            serde_json::Value::Object(merged)
+        }
+        serde_json::Value::Array(previous_items) => {
+            let Some(serde_json::Value::Array(provider_items)) = provider_value else {
+                return previous_value.clone();
+            };
+            if !previous_secret_hash_array_alignment_is_trusted(previous_items, provider_items) {
+                return provider_value
+                    .and_then(|provider| hash_provider_json_as_secret(provider, context).ok())
+                    .unwrap_or_else(|| previous_value.clone());
+            }
+            let mut merged = provider_items.clone();
+            for (index, previous_child) in previous_items.iter().enumerate() {
+                if contains_secret_hash_json(previous_child) {
+                    let merged_child = merge_previous_secret_hashes_into_provider_json(
+                        previous_child,
+                        provider_items.get(index),
+                        context,
+                    );
+                    merged[index] = merged_child;
+                }
+            }
+            serde_json::Value::Array(merged)
+        }
+        _ => provider_value
+            .cloned()
+            .unwrap_or_else(|| previous_value.clone()),
+    }
+}
+
+fn previous_secret_hash_array_alignment_is_trusted(
+    previous_items: &[serde_json::Value],
+    provider_items: &[serde_json::Value],
+) -> bool {
+    if previous_items.len() != provider_items.len() {
+        return false;
+    }
+
+    previous_items
+        .iter()
+        .zip(provider_items)
+        .filter(|(previous, _)| contains_secret_hash_json(previous))
+        .all(|(previous, provider)| hash_bearing_item_alignment_is_trusted(previous, provider))
+}
+
+fn hash_bearing_item_alignment_is_trusted(
+    previous: &serde_json::Value,
+    provider: &serde_json::Value,
+) -> bool {
+    let (serde_json::Value::Object(previous_object), serde_json::Value::Object(provider_object)) =
+        (previous, provider)
+    else {
+        return false;
+    };
+
+    let anchors: Vec<_> = previous_object
+        .iter()
+        .filter(|(_, value)| !contains_secret_hash_json(value))
+        .collect();
+    if anchors.is_empty() {
+        return false;
+    }
+
+    anchors
+        .into_iter()
+        .all(|(key, previous_value)| provider_object.get(key) == Some(previous_value))
+}
+
+fn hash_provider_json_as_secret(
+    provider_json: &serde_json::Value,
+    context: &SecretHashContext,
+) -> Result<serde_json::Value, String> {
+    let provider_value = json_to_dsl_value(provider_json)
+        .ok_or_else(|| "cannot hash null provider secret".to_string())?;
+    let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(provider_value)));
+    value_to_json_with_context(&secret_value, Some(context)).map_err(|err| err.to_string())
+}
+
 /// Returns true if the `ExplicitFields` is the default (`Leaf`) — used
 /// as a `skip_serializing_if` predicate so resources that have not yet
-/// been touched by `from_provider_state` (or that legitimately have no
+/// been touched by `from_provider_state_for_resource_and_schema` (or that legitimately have no
 /// authored attributes) don't emit a verbose `"explicit": {"kind": "leaf"}`
 /// line.
 fn is_empty_explicit(e: &ExplicitFields) -> bool {

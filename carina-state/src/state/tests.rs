@@ -632,8 +632,13 @@ fn test_from_provider_state() {
 
     let existing = ResourceState::new("s3.Bucket", "my-bucket", "awscc").with_protected(true);
 
-    let rs =
-        ResourceState::from_provider_state(&resource, &provider_state, Some(&existing)).unwrap();
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        Some(&existing),
+        None,
+    )
+    .unwrap();
 
     assert_eq!(rs.identifier, Some("my-bucket-abcd1234".to_string()));
     assert_eq!(
@@ -665,7 +670,13 @@ fn test_from_provider_state_without_existing() {
         partial_read: None,
     };
 
-    let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        None,
+        None,
+    )
+    .unwrap();
     assert!(!rs.protected);
     assert_eq!(rs.identifier, Some("test-id".to_string()));
 }
@@ -708,8 +719,13 @@ fn test_from_provider_state_repairs_unrecorded_from_state_attrs() {
     let mut existing = ResourceState::new("sso.Assignment", "x", "awscc");
     existing.explicit = ExplicitFields::Unrecorded;
 
-    let rs =
-        ResourceState::from_provider_state(&resource, &provider_state, Some(&existing)).unwrap();
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        Some(&existing),
+        None,
+    )
+    .unwrap();
 
     let ExplicitFields::Struct { children } = &rs.explicit else {
         panic!(
@@ -752,7 +768,13 @@ fn test_from_provider_state_emits_unrecorded_for_fresh_empty_body_resource() {
         partial_read: None,
     };
 
-    let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        None,
+        None,
+    )
+    .unwrap();
 
     assert!(
         matches!(rs.explicit, ExplicitFields::Unrecorded),
@@ -797,8 +819,13 @@ fn test_from_provider_state_preserves_populated_struct_when_resource_attrs_empty
     };
     existing.explicit = populated.clone();
 
-    let rs =
-        ResourceState::from_provider_state(&resource, &provider_state, Some(&existing)).unwrap();
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        Some(&existing),
+        None,
+    )
+    .unwrap();
 
     assert_eq!(
         rs.explicit, populated,
@@ -831,8 +858,13 @@ fn test_from_provider_state_no_repair_when_state_attrs_also_empty() {
     let mut existing = ResourceState::new("sso.Assignment", "x", "awscc");
     existing.explicit = ExplicitFields::Unrecorded;
 
-    let rs =
-        ResourceState::from_provider_state(&resource, &provider_state, Some(&existing)).unwrap();
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        Some(&existing),
+        None,
+    )
+    .unwrap();
 
     assert!(
         matches!(rs.explicit, ExplicitFields::Unrecorded),
@@ -1188,7 +1220,13 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
         partial_read: None,
     };
 
-    let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(rs.binding, Some("my_subnet".to_string()));
     assert_eq!(
         rs.dependency_bindings,
@@ -1625,7 +1663,13 @@ fn test_merge_write_only_attributes() {
         partial_read: None,
     };
 
-    let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+    let mut rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        None,
+        None,
+    )
+    .unwrap();
 
     // Merge write-only attributes
     let write_only_keys = vec!["ipv4_netmask_length".to_string()];
@@ -1671,7 +1715,13 @@ fn test_merge_write_only_attributes_not_in_desired() {
         partial_read: None,
     };
 
-    let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+    let mut rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        None,
+        None,
+    )
+    .unwrap();
 
     // Try to merge a write-only attribute that the user didn't specify
     let write_only_keys = vec!["ipv4_netmask_length".to_string()];
@@ -1709,7 +1759,13 @@ fn test_merge_write_only_skips_if_already_in_provider_state() {
         partial_read: None,
     };
 
-    let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+    let mut rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        None,
+        None,
+    )
+    .unwrap();
 
     let write_only_keys = vec!["some_attr".to_string()];
     rs.merge_write_only_attributes(&resource, &write_only_keys);
@@ -1787,7 +1843,13 @@ fn test_from_provider_state_secret_stored_as_hash() {
         partial_read: None,
     };
 
-    let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        None,
+        None,
+    )
+    .unwrap();
 
     // State should store the hash, not the plain password
     let stored = rs
@@ -1805,6 +1867,346 @@ fn test_from_provider_state_secret_stored_as_hash() {
         !stored.contains("my-password"),
         "State should not contain the plain password"
     );
+}
+
+#[test]
+fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
+    use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
+    use carina_core::value::SECRET_PREFIX;
+
+    let resource = Resource::with_provider("awscc", "db.Instance", "main", None);
+    let existing = ResourceState::new("db.Instance", "main", "awscc")
+        .with_identifier("db-old")
+        .with_attribute(
+            "password",
+            serde_json::json!(format!("{SECRET_PREFIX}previous")),
+        );
+    let provider_state = ProviderState {
+        id: resource.id.clone(),
+        identifier: Some("db-old".to_string()),
+        attributes: [(
+            "password".to_string(),
+            Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+        )]
+        .into_iter()
+        .collect(),
+        exists: true,
+        dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
+    };
+
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        Some(&existing),
+        None,
+    )
+    .expect("provider state should serialize");
+    let stored = rs
+        .attributes
+        .get("password")
+        .and_then(|value| value.as_str())
+        .expect("password should remain a stored secret hash");
+
+    assert!(stored.starts_with(SECRET_PREFIX), "got {stored}");
+    assert!(!stored.contains("plain-secret"));
+}
+
+#[test]
+fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
+    use carina_core::resource::{ConcreteValue, Resource, Value};
+    use carina_core::value::SECRET_PREFIX;
+
+    let resource = Resource::with_provider("awscc", "db.Instance", "main", None);
+    let attrs = HashMap::from([(
+        "password".to_string(),
+        Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+    )]);
+    let existing = HashMap::from([(
+        "password".to_string(),
+        serde_json::json!(format!("{SECRET_PREFIX}previous")),
+    )]);
+
+    let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
+        &resource,
+        None,
+        &attrs,
+        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
+    );
+    let password = stored
+        .get("password")
+        .and_then(|value| value.as_str())
+        .expect("password should remain a stored secret hash");
+
+    assert!(password.starts_with(SECRET_PREFIX), "got {password}");
+    assert!(!password.contains("plain-secret"));
+}
+
+#[test]
+fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
+    use carina_core::resource::{ConcreteValue, Resource, Value};
+    use carina_core::value::SECRET_PREFIX;
+
+    let resource = Resource::with_provider("awscc", "db.Instance", "main", None);
+    let previous = serde_json::json!(format!("{SECRET_PREFIX}previous"));
+    let attrs = HashMap::from([(
+        "password".to_string(),
+        Value::Concrete(ConcreteValue::String(
+            previous.as_str().unwrap().to_string(),
+        )),
+    )]);
+    let existing = HashMap::from([("password".to_string(), previous.clone())]);
+
+    let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
+        &resource,
+        None,
+        &attrs,
+        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
+    );
+
+    assert_eq!(stored.get("password"), Some(&previous));
+}
+
+#[test]
+fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
+    use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
+    use carina_core::value::SECRET_PREFIX;
+
+    let resource = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
+        "password",
+        Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+    );
+    let existing = ResourceState::new("db.Instance", "main", "awscc")
+        .with_identifier("db-old")
+        .with_attribute(
+            "password",
+            serde_json::json!(format!("{SECRET_PREFIX}previous")),
+        );
+    let provider_state = ProviderState {
+        id: resource.id.clone(),
+        identifier: Some("db-old".to_string()),
+        attributes: [(
+            "password".to_string(),
+            Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+        )]
+        .into_iter()
+        .collect(),
+        exists: true,
+        dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
+    };
+
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        Some(&existing),
+        None,
+    )
+    .expect("provider state should serialize");
+
+    assert_eq!(
+        rs.attributes.get("password"),
+        Some(&serde_json::json!("plain-secret"))
+    );
+}
+
+#[test]
+fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
+    use carina_core::resource::{ConcreteValue, Resource, State as ProviderState, Value};
+    use carina_core::value::SECRET_PREFIX;
+
+    let resource = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
+        "password",
+        Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+    );
+    let existing = ResourceState::new("db.Instance", "main", "awscc")
+        .with_identifier("db-old")
+        .with_attribute(
+            "password",
+            serde_json::json!(format!("{SECRET_PREFIX}previous")),
+        );
+    let provider_state = ProviderState {
+        id: resource.id.clone(),
+        identifier: Some("db-old".to_string()),
+        attributes: HashMap::new(),
+        exists: true,
+        dependency_bindings: BTreeSet::new(),
+
+        partial_read: None,
+    };
+
+    let mut rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        Some(&existing),
+        None,
+    )
+    .expect("provider state should serialize");
+    rs.merge_write_only_attributes(&resource, &["password".to_string()]);
+
+    assert_eq!(
+        rs.attributes.get("password"),
+        Some(&serde_json::json!("plain-secret"))
+    );
+    assert_eq!(rs.write_only_attributes, vec!["password"]);
+}
+
+#[test]
+fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
+    use carina_core::resource::{ConcreteValue, Resource, Value};
+    use carina_core::value::SECRET_PREFIX;
+    use indexmap::IndexMap;
+
+    let resource = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
+    let previous_tags = serde_json::json!({
+        "Name": "old-name",
+        "SecretTag": format!("{SECRET_PREFIX}previous"),
+    });
+    let mut provider_tags = IndexMap::new();
+    provider_tags.insert(
+        "Name".to_string(),
+        Value::Concrete(ConcreteValue::String("new-name".to_string())),
+    );
+    provider_tags.insert(
+        "SecretTag".to_string(),
+        Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+    );
+    let attrs = HashMap::from([(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(provider_tags)),
+    )]);
+    let existing = HashMap::from([("tags".to_string(), previous_tags.clone())]);
+
+    let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
+        &resource,
+        None,
+        &attrs,
+        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
+    );
+    let stored_tags = stored
+        .get("tags")
+        .and_then(|value| value.as_object())
+        .expect("tags should remain a map");
+    let secret = stored_tags
+        .get("SecretTag")
+        .and_then(|value| value.as_str())
+        .expect("secret tag should remain a string");
+
+    assert_eq!(
+        stored_tags.get("Name"),
+        Some(&serde_json::json!("new-name"))
+    );
+    assert!(secret.starts_with(SECRET_PREFIX), "got {secret}");
+    assert!(!secret.contains("plain-secret"));
+
+    let second_existing = HashMap::from([("tags".to_string(), stored["tags"].clone())]);
+    let stored_again = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
+        &resource,
+        None,
+        &attrs,
+        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&second_existing),
+    );
+    assert_eq!(stored_again.get("tags"), stored.get("tags"));
+}
+
+#[test]
+fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf() {
+    use carina_core::resource::{ConcreteValue, Resource, Value};
+    use carina_core::value::SECRET_PREFIX;
+    use indexmap::IndexMap;
+
+    let resource = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
+    let previous_tags = serde_json::json!({
+        "Name": "old-name",
+        "SecretTag": format!("{SECRET_PREFIX}previous"),
+    });
+    let attrs = HashMap::from([(
+        "tags".to_string(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+    )]);
+    let existing = HashMap::from([("tags".to_string(), previous_tags)]);
+
+    let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
+        &resource,
+        None,
+        &attrs,
+        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
+    );
+    let stored_tags = stored
+        .get("tags")
+        .and_then(|value| value.as_object())
+        .expect("tags should remain a map");
+    let secret = stored_tags
+        .get("SecretTag")
+        .and_then(|value| value.as_str())
+        .expect("missing secret tag should keep the previous hash");
+
+    assert!(!stored_tags.contains_key("Name"));
+    assert!(secret.starts_with(SECRET_PREFIX), "got {secret}");
+}
+
+#[test]
+fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted() {
+    use carina_core::resource::{ConcreteValue, Resource, Value};
+    use carina_core::value::SECRET_PREFIX;
+    use indexmap::IndexMap;
+
+    let resource = Resource::with_provider("awscc", "service.Widget", "main", None);
+    let previous_items = serde_json::json!([
+        {
+            "Name": "one",
+            "Token": format!("{SECRET_PREFIX}previous"),
+        },
+        {
+            "Name": "two",
+            "Public": "kept",
+        }
+    ]);
+    let mut first_provider_item = IndexMap::new();
+    first_provider_item.insert(
+        "Name".to_string(),
+        Value::Concrete(ConcreteValue::String("two".to_string())),
+    );
+    first_provider_item.insert(
+        "Public".to_string(),
+        Value::Concrete(ConcreteValue::String("kept".to_string())),
+    );
+    let mut second_provider_item = IndexMap::new();
+    second_provider_item.insert(
+        "Name".to_string(),
+        Value::Concrete(ConcreteValue::String("one".to_string())),
+    );
+    second_provider_item.insert(
+        "Token".to_string(),
+        Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+    );
+    let attrs = HashMap::from([(
+        "items".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Map(first_provider_item)),
+            Value::Concrete(ConcreteValue::Map(second_provider_item)),
+        ])),
+    )]);
+    let existing = HashMap::from([("items".to_string(), previous_items)]);
+
+    let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
+        &resource,
+        None,
+        &attrs,
+        PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
+    );
+    let stored_items = stored
+        .get("items")
+        .and_then(|value| value.as_str())
+        .expect("untrusted array alignment should hash the whole array");
+
+    assert!(
+        stored_items.starts_with(SECRET_PREFIX),
+        "got {stored_items}"
+    );
+    assert!(!stored_items.contains("plain-secret"));
 }
 
 #[test]
@@ -1856,7 +2258,13 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
         partial_read: None,
     };
 
-    let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        None,
+        None,
+    )
+    .unwrap();
 
     // The tags map in state should have the hash for SecretTag
     let tags_json = rs.attributes.get("tags").unwrap();
@@ -1929,7 +2337,13 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
         partial_read: None,
     };
 
-    let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        None,
+        None,
+    )
+    .unwrap();
 
     let tags_json = rs.attributes.get("tags").unwrap();
     let tags_obj = tags_json.as_object().unwrap();
@@ -1990,7 +2404,13 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
         partial_read: None,
     };
 
-    let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+    let rs = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        None,
+        None,
+    )
+    .unwrap();
 
     let values_json = rs.attributes.get("values").unwrap();
     let values_arr = values_json.as_array().unwrap();
@@ -2127,7 +2547,13 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
         partial_read: None,
     };
 
-    let err = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap_err();
+    let err = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        None,
+        None,
+    )
+    .unwrap_err();
     assert!(
         err.contains("unresolved reference") && err.contains("net.vpc.vpc_id"),
         "expected UnresolvedResourceRef diagnostic in error, got: {err}"
