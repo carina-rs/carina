@@ -4835,6 +4835,236 @@ let r = registry {
     assert_eq!(parsed.wait_bindings[0].target, "r.cert");
 }
 
+#[test]
+fn resolve_modules_with_config_populates_and_prefixes_directory_module_dependencies() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let module_dir = tmp.path().join("modules/registry");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::write(
+        module_dir.join("arguments.crn"),
+        r#"
+arguments {
+  label: String
+}
+
+attributes {
+  target_name = target.role_name
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        module_dir.join("resources.crn"),
+        r#"
+let target = mock.iam.Role {
+  role_name = "module-target"
+}
+
+let consumer = mock.iam.Role {
+  role_name   = "module-consumer"
+  description = "${target.role_name}:${label}"
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        module_dir.join("reads.crn"),
+        r#"
+let roles = read mock.iam.Roles {
+  name_regex = "^${target.role_name}$"
+}
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    let root_body = r#"
+let registry = use {
+  source = "../modules/registry"
+}
+
+let registry_publish = registry {
+  label = "caller-label"
+}
+"#;
+    fs::write(root_dir.join("main.crn"), root_body).unwrap();
+
+    let config = ProviderContext::default();
+    let mut parsed = crate::parser::parse(root_body, &config).expect("root must parse");
+    resolve_modules_with_config(&mut parsed, &root_dir, &config)
+        .expect("production module resolution must succeed");
+
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("registry_publish.consumer"))
+        .expect("expanded module consumer must exist");
+    assert!(
+        consumer
+            .dependency_bindings
+            .contains("registry_publish.target"),
+        "module resource dependency must be populated and prefixed: {:?}",
+        consumer.dependency_bindings,
+    );
+    assert!(
+        !consumer
+            .dependency_bindings
+            .contains("registry_publish.label"),
+        "module arguments must not be mistaken for intra-module resources: {:?}",
+        consumer.dependency_bindings,
+    );
+    assert_eq!(
+        consumer.attributes.get("description"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "module-target:caller-label".to_string(),
+        ))),
+        "module-local references must resolve before argument substitution"
+    );
+
+    let roles = parsed
+        .data_sources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("registry_publish.roles"))
+        .expect("expanded module data source must exist");
+    assert_eq!(
+        roles.dependency_bindings,
+        BTreeSet::from(["registry_publish.target".to_string()]),
+        "module data-source dependency must be populated and prefixed"
+    );
+    assert_eq!(
+        roles.attributes.get("name_regex"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "^module-target$".to_string(),
+        ))),
+        "module data-source input must resolve through the production loader"
+    );
+
+    let composition = parsed
+        .compositions
+        .iter()
+        .find(|composition| composition.binding.as_deref() == Some("registry_publish"))
+        .expect("module output composition must exist");
+    let target_name = composition
+        .signature
+        .attributes
+        .get("target_name")
+        .expect("module output must exist");
+    let crate::resource::CompositionAttribute::Forwarded(path) = target_name else {
+        panic!("module output must remain a deferred forwarded path: {target_name:?}");
+    };
+    assert_eq!(path.binding(), "registry_publish.target");
+}
+
+#[test]
+fn nested_directory_module_dependencies_follow_both_instance_prefixes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let inner_dir = tmp.path().join("modules/inner");
+    fs::create_dir_all(&inner_dir).unwrap();
+    fs::write(
+        inner_dir.join("main.crn"),
+        r#"
+attributes {
+  target_name = target.role_name
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        inner_dir.join("resources.crn"),
+        r#"
+let target = mock.iam.Role {
+  role_name = "module-target"
+}
+
+let consumer = mock.iam.Role {
+  role_name   = "module-consumer"
+  description = target.role_name
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        inner_dir.join("reads.crn"),
+        r#"
+let roles = read mock.iam.Roles {
+  name_regex = target.role_name
+}
+"#,
+    )
+    .unwrap();
+
+    let outer_dir = tmp.path().join("modules/outer");
+    fs::create_dir_all(&outer_dir).unwrap();
+    fs::write(
+        outer_dir.join("main.crn"),
+        r#"
+attributes {
+  target_name = inner.target_name
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        outer_dir.join("inner.crn"),
+        r#"
+let inner_module = use {
+  source = "../inner"
+}
+
+let inner = inner_module {}
+"#,
+    )
+    .unwrap();
+
+    let root_dir = tmp.path().join("root");
+    fs::create_dir_all(&root_dir).unwrap();
+    let root_body = r#"
+let outer_module = use {
+  source = "../modules/outer"
+}
+
+let outer = outer_module {}
+"#;
+    fs::write(root_dir.join("main.crn"), root_body).unwrap();
+
+    let config = ProviderContext::default();
+    let mut parsed = crate::parser::parse(root_body, &config).expect("root must parse");
+    resolve_modules_with_config(&mut parsed, &root_dir, &config)
+        .expect("nested production module resolution must succeed");
+
+    let target = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("outer.inner.target"))
+        .expect("twice-expanded target must exist");
+    assert_eq!(target.id.identity_or_empty(), "outer.inner.target");
+
+    let consumer = parsed
+        .resources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("outer.inner.consumer"))
+        .expect("twice-expanded consumer must exist");
+    assert_eq!(
+        consumer.dependency_bindings,
+        BTreeSet::from(["outer.inner.target".to_string()]),
+        "the outer pass must prefix the inner dependency once, matching the final target binding"
+    );
+
+    let roles = parsed
+        .data_sources
+        .iter()
+        .find(|resource| resource.binding.as_deref() == Some("outer.inner.roles"))
+        .expect("twice-expanded data source must exist");
+    assert_eq!(
+        roles.dependency_bindings,
+        BTreeSet::from(["outer.inner.target".to_string()]),
+        "nested data-source dependency metadata must match the twice-expanded target binding"
+    );
+}
+
 /// carina#3238: a `list(T)`-typed module argument must accept a bare
 /// `ResourceRef` whose runtime value is a list (e.g. the `arns` output
 /// of `read aws.iam.Roles`). Before the fix the `TypeExpr::List` arm of

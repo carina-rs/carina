@@ -15,7 +15,7 @@ use carina_core::differ::create_plan_with_cascades;
 use carina_core::executor::normalized::apply_desired_normalization;
 use carina_core::executor::{
     DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
-    UnresolvedResource, unresolved_data_source_inputs,
+    UnresolvedResource,
 };
 use carina_core::override_aware::OverrideAwareResources;
 use carina_core::plan::Plan;
@@ -78,13 +78,16 @@ fn split_execution_outcome(outcome: ExecutionOutcome) -> (ExecutionResult, bool)
 
 fn deferred_data_source_reads_from_data_sources(
     data_sources: &[DataSource],
+    managed: &[Resource],
+    current_states: &HashMap<ResourceId, State>,
 ) -> DeferredDataSourceReads {
     let mut deferred_data_source_reads = DeferredDataSourceReads::none();
-    for data_source in data_sources {
-        let unresolved = unresolved_data_source_inputs(data_source);
-        if !unresolved.is_empty() {
-            deferred_data_source_reads.insert(data_source.id.clone(), unresolved);
-        }
+    for (id, unresolved) in crate::wiring::classify_apply_time_data_source_read_inputs(
+        data_sources,
+        managed,
+        current_states,
+    ) {
+        deferred_data_source_reads.insert(id, unresolved);
     }
     deferred_data_source_reads
 }
@@ -1113,8 +1116,7 @@ async fn run_apply_locked(
     // managed resources are dependency-sorted; data sources are
     // refreshed in a later phase against the populated `current_states`.
     let mut sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
-    let data_sources: Vec<carina_core::resource::DataSource> =
-        unresolved_parsed.data_sources.clone();
+    let data_sources: Vec<carina_core::resource::DataSource> = parsed.data_sources.clone();
 
     // Build state-file-derived maps up front so anonymous → let-bound
     // rename transfer (#1685) can run between refresh phases 1 and 2.
@@ -1482,6 +1484,7 @@ async fn run_apply_locked(
         ctx,
         LateAnonymousIdentityInputs {
             resources: &mut override_aware_resources,
+            data_sources: &data_sources_for_plan,
             state_file: state_file.as_ref(),
             state_block_claims: &state_block_claims,
             current_states: &mut current_states,
@@ -2032,8 +2035,6 @@ async fn run_apply_from_plan_locked(
     let sorted_resources = &plan_file.sorted_resources;
     let plan_compositions: &[carina_core::resource::Composition] = &plan_file.compositions;
     let plan_data_sources: &[carina_core::resource::DataSource] = &plan_file.data_sources;
-    let deferred_data_source_reads =
-        deferred_data_source_reads_from_data_sources(plan_data_sources);
 
     // Rebuild planned current_states HashMap from plan file
     let planned_states: HashMap<ResourceId, State> = plan_file
@@ -2041,6 +2042,11 @@ async fn run_apply_from_plan_locked(
         .into_iter()
         .map(|entry| (entry.id, entry.state))
         .collect();
+    let deferred_data_source_reads = deferred_data_source_reads_from_data_sources(
+        plan_data_sources,
+        sorted_resources,
+        &planned_states,
+    );
 
     // Create provider early for drift detection
     let (provider, ctx) =

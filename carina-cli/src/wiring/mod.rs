@@ -667,7 +667,17 @@ pub(crate) fn adopt_unique_state_identity_for_unresolved_anonymous(
 
 pub(crate) fn assign_fallback_identities_for_unresolved_anonymous(
     resources: &mut [Resource],
+    data_sources: &[DataSource],
 ) -> Vec<(ResourceId, ResourceId)> {
+    let known_bindings: HashSet<String> = resources
+        .iter()
+        .filter_map(|resource| resource.binding.clone())
+        .chain(
+            data_sources
+                .iter()
+                .filter_map(|data_source| data_source.binding.clone()),
+        )
+        .collect();
     let mut used: HashMap<(String, String, Option<String>), HashSet<String>> = HashMap::new();
     let mut renames = Vec::new();
     for resource in resources.iter() {
@@ -701,7 +711,7 @@ pub(crate) fn assign_fallback_identities_for_unresolved_anonymous(
             .map(carina_core::parser::pascal_to_snake)
             .collect::<Vec<_>>()
             .join("_");
-        let hash = fallback_anonymous_hash(resource);
+        let hash = fallback_anonymous_hash(resource, &known_bindings);
         let bare_identifier = if provider_snake.is_empty() {
             format!("{type_snake}_{hash}")
         } else {
@@ -740,6 +750,7 @@ pub(crate) fn assign_fallback_identities_for_unresolved_anonymous(
 
 pub(crate) struct LateAnonymousIdentityInputs<'a> {
     pub resources: &'a mut OverrideAwareResources,
+    pub data_sources: &'a [DataSource],
     pub state_file: Option<&'a StateFile>,
     pub state_block_claims: &'a StateBlockClaims,
     pub current_states: &'a mut HashMap<ResourceId, State>,
@@ -772,8 +783,10 @@ pub(crate) fn reconcile_late_anonymous_identities(
         adopt_unique_state_identity_for_unresolved_anonymous(inputs.resources.resources_mut(), sf);
     }
 
-    let fallback_renames =
-        assign_fallback_identities_for_unresolved_anonymous(inputs.resources.resources_mut());
+    let fallback_renames = assign_fallback_identities_for_unresolved_anonymous(
+        inputs.resources.resources_mut(),
+        inputs.data_sources,
+    );
     for (from, to) in &fallback_renames {
         if let Some(mut state) = inputs.current_states.remove(from) {
             state.id = to.clone();
@@ -790,7 +803,39 @@ pub(crate) fn reconcile_late_anonymous_identities(
     Ok(())
 }
 
-fn fallback_anonymous_hash(resource: &Resource) -> String {
+fn fallback_hash_dependency_bindings(
+    resource: &Resource,
+    known_bindings: &HashSet<String>,
+) -> BTreeSet<String> {
+    let Some(carina_core::resource::ModuleSource::Module { instance, .. }) =
+        &resource.module_source
+    else {
+        // Preserve the historical hash input byte-for-byte for root resources.
+        return resource.dependency_bindings.clone();
+    };
+
+    let instance_prefix = format!("{instance}.");
+    resource
+        .dependency_bindings
+        .iter()
+        .map(|binding| {
+            if binding.starts_with(&instance_prefix) {
+                return binding.clone();
+            }
+
+            let expanded = format!("{instance_prefix}{binding}");
+            if known_bindings.contains(&expanded) {
+                expanded
+            } else {
+                // Module arguments and outer-scope bindings are not owned by
+                // this module instance and retain their historical spelling.
+                binding.clone()
+            }
+        })
+        .collect()
+}
+
+fn fallback_anonymous_hash(resource: &Resource, known_bindings: &HashSet<String>) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     resource.id.provider.hash(&mut hasher);
     resource.id.resource_type.hash(&mut hasher);
@@ -809,7 +854,11 @@ fn fallback_anonymous_hash(resource: &Resource) -> String {
         key.hash(&mut hasher);
         value.hash(&mut hasher);
     }
-    resource.dependency_bindings.hash(&mut hasher);
+    // Released module identities hashed the expanded binding spelling. Promote
+    // a module-local spelling to that compatibility form only when the prefixed
+    // name is an actual sibling binding; arguments and outer-scope names pass
+    // through unchanged. Root resources retain their exact historical set.
+    fallback_hash_dependency_bindings(resource, known_bindings).hash(&mut hasher);
     format!("{:08x}", hasher.finish() & 0xffff_ffff)
 }
 
@@ -1884,7 +1933,6 @@ pub async fn create_plan_from_parsed<E: Clone>(
     create_plan_from_parsed_with_upstream(
         parsed,
         &parsed.resources,
-        &parsed.data_sources,
         state_file,
         refresh,
         &HashMap::new(),
@@ -1899,7 +1947,6 @@ pub async fn create_plan_from_parsed<E: Clone>(
 pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     parsed: &carina_core::parser::File<E>,
     unresolved_resources: &[Resource],
-    unresolved_data_sources: &[DataSource],
     state_file: &Option<StateFile>,
     refresh: bool,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
@@ -1913,7 +1960,6 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
         &ctx,
         parsed,
         unresolved_resources,
-        unresolved_data_sources,
         state_file,
         refresh,
         remote_bindings,
@@ -1929,7 +1975,6 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E>,
     unresolved_resources: &[Resource],
-    unresolved_data_sources: &[DataSource],
     state_file: &Option<StateFile>,
     refresh: bool,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
@@ -1950,7 +1995,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // `current_states`.
     let mut sorted_resources =
         sort_resources_by_dependencies(&parsed.resources).map_err(AppError::Validation)?;
-    let data_sources: Vec<DataSource> = unresolved_data_sources.to_vec();
+    let data_sources: Vec<DataSource> = parsed.data_sources.clone();
 
     // Select appropriate Provider based on configuration
     let provider = get_provider_with_ctx(ctx, parsed, base_dir).await?;
@@ -2418,6 +2463,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         ctx,
         LateAnonymousIdentityInputs {
             resources: &mut override_aware_resources,
+            data_sources: &data_sources_for_plan,
             state_file: state_file.as_ref(),
             state_block_claims,
             current_states: &mut current_states,
@@ -3361,8 +3407,8 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
         remote_bindings,
         wait_aliases,
     });
-    let mut deferred = classify_apply_time_data_source_reads(data_sources, managed, current_states);
-    propagate_deferred_data_source_chains(data_sources, &mut deferred);
+    let deferred =
+        classify_apply_time_data_source_read_inputs(data_sources, managed, current_states);
 
     let mut resolutions = Vec::with_capacity(data_sources.len());
     for resource in data_sources {
@@ -3396,6 +3442,22 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
     }
 
     Ok(resolutions)
+}
+
+/// Classify data-source reads that must run after apply-time publication.
+///
+/// This is shared with saved-plan apply so both live and persisted plans use
+/// the expanded data-source set plus its preserved dependency metadata. The
+/// returned map is keyed by data-source id; an empty input-details vector is
+/// valid when parsing folded the value but retained `dependency_bindings`.
+pub(crate) fn classify_apply_time_data_source_read_inputs(
+    data_sources: &[DataSource],
+    managed: &[Resource],
+    current_states: &HashMap<ResourceId, State>,
+) -> HashMap<ResourceId, Vec<UnresolvedDataSourceInput>> {
+    let mut deferred = classify_apply_time_data_source_reads(data_sources, managed, current_states);
+    propagate_deferred_data_source_chains(data_sources, &mut deferred);
+    deferred
 }
 
 fn classify_apply_time_data_source_reads(
@@ -3439,8 +3501,24 @@ fn classify_apply_time_data_source_reads(
                                 managed_resource_is_missing_from_state(target, current_states)
                             })
                     });
+            // Directory reference resolution can fold an input such as
+            // `"^${target.name}$"` to a concrete string. The structural
+            // dependency is deliberately retained in `dependency_bindings`;
+            // consult it so using the expanded parse does not turn an
+            // apply-time read into a premature refresh-time read.
+            let recorded_dependency_requires_defer =
+                resource.dependency_bindings.iter().any(|binding| {
+                    managed_by_binding
+                        .get(binding.as_str())
+                        .is_some_and(|target| {
+                            managed_resource_is_missing_from_state(target, current_states)
+                        })
+                });
             let has_unknown = input_refs.iter().any(|input| !input.unknowns.is_empty());
-            let must_defer = path_requires_defer || binding_requires_defer || has_unknown;
+            let must_defer = path_requires_defer
+                || binding_requires_defer
+                || recorded_dependency_requires_defer
+                || has_unknown;
             must_defer.then(|| (resource.id.clone(), input_refs))
         })
         .collect()
@@ -3503,7 +3581,16 @@ fn propagate_deferred_data_source_chains(
                         .get(binding.as_str())
                         .is_some_and(|id| deferred.contains_key(*id))
                 });
-            if path_depends_on_deferred_read || binding_depends_on_deferred_read {
+            let recorded_dependency_depends_on_deferred_read =
+                resource.dependency_bindings.iter().any(|binding| {
+                    data_source_id_by_binding
+                        .get(binding.as_str())
+                        .is_some_and(|id| deferred.contains_key(*id))
+                });
+            if path_depends_on_deferred_read
+                || binding_depends_on_deferred_read
+                || recorded_dependency_depends_on_deferred_read
+            {
                 deferred.insert(resource.id.clone(), refs);
                 changed = true;
             }

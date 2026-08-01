@@ -15,7 +15,7 @@ use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
 use carina_core::resource::{
-    ConcreteValue, ResolvedDataSource, Resource, ResourceId, State, Value,
+    ConcreteValue, DataSource, ResolvedDataSource, Resource, ResourceId, State, Value,
 };
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
@@ -56,10 +56,10 @@ pub fn map_lock_error(e: BackendError) -> AppError {
 }
 
 fn format_deferred_state_refresh_warning(
-    resource_id: &ResourceId,
+    resource: &DataSource,
     unresolved: &[UnresolvedDataSourceInput],
 ) -> String {
-    let refs = unresolved
+    let mut refs = unresolved
         .iter()
         .flat_map(|input| {
             let paths = input.paths.iter().map(|path| path.to_dot_string());
@@ -70,11 +70,19 @@ fn format_deferred_state_refresh_warning(
                 .map(|reason| format!("unknown({reason})"));
             paths.chain(bindings).chain(unknowns)
         })
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect::<Vec<_>>();
+    if refs.is_empty() {
+        refs.extend(resource.dependency_bindings.iter().cloned());
+    }
+    let refs = if refs.is_empty() {
+        "unknown input dependency".to_string()
+    } else {
+        refs.join(", ")
+    };
     format!(
-        "Warning: skipped refreshing data source {resource_id} because its inputs depend on \
-         missing or deferred state bindings: {refs}"
+        "Warning: skipped refreshing data source {} because its inputs depend on \
+         missing or deferred state bindings: {refs}",
+        resource.id
     )
 }
 
@@ -1211,7 +1219,7 @@ pub(crate) async fn run_state_refresh_locked(
                 } => {
                     eprintln!(
                         "{}",
-                        format_deferred_state_refresh_warning(&resource.id, &unresolved).yellow()
+                        format_deferred_state_refresh_warning(&resource, &unresolved).yellow()
                     );
                     continue;
                 }
@@ -3406,9 +3414,9 @@ mod tests {
 
     #[test]
     fn deferred_data_source_state_refresh_warning_names_read_and_missing_upstream() {
-        let id = ResourceId::with_provider_identity("mock", "iam.Roles", "roles", None);
+        let resource = DataSource::with_provider("mock", "iam.Roles", "roles", None);
         let warning = format_deferred_state_refresh_warning(
-            &id,
+            &resource,
             &[UnresolvedDataSourceInput {
                 attribute: "name_regex".to_string(),
                 paths: vec![carina_core::resource::AccessPath::new(
@@ -3423,6 +3431,22 @@ mod tests {
         assert!(warning.contains("mock.iam.Roles.roles"));
         assert!(warning.contains("target_role.role_name"));
         assert!(warning.contains("skipped refreshing data source"));
+    }
+
+    #[test]
+    fn deferred_data_source_state_refresh_warning_names_recorded_dependency() {
+        let mut resource = DataSource::with_provider("mock", "iam.Roles", "roles", None);
+        resource
+            .dependency_bindings
+            .insert("registry_publish.target".to_string());
+
+        let warning = format_deferred_state_refresh_warning(&resource, &[]);
+
+        assert!(
+            warning.contains("registry_publish.target"),
+            "warning must name the recorded dependency that caused deferral: {warning}"
+        );
+        assert!(!warning.trim_end().ends_with(':'));
     }
 
     // --- carina#3338: module-prefixed bindings + exports.<key> ---

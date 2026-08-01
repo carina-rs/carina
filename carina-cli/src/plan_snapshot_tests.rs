@@ -180,6 +180,22 @@ fn snapshot_all_create() {
     insta::assert_snapshot!(output);
 }
 
+#[test]
+fn non_module_anonymous_dependency_keeps_historical_fallback_identity() {
+    let (plan, _schemas, _moved) = build_plan_from_fixture("all_create");
+    let route_table = plan
+        .effects()
+        .iter()
+        .find(|effect| effect.resource_id().resource_type == "ec2.RouteTable")
+        .expect("all_create must contain the anonymous route table");
+
+    assert_eq!(
+        route_table.resource_id().identity_or_empty(),
+        "awscc_ec2_route_table_8710819e",
+        "top-level dependency metadata must retain its byte-for-byte legacy hash input"
+    );
+}
+
 /// carina#2191 Phase 3b-2b acceptance: a directory with one default
 /// instance (`provider awscc { ... }`) and one named instance
 /// (`let us = provider awscc { ... }`), plus two resources where only

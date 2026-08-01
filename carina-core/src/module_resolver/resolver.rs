@@ -147,6 +147,14 @@ impl<'cfg> ModuleResolver<'cfg> {
             }
             crate::config_loader::merge_parsed_file(&mut merged, parsed);
         }
+
+        // Resolve references while the module's own binding namespace is still
+        // intact. Besides folding module-local values, this records the direct
+        // dependency bindings that expansion subsequently instance-prefixes.
+        // Argument bindings remain deferred for call-site substitution.
+        crate::parser::resolve_resource_refs_with_config(&mut merged, self.config)
+            .map_err(ModuleError::Parse)?;
+
         let type_errors = crate::validation::resolve_file_type_exprs(&mut merged, self.config);
         if let Some(first) = type_errors.into_iter().next() {
             return Err(ModuleError::Parse(ParseError::InvalidExpression {

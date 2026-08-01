@@ -777,7 +777,6 @@ pub async fn run_plan(
     let ctx = create_plan_from_parsed_with_upstream(
         &parsed,
         &unresolved_parsed.resources,
-        &unresolved_parsed.data_sources,
         &state_file,
         refresh,
         &remote_bindings,
