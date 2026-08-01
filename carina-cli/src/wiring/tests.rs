@@ -1142,7 +1142,6 @@ moved {
     let err = match create_plan_from_parsed_with_upstream(
         &parsed,
         &parsed.resources,
-        &parsed.data_sources,
         &state_file,
         false,
         &HashMap::new(),
@@ -1229,7 +1228,6 @@ removed {
     let err = match create_plan_from_parsed_with_upstream(
         &parsed,
         &parsed.resources,
-        &parsed.data_sources,
         &state_file,
         false,
         &HashMap::new(),
@@ -1896,7 +1894,6 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         &ctx,
         &parsed,
         &unresolved_parsed.resources,
-        &unresolved_parsed.data_sources,
         &Some(state_file),
         false,
         &HashMap::new(),
@@ -2051,7 +2048,6 @@ moved {{
     let ctx = create_plan_from_parsed_with_upstream(
         &parsed,
         &parsed.resources,
-        &parsed.data_sources,
         &Some(state_file),
         false,
         &HashMap::new(),
@@ -2306,6 +2302,46 @@ fn resolve_data_source_refs_for_refresh_defers_resolvable_interpolation_when_tar
         panic!("value-resolvable input that references a new resource must defer: {resolved:?}");
     };
     assert_eq!(unresolved[0].paths[0].to_dot_string(), "target.role_name");
+}
+
+#[test]
+fn resolve_data_source_refs_for_refresh_defers_folded_input_with_missing_dependency() {
+    use carina_core::resource::DataSource;
+
+    let mut target = Resource::with_provider("test", "Upstream", "registry_publish.target", None);
+    target.binding = Some("registry_publish.target".to_string());
+
+    // A resolved input may be folded to a concrete string while retaining
+    // its structural dependency. Module expansion must carry that dependency
+    // under the same instance-prefixed binding used by the managed target.
+    let mut lookup = DataSource::with_provider("test", "Lookup", "registry_publish.roles", None);
+    lookup.binding = Some("registry_publish.roles".to_string());
+    lookup.attributes.insert(
+        "filter".to_string(),
+        Value::Concrete(ConcreteValue::String("^target$".to_string())),
+    );
+    lookup
+        .dependency_bindings
+        .insert("registry_publish.target".to_string());
+
+    let resolved = resolve_data_source_refs_for_refresh(
+        &[target],
+        &[],
+        &[lookup],
+        &HashMap::new(),
+        &HashMap::new(),
+        &carina_core::schema::SchemaRegistry::new(),
+        &[],
+    )
+    .expect("resolution should classify the preserved dependency");
+
+    assert!(
+        matches!(
+            resolved[0],
+            DataSourceRefreshResolution::DeferredToApply { .. }
+        ),
+        "a folded input whose dependency is not in state must defer: {resolved:?}"
+    );
 }
 
 #[test]
@@ -2724,6 +2760,32 @@ fn anonymous_route_resource() -> Resource {
         Value::Concrete(ConcreteValue::String("rtb-123".to_string())),
     );
     resource
+}
+
+#[test]
+fn fallback_anonymous_identity_is_stable_when_dependency_bindings_are_prefixed() {
+    fn module_resources(dependency: &str) -> Vec<Resource> {
+        let target = Resource::with_provider("mock", "iam.Role", "registry_publish.target", None)
+            .with_binding("registry_publish.target");
+        let mut resource = Resource::with_provider("mock", "iam.Role", "", None);
+        resource.module_source = Some(carina_core::resource::ModuleSource::Module {
+            name: "registry".to_string(),
+            instance: "registry_publish".to_string(),
+        });
+        resource.dependency_bindings.insert(dependency.to_string());
+        vec![target, resource]
+    }
+
+    let mut unprefixed = module_resources("target");
+    let mut prefixed = module_resources("registry_publish.target");
+
+    assign_fallback_identities_for_unresolved_anonymous(&mut unprefixed, &[]);
+    assign_fallback_identities_for_unresolved_anonymous(&mut prefixed, &[]);
+
+    assert_eq!(
+        unprefixed[1].id, prefixed[1].id,
+        "derived dependency metadata must not change an anonymous resource's persistent identity"
+    );
 }
 
 #[test]

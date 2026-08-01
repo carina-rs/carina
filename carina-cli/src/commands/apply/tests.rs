@@ -822,6 +822,206 @@ let consumer = mock.iam.Role {{
     )
 }
 
+fn module_data_source_fixture() -> (ApplyCancellationFixture, ApplyTimeReadShared) {
+    let fixture = ApplyCancellationFixture::new();
+    let module_dir = fixture.config_path().join("registry");
+    std::fs::create_dir_all(&module_dir).expect("create module fixture directory");
+    std::fs::write(
+        module_dir.join("read.crn"),
+        r#"
+arguments {
+  consumer_name: String
+}
+
+let caller = read mock.iam.Roles {
+  name_regex = "^existing$"
+}
+"#,
+    )
+    .expect("write module data-source fixture");
+    std::fs::write(
+        module_dir.join("resource.crn"),
+        r#"
+let consumer = mock.iam.Role {
+  role_name  = consumer_name
+  description = "role:${caller.names[0]}"
+}
+"#,
+    )
+    .expect("write module resource fixture");
+
+    let root = format!(
+        r#"backend local {{ path = "{}" }}
+provider mock {{}}
+
+let registry = use {{
+  source = "./registry"
+}}
+
+let registry_publish = registry {{
+  consumer_name = "module-consumer"
+}}
+"#,
+        fixture.state_path().display()
+    );
+    let fixture = fixture.with_raw_config(root);
+
+    let shared = ApplyTimeReadShared::default();
+    shared.created_roles.lock().unwrap().insert(
+        "existing".to_string(),
+        HashMap::from([("role_name".to_string(), string_value("existing"))]),
+    );
+
+    (fixture, shared)
+}
+
+fn load_and_resolve_module_data_source_fixture(
+    fixture: &ApplyCancellationFixture,
+    shared: &ApplyTimeReadShared,
+) -> (
+    carina_core::parser::InferredFile,
+    carina_core::parser::ParsedFile,
+) {
+    let loaded = load_configuration_with_config(
+        fixture.config_path(),
+        fixture.provider_context(),
+        &SchemaRegistry::new(),
+    )
+    .expect("module data-source fixture must load");
+    let mut parsed = loaded.parsed;
+    let unresolved_parsed = loaded.unresolved_parsed;
+    let validation_errors = crate::commands::validate_and_resolve_errors_with_factories(
+        &mut parsed,
+        get_base_dir(fixture.config_path()),
+        false,
+        vec![Box::new(ApplyTimeReadFactory {
+            shared: shared.clone(),
+        })],
+        HashMap::new(),
+    );
+    assert!(
+        validation_errors.is_empty(),
+        "module data-source fixture must validate, got: {validation_errors:?}"
+    );
+
+    (parsed, unresolved_parsed)
+}
+
+#[tokio::test]
+async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
+    use carina_core::effect::Effect;
+
+    let (fixture, shared) = module_data_source_fixture();
+    let (parsed, unresolved_parsed) =
+        load_and_resolve_module_data_source_fixture(&fixture, &shared);
+
+    assert!(
+        unresolved_parsed.data_sources.is_empty(),
+        "the pre-expansion snapshot must not contain module declarations"
+    );
+    assert_eq!(
+        parsed.data_sources[0].binding.as_deref(),
+        Some("registry_publish.caller"),
+        "module resolution must prefix the data-source binding"
+    );
+
+    let ctx = WiringContext::new(vec![Box::new(ApplyTimeReadFactory {
+        shared: shared.clone(),
+    })]);
+    let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
+        &ctx,
+        &parsed,
+        &unresolved_parsed.resources,
+        &None,
+        true,
+        &HashMap::new(),
+        &carina_core::identifier::StateBlockClaims::empty(),
+        &crate::wiring::ResolvedStateBlockTargets::default(),
+        get_base_dir(fixture.config_path()),
+    )
+    .await
+    .expect("module data-source plan should build");
+
+    assert_eq!(
+        plan_ctx
+            .data_sources
+            .iter()
+            .map(|data_source| data_source.id.identity_or_empty())
+            .collect::<Vec<_>>(),
+        ["registry_publish.caller"],
+        "the expanded module data source must be in the planning set"
+    );
+    let consumer = plan_ctx
+        .plan
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Create(resource)
+                if resource.id.identity_or_empty() == "registry_publish.consumer" =>
+            {
+                Some(resource)
+            }
+            _ => None,
+        })
+        .expect("module consumer must have a create effect");
+    assert_eq!(
+        consumer.attributes.get("description"),
+        Some(&string_value("role:existing")),
+        "the module-scoped interpolation must resolve before planning"
+    );
+    assert_eq!(
+        shared.read_calls.load(Ordering::SeqCst),
+        1,
+        "planning must read the module data source exactly once"
+    );
+}
+
+#[tokio::test]
+async fn apply_reads_module_data_source_and_resolves_consumer_interpolation() {
+    let (fixture, shared) = module_data_source_fixture();
+    let (mut parsed, unresolved_parsed) =
+        load_and_resolve_module_data_source_fixture(&fixture, &shared);
+    let ctx = WiringContext::new(vec![Box::new(ApplyTimeReadFactory {
+        shared: shared.clone(),
+    })]);
+    let observer_factory = fixture.observer_factory();
+
+    run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &unresolved_parsed,
+        true,
+        fixture.backend(),
+        None,
+        get_base_dir(fixture.config_path()),
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect("apply must read the module data source before creating its consumer");
+
+    assert_eq!(
+        shared.operations.lock().unwrap().as_slice(),
+        [
+            "read:registry_publish.caller",
+            "create:registry_publish.consumer"
+        ],
+        "apply must include the prefixed read before its module consumer"
+    );
+    let created_roles = shared.created_roles.lock().unwrap();
+    let consumer = created_roles
+        .get("registry_publish.consumer")
+        .expect("module consumer must be created");
+    assert_eq!(
+        consumer.get("description"),
+        Some(&string_value("role:existing")),
+        "apply must not send a deferred interpolation to the provider"
+    );
+}
+
 #[test]
 fn total_apply_line_formats_duration() {
     assert_eq!(
@@ -879,11 +1079,39 @@ fn export_only_fast_path_is_disabled_when_deferred_reads_exist() {
     plan.add(carina_core::effect::Effect::Read {
         resource: carina_core::resource::ResolvedDataSource::new(data_source.clone()),
     });
-    let deferred_reads = deferred_data_source_reads_from_data_sources(&[data_source]);
+    let mut target = Resource::with_provider("mock", "iam.Role", "target_role", None);
+    target.binding = Some("target_role".to_string());
+    let deferred_reads =
+        deferred_data_source_reads_from_data_sources(&[data_source], &[target], &HashMap::new());
 
     assert!(
         !can_use_export_only_fast_path(&plan, &deferred_reads),
         "deferred reads are executable effects and must not be silently skipped"
+    );
+}
+
+#[test]
+fn saved_plan_classifies_folded_data_source_input_from_preserved_dependency() {
+    let mut data_source =
+        DataSource::with_provider("mock", "iam.Roles", "registry_publish.roles", None);
+    data_source.binding = Some("registry_publish.roles".to_string());
+    data_source
+        .attributes
+        .insert("name_regex".to_string(), string_value("^target-role$"));
+    data_source
+        .dependency_bindings
+        .insert("registry_publish.target_role".to_string());
+    let id = data_source.id.clone();
+    let mut target =
+        Resource::with_provider("mock", "iam.Role", "registry_publish.target_role", None);
+    target.binding = Some("registry_publish.target_role".to_string());
+
+    let deferred_reads =
+        deferred_data_source_reads_from_data_sources(&[data_source], &[target], &HashMap::new());
+
+    assert!(
+        deferred_reads.contains(&id),
+        "saved-plan apply must preserve a deferred read after parsing folded its input value"
     );
 }
 
@@ -1837,7 +2065,6 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         &ctx,
         &parsed,
         &unresolved_parsed.resources,
-        &unresolved_parsed.data_sources,
         &state_file,
         true,
         &HashMap::new(),

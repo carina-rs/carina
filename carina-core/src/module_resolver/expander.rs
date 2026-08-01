@@ -478,13 +478,36 @@ pub(crate) fn build_expansion_trace(
 ///
 /// This is the *single* definition of the instance-prefix spelling.
 /// Every site that prefixes a binding — resource ids, resource
-/// bindings, `rewrite_intra_module_refs`, and [`prefix_wait_binding`] —
-/// routes through here so the format can never drift between binding
-/// kinds (the carina#3061 class of bug was a binding kind that was
-/// *not* prefixed at all; keeping one spelling makes "is this kind
-/// prefixed?" a single, greppable call site per kind).
+/// bindings, dependency bindings, `rewrite_intra_module_refs`, and
+/// [`prefix_wait_binding`] — routes through here so the format can never
+/// drift between binding kinds (the carina#3061 class of bug was a binding
+/// kind that was *not* prefixed at all; keeping one spelling makes "is this
+/// kind prefixed?" a single, greppable call site per kind).
 fn apply_instance_prefix(instance_prefix: &str, name: &str) -> String {
     format!("{instance_prefix}.{name}")
+}
+
+/// Prefix dependency metadata that names bindings owned by this module.
+///
+/// Argument names and caller/outer-scope bindings are deliberately left
+/// unchanged: they are not members of `intra_module_bindings`, matching the
+/// discrimination used by [`rewrite_intra_module_refs`] for value-shaped
+/// references.
+fn prefix_dependency_bindings(
+    dependency_bindings: &BTreeSet<String>,
+    instance_prefix: &str,
+    intra_module_bindings: &HashSet<String>,
+) -> BTreeSet<String> {
+    dependency_bindings
+        .iter()
+        .map(|binding| {
+            if intra_module_bindings.contains(binding) {
+                apply_instance_prefix(instance_prefix, binding)
+            } else {
+                binding.clone()
+            }
+        })
+        .collect()
 }
 
 /// `BindingName`-typed instance-prefix: the wait path's binding-name
@@ -567,10 +590,11 @@ fn prefix_attr_value(
     substituted
 }
 
-/// Instance-prefix one module resource: `Bound` id name + binding take
-/// the instance prefix, typed module-source is stamped, and every
-/// attribute is `rewrite_intra_module_refs` → `substitute_arguments`
-/// → `canonicalize_in_place` (the #2222 / #2815 / #2817 sequence).
+/// Instance-prefix one module resource: `Bound` id name, binding, and
+/// intra-module dependency metadata take the instance prefix, typed
+/// module-source is stamped, and every attribute is
+/// `rewrite_intra_module_refs` → `substitute_arguments` →
+/// `canonicalize_in_place` (the #2222 / #2815 / #2817 sequence).
 ///
 /// The single definition of "expand a module resource", shared by the
 /// `module.resources` loop and `prefix_deferred_for_expression`'s
@@ -598,6 +622,11 @@ fn prefix_module_resource(
     if let Some(ref binding) = new_resource.binding {
         new_resource.binding = Some(apply_instance_prefix(instance_prefix, binding));
     }
+    new_resource.dependency_bindings = prefix_dependency_bindings(
+        &new_resource.dependency_bindings,
+        instance_prefix,
+        intra_module_bindings,
+    );
 
     new_resource.module_source = Some(crate::resource::ModuleSource::Module {
         name: module_name.to_string(),
@@ -625,8 +654,9 @@ fn prefix_module_resource(
 
 /// Instance-prefix one module data source — the [`DataSource`] analogue
 /// of [`prefix_module_resource`]. A `DataSource` carries no `prefixes`
-/// field, so only its assigned identity, `binding`, `module_source`, and
-/// attributes take the module-boundary treatment.
+/// field, so its assigned identity, `binding`, intra-module dependency
+/// metadata, `module_source`, and attributes take the module-boundary
+/// treatment.
 fn prefix_module_data_source(
     data_source: &DataSource,
     instance_prefix: &str,
@@ -646,6 +676,11 @@ fn prefix_module_data_source(
     if let Some(ref binding) = new_data_source.binding {
         new_data_source.binding = Some(apply_instance_prefix(instance_prefix, binding));
     }
+    new_data_source.dependency_bindings = prefix_dependency_bindings(
+        &new_data_source.dependency_bindings,
+        instance_prefix,
+        intra_module_bindings,
+    );
 
     new_data_source.module_source = Some(crate::resource::ModuleSource::Module {
         name: module_name.to_string(),
@@ -1250,5 +1285,87 @@ fn rewrite_ref_prefixes(
             })
         }
         _ => value.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_module_data_source_prefixes_non_empty_identity_and_binding() {
+        let mut data_source =
+            DataSource::with_provider("aws", "sts.CallerIdentity", "caller", None)
+                .with_binding("caller");
+        data_source
+            .dependency_bindings
+            .extend(["target".to_string(), "module_argument".to_string()]);
+
+        let prefixed = prefix_module_data_source(
+            &data_source,
+            "registry_publish",
+            "registry",
+            &HashSet::from(["caller".to_string(), "target".to_string()]),
+            &HashMap::new(),
+        );
+
+        assert_eq!(prefixed.id.identity_or_empty(), "registry_publish.caller");
+        assert_eq!(prefixed.binding.as_deref(), Some("registry_publish.caller"));
+        assert_eq!(
+            prefixed.dependency_bindings,
+            BTreeSet::from([
+                "module_argument".to_string(),
+                "registry_publish.target".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn prefix_module_resource_prefixes_only_intra_module_dependency_bindings() {
+        let mut resource =
+            Resource::with_provider("aws", "iam.Role", "consumer", None).with_binding("consumer");
+        resource.dependency_bindings.extend([
+            "target".to_string(),
+            "module_argument".to_string(),
+            "outer_binding".to_string(),
+        ]);
+
+        let prefixed = prefix_module_resource(
+            &resource,
+            "registry_publish",
+            "registry",
+            &HashSet::from(["consumer".to_string(), "target".to_string()]),
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            prefixed.dependency_bindings,
+            BTreeSet::from([
+                "module_argument".to_string(),
+                "outer_binding".to_string(),
+                "registry_publish.target".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn prefix_module_data_source_prefixes_managed_dependency_binding() {
+        let mut roles =
+            DataSource::with_provider("mock", "iam.Roles", "roles", None).with_binding("roles");
+        roles.dependency_bindings.insert("target".to_string());
+
+        let intra_module_bindings = HashSet::from(["target".to_string(), "roles".to_string()]);
+        let roles = prefix_module_data_source(
+            &roles,
+            "registry_publish",
+            "registry",
+            &intra_module_bindings,
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            roles.dependency_bindings,
+            BTreeSet::from(["registry_publish.target".to_string()]),
+        );
     }
 }

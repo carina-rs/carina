@@ -312,6 +312,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     }
     let fallback_renames = assign_fallback_identities_for_unresolved_anonymous(
         override_aware_resources.resources_mut(),
+        &data_sources_for_plan,
     );
     for (from, to) in &fallback_renames {
         if let Some(mut state) = current_states.remove(from) {
