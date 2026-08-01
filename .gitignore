@@ -35,3 +35,9 @@ site/.astro/
 
 # Superpowers brainstorm sessions
 .superpowers/
+
+# Share project skills with the team. A global ~/.gitignore may ignore
+# .claude/ wholesale; re-include the checked-in skills explicitly.
+!.claude/
+!.claude/skills/
+!.claude/skills/**
