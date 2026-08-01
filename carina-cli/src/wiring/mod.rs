@@ -184,9 +184,9 @@ pub fn build_factories_from_providers(
             None => continue,
         };
 
-        let binary_path = if source.starts_with("file://") || source.starts_with("github.com/") {
+        let installed = if source.starts_with("file://") || source.starts_with("github.com/") {
             match carina_provider_resolver::find_installed_provider(base_dir, config) {
-                Ok(path) => path,
+                Ok(installed) => installed,
                 Err(e) => {
                     let reason = format!("Provider '{}' {}", config.name, e);
                     eprintln!("{}", reason.red());
@@ -204,7 +204,7 @@ pub fn build_factories_from_providers(
             continue;
         };
 
-        if !carina_provider_resolver::is_wasm_provider(&binary_path) {
+        if !carina_provider_resolver::is_wasm_provider(installed.path()) {
             let reason = format!(
                 "Provider '{}': native binaries are no longer supported. Use a .wasm component instead.",
                 config.name
@@ -214,27 +214,29 @@ pub fn build_factories_from_providers(
             continue;
         }
 
-        let factory_result: Result<Box<dyn ProviderFactory>, String> = {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(
-                    carina_plugin_host::WasmProviderFactory::new(binary_path.clone()),
-                )
-            })
-            .and_then(|f| {
-                if let Some(constraint) = &config.version {
-                    f.verify_version(&constraint.raw)?;
-                }
-                Ok(Box::new(f) as Box<dyn ProviderFactory>)
-            })
-            .map_err(|e| format!("Failed to load WASM provider: {e}"))
-        };
+        let factory_result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(load_installed_wasm_provider(&installed))
+        });
 
         match factory_result {
             Ok(factory) => {
-                factories.push(factory);
+                if let Some(constraint) = &config.version
+                    && let Err(message) = factory.verify_version(&constraint.raw)
+                {
+                    let reason = installed
+                        .with_load_error(carina_plugin_host::WasmProviderLoadError::Other(message))
+                        .to_string();
+                    eprintln!("{}", reason.red());
+                    load_errors.insert(config.name.clone(), reason);
+                    continue;
+                }
+                factories.push(Box::new(factory));
             }
-            Err(e) => {
-                let reason = format!("Failed to load provider '{}': {}", config.name, e);
+            Err(error) => {
+                // Final UI boundary: `ProviderArtifactLoadError::Display`
+                // renders the structured host chain first, followed by the
+                // resolver-owned provenance and mode-accurate hint.
+                let reason = error.to_string();
                 eprintln!("{}", reason.red());
                 load_errors.insert(config.name.clone(), reason);
             }
@@ -242,6 +244,53 @@ pub fn build_factories_from_providers(
     }
 
     (factories, load_errors)
+}
+
+async fn load_installed_wasm_provider(
+    installed: &carina_provider_resolver::InstalledProvider,
+) -> Result<
+    carina_plugin_host::WasmProviderFactory,
+    carina_provider_resolver::ProviderArtifactLoadError<carina_plugin_host::WasmProviderLoadError>,
+> {
+    load_installed_wasm_provider_using(installed, carina_plugin_host::WasmProviderFactory::new)
+        .await
+}
+
+async fn load_installed_wasm_provider_using<F, Fut>(
+    installed: &carina_provider_resolver::InstalledProvider,
+    loader: F,
+) -> Result<
+    carina_plugin_host::WasmProviderFactory,
+    carina_provider_resolver::ProviderArtifactLoadError<carina_plugin_host::WasmProviderLoadError>,
+>
+where
+    F: FnOnce(std::path::PathBuf) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<
+                carina_plugin_host::WasmProviderFactory,
+                carina_plugin_host::WasmProviderLoadError,
+            >,
+        >,
+{
+    // Injection keeps wiring regression tests out of the user's default precompile cache.
+    let factory = installed.load_with(loader).await?;
+    let runtime_artifact = installed.clone();
+    Ok(
+        factory.with_runtime_instantiation_error_mapper(move |error| {
+            runtime_instantiation_error_with_provenance(&runtime_artifact, error)
+        }),
+    )
+}
+
+fn runtime_instantiation_error_with_provenance<E>(
+    installed: &carina_provider_resolver::InstalledProvider,
+    error: E,
+) -> ProviderError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    ProviderError::internal("Failed to instantiate WASM provider runtime instance")
+        .with_cause(installed.with_load_error(error))
 }
 
 /// Lift a core-validation `Result<(), String>` into per-finding
@@ -1384,6 +1433,13 @@ async fn try_add_source_provider(
             // structured block with the right provider.
             Err(AppError::Provider(e.for_provider(config.name.clone())))
         }
+        Err(LoadSourceError::Wasm(error)) => {
+            // Terminal display boundary for the structured host error plus
+            // resolver provenance. The underlying error remains typed until
+            // this colorized stderr rendering.
+            eprintln!("{}", error.to_string().red());
+            Ok(())
+        }
         Err(LoadSourceError::Other(msg)) => {
             eprintln!(
                 "{}",
@@ -1403,6 +1459,14 @@ enum LoadSourceError {
     /// The provider's `init` step rejected the configuration (e.g.,
     /// `allowed_account_ids` mismatch). Message is user-facing.
     Provider(ProviderError),
+    /// WASM loading failed after resolution. Kept structured until the
+    /// terminal-rendering boundary so both the anyhow chain and artifact
+    /// provenance remain attached.
+    Wasm(
+        carina_provider_resolver::ProviderArtifactLoadError<
+            carina_plugin_host::WasmProviderLoadError,
+        >,
+    ),
     /// Plumbing failure: binary not found, unsupported source scheme,
     /// invalid config, etc. Logged and skipped.
     Other(String),
@@ -1413,7 +1477,7 @@ async fn load_source_provider(
     config: &ProviderConfig,
     base_dir: &Path,
 ) -> Result<(Box<dyn ProviderFactory>, Box<dyn Provider>, String), LoadSourceError> {
-    let binary_path = if source.starts_with("file://") || source.starts_with("github.com/") {
+    let installed = if source.starts_with("file://") || source.starts_with("github.com/") {
         carina_provider_resolver::find_installed_provider(base_dir, config)
             .map_err(|e| LoadSourceError::Other(format!("Provider '{}' {}", config.name, e)))?
     } else {
@@ -1422,7 +1486,7 @@ async fn load_source_provider(
         )));
     };
 
-    if !carina_provider_resolver::is_wasm_provider(&binary_path) {
+    if !carina_provider_resolver::is_wasm_provider(installed.path()) {
         return Err(LoadSourceError::Other(format!(
             "Provider '{}': native binaries are no longer supported. Use a .wasm component instead.",
             config.name
@@ -1430,9 +1494,9 @@ async fn load_source_provider(
     }
 
     let factory: Box<dyn ProviderFactory> = Box::new(
-        carina_plugin_host::WasmProviderFactory::new(binary_path.clone())
+        load_installed_wasm_provider(&installed)
             .await
-            .map_err(|e| LoadSourceError::Other(format!("Failed to load WASM provider: {e}")))?,
+            .map_err(LoadSourceError::Wasm)?,
     );
     let name = factory.name().to_string();
 
