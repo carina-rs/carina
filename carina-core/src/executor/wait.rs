@@ -190,7 +190,7 @@ pub(super) const SKIP_REASON_CANCELLED: &str = "cancelled";
 pub(super) fn signal_in_flight_waits(
     wait_cancellers: &HashMap<usize, tokio::sync::watch::Sender<WaitSignal>>,
 ) {
-    for (_idx, tx) in wait_cancellers.iter() {
+    for tx in wait_cancellers.values() {
         // Receiver dropped == Wait future completed; nothing to cancel.
         let _ = tx.send(WaitSignal::Cancelled);
     }

@@ -2722,13 +2722,11 @@ impl AttributeType {
                 String {
                     identity: Some(s_id),
                     length: s_len,
-                    pattern: _,
                     ..
                 },
                 String {
                     identity: Some(k_id),
                     length: k_len,
-                    pattern: _,
                     ..
                 },
             ) => s_id.assignable_to(k_id) && length_contains(s_len.as_ref(), k_len.as_ref()),
