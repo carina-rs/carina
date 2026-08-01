@@ -132,6 +132,29 @@ fn assert_success(label: &str, output: std::process::Output) {
     );
 }
 
+fn assert_known_refs_relaxed(label: &str, known_ref_elapsed: Duration, depends_elapsed: Duration) {
+    // With 13 updates at parallelism 8, known-disjoint refs need ceil(13 / 8) = 2
+    // rounds. An explicit depends_on gates the parent for 1 round, then 12 children
+    // need ceil(12 / 8) = 2 rounds, for 3 rounds total. The expected gap is exactly
+    // one DELAY_MS round. A difference is used because shared additive overhead
+    // cancels out, while the same overhead pushes a ratio toward 1. Requiring 70%
+    // of one round leaves 30% headroom for jitter. If relaxation regresses, both
+    // schedules take about 3 rounds and the gap collapses to about 0.
+    //
+    // At DELAY_MS=800, the 560 ms margin passes known=1,645 ms and
+    // depends_on=2,441 ms (a 796 ms gap), rejects serial known=10,474 ms versus
+    // depends_on=2,444 ms and a 2,400/2,400 ms 3-round regression, and a shared
+    // 1,600 ms overhead leaves the theoretical 800 ms gap unchanged.
+    //
+    // Known residual: #3659 also recorded known=2.43s and depends_on=2.49s, with
+    // depends_on itself near its 2.4s floor. That non-uniform slowdown defeats both
+    // ratio and difference comparisons; no same-run comparison can cancel it.
+    assert!(
+        depends_elapsed >= known_ref_elapsed + Duration::from_millis(DELAY_MS * 7 / 10),
+        "{label} known-disjoint refs should finish at least 70% of one delay round faster than depends_on; known={known_ref_elapsed:?}, depends_on={depends_elapsed:?}"
+    );
+}
+
 fn project_with_resources(resources: String) -> String {
     format!(
         r#"backend local {{ path = "carina.state.json" }}
@@ -280,14 +303,7 @@ fn apply_parallelism_cli_e2e_covers_caps_and_unknown_update_edges() {
         known_ref_max <= 8,
         "known-ref case must still respect --parallelism 8, got {known_ref_max}"
     );
-    assert!(
-        known_ref_elapsed <= Duration::from_millis(DELAY_MS * 3 + 300),
-        "known-disjoint refs should finish within the relaxed parallel window plus CLI overhead; got {known_ref_elapsed:?}"
-    );
-    assert!(
-        known_ref_elapsed + Duration::from_millis(DELAY_MS / 2) < depends_elapsed,
-        "known-disjoint refs should finish materially faster than depends_on; known={known_ref_elapsed:?}, depends_on={depends_elapsed:?}"
-    );
+    assert_known_refs_relaxed("direct apply", known_ref_elapsed, depends_elapsed);
 }
 
 #[test]
@@ -318,12 +334,5 @@ fn apply_saved_plan_parallelism_relaxes_known_disjoint_refs() {
         known_ref_max <= 8,
         "saved-plan known-ref case must respect --parallelism 8, got {known_ref_max}"
     );
-    assert!(
-        known_ref_elapsed <= Duration::from_millis(DELAY_MS * 3 + 600),
-        "saved-plan known-disjoint refs should finish within the relaxed parallel window plus CLI overhead; got {known_ref_elapsed:?}"
-    );
-    assert!(
-        known_ref_elapsed + Duration::from_millis(DELAY_MS / 2) < depends_elapsed,
-        "saved-plan known-disjoint refs should finish materially faster than depends_on; known={known_ref_elapsed:?}, depends_on={depends_elapsed:?}"
-    );
+    assert_known_refs_relaxed("saved-plan apply", known_ref_elapsed, depends_elapsed);
 }
