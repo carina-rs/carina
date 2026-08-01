@@ -4831,3 +4831,161 @@ mod wait_until_enum_alias {
         );
     }
 }
+
+/// carina#3688 composition regression: the CLI's one provider-loader seam
+/// must combine the host's structured instantiation diagnostic with the
+/// resolver's typed lock provenance. Neither half may be re-derived at a
+/// command-specific consumer.
+#[tokio::test(flavor = "multi_thread")]
+async fn installed_revision_instantiation_error_includes_lock_provenance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let source = "github.com/carina-rs/carina-provider-awscc";
+    let revision = "main";
+    let resolved_sha = "deadbeefcafe1234567890";
+    let wasm_path = carina_provider_resolver::revision_resolver::cache_path_revision(
+        base,
+        source,
+        resolved_sha,
+    );
+    std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &wasm_path,
+        r#"
+            (component
+              (type $empty (instance))
+              (import "wasi:http/types@0.2.9" (instance (type $empty)))
+            )
+        "#,
+    )
+    .unwrap();
+
+    let mut lock = carina_provider_resolver::LockFile::default();
+    lock.upsert(carina_provider_resolver::LockEntry {
+        name: "awscc".into(),
+        source: source.into(),
+        kind: carina_provider_resolver::LockEntryKind::Revision {
+            revision: revision.into(),
+            resolved_sha: resolved_sha.into(),
+        },
+        sha256: "fixture".into(),
+        registry: None,
+    });
+    lock.save(&base.join("carina-providers.lock")).unwrap();
+    let config = ProviderConfig {
+        name: "awscc".into(),
+        source: Some(source.into()),
+        version: None,
+        revision: Some(revision.into()),
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+    let installed = carina_provider_resolver::find_installed_provider(base, &config).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    let error = match load_installed_wasm_provider_using(&installed, |path| {
+        carina_plugin_host::WasmProviderFactory::new_with_cache_dir(path, cache.path())
+    })
+    .await
+    {
+        Ok(_) => panic!("fixture component must not instantiate as a provider"),
+        Err(error) => error,
+    };
+    let rendered = error.to_string();
+
+    assert!(rendered.starts_with("Failed to instantiate WASM component (HTTP)"));
+    assert!(rendered.contains("Provider: awscc"));
+    assert!(rendered.contains("wasi:http/types@0.2.9"));
+    assert!(rendered.contains("Host wasi:http version: 0.2.6"));
+    assert!(rendered.contains("carina-providers.lock"));
+    assert!(rendered.contains("revision main"));
+    assert!(rendered.contains("resolved_sha deadbeefcafe1234567890"));
+    assert!(rendered.contains("carina init --upgrade"));
+}
+
+#[test]
+fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let source = "github.com/carina-rs/carina-provider-awscc";
+    let revision = "main";
+    let resolved_sha = "deadbeefcafe1234567890";
+    let lock_path = base.join("carina-providers.lock");
+    let mut lock = carina_provider_resolver::LockFile::default();
+    lock.upsert(carina_provider_resolver::LockEntry {
+        name: "awscc".into(),
+        source: source.into(),
+        kind: carina_provider_resolver::LockEntryKind::Revision {
+            revision: revision.into(),
+            resolved_sha: resolved_sha.into(),
+        },
+        sha256: "fixture".into(),
+        registry: None,
+    });
+    lock.save(&lock_path).unwrap();
+    let config = ProviderConfig {
+        name: "awscc".into(),
+        source: Some(source.into()),
+        version: None,
+        revision: Some(revision.into()),
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+
+    let (factories, errors) = build_factories_from_providers(&[config], base);
+    let rendered = errors
+        .get("awscc")
+        .expect("missing locked artifact must reach the CLI diagnostic boundary");
+
+    assert!(factories.is_empty());
+    assert!(rendered.starts_with("Provider 'awscc' not installed."));
+    assert!(rendered.contains(&lock_path.display().to_string()));
+    assert!(rendered.contains("revision main"));
+    assert!(rendered.contains("resolved_sha deadbeefcafe1234567890"));
+    assert!(rendered.contains("Run `carina init`"));
+    assert!(!rendered.contains("lock is stale"));
+    assert!(!rendered.contains("carina init --upgrade"));
+}
+
+#[test]
+fn runtime_instantiation_error_retains_installed_artifact_provenance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wasm_path = tmp.path().join("local-provider.wasm");
+    std::fs::write(&wasm_path, b"fixture").unwrap();
+    let config = ProviderConfig {
+        name: "local".into(),
+        source: Some(format!("file://{}", wasm_path.display())),
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+    let installed = carina_provider_resolver::find_file_provider_source(&config).unwrap();
+
+    let error = runtime_instantiation_error_with_provenance(
+        &installed,
+        std::io::Error::other("runtime instantiation failed"),
+    );
+    let cause = std::error::Error::source(&error)
+        .expect("the ProviderError boundary must retain the artifact wrapper");
+
+    assert!(
+        cause
+            .downcast_ref::<carina_provider_resolver::ProviderArtifactLoadError<std::io::Error>>()
+            .is_some()
+    );
+    let rendered = error.to_string();
+    assert!(rendered.contains("runtime instantiation failed"));
+    assert!(rendered.contains("Provider: local"));
+    assert!(rendered.contains("provider resolved from file://"));
+    assert!(rendered.contains("not controlled by carina-providers.lock"));
+}

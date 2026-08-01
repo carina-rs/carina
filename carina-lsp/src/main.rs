@@ -8,8 +8,34 @@ use tower_lsp::{LspService, Server};
 use carina_lsp::Backend;
 use carina_lsp::backend::FactoryBuildResult;
 
-/// Resolve the on-disk path the LSP would load for `config`, if any. `None`
-/// means the provider is not currently installed for the LSP's purposes.
+#[derive(Debug, PartialEq, Eq)]
+enum InstallRejection {
+    MissingSource,
+    UnsupportedSource { source: String },
+    ResolutionFailed { message: String },
+    NotWasmComponent { path: PathBuf },
+}
+
+impl std::fmt::Display for InstallRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InstallRejection::MissingSource => f.write_str(
+                "no source configured. Add `source = 'github.com/...'` to the provider block.",
+            ),
+            InstallRejection::UnsupportedSource { source } => {
+                write!(f, "unsupported source format: {source}")
+            }
+            InstallRejection::ResolutionFailed { message } => f.write_str(message),
+            InstallRejection::NotWasmComponent { path } => {
+                write!(f, "not a WASM component: {}", path.display())
+            }
+        }
+    }
+}
+
+/// Resolve the on-disk artifact the LSP would load for `config`, or retain the
+/// exact reason it rejected the source. The rejection enum prevents the load
+/// path from having to re-run filesystem resolution to reconstruct a reason.
 ///
 /// Shared by `build_factories` (at load time) and the drift-poll prober (at
 /// poll time) so both sides agree on what "installed" means. In particular:
@@ -17,22 +43,32 @@ use carina_lsp::backend::FactoryBuildResult;
 /// being a WASM component — not whether a copy landed in `.carina/…/file/`.
 /// That matters because `build_factories` loads the direct path, so the
 /// drift poll must observe that same path to detect its deletion.
-fn resolve_install(source_dir: &Path, config: &ProviderConfig) -> Option<PathBuf> {
-    let source = config.source.as_deref()?;
-    let binary_path = if let Some(path) = source.strip_prefix("file://") {
-        PathBuf::from(path)
+fn resolve_install(
+    source_dir: &Path,
+    config: &ProviderConfig,
+) -> Result<carina_provider_resolver::InstalledProvider, InstallRejection> {
+    let source = config
+        .source
+        .as_deref()
+        .ok_or(InstallRejection::MissingSource)?;
+    let installed = if source.starts_with("file://") {
+        carina_provider_resolver::find_file_provider_source(config)
     } else if source.starts_with("github.com/") {
-        carina_provider_resolver::find_installed_provider(source_dir, config).ok()?
+        carina_provider_resolver::find_installed_provider(source_dir, config)
     } else {
-        return None;
-    };
-    if !carina_provider_resolver::is_wasm_provider(&binary_path) {
-        return None;
+        return Err(InstallRejection::UnsupportedSource {
+            source: source.to_string(),
+        });
     }
-    if !binary_path.exists() {
-        return None;
+    .map_err(|message| InstallRejection::ResolutionFailed { message })?;
+    if !carina_provider_resolver::is_wasm_provider(installed.path()) {
+        return Err(InstallRejection::NotWasmComponent {
+            path: installed.path().to_path_buf(),
+        });
     }
-    Some(binary_path)
+    // Both resolver functions only construct `InstalledProvider` after their
+    // selected path exists, so a second `.exists()` check here was unreachable.
+    Ok(installed)
 }
 
 /// Build provider factories from discovered provider configs.
@@ -44,58 +80,14 @@ fn build_factories(providers: &[(PathBuf, ProviderConfig)]) -> FactoryBuildResul
     let mut fingerprint: Vec<(String, bool)> = Vec::with_capacity(providers.len());
 
     for (source_dir, config) in providers {
-        let source = match &config.source {
-            Some(s) => s,
-            None => {
-                // Named provider instances (`let <name> = provider <kind>
-                // { ... }`) inherit `source` from the kind's default;
-                // the parser forbids them from setting it themselves.
-                // Only the kind default's deliberate absence of
-                // `source` is a real user error (carina#3023). The
-                // `fingerprint` push stays outside this gate so
-                // every config in `providers` produces exactly one
-                // entry — `probe_install_fingerprint` iterates the
-                // same slice unconditionally, and the LSP's
-                // drift-poll compares the two fingerprint vectors
-                // for equality.
-                if config.is_default {
-                    errors.insert(
-                        config.name.clone(),
-                        "no source configured. Add `source = 'github.com/...'` to the provider block.".to_string(),
-                    );
-                }
-                fingerprint.push((config.name.clone(), false));
-                continue;
-            }
-        };
-
-        let binary_path = match resolve_install(source_dir, config) {
-            Some(path) => path,
-            None => {
-                // Build the same error wording the previous code path produced,
-                // so surfaced diagnostics match what users saw before.
-                if source.starts_with("file://") {
-                    let stripped = source.strip_prefix("file://").unwrap_or(source);
-                    let p = PathBuf::from(stripped);
-                    if !p.exists() {
-                        errors.insert(config.name.clone(), format!("file not found: {}", stripped));
-                    } else if !carina_provider_resolver::is_wasm_provider(&p) {
-                        errors.insert(
-                            config.name.clone(),
-                            format!("not a WASM component: {}", p.display()),
-                        );
-                    }
-                } else if source.starts_with("github.com/") {
-                    if let Err(e) =
-                        carina_provider_resolver::find_installed_provider(source_dir, config)
-                    {
-                        errors.insert(config.name.clone(), e);
-                    }
-                } else {
-                    errors.insert(
-                        config.name.clone(),
-                        format!("unsupported source format: {}", source),
-                    );
+        let installed = match resolve_install(source_dir, config) {
+            Ok(installed) => installed,
+            Err(rejection) => {
+                // Named instances inherit the kind default's source. Their
+                // missing source is deliberate; every other rejection is a
+                // diagnostic produced directly from this one resolution.
+                if config.is_default || rejection != InstallRejection::MissingSource {
+                    errors.insert(config.name.clone(), rejection.to_string());
                 }
                 fingerprint.push((config.name.clone(), false));
                 continue;
@@ -103,21 +95,22 @@ fn build_factories(providers: &[(PathBuf, ProviderConfig)]) -> FactoryBuildResul
         };
 
         match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(
-                carina_plugin_host::WasmProviderFactory::new(binary_path.clone()),
-            )
+            tokio::runtime::Handle::current()
+                .block_on(installed.load_with(carina_plugin_host::WasmProviderFactory::new))
         }) {
             Ok(factory) => {
                 log::info!(
                     "LSP: loaded provider '{}' from {}",
                     config.name,
-                    binary_path.display()
+                    installed.path().display()
                 );
                 factories.push(Box::new(factory));
                 fingerprint.push((config.name.clone(), true));
             }
-            Err(e) => {
-                errors.insert(config.name.clone(), format!("failed to load WASM: {}", e));
+            Err(error) => {
+                // Final LSP-diagnostic boundary. The structured host chain is
+                // rendered first and resolver provenance follows it.
+                errors.insert(config.name.clone(), error.to_string());
                 // Factory failed to load even though the path resolved; treat
                 // as "not installed" from the LSP's perspective so the next
                 // poll can notice if the user replaces the WASM.
@@ -159,7 +152,7 @@ async fn main() {
         // the snapshot captured at build time and the drift-poll observation
         // describe the same filesystem state.
         let install_prober: carina_lsp::backend::ProviderInstallProber =
-            std::sync::Arc::new(|dir, cfg| resolve_install(dir, cfg).is_some());
+            std::sync::Arc::new(|dir, cfg| resolve_install(dir, cfg).is_ok());
 
         Backend::with_install_prober(
             client,
@@ -233,5 +226,61 @@ mod tests {
              carina#3023. errors: {:?}",
             errors
         );
+    }
+
+    #[test]
+    fn direct_file_install_retains_non_lock_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wasm = tmp.path().join("local-provider.wasm");
+        std::fs::write(&wasm, b"fixture").unwrap();
+        let providers = cfg(
+            "local",
+            Some(&format!("file://{}", wasm.display())),
+            true,
+            None,
+        );
+
+        let installed = resolve_install(&providers.0, &providers.1)
+            .expect("direct file source should be observed by the LSP");
+        assert_eq!(installed.path(), wasm);
+        let rendered = installed.with_load_error("load failed").to_string();
+        assert!(rendered.contains("provider resolved from file://"));
+        assert!(rendered.contains("not controlled by carina-providers.lock"));
+        assert!(!rendered.contains("carina init --upgrade"));
+    }
+
+    #[test]
+    fn github_installed_non_wasm_artifact_produces_a_diagnostic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = "github.com/example/native-provider";
+        let version = "1.2.3";
+        let native_path = carina_provider_resolver::cache_path(tmp.path(), source, version);
+        std::fs::create_dir_all(native_path.parent().unwrap()).unwrap();
+        std::fs::write(&native_path, b"native provider fixture").unwrap();
+
+        let mut lock = carina_provider_resolver::LockFile::default();
+        lock.upsert(carina_provider_resolver::LockEntry {
+            name: "native".into(),
+            source: source.into(),
+            kind: carina_provider_resolver::LockEntryKind::Version {
+                version: version.into(),
+                constraint: None,
+            },
+            sha256: "fixture".into(),
+            registry: None,
+        });
+        lock.save(&tmp.path().join("carina-providers.lock"))
+            .unwrap();
+
+        let (_, config) = cfg("native", Some(source), true, None);
+        let providers = vec![(tmp.path().to_path_buf(), config)];
+        let (_factories, errors, fingerprint) = build_factories(&providers);
+
+        let diagnostic = errors
+            .get("native")
+            .expect("an installed non-WASM artifact must never be silently dropped");
+        assert!(diagnostic.contains("not a WASM component"));
+        assert!(diagnostic.contains(&native_path.display().to_string()));
+        assert_eq!(fingerprint, vec![("native".to_string(), false)]);
     }
 }

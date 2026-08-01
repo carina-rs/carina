@@ -1,6 +1,7 @@
 //! Provider resolution: download, extract, cache, and verify provider binaries.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -167,6 +168,174 @@ impl LockFile {
             self.provider.push(entry);
         }
     }
+}
+
+/// An installed provider artifact together with the resolution provenance that
+/// selected it. The path is private so load callers must retain this wrapper
+/// and therefore cannot accidentally separate an artifact from its lock mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledProvider {
+    path: PathBuf,
+    provider_name: String,
+    provenance: ProviderArtifactProvenance,
+}
+
+impl InstalledProvider {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn provenance(&self) -> &ProviderArtifactProvenance {
+        &self.provenance
+    }
+
+    pub fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+
+    /// Attach this artifact's provenance to a load failure without flattening
+    /// the underlying error. Display always renders the load error first.
+    pub fn with_load_error<E>(&self, error: E) -> ProviderArtifactLoadError<E> {
+        ProviderArtifactLoadError {
+            error,
+            provider_name: self.provider_name.clone(),
+            provenance: Box::new(self.provenance.clone()),
+        }
+    }
+
+    /// Load through a caller-supplied async function while making provenance
+    /// attachment mandatory on the error path.
+    pub async fn load_with<T, E, F, Fut>(
+        &self,
+        loader: F,
+    ) -> Result<T, ProviderArtifactLoadError<E>>
+    where
+        F: FnOnce(PathBuf) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        loader(self.path.clone())
+            .await
+            .map_err(|error| self.with_load_error(error))
+    }
+}
+
+/// Where an installed provider artifact came from. Locked variants cannot
+/// represent `file://`, so only lock-controlled artifacts can produce a stale
+/// lock hint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderArtifactProvenance {
+    LockFile {
+        lock_path: PathBuf,
+        pin: LockedProviderPin,
+    },
+    File {
+        source: String,
+    },
+}
+
+/// The lock-entry modes that can select a cached provider artifact.
+/// [`LockEntryKind::File`] is deliberately absent: file artifacts have their
+/// own provenance variant and are never candidates for a stale-lock hint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockedProviderPin {
+    Version {
+        version: String,
+        constraint: Option<String>,
+    },
+    Revision {
+        revision: String,
+        resolved_sha: String,
+    },
+    RegistryRevision {
+        revision: String,
+        version: String,
+    },
+}
+
+impl fmt::Display for LockedProviderPin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LockedProviderPin::Version {
+                version,
+                constraint,
+            } => {
+                write!(f, "version {version}")?;
+                if let Some(constraint) = constraint {
+                    write!(f, ", constraint {constraint}")?;
+                }
+                Ok(())
+            }
+            LockedProviderPin::Revision {
+                revision,
+                resolved_sha,
+            } => write!(f, "revision {revision}, resolved_sha {resolved_sha}"),
+            LockedProviderPin::RegistryRevision { revision, version } => {
+                write!(f, "registry revision {revision}, version {version}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for ProviderArtifactProvenance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProviderArtifactProvenance::LockFile { lock_path, pin } => {
+                write!(
+                    f,
+                    "provider resolved from {} ({pin}); if this lock is stale, run `carina init --upgrade`",
+                    lock_path.display()
+                )
+            }
+            ProviderArtifactProvenance::File { source } => write!(
+                f,
+                "provider resolved from {source}; file providers are not controlled by carina-providers.lock"
+            ),
+        }
+    }
+}
+
+/// A provider load failure that retains both the typed underlying error and
+/// the artifact provenance selected by the resolver.
+#[derive(Debug)]
+pub struct ProviderArtifactLoadError<E> {
+    error: E,
+    provider_name: String,
+    provenance: Box<ProviderArtifactProvenance>,
+}
+
+impl<E: fmt::Display> fmt::Display for ProviderArtifactLoadError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}\nProvider: {}\n{}",
+            self.error, self.provider_name, self.provenance
+        )
+    }
+}
+
+// `Display` is the sole rendering surface for this composite diagnostic: CLI
+// and LSP callers require one self-contained message containing both the child
+// error and provenance. Exposing the same child through `source()` would make
+// standard chain walkers print it again.
+impl<E> std::error::Error for ProviderArtifactLoadError<E> where E: std::error::Error + 'static {}
+
+fn missing_locked_artifact_error(
+    base_dir: &Path,
+    lock_path: &Path,
+    pin: &LockedProviderPin,
+    requested_revision: Option<&str>,
+) -> String {
+    let action = match requested_revision {
+        Some(revision) => format!(
+            "not installed. Run `carina init` in {} to install (revision: {revision})",
+            base_dir.display()
+        ),
+        None => format!("not installed. Run `carina init` in {}", base_dir.display()),
+    };
+    format!(
+        "{action}\nConsulted {} ({pin}), but its artifact is missing.",
+        lock_path.display()
+    )
 }
 
 /// Detect the current platform's target triple.
@@ -1217,17 +1386,41 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
     Ok(binary_path)
 }
 
+/// Resolve a `file://` provider at its source path without copying it.
+///
+/// The LSP uses this direct-source view so its drift poll observes the same
+/// file it loads, while still retaining typed file provenance.
+pub fn find_file_provider_source(config: &ProviderConfig) -> Result<InstalledProvider, String> {
+    let source = config
+        .source
+        .as_deref()
+        .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
+    let file_path = source
+        .strip_prefix("file://")
+        .ok_or_else(|| format!("Provider '{}' is not a file:// source", config.name))?;
+    let path = PathBuf::from(file_path);
+    if !path.exists() {
+        return Err(format!("file not found: {file_path}"));
+    }
+    Ok(InstalledProvider {
+        path,
+        provider_name: config.name.clone(),
+        provenance: ProviderArtifactProvenance::File {
+            source: source.to_string(),
+        },
+    })
+}
+
 /// Find an already-installed provider without downloading.
 ///
-/// Checks local project cache, global plugin cache, and lock file entries.
-/// Returns the path to the WASM binary if found, or an error suggesting
-/// `carina init` if not installed.
-///
-/// This is used by the LSP to avoid filesystem side effects from the editor.
+/// Checks the project-local provider cache and lock file. Unlike a bare path,
+/// the returned artifact always retains the lock/file provenance that selected
+/// it. This is used by the LSP to avoid editor-triggered downloads as well as
+/// by CLI load paths after `carina init` has installed the artifact.
 pub fn find_installed_provider(
     base_dir: &Path,
     config: &ProviderConfig,
-) -> Result<PathBuf, String> {
+) -> Result<InstalledProvider, String> {
     let source = config
         .source
         .as_deref()
@@ -1251,7 +1444,13 @@ pub fn find_installed_provider(
                     .unwrap_or("provider.wasm"),
             );
         if dest.exists() {
-            return Ok(dest);
+            return Ok(InstalledProvider {
+                path: dest,
+                provider_name: config.name.clone(),
+                provenance: ProviderArtifactProvenance::File {
+                    source: source.to_string(),
+                },
+            });
         }
         return Err(format!(
             "not installed. Run `carina init` in {}",
@@ -1278,23 +1477,64 @@ pub fn find_installed_provider(
                 && locked_revision == revision
             {
                 let wasm_path = cache_path_wasm(base_dir, &source, version);
-                if wasm_path.exists() {
-                    return Ok(wasm_path);
-                }
                 let binary_path = cache_path(base_dir, &source, version);
-                if binary_path.exists() {
-                    return Ok(binary_path);
+                let path = if wasm_path.exists() {
+                    Some(wasm_path)
+                } else if binary_path.exists() {
+                    Some(binary_path)
+                } else {
+                    None
+                };
+                let pin = LockedProviderPin::RegistryRevision {
+                    revision: locked_revision.clone(),
+                    version: version.clone(),
+                };
+                if let Some(path) = path {
+                    return Ok(InstalledProvider {
+                        path,
+                        provider_name: config.name.clone(),
+                        provenance: ProviderArtifactProvenance::LockFile {
+                            lock_path: lock_path.clone(),
+                            pin,
+                        },
+                    });
                 }
+                return Err(missing_locked_artifact_error(
+                    base_dir,
+                    &lock_path,
+                    &pin,
+                    Some(revision),
+                ));
             }
         } else {
             if let Some(lock_entry) = lock_file.find_by_source(&source)
-                && let LockEntryKind::Revision { resolved_sha, .. } = &lock_entry.kind
+                && let LockEntryKind::Revision {
+                    revision: locked_revision,
+                    resolved_sha,
+                } = &lock_entry.kind
             {
                 let wasm_path =
                     crate::revision_resolver::cache_path_revision(base_dir, &source, resolved_sha);
+                let pin = LockedProviderPin::Revision {
+                    revision: locked_revision.clone(),
+                    resolved_sha: resolved_sha.clone(),
+                };
                 if wasm_path.exists() {
-                    return Ok(wasm_path);
+                    return Ok(InstalledProvider {
+                        path: wasm_path,
+                        provider_name: config.name.clone(),
+                        provenance: ProviderArtifactProvenance::LockFile {
+                            lock_path: lock_path.clone(),
+                            pin,
+                        },
+                    });
                 }
+                return Err(missing_locked_artifact_error(
+                    base_dir,
+                    &lock_path,
+                    &pin,
+                    Some(revision),
+                ));
             }
         }
         return Err(format!(
@@ -1305,16 +1545,34 @@ pub fn find_installed_provider(
     }
 
     if let Some(lock_entry) = lock_file.find_by_source(&source)
-        && let LockEntryKind::Version { version, .. } = &lock_entry.kind
+        && let LockEntryKind::Version {
+            version,
+            constraint,
+        } = &lock_entry.kind
     {
         let wasm_path = cache_path_wasm(base_dir, &source, version);
-        if wasm_path.exists() {
-            return Ok(wasm_path);
-        }
         let binary_path = cache_path(base_dir, &source, version);
-        if binary_path.exists() {
-            return Ok(binary_path);
+        let path = if wasm_path.exists() {
+            Some(wasm_path)
+        } else if binary_path.exists() {
+            Some(binary_path)
+        } else {
+            None
+        };
+        let pin = LockedProviderPin::Version {
+            version: version.clone(),
+            constraint: constraint.clone(),
+        };
+        if let Some(path) = path {
+            return Ok(InstalledProvider {
+                path,
+                provider_name: config.name.clone(),
+                provenance: ProviderArtifactProvenance::LockFile { lock_path, pin },
+            });
         }
+        return Err(missing_locked_artifact_error(
+            base_dir, &lock_path, &pin, None,
+        ));
     }
 
     Err(format!(
@@ -3258,7 +3516,7 @@ sha256 = "abc"
                 find_installed_provider(dir.path(), &provider_config(requested_source, None))
                     .unwrap();
 
-            assert_eq!(found_path, installed_path);
+            assert_eq!(found_path.path(), installed_path);
             assert_eq!(
                 installed_path,
                 cache_path_wasm(dir.path(), "carina-rs/aws", "0.5.0")
@@ -3594,6 +3852,112 @@ sha256 = "abc"
     }
 
     #[test]
+    fn missing_revision_artifact_reports_the_consulted_lock_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let revision = "main";
+        let resolved_sha = "deadbeefcafe1234567890";
+        let lock_path = base.join("carina-providers.lock");
+        let mut lock = LockFile::default();
+        lock.upsert(revision_entry(source, revision, resolved_sha));
+        lock.save(&lock_path).unwrap();
+
+        let error = find_installed_provider(base, &provider_config(source, Some(revision)))
+            .expect_err("the locked revision artifact was deliberately not installed");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("Run `carina init`"), "{rendered}");
+        assert!(
+            rendered.contains(&lock_path.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("revision main"), "{rendered}");
+        assert!(
+            rendered.contains("resolved_sha deadbeefcafe1234567890"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("lock is stale"), "{rendered}");
+        assert!(!rendered.contains("carina init --upgrade"), "{rendered}");
+    }
+
+    #[test]
+    fn missing_version_artifact_reports_the_consulted_lock_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let version = "1.2.3";
+        let constraint = "^1.0";
+        let lock_path = base.join("carina-providers.lock");
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "awscc".into(),
+            source: source.into(),
+            kind: LockEntryKind::Version {
+                version: version.into(),
+                constraint: Some(constraint.into()),
+            },
+            sha256: "abc".into(),
+            registry: None,
+        });
+        lock.save(&lock_path).unwrap();
+
+        let error = find_installed_provider(base, &provider_config(source, None))
+            .expect_err("the locked version artifact was deliberately not installed");
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("Run `carina init`"), "{rendered}");
+        assert!(
+            rendered.contains(&lock_path.display().to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("version 1.2.3"), "{rendered}");
+        assert!(rendered.contains("constraint ^1.0"), "{rendered}");
+        assert!(!rendered.contains("lock is stale"), "{rendered}");
+        assert!(!rendered.contains("carina init --upgrade"), "{rendered}");
+    }
+
+    #[test]
+    fn locked_version_provenance_renders_with_and_without_a_constraint() {
+        let lock_path = PathBuf::from("project/carina-providers.lock");
+        let render = |constraint: Option<&str>| {
+            ProviderArtifactProvenance::LockFile {
+                lock_path: lock_path.clone(),
+                pin: LockedProviderPin::Version {
+                    version: "1.2.3".into(),
+                    constraint: constraint.map(str::to_string),
+                },
+            }
+            .to_string()
+        };
+
+        assert_eq!(
+            render(None),
+            "provider resolved from project/carina-providers.lock (version 1.2.3); if this lock is stale, run `carina init --upgrade`"
+        );
+        assert_eq!(
+            render(Some("^1.0")),
+            "provider resolved from project/carina-providers.lock (version 1.2.3, constraint ^1.0); if this lock is stale, run `carina init --upgrade`"
+        );
+    }
+
+    #[test]
+    fn locked_registry_revision_provenance_renders_revision_and_version() {
+        let provenance = ProviderArtifactProvenance::LockFile {
+            lock_path: PathBuf::from("project/carina-providers.lock"),
+            pin: LockedProviderPin::RegistryRevision {
+                revision: "main".into(),
+                version: "0.0.0-main.10.bbb".into(),
+            },
+        };
+
+        assert_eq!(
+            provenance.to_string(),
+            "provider resolved from project/carina-providers.lock (registry revision main, version 0.0.0-main.10.bbb); if this lock is stale, run `carina init --upgrade`"
+        );
+    }
+
+    #[test]
     fn find_installed_provider_registry_revision_uses_version_cache_path() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
@@ -3617,7 +3981,70 @@ sha256 = "abc"
         lock.save(&base.join("carina-providers.lock")).unwrap();
         let config = provider_config(source, Some("main"));
 
-        assert_eq!(find_installed_provider(base, &config).unwrap(), wasm_path);
+        assert_eq!(
+            find_installed_provider(base, &config).unwrap().path(),
+            wasm_path
+        );
+    }
+
+    #[test]
+    fn revision_install_load_error_carries_stale_lock_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let source = "github.com/carina-rs/carina-provider-awscc";
+        let revision = "main";
+        let resolved_sha = "deadbeefcafe1234567890";
+        let wasm_path = crate::revision_resolver::cache_path_revision(base, source, resolved_sha);
+        fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        fs::write(&wasm_path, b"stale provider wasm").unwrap();
+
+        let mut lock = LockFile::default();
+        lock.upsert(revision_entry(source, revision, resolved_sha));
+        lock.save(&base.join("carina-providers.lock")).unwrap();
+
+        let installed = find_installed_provider(base, &provider_config(source, Some(revision)))
+            .expect("revision provider should resolve");
+        assert_eq!(installed.path(), wasm_path);
+        let error = installed.with_load_error(io::Error::other(
+            "Failed to instantiate WASM component (HTTP)",
+        ));
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "the self-contained Display contract must not expose the rendered child again"
+        );
+        let rendered = error.to_string();
+
+        assert!(rendered.starts_with("Failed to instantiate WASM component (HTTP)"));
+        assert!(rendered.contains("provider resolved from"));
+        assert!(rendered.contains("carina-providers.lock"));
+        assert!(rendered.contains("revision main"));
+        assert!(rendered.contains("resolved_sha deadbeefcafe1234567890"));
+        assert!(rendered.contains("if this lock is stale"));
+        assert!(rendered.contains("carina init --upgrade"));
+    }
+
+    #[test]
+    fn file_install_load_error_cannot_claim_the_provider_lock_is_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        let source_path = base.join("local-provider.wasm");
+        fs::write(&source_path, b"local provider wasm").unwrap();
+        let source = format!("file://{}", source_path.display());
+        let installed_path = base.join(".carina/providers/file/local-provider/local-provider.wasm");
+        fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
+        fs::write(&installed_path, b"installed local provider wasm").unwrap();
+
+        let installed = find_installed_provider(base, &provider_config(&source, None))
+            .expect("file provider should resolve");
+        assert_eq!(installed.path(), installed_path);
+        let rendered = installed
+            .with_load_error("Failed to instantiate WASM component (HTTP)")
+            .to_string();
+
+        assert!(rendered.contains(&format!("provider resolved from {source}")));
+        assert!(rendered.contains("not controlled by carina-providers.lock"));
+        assert!(!rendered.contains("if this lock is stale"));
+        assert!(!rendered.contains("carina init --upgrade"));
     }
 
     // --- Issue #2026: lock vs .crn mismatch must error without --upgrade ---

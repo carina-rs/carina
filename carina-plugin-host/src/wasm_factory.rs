@@ -1,6 +1,7 @@
 //! WasmProviderFactory loads a WASM component and implements ProviderFactory.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
@@ -66,6 +67,493 @@ fn provider_schema_decode_error(
     format!(
         "provider '{provider_name}' {provider_version} emitted schema metadata this host cannot decode: {detail}; the provider revision may predate this host; bump the provider lock with `carina init --upgrade`"
     )
+}
+
+/// The wasi:http package version linked by `wasmtime-wasi-http` 43.0.0.
+///
+/// This must track the `package wasi:http@...` declaration in
+/// `wasmtime-wasi-http`'s `wit/deps/http.wit`. The regression test below pins
+/// the companion crate version against `Cargo.lock`, so a dependency bump
+/// cannot silently leave this user-facing version stale.
+pub const WASI_HTTP_HOST_VERSION: &str = "0.2.6";
+
+/// The `wasmtime-wasi-http` crate release whose WIT was inspected when
+/// [`WASI_HTTP_HOST_VERSION`] was set.
+const WASMTIME_WASI_HTTP_CRATE_VERSION_WITH_KNOWN_WIT: &str = "43.0.0";
+
+#[derive(Debug)]
+struct WasiHttpImport {
+    name: String,
+    version: WasiHttpImportVersion,
+}
+
+#[derive(Debug)]
+enum WasiHttpImportVersion {
+    Semver(semver::Version),
+    Unversioned,
+    Invalid,
+}
+
+#[derive(Debug)]
+struct ComponentImports {
+    names: Vec<String>,
+}
+
+impl ComponentImports {
+    fn from_component(engine: &Engine, component: &Component) -> Self {
+        let component_type = component.component_type();
+        let mut names: Vec<_> = component_type
+            .imports(engine)
+            .map(|(name, _)| name.to_string())
+            .collect();
+        names.sort();
+        names.dedup();
+        Self { names }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        self.names.iter().map(String::as_str)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+}
+
+/// A non-empty set of wasi:http imports. Splitting out the first item keeps
+/// the "component imports wasi:http" state non-empty by construction.
+#[derive(Debug)]
+struct WasiHttpImports {
+    first: WasiHttpImport,
+    rest: Vec<WasiHttpImport>,
+}
+
+impl WasiHttpImports {
+    fn from_component_imports(component_imports: &ComponentImports) -> Option<Self> {
+        let imports: Vec<_> = component_imports
+            .iter()
+            .filter_map(|name| {
+                name.strip_prefix("wasi:http/")?;
+                let version = match name.rsplit_once('@') {
+                    Some((_, raw)) => semver::Version::parse(raw)
+                        .map(WasiHttpImportVersion::Semver)
+                        .unwrap_or(WasiHttpImportVersion::Invalid),
+                    None => WasiHttpImportVersion::Unversioned,
+                };
+                Some(WasiHttpImport {
+                    name: name.to_string(),
+                    version,
+                })
+            })
+            .collect();
+
+        let mut imports = imports.into_iter();
+        let first = imports.next()?;
+        Some(Self {
+            first,
+            rest: imports.collect(),
+        })
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &WasiHttpImport> {
+        std::iter::once(&self.first).chain(self.rest.iter())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WasiHttpCompatibility {
+    Compatible,
+    Incompatible,
+    Unknown,
+}
+
+#[derive(Debug)]
+struct WasiHttpImportedContext {
+    imports: WasiHttpImports,
+    host_version: semver::Version,
+    compatibility: WasiHttpCompatibility,
+}
+
+#[derive(Debug)]
+struct WasiHttpNotImportedContext {
+    component_imports: ComponentImports,
+    host_version: semver::Version,
+}
+
+#[derive(Debug)]
+enum ComponentInstantiationContext {
+    WasiHttpImported { context: WasiHttpImportedContext },
+    WasiHttpNotImported { context: WasiHttpNotImportedContext },
+}
+
+impl ComponentInstantiationContext {
+    fn from_component(engine: &Engine, component: &Component) -> Self {
+        let host_version = semver::Version::parse(WASI_HTTP_HOST_VERSION)
+            .expect("WASI_HTTP_HOST_VERSION must be valid semver");
+        let component_imports = ComponentImports::from_component(engine, component);
+        match WasiHttpImports::from_component_imports(&component_imports) {
+            Some(imports) => {
+                let compatibility = wasi_http_compatibility(&host_version, &imports);
+                Self::WasiHttpImported {
+                    context: WasiHttpImportedContext {
+                        imports,
+                        host_version,
+                        compatibility,
+                    },
+                }
+            }
+            None => Self::WasiHttpNotImported {
+                context: WasiHttpNotImportedContext {
+                    component_imports,
+                    host_version,
+                },
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DualAttemptContext {
+    WasiHttpImported {
+        context: WasiHttpImportedContext,
+    },
+    WasiHttpNotImported {
+        context: WasiHttpNotImportedContext,
+        basic_failure: wasmtime::Error,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstantiationWorld {
+    HttpEnabled,
+    Basic,
+}
+
+/// The attempt shape is explicit: the load path carries its dual-attempt
+/// fallback disposition, while the runtime path carries exactly one selected
+/// world and cannot represent a fallback that never happened.
+#[derive(Debug)]
+enum InstantiationContext {
+    HttpThenBasic {
+        context: DualAttemptContext,
+    },
+    SingleAttempt {
+        world: InstantiationWorld,
+        context: ComponentInstantiationContext,
+    },
+}
+
+/// A provider component failed to instantiate.
+///
+/// Unlike the former `String`, this owns the primary Wasmtime error, so its
+/// complete `anyhow` source chain remains available until the final display
+/// boundary. Its tagged context also owns component-derived import evidence,
+/// the host's linked wasi:http version, and the exact load/runtime attempt
+/// shape; callers cannot construct context-free or fictitious fallback prose.
+#[derive(Debug)]
+pub struct ProviderInstantiationError {
+    primary_failure: wasmtime::Error,
+    context: Box<InstantiationContext>,
+}
+
+impl ProviderInstantiationError {
+    fn from_attempts(
+        engine: &Engine,
+        component: &Component,
+        http_failure: wasmtime::Error,
+        basic_failure: wasmtime::Error,
+    ) -> Self {
+        let context = match ComponentInstantiationContext::from_component(engine, component) {
+            ComponentInstantiationContext::WasiHttpImported { context } => {
+                DualAttemptContext::WasiHttpImported { context }
+            }
+            ComponentInstantiationContext::WasiHttpNotImported { context } => {
+                DualAttemptContext::WasiHttpNotImported {
+                    context,
+                    basic_failure,
+                }
+            }
+        };
+        Self {
+            primary_failure: http_failure,
+            context: Box::new(InstantiationContext::HttpThenBasic { context }),
+        }
+    }
+
+    fn from_single_attempt(
+        engine: &Engine,
+        component: &Component,
+        world: InstantiationWorld,
+        failure: wasmtime::Error,
+    ) -> Self {
+        Self {
+            primary_failure: failure,
+            context: Box::new(InstantiationContext::SingleAttempt {
+                world,
+                context: ComponentInstantiationContext::from_component(engine, component),
+            }),
+        }
+    }
+}
+
+fn write_wasi_http_imported_context(
+    f: &mut fmt::Formatter<'_>,
+    context: &WasiHttpImportedContext,
+) -> fmt::Result {
+    write!(f, "\nComponent wasi:http imports: ")?;
+    for (index, import) in context.imports.iter().enumerate() {
+        if index > 0 {
+            write!(f, ", ")?;
+        }
+        write!(f, "{}", import.name)?;
+    }
+    write!(
+        f,
+        "\nHost wasi:http version: {} (provided by wasmtime-wasi-http {WASMTIME_WASI_HTTP_CRATE_VERSION_WITH_KNOWN_WIT})",
+        context.host_version
+    )?;
+    match context.compatibility {
+        WasiHttpCompatibility::Compatible
+            if context.imports.iter().all(|import| {
+                matches!(
+                    &import.version,
+                    WasiHttpImportVersion::Semver(version) if version == &context.host_version
+                )
+            }) =>
+        {
+            write!(
+                f,
+                "\nThe component and host use the identical wasi:http version {}, so the wasi:http version is not the problem.",
+                context.host_version
+            )
+        }
+        WasiHttpCompatibility::Compatible => write!(
+            f,
+            "\nThese wasi:http versions are compatible but differ: Wasmtime's component linker matches 0.2.x patch versions bidirectionally, so the version difference is not the problem."
+        ),
+        WasiHttpCompatibility::Incompatible => write!(
+            f,
+            "\nThese wasi:http versions are not semver-compatible under Wasmtime's component-linker rules."
+        ),
+        WasiHttpCompatibility::Unknown => write!(
+            f,
+            "\nCompatibility could not be determined because at least one wasi:http import has no valid semantic version."
+        ),
+    }
+}
+
+fn write_wasi_http_not_imported_context(
+    f: &mut fmt::Formatter<'_>,
+    context: &WasiHttpNotImportedContext,
+) -> fmt::Result {
+    write!(f, "\nComponent wasi:http imports: none detected")?;
+    if !context.component_imports.is_empty() {
+        write!(f, "\nComponent imports: ")?;
+        for (index, import) in context.component_imports.iter().enumerate() {
+            if index > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{import}")?;
+        }
+    }
+    write!(
+        f,
+        "\nHost wasi:http version: {} (provided by wasmtime-wasi-http {WASMTIME_WASI_HTTP_CRATE_VERSION_WITH_KNOWN_WIT})",
+        context.host_version
+    )
+}
+
+fn write_single_attempt_context(
+    f: &mut fmt::Formatter<'_>,
+    world: InstantiationWorld,
+) -> fmt::Result {
+    match world {
+        InstantiationWorld::HttpEnabled => write!(
+            f,
+            "\nSingle runtime instantiation attempt: HTTP-enabled world. No basic fallback was attempted."
+        ),
+        InstantiationWorld::Basic => write!(
+            f,
+            "\nSingle runtime instantiation attempt: basic world. No fallback attempt was made."
+        ),
+    }
+}
+
+impl fmt::Display for ProviderInstantiationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_error_chain(f, &self.primary_failure)?;
+        match self.context.as_ref() {
+            InstantiationContext::HttpThenBasic {
+                context: DualAttemptContext::WasiHttpImported { context },
+            } => {
+                write_wasi_http_imported_context(f, context)?;
+                write!(
+                    f,
+                    "\nBasic fallback diagnostic omitted: this component imports wasi:http, which the basic linker deliberately does not provide, so that attempt cannot identify the root cause."
+                )
+            }
+            InstantiationContext::HttpThenBasic {
+                context:
+                    DualAttemptContext::WasiHttpNotImported {
+                        context,
+                        basic_failure,
+                    },
+            } => {
+                write_wasi_http_not_imported_context(f, context)?;
+                write!(
+                    f,
+                    "\nSubordinate basic fallback attempt also failed (not the root cause): "
+                )?;
+                write_error_chain(f, basic_failure)
+            }
+            InstantiationContext::SingleAttempt { world, context } => {
+                match context {
+                    ComponentInstantiationContext::WasiHttpImported { context } => {
+                        write_wasi_http_imported_context(f, context)?;
+                    }
+                    ComponentInstantiationContext::WasiHttpNotImported { context } => {
+                        write_wasi_http_not_imported_context(f, context)?;
+                    }
+                }
+                write_single_attempt_context(f, *world)
+            }
+        }
+    }
+}
+
+// These diagnostics are deliberately self-contained because CLI/LSP boundaries
+// render them with `Display`. Do not also expose their already-rendered child
+// through `source()`: standard chain walkers would print the same chain twice.
+impl std::error::Error for ProviderInstantiationError {}
+
+/// Error returned while loading a WASM provider.
+///
+/// Instantiation is a dedicated variant so composition roots can attach
+/// resolver provenance without first flattening the diagnostic to prose.
+#[derive(Debug)]
+pub enum WasmProviderLoadError {
+    Instantiation(ProviderInstantiationError),
+    Other(String),
+}
+
+impl fmt::Display for WasmProviderLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WasmProviderLoadError::Instantiation(error) => error.fmt(f),
+            WasmProviderLoadError::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for WasmProviderLoadError {}
+
+impl From<ProviderInstantiationError> for WasmProviderLoadError {
+    fn from(error: ProviderInstantiationError) -> Self {
+        WasmProviderLoadError::Instantiation(error)
+    }
+}
+
+impl From<String> for WasmProviderLoadError {
+    fn from(message: String) -> Self {
+        WasmProviderLoadError::Other(message)
+    }
+}
+
+/// Failure while creating a credentialed per-binding runtime instance.
+/// Instantiation remains typed until the `ProviderFactory` trait boundary;
+/// provider initialization rejections retain their existing verbatim message.
+#[derive(Debug)]
+enum WasmProviderInstanceError {
+    Instantiation(ProviderInstantiationError),
+    Other(String),
+}
+
+type ProviderInstantiationErrorMapper =
+    Arc<dyn Fn(ProviderInstantiationError) -> ProviderError + Send + Sync>;
+
+fn default_provider_instantiation_error_mapper(error: ProviderInstantiationError) -> ProviderError {
+    ProviderError::internal("Failed to instantiate WASM provider runtime instance")
+        .with_cause(error)
+}
+
+impl WasmProviderInstanceError {
+    fn into_provider_error_with(self, mapper: &ProviderInstantiationErrorMapper) -> ProviderError {
+        match self {
+            WasmProviderInstanceError::Instantiation(error) => mapper(error),
+            WasmProviderInstanceError::Other(message) => ProviderError::invalid_input(message),
+        }
+    }
+}
+
+impl fmt::Display for WasmProviderInstanceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WasmProviderInstanceError::Instantiation(error) => error.fmt(f),
+            WasmProviderInstanceError::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for WasmProviderInstanceError {}
+
+impl From<String> for WasmProviderInstanceError {
+    fn from(message: String) -> Self {
+        WasmProviderInstanceError::Other(message)
+    }
+}
+
+fn wasi_http_compatibility(
+    host_version: &semver::Version,
+    imports: &WasiHttpImports,
+) -> WasiHttpCompatibility {
+    let mut saw_unknown = false;
+    for import in imports.iter() {
+        match &import.version {
+            WasiHttpImportVersion::Semver(component_version) => {
+                if !component_versions_linker_compatible(host_version, component_version) {
+                    return WasiHttpCompatibility::Incompatible;
+                }
+            }
+            WasiHttpImportVersion::Unversioned | WasiHttpImportVersion::Invalid => {
+                saw_unknown = true
+            }
+        }
+    }
+    if saw_unknown {
+        WasiHttpCompatibility::Unknown
+    } else {
+        WasiHttpCompatibility::Compatible
+    }
+}
+
+/// Mirrors Wasmtime's component-name compatibility tracks: stable 1.x names
+/// share a major-version track, stable 0.x names with a non-zero minor share
+/// a major/minor track, and pre-releases or 0.0.x names match only exactly.
+fn component_versions_linker_compatible(left: &semver::Version, right: &semver::Version) -> bool {
+    if left == right {
+        return true;
+    }
+    if !left.pre.is_empty() || !right.pre.is_empty() {
+        return false;
+    }
+    if left.major != 0 || right.major != 0 {
+        return left.major != 0 && left.major == right.major;
+    }
+    if left.minor != 0 || right.minor != 0 {
+        return left.minor != 0 && left.minor == right.minor;
+    }
+    false
+}
+
+fn write_error_chain(f: &mut fmt::Formatter<'_>, error: &wasmtime::Error) -> fmt::Result {
+    for (index, cause) in error.chain().enumerate() {
+        if index == 0 {
+            write!(f, "{cause}")?;
+        } else {
+            write!(f, "\n  caused by: {cause}")?;
+        }
+    }
+    Ok(())
 }
 
 // -- HTTP allow-list hooks --
@@ -1081,7 +1569,7 @@ async fn create_instance(
     engine: &Engine,
     component: &Component,
     provider_kind: Option<&str>,
-) -> Result<(Store<HostState>, WasmBindings), String> {
+) -> wasmtime::Result<(Store<HostState>, WasmBindings)> {
     let wasi_ctx = build_sandboxed_wasi_ctx(provider_kind);
     let host_state = HostState {
         wasi_ctx,
@@ -1096,11 +1584,11 @@ async fn create_instance(
 
     let mut linker = Linker::new(engine);
     add_wasi_sans_sockets_to_linker(&mut linker)
-        .map_err(|e| format!("Failed to add WASI to linker: {e}"))?;
+        .map_err(|error| error.context("Failed to add WASI to linker"))?;
 
     let bindings = CarinaProvider::instantiate_async(&mut store, component, &linker)
         .await
-        .map_err(|e| format!("Failed to instantiate WASM component: {e}"))?;
+        .map_err(|error| error.context("Failed to instantiate WASM component"))?;
 
     Ok((store, WasmBindings::Basic(bindings)))
 }
@@ -1230,7 +1718,7 @@ async fn create_instance_with_http(
     engine: &Engine,
     component: &Component,
     provider_kind: Option<&str>,
-) -> Result<(Store<HostState>, WasmBindings), String> {
+) -> wasmtime::Result<(Store<HostState>, WasmBindings)> {
     let wasi_ctx = build_sandboxed_wasi_ctx(provider_kind);
     let host_state = HostState {
         wasi_ctx,
@@ -1245,24 +1733,49 @@ async fn create_instance_with_http(
 
     let mut linker = Linker::new(engine);
     add_wasi_sans_sockets_to_linker(&mut linker)
-        .map_err(|e| format!("Failed to add WASI to linker: {e}"))?;
+        .map_err(|error| error.context("Failed to add WASI to linker"))?;
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
-        .map_err(|e| format!("Failed to add wasi:http to linker: {e}"))?;
+        .map_err(|error| error.context("Failed to add wasi:http to linker"))?;
 
     let bindings = CarinaProviderWithHttp::instantiate_async(&mut store, component, &linker)
         .await
-        .map_err(|e| format!("Failed to instantiate WASM component (HTTP): {e}"))?;
+        .map_err(|error| error.context("Failed to instantiate WASM component (HTTP)"))?;
 
     Ok((store, WasmBindings::Http(bindings)))
 }
 
+/// Instantiate exactly the world selected when the factory was loaded.
+///
+/// Runtime per-binding instances do not retry another world. Keeping the
+/// selection and typed error construction in one function prevents either
+/// branch from flattening its Wasmtime failure or inventing fallback context.
+async fn create_runtime_instance(
+    engine: &Engine,
+    component: &Component,
+    provider_kind: Option<&str>,
+    world: InstantiationWorld,
+) -> Result<(Store<HostState>, WasmBindings), ProviderInstantiationError> {
+    let result = match world {
+        InstantiationWorld::HttpEnabled => {
+            create_instance_with_http(engine, component, provider_kind).await
+        }
+        InstantiationWorld::Basic => create_instance(engine, component, provider_kind).await,
+    };
+    result.map_err(|failure| {
+        ProviderInstantiationError::from_single_attempt(engine, component, world, failure)
+    })
+}
+
 /// Output of `create_instance_auto`: the instantiated store, the
 /// bindings, and whether the HTTP-enabled world was used.
-type CreateInstanceResult = Result<(Store<HostState>, WasmBindings, bool), String>;
+type CreateInstanceResult =
+    Result<(Store<HostState>, WasmBindings, bool), ProviderInstantiationError>;
 
-/// Try HTTP instantiation first, then basic. On double failure, report
-/// both errors: the basic fallback's "wasi:http/types not found" is
-/// misleading when the real cause is in the HTTP path.
+/// Try HTTP instantiation first, then basic. On double failure, retain the
+/// complete HTTP-path error and component-derived compatibility context. The
+/// basic failure is omitted when the component imports wasi:http because that
+/// linker deliberately cannot satisfy it and therefore carries no diagnostic
+/// signal.
 ///
 /// Returns a boxed future (not `async fn`) to erase the future type at
 /// this call site. Inlining this helper as a plain `async fn` composes
@@ -1281,21 +1794,12 @@ fn create_instance_auto<'a>(
             Ok((store, bindings)) => Ok((store, bindings, true)),
             Err(http_err) => match create_instance(engine, component, provider_kind).await {
                 Ok((store, bindings)) => Ok((store, bindings, false)),
-                Err(basic_err) => Err(format_dual_instantiation_error(&http_err, &basic_err)),
+                Err(basic_err) => Err(ProviderInstantiationError::from_attempts(
+                    engine, component, http_err, basic_err,
+                )),
             },
         }
     })
-}
-
-/// Format the combined error message when both the HTTP and basic
-/// instantiation attempts fail. Extracted so regressions in the format
-/// (or accidentally dropping one of the two errors) can be unit-tested.
-fn format_dual_instantiation_error(http_err: &str, basic_err: &str) -> String {
-    format!(
-        "Failed to instantiate WASM component; \
-         HTTP-enabled world failed: {http_err}; \
-         basic fallback also failed: {basic_err}"
-    )
 }
 
 // -- SharedWasmInstance --
@@ -1356,6 +1860,10 @@ pub struct WasmProviderFactory {
     /// to the first instance's attributes (e.g. region) regardless of
     /// what later instances configure.
     shared_instances: Mutex<HashMap<Option<String>, Arc<SharedWasmInstance>>>,
+    /// Maps the host's typed runtime-instantiation error into the public
+    /// `ProviderError` trait boundary. Composition roots can wrap it with
+    /// resolver-owned artifact provenance without stringifying either layer.
+    instantiation_error_mapper: ProviderInstantiationErrorMapper,
     /// Background thread that ticks the epoch counter for timeout enforcement.
     /// Kept alive for the lifetime of the factory; dropped automatically.
     _epoch_ticker: EpochTicker,
@@ -1451,7 +1959,7 @@ impl WasmProviderFactory {
     /// Load a WASM provider, using the default precompile cache at `~/.carina/cache/`.
     ///
     /// If the cache directory cannot be created, falls back to compiling without caching.
-    pub async fn new(wasm_path: PathBuf) -> Result<Self, String> {
+    pub async fn new(wasm_path: PathBuf) -> Result<Self, WasmProviderLoadError> {
         match Self::default_cache_dir() {
             Some(cache_dir) => Self::new_with_cache_dir(wasm_path, &cache_dir).await,
             None => Self::new_uncached(wasm_path).await,
@@ -1459,7 +1967,10 @@ impl WasmProviderFactory {
     }
 
     /// Load a WASM provider with an explicit cache directory.
-    pub async fn new_with_cache_dir(wasm_path: PathBuf, cache_dir: &Path) -> Result<Self, String> {
+    pub async fn new_with_cache_dir(
+        wasm_path: PathBuf,
+        cache_dir: &Path,
+    ) -> Result<Self, WasmProviderLoadError> {
         let cwasm_name = Self::cache_key(&wasm_path);
         let cwasm_path = cache_dir.join(&cwasm_name);
 
@@ -1506,7 +2017,7 @@ impl WasmProviderFactory {
     }
 
     /// Load a WASM provider without any precompile caching.
-    async fn new_uncached(wasm_path: PathBuf) -> Result<Self, String> {
+    async fn new_uncached(wasm_path: PathBuf) -> Result<Self, WasmProviderLoadError> {
         let config = build_engine_config();
         let engine =
             Engine::new(&config).map_err(|e| format!("Failed to create WASM engine: {e}"))?;
@@ -1558,6 +2069,7 @@ impl WasmProviderFactory {
             enable_http,
             init_instance: Mutex::new((store, bindings)),
             shared_instances: Mutex::new(HashMap::new()),
+            instantiation_error_mapper: Arc::new(default_provider_instantiation_error_mapper),
             _epoch_ticker: epoch_ticker,
         })
     }
@@ -1614,7 +2126,7 @@ impl WasmProviderFactory {
     /// # Safety
     /// The .cwasm file must have been produced by `precompile()` using the same
     /// Wasmtime version. Deserializing an untrusted or corrupted file is unsafe.
-    pub async fn from_precompiled(cwasm_path: &Path) -> Result<Self, String> {
+    pub async fn from_precompiled(cwasm_path: &Path) -> Result<Self, WasmProviderLoadError> {
         let config = build_engine_config();
         let engine =
             Engine::new(&config).map_err(|e| format!("Failed to create WASM engine: {e}"))?;
@@ -1669,6 +2181,7 @@ impl WasmProviderFactory {
             enable_http,
             init_instance: Mutex::new((store, bindings)),
             shared_instances: Mutex::new(HashMap::new()),
+            instantiation_error_mapper: Arc::new(default_provider_instantiation_error_mapper),
             _epoch_ticker: epoch_ticker,
         })
     }
@@ -1680,24 +2193,31 @@ impl WasmProviderFactory {
     ///
     /// **Deprecated**: Use `new()` or `new_with_cache_dir()` instead, which
     /// handle caching automatically.
-    pub async fn from_file_cached(wasm_path: &Path, cache_dir: &Path) -> Result<Self, String> {
+    pub async fn from_file_cached(
+        wasm_path: &Path,
+        cache_dir: &Path,
+    ) -> Result<Self, WasmProviderLoadError> {
         Self::new_with_cache_dir(wasm_path.to_path_buf(), cache_dir).await
     }
 
     async fn create_initialized_instance(
         &self,
         attributes: &IndexMap<String, Value>,
-    ) -> Result<(Store<HostState>, WasmBindings), String> {
+    ) -> Result<(Store<HostState>, WasmBindings), WasmProviderInstanceError> {
         // This is the credentialed runtime instance (it calls
         // `initialize` and then read/create/update/delete). The provider
         // kind is known here (`self.name`, learned from `info()` at load
         // time), so the guest receives only its own credential partition.
         let kind = Some(self.name.as_str());
-        let (mut store, bindings) = if self.enable_http {
-            create_instance_with_http(&self.engine, &self.component, kind).await?
+        let world = if self.enable_http {
+            InstantiationWorld::HttpEnabled
         } else {
-            create_instance(&self.engine, &self.component, kind).await?
+            InstantiationWorld::Basic
         };
+        let (mut store, bindings) =
+            create_runtime_instance(&self.engine, &self.component, kind, world)
+                .await
+                .map_err(WasmProviderInstanceError::Instantiation)?;
         let wit_attrs =
             wasm_convert::core_to_wit_value_map(attributes).map_err(|e| e.to_string())?;
         bindings
@@ -1725,7 +2245,7 @@ impl WasmProviderFactory {
         &self,
         binding: Option<&str>,
         attributes: &IndexMap<String, Value>,
-    ) -> Result<Arc<SharedWasmInstance>, String> {
+    ) -> Result<Arc<SharedWasmInstance>, WasmProviderInstanceError> {
         let key: Option<String> = binding.map(|s| s.to_string());
         let mut guard = self.shared_instances.lock().await;
         if let Some(instance) = guard.get(&key) {
@@ -1743,6 +2263,17 @@ impl WasmProviderFactory {
 }
 
 impl WasmProviderFactory {
+    /// Replace the runtime-instantiation mapper used at the `ProviderFactory`
+    /// boundary. Installed-artifact loaders use this to attach resolver
+    /// provenance while the [`ProviderInstantiationError`] is still typed.
+    pub fn with_runtime_instantiation_error_mapper<F>(mut self, mapper: F) -> Self
+    where
+        F: Fn(ProviderInstantiationError) -> ProviderError + Send + Sync + 'static,
+    {
+        self.instantiation_error_mapper = Arc::new(mapper);
+        self
+    }
+
     pub fn version(&self) -> &str {
         &self.version
     }
@@ -1864,15 +2395,15 @@ impl ProviderFactory for WasmProviderFactory {
         let attrs = attributes.clone();
         let binding = binding.map(|s| s.to_string());
         Box::pin(async move {
-            // Surface the inner error string verbatim — it carries the
-            // user-actionable message (e.g. allowed_account_ids
-            // mismatch) produced by the provider's init step. Adding a
-            // wrapper prefix here would leak the WASM hosting detail
-            // into the user-facing error (see #2407).
+            // Provider init rejections still surface their user-actionable
+            // message verbatim (for example, allowed_account_ids mismatch;
+            // see #2407). Instantiation failures take the typed mapper path.
             let instance = self
                 .get_or_create_shared_instance(binding.as_deref(), &attrs)
                 .await
-                .map_err(ProviderError::invalid_input)?;
+                .map_err(|error| {
+                    error.into_provider_error_with(&self.instantiation_error_mapper)
+                })?;
             Ok(Box::new(WasmProvider {
                 instance,
                 name: self.name.clone(),
@@ -1895,8 +2426,9 @@ impl ProviderFactory for WasmProviderFactory {
                 Ok(instance) => {
                     Box::new(WasmProviderNormalizer { instance }) as Box<dyn ProviderNormalizer>
                 }
-                Err(e) => {
-                    log::error!("Failed to create WASM normalizer instance: {e}");
+                Err(error) => {
+                    let error = error.into_provider_error_with(&self.instantiation_error_mapper);
+                    log::error!("Failed to create WASM normalizer instance: {error}");
                     Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>
                 }
             }
@@ -2811,20 +3343,433 @@ mod tests {
         assert_eq!(key1, key2, "cache key should be stable for same content");
     }
 
-    /// Regression guard for carina#1681: when both HTTP and basic
-    /// instantiation fail, the combined error must preserve *both* causes.
-    /// Dropping either side re-introduces the misdiagnosis pattern that
-    /// caused the recurring false "wasi:http/types not found" reports.
+    fn render_wasi_http_import_context(
+        imports: WasiHttpImports,
+    ) -> (WasiHttpCompatibility, String) {
+        let host_version = semver::Version::parse(WASI_HTTP_HOST_VERSION).unwrap();
+        let compatibility = wasi_http_compatibility(&host_version, &imports);
+        let error = ProviderInstantiationError {
+            primary_failure: wasmtime::Error::msg("fixture instantiation failure"),
+            context: Box::new(InstantiationContext::SingleAttempt {
+                world: InstantiationWorld::HttpEnabled,
+                context: ComponentInstantiationContext::WasiHttpImported {
+                    context: WasiHttpImportedContext {
+                        imports,
+                        host_version,
+                        compatibility,
+                    },
+                },
+            }),
+        };
+        (compatibility, error.to_string())
+    }
+
+    fn one_wasi_http_import(name: &str, version: WasiHttpImportVersion) -> WasiHttpImports {
+        WasiHttpImports {
+            first: WasiHttpImport {
+                name: name.into(),
+                version,
+            },
+            rest: Vec::new(),
+        }
+    }
+
     #[test]
-    fn format_dual_instantiation_error_preserves_both_causes() {
-        let msg = format_dual_instantiation_error(
-            "HTTP cause: missing export `foo`",
-            "BASIC cause: wasi:http/types not in linker",
+    fn identical_wasi_http_versions_are_rendered_as_identical() {
+        let imports = one_wasi_http_import(
+            "wasi:http/outgoing-handler@0.2.6",
+            WasiHttpImportVersion::Semver(semver::Version::new(0, 2, 6)),
         );
-        assert!(msg.contains("HTTP cause: missing export `foo`"));
-        assert!(msg.contains("BASIC cause: wasi:http/types not in linker"));
-        assert!(msg.contains("HTTP-enabled world failed"));
-        assert!(msg.contains("basic fallback also failed"));
+
+        let (compatibility, rendered) = render_wasi_http_import_context(imports);
+
+        assert_eq!(compatibility, WasiHttpCompatibility::Compatible);
+        assert!(
+            rendered.contains(
+                "The component and host use the identical wasi:http version 0.2.6, so the wasi:http version is not the problem."
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("matches 0.2.x patch versions bidirectionally"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn differing_compatible_wasi_http_versions_explain_patch_matching() {
+        let imports = one_wasi_http_import(
+            "wasi:http/outgoing-handler@0.2.9",
+            WasiHttpImportVersion::Semver(semver::Version::new(0, 2, 9)),
+        );
+
+        let (compatibility, rendered) = render_wasi_http_import_context(imports);
+
+        assert_eq!(compatibility, WasiHttpCompatibility::Compatible);
+        assert!(
+            rendered.contains(
+                "These wasi:http versions are compatible but differ: Wasmtime's component linker matches 0.2.x patch versions bidirectionally, so the version difference is not the problem."
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn incompatible_wasi_http_import_renders_component_linker_wording() {
+        let imports = one_wasi_http_import(
+            "wasi:http/outgoing-handler@0.3.0",
+            WasiHttpImportVersion::Semver(semver::Version::new(0, 3, 0)),
+        );
+
+        let (compatibility, rendered) = render_wasi_http_import_context(imports);
+
+        assert_eq!(compatibility, WasiHttpCompatibility::Incompatible);
+        assert!(
+            rendered.contains(
+                "These wasi:http versions are not semver-compatible under Wasmtime's component-linker rules."
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn unknown_wasi_http_import_versions_render_uncertain_compatibility() {
+        let imports = WasiHttpImports {
+            first: WasiHttpImport {
+                name: "wasi:http/types".into(),
+                version: WasiHttpImportVersion::Unversioned,
+            },
+            rest: vec![WasiHttpImport {
+                name: "wasi:http/outgoing-handler@not-semver".into(),
+                version: WasiHttpImportVersion::Invalid,
+            }],
+        };
+
+        let (compatibility, rendered) = render_wasi_http_import_context(imports);
+
+        assert_eq!(compatibility, WasiHttpCompatibility::Unknown);
+        assert!(
+            rendered.contains(
+                "Compatibility could not be determined because at least one wasi:http import has no valid semantic version."
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// Regression guard for carina#3688: the HTTP path is the real
+    /// instantiation attempt. Its complete cause chain must lead the
+    /// diagnostic, while the structurally-inapplicable basic fallback must
+    /// not surface its predetermined "wasi:http not in linker" error as a
+    /// peer cause.
+    #[test]
+    fn provider_instantiation_error_preserves_full_http_chain_and_demotes_fallback() {
+        let config = build_engine_config();
+        let engine = Engine::new(&config).unwrap();
+        let component = Component::new(
+            &engine,
+            r#"
+                (component
+                  (type $empty (instance))
+                  (import "wasi:http/types@0.2.9" (instance (type $empty)))
+                  (import "wasi:http/outgoing-handler@0.2.9" (instance (type $empty)))
+                )
+            "#,
+        )
+        .unwrap();
+        let http_error = wasmtime::Error::msg(
+            "parameter 2 expected own<wasi:http/types.request> but found borrow",
+        )
+        .context("failed to convert function to given type")
+        .context("Failed to instantiate WASM component (HTTP)");
+        let basic_error = wasmtime::Error::msg(
+            "component imports instance `wasi:http/types@0.2.9`, but a matching implementation was not found in the linker",
+        )
+        .context("Failed to instantiate WASM component");
+
+        let error =
+            ProviderInstantiationError::from_attempts(&engine, &component, http_error, basic_error);
+        let msg = error.to_string();
+
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "the self-contained Display contract must not expose the rendered chain again"
+        );
+
+        let outer = msg
+            .find("Failed to instantiate WASM component (HTTP)")
+            .unwrap();
+        let middle = msg
+            .find("failed to convert function to given type")
+            .unwrap();
+        let root = msg
+            .find("parameter 2 expected own<wasi:http/types.request> but found borrow")
+            .unwrap();
+        assert!(
+            outer < middle && middle < root,
+            "cause chain out of order: {msg}"
+        );
+        assert!(
+            msg.starts_with("Failed to instantiate WASM component (HTTP)"),
+            "the real HTTP failure must lead: {msg}"
+        );
+        assert!(msg.contains("wasi:http/outgoing-handler@0.2.9"));
+        assert!(msg.contains("wasi:http/types@0.2.9"));
+        assert!(msg.contains("Host wasi:http version: 0.2.6"));
+        assert!(
+            msg.contains("These wasi:http versions are compatible"),
+            "compatible versions must be ruled out affirmatively: {msg}"
+        );
+        assert!(msg.contains("matches 0.2.x patch versions bidirectionally"));
+        assert!(msg.contains("Basic fallback diagnostic omitted"));
+        assert!(
+            !msg.contains("matching implementation was not found in the linker"),
+            "the predetermined fallback error must not compete with the real failure: {msg}"
+        );
+        assert!(!msg.contains("HTTP-enabled world failed"));
+        assert!(!msg.contains("basic fallback also failed"));
+    }
+
+    #[tokio::test]
+    async fn selected_http_runtime_attempt_returns_structured_instantiation_error() {
+        let config = build_engine_config();
+        let engine = Engine::new(&config).unwrap();
+        let component = Component::new(
+            &engine,
+            r#"
+                (component
+                  (type $empty (instance))
+                  (import "bogus:runtime/iface@1.0.0" (instance (type $empty)))
+                )
+            "#,
+        )
+        .unwrap();
+
+        let error = match create_runtime_instance(
+            &engine,
+            &component,
+            None,
+            InstantiationWorld::HttpEnabled,
+        )
+        .await
+        {
+            Ok(_) => panic!("the unresolved bogus import must reject instantiation"),
+            Err(error) => error,
+        };
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("bogus:runtime/iface@1.0.0"));
+        assert!(rendered.contains("Component wasi:http imports: none detected"));
+        assert!(rendered.contains("Single runtime instantiation attempt: HTTP-enabled world"));
+        assert!(rendered.contains("No basic fallback was attempted"));
+        assert!(!rendered.contains("Basic fallback diagnostic omitted"));
+        assert!(!rendered.contains("Subordinate basic fallback attempt"));
+    }
+
+    #[tokio::test]
+    async fn selected_basic_runtime_attempt_returns_structured_instantiation_error() {
+        let config = build_engine_config();
+        let engine = Engine::new(&config).unwrap();
+        let component = Component::new(
+            &engine,
+            r#"
+                (component
+                  (type $empty (instance))
+                  (import "wasi:http/types@0.2.9" (instance (type $empty)))
+                )
+            "#,
+        )
+        .unwrap();
+
+        let error =
+            match create_runtime_instance(&engine, &component, None, InstantiationWorld::Basic)
+                .await
+            {
+                Ok(_) => panic!("the basic linker must reject the wasi:http import"),
+                Err(error) => error,
+            };
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("wasi:http/types@0.2.9"));
+        assert!(rendered.contains("Host wasi:http version: 0.2.6"));
+        assert!(rendered.contains("These wasi:http versions are compatible"));
+        assert!(rendered.contains("Single runtime instantiation attempt: basic world"));
+        assert!(rendered.contains("No fallback attempt was made"));
+        assert!(!rendered.contains("Basic fallback diagnostic omitted"));
+        assert!(!rendered.contains("Subordinate basic fallback attempt"));
+    }
+
+    #[test]
+    fn single_http_instantiation_error_keeps_typed_context_without_claiming_a_fallback() {
+        let config = build_engine_config();
+        let engine = Engine::new(&config).unwrap();
+        let component = Component::new(
+            &engine,
+            r#"
+                (component
+                  (type $empty (instance))
+                  (import "wasi:http/types@0.2.9" (instance (type $empty)))
+                )
+            "#,
+        )
+        .unwrap();
+        let failure = wasmtime::Error::msg("runtime HTTP type mismatch")
+            .context("failed to convert function to given type")
+            .context("Failed to instantiate WASM component (HTTP)");
+
+        let error = ProviderInstantiationError::from_single_attempt(
+            &engine,
+            &component,
+            InstantiationWorld::HttpEnabled,
+            failure,
+        );
+        let rendered = error.to_string();
+
+        assert!(rendered.starts_with("Failed to instantiate WASM component (HTTP)"));
+        assert!(rendered.contains("runtime HTTP type mismatch"));
+        assert!(rendered.contains("wasi:http/types@0.2.9"));
+        assert!(rendered.contains("Host wasi:http version: 0.2.6"));
+        assert!(rendered.contains("These wasi:http versions are compatible"));
+        assert!(rendered.contains("Single runtime instantiation attempt: HTTP-enabled world"));
+        assert!(rendered.contains("No basic fallback was attempted"));
+        assert!(!rendered.contains("Basic fallback diagnostic omitted"));
+        assert!(!rendered.contains("Subordinate basic fallback attempt"));
+    }
+
+    #[test]
+    fn single_basic_instantiation_error_keeps_typed_context_without_demotion() {
+        let config = build_engine_config();
+        let engine = Engine::new(&config).unwrap();
+        let component = Component::new(
+            &engine,
+            r#"
+                (component
+                  (type $empty (instance))
+                  (import "wasi:http/types@0.2.9" (instance (type $empty)))
+                )
+            "#,
+        )
+        .unwrap();
+        let failure = wasmtime::Error::msg(
+            "component imports instance `wasi:http/types@0.2.9`, but a matching implementation was not found in the linker",
+        )
+        .context("Failed to instantiate WASM component");
+
+        let error = ProviderInstantiationError::from_single_attempt(
+            &engine,
+            &component,
+            InstantiationWorld::Basic,
+            failure,
+        );
+        let rendered = error.to_string();
+
+        assert!(rendered.starts_with("Failed to instantiate WASM component"));
+        assert!(rendered.contains("matching implementation was not found in the linker"));
+        assert!(rendered.contains("wasi:http/types@0.2.9"));
+        assert!(rendered.contains("Host wasi:http version: 0.2.6"));
+        assert!(rendered.contains("These wasi:http versions are compatible"));
+        assert!(rendered.contains("Single runtime instantiation attempt: basic world"));
+        assert!(rendered.contains("No fallback attempt was made"));
+        assert!(!rendered.contains("Basic fallback diagnostic omitted"));
+        assert!(!rendered.contains("Subordinate basic fallback attempt"));
+    }
+
+    #[test]
+    fn runtime_instantiation_error_remains_typed_at_provider_error_boundary() {
+        let config = build_engine_config();
+        let engine = Engine::new(&config).unwrap();
+        let component = Component::new(
+            &engine,
+            r#"
+                (component
+                  (type $empty (instance))
+                  (import "wasi:http/types@0.2.9" (instance (type $empty)))
+                )
+            "#,
+        )
+        .unwrap();
+        let instantiation = ProviderInstantiationError::from_single_attempt(
+            &engine,
+            &component,
+            InstantiationWorld::HttpEnabled,
+            wasmtime::Error::msg("runtime instantiation failed"),
+        );
+
+        let mapper: ProviderInstantiationErrorMapper =
+            Arc::new(default_provider_instantiation_error_mapper);
+        let provider_error = WasmProviderInstanceError::Instantiation(instantiation)
+            .into_provider_error_with(&mapper);
+        let cause = std::error::Error::source(&provider_error)
+            .expect("provider boundary must retain the typed instantiation cause");
+
+        assert!(cause.downcast_ref::<ProviderInstantiationError>().is_some());
+        let rendered = provider_error.to_string();
+        assert!(rendered.contains("runtime instantiation failed"));
+        assert!(rendered.contains("wasi:http/types@0.2.9"));
+        assert!(rendered.contains("Host wasi:http version: 0.2.6"));
+        assert!(rendered.contains("These wasi:http versions are compatible"));
+        assert!(rendered.contains("Single runtime instantiation attempt"));
+    }
+
+    #[test]
+    fn runtime_instantiation_error_accepts_a_typed_composition_mapper() {
+        let config = build_engine_config();
+        let engine = Engine::new(&config).unwrap();
+        let component = Component::new(&engine, "(component)").unwrap();
+        let instantiation = ProviderInstantiationError::from_single_attempt(
+            &engine,
+            &component,
+            InstantiationWorld::HttpEnabled,
+            wasmtime::Error::msg("runtime instantiation failed"),
+        );
+        let mapper: ProviderInstantiationErrorMapper = Arc::new(|error| {
+            ProviderError::internal("artifact provenance attached").with_cause(error)
+        });
+
+        let provider_error = WasmProviderInstanceError::Instantiation(instantiation)
+            .into_provider_error_with(&mapper);
+
+        assert!(
+            provider_error
+                .to_string()
+                .contains("artifact provenance attached")
+        );
+        assert!(
+            provider_error
+                .to_string()
+                .contains("runtime instantiation failed")
+        );
+    }
+
+    /// `WASI_HTTP_HOST_VERSION` is user-facing compatibility evidence, so a
+    /// dependency bump must force an explicit review of the dependency's
+    /// `wit/deps/http.wit` package version instead of silently leaving stale
+    /// output behind.
+    #[test]
+    fn host_wasi_http_version_tracks_locked_wasmtime_wasi_http_pin() {
+        let lock = include_str!("../../Cargo.lock");
+        let mut locked_versions: Vec<_> = lock
+            .split("[[package]]")
+            .filter(|package| {
+                package
+                    .lines()
+                    .any(|line| line.trim() == "name = \"wasmtime-wasi-http\"")
+            })
+            .filter_map(|package| {
+                package.lines().find_map(|line| {
+                    line.trim()
+                        .strip_prefix("version = \"")
+                        .and_then(|version| version.strip_suffix('\"'))
+                })
+            })
+            .collect();
+        locked_versions.sort_unstable();
+        locked_versions.dedup();
+
+        assert_eq!(
+            locked_versions,
+            [WASMTIME_WASI_HTTP_CRATE_VERSION_WITH_KNOWN_WIT],
+            "inspect wasmtime-wasi-http's wit/deps/http.wit and update WASI_HTTP_HOST_VERSION"
+        );
     }
 
     /// A fresh (un-poisoned) instance lets an operation proceed: the

@@ -25,4 +25,6 @@ pub mod wasm_bindings_http {
     });
 }
 
-pub use wasm_factory::WasmProviderFactory;
+pub use wasm_factory::{
+    ProviderInstantiationError, WASI_HTTP_HOST_VERSION, WasmProviderFactory, WasmProviderLoadError,
+};
