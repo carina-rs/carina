@@ -1,20 +1,32 @@
 //! CLI-level coverage for apply parallelism and update-update edge retention.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-const DELAY_MS: u64 = 800;
 const UPDATE_COUNT: usize = 13;
+
+#[derive(Debug)]
+enum UpdateTraceEvent {
+    Start { resource: String, active: usize },
+    Finish { resource: String },
+}
+
+#[derive(Debug)]
+struct UpdateRun {
+    max_active: usize,
+    trace: Vec<UpdateTraceEvent>,
+}
 
 struct Scenario {
     _tmp: TempDir,
     project: PathBuf,
     mock_state: PathBuf,
     max_active: PathBuf,
+    update_trace: PathBuf,
 }
 
 impl Scenario {
@@ -24,6 +36,7 @@ impl Scenario {
         Self {
             mock_state: project.join("mock-state.json"),
             max_active: project.join("max-active.txt"),
+            update_trace: project.join("update-trace.txt"),
             project,
             _tmp: tmp,
         }
@@ -41,7 +54,7 @@ impl Scenario {
         assert_success("carina init", output);
     }
 
-    fn apply(&self, parallelism: usize, delay_updates: bool) -> (Duration, usize) {
+    fn apply(&self, parallelism: usize) -> UpdateRun {
         let mut command = carina(&self.project);
         command.args([
             "apply",
@@ -53,21 +66,12 @@ impl Scenario {
         ]);
         command
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
-            .env("CARINA_MOCK_MAX_ACTIVE_PATH", &self.max_active);
-        if delay_updates {
-            command.env("CARINA_MOCK_UPDATE_DELAY_MS", DELAY_MS.to_string());
-        }
+            .env("CARINA_MOCK_MAX_ACTIVE_PATH", &self.max_active)
+            .env("CARINA_MOCK_UPDATE_TRACE_PATH", &self.update_trace);
 
-        let started = Instant::now();
         let output = command.output().expect("failed to execute carina apply");
-        let elapsed = started.elapsed();
         assert_success("carina apply", output);
-        let max_active = fs::read_to_string(&self.max_active)
-            .unwrap_or_else(|_| "0".to_string())
-            .trim()
-            .parse::<usize>()
-            .unwrap();
-        (elapsed, max_active)
+        self.read_update_run()
     }
 
     fn plan_out(&self, plan_path: &Path) {
@@ -80,12 +84,7 @@ impl Scenario {
         assert_success("carina plan --out", output);
     }
 
-    fn apply_plan(
-        &self,
-        plan_path: &Path,
-        parallelism: usize,
-        delay_updates: bool,
-    ) -> (Duration, usize) {
+    fn apply_plan(&self, plan_path: &Path, parallelism: usize) -> UpdateRun {
         let mut command = carina(&self.project);
         command
             .arg("apply")
@@ -94,23 +93,28 @@ impl Scenario {
             .arg(parallelism.to_string());
         command
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
-            .env("CARINA_MOCK_MAX_ACTIVE_PATH", &self.max_active);
-        if delay_updates {
-            command.env("CARINA_MOCK_UPDATE_DELAY_MS", DELAY_MS.to_string());
-        }
+            .env("CARINA_MOCK_MAX_ACTIVE_PATH", &self.max_active)
+            .env("CARINA_MOCK_UPDATE_TRACE_PATH", &self.update_trace);
 
-        let started = Instant::now();
         let output = command
             .output()
             .expect("failed to execute carina apply plan");
-        let elapsed = started.elapsed();
         assert_success("carina apply plan", output);
+        self.read_update_run()
+    }
+
+    fn read_update_run(&self) -> UpdateRun {
         let max_active = fs::read_to_string(&self.max_active)
             .unwrap_or_else(|_| "0".to_string())
             .trim()
             .parse::<usize>()
             .unwrap();
-        (elapsed, max_active)
+        let trace = fs::read_to_string(&self.update_trace)
+            .unwrap_or_else(|err| panic!("failed to read update trace: {err}"))
+            .lines()
+            .map(parse_update_trace_event)
+            .collect();
+        UpdateRun { max_active, trace }
     }
 }
 
@@ -132,26 +136,173 @@ fn assert_success(label: &str, output: std::process::Output) {
     );
 }
 
-fn assert_known_refs_relaxed(label: &str, known_ref_elapsed: Duration, depends_elapsed: Duration) {
-    // With 13 updates at parallelism 8, known-disjoint refs need ceil(13 / 8) = 2
-    // rounds. An explicit depends_on gates the parent for 1 round, then 12 children
-    // need ceil(12 / 8) = 2 rounds, for 3 rounds total. The expected gap is exactly
-    // one DELAY_MS round. A difference is used because shared additive overhead
-    // cancels out, while the same overhead pushes a ratio toward 1. Requiring 70%
-    // of one round leaves 30% headroom for jitter. If relaxation regresses, both
-    // schedules take about 3 rounds and the gap collapses to about 0.
-    //
-    // At DELAY_MS=800, the 560 ms margin passes known=1,645 ms and
-    // depends_on=2,441 ms (a 796 ms gap), rejects serial known=10,474 ms versus
-    // depends_on=2,444 ms and a 2,400/2,400 ms 3-round regression, and a shared
-    // 1,600 ms overhead leaves the theoretical 800 ms gap unchanged.
-    //
-    // Known residual: #3659 also recorded known=2.43s and depends_on=2.49s, with
-    // depends_on itself near its 2.4s floor. That non-uniform slowdown defeats both
-    // ratio and difference comparisons; no same-run comparison can cancel it.
+fn parse_update_trace_event(line: &str) -> UpdateTraceEvent {
+    let mut fields = line.split_whitespace();
+    let event = fields.next();
+    let resource = fields.next().map(str::to_string);
+    let active = fields.next();
+    let trailing = fields.next();
+    match (event, resource, active, trailing) {
+        (Some("start"), Some(resource), Some(active), None) => UpdateTraceEvent::Start {
+            resource,
+            active: active
+                .parse()
+                .unwrap_or_else(|err| panic!("invalid active count in trace line {line:?}: {err}")),
+        },
+        (Some("finish"), Some(resource), None, None) => UpdateTraceEvent::Finish { resource },
+        _ => panic!("invalid update trace line: {line:?}"),
+    }
+}
+
+fn assert_complete_update_trace(label: &str, trace: &[UpdateTraceEvent]) {
+    let mut started = trace
+        .iter()
+        .filter_map(|event| match event {
+            UpdateTraceEvent::Start { resource, .. } => Some(resource.as_str()),
+            UpdateTraceEvent::Finish { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let mut finished = trace
+        .iter()
+        .filter_map(|event| match event {
+            UpdateTraceEvent::Start { .. } => None,
+            UpdateTraceEvent::Finish { resource } => Some(resource.as_str()),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        started.len(),
+        UPDATE_COUNT,
+        "{label} must start every update; trace={trace:#?}"
+    );
+    started.sort_unstable();
+    finished.sort_unstable();
+    assert_eq!(
+        finished, started,
+        "{label} must finish every update it starts; trace={trace:#?}"
+    );
+}
+
+fn update_waves(trace: &[UpdateTraceEvent]) -> Vec<Vec<&str>> {
+    let mut waves = Vec::<Vec<&str>>::new();
+    let mut started_in_wave = HashMap::<&str, usize>::new();
+    let mut active_resources = HashSet::<&str>::new();
+    let mut finished_resources = HashSet::<&str>::new();
+    let mut latest_finished_wave = None::<usize>;
+
+    for event in trace {
+        match event {
+            UpdateTraceEvent::Start { resource, active } => {
+                let resource = resource.as_str();
+                assert!(
+                    !started_in_wave.contains_key(resource),
+                    "update trace starts {resource} more than once; trace={trace:#?}"
+                );
+                assert_eq!(
+                    *active,
+                    active_resources.len() + 1,
+                    "update trace has an inconsistent active count at {resource}; trace={trace:#?}"
+                );
+                assert!(
+                    active_resources.insert(resource),
+                    "update trace starts active resource {resource} again; trace={trace:#?}"
+                );
+
+                // A start is one causal wave after the newest wave with an observed
+                // finish. The mock's yield makes a ready group record all starts
+                // before its first finish, so this preserves narrower later waves
+                // and turns a serial start/finish trace into one wave per update.
+                let wave = latest_finished_wave.map_or(0, |finished| finished + 1);
+                if waves.len() == wave {
+                    waves.push(Vec::new());
+                }
+                assert!(
+                    wave < waves.len(),
+                    "update trace skipped a wave before starting {resource}; trace={trace:#?}"
+                );
+                waves[wave].push(resource);
+                started_in_wave.insert(resource, wave);
+            }
+            UpdateTraceEvent::Finish { resource } => {
+                let resource = resource.as_str();
+                let wave = *started_in_wave.get(resource).unwrap_or_else(|| {
+                    panic!("update trace finishes {resource} before it starts; trace={trace:#?}")
+                });
+                assert!(
+                    active_resources.remove(resource),
+                    "update trace finishes inactive resource {resource}; trace={trace:#?}"
+                );
+                assert!(
+                    finished_resources.insert(resource),
+                    "update trace finishes {resource} more than once; trace={trace:#?}"
+                );
+                latest_finished_wave =
+                    Some(latest_finished_wave.map_or(wave, |finished| finished.max(wave)));
+            }
+        }
+    }
+
+    assert_eq!(
+        active_resources,
+        HashSet::new(),
+        "update trace leaves resources active; trace={trace:#?}"
+    );
+    waves
+}
+
+fn assert_parallelism_cap(label: &str, run: &UpdateRun, limit: usize) {
     assert!(
-        depends_elapsed >= known_ref_elapsed + Duration::from_millis(DELAY_MS * 7 / 10),
-        "{label} known-disjoint refs should finish at least 70% of one delay round faster than depends_on; known={known_ref_elapsed:?}, depends_on={depends_elapsed:?}"
+        run.max_active <= limit,
+        "{label} must respect --parallelism {limit}, got {}",
+        run.max_active
+    );
+    let traced_max = run
+        .trace
+        .iter()
+        .filter_map(|event| match event {
+            UpdateTraceEvent::Start { active, .. } => Some(*active),
+            UpdateTraceEvent::Finish { .. } => None,
+        })
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        run.max_active, traced_max,
+        "{label} max-active counter must match its trace; trace={:#?}",
+        run.trace
+    );
+}
+
+fn assert_update_schedule(
+    label: &str,
+    run: &UpdateRun,
+    parallelism: usize,
+    expected_wave_widths: &[usize],
+) {
+    assert_parallelism_cap(label, run, parallelism);
+    assert_complete_update_trace(label, &run.trace);
+    let waves = update_waves(&run.trace);
+    let actual_wave_widths = waves.iter().map(Vec::len).collect::<Vec<_>>();
+    assert_eq!(
+        actual_wave_widths, expected_wave_widths,
+        "{label} must have update wave widths {expected_wave_widths:?}; waves={waves:#?}; trace={:#?}",
+        run.trace
+    );
+}
+
+fn assert_known_refs_bypass_parent_gate(
+    label: &str,
+    known_ref_run: &UpdateRun,
+    depends_run: &UpdateRun,
+) {
+    let known_ref_waves = update_waves(&known_ref_run.trace);
+    let depends_waves = update_waves(&depends_run.trace);
+    assert_eq!(
+        depends_waves[0],
+        ["test.resource.vpc"],
+        "{label} depends_on must gate children on the parent; waves={depends_waves:#?}"
+    );
+    assert!(
+        known_ref_waves[0].contains(&"test.resource.vpc") && known_ref_waves[0].len() > 1,
+        "{label} known-disjoint refs must let children update alongside the parent; waves={known_ref_waves:#?}"
     );
 }
 
@@ -207,132 +358,79 @@ fn parent_child_resources(version: &str, child_extra: impl Fn(usize) -> String) 
     project_with_resources(resources)
 }
 
-fn update_scenario(initial: String, updated: String, parallelism: usize) -> (Duration, usize) {
+fn update_scenario(initial: String, updated: String, parallelism: usize) -> UpdateRun {
     let scenario = Scenario::new();
     scenario.write_config(&initial);
     scenario.init();
-    scenario.apply(parallelism, false);
+    scenario.apply(parallelism);
     scenario.write_config(&updated);
-    scenario.apply(parallelism, true)
+    scenario.apply(parallelism)
 }
 
-fn saved_plan_update_scenario(
-    initial: String,
-    updated: String,
-    parallelism: usize,
-) -> (Duration, usize) {
+fn saved_plan_update_scenario(initial: String, updated: String, parallelism: usize) -> UpdateRun {
     let scenario = Scenario::new();
     scenario.write_config(&initial);
     scenario.init();
-    scenario.apply(parallelism, false);
+    scenario.apply(parallelism);
     scenario.write_config(&updated);
     let plan_path = scenario.project.join("plan.json");
     scenario.plan_out(&plan_path);
-    scenario.apply_plan(&plan_path, parallelism, true)
+    scenario.apply_plan(&plan_path, parallelism)
 }
 
 #[test]
 fn apply_parallelism_cli_e2e_covers_caps_and_unknown_update_edges() {
-    let (cap_elapsed, cap_max) = update_scenario(
+    let cap = update_scenario(
         independent_resources("old"),
         independent_resources("new"),
         4,
     );
-    assert!(
-        cap_max <= 4,
-        "--parallelism 4 must cap in-flight updates at 4, got {cap_max}"
-    );
-    assert!(
-        cap_max > 1,
-        "--parallelism 4 should permit concurrent updates, got {cap_max}"
-    );
-    assert!(
-        cap_elapsed >= Duration::from_millis(DELAY_MS * 3)
-            && cap_elapsed < Duration::from_millis(DELAY_MS * UPDATE_COUNT as u64),
-        "--parallelism 4 elapsed should land between parallel and serial bounds, got {cap_elapsed:?}"
-    );
+    assert_update_schedule("--parallelism 4", &cap, 4, &[4, 4, 4, 1]);
 
-    let (serial_elapsed, serial_max) = update_scenario(
+    let serial = update_scenario(
         independent_resources("old"),
         independent_resources("new"),
         1,
     );
-    assert_eq!(
-        serial_max, 1,
-        "--parallelism 1 must run updates serially, got {serial_max}"
-    );
-    assert!(
-        serial_elapsed >= Duration::from_millis(DELAY_MS * UPDATE_COUNT as u64),
-        "--parallelism 1 elapsed should be at least the serial delay floor, got {serial_elapsed:?}"
-    );
+    assert_update_schedule("--parallelism 1", &serial, 1, &[1; UPDATE_COUNT]);
 
-    let (bare_elapsed, bare_max) = update_scenario(
+    let bare = update_scenario(
         parent_child_resources("old", |_| "  parent = vpc".to_string()),
         parent_child_resources("new", |_| "  parent = vpc".to_string()),
         8,
     );
-    assert!(
-        bare_max <= 8,
-        "bare binding case must still respect --parallelism 8, got {bare_max}"
-    );
-    assert!(
-        bare_elapsed >= Duration::from_millis(DELAY_MS * 2),
-        "bare binding should still execute through the capped update scheduler, got {bare_elapsed:?}"
-    );
+    assert_update_schedule("bare binding", &bare, 8, &[8, 5]);
 
-    let (depends_elapsed, depends_max) = update_scenario(
+    let depends = update_scenario(
         parent_child_resources("old", |_| "  directives { depends_on = [vpc] }".to_string()),
         parent_child_resources("new", |_| "  directives { depends_on = [vpc] }".to_string()),
         8,
     );
-    assert!(
-        depends_max <= 8,
-        "depends_on case must still respect --parallelism 8, got {depends_max}"
-    );
-    assert!(
-        depends_elapsed >= Duration::from_millis(DELAY_MS * 3),
-        "depends_on should retain the parent gate instead of relaxing to two rounds, got {depends_elapsed:?}"
-    );
+    assert_update_schedule("depends_on", &depends, 8, &[1, 8, 4]);
 
-    let (known_ref_elapsed, known_ref_max) = update_scenario(
+    let known_ref = update_scenario(
         parent_child_resources("old", |_| "  parent_name = vpc.name".to_string()),
         parent_child_resources("new", |_| "  parent_name = vpc.name".to_string()),
         8,
     );
-    assert!(
-        known_ref_max <= 8,
-        "known-ref case must still respect --parallelism 8, got {known_ref_max}"
-    );
-    assert_known_refs_relaxed("direct apply", known_ref_elapsed, depends_elapsed);
+    assert_update_schedule("known-disjoint refs", &known_ref, 8, &[8, 5]);
+    assert_known_refs_bypass_parent_gate("direct apply", &known_ref, &depends);
 }
 
 #[test]
 fn apply_saved_plan_parallelism_relaxes_known_disjoint_refs() {
-    let (depends_elapsed, depends_max) = saved_plan_update_scenario(
+    let depends = saved_plan_update_scenario(
         parent_child_resources("old", |_| "  directives { depends_on = [vpc] }".to_string()),
         parent_child_resources("new", |_| "  directives { depends_on = [vpc] }".to_string()),
         8,
     );
-    assert!(
-        depends_max <= 8,
-        "saved-plan depends_on case must respect --parallelism 8, got {depends_max}"
-    );
-    assert!(
-        depends_elapsed >= Duration::from_millis(DELAY_MS * 3),
-        "saved-plan depends_on should retain the parent gate, got {depends_elapsed:?}"
-    );
+    assert_update_schedule("saved-plan depends_on", &depends, 8, &[1, 8, 4]);
 
-    let (known_ref_elapsed, known_ref_max) = saved_plan_update_scenario(
+    let known_ref = saved_plan_update_scenario(
         parent_child_resources("old", |_| "  parent_name = vpc.name".to_string()),
         parent_child_resources("new", |_| "  parent_name = vpc.name".to_string()),
         8,
     );
-    eprintln!(
-        "saved-plan apply elapsed: known_ref={known_ref_elapsed:?}, depends_on={depends_elapsed:?}"
-    );
-    assert!(
-        known_ref_max <= 8,
-        "saved-plan known-ref case must respect --parallelism 8, got {known_ref_max}"
-    );
-    assert_known_refs_relaxed("saved-plan apply", known_ref_elapsed, depends_elapsed);
+    assert_update_schedule("saved-plan known-disjoint refs", &known_ref, 8, &[8, 5]);
+    assert_known_refs_bypass_parent_gate("saved-plan apply", &known_ref, &depends);
 }

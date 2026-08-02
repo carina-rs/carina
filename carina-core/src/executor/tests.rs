@@ -3009,26 +3009,23 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
     );
 }
 
-struct DelayedUpdateProvider {
-    delay: std::time::Duration,
+struct YieldingUpdateProvider {
     change_unrelated_id: bool,
     active: Arc<std::sync::atomic::AtomicUsize>,
     max_active: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl DelayedUpdateProvider {
-    fn new(delay: std::time::Duration) -> Self {
+impl YieldingUpdateProvider {
+    fn new() -> Self {
         Self {
-            delay,
             change_unrelated_id: false,
             active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
-    fn violates_unrelated_id(delay: std::time::Duration) -> Self {
+    fn violates_unrelated_id() -> Self {
         Self {
-            delay,
             change_unrelated_id: true,
             active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3040,9 +3037,9 @@ impl DelayedUpdateProvider {
     }
 }
 
-impl Provider for DelayedUpdateProvider {
+impl Provider for YieldingUpdateProvider {
     fn name(&self) -> &str {
-        "delayed-update"
+        "yielding-update"
     }
 
     fn read(
@@ -3074,14 +3071,13 @@ impl Provider for DelayedUpdateProvider {
     ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         let id = id.clone();
         let identifier = identifier.to_string();
-        let delay = self.delay;
         let change_unrelated_id = self.change_unrelated_id;
         let active = self.active.clone();
         let max_active = self.max_active.clone();
         Box::pin(async move {
             let now_active = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             max_active.fetch_max(now_active, std::sync::atomic::Ordering::SeqCst);
-            tokio::time::sleep(delay).await;
+            tokio::task::yield_now().await;
             active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 
             let mut attrs = request.from.attributes.clone();
@@ -3149,7 +3145,7 @@ fn tag_update_state(id: &ResourceId, binding: &str) -> State {
     .with_identifier(format!("{binding}-id"))
 }
 
-async fn run_tag_sweep(parallelism: NonZeroUsize) -> (std::time::Duration, usize) {
+async fn run_tag_sweep(parallelism: NonZeroUsize) -> usize {
     let mut resources = Vec::new();
     resources.push(tag_update_resource("vpc", None));
     for idx in 0..12 {
@@ -3191,7 +3187,7 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> (std::time::Duration, usize
         wait_aliases: &[],
     });
 
-    let provider = DelayedUpdateProvider::new(std::time::Duration::from_millis(200));
+    let provider = YieldingUpdateProvider::new();
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &unresolved_resources,
@@ -3207,14 +3203,12 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> (std::time::Duration, usize
     };
 
     let observer = MockObserver::new();
-    let started = Instant::now();
     let result =
         completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
-    let elapsed = started.elapsed();
 
     assert_eq!(result.success_count, 13);
     assert_eq!(result.failure_count, 0);
-    (elapsed, provider.max_active())
+    provider.max_active()
 }
 
 async fn run_provider_contract_case(unknown_read: bool) -> usize {
@@ -3264,8 +3258,7 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
         wait_aliases: &[],
     });
 
-    let provider =
-        DelayedUpdateProvider::violates_unrelated_id(std::time::Duration::from_millis(100));
+    let provider = YieldingUpdateProvider::violates_unrelated_id();
     let input = ExecutionInput {
         plan: &plan,
         unresolved_resources: &unresolved_resources,
@@ -3308,7 +3301,7 @@ async fn provider_contract_violation_known_disjoint_edge_still_relaxes_by_static
 
 #[tokio::test]
 async fn test_parallel_update_relaxation_with_cap_eight_finishes_in_two_rounds() {
-    let (_elapsed, max_active) = run_tag_sweep(NonZeroUsize::new(8).unwrap()).await;
+    let max_active = run_tag_sweep(NonZeroUsize::new(8).unwrap()).await;
     assert!(
         max_active <= 8,
         "scheduler must not dispatch more than the cap, max_active={max_active}",
@@ -3321,12 +3314,7 @@ async fn test_parallel_update_relaxation_with_cap_eight_finishes_in_two_rounds()
 
 #[tokio::test]
 async fn test_parallelism_one_keeps_update_sweep_serial() {
-    let (elapsed, max_active) = run_tag_sweep(NonZeroUsize::new(1).unwrap()).await;
-
-    assert!(
-        elapsed >= std::time::Duration::from_millis(2400),
-        "cap=1 should serialize thirteen 200ms updates, got {elapsed:?}",
-    );
+    let max_active = run_tag_sweep(NonZeroUsize::new(1).unwrap()).await;
     assert_eq!(max_active, 1);
 }
 
