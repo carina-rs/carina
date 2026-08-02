@@ -421,24 +421,32 @@ impl fmt::Display for ProviderInstantiationError {
     }
 }
 
-// These diagnostics are deliberately self-contained because CLI/LSP boundaries
-// render them with `Display`. Do not also expose their already-rendered child
-// through `source()`: standard chain walkers would print the same chain twice.
+// `ProviderInstantiationError` and
+// `PrecompiledComponentDeserializationError` deliberately render their
+// complete child chains because CLI/LSP boundaries use `Display`. Do not also
+// expose those already-rendered children through `source()`: standard chain
+// walkers would print the same chains twice.
 impl std::error::Error for ProviderInstantiationError {}
 
 /// Error returned while loading a WASM provider.
 ///
-/// Instantiation is a dedicated variant so composition roots can attach
-/// resolver provenance without first flattening the diagnostic to prose.
+/// Precompiled deserialization and instantiation are dedicated variants so
+/// callers can classify the exact failing step without flattening diagnostics
+/// to prose or treating unrelated provider bring-up failures as cache faults.
 #[derive(Debug)]
 pub enum WasmProviderLoadError {
+    /// `Component::deserialize_file` rejected a precompiled cache entry.
+    PrecompiledDeserialization(PrecompiledComponentDeserializationError),
+    /// The component could not be instantiated as a Carina provider.
     Instantiation(ProviderInstantiationError),
+    /// Any other engine, component-load, or provider bring-up failure.
     Other(String),
 }
 
 impl fmt::Display for WasmProviderLoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            WasmProviderLoadError::PrecompiledDeserialization(error) => error.fmt(f),
             WasmProviderLoadError::Instantiation(error) => error.fmt(f),
             WasmProviderLoadError::Other(message) => f.write_str(message),
         }
@@ -458,6 +466,30 @@ impl From<String> for WasmProviderLoadError {
         WasmProviderLoadError::Other(message)
     }
 }
+
+/// Failure returned while deserializing a precompiled component cache entry.
+///
+/// Owns the cache path and structured Wasmtime error from the
+/// `Component::deserialize_file` attempt so the complete cause chain remains
+/// available at the final display boundary.
+#[derive(Debug)]
+pub struct PrecompiledComponentDeserializationError {
+    cwasm_path: PathBuf,
+    source: wasmtime::Error,
+}
+
+impl fmt::Display for PrecompiledComponentDeserializationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Failed to deserialize WASM component from {}: ",
+            self.cwasm_path.display()
+        )?;
+        write_error_chain(f, &self.source)
+    }
+}
+
+impl std::error::Error for PrecompiledComponentDeserializationError {}
 
 /// Failure while creating a credentialed per-binding runtime instance.
 /// Instantiation remains typed until the `ProviderFactory` trait boundary;
@@ -1829,6 +1861,11 @@ unsafe impl Sync for SharedWasmInstance {}
 
 // -- WasmProviderFactory --
 
+enum CachedComponentAcquisition {
+    Hit(Component),
+    Miss,
+}
+
 pub struct WasmProviderFactory {
     engine: Engine,
     component: Component,
@@ -1956,80 +1993,84 @@ impl WasmProviderFactory {
         format!("{stem}-{}.cwasm", &hash[..16])
     }
 
-    /// Load a WASM provider, using the default precompile cache at `~/.carina/cache/`.
-    ///
-    /// If the cache directory cannot be created, falls back to compiling without caching.
-    pub async fn new(wasm_path: PathBuf) -> Result<Self, WasmProviderLoadError> {
-        match Self::default_cache_dir() {
-            Some(cache_dir) => Self::new_with_cache_dir(wasm_path, &cache_dir).await,
-            None => Self::new_uncached(wasm_path).await,
-        }
-    }
-
-    /// Load a WASM provider with an explicit cache directory.
-    pub async fn new_with_cache_dir(
-        wasm_path: PathBuf,
-        cache_dir: &Path,
-    ) -> Result<Self, WasmProviderLoadError> {
-        let cwasm_name = Self::cache_key(&wasm_path);
-        let cwasm_path = cache_dir.join(&cwasm_name);
-
-        // Try loading from existing cache.
-        // On failure, retry once after a short delay — another process may be
-        // writing the cache file atomically (write to .tmp then rename).
-        if cwasm_path.exists() {
-            match Self::from_precompiled(&cwasm_path).await {
-                Ok(mut factory) => {
-                    factory.wasm_path = wasm_path;
-                    return Ok(factory);
-                }
-                Err(_) => {
-                    // Another process may be writing; wait briefly and retry
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if cwasm_path.exists() {
-                        match Self::from_precompiled(&cwasm_path).await {
-                            Ok(mut factory) => {
-                                factory.wasm_path = wasm_path;
-                                return Ok(factory);
-                            }
-                            Err(e) => {
-                                eprintln!("Precompile cache invalid, recompiling: {e}");
-                                let _ = std::fs::remove_file(&cwasm_path);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Try to precompile and cache
-        match Self::precompile(&wasm_path, &cwasm_path) {
-            Ok(()) => {
-                let mut factory = Self::from_precompiled(&cwasm_path).await?;
-                factory.wasm_path = wasm_path;
-                Ok(factory)
-            }
-            Err(e) => {
-                eprintln!("Failed to write precompile cache, loading directly: {e}");
-                Self::new_uncached(wasm_path).await
-            }
-        }
-    }
-
-    /// Load a WASM provider without any precompile caching.
-    async fn new_uncached(wasm_path: PathBuf) -> Result<Self, WasmProviderLoadError> {
+    fn create_engine() -> Result<Engine, WasmProviderLoadError> {
         let config = build_engine_config();
-        let engine =
-            Engine::new(&config).map_err(|e| format!("Failed to create WASM engine: {e}"))?;
-        let epoch_ticker = EpochTicker::start(engine.clone());
+        Engine::new(&config).map_err(|e| format!("Failed to create WASM engine: {e}").into())
+    }
 
-        let component = Component::from_file(&engine, &wasm_path).map_err(|e| {
+    fn load_component_from_file(
+        engine: &Engine,
+        wasm_path: &Path,
+    ) -> Result<Component, WasmProviderLoadError> {
+        Component::from_file(engine, wasm_path).map_err(|e| {
             format!(
                 "Failed to load WASM component from {}: {e}",
                 wasm_path.display()
             )
-        })?;
+            .into()
+        })
+    }
 
+    fn deserialize_precompiled_component(
+        engine: &Engine,
+        cwasm_path: &Path,
+    ) -> Result<Component, PrecompiledComponentDeserializationError> {
+        // SAFETY: The caller is responsible for ensuring the .cwasm file was
+        // produced by a trusted `precompile()` call with the same Wasmtime version.
+        unsafe { Component::deserialize_file(engine, cwasm_path) }.map_err(|e| {
+            PrecompiledComponentDeserializationError {
+                cwasm_path: cwasm_path.to_path_buf(),
+                source: e,
+            }
+        })
+    }
+
+    /// Acquire a component from the cache without bringing the provider up.
+    ///
+    /// A miss means the entry was absent or failed deserialization after the
+    /// concurrent-writer retry. Its infallible return signature has no error
+    /// channel through which a provider bring-up failure could enter this
+    /// cache-recovery decision.
+    async fn acquire_cached_component(
+        engine: &Engine,
+        cwasm_path: &Path,
+    ) -> CachedComponentAcquisition {
+        if !cwasm_path.exists() {
+            return CachedComponentAcquisition::Miss;
+        }
+
+        match Self::deserialize_precompiled_component(engine, cwasm_path) {
+            Ok(component) => CachedComponentAcquisition::Hit(component),
+            Err(_) => {
+                // Another process may be publishing the cache entry; wait
+                // briefly and retry the deserialization step once.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                // A concurrent process may have removed the entry while we
+                // slept. Treat that as a quiet miss, without invalid-cache noise.
+                if !cwasm_path.exists() {
+                    return CachedComponentAcquisition::Miss;
+                }
+
+                match Self::deserialize_precompiled_component(engine, cwasm_path) {
+                    Ok(component) => CachedComponentAcquisition::Hit(component),
+                    Err(error) => {
+                        eprintln!("Precompile cache invalid, recompiling: {error}");
+                        let _ = std::fs::remove_file(cwasm_path);
+                        CachedComponentAcquisition::Miss
+                    }
+                }
+            }
+        }
+    }
+
+    /// Instantiate a component and load all provider metadata shared by the
+    /// cached and uncached acquisition paths.
+    async fn bring_up_component(
+        engine: Engine,
+        component: Component,
+        wasm_path: PathBuf,
+        epoch_ticker: EpochTicker,
+    ) -> Result<Self, WasmProviderLoadError> {
         let (mut store, bindings, enable_http) =
             create_instance_auto(&engine, &component, None).await?;
         let info_json = bindings
@@ -2074,16 +2115,78 @@ impl WasmProviderFactory {
         })
     }
 
+    /// Load a WASM provider, using the default precompile cache at `~/.carina/cache/`.
+    ///
+    /// If the cache directory cannot be created, falls back to compiling without caching.
+    pub async fn new(wasm_path: PathBuf) -> Result<Self, WasmProviderLoadError> {
+        match Self::default_cache_dir() {
+            Some(cache_dir) => Self::new_with_cache_dir(wasm_path, &cache_dir).await,
+            None => Self::new_uncached(wasm_path).await,
+        }
+    }
+
+    /// Load a WASM provider with an explicit cache directory.
+    pub async fn new_with_cache_dir(
+        wasm_path: PathBuf,
+        cache_dir: &Path,
+    ) -> Result<Self, WasmProviderLoadError> {
+        let cwasm_name = Self::cache_key(&wasm_path);
+        let cwasm_path = cache_dir.join(&cwasm_name);
+
+        // A cold-cache write can fail because the cache directory is
+        // unavailable. Resolve that fallback before creating the runtime so
+        // `new_uncached` remains the only runtime owner on this path.
+        if !cwasm_path.exists()
+            && let Err(error) = Self::precompile(&wasm_path, &cwasm_path)
+        {
+            eprintln!("Failed to write precompile cache, loading directly: {error}");
+            return Self::new_uncached(wasm_path).await;
+        }
+
+        let engine = Self::create_engine()?;
+
+        let component = match Self::acquire_cached_component(&engine, &cwasm_path).await {
+            CachedComponentAcquisition::Hit(component) => component,
+            CachedComponentAcquisition::Miss => {
+                // Try to precompile and cache.
+                match Self::precompile(&wasm_path, &cwasm_path) {
+                    Ok(()) => Self::deserialize_precompiled_component(&engine, &cwasm_path)
+                        .map_err(WasmProviderLoadError::PrecompiledDeserialization)?,
+                    Err(error) => {
+                        eprintln!("Failed to write precompile cache, loading directly: {error}");
+                        // Cache inspection already required this engine. Reuse
+                        // it so a stale-cache recovery failure cannot create a
+                        // second engine or orphan an epoch ticker.
+                        Self::load_component_from_file(&engine, &wasm_path)?
+                    }
+                }
+            }
+        };
+
+        let epoch_ticker = EpochTicker::start(engine.clone());
+        Self::bring_up_component(engine, component, wasm_path, epoch_ticker).await
+    }
+
+    /// Load a WASM provider without any precompile caching.
+    async fn new_uncached(wasm_path: PathBuf) -> Result<Self, WasmProviderLoadError> {
+        let engine = Self::create_engine()?;
+        let component = Self::load_component_from_file(&engine, &wasm_path)?;
+        let epoch_ticker = EpochTicker::start(engine.clone());
+
+        Self::bring_up_component(engine, component, wasm_path, epoch_ticker).await
+    }
+
     /// Precompile a .wasm file and save the result to a .cwasm file.
     ///
-    /// **Mmap safety invariant:** `from_precompiled` loads `.cwasm` via
-    /// `Component::deserialize_file`, which keeps the file memory-mapped for
-    /// the lifetime of the returned `Component`. Any in-place mutation of
-    /// `cwasm_path` — including `std::fs::write(cwasm_path, …)` or
-    /// `OpenOptions::truncate(true)` — while a previous `Component` is still
-    /// alive pulls backing pages out from under the mmap region; subsequent
-    /// access then traps as `SIGBUS` on Linux (macOS is more lenient, so a
-    /// bug slipping through on macOS still blows up in CI).
+    /// **Mmap safety invariant:** `deserialize_precompiled_component` loads
+    /// `.cwasm` via `Component::deserialize_file`, which keeps the file
+    /// memory-mapped for the lifetime of the returned `Component`. Any
+    /// in-place mutation of `cwasm_path` — including
+    /// `std::fs::write(cwasm_path, …)` or `OpenOptions::truncate(true)` —
+    /// while a previous `Component` is still alive pulls backing pages out
+    /// from under the mmap region; subsequent access then traps as `SIGBUS`
+    /// on Linux (macOS is more lenient, so a bug slipping through on macOS
+    /// still blows up in CI).
     ///
     /// To honor the invariant, this function writes to a sibling temp file
     /// and then `rename()`s it onto `cwasm_path`. Rename creates a new inode
@@ -2127,63 +2230,12 @@ impl WasmProviderFactory {
     /// The .cwasm file must have been produced by `precompile()` using the same
     /// Wasmtime version. Deserializing an untrusted or corrupted file is unsafe.
     pub async fn from_precompiled(cwasm_path: &Path) -> Result<Self, WasmProviderLoadError> {
-        let config = build_engine_config();
-        let engine =
-            Engine::new(&config).map_err(|e| format!("Failed to create WASM engine: {e}"))?;
+        let engine = Self::create_engine()?;
+        let component = Self::deserialize_precompiled_component(&engine, cwasm_path)
+            .map_err(WasmProviderLoadError::PrecompiledDeserialization)?;
         let epoch_ticker = EpochTicker::start(engine.clone());
 
-        // SAFETY: The caller is responsible for ensuring the .cwasm file was
-        // produced by a trusted `precompile()` call with the same Wasmtime version.
-        let component =
-            unsafe { Component::deserialize_file(&engine, cwasm_path) }.map_err(|e| {
-                format!(
-                    "Failed to deserialize WASM component from {}: {e}",
-                    cwasm_path.display()
-                )
-            })?;
-
-        let (mut store, bindings, enable_http) =
-            create_instance_auto(&engine, &component, None).await?;
-        let info_json = bindings
-            .call_info(&mut store)
-            .await
-            .map_err(|e| format!("Failed to call info(): {e}"))?;
-        wasm_convert::check_protocol_version(&info_json)?;
-
-        let schemas_json = bindings
-            .call_schemas(&mut store)
-            .await
-            .map_err(|e| format!("Failed to call schemas(): {e}"))?;
-
-        let (name, display_name, version) = wasm_convert::json_to_provider_info(&info_json);
-        let schemas: Vec<ResourceSchema> = wasm_convert::json_to_schemas(&schemas_json)
-            .map_err(|e| provider_schema_decode_error(&name, &version, e))?;
-
-        let (
-            cached_config_completions,
-            cached_identity_attributes,
-            cached_enum_aliases,
-            cached_provider_config_types,
-        ) = Self::load_metadata(&bindings, &mut store, &name, &version).await?;
-
-        Ok(Self {
-            engine,
-            component,
-            wasm_path: cwasm_path.to_path_buf(),
-            name,
-            display_name,
-            version,
-            schemas,
-            cached_config_completions,
-            cached_identity_attributes,
-            cached_enum_aliases,
-            cached_provider_config_types,
-            enable_http,
-            init_instance: Mutex::new((store, bindings)),
-            shared_instances: Mutex::new(HashMap::new()),
-            instantiation_error_mapper: Arc::new(default_provider_instantiation_error_mapper),
-            _epoch_ticker: epoch_ticker,
-        })
+        Self::bring_up_component(engine, component, cwasm_path.to_path_buf(), epoch_ticker).await
     }
 
     /// Load from .wasm with automatic precompile caching.
@@ -3341,6 +3393,42 @@ mod tests {
         let key2 = WasmProviderFactory::cache_key(&wasm_path);
 
         assert_eq!(key1, key2, "cache key should be stable for same content");
+    }
+
+    #[test]
+    fn precompiled_deserialization_error_preserves_full_wasmtime_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwasm_path = dir.path().join("corrupt.cwasm");
+        std::fs::write(&cwasm_path, b"not a precompiled component").unwrap();
+        let engine = Engine::new(&build_engine_config()).unwrap();
+
+        let error =
+            match WasmProviderFactory::deserialize_precompiled_component(&engine, &cwasm_path) {
+                Ok(_) => panic!("corrupt precompiled component must fail deserialization"),
+                Err(error) => error,
+            };
+        let source_chain: Vec<_> = error.source.chain().map(ToString::to_string).collect();
+        assert!(
+            source_chain.len() >= 2,
+            "fixture must produce a genuinely nested Wasmtime error: {source_chain:?}"
+        );
+
+        let mut expected_chain = source_chain[0].clone();
+        for cause in &source_chain[1..] {
+            expected_chain.push_str("\n  caused by: ");
+            expected_chain.push_str(cause);
+        }
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Failed to deserialize WASM component from {}: {expected_chain}",
+                cwasm_path.display()
+            )
+        );
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "the self-contained Display contract must not expose the rendered chain again"
+        );
     }
 
     fn render_wasi_http_import_context(
