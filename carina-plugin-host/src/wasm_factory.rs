@@ -5,6 +5,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -839,10 +841,43 @@ fn is_metadata_host(host: &str) -> bool {
     METADATA_HOSTS.contains(&host_without_port(host))
 }
 
+/// Memoizes metadata endpoint availability for a single probe owner.
+struct MetadataProbe {
+    cache: OnceLock<bool>,
+    #[cfg(test)]
+    probes: AtomicUsize,
+}
+
+impl MetadataProbe {
+    const fn new() -> Self {
+        Self {
+            cache: OnceLock::new(),
+            #[cfg(test)]
+            probes: AtomicUsize::new(0),
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        *self.cache.get_or_init(|| {
+            #[cfg(test)]
+            self.probes.fetch_add(1, Ordering::Relaxed);
+
+            probe_metadata_endpoints()
+        })
+    }
+
+    #[cfg(test)]
+    fn probe_count(&self) -> usize {
+        self.probes.load(Ordering::Relaxed)
+    }
+}
+
+static METADATA_PROBE: MetadataProbe = MetadataProbe::new();
+
 /// Probe metadata endpoints and return true if any is reachable.
 ///
 /// Uses parallel TCP connect attempts with a 1-second timeout.
-/// Called once at startup; result is cached by the caller.
+/// Memoization is owned by [`MetadataProbe`].
 fn probe_metadata_endpoints() -> bool {
     use std::net::{SocketAddr, TcpStream};
 
@@ -863,8 +898,7 @@ fn probe_metadata_endpoints() -> bool {
 /// Returns `true` if any metadata endpoint is reachable.
 /// Result is cached for the lifetime of the process.
 fn is_metadata_available() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(probe_metadata_endpoints)
+    METADATA_PROBE.is_available()
 }
 
 /// Custom `WasiHttpHooks` that restricts outgoing HTTP requests to
@@ -3267,14 +3301,18 @@ mod tests {
     #[test]
     fn test_metadata_probe_result_is_cached() {
         let first = is_metadata_available();
-        let start = std::time::Instant::now();
         let second = is_metadata_available();
-        let elapsed = start.elapsed();
         assert_eq!(first, second);
-        assert!(
-            elapsed < std::time::Duration::from_millis(10),
-            "second call should be cached, took {elapsed:?}"
+
+        let probe = MetadataProbe::new();
+        let local_first = probe.is_available();
+        let local_second = probe.is_available();
+        assert_eq!(
+            probe.probe_count(),
+            1,
+            "test-local MetadataProbe memoization must run exactly one endpoint probe for two calls"
         );
+        assert_eq!(local_first, local_second);
     }
 
     #[test]
