@@ -29,19 +29,24 @@ struct PartialConfig {
 static ACTIVE_UPDATES: AtomicUsize = AtomicUsize::new(0);
 static MAX_ACTIVE_UPDATES: AtomicUsize = AtomicUsize::new(0);
 
-struct ActiveUpdateGuard;
+struct ActiveUpdateGuard {
+    resource: String,
+}
 
 impl ActiveUpdateGuard {
-    fn enter() -> Self {
+    fn enter(id: &ResourceId) -> Self {
         let active = ACTIVE_UPDATES.fetch_add(1, Ordering::SeqCst) + 1;
         MAX_ACTIVE_UPDATES.fetch_max(active, Ordering::SeqCst);
         write_max_active();
-        Self
+        let resource = MockProvider::resource_key(id);
+        append_update_trace("start", &resource, Some(active));
+        Self { resource }
     }
 }
 
 impl Drop for ActiveUpdateGuard {
     fn drop(&mut self) {
+        append_update_trace("finish", &self.resource, None);
         ACTIVE_UPDATES.fetch_sub(1, Ordering::SeqCst);
     }
 }
@@ -55,6 +60,9 @@ impl MockProvider {
             ACTIVE_UPDATES.store(0, Ordering::SeqCst);
             MAX_ACTIVE_UPDATES.store(0, Ordering::SeqCst);
             write_max_active();
+        }
+        if env::var_os("CARINA_MOCK_UPDATE_TRACE_PATH").is_some() {
+            reset_update_trace();
         }
         Self {
             state_file,
@@ -138,7 +146,7 @@ impl MockProvider {
             fs::create_dir_all(parent)?;
         }
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        writeln!(file, "{}", Self::resource_key(id))
+        file.write_all(format!("{}\n", Self::resource_key(id)).as_bytes())
     }
 
     fn append_op_log(path: PathBuf, op: &str, id: &ResourceId) -> Result<(), std::io::Error> {
@@ -146,7 +154,7 @@ impl MockProvider {
             fs::create_dir_all(parent)?;
         }
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        writeln!(file, "{} {}", op, Self::resource_key(id))
+        file.write_all(format!("{op} {}\n", Self::resource_key(id)).as_bytes())
     }
 
     fn append_op_log_if_configured(op: &str, id: &ResourceId) -> ProviderResult<()> {
@@ -346,6 +354,38 @@ fn write_max_active() {
     let _ = fs::write(path, MAX_ACTIVE_UPDATES.load(Ordering::SeqCst).to_string());
 }
 
+fn update_trace_path() -> Option<PathBuf> {
+    env::var_os("CARINA_MOCK_UPDATE_TRACE_PATH").map(PathBuf::from)
+}
+
+fn reset_update_trace() {
+    let Some(path) = update_trace_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, "");
+}
+
+fn append_update_trace(event: &str, resource: &str, active: Option<usize>) {
+    let Some(path) = update_trace_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let line = if let Some(active) = active {
+        format!("{event} {resource} {active}\n")
+    } else {
+        format!("{event} {resource}\n")
+    };
+    let _ = file.write_all(line.as_bytes());
+}
+
 impl Default for MockProvider {
     fn default() -> Self {
         Self::new()
@@ -402,7 +442,16 @@ impl Provider for MockProvider {
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
         Box::pin(async move {
-            let _active = ActiveUpdateGuard::enter();
+            let _active = ActiveUpdateGuard::enter(&id);
+            if update_trace_path().is_some() {
+                // This test hook is coupled to the executor's continuous-refill loop:
+                // it dispatches every currently ready future that fits before polling
+                // any of them. Yield once so that dispatch batch records all starts
+                // before any finish. Trace tests reconstruct causal waves from that
+                // ordering; an await before this write or during dispatch must revisit
+                // those assertions. The executor itself is not wave-based.
+                tokio::task::yield_now().await;
+            }
             if let Some(delay) = update_delay() {
                 tokio::time::sleep(delay).await;
             }
