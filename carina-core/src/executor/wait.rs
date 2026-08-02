@@ -113,7 +113,10 @@ pub enum UnsatisfiableReason {
     NoMutatorRemaining,
 }
 
-pub(crate) fn default_heartbeat_gap(interval: Duration) -> Duration {
+/// Returns the longer of 30s and five polling intervals to limit heartbeat
+/// spam. In the loop, the triggering `now` sample is taken on the first poll
+/// at or after this period has elapsed since the last emit.
+pub(crate) fn default_heartbeat_cadence(interval: Duration) -> Duration {
     Duration::from_secs(30).max(interval * 5)
 }
 
@@ -368,7 +371,7 @@ pub async fn execute_wait_effect(
     cancel: tokio::sync::watch::Receiver<WaitSignal>,
     observer: &dyn ExecutionObserver,
 ) -> WaitOutcome {
-    execute_wait_effect_with_heartbeat_gap(
+    execute_wait_effect_with_heartbeat_cadence(
         provider,
         target_id.identity_or_empty(),
         target_id,
@@ -378,13 +381,13 @@ pub async fn execute_wait_effect(
         interval,
         cancel,
         observer,
-        default_heartbeat_gap(interval),
+        default_heartbeat_cadence(interval),
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn execute_wait_effect_with_heartbeat_gap(
+pub(crate) async fn execute_wait_effect_with_heartbeat_cadence(
     provider: &dyn Provider,
     binding: &str,
     target_id: &ResourceId,
@@ -394,7 +397,7 @@ pub(crate) async fn execute_wait_effect_with_heartbeat_gap(
     interval: Duration,
     mut cancel: tokio::sync::watch::Receiver<WaitSignal>,
     observer: &dyn ExecutionObserver,
-    heartbeat_gap: Duration,
+    heartbeat_cadence: Duration,
 ) -> WaitOutcome {
     let start = Instant::now();
     let mut last_heartbeat_at: Option<Instant> = None;
@@ -418,17 +421,15 @@ pub(crate) async fn execute_wait_effect_with_heartbeat_gap(
             );
         }
 
-        // Sample `now` before the sleep below deliberately. On the polling
-        // interval grid, `default_heartbeat_gap`'s `interval * 5` branch lands
-        // exactly on the gap. Only the 30s-floor branch can require rounding
-        // up to a later poll when the interval does not divide 30s; provider or
-        // scheduler delay can make either branch late. Thus the triggering
-        // `now` samples for consecutive emits are at least `heartbeat_gap`
-        // apart, never less. Observer-side timestamps follow those samples and
-        // can differ by variable event-construction and callback delay.
+        // Sample `now` before the sleep deliberately: it timestamps this poll,
+        // not the following wakeup. With `>=`, the cadence is a floor, not a
+        // target: emits are never early but can be late when the interval does
+        // not divide 30s or provider/scheduler work delays a poll.
+        // Observer-side timestamps can drift further through event construction
+        // and callback delay.
         let now = Instant::now();
         let should_emit_heartbeat = last_heartbeat_at
-            .map(|last| now.duration_since(last) >= heartbeat_gap)
+            .map(|last| now.duration_since(last) >= heartbeat_cadence)
             .unwrap_or(true);
         if should_emit_heartbeat {
             let observation = WaitObservation::new(binding, target_id, until, &state.attributes);
@@ -635,13 +636,13 @@ mod tests {
     }
 
     #[test]
-    fn default_heartbeat_gap_uses_maximum_of_floor_and_interval_multiple() {
+    fn default_heartbeat_cadence_uses_maximum_of_floor_and_interval_multiple() {
         assert_eq!(
-            default_heartbeat_gap(Duration::from_millis(1)),
+            default_heartbeat_cadence(Duration::from_millis(1)),
             Duration::from_secs(30)
         );
         assert_eq!(
-            default_heartbeat_gap(Duration::from_secs(60)),
+            default_heartbeat_cadence(Duration::from_secs(60)),
             Duration::from_secs(300)
         );
     }
@@ -887,14 +888,14 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn wait_emits_heartbeat_at_max_interval() {
+    async fn wait_emits_exact_heartbeat_count_for_cadence() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let pred = equals_status("ISSUED");
         let target = ResourceId::with_identity("acm.Certificate", "cert");
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = HeartbeatObserver::new();
 
-        let result = execute_wait_effect_with_heartbeat_gap(
+        let result = execute_wait_effect_with_heartbeat_cadence(
             &provider,
             "cert_issued",
             &target,
