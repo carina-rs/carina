@@ -738,7 +738,7 @@ pub async fn run_plan(
             &mut parsed.resources,
             sf,
             &state_block_claims,
-        );
+        )?;
     }
     if !refresh {
         eprintln!(

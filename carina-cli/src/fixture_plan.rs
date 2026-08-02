@@ -132,7 +132,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             &mut parsed.resources,
             sf,
             &state_block_claims,
-        );
+        )
+        .expect("fixture state identities must remain unique");
     }
 
     // carina#3181: `parsed.resources` is managed-only; data sources live
@@ -209,7 +210,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         let bindings = std::fs::read_to_string(&state_path)
             .ok()
             .and_then(|content| check_and_migrate(&content).ok())
-            .map(|migrated| migrated.state.build_remote_bindings())
+            .map(|migrated| migrated.state().build_remote_bindings())
             .unwrap_or_default();
         remote_bindings.insert(us.binding.clone(), bindings);
     }
@@ -304,7 +305,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             override_aware_resources.resources_mut(),
             sf,
             &state_block_claims,
-        );
+        )
+        .expect("fixture state identities must remain unique");
         adopt_unique_state_identity_for_unresolved_anonymous(
             override_aware_resources.resources_mut(),
             sf,

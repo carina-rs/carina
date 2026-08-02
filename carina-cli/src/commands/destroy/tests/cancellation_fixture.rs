@@ -43,7 +43,9 @@ impl DestroyCancellationFixture {
             resource
                 .attributes
                 .insert("name".to_string(), serde_json::json!(name));
-            state.upsert_resource(resource);
+            state
+                .upsert_resource(resource)
+                .expect("test state setup must be valid");
         }
 
         self.base.write_crn(crn);

@@ -56,11 +56,13 @@ fn state_json(lineage: &str) -> String {
     let mut state = StateFile::new();
     state.serial = 3;
     state.lineage = lineage.to_string();
-    state.upsert_resource(
-        ResourceState::new("test.resource", "r1", "mock")
-            .with_identifier("mock-id")
-            .with_attribute("name", serde_json::json!("r1")),
-    );
+    state
+        .upsert_resource(
+            ResourceState::new("test.resource", "r1", "mock")
+                .with_identifier("mock-id")
+                .with_attribute("name", serde_json::json!("r1")),
+        )
+        .expect("test state setup must be valid");
     serde_json::to_string_pretty(&state).expect("serialize state fixture")
 }
 

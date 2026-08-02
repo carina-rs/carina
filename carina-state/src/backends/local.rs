@@ -240,22 +240,23 @@ impl StateBackend for LocalBackend {
         };
 
         let outcome = state::check_and_migrate(&content)?;
-        if let Some(info) = outcome.migration {
+        let (state, migration) = outcome.into_parts();
+        if let Some(info) = migration {
             log_state_migration_once(
                 &self.migration_logged,
                 info,
                 &self.state_path.display().to_string(),
             );
-            Ok(Some(LoadedState::Migrated {
-                state: outcome.state,
-                info,
-            }))
+            Ok(Some(LoadedState::Migrated { state, info }))
         } else {
-            Ok(Some(LoadedState::Pristine(outcome.state)))
+            Ok(Some(LoadedState::Pristine(state)))
         }
     }
 
     async fn write_state(&self, state: &StateFile) -> BackendResult<()> {
+        state
+            .validate_unique_identities()
+            .map_err(BackendError::InvalidState)?;
         let content = carina_core::utils::pretty_with_newline(state).map_err(|e| {
             BackendError::Serialization(format!("Failed to serialize state: {}", e))
         })?;
@@ -559,6 +560,7 @@ impl StateBackend for LocalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::ResourceState;
     use std::sync::{Arc, Barrier};
     use tempfile::tempdir;
 
@@ -602,6 +604,29 @@ mod tests {
             "carina.state.json must end with a trailing newline; got {:?}",
             bytes.last().map(|b| *b as char),
         );
+    }
+
+    #[tokio::test]
+    async fn write_state_reports_duplicate_identity_as_invalid_state() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let backend = LocalBackend::with_path(state_path.clone());
+        let resource = ResourceState::new("ec2.Vpc", "network", "aws");
+        let state = StateFile::from_unchecked_resources_for_test(vec![resource.clone(), resource]);
+
+        let error = backend
+            .write_state(&state)
+            .await
+            .expect_err("duplicate identity must be rejected before serialization");
+
+        assert!(
+            matches!(&error, BackendError::InvalidState(message) if message.contains("duplicate resource identity")
+                && message.contains("aws")
+                && message.contains("ec2.Vpc")
+                && message.contains("network")),
+            "unexpected error: {error}"
+        );
+        assert!(!state_path.exists(), "invalid state must not be written");
     }
 
     #[tokio::test]

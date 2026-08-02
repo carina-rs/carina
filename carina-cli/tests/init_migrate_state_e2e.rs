@@ -24,10 +24,11 @@ fn state_json(lineage: &str, n: usize) -> String {
     s.serial = 3;
     s.lineage = lineage.to_string();
     for i in 0..n {
-        s.resources.push(
+        s.upsert_resource(
             ResourceState::new("s3.Bucket", format!("demo{i}"), "aws")
                 .with_identifier(format!("demo-bucket-{i}")),
-        );
+        )
+        .expect("test state setup must be valid");
     }
     serde_json::to_string_pretty(&s).expect("serialize state fixture")
 }

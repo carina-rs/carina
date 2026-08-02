@@ -14,12 +14,12 @@ use carina_core::value::{
     merge_secrets_into_provider_json, value_to_json, value_to_json_with_context,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::backend::BackendError;
 
 /// The main state file structure that persists to the backend
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StateFile {
     /// State file format version
     pub version: u32,
@@ -30,10 +30,39 @@ pub struct StateFile {
     /// Version of Carina that last modified this state
     pub carina_version: String,
     /// All managed resources and their current state
-    pub resources: Vec<ResourceState>,
+    resources: Vec<ResourceState>,
     /// Published exports for remote_state consumers
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub exports: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct UncheckedStateFile {
+    version: u32,
+    serial: u64,
+    lineage: String,
+    carina_version: String,
+    resources: Vec<ResourceState>,
+    #[serde(default)]
+    exports: HashMap<String, serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for StateFile {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let unchecked = UncheckedStateFile::deserialize(deserializer)?;
+        let state = Self {
+            version: unchecked.version,
+            serial: unchecked.serial,
+            lineage: unchecked.lineage,
+            carina_version: unchecked.carina_version,
+            resources: unchecked.resources,
+            exports: unchecked.exports,
+        };
+        state
+            .validate_unique_identities()
+            .map_err(serde::de::Error::custom)?;
+        Ok(state)
+    }
 }
 
 impl StateFile {
@@ -92,8 +121,8 @@ impl StateFile {
     ///     "aws_s3_bucket_a3f2b1c8",
     ///     "my-state-bucket",
     /// );
-    /// assert_eq!(state.resources.len(), 1);
-    /// assert_eq!(state.resources[0].identity, "aws_s3_bucket_a3f2b1c8");
+    /// assert_eq!(state.resources().len(), 1);
+    /// assert_eq!(state.resources()[0].identity, "aws_s3_bucket_a3f2b1c8");
     /// ```
     pub fn with_managed_state_bucket(
         provider: impl Into<String>,
@@ -102,12 +131,14 @@ impl StateFile {
         bucket_name: impl Into<String>,
     ) -> Self {
         let mut state = Self::new();
-        state.upsert_resource(ResourceState::managed_state_bucket(
-            provider,
-            resource_type,
-            resource_identity,
-            bucket_name,
-        ));
+        state
+            .upsert_resource(ResourceState::managed_state_bucket(
+                provider,
+                resource_type,
+                resource_identity,
+                bucket_name,
+            ))
+            .expect("fresh state file cannot contain duplicates");
         state
     }
 
@@ -127,6 +158,25 @@ impl StateFile {
     pub fn increment_serial(&mut self) {
         self.serial += 1;
         self.carina_version = env!("CARGO_PKG_VERSION").to_string();
+    }
+
+    pub(crate) fn validate_unique_identities(&self) -> Result<(), String> {
+        validate_resource_identities(&self.resources)
+    }
+
+    /// Borrow all managed resource rows.
+    ///
+    /// Mutation is intentionally routed through the identity-preserving state
+    /// APIs rather than exposing the backing vector.
+    pub fn resources(&self) -> &[ResourceState] {
+        &self.resources
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_unchecked_resources_for_test(resources: Vec<ResourceState>) -> Self {
+        let mut state = Self::new();
+        state.resources = resources;
+        state
     }
 
     /// Find a resource by provider, type, and identity
@@ -149,18 +199,6 @@ impl StateFile {
             .collect()
     }
 
-    /// Find a resource mutably by provider, type, and identity
-    pub fn find_resource_mut(
-        &mut self,
-        provider: &str,
-        resource_type: &str,
-        identity: &str,
-    ) -> Option<&mut ResourceState> {
-        self.resources.iter_mut().find(|r| {
-            r.provider == provider && r.resource_type == resource_type && r.identity == identity
-        })
-    }
-
     /// Add or update a resource in the state.
     ///
     /// Existing deposed generations are carried through this single row-write
@@ -168,27 +206,32 @@ impl StateFile {
     /// Incoming deposed entries win on `(identifier, provider_instance)`, and
     /// any entry matching the current identifier is removed so the live current
     /// instance cannot also be scheduled as deposed.
-    pub fn upsert_resource(&mut self, mut resource: ResourceState) {
+    pub fn upsert_resource(&mut self, mut resource: ResourceState) -> Result<(), BackendError> {
+        validate_deposed_identities(&resource).map_err(BackendError::InvalidState)?;
         if let Some(pos) = self.resources.iter().position(|existing| {
             existing.provider == resource.provider
                 && existing.resource_type == resource.resource_type
                 && existing.identity == resource.identity
         }) {
             let existing_deposed = self.resources[pos].deposed.clone();
-            merge_deposed_generations(&mut resource, existing_deposed);
+            merge_deposed_generations(&mut resource, existing_deposed)
+                .map_err(BackendError::InvalidState)?;
             remove_current_identifier_from_deposed(&mut resource);
             self.resources[pos] = resource;
         } else {
             remove_current_identifier_from_deposed(&mut resource);
             self.resources.push(resource);
         }
+        Ok(())
     }
 
     /// Add or refresh one deposed generation through the row-write seam.
     ///
-    /// Existing entries are keyed by `(identifier, provider_instance)`. The
-    /// final write uses [`Self::upsert_resource`] so the invariant that a
-    /// current identifier cannot also be deposed is applied uniformly.
+    /// Existing entries are matched on both their system-assigned key and
+    /// `(identifier, provider_instance)`. The final write uses
+    /// [`Self::upsert_resource`] so both deposed uniqueness axes and the
+    /// invariant that a current identifier cannot also be deposed are applied
+    /// uniformly.
     pub fn upsert_deposed_generation(
         &mut self,
         provider: &str,
@@ -196,7 +239,7 @@ impl StateFile {
         identity: &str,
         row_provider_instance: Option<String>,
         instance: DeposedInstance,
-    ) {
+    ) -> Result<(), BackendError> {
         let mut row = self
             .find_resource(provider, resource_type, identity)
             .cloned()
@@ -206,15 +249,57 @@ impl StateFile {
                 row
             });
 
-        if let Some(existing) = row.deposed.iter_mut().find(|entry| {
+        let key_position = row
+            .deposed
+            .iter()
+            .position(|entry| entry.key == instance.key);
+        let identity_position = row.deposed.iter().position(|entry| {
             entry.identifier == instance.identifier
                 && entry.provider_instance == instance.provider_instance
-        }) {
-            *existing = instance;
+        });
+        let replace_position = match (key_position, identity_position) {
+            (Some(key_pos), Some(identity_pos)) if key_pos != identity_pos => {
+                return Err(BackendError::InvalidState(format!(
+                    "cannot upsert deposed generation key {:?} with identity \
+                     (identifier={:?}, provider_instance={:?}) for resource \
+                     (provider={provider:?}, resource_type={resource_type:?}, \
+                     identity={identity:?}): the key and identity match different \
+                     existing generations",
+                    instance.key, instance.identifier, instance.provider_instance
+                )));
+            }
+            (Some(position), _) | (_, Some(position)) => Some(position),
+            (None, None) => None,
+        };
+        if let Some(position) = replace_position {
+            row.deposed[position] = instance;
         } else {
             row.deposed.push(instance);
         }
-        self.upsert_resource(row);
+        self.upsert_resource(row)
+    }
+
+    /// Rekey resource identities while preserving the state-wide uniqueness
+    /// invariant.
+    pub fn rename_resource_identities(
+        &mut self,
+        renames: &[(String, String)],
+    ) -> Result<(), BackendError> {
+        self.validate_unique_identities()
+            .map_err(BackendError::InvalidState)?;
+        let by_old: HashMap<&str, &str> = renames
+            .iter()
+            .map(|(old, new)| (old.as_str(), new.as_str()))
+            .collect();
+        let mut renamed = self.resources.clone();
+        for resource in &mut renamed {
+            if let Some(new_identity) = by_old.get(resource.identity.as_str()) {
+                resource.identity = (*new_identity).to_string();
+            }
+        }
+        validate_resource_identities(&renamed).map_err(BackendError::InvalidState)?;
+        self.resources = renamed;
+        Ok(())
     }
 
     /// Remove one deposed generation after that exact generation's Delete
@@ -463,7 +548,7 @@ impl StateFile {
     /// `binding['key']` for non-identifier-safe keys). Running this on
     /// load lets old state resolve against new desired-state addresses
     /// without a `moved` block.
-    pub fn canonicalize_addresses(&mut self) {
+    fn canonicalize_addresses(&mut self) {
         use carina_core::utils::canonicalize_map_key_address;
         for r in &mut self.resources {
             r.identity = canonicalize_map_key_address(&r.identity);
@@ -518,16 +603,89 @@ impl Default for StateFile {
     }
 }
 
-fn merge_deposed_generations(resource: &mut ResourceState, existing_deposed: Vec<DeposedInstance>) {
+fn validate_resource_identities(resources: &[ResourceState]) -> Result<(), String> {
+    let mut resource_identities = HashSet::new();
+    for resource in resources {
+        if !resource_identities.insert((
+            resource.provider.as_str(),
+            resource.resource_type.as_str(),
+            resource.identity.as_str(),
+        )) {
+            return Err(format!(
+                "duplicate resource identity (provider={:?}, resource_type={:?}, identity={:?})",
+                resource.provider, resource.resource_type, resource.identity
+            ));
+        }
+        validate_deposed_identities(resource)?;
+    }
+    Ok(())
+}
+
+fn validate_deposed_identities(resource: &ResourceState) -> Result<(), String> {
+    let mut keys = HashSet::new();
+    let mut instance_identities = HashSet::new();
+    for instance in &resource.deposed {
+        if !keys.insert(instance.key.as_str()) {
+            return Err(format!(
+                "duplicate deposed generation key {:?} in resource \
+                 (provider={:?}, resource_type={:?}, identity={:?})",
+                instance.key, resource.provider, resource.resource_type, resource.identity
+            ));
+        }
+        if !instance_identities.insert((
+            instance.identifier.as_str(),
+            instance.provider_instance.as_deref(),
+        )) {
+            return Err(format!(
+                "duplicate deposed generation identity \
+                 (identifier={:?}, provider_instance={:?}) in resource \
+                 (provider={:?}, resource_type={:?}, identity={:?})",
+                instance.identifier,
+                instance.provider_instance,
+                resource.provider,
+                resource.resource_type,
+                resource.identity
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn merge_deposed_generations(
+    resource: &mut ResourceState,
+    existing_deposed: Vec<DeposedInstance>,
+) -> Result<(), String> {
     for existing in existing_deposed {
-        let exists_in_incoming = resource.deposed.iter().any(|incoming| {
+        let same_instance_is_incoming = resource.deposed.iter().any(|incoming| {
             incoming.identifier == existing.identifier
                 && incoming.provider_instance == existing.provider_instance
         });
-        if !exists_in_incoming {
-            resource.deposed.push(existing);
+        if same_instance_is_incoming {
+            continue;
         }
+        if let Some(incoming) = resource
+            .deposed
+            .iter()
+            .find(|incoming| incoming.key == existing.key)
+        {
+            return Err(format!(
+                "deposed generation key {:?} identifies both \
+                 (identifier={:?}, provider_instance={:?}) and \
+                 (identifier={:?}, provider_instance={:?}) in resource \
+                 (provider={:?}, resource_type={:?}, identity={:?})",
+                existing.key,
+                incoming.identifier,
+                incoming.provider_instance,
+                existing.identifier,
+                existing.provider_instance,
+                resource.provider,
+                resource.resource_type,
+                resource.identity
+            ));
+        }
+        resource.deposed.push(existing);
     }
+    Ok(())
 }
 
 fn remove_current_identifier_from_deposed(resource: &mut ResourceState) {
@@ -594,14 +752,30 @@ pub struct MigrationInfo {
 /// Intentionally not `Clone`: a [`StateFile`] can hold every resource
 /// in the deployment, so accidentally cloning the wrapper would clone
 /// the full state. The wrapper is consumed at the backend boundary
-/// (`read_state` → caller takes `.state` or `.into_state()`).
+/// (`read_state` → caller takes `.into_parts()` or `.into_state()`). Its
+/// fields are private so only the validating load seam can construct one.
 #[derive(Debug)]
 pub struct MigratedStateFile {
-    pub state: StateFile,
-    pub migration: Option<MigrationInfo>,
+    state: StateFile,
+    migration: Option<MigrationInfo>,
 }
 
 impl MigratedStateFile {
+    /// Borrow the validated, fully migrated state.
+    pub fn state(&self) -> &StateFile {
+        &self.state
+    }
+
+    /// Report the in-memory schema migration, if one was applied.
+    pub fn migration(&self) -> Option<MigrationInfo> {
+        self.migration
+    }
+
+    /// Consume the validated outcome into its state and migration metadata.
+    pub fn into_parts(self) -> (StateFile, Option<MigrationInfo>) {
+        (self.state, self.migration)
+    }
+
     /// Discard the migration info and return just the state. Convenience
     /// for call sites (e.g. unit tests, fixture loaders) that only need
     /// the parsed `StateFile` and never log the migration.
@@ -788,6 +962,13 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
     state
         .resources
         .retain(|rs| rs.identifier.is_some() || !rs.deposed.is_empty());
+    // Identity spellings can converge during migration (notably legacy map-key
+    // address canonicalization), so the serde-time check is not sufficient.
+    // Validate the fully migrated shape immediately before it crosses the load
+    // boundary.
+    state
+        .validate_unique_identities()
+        .map_err(BackendError::InvalidState)?;
     Ok(MigratedStateFile { state, migration })
 }
 

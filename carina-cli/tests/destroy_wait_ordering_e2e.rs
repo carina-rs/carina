@@ -100,7 +100,9 @@ let lst = mock.test.resource {{
             .with_attribute("id", serde_json::json!("cert-id"))
             .with_attribute("status", serde_json::json!("ISSUED"));
         cert.binding = Some("cert".to_string());
-        state.upsert_resource(cert);
+        state
+            .upsert_resource(cert)
+            .expect("test state setup must be valid");
 
         let mut lst = ResourceState::new("test.resource", "lst", "mock")
             .with_identifier("mock-id")
@@ -109,7 +111,9 @@ let lst = mock.test.resource {{
             .with_attribute("upstream", serde_json::json!("cert-id"));
         lst.binding = Some("lst".to_string());
         lst.dependency_bindings.insert("cert_issued".to_string());
-        state.upsert_resource(lst);
+        state
+            .upsert_resource(lst)
+            .expect("test state setup must be valid");
 
         fs::write(
             &self.state_path,
@@ -161,7 +165,9 @@ let lst = mock.test.resource {{
             ]),
             dependency_bindings: BTreeSet::new(),
         });
-        state.upsert_resource(main);
+        state
+            .upsert_resource(main)
+            .expect("test state setup must be valid");
 
         fs::write(
             &self.state_path,

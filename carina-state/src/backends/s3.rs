@@ -187,6 +187,9 @@ impl S3Backend {
     }
 
     fn state_body(state: &StateFile) -> BackendResult<Vec<u8>> {
+        state
+            .validate_unique_identities()
+            .map_err(BackendError::InvalidState)?;
         carina_core::utils::pretty_with_newline_bytes(state)
             .map_err(|e| BackendError::Serialization(e.to_string()))
     }
@@ -290,18 +293,16 @@ impl StateBackend for S3Backend {
                     .map_err(|e| BackendError::Io(e.to_string()))?;
                 let bytes = body.into_bytes();
                 let outcome = state::check_and_migrate_bytes(&bytes)?;
-                let loaded = if let Some(info) = outcome.migration {
+                let (state, migration) = outcome.into_parts();
+                let loaded = if let Some(info) = migration {
                     log_state_migration_once(
                         &self.migration_logged,
                         info,
                         &format!("s3://{}/{}", self.bucket, self.key.trim_start_matches('/')),
                     );
-                    LoadedState::Migrated {
-                        state: outcome.state,
-                        info,
-                    }
+                    LoadedState::Migrated { state, info }
                 } else {
-                    LoadedState::Pristine(outcome.state)
+                    LoadedState::Pristine(state)
                 };
                 Ok(Some(loaded))
             }
@@ -632,6 +633,7 @@ fn is_missing_head_bucket_response(err: &aws_sdk_s3::error::SdkError<HeadBucketE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::ResourceState;
     use aws_sdk_s3::error::{ErrorMetadata, SdkError};
 
     #[test]
@@ -714,6 +716,23 @@ mod tests {
             Some(b'\n'),
             "S3 state body must end with a trailing newline; got {:?}",
             bytes.last().map(|b| *b as char),
+        );
+    }
+
+    #[test]
+    fn state_body_reports_duplicate_identity_as_invalid_state() {
+        let resource = ResourceState::new("ec2.Vpc", "network", "aws");
+        let state = StateFile::from_unchecked_resources_for_test(vec![resource.clone(), resource]);
+
+        let error = S3Backend::state_body(&state)
+            .expect_err("duplicate identity must be rejected before serialization");
+
+        assert!(
+            matches!(&error, BackendError::InvalidState(message) if message.contains("duplicate resource identity")
+                && message.contains("aws")
+                && message.contains("ec2.Vpc")
+                && message.contains("network")),
+            "unexpected error: {error}"
         );
     }
 

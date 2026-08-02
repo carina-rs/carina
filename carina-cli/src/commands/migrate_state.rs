@@ -102,7 +102,7 @@ async fn perform_state_migration(
         .await
         .map_err(AppError::Backend)?
         .map(|loaded| loaded.into_state())
-        && (existing.lineage != state.lineage || !existing.resources.is_empty())
+        && (existing.lineage != state.lineage || !existing.resources().is_empty())
         && !force
     {
         return Err(AppError::Config(format!(
@@ -111,7 +111,7 @@ async fn perform_state_migration(
              copy you want to replace, re-run with --force; otherwise verify \
              the backend configuration points where you expect.",
             existing.lineage,
-            existing.resources.len()
+            existing.resources().len()
         )));
     }
 
@@ -136,7 +136,8 @@ async fn perform_state_migration(
                     .to_string(),
             )
         })?;
-    if roundtrip.lineage != state.lineage || roundtrip.resources.len() != state.resources.len() {
+    if roundtrip.lineage != state.lineage || roundtrip.resources().len() != state.resources().len()
+    {
         return Err(AppError::Config(
             "State verification failed: the copy read back from the configured \
              backend did not match the source. The source is untouched."
@@ -198,7 +199,7 @@ pub async fn run_init_migrate_state(
     println!(
         "  {} copied {} resource(s) to the configured backend",
         "✓".green(),
-        state.resources.len()
+        state.resources().len()
     );
 
     // Rewrite the lock *before* touching the source. This is the commit
@@ -248,7 +249,7 @@ pub async fn run_init_migrate_state(
     };
 
     Ok(MigrationOutcome::Migrated {
-        resources: state.resources.len(),
+        resources: state.resources().len(),
         source,
     })
 }
@@ -269,10 +270,11 @@ mod tests {
             // read path prunes identifier=None rows as historical
             // artifacts. Production-shaped `state.resources` rows always
             // carry an identifier from the provider's apply result.
-            s.resources.push(
+            s.upsert_resource(
                 ResourceState::new("s3.Bucket", format!("r{i}"), "aws")
                     .with_identifier(format!("bucket-{i}")),
-            );
+            )
+            .expect("test state setup must be valid");
         }
         s
     }
@@ -288,11 +290,11 @@ mod tests {
         src.write_state(&state_with("lin-1", 3)).await.unwrap();
 
         let state = perform_state_migration(&src, &dst, false).await.unwrap();
-        assert_eq!(state.resources.len(), 3);
+        assert_eq!(state.resources().len(), 3);
 
         let migrated = dst.read_state().await.unwrap().unwrap().into_state();
         assert_eq!(migrated.lineage, "lin-1");
-        assert_eq!(migrated.resources.len(), 3);
+        assert_eq!(migrated.resources().len(), 3);
     }
 
     #[tokio::test]
@@ -326,7 +328,7 @@ mod tests {
         perform_state_migration(&src, &dst, true).await.unwrap();
         let dst_state = dst.read_state().await.unwrap().unwrap().into_state();
         assert_eq!(dst_state.lineage, "lin-src");
-        assert_eq!(dst_state.resources.len(), 1);
+        assert_eq!(dst_state.resources().len(), 1);
     }
 
     #[tokio::test]
@@ -404,7 +406,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .into_state();
-        assert_eq!(migrated.resources.len(), 2);
+        assert_eq!(migrated.resources().len(), 2);
 
         // Lock now reflects the configured backend ⇒ a second run is a no-op.
         let second = run_init_migrate_state(base, Some(&cfg), false)

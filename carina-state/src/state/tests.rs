@@ -28,19 +28,127 @@ fn test_state_file_upsert_resource() {
     let resource1 = ResourceState::new("s3.Bucket", "my-bucket", "aws")
         .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1"));
 
-    state.upsert_resource(resource1);
+    state
+        .upsert_resource(resource1)
+        .expect("test state setup must be valid");
     assert_eq!(state.resources.len(), 1);
 
     // Update the same resource
     let resource2 = ResourceState::new("s3.Bucket", "my-bucket", "aws")
         .with_attribute("region".to_string(), serde_json::json!("us-west-2"));
 
-    state.upsert_resource(resource2);
+    state
+        .upsert_resource(resource2)
+        .expect("test state setup must be valid");
     assert_eq!(state.resources.len(), 1);
     assert_eq!(
         state.resources[0].attributes.get("region"),
         Some(&serde_json::json!("us-west-2"))
     );
+}
+
+#[test]
+fn upsert_resource_returns_error_for_duplicate_deposed_key() {
+    let mut state = StateFile::new();
+    let duplicate_key = DeposedKey::new_unique();
+    let mut resource = ResourceState::new("ec2.Vpc", "main", "aws");
+    resource.deposed = vec![
+        DeposedInstance {
+            key: duplicate_key.clone(),
+            identifier: "vpc-old-a".to_string(),
+            provider_instance: Some("west".to_string()),
+            attributes: HashMap::new(),
+            dependency_bindings: BTreeSet::new(),
+        },
+        DeposedInstance {
+            key: duplicate_key,
+            identifier: "vpc-old-b".to_string(),
+            provider_instance: Some("east".to_string()),
+            attributes: HashMap::new(),
+            dependency_bindings: BTreeSet::new(),
+        },
+    ];
+
+    let error = state
+        .upsert_resource(resource)
+        .expect_err("duplicate deposed keys must be rejected");
+
+    assert!(
+        matches!(error, BackendError::InvalidState(message) if message.contains("duplicate deposed generation key"))
+    );
+    assert!(state.resources().is_empty());
+}
+
+#[test]
+fn rename_resource_identities_returns_error_for_duplicate_destination() {
+    let mut state = StateFile::new();
+    state
+        .upsert_resource(ResourceState::new("ec2.Vpc", "old", "aws"))
+        .expect("fresh state accepts the old identity");
+    state
+        .upsert_resource(ResourceState::new("ec2.Vpc", "existing", "aws"))
+        .expect("fresh state accepts the destination identity");
+
+    let error = state
+        .rename_resource_identities(&[("old".to_string(), "existing".to_string())])
+        .expect_err("rename must reject a duplicate destination identity");
+
+    assert!(
+        matches!(error, BackendError::InvalidState(message) if message.contains("duplicate resource identity"))
+    );
+    assert!(state.find_resource("aws", "ec2.Vpc", "old").is_some());
+    assert!(state.find_resource("aws", "ec2.Vpc", "existing").is_some());
+}
+
+#[test]
+fn upsert_deposed_generation_returns_error_when_key_and_identity_cross_generations() {
+    let mut state = StateFile::new();
+    let first_key = DeposedKey::new_unique();
+    let second_key = DeposedKey::new_unique();
+    let mut resource = ResourceState::new("ec2.Vpc", "main", "aws");
+    resource.deposed = vec![
+        DeposedInstance {
+            key: first_key.clone(),
+            identifier: "vpc-old-a".to_string(),
+            provider_instance: Some("west".to_string()),
+            attributes: HashMap::new(),
+            dependency_bindings: BTreeSet::new(),
+        },
+        DeposedInstance {
+            key: second_key,
+            identifier: "vpc-old-b".to_string(),
+            provider_instance: Some("east".to_string()),
+            attributes: HashMap::new(),
+            dependency_bindings: BTreeSet::new(),
+        },
+    ];
+    state
+        .upsert_resource(resource)
+        .expect("setup generations are unique on both axes");
+
+    let error = state
+        .upsert_deposed_generation(
+            "aws",
+            "ec2.Vpc",
+            "main",
+            None,
+            DeposedInstance {
+                key: first_key,
+                identifier: "vpc-old-b".to_string(),
+                provider_instance: Some("east".to_string()),
+                attributes: HashMap::new(),
+                dependency_bindings: BTreeSet::new(),
+            },
+        )
+        .expect_err("key and identity cannot select different generations");
+
+    assert!(
+        matches!(error, BackendError::InvalidState(message) if message.contains("match different existing generations"))
+    );
+    let row = state
+        .find_resource("aws", "ec2.Vpc", "main")
+        .expect("failed upsert must preserve the existing row");
+    assert_eq!(row.deposed.len(), 2);
 }
 
 #[test]
@@ -57,12 +165,16 @@ fn upsert_resource_preserves_existing_deposed_generations() {
         attributes: HashMap::from([("cidr_block".to_string(), serde_json::json!("10.255.0.0/16"))]),
         dependency_bindings: BTreeSet::from(["igw".to_string()]),
     });
-    state.upsert_resource(existing);
+    state
+        .upsert_resource(existing)
+        .expect("test state setup must be valid");
 
     let incoming = ResourceState::new("ec2.Vpc", "main", "aws")
         .with_identifier("vpc-new")
         .with_attribute("cidr_block", serde_json::json!("10.1.0.0/16"));
-    state.upsert_resource(incoming);
+    state
+        .upsert_resource(incoming)
+        .expect("test state setup must be valid");
 
     let row = state
         .find_resource("aws", "ec2.Vpc", "main")
@@ -99,13 +211,17 @@ fn upsert_resource_drops_deposed_generation_matching_current_identifier() {
         attributes: HashMap::from([("cidr_block".to_string(), serde_json::json!("10.255.0.0/16"))]),
         dependency_bindings: BTreeSet::from(["igw".to_string()]),
     });
-    state.upsert_resource(existing);
+    state
+        .upsert_resource(existing)
+        .expect("test state setup must be valid");
 
     let mut incoming = ResourceState::new("ec2.Vpc", "main", "aws")
         .with_identifier("vpc-reused")
         .with_attribute("cidr_block", serde_json::json!("10.2.0.0/16"));
     incoming.directives.provider_instance = Some("west".to_string());
-    state.upsert_resource(incoming);
+    state
+        .upsert_resource(incoming)
+        .expect("test state setup must be valid");
 
     let row = state
         .find_resource("aws", "ec2.Vpc", "main")
@@ -130,13 +246,17 @@ fn upsert_resource_keeps_deposed_generation_with_same_identifier_on_other_provid
         attributes: HashMap::from([("cidr_block".to_string(), serde_json::json!("10.2.0.0/16"))]),
         dependency_bindings: BTreeSet::new(),
     });
-    state.upsert_resource(existing);
+    state
+        .upsert_resource(existing)
+        .expect("test state setup must be valid");
 
     let mut incoming = ResourceState::new("ec2.Vpc", "main", "aws")
         .with_identifier("vpc-reused")
         .with_attribute("cidr_block", serde_json::json!("10.2.0.0/16"));
     incoming.directives.provider_instance = Some("east".to_string());
-    state.upsert_resource(incoming);
+    state
+        .upsert_resource(incoming)
+        .expect("test state setup must be valid");
 
     let row = state
         .find_resource("aws", "ec2.Vpc", "main")
@@ -154,7 +274,9 @@ fn test_state_file_remove_resource() {
     let mut state = StateFile::new();
 
     let resource = ResourceState::new("s3.Bucket", "my-bucket", "aws");
-    state.upsert_resource(resource);
+    state
+        .upsert_resource(resource)
+        .expect("test state setup must be valid");
     assert_eq!(state.resources.len(), 1);
 
     let removed = state.remove_resource("aws", "s3.Bucket", "my-bucket");
@@ -202,7 +324,9 @@ fn remove_resource_clears_current_instance_and_keeps_deposed_generations() {
         attributes: HashMap::from([("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))]),
         dependency_bindings: BTreeSet::from(["network".to_string()]),
     });
-    state.upsert_resource(resource);
+    state
+        .upsert_resource(resource)
+        .expect("test state setup must be valid");
 
     let removed = state.remove_resource("aws", "ec2.Vpc", "main");
 
@@ -299,7 +423,9 @@ fn test_state_file_serialization() {
         .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1"))
         .with_attribute("versioning".to_string(), serde_json::json!("Enabled"));
 
-    state.upsert_resource(resource);
+    state
+        .upsert_resource(resource)
+        .expect("test state setup must be valid");
 
     let json = serde_json::to_string_pretty(&state).unwrap();
     let deserialized: StateFile = serde_json::from_str(&json).unwrap();
@@ -480,7 +606,9 @@ fn test_get_identifier_for_resource_from_state() {
     let mut state = StateFile::new();
     let rs =
         ResourceState::new("s3.Bucket", "my-bucket", "awscc").with_identifier("my-bucket-abcd1234");
-    state.upsert_resource(rs);
+    state
+        .upsert_resource(rs)
+        .expect("test state setup must be valid");
 
     let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     assert_eq!(
@@ -505,7 +633,9 @@ fn test_build_directives() {
     let mut state = StateFile::new();
     let mut rs = ResourceState::new("s3.Bucket", "my-bucket", "awscc");
     rs.directives.force_delete = true;
-    state.upsert_resource(rs);
+    state
+        .upsert_resource(rs)
+        .expect("test state setup must be valid");
 
     let directives_map = state.build_directives();
     let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "my-bucket", None);
@@ -519,7 +649,9 @@ fn test_build_saved_attrs() {
     let mut state = StateFile::new();
     let rs = ResourceState::new("s3.Bucket", "my-bucket", "awscc")
         .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1"));
-    state.upsert_resource(rs);
+    state
+        .upsert_resource(rs)
+        .expect("test state setup must be valid");
 
     let saved = state.build_saved_attrs();
     let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "my-bucket", None);
@@ -1033,8 +1165,12 @@ fn test_multi_provider_resources_do_not_collide() {
     let awscc_resource =
         ResourceState::new("s3.Bucket", "main", "awscc").with_identifier("awscc-bucket-id");
 
-    state.upsert_resource(aws_resource);
-    state.upsert_resource(awscc_resource);
+    state
+        .upsert_resource(aws_resource)
+        .expect("test state setup must be valid");
+    state
+        .upsert_resource(awscc_resource)
+        .expect("test state setup must be valid");
 
     // Both should be stored independently
     assert_eq!(state.resources.len(), 2);
@@ -1062,7 +1198,9 @@ fn test_multi_provider_resources_do_not_collide() {
     // Upsert should only update the matching provider's entry
     let updated_aws =
         ResourceState::new("s3.Bucket", "main", "aws").with_identifier("aws-bucket-id-v2");
-    state.upsert_resource(updated_aws);
+    state
+        .upsert_resource(updated_aws)
+        .expect("test state setup must be valid");
     assert_eq!(state.resources.len(), 2);
     assert_eq!(
         state
@@ -1099,8 +1237,12 @@ fn test_build_directives_provider_scoped() {
     aws_rs.directives.force_delete = true;
     let awscc_rs = ResourceState::new("s3.Bucket", "main", "awscc");
 
-    state.upsert_resource(aws_rs);
-    state.upsert_resource(awscc_rs);
+    state
+        .upsert_resource(aws_rs)
+        .expect("test state setup must be valid");
+    state
+        .upsert_resource(awscc_rs)
+        .expect("test state setup must be valid");
 
     let directives_map = state.build_directives();
     let aws_id = ResourceId::with_provider_identity("aws", "s3.Bucket", "main", None);
@@ -1120,8 +1262,12 @@ fn test_build_saved_attrs_provider_scoped() {
     let awscc_rs = ResourceState::new("s3.Bucket", "main", "awscc")
         .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1"));
 
-    state.upsert_resource(aws_rs);
-    state.upsert_resource(awscc_rs);
+    state
+        .upsert_resource(aws_rs)
+        .expect("test state setup must be valid");
+    state
+        .upsert_resource(awscc_rs)
+        .expect("test state setup must be valid");
 
     let saved = state.build_saved_attrs();
     let aws_id = ResourceId::with_provider_identity("aws", "s3.Bucket", "main", None);
@@ -1146,11 +1292,13 @@ fn test_build_state_for_resource_existing() {
     use carina_core::resource::{ConcreteValue, Resource, Value};
 
     let mut state = StateFile::new();
-    state.upsert_resource(
-        ResourceState::new("s3.Bucket", "my-bucket", "awscc")
-            .with_identifier("my-bucket-id")
-            .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1")),
-    );
+    state
+        .upsert_resource(
+            ResourceState::new("s3.Bucket", "my-bucket", "awscc")
+                .with_identifier("my-bucket-id")
+                .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1")),
+        )
+        .expect("test state setup must be valid");
 
     let resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     let result = state.build_state_for_resource(&resource.id);
@@ -1181,10 +1329,12 @@ fn test_build_state_for_resource_not_found() {
 fn test_build_state_for_resource_without_identifier() {
     let mut state = StateFile::new();
     // Resource in state but without identifier (not yet created)
-    state.upsert_resource(
-        ResourceState::new("s3.Bucket", "pending", "awscc")
-            .with_attribute("region".to_string(), serde_json::json!("us-east-1")),
-    );
+    state
+        .upsert_resource(
+            ResourceState::new("s3.Bucket", "pending", "awscc")
+                .with_attribute("region".to_string(), serde_json::json!("us-east-1")),
+        )
+        .expect("test state setup must be valid");
 
     let resource =
         carina_core::resource::Resource::with_provider("awscc", "s3.Bucket", "pending", None);
@@ -1243,7 +1393,9 @@ fn test_build_orphan_states_injects_binding() {
         ResourceState::new("ec2.Subnet", "orphan-subnet", "awscc").with_identifier("subnet-123");
     rs.binding = Some("my_subnet".to_string());
     rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
-    state.upsert_resource(rs);
+    state
+        .upsert_resource(rs)
+        .expect("test state setup must be valid");
 
     let desired_ids = std::collections::HashSet::new();
     let orphans = state.build_orphan_states(&desired_ids);
@@ -1268,7 +1420,9 @@ fn test_build_orphan_dependencies() {
         ResourceState::new("ec2.Subnet", "orphan-subnet", "awscc").with_identifier("subnet-123");
     rs.binding = Some("my_subnet".to_string());
     rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
-    state.upsert_resource(rs);
+    state
+        .upsert_resource(rs)
+        .expect("test state setup must be valid");
 
     let desired_ids = std::collections::HashSet::new();
     let deps = state.build_orphan_dependencies(&desired_ids);
@@ -1431,7 +1585,9 @@ fn test_build_orphan_dependencies_excludes_desired() {
     let mut rs =
         ResourceState::new("ec2.Subnet", "kept-subnet", "awscc").with_identifier("subnet-456");
     rs.dependency_bindings = BTreeSet::from(["my_vpc".to_string()]);
-    state.upsert_resource(rs);
+    state
+        .upsert_resource(rs)
+        .expect("test state setup must be valid");
 
     let id = ResourceId::with_provider_identity("awscc", "ec2.Subnet", "kept-subnet", None);
     let mut desired_ids = std::collections::HashSet::new();
@@ -1450,6 +1606,195 @@ fn test_check_and_migrate_current_version() {
     let result = check_and_migrate(&json).unwrap().into_state();
     assert_eq!(result.version, StateFile::CURRENT_VERSION);
     assert_eq!(result.lineage, state.lineage);
+}
+
+fn persisted_resource(provider: &str, resource_type: &str, identity: &str) -> serde_json::Value {
+    serde_json::json!({
+        "resource_type": resource_type,
+        "identity": identity,
+        "provider": provider,
+        "identifier": format!("{provider}-{resource_type}-{identity}"),
+        "attributes": {}
+    })
+}
+
+fn state_json_with_resources(version: u32, resources: Vec<serde_json::Value>) -> String {
+    serde_json::json!({
+        "version": version,
+        "serial": 1,
+        "lineage": "duplicate-identity-test",
+        "carina_version": "test",
+        "resources": resources
+    })
+    .to_string()
+}
+
+fn invalid_state_message(result: Result<MigratedStateFile, BackendError>) -> String {
+    match result.expect_err("duplicate identity must be rejected") {
+        BackendError::InvalidState(message) => message,
+        other => panic!("expected InvalidState, got {other}"),
+    }
+}
+
+#[test]
+fn check_and_migrate_rejects_duplicate_resource_identity() {
+    let resource = persisted_resource("aws", "ec2.Vpc", "network");
+    let json =
+        state_json_with_resources(StateFile::CURRENT_VERSION, vec![resource.clone(), resource]);
+
+    let message = invalid_state_message(check_and_migrate(&json));
+
+    assert!(message.contains("duplicate resource identity"), "{message}");
+    assert!(message.contains("aws"), "{message}");
+    assert!(message.contains("ec2.Vpc"), "{message}");
+    assert!(message.contains("network"), "{message}");
+}
+
+#[test]
+fn check_and_migrate_accepts_resource_identities_differing_on_each_axis() {
+    let json = state_json_with_resources(
+        StateFile::CURRENT_VERSION,
+        vec![
+            persisted_resource("aws", "ec2.Vpc", "network"),
+            persisted_resource("awscc", "ec2.Vpc", "network"),
+            persisted_resource("aws", "ec2.Subnet", "network"),
+            persisted_resource("aws", "ec2.Vpc", "other-network"),
+        ],
+    );
+
+    let state = check_and_migrate(&json)
+        .expect("all three resource identity axes must participate in uniqueness")
+        .into_state();
+
+    assert_eq!(state.resources.len(), 4);
+}
+
+fn deposed_generation(
+    key: &str,
+    identifier: &str,
+    provider_instance: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "key": key,
+        "identifier": identifier,
+        "provider_instance": provider_instance,
+        "attributes": {},
+        "dependency_bindings": []
+    })
+}
+
+fn resource_with_deposed(deposed: Vec<serde_json::Value>) -> serde_json::Value {
+    let mut resource = persisted_resource("awscc", "ec2.Vpc", "network");
+    resource["deposed"] = serde_json::Value::Array(deposed);
+    resource
+}
+
+#[test]
+fn check_and_migrate_rejects_duplicate_deposed_key() {
+    let json = state_json_with_resources(
+        StateFile::CURRENT_VERSION,
+        vec![resource_with_deposed(vec![
+            deposed_generation("generation-a", "vpc-old-a", Some("west")),
+            deposed_generation("generation-a", "vpc-old-b", Some("east")),
+        ])],
+    );
+
+    let message = invalid_state_message(check_and_migrate(&json));
+
+    assert!(
+        message.contains("duplicate deposed generation key"),
+        "{message}"
+    );
+    assert!(message.contains("awscc"), "{message}");
+    assert!(message.contains("ec2.Vpc"), "{message}");
+    assert!(message.contains("network"), "{message}");
+    assert!(message.contains("generation-a"), "{message}");
+}
+
+#[test]
+fn check_and_migrate_rejects_duplicate_deposed_identifier_and_provider_instance() {
+    let json = state_json_with_resources(
+        StateFile::CURRENT_VERSION,
+        vec![resource_with_deposed(vec![
+            deposed_generation("generation-a", "vpc-old", Some("west")),
+            deposed_generation("generation-b", "vpc-old", Some("west")),
+        ])],
+    );
+
+    let message = invalid_state_message(check_and_migrate(&json));
+
+    assert!(
+        message.contains("duplicate deposed generation identity"),
+        "{message}"
+    );
+    assert!(message.contains("awscc"), "{message}");
+    assert!(message.contains("ec2.Vpc"), "{message}");
+    assert!(message.contains("network"), "{message}");
+    assert!(message.contains("vpc-old"), "{message}");
+    assert!(message.contains("west"), "{message}");
+}
+
+#[test]
+fn check_and_migrate_loads_legacy_name_alias_and_checks_it_for_duplicates() {
+    let mut legacy = persisted_resource("aws", "s3.Bucket", "logs");
+    let identity = legacy.as_object_mut().unwrap().remove("identity").unwrap();
+    legacy["name"] = identity;
+    let valid_json = state_json_with_resources(StateFile::CURRENT_VERSION, vec![legacy.clone()]);
+
+    let state = check_and_migrate(&valid_json)
+        .expect("legacy name alias must remain readable")
+        .into_state();
+    assert_eq!(state.resources[0].identity, "logs");
+
+    let duplicate_json = state_json_with_resources(
+        StateFile::CURRENT_VERSION,
+        vec![legacy, persisted_resource("aws", "s3.Bucket", "logs")],
+    );
+    let message = invalid_state_message(check_and_migrate(&duplicate_json));
+    assert!(message.contains("duplicate resource identity"), "{message}");
+    assert!(message.contains("logs"), "{message}");
+}
+
+#[test]
+fn check_and_migrate_bytes_rejects_duplicate_resource_identity() {
+    let resource = persisted_resource("aws", "ec2.Vpc", "network");
+    let json =
+        state_json_with_resources(StateFile::CURRENT_VERSION, vec![resource.clone(), resource]);
+
+    let message = invalid_state_message(check_and_migrate_bytes(json.as_bytes()));
+
+    assert!(message.contains("duplicate resource identity"), "{message}");
+    assert!(message.contains("network"), "{message}");
+}
+
+fn assert_migration_rejects_canonicalized_duplicate(version: u32) {
+    let mut legacy = persisted_resource("awscc", "sso.Assignment", "placeholder");
+    legacy["name"] = serde_json::json!("_accounts[\"registry_prod\"]");
+    legacy.as_object_mut().unwrap().remove("identity");
+    let current = persisted_resource("awscc", "sso.Assignment", "_accounts.registry_prod");
+    let json = state_json_with_resources(version, vec![legacy, current]);
+
+    let message = invalid_state_message(check_and_migrate(&json));
+
+    assert!(message.contains("duplicate resource identity"), "{message}");
+    assert!(message.contains("awscc"), "{message}");
+    assert!(message.contains("sso.Assignment"), "{message}");
+    assert!(message.contains("_accounts.registry_prod"), "{message}");
+}
+
+#[test]
+fn v5_migration_rejects_duplicate_created_by_canonicalization() {
+    assert_migration_rejects_canonicalized_duplicate(5);
+}
+
+#[test]
+fn v6_migration_rejects_duplicate_created_by_canonicalization() {
+    assert_migration_rejects_canonicalized_duplicate(6);
+}
+
+#[test]
+fn older_migration_rejects_duplicate_created_by_canonicalization() {
+    assert_migration_rejects_canonicalized_duplicate(3);
 }
 
 #[test]
@@ -1557,11 +1902,11 @@ fn test_check_and_migrate_returns_migration_info_for_older_version() {
 
     let outcome = check_and_migrate(json).unwrap();
     let migration = outcome
-        .migration
+        .migration()
         .expect("migration info should be present for v6 → v7");
     assert_eq!(migration.from, 6);
     assert_eq!(migration.to, StateFile::CURRENT_VERSION);
-    assert_eq!(outcome.state.version, StateFile::CURRENT_VERSION);
+    assert_eq!(outcome.state().version, StateFile::CURRENT_VERSION);
 }
 
 #[test]
@@ -1572,10 +1917,10 @@ fn test_check_and_migrate_no_migration_info_for_current_version() {
     let json = serde_json::to_string_pretty(&state).unwrap();
     let outcome = check_and_migrate(&json).unwrap();
     assert!(
-        outcome.migration.is_none(),
+        outcome.migration().is_none(),
         "current-version reads must not report a migration"
     );
-    assert_eq!(outcome.state.version, StateFile::CURRENT_VERSION);
+    assert_eq!(outcome.state().version, StateFile::CURRENT_VERSION);
 }
 
 // carina#3266: `state.resources` is managed-only by invariant since
@@ -2454,26 +2799,28 @@ fn build_remote_bindings_empty_when_no_exports() {
 fn build_remote_bindings_ignores_resource_bindings() {
     let mut state = StateFile::new();
     // Add a resource with a binding — should NOT appear in remote bindings
-    state.resources.push(ResourceState {
-        resource_type: "ec2.Vpc".to_string(),
-        identity: "vpc_123".to_string(),
-        provider: "awscc".to_string(),
-        identifier: Some("vpc-123".to_string()),
-        attributes: HashMap::from([(
-            "vpc_id".to_string(),
-            serde_json::Value::String("vpc-123".to_string()),
-        )]),
-        deposed: Vec::new(),
-        protected: false,
-        directives: carina_core::resource::Directives::default(),
-        prefixes: HashMap::new(),
-        name_overrides: HashMap::new(),
-        explicit: ExplicitFields::default(),
-        binding: Some("vpc".to_string()),
-        dependency_bindings: BTreeSet::new(),
-        write_only_attributes: vec![],
-        partial_read: None,
-    });
+    state
+        .upsert_resource(ResourceState {
+            resource_type: "ec2.Vpc".to_string(),
+            identity: "vpc_123".to_string(),
+            provider: "awscc".to_string(),
+            identifier: Some("vpc-123".to_string()),
+            attributes: HashMap::from([(
+                "vpc_id".to_string(),
+                serde_json::Value::String("vpc-123".to_string()),
+            )]),
+            deposed: Vec::new(),
+            protected: false,
+            directives: carina_core::resource::Directives::default(),
+            prefixes: HashMap::new(),
+            name_overrides: HashMap::new(),
+            explicit: ExplicitFields::default(),
+            binding: Some("vpc".to_string()),
+            dependency_bindings: BTreeSet::new(),
+            write_only_attributes: vec![],
+            partial_read: None,
+        })
+        .expect("test state setup must be valid");
     let bindings = state.build_remote_bindings();
     assert!(
         bindings.is_empty(),
@@ -2632,7 +2979,9 @@ fn current_state_writes_and_reads_full_explicit_tree() {
             },
         )]),
     };
-    state.upsert_resource(rs);
+    state
+        .upsert_resource(rs)
+        .expect("test state setup must be valid");
 
     let json = serde_json::to_string(&state).expect("serialize");
     let back = check_and_migrate(&json).expect("read").into_state();
@@ -2647,7 +2996,9 @@ fn build_explicit_yields_per_resource_trees() {
     rs.explicit = ExplicitFields::Struct {
         children: HashMap::from([("region".into(), ExplicitFields::Leaf)]),
     };
-    state.upsert_resource(rs);
+    state
+        .upsert_resource(rs)
+        .expect("test state setup must be valid");
 
     let map = state.build_explicit();
     let id = ResourceId::with_provider_identity("aws", "s3.Bucket", "my-bucket", None);
@@ -2668,7 +3019,9 @@ fn build_directives_keys_include_provider_instance() {
     let mut state = StateFile::new();
     let mut rs = ResourceState::new("s3.Bucket", "shared-name", "aws");
     rs.directives.provider_instance = Some("us".to_string());
-    state.upsert_resource(rs);
+    state
+        .upsert_resource(rs)
+        .expect("test state setup must be valid");
 
     let map = state.build_directives();
     let expected = ResourceId::with_provider_identity(
@@ -2698,7 +3051,9 @@ fn partial_read_marker_round_trips_through_state_json() {
         detail: "mock partial create".to_string(),
         missing_attributes: ["a".to_string(), "b".to_string()].into_iter().collect(),
     });
-    state.upsert_resource(rs);
+    state
+        .upsert_resource(rs)
+        .expect("test state setup must be valid");
 
     let json = serde_json::to_string(&state).expect("serialize");
     let back = check_and_migrate(&json).expect("read").into_state();

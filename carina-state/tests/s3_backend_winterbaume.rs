@@ -96,7 +96,7 @@ async fn init_auto_creates_bucket_and_seeds_empty_state() {
     );
     assert_eq!(state.serial, 0, "seeded state should start at serial 0");
     assert!(
-        state.resources.is_empty(),
+        state.resources().is_empty(),
         "seeded state should have no resources",
     );
 }
@@ -158,7 +158,7 @@ async fn write_then_read_state_round_trips() {
     written.increment_serial();
     written.increment_serial();
     assert_eq!(
-        written.resources.len(),
+        written.resources().len(),
         1,
         "precondition: the written state carries one resource",
     );
@@ -184,7 +184,7 @@ async fn write_then_read_state_round_trips() {
         "version must round-trip",
     );
     assert_eq!(
-        read_back.resources.len(),
+        read_back.resources().len(),
         1,
         "the resource entry must survive the write/read round-trip",
     );
@@ -192,8 +192,8 @@ async fn write_then_read_state_round_trips() {
     // that dropped any one of `attributes` (a JSON map), `identifier`
     // (an `Option`), or `protected` (a `bool`) would survive a
     // name/type-only check but is caught here.
-    let written_res = &written.resources[0];
-    let read_res = &read_back.resources[0];
+    let written_res = &written.resources()[0];
+    let read_res = &read_back.resources()[0];
     assert_eq!(
         read_res.identity, written_res.identity,
         "the round-tripped resource must keep its identity",

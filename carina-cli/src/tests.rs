@@ -160,11 +160,13 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
         refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
 
     let mut existing_state = StateFile::new();
-    existing_state.upsert_resource(
-        ResourceState::new("s3.Bucket", "bucket", "aws")
-            .with_identifier(identifier)
-            .with_attribute("status", json!("before")),
-    );
+    existing_state
+        .upsert_resource(
+            ResourceState::new("s3.Bucket", "bucket", "aws")
+                .with_identifier(identifier)
+                .with_attribute("status", json!("before")),
+        )
+        .expect("test state setup must be valid");
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(existing_state),
@@ -211,11 +213,13 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
         refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
 
     let mut existing_state = StateFile::new();
-    existing_state.upsert_resource(
-        ResourceState::new("s3.Bucket", "bucket", "aws")
-            .with_identifier(identifier)
-            .with_attribute("status", json!("before")),
-    );
+    existing_state
+        .upsert_resource(
+            ResourceState::new("s3.Bucket", "bucket", "aws")
+                .with_identifier(identifier)
+                .with_attribute("status", json!("before")),
+        )
+        .expect("test state setup must be valid");
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(existing_state),
@@ -258,11 +262,13 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
         refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
 
     let mut existing_state = StateFile::new();
-    existing_state.upsert_resource(
-        ResourceState::new("s3.Bucket", "bucket", "aws")
-            .with_identifier(identifier)
-            .with_attribute("status", json!("saved")),
-    );
+    existing_state
+        .upsert_resource(
+            ResourceState::new("s3.Bucket", "bucket", "aws")
+                .with_identifier(identifier)
+                .with_attribute("status", json!("saved")),
+        )
+        .expect("test state setup must be valid");
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(existing_state),
@@ -528,7 +534,9 @@ fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
     );
     rs.prefixes
         .insert("bucket_name".to_string(), "my-app-".to_string());
-    state_file.upsert_resource(rs);
+    state_file
+        .upsert_resource(rs)
+        .expect("test state setup must be valid");
 
     let mut resources = vec![resource];
     reconcile_prefixed_names(&mut resources, &Some(state_file));
@@ -561,7 +569,9 @@ fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
     );
     rs.prefixes
         .insert("bucket_name".to_string(), "old-prefix-".to_string());
-    state_file.upsert_resource(rs);
+    state_file
+        .upsert_resource(rs)
+        .expect("test state setup must be valid");
 
     let mut resources = vec![resource];
     reconcile_prefixed_names(&mut resources, &Some(state_file));
@@ -923,7 +933,9 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
     .unwrap();
 
     let mut state_file = StateFile::new();
-    state_file.upsert_resource(resource_state);
+    state_file
+        .upsert_resource(resource_state)
+        .expect("test state setup must be valid");
 
     // --- Second run (plan-verify) ---
     // 1. Parse again: same anonymous resource with bucket_name_prefix
@@ -1045,7 +1057,9 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     )
     .unwrap();
     let mut state_file = StateFile::new();
-    state_file.upsert_resource(resource_state);
+    state_file
+        .upsert_resource(resource_state)
+        .expect("test state setup must be valid");
 
     // --- Second run ---
     let mut resource_run2 = Resource::with_provider("awscc", "iam.role", "", None);
@@ -1165,7 +1179,9 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
     )
     .unwrap();
     let mut state_file = StateFile::new();
-    state_file.upsert_resource(resource_state);
+    state_file
+        .upsert_resource(resource_state)
+        .expect("test state setup must be valid");
 
     // --- Second run ---
     let mut resource_run2 = Resource::with_provider("awscc", "ec2.flow_log", "", None);
@@ -1327,16 +1343,20 @@ fn orphaned_state_resource_produces_delete_effect() {
 
     // State file has two resources: "keep-bucket" and "removed-bucket"
     let mut state_file = StateFile::new();
-    state_file.upsert_resource(
-        ResourceState::new("s3.Bucket", "keep-bucket", "aws")
-            .with_identifier("keep-bucket")
-            .with_attribute("bucket", json!("keep-bucket")),
-    );
-    state_file.upsert_resource(
-        ResourceState::new("s3.Bucket", "removed-bucket", "aws")
-            .with_identifier("removed-bucket")
-            .with_attribute("bucket", json!("removed-bucket")),
-    );
+    state_file
+        .upsert_resource(
+            ResourceState::new("s3.Bucket", "keep-bucket", "aws")
+                .with_identifier("keep-bucket")
+                .with_attribute("bucket", json!("keep-bucket")),
+        )
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(
+            ResourceState::new("s3.Bucket", "removed-bucket", "aws")
+                .with_identifier("removed-bucket")
+                .with_attribute("bucket", json!("removed-bucket")),
+        )
+        .expect("test state setup must be valid");
 
     // Config only has "keep-bucket" -- "removed-bucket" was deleted from .crn
     let desired = vec![
@@ -1751,16 +1771,20 @@ impl StateBackend for RefreshTestBackend {
 async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     // State has two resources: "keep-bucket" (in config) and "orphan-bucket" (not in config)
     let mut state = StateFile::new();
-    state.upsert_resource(
-        ResourceState::new("s3.Bucket", "keep-bucket", "")
-            .with_identifier("keep-bucket")
-            .with_attribute("bucket", json!("keep-bucket")),
-    );
-    state.upsert_resource(
-        ResourceState::new("s3.Bucket", "orphan-bucket", "")
-            .with_identifier("orphan-bucket")
-            .with_attribute("bucket", json!("orphan-bucket")),
-    );
+    state
+        .upsert_resource(
+            ResourceState::new("s3.Bucket", "keep-bucket", "")
+                .with_identifier("keep-bucket")
+                .with_attribute("bucket", json!("keep-bucket")),
+        )
+        .expect("test state setup must be valid");
+    state
+        .upsert_resource(
+            ResourceState::new("s3.Bucket", "orphan-bucket", "")
+                .with_identifier("orphan-bucket")
+                .with_attribute("bucket", json!("orphan-bucket")),
+        )
+        .expect("test state setup must be valid");
 
     let backend = RefreshTestBackend::new(state);
 
@@ -1811,7 +1835,9 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
         attributes: HashMap::from([("bucket".to_string(), json!("old-bucket"))]),
         dependency_bindings: BTreeSet::new(),
     });
-    state.upsert_resource(row);
+    state
+        .upsert_resource(row)
+        .expect("test state setup must be valid");
 
     let backend = RefreshTestBackend::new(state);
     let mut parsed = carina_core::parser::InferredFile::default();
@@ -1871,7 +1897,9 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
         ]),
         dependency_bindings: BTreeSet::new(),
     });
-    state.upsert_resource(row);
+    state
+        .upsert_resource(row)
+        .expect("test state setup must be valid");
 
     let backend = RefreshTestBackend::new(state);
     let mut parsed = carina_core::parser::InferredFile::default();
@@ -2027,11 +2055,13 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
 
     // State file tracks "removed-bucket" with an identifier (implies it existed in infra)
     let mut state_file = StateFile::new();
-    state_file.upsert_resource(
-        ResourceState::new("s3.Bucket", "removed-bucket", "aws")
-            .with_identifier("removed-bucket")
-            .with_attribute("bucket", json!("removed-bucket")),
-    );
+    state_file
+        .upsert_resource(
+            ResourceState::new("s3.Bucket", "removed-bucket", "aws")
+                .with_identifier("removed-bucket")
+                .with_attribute("bucket", json!("removed-bucket")),
+        )
+        .expect("test state setup must be valid");
 
     // No desired resources — "removed-bucket" was removed from .crn
     let desired: Vec<Resource> = vec![];
@@ -2104,12 +2134,14 @@ fn refresh_false_uses_cached_state_from_state_file() {
     use carina_core::differ::create_plan;
 
     let mut state_file = StateFile::new();
-    state_file.upsert_resource(
-        ResourceState::new("s3.Bucket", "my-bucket", "awscc")
-            .with_identifier("my-bucket-id")
-            .with_attribute("bucket_name", json!("my-bucket"))
-            .with_attribute("region", json!("ap-northeast-1")),
-    );
+    state_file
+        .upsert_resource(
+            ResourceState::new("s3.Bucket", "my-bucket", "awscc")
+                .with_identifier("my-bucket-id")
+                .with_attribute("bucket_name", json!("my-bucket"))
+                .with_attribute("region", json!("ap-northeast-1")),
+        )
+        .expect("test state setup must be valid");
 
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     resource.set_attr(
@@ -2183,11 +2215,13 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
     use carina_core::differ::create_plan;
 
     let mut state_file = StateFile::new();
-    state_file.upsert_resource(
-        ResourceState::new("s3.Bucket", "orphaned-bucket", "awscc")
-            .with_identifier("orphaned-bucket-id")
-            .with_attribute("bucket_name", json!("orphaned-bucket")),
-    );
+    state_file
+        .upsert_resource(
+            ResourceState::new("s3.Bucket", "orphaned-bucket", "awscc")
+                .with_identifier("orphaned-bucket-id")
+                .with_attribute("bucket_name", json!("orphaned-bucket")),
+        )
+        .expect("test state setup must be valid");
 
     // No desired resources — the bucket was removed from .crn
     let desired: Vec<Resource> = vec![];
@@ -2575,7 +2609,9 @@ fn build_state_after_apply_write_only_detects_value_change() {
         .with_attribute("cidr_block".to_string(), json!("10.0.0.0/16"))
         .with_attribute("ipv4_netmask_length".to_string(), json!(16));
     old_rs.write_only_attributes = vec!["ipv4_netmask_length".to_string()];
-    existing_state.upsert_resource(old_rs);
+    existing_state
+        .upsert_resource(old_rs)
+        .expect("test state setup must be valid");
 
     let mut schemas = SchemaRegistry::new();
     schemas.insert(

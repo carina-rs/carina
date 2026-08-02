@@ -133,7 +133,7 @@ fn complete_state_lookup(current: &OsStr) -> Vec<CompletionCandidate> {
 ///   exports and the partial matches it.
 fn complete_state_lookup_from(state: &StateFile, current: &str) -> Vec<CompletionCandidate> {
     let resource_named_exports = state
-        .resources
+        .resources()
         .iter()
         .any(|r| r.binding.as_deref() == Some("exports"));
 
@@ -168,7 +168,7 @@ fn complete_state_lookup_from(state: &StateFile, current: &str) -> Vec<Completio
 
     // Top-level: resource bindings/identities + optional `exports`.
     let mut candidates: Vec<CompletionCandidate> = Vec::new();
-    for rs in &state.resources {
+    for rs in state.resources() {
         let display_name = rs.binding.as_deref().unwrap_or(&rs.identity);
         if display_name.starts_with(current) {
             candidates.push(CompletionCandidate::new(display_name));
@@ -403,19 +403,19 @@ async fn load_state_file(
 fn find_resource_by_query<'a>(state: &'a StateFile, name: &str) -> Option<&'a ResourceState> {
     // Search by binding first
     state
-        .resources
+        .resources()
         .iter()
         .find(|r| r.binding.as_deref() == Some(name))
         .or_else(|| {
             // Fall back to identity
-            state.resources.iter().find(|r| r.identity == name)
+            state.resources().iter().find(|r| r.identity == name)
         })
 }
 
 /// Format state list output. Returns each line as a string.
 fn format_state_list(state: &StateFile) -> Vec<String> {
     let mut lines = Vec::new();
-    for rs in &state.resources {
+    for rs in state.resources() {
         let display_name = rs.binding.as_deref().unwrap_or(&rs.identity);
         let row_prefix = format!("{}.{} {}", rs.provider, rs.resource_type, display_name);
         if rs.identifier.is_none() {
@@ -446,7 +446,7 @@ async fn run_state_list(
 ) -> Result<(), AppError> {
     let state = load_state_file(path, state_url, provider_context).await?;
 
-    if state.resources.is_empty() {
+    if state.resources().is_empty() {
         println!("No resources in state.");
         return Ok(());
     }
@@ -537,7 +537,7 @@ fn resolve_resource_address<'a>(
     // candidates: binding wins over name (matches the historical
     // `find_resource_by_query` precedence).
     let mut best: Option<(&'a ResourceState, &'a str, bool)> = None;
-    for rs in &state.resources {
+    for rs in state.resources() {
         for (candidate, is_binding) in candidate_addresses(rs) {
             if query_starts_with_address(query, candidate) {
                 let take = match &best {
@@ -686,7 +686,7 @@ async fn run_state_lookup(
 /// render it with all attributes in the detail panel.
 fn build_plan_from_state(state: &StateFile) -> Plan {
     let mut plan = Plan::new();
-    for rs in &state.resources {
+    for rs in state.resources() {
         // carina#3181 PR D: `Effect::Read` carries a `DataSource`.
         let mut resource = carina_core::resource::DataSource::with_provider(
             &rs.provider,
@@ -719,7 +719,7 @@ fn build_plan_from_state(state: &StateFile) -> Plan {
 /// Shows all resources with their type, identity/binding, and full attributes.
 fn format_state_show(state: &StateFile) -> String {
     let mut output = String::new();
-    for (i, rs) in state.resources.iter().enumerate() {
+    for (i, rs) in state.resources().iter().enumerate() {
         if i > 0 {
             output.push('\n');
         }
@@ -773,7 +773,7 @@ async fn run_state_show(
         return Ok(());
     }
 
-    if state.resources.is_empty() {
+    if state.resources().is_empty() {
         println!("No resources in state.");
         return Ok(());
     }
@@ -1019,7 +1019,7 @@ pub(crate) async fn run_state_refresh_locked(
     let mut state_file =
         crate::commands::apply::load_state_persist_if_migrated(backend, lock).await?;
 
-    if state_file.as_ref().is_none_or(|s| s.resources.is_empty()) {
+    if state_file.as_ref().is_none_or(|s| s.resources().is_empty()) {
         let msg = if state_file.is_none() {
             "No state file found. Nothing to refresh."
         } else {
@@ -1042,7 +1042,7 @@ pub(crate) async fn run_state_refresh_locked(
             &mut parsed.resources,
             sf,
             &state_block_claims,
-        );
+        )?;
     }
     // state is a read-only inspection command and does not run the differ. The
     // state-side name_overrides are sufficient for this narrow display path; the
@@ -1157,7 +1157,7 @@ pub(crate) async fn run_state_refresh_locked(
     let orphan_ids: Vec<(ResourceId, String)> = state_file
         .as_ref()
         .map(|sf| {
-            sf.resources
+            sf.resources()
                 .iter()
                 .filter_map(|rs| {
                     let id = ResourceId::with_provider_name_compat(
@@ -1603,7 +1603,7 @@ where
             &target.row_identity,
             target.row_provider_instance.clone(),
             updated,
-        );
+        )?;
         println!(
             "  {} \"{}\" {}:",
             target.id.display_type().cyan(),
@@ -1619,7 +1619,7 @@ where
 
 fn collect_deposed_refresh_targets(state: &carina_state::StateFile) -> Vec<DeposedRefreshTarget> {
     state
-        .resources
+        .resources()
         .iter()
         .flat_map(|row| {
             row.deposed.iter().map(|deposed| {
@@ -1861,7 +1861,7 @@ fn diff_display_update_resource(
 
     // Update state with refreshed data
     if let Some(resource_state) = refreshed_resource_state {
-        state.upsert_resource(resource_state);
+        state.upsert_resource(resource_state)?;
     } else {
         state.remove_resource(&id.provider, &id.resource_type, id.identity_or_empty());
     }
@@ -2065,7 +2065,9 @@ mod tests {
             None,
             HashMap::from([("vpc_id".to_string(), json!("vpc-older"))]),
         ));
-        state.upsert_resource(row);
+        state
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         let mut shell = ResourceState::new("ec2.Subnet", "abandoned", "awscc");
         shell.binding = Some("abandoned".to_string());
@@ -2075,7 +2077,9 @@ mod tests {
             None,
             HashMap::from([("subnet_id".to_string(), json!("subnet-old"))]),
         ));
-        state.upsert_resource(shell);
+        state
+            .upsert_resource(shell)
+            .expect("test state setup must be valid");
 
         state
     }
@@ -2129,8 +2133,12 @@ mod tests {
         rs1.binding = Some("my_vpc".to_string());
         let mut rs2 = ResourceState::new("ec2.Subnet", "my_vpc", "awscc");
         rs2.binding = None;
-        state.upsert_resource(rs1);
-        state.upsert_resource(rs2);
+        state
+            .upsert_resource(rs1)
+            .expect("test state setup must be valid");
+        state
+            .upsert_resource(rs2)
+            .expect("test state setup must be valid");
 
         let found = find_resource_by_query(&state, "my_vpc").unwrap();
         // Should find the one with binding="my_vpc", not name="my_vpc"
@@ -2345,7 +2353,9 @@ mod tests {
             None,
             HashMap::from([("vpc_id".to_string(), json!("vpc-old"))]),
         ));
-        state.upsert_resource(row);
+        state
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         let output = format_state_lookup(&state, "main", false).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -2527,7 +2537,9 @@ mod tests {
             Some("west"),
             HashMap::from([("vpc_id".to_string(), json!("vpc-alive-old"))]),
         ));
-        state.upsert_resource(row);
+        state
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         let gone_id = ResourceId::with_provider_name_compat("awscc", "ec2.Vpc", "main", None);
         let alive_id = ResourceId::with_provider_name_compat(
@@ -2598,7 +2610,9 @@ mod tests {
             None,
             HashMap::from([("vpc_id".to_string(), json!("vpc-gone"))]),
         ));
-        state.upsert_resource(row);
+        state
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         let id = ResourceId::with_provider_name_compat("awscc", "ec2.Vpc", "main", None);
         let provider = DeposedRefreshTestProvider::default().with_read_state(
@@ -2639,7 +2653,9 @@ mod tests {
             None,
             HashMap::from([("password".to_string(), json!("old-hash"))]),
         ));
-        state.upsert_resource(row);
+        state
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
         let provider = DeposedRefreshTestProvider::default().with_read_state(
@@ -2690,7 +2706,9 @@ mod tests {
             None,
             HashMap::from([("password".to_string(), json!("old-hash"))]),
         ));
-        state.upsert_resource(row);
+        state
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
         let provider = DeposedRefreshTestProvider::default().with_read_state(
@@ -2748,7 +2766,9 @@ mod tests {
                 json!(format!("{SECRET_PREFIX}previous")),
             )]),
         ));
-        state.upsert_resource(row);
+        state
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
         let provider = DeposedRefreshTestProvider::default().with_read_state(
@@ -2806,7 +2826,9 @@ mod tests {
             None,
             HashMap::from([("tags".to_string(), previous_tags.clone())]),
         ));
-        state.upsert_resource(row);
+        state
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         let id = ResourceId::with_provider_name_compat("awscc", "ec2.Vpc", "main", None);
         let mut provider_tags = indexmap::IndexMap::new();
@@ -2874,11 +2896,13 @@ mod tests {
     fn current_orphan_refresh_rehashes_existing_hash_without_desired_secret() {
         let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
         let mut state = StateFile::new();
-        state.upsert_resource(
-            ResourceState::new("db.Instance", "main", "awscc")
-                .with_identifier("db-current")
-                .with_attribute("password", json!(format!("{SECRET_PREFIX}previous"))),
-        );
+        state
+            .upsert_resource(
+                ResourceState::new("db.Instance", "main", "awscc")
+                    .with_identifier("db-current")
+                    .with_attribute("password", json!(format!("{SECRET_PREFIX}previous"))),
+            )
+            .expect("test state setup must be valid");
         let fresh = State::existing(
             id.clone(),
             HashMap::from([("password".to_string(), string_value("plain-secret"))]),
@@ -2918,11 +2942,13 @@ mod tests {
             "SecretTag": format!("{SECRET_PREFIX}previous"),
         });
         let mut state = StateFile::new();
-        state.upsert_resource(
-            ResourceState::new("ec2.Vpc", "main", "awscc")
-                .with_identifier("vpc-current")
-                .with_attribute("tags", previous_tags),
-        );
+        state
+            .upsert_resource(
+                ResourceState::new("ec2.Vpc", "main", "awscc")
+                    .with_identifier("vpc-current")
+                    .with_attribute("tags", previous_tags),
+            )
+            .expect("test state setup must be valid");
         let mut provider_tags = indexmap::IndexMap::new();
         provider_tags.insert("Name".to_string(), string_value("new-name"));
         provider_tags.insert("SecretTag".to_string(), string_value("plain-secret"));
@@ -2991,9 +3017,11 @@ mod tests {
         let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None);
         let mut state = StateFile::new();
-        state.upsert_resource(
-            ResourceState::new("db.Instance", "main", "awscc").with_identifier("db-current"),
-        );
+        state
+            .upsert_resource(
+                ResourceState::new("db.Instance", "main", "awscc").with_identifier("db-current"),
+            )
+            .expect("test state setup must be valid");
         let fresh = State::existing(
             id.clone(),
             HashMap::from([("password".to_string(), string_value("plain-secret"))]),
@@ -3040,7 +3068,9 @@ mod tests {
                 ("endpoint".to_string(), json!("old.example")),
             ]),
         ));
-        state.upsert_resource(row);
+        state
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
         let provider = DeposedRefreshTestProvider::default()
@@ -3108,7 +3138,9 @@ mod tests {
             None,
             HashMap::from([("status".to_string(), json!("Enabled"))]),
         ));
-        state.upsert_resource(row);
+        state
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         let id = ResourceId::with_provider_name_compat("awscc", "service.Widget", "main", None);
         let provider = DeposedRefreshTestProvider::default().with_read_state(
@@ -3189,7 +3221,9 @@ mod tests {
             Some("west"),
             HashMap::from([("password".to_string(), json!("old-plain"))]),
         ));
-        state.upsert_resource(row);
+        state
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         let id = ResourceId::with_provider_name_compat(
             "awscc",
@@ -3249,7 +3283,9 @@ mod tests {
             None,
             HashMap::from([("vpc_id".to_string(), json!("vpc-old"))]),
         ));
-        state.upsert_resource(row);
+        state
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         let id = ResourceId::with_provider_name_compat("awscc", "ec2.Vpc", "main", None);
         let provider =
@@ -3297,7 +3333,9 @@ mod tests {
             None,
             HashMap::from([("vpc_id".to_string(), json!("vpc-old"))]),
         ));
-        state.upsert_resource(row);
+        state
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
         let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
         let fresh = State::existing(
             id.clone(),
@@ -3587,7 +3625,9 @@ mod tests {
         rs.binding = Some("exports".to_string());
         rs.attributes
             .insert("vpc_id".to_string(), serde_json::json!("vpc-from-resource"));
-        state.upsert_resource(rs);
+        state
+            .upsert_resource(rs)
+            .expect("test state setup must be valid");
         state
             .exports
             .insert("vpc_id".to_string(), serde_json::json!("from-export"));

@@ -750,7 +750,9 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
     let mut state_file = StateFile::new();
     let mut rs = ResourceState::new("route53.RecordSet", "old_record", "aws");
     rs.directives.provider_instance = Some("management".to_string());
-    state_file.resources.push(rs);
+    state_file
+        .upsert_resource(rs)
+        .expect("test state setup must be valid");
 
     // Pre-populate `current_states` with the routed `from` id (mirrors
     // what `build_state_for_resource` would produce).
@@ -821,7 +823,9 @@ fn removed_block_suppresses_delete_when_state_resource_is_routed_to_named_instan
     let mut state_file = StateFile::new();
     let mut rs = ResourceState::new("route53.RecordSet", "r.delegation_ns", "aws");
     rs.directives.provider_instance = Some("management".to_string());
-    state_file.resources.push(rs);
+    state_file
+        .upsert_resource(rs)
+        .expect("test state setup must be valid");
 
     // The orphan Delete effect carries the same routed instance.
     let mut plan = Plan::new();
@@ -899,7 +903,9 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
         attributes: HashMap::new(),
         dependency_bindings: BTreeSet::new(),
     });
-    state_file.resources.push(rs);
+    state_file
+        .upsert_resource(rs)
+        .expect("test state setup must be valid");
 
     let id =
         ResourceId::with_provider_identity("aws", "route53.RecordSet", "r.delegation_ns", None);
@@ -1061,8 +1067,8 @@ fn test_materialize_moved_states_warns_on_missing_from() {
 
     let mut state_file = StateFile::new();
     state_file
-        .resources
-        .push(ResourceState::new("s3.Bucket", "new_bucket", "awscc"));
+        .upsert_resource(ResourceState::new("s3.Bucket", "new_bucket", "awscc"))
+        .expect("test state setup must be valid");
     let mut warnings = Vec::new();
     let moved_pairs = materialize_moved_states_with_warning_sink(
         &mut HashMap::new(),
@@ -1093,8 +1099,8 @@ fn bucket_state_file(names: &[&str]) -> carina_state::state::StateFile {
     let mut state_file = StateFile::new();
     for name in names {
         state_file
-            .resources
-            .push(ResourceState::new("s3.Bucket", *name, "awscc"));
+            .upsert_resource(ResourceState::new("s3.Bucket", *name, "awscc"))
+            .expect("test state setup must be valid");
     }
     state_file
 }
@@ -1193,7 +1199,7 @@ removed {
     let parsed = parse(source, &ProviderContext::default()).expect("parse removed fixture");
     let state_file = {
         let mut sf = StateFile::new();
-        sf.resources.push(
+        sf.upsert_resource(
             ResourceState::new("acm.Certificate", "cert", "aws")
                 .with_identifier("cert-arn")
                 .with_attribute(
@@ -1207,11 +1213,13 @@ removed {
                         }
                     ]),
                 ),
-        );
-        sf.resources.push(
+        )
+        .expect("test state setup must be valid");
+        sf.upsert_resource(
             ResourceState::new("route53.RecordSet", "records[0]", "aws")
                 .with_identifier("record-set-id"),
-        );
+        )
+        .expect("test state setup must be valid");
         Some(sf)
     };
     let StateBlockResolution {
@@ -1543,11 +1551,11 @@ fn assert_claimed_association_stays_orphaned_after_reconcile() {
     let desired_name = "ec2_subnet_route_table_association_aaaaaaaa";
     let mut state_file = StateFile::new();
     state_file
-        .resources
-        .push(route_table_state("private_rtb", "rtb-private"));
+        .upsert_resource(route_table_state("private_rtb", "rtb-private"))
+        .expect("test state setup must be valid");
     state_file
-        .resources
-        .push(association_state(old_name, "rtb-private", "subnet-a"));
+        .upsert_resource(association_state(old_name, "rtb-private", "subnet-a"))
+        .expect("test state setup must be valid");
     let mut resources = vec![desired_association(desired_name, "private_rtb", "subnet-a")];
     let state_blocks = vec![StateBlock::Removed {
         from: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", old_name),
@@ -1563,7 +1571,8 @@ fn assert_claimed_association_stays_orphaned_after_reconcile() {
         claims.claims_from("awscc", "ec2.SubnetRouteTableAssociation", old_name),
         "effective removed block must claim its state entry"
     );
-    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims);
+    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims)
+        .expect("test state identities must remain unique");
 
     assert_eq!(
         resources[0].id.identity_or_empty(),
@@ -1595,26 +1604,32 @@ fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_s
     let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)]);
     let mut state_file = StateFile::new();
     state_file
-        .resources
-        .push(route_table_state("private_rtb", "rtb-private"));
+        .upsert_resource(route_table_state("private_rtb", "rtb-private"))
+        .expect("test state setup must be valid");
     state_file
-        .resources
-        .push(route_table_state("public_rtb", "rtb-public"));
-    state_file.resources.push(association_state(
-        "ec2_subnet_route_table_association_11111111",
-        "rtb-private",
-        "subnet-a",
-    ));
-    state_file.resources.push(association_state(
-        "ec2_subnet_route_table_association_22222222",
-        "rtb-public",
-        "subnet-a",
-    ));
-    state_file.resources.push(association_state(
-        "ec2_subnet_route_table_association_33333333",
-        "rtb-private",
-        "subnet-c",
-    ));
+        .upsert_resource(route_table_state("public_rtb", "rtb-public"))
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(association_state(
+            "ec2_subnet_route_table_association_11111111",
+            "rtb-private",
+            "subnet-a",
+        ))
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(association_state(
+            "ec2_subnet_route_table_association_22222222",
+            "rtb-public",
+            "subnet-a",
+        ))
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(association_state(
+            "ec2_subnet_route_table_association_33333333",
+            "rtb-private",
+            "subnet-c",
+        ))
+        .expect("test state setup must be valid");
 
     let mut resources = vec![
         desired_association(
@@ -1639,7 +1654,8 @@ fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_s
         &mut resources,
         &mut state_file,
         &carina_core::identifier::StateBlockClaims::empty(),
-    );
+    )
+    .expect("test state identities must remain unique");
 
     let names: Vec<_> = resources
         .iter()
@@ -1663,13 +1679,15 @@ fn test_stale_moved_block_releases_claims() {
     let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)]);
     let mut state_file = StateFile::new();
     state_file
-        .resources
-        .push(route_table_state("private_rtb", "rtb-private"));
-    state_file.resources.push(association_state(
-        "ec2_subnet_route_table_association_11111111",
-        "rtb-private",
-        "subnet-a",
-    ));
+        .upsert_resource(route_table_state("private_rtb", "rtb-private"))
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(association_state(
+            "ec2_subnet_route_table_association_11111111",
+            "rtb-private",
+            "subnet-a",
+        ))
+        .expect("test state setup must be valid");
 
     let mut resources = vec![desired_association(
         "ec2_subnet_route_table_association_aaaaaaaa",
@@ -1699,7 +1717,8 @@ fn test_stale_moved_block_releases_claims() {
         ),
         "ineffective moved block must not pin its to address"
     );
-    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims);
+    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims)
+        .expect("test state identities must remain unique");
 
     assert_eq!(
         resources[0].id.identity_or_empty(),
@@ -1729,11 +1748,11 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
         let desired_name = format!("ec2_subnet_route_table_association_new_{idx:08x}");
 
         state_file
-            .resources
-            .push(route_table_state(&binding, &route_table_id));
+            .upsert_resource(route_table_state(&binding, &route_table_id))
+            .expect("test state setup must be valid");
         state_file
-            .resources
-            .push(association_state(&old_name, &route_table_id, &subnet_id));
+            .upsert_resource(association_state(&old_name, &route_table_id, &subnet_id))
+            .expect("test state setup must be valid");
         resources.push(desired_association(&desired_name, &binding, &subnet_id));
         state_blocks.push(StateBlock::Moved {
             from: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", &old_name),
@@ -1757,7 +1776,8 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
         &resources,
         ctx.schemas(),
     );
-    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims);
+    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims)
+        .expect("test state identities must remain unique");
     assert_eq!(
         resources
             .iter()
@@ -1886,8 +1906,12 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     subnet_state.dependency_bindings.insert("vpc".to_string());
 
     let mut state_file = StateFile::new();
-    state_file.resources.push(vpc_state);
-    state_file.resources.push(subnet_state);
+    state_file
+        .upsert_resource(vpc_state)
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(subnet_state)
+        .expect("test state setup must be valid");
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let plan_ctx = create_plan_from_parsed_with_upstream_with_ctx(
@@ -2026,12 +2050,14 @@ moved {{
 "#
         ));
 
-        state_file.resources.push(
-            ResourceState::new("ec2.SubnetRouteTableAssociation", &old_name, "awscc")
-                .with_identifier(format!("assoc-{idx}"))
-                .with_attribute("route_table_id", serde_json::Value::String(route_table_id))
-                .with_attribute("subnet_id", serde_json::Value::String(subnet_id)),
-        );
+        state_file
+            .upsert_resource(
+                ResourceState::new("ec2.SubnetRouteTableAssociation", &old_name, "awscc")
+                    .with_identifier(format!("assoc-{idx}"))
+                    .with_attribute("route_table_id", serde_json::Value::String(route_table_id))
+                    .with_attribute("subnet_id", serde_json::Value::String(subnet_id)),
+            )
+            .expect("test state setup must be valid");
     }
 
     let parsed = parse(&source, &ProviderContext::default()).expect("parse fixture");
@@ -2837,8 +2863,8 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
 
     let mut state_file = StateFile::new();
     state_file
-        .resources
-        .push(ResourceState::new("ec2.Route", &old_name, "awscc"));
+        .upsert_resource(ResourceState::new("ec2.Route", &old_name, "awscc"))
+        .expect("test state setup must be valid");
     let mut current_states = HashMap::new();
     let mut prev_explicit = HashMap::new();
     let mut saved_attrs = HashMap::new();
