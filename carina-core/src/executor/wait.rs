@@ -11,9 +11,10 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::stream::{FuturesUnordered, StreamExt};
+use tokio::time::Instant;
 
 use crate::executor::scheduler::FailureView;
 use crate::executor::{ExecutionEvent, ExecutionObserver};
@@ -417,6 +418,14 @@ pub(crate) async fn execute_wait_effect_with_heartbeat_gap(
             );
         }
 
+        // Sample `now` before the sleep below deliberately. On the polling
+        // interval grid, `default_heartbeat_gap`'s `interval * 5` branch lands
+        // exactly on the gap. Only the 30s-floor branch can require rounding
+        // up to a later poll when the interval does not divide 30s; provider or
+        // scheduler delay can make either branch late. Thus the triggering
+        // `now` samples for consecutive emits are at least `heartbeat_gap`
+        // apart, never less. Observer-side timestamps follow those samples and
+        // can differ by variable event-construction and callback delay.
         let now = Instant::now();
         let should_emit_heartbeat = last_heartbeat_at
             .map(|last| now.duration_since(last) >= heartbeat_gap)
@@ -597,7 +606,7 @@ mod tests {
     }
 
     struct HeartbeatObserver {
-        heartbeats: Mutex<Vec<(Instant, Vec<AttrPath>)>>,
+        heartbeats: Mutex<Vec<Vec<AttrPath>>>,
     }
 
     impl HeartbeatObserver {
@@ -607,7 +616,7 @@ mod tests {
             }
         }
 
-        fn heartbeats(&self) -> Vec<(Instant, Vec<AttrPath>)> {
+        fn heartbeats(&self) -> Vec<Vec<AttrPath>> {
             self.heartbeats.lock().unwrap().clone()
         }
     }
@@ -620,10 +629,7 @@ mod tests {
                     .iter()
                     .map(|attr| (*attr).clone())
                     .collect();
-                self.heartbeats
-                    .lock()
-                    .unwrap()
-                    .push((Instant::now(), watched_attrs));
+                self.heartbeats.lock().unwrap().push(watched_attrs);
             }
         }
     }
@@ -880,7 +886,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_emits_heartbeat_at_max_interval() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let pred = equals_status("ISSUED");
@@ -907,17 +913,23 @@ mod tests {
             "heartbeat test should end by timeout, got {result:?}"
         );
         let heartbeats = observer.heartbeats();
-        assert!(
-            !heartbeats.is_empty(),
-            "wait should emit at least one WaitPolling heartbeat"
+        // With Tokio time paused, each 1ms sleep advances exactly one virtual
+        // millisecond. The loop therefore reads at 0ms through 100ms inclusive
+        // and emits every 5ms from 0ms through 100ms inclusive: 21 heartbeats.
+        // The final emit at 100ms occurs only because heartbeat emission
+        // precedes the timeout check; with those checks reversed, the loop
+        // would exit first and emit 20 heartbeats.
+        // These exact counts guard against both a silent and a noisy cadence
+        // without imposing a scheduler-latency floor on real time.
+        const EXPECTED_READS: usize = 101;
+        const EXPECTED_HEARTBEATS: usize = 21;
+        assert_eq!(provider.read_count(), EXPECTED_READS);
+        assert_eq!(
+            heartbeats.len(),
+            EXPECTED_HEARTBEATS,
+            "5ms heartbeat cadence over a virtual 100ms timeout should emit \
+             exactly {EXPECTED_HEARTBEATS} heartbeats"
         );
-        assert_eq!(heartbeats[0].1, vec![AttrPath::single("status")]);
-        for pair in heartbeats.windows(2) {
-            let gap = pair[1].0.duration_since(pair[0].0);
-            assert!(
-                gap >= Duration::from_millis(5),
-                "heartbeat gap should respect max(30s, interval * 5) with test seam, got {gap:?}"
-            );
-        }
+        assert_eq!(heartbeats[0], vec![AttrPath::single("status")]);
     }
 }
