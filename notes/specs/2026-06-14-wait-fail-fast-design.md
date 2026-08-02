@@ -199,7 +199,7 @@ EffectSkipped で完了する。**この経路は触らない**。
 
    > **訂正 (2026-08-02):** 「heartbeat は 1 回だけ」は誤り。100ms の
    > timeout では 0ms から 100ms まで 5ms ごとに計 21 回 emit され、
-   > `wait_emits_heartbeat_at_max_interval` がその回数を assert する。
+   > `wait_emits_exact_heartbeat_count_for_cadence` がその回数を assert する。
 
 5. **E2E (carina-cli)**: 既存の wait 関連の integration test (あれば)
    に「上流リソース失敗 → wait 即 fail」のシナリオを追加。
