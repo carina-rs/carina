@@ -1,9 +1,81 @@
 //! Tests for WasmProviderFactory precompile cache functionality.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use carina_core::provider::ProviderFactory;
-use carina_plugin_host::WasmProviderFactory;
+use carina_plugin_host::{WasmProviderFactory, WasmProviderLoadError};
+
+/// A valid component that cannot be brought up as a Carina provider because
+/// neither host world can satisfy its imported interface.
+const NON_INSTANTIABLE_COMPONENT_WAT: &str = r#"
+(component
+  (type $i (instance))
+  (import "bogus:cache-regression/iface@1.0.0" (instance (type $i)))
+)
+"#;
+
+struct CacheArtifactSnapshot {
+    contents: Vec<u8>,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    device_and_inode: (u64, u64),
+}
+
+fn cached_component_path(cache_dir: &Path) -> PathBuf {
+    std::fs::read_dir(cache_dir)
+        .expect("read cache dir")
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().extension().is_some_and(|ext| ext == "cwasm"))
+        .expect("cold load should leave one precompiled artifact")
+        .path()
+}
+
+fn snapshot_cache_artifact(cwasm_path: &Path) -> CacheArtifactSnapshot {
+    let metadata = std::fs::metadata(cwasm_path).expect("stat warm cache artifact");
+
+    #[cfg(unix)]
+    let device_and_inode = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
+
+    CacheArtifactSnapshot {
+        contents: std::fs::read(cwasm_path).expect("read warm cache artifact"),
+        modified: metadata.modified().expect("cache modified time"),
+        #[cfg(unix)]
+        device_and_inode,
+    }
+}
+
+fn assert_cache_artifact_preserved(cwasm_path: &Path, before: &CacheArtifactSnapshot) {
+    assert!(
+        cwasm_path.exists(),
+        "component bring-up failure must not delete a valid cache artifact"
+    );
+    assert_eq!(
+        std::fs::read(cwasm_path).expect("read preserved cache artifact"),
+        before.contents,
+        "component bring-up failure must not replace a valid cache artifact"
+    );
+
+    let metadata_after = std::fs::metadata(cwasm_path).expect("stat preserved cache artifact");
+    assert_eq!(
+        metadata_after.modified().expect("cache modified time"),
+        before.modified,
+        "component bring-up failure must not rewrite a valid cache artifact"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        assert_eq!(
+            (metadata_after.dev(), metadata_after.ino()),
+            before.device_and_inode,
+            "component bring-up failure must leave the original cache file in place"
+        );
+    }
+}
 
 fn wasm_path() -> Option<PathBuf> {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -122,8 +194,8 @@ async fn test_from_file_cached_recovers_from_stale_cache() {
     // locally.
     drop(factory);
 
-    std::fs::write(&cwasm_path, b"not a valid cwasm file")
-        .expect("Failed to write stale cache file");
+    let corrupt_contents = b"not a valid cwasm file";
+    std::fs::write(&cwasm_path, corrupt_contents).expect("Failed to write stale cache file");
 
     // from_file_cached should detect invalid cache, recompile, and succeed
     let factory = WasmProviderFactory::from_file_cached(&wasm, cache_dir.path())
@@ -131,6 +203,140 @@ async fn test_from_file_cached_recovers_from_stale_cache() {
         .expect("from_file_cached should recover from stale cache");
 
     assert_eq!(factory.name(), "mock");
+    assert_ne!(
+        std::fs::read(&cwasm_path).expect("read recovered cache artifact"),
+        corrupt_contents,
+        "corrupt cache artifact should be replaced after recovery"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn warm_cache_instantiation_failure_preserves_precompiled_artifact() {
+    let source_dir = tempfile::tempdir().expect("Failed to create source temp dir");
+    let wasm_path = source_dir.path().join("non-instantiable.wasm");
+    std::fs::write(&wasm_path, NON_INSTANTIABLE_COMPONENT_WAT)
+        .expect("Failed to write test component");
+    let cache_dir = tempfile::tempdir().expect("Failed to create cache temp dir");
+
+    // A cold load still precompiles the component before its deterministic
+    // bring-up failure, leaving a valid cache artifact for the next attempt.
+    let cold_error =
+        match WasmProviderFactory::new_with_cache_dir(wasm_path.clone(), cache_dir.path()).await {
+            Ok(_) => panic!("component should fail to instantiate"),
+            Err(error) => error,
+        };
+    assert!(matches!(
+        cold_error,
+        WasmProviderLoadError::Instantiation(_)
+    ));
+
+    let cwasm_path = cached_component_path(cache_dir.path());
+    let artifact_before = snapshot_cache_artifact(&cwasm_path);
+
+    let warm_error =
+        match WasmProviderFactory::new_with_cache_dir(wasm_path.clone(), cache_dir.path()).await {
+            Ok(_) => panic!("component should still fail to instantiate"),
+            Err(error) => error,
+        };
+    assert!(matches!(
+        warm_error,
+        WasmProviderLoadError::Instantiation(_)
+    ));
+
+    assert_cache_artifact_preserved(&cwasm_path, &artifact_before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn warm_cache_protocol_version_failure_preserves_precompiled_artifact() {
+    let valid_wasm_path = skip_if_no_wasm!();
+    let source_dir = tempfile::tempdir().expect("Failed to create source temp dir");
+    let wasm_path = source_dir.path().join("unsupported-protocol.wasm");
+    let mut component_bytes =
+        std::fs::read(valid_wasm_path).expect("read valid mock provider component");
+
+    // Keep the component binary structurally valid while making the mock
+    // provider serialize an old-style info envelope. The host defaults a
+    // missing protocol_version field to zero, then rejects it after the
+    // component has instantiated and info() has returned successfully.
+    let field_name = b"protocol_version";
+    let invalid_field_name = b"protocol_xersion";
+    assert_eq!(field_name.len(), invalid_field_name.len());
+    let field_offsets: Vec<_> = component_bytes
+        .windows(field_name.len())
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == field_name).then_some(offset))
+        .collect();
+    assert!(
+        !field_offsets.is_empty(),
+        "mock component should contain the serialized protocol_version field name"
+    );
+    for offset in field_offsets {
+        component_bytes[offset..offset + field_name.len()].copy_from_slice(invalid_field_name);
+    }
+    std::fs::write(&wasm_path, component_bytes).expect("write protocol-mismatch component");
+
+    let cache_dir = tempfile::tempdir().expect("Failed to create cache temp dir");
+    let cold_error =
+        match WasmProviderFactory::new_with_cache_dir(wasm_path.clone(), cache_dir.path()).await {
+            Ok(_) => panic!("component with an unsupported protocol should fail bring-up"),
+            Err(error) => error,
+        };
+    assert!(
+        matches!(
+            &cold_error,
+            WasmProviderLoadError::Other(message) if message.contains("protocol version 0")
+        ),
+        "component should instantiate and fail during its protocol-version check: {cold_error}"
+    );
+
+    let cwasm_path = cached_component_path(cache_dir.path());
+    let artifact_before = snapshot_cache_artifact(&cwasm_path);
+
+    let warm_error =
+        match WasmProviderFactory::new_with_cache_dir(wasm_path, cache_dir.path()).await {
+            Ok(_) => panic!("component with an unsupported protocol should still fail bring-up"),
+            Err(error) => error,
+        };
+    assert!(
+        matches!(
+            &warm_error,
+            WasmProviderLoadError::Other(message) if message.contains("protocol version 0")
+        ),
+        "warm component should fail during its protocol-version check: {warm_error}"
+    );
+
+    assert_cache_artifact_preserved(&cwasm_path, &artifact_before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn from_precompiled_classifies_failure_by_step() {
+    let source_dir = tempfile::tempdir().expect("Failed to create source temp dir");
+    let wasm_path = source_dir.path().join("non-instantiable.wasm");
+    std::fs::write(&wasm_path, NON_INSTANTIABLE_COMPONENT_WAT)
+        .expect("Failed to write test component");
+    let cwasm_path = source_dir.path().join("non-instantiable.cwasm");
+    WasmProviderFactory::precompile(&wasm_path, &cwasm_path)
+        .expect("test component should precompile");
+
+    let bring_up_error = match WasmProviderFactory::from_precompiled(&cwasm_path).await {
+        Ok(_) => panic!("component should fail to instantiate"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        bring_up_error,
+        WasmProviderLoadError::Instantiation(_)
+    ));
+
+    std::fs::write(&cwasm_path, b"not a precompiled component")
+        .expect("Failed to corrupt precompiled component");
+    let deserialization_error = match WasmProviderFactory::from_precompiled(&cwasm_path).await {
+        Ok(_) => panic!("corrupt component should fail deserialization"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        deserialization_error,
+        WasmProviderLoadError::PrecompiledDeserialization(_)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
