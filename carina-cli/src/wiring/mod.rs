@@ -43,7 +43,7 @@ use carina_core::schema::{
 };
 use carina_core::validation;
 use carina_provider_mock::MockProvider;
-use carina_state::StateFile;
+use carina_state::{BackendError, StateFile};
 
 use crate::commands::shared::progress::{RefreshProgress, refresh_multi_progress};
 use crate::error::AppError;
@@ -619,9 +619,9 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
     resources: &mut [Resource],
     state_file: &mut StateFile,
     claims: &StateBlockClaims,
-) {
+) -> Result<(), BackendError> {
     let state_by_binding: HashMap<String, Vec<AnonymousIdBindingStateInfo>> = state_file
-        .resources
+        .resources()
         .iter()
         .filter_map(|sr| {
             let binding = sr.binding.as_ref()?;
@@ -683,7 +683,7 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
         claims,
     );
 
-    apply_provider_prefix_renames(&renames, state_file);
+    state_file.rename_resource_identities(&renames)
 }
 
 pub(crate) fn adopt_unique_state_identity_for_unresolved_anonymous(
@@ -828,7 +828,7 @@ pub(crate) fn reconcile_late_anonymous_identities(
             inputs.resources.resources_mut(),
             &mut state_for_late_reconcile,
             inputs.state_block_claims,
-        );
+        )?;
         adopt_unique_state_identity_for_unresolved_anonymous(inputs.resources.resources_mut(), sf);
     }
 
@@ -909,29 +909,6 @@ fn fallback_anonymous_hash(resource: &Resource, known_bindings: &HashSet<String>
     // through unchanged. Root resources retain their exact historical set.
     fallback_hash_dependency_bindings(resource, known_bindings).hash(&mut hasher);
     format!("{:08x}", hasher.finish() & 0xffff_ffff)
-}
-
-/// Re-key state entries when `reconcile_anonymous_identifiers` produced rename
-/// pairs (anonymous → anonymous due to identifier-format upgrade).
-///
-/// For each `(old_name, new_name)` pair, find the matching `ResourceState`
-/// in `state_file.resources` and overwrite its `identity` field. Downstream maps
-/// (`build_saved_attrs`, `build_explicit`, `build_directives`) then key
-/// off the new identity, so the differ sees the resource under its updated
-/// identifier instead of an orphan-delete + create pair.
-pub fn apply_provider_prefix_renames(renames: &[(String, String)], state_file: &mut StateFile) {
-    if renames.is_empty() {
-        return;
-    }
-    let by_old: HashMap<&str, &str> = renames
-        .iter()
-        .map(|(old, new)| (old.as_str(), new.as_str()))
-        .collect();
-    for sr in &mut state_file.resources {
-        if let Some(new_name) = by_old.get(sr.identity.as_str()) {
-            sr.identity = new_name.to_string();
-        }
-    }
 }
 
 pub fn compute_anonymous_identifiers_with_ctx(
@@ -3189,7 +3166,7 @@ pub fn add_deposed_delete_effects(plan: &mut Plan, state_file: &Option<StateFile
         return;
     };
 
-    for row in &state_file.resources {
+    for row in state_file.resources() {
         for effect in deposed_delete_effects_for_row(row) {
             plan.add(effect);
         }

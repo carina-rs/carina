@@ -105,7 +105,7 @@ impl PostApplyStates {
         state: &StateFile,
     ) -> Self {
         let mut map = current_states.clone();
-        for rs in &state.resources {
+        for rs in state.resources() {
             let id = ResourceId::with_provider_name_compat(
                 &rs.provider,
                 &rs.resource_type,
@@ -1159,11 +1159,11 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
         if !write_only_keys.is_empty() {
             resource_state.merge_write_only_attributes(resource, &write_only_keys);
         }
-        state.upsert_resource(resource_state);
+        state.upsert_resource(resource_state)?;
     }
 
     for planned in writeback.deposes {
-        apply_planned_depose(&mut state, planned);
+        apply_planned_depose(&mut state, planned)?;
     }
 
     for planned in writeback.remove_deposed {
@@ -1182,7 +1182,7 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
     Ok(state)
 }
 
-fn apply_planned_depose(state: &mut StateFile, planned: PlannedDepose) {
+fn apply_planned_depose(state: &mut StateFile, planned: PlannedDepose) -> Result<(), AppError> {
     let row_provider_instance = planned.instance.provider_instance.clone();
     state.upsert_deposed_generation(
         &planned.id.provider,
@@ -1190,7 +1190,8 @@ fn apply_planned_depose(state: &mut StateFile, planned: PlannedDepose) {
         planned.id.identity_or_empty(),
         row_provider_instance,
         planned.instance,
-    );
+    )?;
+    Ok(())
 }
 
 /// Apply destroy results to the state file: remove destroyed resources and
@@ -1399,7 +1400,9 @@ mod apply_state_save_tests {
             },
         );
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
         let applied_states = HashMap::from([(id.clone(), applied_name_state(&id, "new-temp"))]);
         let plan = plan_with_name_override(&id, "new-temp", "dsl-new");
 
@@ -1446,7 +1449,9 @@ mod apply_state_save_tests {
             },
         );
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
         let applied_states = HashMap::from([(id.clone(), applied_name_state(&id, "legacy-temp"))]);
         let plan = plan_with_name_override(&id, "legacy-temp", "dsl-value");
 
@@ -1507,7 +1512,7 @@ mod apply_state_save_tests {
 
         assert!(
             state
-                .resources
+                .resources()
                 .iter()
                 .any(|row| row.provider == child_id.provider
                     && row.resource_type == child_id.resource_type
@@ -1525,8 +1530,12 @@ mod apply_state_save_tests {
         let mut row_b = ResourceState::new("type.B", "shared", "mock");
         row_b.identifier = Some("b-old".to_string());
         let mut state_file = StateFile::new();
-        state_file.resources.push(row_a);
-        state_file.resources.push(row_b);
+        state_file
+            .upsert_resource(row_a)
+            .expect("test state setup must be valid");
+        state_file
+            .upsert_resource(row_b)
+            .expect("test state setup must be valid");
 
         let mut plan = Plan::new();
         for (id, identifier) in [(&id_a, "a-old"), (&id_b, "b-old")] {
@@ -1586,7 +1595,9 @@ mod apply_state_save_tests {
             dependency_bindings: BTreeSet::from(["cert".to_string()]),
         });
         let mut state_file = StateFile::new();
-        state_file.resources.push(row);
+        state_file
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         let mut plan = Plan::new();
         plan.add(Effect::Delete {
@@ -1777,7 +1788,9 @@ mod apply_state_save_tests {
         existing.directives.provider_instance = Some("west".to_string());
         existing.dependency_bindings.insert("cert".to_string());
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
@@ -1869,7 +1882,9 @@ mod apply_state_save_tests {
             .with_identifier("vpc-canonical-old")
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
         let from_state = State::existing(
             id.clone(),
             HashMap::from([(
@@ -1930,7 +1945,9 @@ mod apply_state_save_tests {
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
         existing.dependency_bindings.insert("igw".to_string());
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
         let applied_state = State::existing(
             id.clone(),
             HashMap::from([(
@@ -1986,7 +2003,9 @@ mod apply_state_save_tests {
             .with_identifier("vpc-old")
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
         let current_state = State::not_found(id.clone()).with_identifier("vpc-old");
         let applied_state = State::existing(
             id.clone(),
@@ -2039,7 +2058,9 @@ mod apply_state_save_tests {
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
         existing.directives.provider_instance = Some("old-provider".to_string());
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
         let applied_state = State::existing(
             id.clone(),
             HashMap::from([(
@@ -2101,7 +2122,9 @@ mod apply_state_save_tests {
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
         existing.directives.provider_instance = Some("old-provider".to_string());
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
         let applied_state = State::existing(
             create_id.clone(),
             HashMap::from([(
@@ -2183,7 +2206,9 @@ mod apply_state_save_tests {
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
         existing.directives.provider_instance = Some("old-provider".to_string());
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
         let applied_state = State::existing(
             create_id.clone(),
             HashMap::from([(
@@ -2253,7 +2278,9 @@ mod apply_state_save_tests {
             dependency_bindings: BTreeSet::new(),
         });
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
 
         let applied_state = State::existing(
             id.clone(),
@@ -2361,7 +2388,9 @@ mod apply_state_save_tests {
             dependency_bindings: BTreeSet::new(),
         });
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
 
         let applied_state = State::existing(
             id.clone(),
@@ -2457,7 +2486,9 @@ mod apply_state_save_tests {
             .with_identifier("vpc-old")
             .with_attribute("cidr_block", serde_json::json!("10.0.0.0/16"));
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
         let refreshed_state = State::existing(
             id.clone(),
             HashMap::from([(
@@ -2504,7 +2535,9 @@ mod apply_state_save_tests {
                 serde_json::json!(format!("{SECRET_PREFIX}previous")),
             );
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
         let from_state = State::existing(
             id.clone(),
             HashMap::from([(
@@ -2586,7 +2619,9 @@ mod apply_state_save_tests {
                 serde_json::json!(format!("{SECRET_PREFIX}previous")),
             );
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
         let from_state = State::existing(id.clone(), HashMap::new()).with_identifier("db-1");
         let applied_state = State::existing(id.clone(), HashMap::new()).with_identifier("db-1");
         let mut plan = Plan::new();
@@ -2759,7 +2794,9 @@ mod apply_state_save_tests {
                 serde_json::json!(format!("{SECRET_PREFIX}previous")),
             );
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
@@ -2894,7 +2931,8 @@ mod apply_state_save_tests {
                     dependency_bindings: BTreeSet::from(["cert".to_string()]),
                 },
             },
-        );
+        )
+        .expect("test deposed setup must be valid");
 
         let row = state
             .find_resource("aws", "route53.Record", "validation_records[0]")
@@ -2928,7 +2966,9 @@ mod apply_state_save_tests {
             dependency_bindings: BTreeSet::from(["old".to_string()]),
         });
         let mut state = StateFile::new();
-        state.resources.push(row);
+        state
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         apply_planned_depose(
             &mut state,
@@ -2942,7 +2982,8 @@ mod apply_state_save_tests {
                     dependency_bindings: BTreeSet::from(["new".to_string()]),
                 },
             },
-        );
+        )
+        .expect("test deposed setup must be valid");
 
         let row = state
             .find_resource("aws", "route53.Record", "validation_records[0]")
@@ -2969,7 +3010,8 @@ mod apply_state_save_tests {
                     dependency_bindings: BTreeSet::from(["newer".to_string()]),
                 },
             },
-        );
+        )
+        .expect("test deposed setup must be valid");
 
         let row = state
             .find_resource("aws", "route53.Record", "validation_records[0]")
@@ -3022,7 +3064,9 @@ mod apply_state_save_tests {
             dependency_bindings: BTreeSet::from(["cert".to_string()]),
         });
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
         let mut plan = Plan::new();
         plan.add(deferred_replace_effect(&id));
         let current_states = HashMap::from([(id.clone(), current_state)]);
@@ -3233,7 +3277,9 @@ mod apply_state_save_tests {
             .with_attribute("bucket_name", serde_json::json!("old-name"));
         existing.dependency_bindings.insert("logs".to_string());
         let mut state_file = StateFile::new();
-        state_file.resources.push(existing);
+        state_file
+            .upsert_resource(existing)
+            .expect("test state setup must be valid");
         let applied_state = State::existing(
             id.clone(),
             HashMap::from([(

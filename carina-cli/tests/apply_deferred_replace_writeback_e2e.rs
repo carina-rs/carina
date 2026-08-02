@@ -60,11 +60,13 @@ provider mock {}
     fn seed_state(&self) -> StateFile {
         let mut state = StateFile::new();
         state.serial = 1;
-        state.resources.push(
-            ResourceState::new("test.resource", "validation_records[0]", "mock")
-                .with_identifier("old-validation-id")
-                .with_attribute("name", serde_json::json!("old-validation-token")),
-        );
+        state
+            .upsert_resource(
+                ResourceState::new("test.resource", "validation_records[0]", "mock")
+                    .with_identifier("old-validation-id")
+                    .with_attribute("name", serde_json::json!("old-validation-token")),
+            )
+            .expect("test state setup must be valid");
         fs::write(
             &self.state_path,
             carina_core::utils::pretty_with_newline(&state).unwrap(),
@@ -292,7 +294,9 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         ]),
         dependency_bindings: std::collections::BTreeSet::new(),
     });
-    state.upsert_resource(row);
+    state
+        .upsert_resource(row)
+        .expect("test state setup must be valid");
     fs::write(
         &scenario.state_path,
         carina_core::utils::pretty_with_newline(&state).unwrap(),

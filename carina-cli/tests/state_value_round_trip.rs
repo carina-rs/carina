@@ -72,7 +72,7 @@ fn fixture_attributes_round_trip_through_value_codec() {
             }
         };
 
-        for resource in &state.resources {
+        for resource in state.resources() {
             let resource_id = format!(
                 "{}.{}.{}",
                 resource.provider, resource.resource_type, resource.identity,

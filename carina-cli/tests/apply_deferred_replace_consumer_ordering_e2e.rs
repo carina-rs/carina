@@ -72,7 +72,9 @@ provider mock {}
             .with_attribute("identifier", serde_json::json!("old-validation-id"));
         validation.binding = Some("validation_records[0]".to_string());
         validation.dependency_bindings.insert("cert".to_string());
-        state.upsert_resource(validation);
+        state
+            .upsert_resource(validation)
+            .expect("test state setup must be valid");
 
         let mut consumer = ResourceState::new("test.resource", "consumer", "mock")
             .with_identifier("mock-id")
@@ -83,7 +85,9 @@ provider mock {}
         consumer
             .dependency_bindings
             .insert("validation_records[0]".to_string());
-        state.upsert_resource(consumer);
+        state
+            .upsert_resource(consumer)
+            .expect("test state setup must be valid");
 
         fs::write(
             &self.state_path,

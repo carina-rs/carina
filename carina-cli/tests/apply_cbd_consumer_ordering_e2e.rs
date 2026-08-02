@@ -70,7 +70,9 @@ let distribution = mock.test.resource {{
             .with_attribute("identifier", serde_json::json!("web-acl-old-id"))
             .with_attribute("comment", serde_json::json!("v1"));
         web_acl.binding = Some("web_acl".to_string());
-        state.upsert_resource(web_acl);
+        state
+            .upsert_resource(web_acl)
+            .expect("test state setup must be valid");
 
         let mut distribution = ResourceState::new("test.resource", "distribution", "mock")
             .with_identifier("dist-id")
@@ -82,7 +84,9 @@ let distribution = mock.test.resource {{
         distribution
             .dependency_bindings
             .insert("web_acl".to_string());
-        state.upsert_resource(distribution);
+        state
+            .upsert_resource(distribution)
+            .expect("test state setup must be valid");
 
         fs::write(
             &self.state_path,

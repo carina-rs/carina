@@ -516,7 +516,9 @@ fn seed_apply_cascade_state(
     vpc_state.binding = Some("vpc".to_string());
 
     let mut state_file = carina_state::StateFile::new();
-    state_file.resources.push(vpc_state);
+    state_file
+        .upsert_resource(vpc_state)
+        .expect("test state setup must be valid");
 
     if include_subnet {
         let mut subnet_state = ResourceState::new(
@@ -529,7 +531,9 @@ fn seed_apply_cascade_state(
         .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
         .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
         subnet_state.dependency_bindings.insert("vpc".to_string());
-        state_file.resources.push(subnet_state);
+        state_file
+            .upsert_resource(subnet_state)
+            .expect("test state setup must be valid");
     }
 
     fixture.write_state(&state_file);
@@ -558,7 +562,9 @@ fn seed_apply_cascade_state_with_deposed(
     }
 
     let mut state_file = carina_state::StateFile::new();
-    state_file.resources.push(vpc_state);
+    state_file
+        .upsert_resource(vpc_state)
+        .expect("test state setup must be valid");
     fixture.write_state(&state_file);
 }
 
@@ -1046,7 +1052,9 @@ fn legacy_override_state() -> StateFile {
             original_value: None,
         },
     );
-    state.resources.push(resource);
+    state
+        .upsert_resource(resource)
+        .expect("test state setup must be valid");
     state
 }
 
@@ -1391,7 +1399,7 @@ async fn run_apply_cancelled_after_partial_execution_persists_state_and_releases
     let state = fixture.read_state().await;
     assert!(fixture.backend().state_path().exists());
     assert_eq!(
-        state.resources.len(),
+        state.resources().len(),
         1,
         "state must contain exactly the completed resource"
     );
@@ -1932,8 +1940,12 @@ awscc.ec2.Subnet {{
     subnet_state.dependency_bindings.insert("vpc".to_string());
 
     let mut state_file = carina_state::StateFile::new();
-    state_file.resources.push(vpc_state);
-    state_file.resources.push(subnet_state);
+    state_file
+        .upsert_resource(vpc_state)
+        .expect("test state setup must be valid");
+    state_file
+        .upsert_resource(subnet_state)
+        .expect("test state setup must be valid");
     fixture.write_state(&state_file);
 
     let observer_factory = fixture.observer_factory();
@@ -2720,7 +2732,9 @@ fn move_plus_update_keeps_post_update_attributes() {
         .with_attribute("key", serde_json::Value::String("env".to_string()))
         .with_attribute("value", serde_json::Value::String("staging".to_string()));
     let mut state_file = StateFile::default();
-    state_file.resources.push(old_row);
+    state_file
+        .upsert_resource(old_row)
+        .expect("test state setup must be valid");
 
     let mut plan = Plan::new();
     let from_id = ResourceId::with_provider_identity("awscc", "ec2.Tag", "tag_old", None);
@@ -2803,7 +2817,9 @@ fn move_alone_carries_attributes_via_current_states() {
         .with_identifier("my-bucket")
         .with_attribute("bucket_name", serde_json::Value::String("my-bucket".into()));
     let mut state_file = StateFile::default();
-    state_file.resources.push(old_row);
+    state_file
+        .upsert_resource(old_row)
+        .expect("test state setup must be valid");
 
     let mut plan = Plan::new();
     plan.add(Effect::Move {
@@ -2876,7 +2892,10 @@ fn move_with_absent_from_is_no_op() {
     })
     .expect("writeback should succeed");
 
-    assert!(saved.resources.is_empty(), "no-op move leaves state empty");
+    assert!(
+        saved.resources().is_empty(),
+        "no-op move leaves state empty"
+    );
 }
 
 /// `failed_refreshes` must skip both Upsert and Cleanup: the
@@ -2907,7 +2926,9 @@ fn failed_refresh_preserves_existing_row() {
             serde_json::Value::String("preserved".to_string()),
         );
     let mut state_file = StateFile::default();
-    state_file.resources.push(existing);
+    state_file
+        .upsert_resource(existing)
+        .expect("test state setup must be valid");
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(state_file),

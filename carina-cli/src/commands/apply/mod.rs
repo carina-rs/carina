@@ -1072,7 +1072,7 @@ async fn run_apply_locked(
             &mut parsed.resources,
             sf,
             &state_block_claims,
-        );
+        )?;
     }
     // Upstream state bindings are loaded up front so refs that target
     // `upstream_state` blocks can be resolved during refresh (#1683) and

@@ -183,7 +183,7 @@ async fn run_destroy_locked(
             &mut parsed.resources,
             sf,
             &state_block_claims,
-        );
+        )?;
     }
     // destroy operates on the existing state-only resource set and does not run the
     // differ. The state-side name_overrides are the only thing destroy needs from
@@ -1226,7 +1226,7 @@ fn build_destroy_delete_effects(
         });
     }
     if let Some(sf) = state_file {
-        for row in &sf.resources {
+        for row in sf.resources() {
             if protected_row_keys.contains(&state_row_key_from_parts(
                 &row.provider,
                 &row.resource_type,
@@ -1624,7 +1624,7 @@ mod tests {
             "second must remain in state"
         );
         assert!(!fixture.lock_path().exists(), "lock file must be released");
-        assert_eq!(state.resources.len(), 1);
+        assert_eq!(state.resources().len(), 1);
         assert!(state.serial >= 1, "state must be written");
         assert!(
             state.exports.is_empty(),
@@ -1763,7 +1763,9 @@ mod tests {
             dependency_bindings: BTreeSet::from(["subnet".to_string()]),
         });
         let mut state_file = StateFile::new();
-        state_file.resources.push(row);
+        state_file
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         let effects = build_destroy_delete_effects(
             &[&resource],
@@ -1813,7 +1815,9 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
         });
         let mut state_file = StateFile::new();
-        state_file.resources.push(row);
+        state_file
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
         let protected = HashSet::from([state_row_key_from_id(&resource.id)]);
 
         let effects =
@@ -1842,7 +1846,9 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
         });
         let mut state_file = StateFile::new();
-        state_file.resources.push(row);
+        state_file
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         let effects =
             build_destroy_delete_effects(&[], &HashMap::new(), Some(&state_file), &HashSet::new());
@@ -1872,7 +1878,9 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
         });
         let mut state_file = StateFile::new();
-        state_file.resources.push(row);
+        state_file
+            .upsert_resource(row)
+            .expect("test state setup must be valid");
 
         let effects =
             build_destroy_delete_effects(&[], &HashMap::new(), Some(&state_file), &HashSet::new());
@@ -1905,8 +1913,8 @@ mod tests {
 
         let mut state = carina_state::StateFile::new();
         state
-            .resources
-            .push(ResourceState::new("ec2.Vpc", "main", "awscc"));
+            .upsert_resource(ResourceState::new("ec2.Vpc", "main", "awscc"))
+            .expect("test state setup must be valid");
         state
             .exports
             .insert("vpc_id".to_string(), serde_json::json!("vpc-12345"));
@@ -1917,7 +1925,7 @@ mod tests {
         }];
         apply_destroy_to_state(&mut state, &destroyed);
 
-        assert!(state.resources.is_empty(), "resource should be removed");
+        assert!(state.resources().is_empty(), "resource should be removed");
         assert!(state.exports.is_empty(), "exports should be cleared");
     }
 
@@ -1940,7 +1948,9 @@ mod tests {
             )]),
             dependency_bindings: BTreeSet::from(["network".to_string()]),
         });
-        state.resources.push(resource);
+        state
+            .upsert_resource(resource)
+            .expect("test state setup must be valid");
         state
             .exports
             .insert("vpc_id".to_string(), serde_json::json!("vpc-new"));
@@ -1992,7 +2002,9 @@ mod tests {
             )]),
             dependency_bindings: BTreeSet::from(["network".to_string()]),
         });
-        state.resources.push(resource);
+        state
+            .upsert_resource(resource)
+            .expect("test state setup must be valid");
 
         let destroyed = vec![DestroyedInstance {
             id: ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None),
@@ -2029,7 +2041,9 @@ mod tests {
             )]),
             dependency_bindings: BTreeSet::from(["network".to_string()]),
         });
-        state.resources.push(resource);
+        state
+            .upsert_resource(resource)
+            .expect("test state setup must be valid");
 
         let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let destroyed = vec![
