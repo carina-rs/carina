@@ -427,7 +427,7 @@ changed before declaring a PR complete.
 
 The parser uses [pest](https://pest.rs/) grammar defined in `carina-core/src/parser/carina.pest`. Key constructs:
 - `provider <name> { ... }` - Provider configuration
-- `<provider>.<service>.<resource_type> { ... }` - Anonymous resource (ID from `name` attribute)
+- `<provider>.<service>.<ResourceType> { ... }` - Anonymous resource (system-assigned auto-generated identity)
 - `let <binding> = <resource>` - Named resource binding
 
 ## LSP Integration
@@ -444,11 +444,11 @@ The two TextMate grammars —
 ## Validation Formats
 
 - **Region**: Accepts both DSL format (`aws.Region.ap_northeast_1`) and AWS string format (`"ap-northeast-1"`). Validation normalizes both to AWS format for comparison.
-- **S3 Versioning**: Uses enum `aws.s3.VersioningStatus.Enabled` / `aws.s3.VersioningStatus.Suspended` in DSL (PascalCase matches the AWS SDK representation).
+- **S3 Versioning**: Uses enum `aws.s3.BucketVersioning.VersioningStatus.enabled` / `aws.s3.BucketVersioning.VersioningStatus.suspended` in DSL (enum values are snake_case per the DSL convention).
 
 ## Namespaced Enum Identifiers
 
-Enum values use namespaced identifiers like `aws.s3.Bucket.VersioningStatus.enabled`.
+Enum values use namespaced identifiers like `aws.s3.BucketVersioning.VersioningStatus.enabled`.
 
 **When adding new namespaced patterns:**
 
