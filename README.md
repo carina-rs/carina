@@ -43,30 +43,49 @@ Create a `.crn` file:
 # main.crn
 
 provider aws {
-  region = aws.Region.ap_northeast_1
+  source   = 'github.com/carina-rs/carina-provider-aws'
+  revision = 'main'
+  region   = aws.Region.ap_northeast_1
 }
 
-let main_vpc = aws.vpc {
-  name       = 'main-vpc'
+let main_vpc = aws.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
+
+  tags = {
+    Name = 'main-vpc'
+  }
 }
 
-let web_sg = aws.security_group {
-  name   = 'web-sg'
-  vpc_id = main_vpc.id
+let web_sg = aws.ec2.SecurityGroup {
+  group_name  = 'web-sg'
+  description = 'Web server security group'
+  vpc_id      = main_vpc.vpc_id
 }
 
-aws.security_group.ingress_rule {
-  name              = 'http'
-  security_group_id = web_sg.id
-  from_port         = 80
-  to_port           = 80
-  protocol          = 'tcp'
-  cidr_blocks       = ['0.0.0.0/0']
+aws.ec2.SecurityGroupIngress {
+  group_id    = web_sg.group_id
+  description = 'Allow HTTP'
+  ip_protocol = tcp
+  from_port   = 80
+  to_port     = 80
+  cidr_ip     = '0.0.0.0/0'
 }
 ```
 
-### 2. Validate
+### 2. Init
+
+Download and install the provider plugins declared in the `provider` blocks:
+
+```bash
+$ carina init .
+Resolving 1 provider(s)...
+Resolving revision 'main' for provider 'aws'...
+Installed provider 'aws' (github.com/carina-rs/carina-provider-aws@2906c22e0b25)
+1 provider(s) installed in .carina/providers/
+Initialized successfully.
+```
+
+### 3. Validate
 
 Point `carina` at the directory containing your `.crn` files (all `.crn` files in that directory are merged):
 
@@ -74,39 +93,51 @@ Point `carina` at the directory containing your `.crn` files (all `.crn` files i
 $ carina validate .
 Validating...
 ✓ 3 resources validated successfully.
-  • vpc.main-vpc
-  • security_group.web-sg
-  • security_group.ingress_rule.http
+  • aws.ec2.Vpc.main_vpc
+  • aws.ec2.SecurityGroup.web_sg
+  • aws.ec2.SecurityGroupIngress.aws_ec2_security_group_ingress_d819070a
 ```
 
-### 3. Plan
+### 4. Plan
 
 ```bash
 $ carina plan .
 Execution Plan:
 
-  + vpc
-      name: "main-vpc"
+  + aws.ec2.Vpc main_vpc
       cidr_block: "10.0.0.0/16"
-        └─ + security_group
-              name: "web-sg"
-              vpc_id: main_vpc.id
-              └─ + security_group.ingress_rule
-                    name: "http"
-                    security_group_id: web_sg.id
+      tags:
+        Name: "main-vpc"
+      vpc_id: (known after apply)
+        │
+        └─ + aws.ec2.SecurityGroup web_sg
+              description: "Web server security group"
+              group_name: "web-sg"
+              vpc_id: main_vpc.vpc_id
+              group_id: (known after apply)
+              │
+              └─ + aws.ec2.SecurityGroupIngress aws_ec2_security_group_ingress_d819070a
+                    cidr_ip: "0.0.0.0/0"
+                    description: "Allow HTTP"
+                    from_port: 80
+                    group_id: web_sg.group_id
+                    ip_protocol: tcp
+                    to_port: 80
+                    security_group_rule_id: (known after apply)
 
 Plan: 3 to add, 0 to change, 0 to destroy.
 ```
 
-### 4. Apply
+### 5. Apply
 
 ```bash
 $ carina apply .
 Applying changes...
 
-  ✓ Create vpc.main-vpc
-  ✓ Create security_group.web-sg
-  ✓ Create security_group.ingress_rule.http
+  ✓ Create aws.ec2.Vpc main_vpc took 2.1s 1/3
+  ✓ Create aws.ec2.SecurityGroup web_sg took 1.4s 2/3
+  ✓ Create aws.ec2.SecurityGroupIngress aws_ec2_security_group_ingress_d819070a took 0.8s 3/3
+  ✓ State saved (serial: 1)
 
 Apply complete! 3 changes applied.
 ```
@@ -115,32 +146,39 @@ Apply complete! 3 changes applied.
 
 ### Provider Block
 
+Declares which provider plugin to use (`source`/`revision`, installed by `carina init`) and its configuration:
+
 ```hcl
 provider aws {
-  region = aws.Region.ap_northeast_1
+  source   = 'github.com/carina-rs/carina-provider-aws'
+  revision = 'main'
+  region   = aws.Region.ap_northeast_1
 }
 ```
 
 ### Resources
 
-**Anonymous resources** - ID is derived from the `name` attribute:
+Resource types are written as `<provider>.<service>.<ResourceType>`.
+
+**Anonymous resources** - No binding name; Carina assigns an auto-generated identity:
 
 ```hcl
-aws.security_group.ingress_rule {
-  name              = 'http'
-  security_group_id = web_sg.id
-  from_port         = 80
-  to_port           = 80
-  protocol          = 'tcp'
+aws.ec2.SecurityGroupIngress {
+  group_id    = web_sg.group_id
+  ip_protocol = tcp
+  from_port   = 80
+  to_port     = 80
+  cidr_ip     = '0.0.0.0/0'
 }
 ```
 
 **Named resources** - Use `let` binding for referencing:
 
 ```hcl
-let web_sg = aws.security_group {
-  name   = 'web-sg'
-  vpc_id = main_vpc.id
+let web_sg = aws.ec2.SecurityGroup {
+  group_name  = 'web-sg'
+  description = 'Web server security group'
+  vpc_id      = main_vpc.vpc_id
 }
 ```
 
@@ -149,21 +187,13 @@ let web_sg = aws.security_group {
 Use the `read` keyword to reference existing infrastructure without managing its lifecycle. Data sources are read-only and cannot be created, modified, or deleted by Carina.
 
 ```hcl
-# Read an existing VPC (data source)
-let existing_vpc = read aws.vpc {
-  name = 'production-vpc'
-}
-
-# Create a new subnet that references the existing VPC
-let app_subnet = aws.subnet {
-  name              = 'app-subnet'
-  vpc_id            = existing_vpc.id
-  cidr_block        = '10.0.100.0/24'
-  availability_zone = aws.AvailabilityZone.ZoneName.ap_northeast_1a
+# Look up an existing S3 bucket (data source)
+let assets = read aws.s3.Bucket {
+  bucket = 'my-existing-assets-bucket'
 }
 ```
 
-In plan output, read effects are displayed with the `<=` symbol to distinguish them from mutations.
+The looked-up attributes (`assets.arn`, `assets.region`, ...) can be referenced from other resources. In plan output, read effects are displayed with the `<=` symbol to distinguish them from mutations.
 
 ### Enum Values
 
@@ -186,19 +216,18 @@ Some resources support nested objects for inline configuration. Use repeated blo
 
 ```hcl
 awscc.ec2.SecurityGroup {
-  name              = 'web-sg'
   vpc_id            = vpc.vpc_id
   group_description = 'Web server security group'
 
   security_group_ingress {
-    ip_protocol = 'tcp'
+    ip_protocol = tcp
     from_port   = 80
     to_port     = 80
     cidr_ip     = '0.0.0.0/0'
   }
 
   security_group_ingress {
-    ip_protocol = 'tcp'
+    ip_protocol = tcp
     from_port   = 443
     to_port     = 443
     cidr_ip     = '0.0.0.0/0'
@@ -211,7 +240,7 @@ Array syntax is also supported:
 ```hcl
   security_group_ingress = [
     {
-      ip_protocol = 'tcp'
+      ip_protocol = tcp
       from_port   = 80
       to_port     = 80
       cidr_ip     = '0.0.0.0/0'
@@ -221,41 +250,46 @@ Array syntax is also supported:
 
 ### Modules
 
-Modules enable reusable infrastructure components with typed inputs and outputs.
+Modules enable reusable infrastructure components with typed arguments and attributes. A module is a directory of `.crn` files.
 
 **Module definition** (`modules/web_tier/main.crn`):
 
 ```hcl
-input {
-  vpc: aws.vpc
-  cidr_blocks: list(cidr)
-  enable_https: bool = true
+arguments {
+  vpc_id: aws.ec2.Vpc {
+    description = 'The VPC to deploy resources into'
+  }
+  environment: String {
+    description = 'Deployment environment name'
+  }
+  enable_https: Bool = true
 }
 
-output {
-  security_group: aws.security_group = web_sg.id
+attributes {
+  security_group_id: aws.ec2.SecurityGroup = web_sg.group_id
 }
 
-let web_sg = aws.security_group {
-  name        = 'web-sg'
-  vpc_id      = input.vpc
+let web_sg = aws.ec2.SecurityGroup {
+  group_name  = 'web-sg'
   description = 'Security group for web servers'
+  vpc_id      = vpc_id
 }
 ```
 
 **Using modules**:
 
 ```hcl
-let web_tier = use { source = './modules/web_tier' }
+let web_tier = use {
+  source = './modules/web_tier'
+}
 
-let main_vpc = aws.vpc {
-  name       = 'main-vpc'
+let main_vpc = aws.ec2.Vpc {
   cidr_block = '10.0.0.0/16'
 }
 
-web_tier {
-  vpc         = main_vpc.id
-  cidr_blocks = ['10.0.1.0/24', '10.0.2.0/25']
+let web = web_tier {
+  vpc_id      = main_vpc.vpc_id
+  environment = 'production'
 }
 ```
 
@@ -265,22 +299,21 @@ web_tier {
 $ carina module info modules/web_tier
 Module: web_tier
 
-=== REQUIRES ===
+=== ARGUMENTS ===
 
-  vpc: aws.vpc  (required)
-  cidr_blocks: list(cidr)  (required)
-  enable_https: bool = true
+  vpc_id: aws.ec2.Vpc  (required)
+    The VPC to deploy resources into
+  environment: String  (required)
+    Deployment environment name
+  enable_https: Bool = true
 
 === CREATES ===
 
-  input { vpc: aws.vpc }
-    └── web_sg: aws.security_group
-       ├── http: aws.security_group.ingress_rule
-       └── https: aws.security_group.ingress_rule
+  web_sg: aws.ec2.SecurityGroup
 
 === ATTRIBUTES ===
 
-  security_group: aws.security_group
+  security_group_id: aws.ec2.SecurityGroup
 ```
 
 ## Architecture
@@ -375,11 +408,11 @@ aws-vault exec myprofile -- carina apply .
 Format `.crn` files:
 
 ```bash
-# Format a single file
-$ carina fmt example.crn
-
 # Format all .crn files in current directory
 $ carina fmt
+
+# Format all .crn files in a directory
+$ carina fmt path/to/dir
 
 # Format recursively
 $ carina fmt -r
@@ -399,9 +432,17 @@ Remove all resources defined in a configuration:
 $ carina destroy .
 Destroy Plan:
 
-  - security_group.ingress_rule.http
-  - security_group.web-sg
-  - vpc.main-vpc
+  - aws.ec2.Vpc main_vpc
+      cidr_block: "10.0.0.0/16"
+      vpc_id: "vpc-0123456789abcdef0"
+        │
+        └─ - aws.ec2.SecurityGroup web_sg
+              group_name: "web-sg"
+              vpc_id: "vpc-0123456789abcdef0"
+              │
+              └─ - aws.ec2.SecurityGroupIngress aws_ec2_security_group_ingress_d819070a
+                    from_port: 80
+                    to_port: 80
 
 Plan: 3 to destroy.
 
@@ -412,9 +453,10 @@ Do you really want to destroy all resources?
 
 Destroying resources...
 
-  ✓ Delete security_group.ingress_rule.http
-  ✓ Delete security_group.web-sg
-  ✓ Delete vpc.main-vpc
+  ✓ Delete aws.ec2.SecurityGroupIngress aws_ec2_security_group_ingress_d819070a took 0.9s 1/3
+  ✓ Delete aws.ec2.SecurityGroup web_sg took 1.2s 2/3
+  ✓ Delete aws.ec2.Vpc main_vpc took 1.8s 3/3
+  ✓ State saved (serial: 2)
 
 Destroy complete! 3 resources destroyed.
 ```
@@ -439,19 +481,19 @@ Store state in an S3 bucket:
 
 ```hcl
 backend s3 {
+  bucket = 'my-carina-state'
+  key    = 'infra/prod/carina.state.json'
+}
+```
+
+Server-side encryption (`encrypt`) and automatic bucket creation (`auto_create`) are enabled by default and can be turned off explicitly:
+
+```hcl
+backend s3 {
   bucket      = 'my-carina-state'
-  key         = 'infra/prod/carina.crnstate'
-  region      = aws.Region.ap_northeast_1
+  key         = 'infra/prod/carina.state.json'
   encrypt     = true
-  auto_create = true  # Automatically create the bucket if it doesn't exist
-}
-
-provider aws {
-  region = aws.Region.ap_northeast_1
-}
-
-aws.s3.Bucket {
-  name = 'my-app-data'
+  auto_create = false  # Do not create the bucket automatically
 }
 ```
 
@@ -464,8 +506,11 @@ The state file tracks:
 
 ### Run tests
 
+Tests run under [nextest](https://nexte.st/) (`cargo install cargo-nextest --locked`); doctests need a separate run:
+
 ```bash
-cargo test
+cargo nextest run
+cargo test --workspace --doc
 ```
 
 ### Build
@@ -485,6 +530,6 @@ MIT
 - [x] Destroy command
 - [x] State file management (S3 backend)
 - [x] Data sources (read existing infrastructure)
+- [x] Import existing resources
 - [ ] More AWS resources (EC2, IAM, Lambda, etc.)
 - [ ] GCP provider
-- [ ] Import existing resources
