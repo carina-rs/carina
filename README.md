@@ -27,6 +27,7 @@ A strongly typed infrastructure management tool written in Rust.
 ## Installation
 
 ```bash
+git submodule update --init --recursive  # WIT definitions (carina-plugin-wit)
 cargo build --release
 ```
 
@@ -327,17 +328,18 @@ carina/
 │   ├── src/
 │   │   ├── effect.rs        # Effect type definitions
 │   │   ├── plan.rs          # Plan (collection of Effects)
-│   │   ├── resource.rs      # Resource and State types
+│   │   ├── resource/        # Resource and State types
 │   │   ├── provider.rs      # Provider trait
 │   │   ├── differ/          # State comparison
 │   │   ├── parser/          # DSL parser (pest-based)
-│   │   ├── schema.rs        # Type validation (generic types only)
+│   │   ├── schema/          # Type validation (generic types only)
 │   │   ├── module.rs        # Module signature and dependency graph
 │   │   ├── module_resolver/ # Module import and expansion
 │   │   └── formatter/       # Code formatter
 │   └── ...
 ├── carina-plugin-host/      # WASM plugin host for provider plugins
 ├── carina-plugin-sdk/       # SDK for building WASM provider plugins
+├── carina-plugin-wit/       # WIT interface definitions (git submodule)
 ├── carina-provider-mock/    # Mock provider for testing
 ├── carina-provider-protocol/ # Protocol definitions for provider communication
 ├── carina-provider-resolver/ # Resolves and loads provider plugins
