@@ -28,7 +28,7 @@ use super::{
     BackendDriftStatus, DriftCommand, inspect_backend_drift, validate_and_resolve_with_config,
     verify_for_mutation,
 };
-use crate::commands::shared::state_writeback::apply_name_overrides;
+use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overrides};
 use crate::error::AppError;
 use crate::wiring::{
     DataSourceRefreshResolution, WiringContext, build_factories_from_providers,
@@ -1319,7 +1319,7 @@ pub(crate) async fn run_state_refresh_locked(
     }
 
     // Re-resolve exports using refreshed state
-    if !parsed.export_params.is_empty() {
+    let skipped_exports = if !parsed.export_params.is_empty() {
         let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
             .wait_bindings
             .iter()
@@ -1343,8 +1343,10 @@ pub(crate) async fn run_state_refresh_locked(
             ctx.schemas(),
             &wait_aliases,
         )?;
-        resolution.write_into(&mut state);
-    }
+        resolution.write_into(&mut state)
+    } else {
+        SkippedExports::default()
+    };
 
     // Save state (with or without lock validation)
     if let Some(lock) = lock {
@@ -1363,6 +1365,11 @@ pub(crate) async fn run_state_refresh_locked(
         )
     );
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+
+    if !skipped_exports.is_empty() {
+        println!("  {} {}", "!".yellow(), skipped_exports.count_description());
+        return Err(AppError::Config(skipped_exports.failure_message()));
+    }
 
     Ok(())
 }

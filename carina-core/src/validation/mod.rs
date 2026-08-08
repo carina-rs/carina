@@ -326,8 +326,9 @@ pub fn validate_resource_ref_types<E>(
     }
 }
 
-/// Validate that attribute parameter ResourceRef values have types compatible
-/// with their declared TypeExpr types.
+/// Validate that attribute parameter ResourceRef values name attributes on
+/// their referenced schemas, and that plain refs with a simple custom type
+/// annotation are type-compatible.
 ///
 /// For example, `attributes { role_arn: iam_role_arn = role.role_name }` should
 /// be rejected because `role_name` is `String`, not `IamRoleArn`.
@@ -338,26 +339,29 @@ pub fn validate_attribute_param_ref_types_with_bindings(
     let mut errors = Vec::new();
 
     for param in attribute_params {
-        let Some(ref type_expr) = param.type_expr else {
-            continue;
-        };
         let Some(ref value) = param.value else {
             continue;
         };
 
-        // Get expected type name from TypeExpr
-        let expected_type = match type_expr {
-            crate::parser::TypeExpr::Simple(name) => name.as_str(),
-            _ => continue, // String, Bool, etc. are handled by validate_type_expr_value
-        };
-
-        if let Value::Deferred(DeferredValue::ResourceRef { path }) = value {
+        // A plain ResourceRef with a Simple annotation takes the existing
+        // combined existence + compatibility path. Do not also send it
+        // through the generic existence walk or an unknown attribute would
+        // produce the same diagnostic twice.
+        if let (
+            Some(TypeExpr::Simple(expected_type)),
+            Value::Deferred(DeferredValue::ResourceRef { path }),
+        ) = (&param.type_expr, value)
+        {
             check_attribute_param_ref_type(&param.name, expected_type, path, bindings, &mut errors);
-        } else {
-            value.visit_resource_refs(&mut |path| {
-                check_attribute_param_ref_existence(&param.name, path, bindings, &mut errors);
-            });
+            continue;
         }
+
+        // Attribute existence is independent of whether the module output has
+        // a type annotation. Compatibility remains gated on the direct
+        // Simple-annotated path above.
+        value.visit_resource_refs(&mut |path| {
+            check_attribute_param_ref_existence(&param.name, path, bindings, &mut errors);
+        });
     }
 
     if errors.is_empty() {
@@ -382,14 +386,26 @@ fn check_attribute_param_ref_type(
     };
     let ref_schema = ref_entry.schema;
     let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
+        let known_attrs: Vec<&str> = ref_schema.attributes.keys().map(|s| s.as_str()).collect();
         errors.push(format!(
-            "attribute '{}': unknown attribute '{}' on '{}' in reference {}.{}",
-            param_name, ref_attr, ref_binding, ref_binding, ref_attr,
+            "attribute '{}': unknown attribute '{}' on '{}' in reference {}.{}{}",
+            param_name,
+            ref_attr,
+            ref_binding,
+            ref_binding,
+            ref_attr,
+            did_you_mean(ref_attr, &known_attrs),
         ));
         return;
     };
 
-    let ref_type_name = ref_attr_schema.attr_type.type_name();
+    let Some(ref_attr_type) =
+        narrow_attribute_param_ref_type(param_name, path, ref_schema, ref_attr_schema, errors)
+    else {
+        return;
+    };
+
+    let ref_type_name = ref_attr_type.type_name();
     let ref_type_snake = crate::parser::pascal_to_snake(&ref_type_name);
 
     if ref_type_snake == expected_type {
@@ -415,14 +431,56 @@ fn check_attribute_param_ref_existence(
         return;
     };
     let ref_schema = ref_entry.schema;
-    if ref_schema.attributes.contains_key(ref_attr) {
+    let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
+        let known_attrs: Vec<&str> = ref_schema.attributes.keys().map(|s| s.as_str()).collect();
+        errors.push(format!(
+            "attribute '{}': unknown attribute '{}' on '{}' in reference {}.{}{}",
+            param_name,
+            ref_attr,
+            ref_binding,
+            ref_binding,
+            ref_attr,
+            did_you_mean(ref_attr, &known_attrs),
+        ));
         return;
-    }
+    };
 
-    errors.push(format!(
-        "attribute '{}': unknown attribute '{}' on '{}' in reference {}.{}",
-        param_name, ref_attr, ref_binding, ref_binding, ref_attr,
-    ));
+    let _ = narrow_attribute_param_ref_type(param_name, path, ref_schema, ref_attr_schema, errors);
+}
+
+fn narrow_attribute_param_ref_type<'a>(
+    param_name: &str,
+    path: &crate::resource::AccessPath,
+    ref_schema: &'a crate::schema::ResourceSchema,
+    ref_attr_schema: &'a crate::schema::AttributeSchema,
+    errors: &mut Vec<String>,
+) -> Option<&'a AttributeType> {
+    match narrow_attribute_type(
+        &ref_attr_schema.attr_type,
+        path.segments(),
+        &ref_schema.defs,
+    ) {
+        Ok(ref_attr_type) => Some(ref_attr_type),
+        Err(NarrowError::UnknownStructField {
+            field,
+            struct_name,
+            known_fields,
+        }) => {
+            let known: Vec<&str> = known_fields.iter().map(|name| name.as_str()).collect();
+            errors.push(format!(
+                "attribute '{}': unknown field '{}' on struct '{}' in reference {}; \
+                 known fields: {}.{}",
+                param_name,
+                field,
+                struct_name,
+                path.to_dot_string(),
+                known.join(", "),
+                did_you_mean(&field, &known),
+            ));
+            None
+        }
+        Err(NarrowError::ShapeMismatch) => None,
+    }
 }
 
 /// Validate export parameter values that are ResourceRef against their declared

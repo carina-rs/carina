@@ -1517,10 +1517,12 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
     .await
     .unwrap_err();
 
+    let message = err.to_string();
     assert!(
-        err.to_string()
-            .contains("Apply failed. 1 succeeded, 1 failed."),
-        "partial apply must still surface a non-success result, got {err:?}"
+        message.contains("1 succeeded")
+            && message.contains("1 failed")
+            && message.contains("1 export not written"),
+        "partial apply must report both the resource and export failures, got {err:?}",
     );
 
     let state = fixture.read_state().await;
@@ -4489,4 +4491,37 @@ fn apply_exit_code_prioritizes_failure_over_partial() {
     );
     assert_eq!(apply_exit_code_for_counts(1, 0), ApplyExitCode::Failure);
     assert_eq!(apply_exit_code_for_counts(1, 1), ApplyExitCode::Failure);
+}
+
+#[test]
+fn skipped_export_does_not_downgrade_partial_success() {
+    let result = ExecutionResult {
+        success_count: 0,
+        failure_count: 0,
+        partial_count: 1,
+        partial_diagnostics: Vec::new(),
+        skip_count: 0,
+        applied_states: HashMap::new(),
+        runtime_synthesized_resources: Vec::new(),
+        successfully_deleted: HashSet::new(),
+        permanent_name_overrides: HashMap::new(),
+        current_states: HashMap::new(),
+        bindings: Default::default(),
+        failed_refreshes: HashSet::new(),
+    };
+
+    let err = finish_apply(
+        &result,
+        SkippedExports::from_names_for_test(&["role_arn"]),
+        Duration::ZERO,
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(&err, AppError::PartialSuccess(_)),
+        "a skipped export must not downgrade partial-success exit semantics: {err:?}",
+    );
+    let message = err.to_string();
+    assert!(message.contains("1 partial"), "error: {message}");
+    assert!(message.contains("1 export not written"), "error: {message}",);
 }
