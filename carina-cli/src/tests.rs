@@ -2858,6 +2858,56 @@ async fn persist_exports_only_writes_state_with_new_exports() {
     );
 }
 
+#[tokio::test]
+async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
+    use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::resource::AccessPath;
+
+    let captured = Arc::new(Mutex::new(None));
+    let backend = CapturingBackend {
+        captured: captured.clone(),
+    };
+    let lock = LockInfo::new("apply");
+    let mut state_in = StateFile::new();
+    state_in
+        .exports
+        .insert("role_arn".to_string(), serde_json::json!("prior-arn"));
+    let export_params = vec![InferredExportParam {
+        name: "role_arn".to_string(),
+        type_expr: TypeExpr::Unknown,
+        value: Some(Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("role", "web_acl_arn"),
+        })),
+    }];
+
+    let result = crate::commands::apply::persist_exports_only(
+        &backend,
+        Some(&lock),
+        Some(state_in),
+        &[],
+        &[],
+        &[],
+        &export_params,
+        &carina_core::schema::SchemaRegistry::new(),
+        &[],
+        &HashMap::new(),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "an unresolved export must fail only after state persistence"
+    );
+    let written = captured.lock().unwrap();
+    let state = written.as_ref().expect("state should be written");
+    assert_eq!(state.serial, 1, "state save must happen before the error");
+    assert_eq!(
+        state.exports.get("role_arn"),
+        Some(&serde_json::json!("prior-arn")),
+        "a skipped export must preserve its prior persisted value",
+    );
+}
+
 /// Regression test for #2932: when the user removes the entire
 /// `exports {}` block (so `parsed.export_params` is empty) but the
 /// plan has resource changes, `finalize_apply` must still drop
@@ -3063,9 +3113,12 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     })
     .await;
 
-    assert!(
-        op_result.is_ok(),
-        "unresolved export from failed resource must not abort writeback: {op_result:?}"
+    let skipped =
+        op_result.expect("unresolved export from failed resource must not abort state writeback");
+    assert_eq!(
+        skipped.len(),
+        1,
+        "the caller must receive the skipped-export summary after state save",
     );
     assert!(
         result.failure_count > 0,

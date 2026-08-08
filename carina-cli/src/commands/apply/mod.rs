@@ -42,7 +42,8 @@ use crate::commands::shared::progress::{
     RefreshProgress, emit_newline_on_interrupt, format_duration, refresh_multi_progress,
 };
 use crate::commands::shared::state_writeback::{
-    ApplyStateSave, FinalizeApplyInput, PostApplyStates, build_state_after_apply, resolve_exports,
+    ApplyStateSave, FinalizeApplyInput, PostApplyStates, SkippedExports, build_state_after_apply,
+    resolve_exports,
 };
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
@@ -442,7 +443,12 @@ pub async fn refresh_pending_states(
 ///
 /// When `lock` is `None` (i.e. `--lock=false`), state is written without lock
 /// validation via `save_state_unlocked`.
-pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), AppError> {
+///
+/// Returns the [`SkippedExports`] summary after state is saved. Callers must fold
+/// unresolved exports into the command's exit status (carina#3710).
+pub(crate) async fn finalize_apply(
+    input: FinalizeApplyInput<'_>,
+) -> Result<SkippedExports, AppError> {
     println!();
     println!("{}", "Saving state...".cyan());
 
@@ -463,7 +469,7 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
     // (#2932). `None` preserves `state.exports` because the caller has
     // no source-side view of which exports the user intends — see the
     // `FinalizeApplyInput::export_params` doc-comment.
-    if let Some(params) = input.export_params {
+    let skipped_exports = if let Some(params) = input.export_params {
         let post_apply_states =
             PostApplyStates::from_current_and_state(input.current_states, &state);
         let resolution = resolve_exports(
@@ -475,8 +481,10 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
             input.schemas,
             input.wait_aliases,
         )?;
-        resolution.write_into(&mut state);
-    }
+        resolution.write_into(&mut state)
+    } else {
+        SkippedExports::default()
+    };
 
     if let Some(lock) = input.lock {
         save_state_locked(input.backend, lock, &mut state).await?;
@@ -485,7 +493,7 @@ pub(crate) async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), 
     }
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
-    Ok(())
+    Ok(skipped_exports)
 }
 
 /// Renew the lock and write state with lock validation.
@@ -562,6 +570,10 @@ pub async fn load_state_persist_if_migrated(
 /// exports may have changed. Rebuild the exports from the current
 /// state + desired `export_params` and write the state
 /// (carina#3270).
+///
+/// If any export remains unresolved, state is saved first, then this prints
+/// `! N export(s) not written` instead of `✓ Exports updated` and returns an
+/// error so the command exits non-zero (carina#3710).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_exports_only(
     backend: &dyn StateBackend,
@@ -586,15 +598,20 @@ pub(crate) async fn persist_exports_only(
         schemas,
         wait_aliases,
     )?;
-    resolution.write_into(&mut state);
+    let skipped_exports = resolution.write_into(&mut state);
     if let Some(lk) = lock {
         save_state_locked(backend, lk, &mut state).await?;
     } else {
         save_state_unlocked(backend, &mut state).await?;
     }
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
-    println!("  {} Exports updated", "✓".green());
-    Ok(())
+    if skipped_exports.is_empty() {
+        println!("  {} Exports updated", "✓".green());
+        Ok(())
+    } else {
+        println!("  {} {}", "!".yellow(), skipped_exports.count_description());
+        Err(AppError::Config(skipped_exports.failure_message()))
+    }
 }
 
 /// Detect infrastructure drift by comparing planned states against actual infrastructure.
@@ -1726,39 +1743,13 @@ async fn run_apply_locked(
         pre_resolve_compositions: &pre_resolve_compositions,
     })
     .await;
-    handle_finalize_after_execute(finalize_result, cancelled)?;
+    let skipped_exports = handle_finalize_after_execute(finalize_result, cancelled)?;
 
-    println!();
-    let exit_code = apply_exit_code_for_counts(
-        result.failure_count + result.skip_count,
-        result.partial_count,
-    );
-    if exit_code == ApplyExitCode::Success {
-        println!(
-            "{}",
-            format!("Apply complete! {} changes applied.", result.success_count)
-                .green()
-                .bold()
-        );
-        Ok(Some(resources_finished.duration_since(apply_phase_started)))
-    } else {
-        let mut parts = vec![format!("{} succeeded", result.success_count)];
-        if result.partial_count > 0 {
-            parts.push(format!("{} partial", result.partial_count));
-        }
-        if result.failure_count > 0 {
-            parts.push(format!("{} failed", result.failure_count));
-        }
-        if result.skip_count > 0 {
-            parts.push(format!("{} skipped", result.skip_count));
-        }
-        let message = format!("Apply failed. {}.", parts.join(", "));
-        if exit_code == ApplyExitCode::PartialSuccess {
-            Err(AppError::PartialSuccess(message))
-        } else {
-            Err(AppError::Config(message))
-        }
-    }
+    finish_apply(
+        &result,
+        skipped_exports,
+        resources_finished.duration_since(apply_phase_started),
+    )
 }
 
 fn ensure_saved_plan_backend_matches_current(
@@ -2230,39 +2221,13 @@ async fn run_apply_from_plan_locked(
         pre_resolve_compositions: &[],
     })
     .await;
-    handle_finalize_after_execute(finalize_result, cancelled)?;
+    let skipped_exports = handle_finalize_after_execute(finalize_result, cancelled)?;
 
-    println!();
-    let exit_code = apply_exit_code_for_counts(
-        result.failure_count + result.skip_count,
-        result.partial_count,
-    );
-    if exit_code == ApplyExitCode::Success {
-        println!(
-            "{}",
-            format!("Apply complete! {} changes applied.", result.success_count)
-                .green()
-                .bold()
-        );
-        Ok(Some(resources_finished.duration_since(apply_phase_started)))
-    } else {
-        let mut parts = vec![format!("{} succeeded", result.success_count)];
-        if result.partial_count > 0 {
-            parts.push(format!("{} partial", result.partial_count));
-        }
-        if result.failure_count > 0 {
-            parts.push(format!("{} failed", result.failure_count));
-        }
-        if result.skip_count > 0 {
-            parts.push(format!("{} skipped", result.skip_count));
-        }
-        let message = format!("Apply failed. {}.", parts.join(", "));
-        if exit_code == ApplyExitCode::PartialSuccess {
-            Err(AppError::PartialSuccess(message))
-        } else {
-            Err(AppError::Config(message))
-        }
-    }
+    finish_apply(
+        &result,
+        skipped_exports,
+        resources_finished.duration_since(apply_phase_started),
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2288,6 +2253,53 @@ pub(crate) fn apply_exit_code_for_counts(
         ApplyExitCode::PartialSuccess
     } else {
         ApplyExitCode::Success
+    }
+}
+
+fn finish_apply(
+    result: &ExecutionResult,
+    skipped_exports: SkippedExports,
+    elapsed: Duration,
+) -> Result<Option<Duration>, AppError> {
+    println!();
+    let exit_code = apply_exit_code_for_counts(
+        result.failure_count + result.skip_count,
+        result.partial_count,
+    );
+    if exit_code == ApplyExitCode::Success && skipped_exports.is_empty() {
+        println!(
+            "{}",
+            format!("Apply complete! {} changes applied.", result.success_count)
+                .green()
+                .bold()
+        );
+        return Ok(Some(elapsed));
+    }
+
+    let mut parts = vec![format!("{} succeeded", result.success_count)];
+    if result.partial_count > 0 {
+        parts.push(format!("{} partial", result.partial_count));
+    }
+    if result.failure_count > 0 {
+        parts.push(format!("{} failed", result.failure_count));
+    }
+    if result.skip_count > 0 {
+        parts.push(format!("{} skipped", result.skip_count));
+    }
+    if !skipped_exports.is_empty() {
+        parts.push(skipped_exports.write_failure_description());
+    }
+    let export_hint = if skipped_exports.is_empty() {
+        ""
+    } else {
+        " (see '! export ...' lines above)"
+    };
+    let message = format!("Apply failed. {}{}.", parts.join(", "), export_hint);
+
+    if exit_code == ApplyExitCode::PartialSuccess {
+        Err(AppError::PartialSuccess(message))
+    } else {
+        Err(AppError::Config(message))
     }
 }
 

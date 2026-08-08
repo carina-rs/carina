@@ -2233,6 +2233,233 @@ fn attribute_param_ref_types_does_not_misreport_type_mismatch_for_nested_ref_to_
     );
 }
 
+fn validate_attribute_params_against_target_group(
+    params: &[crate::parser::AttributeParameter],
+) -> Result<(), String> {
+    use crate::schema::{AttributeSchema, ResourceSchema};
+
+    let target_group = Resource::with_provider("awscc", "elbv2.TargetGroup", "app", None)
+        .with_binding("target_group")
+        .with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("app".to_string())),
+        );
+    let target_group_schema = ResourceSchema::new("elbv2.TargetGroup")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new(
+            "target_group_arn",
+            AttributeType::string(),
+        ));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", target_group_schema);
+    let mut parsed = empty_parsed();
+    parsed.resources.push(target_group); // allow: direct — fixture test inspection
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+
+    validate_attribute_param_ref_types_with_bindings(params, &bindings)
+}
+
+fn validate_attribute_params_against_target_group_tags(
+    params: &[crate::parser::AttributeParameter],
+) -> Result<(), String> {
+    use crate::schema::StructField;
+
+    let target_group = Resource::with_provider("awscc", "elbv2.TargetGroup", "app", None)
+        .with_binding("target_group")
+        .with_attribute("tags", Value::Concrete(ConcreteValue::Map(IndexMap::new())));
+    let target_group_schema = make_schema(
+        "elbv2.TargetGroup",
+        vec![(
+            "tags",
+            AttributeType::struct_(
+                "TargetGroupTags",
+                vec![
+                    StructField::new(
+                        "environment",
+                        AttributeType::refined_string(
+                            Some(TypeIdentity::bare("EnvironmentName")),
+                            None,
+                            None,
+                            None,
+                        ),
+                    ),
+                    StructField::new("bad_fields", AttributeType::string()),
+                ],
+            ),
+        )],
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", target_group_schema);
+    let mut parsed = empty_parsed();
+    parsed.resources.push(target_group); // allow: direct — fixture test inspection
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+
+    validate_attribute_param_ref_types_with_bindings(params, &bindings)
+}
+
+#[test]
+fn attribute_param_nested_unknown_field_reports_suggestion() {
+    use crate::parser::AttributeParameter;
+
+    let params = vec![AttributeParameter {
+        name: "x".to_string(),
+        type_expr: None,
+        value: Some(Value::resource_ref(
+            "target_group".to_string(),
+            "tags".to_string(),
+            vec!["bad_field".to_string()],
+        )),
+    }];
+
+    let err = validate_attribute_params_against_target_group_tags(&params).unwrap_err();
+
+    assert!(
+        err.contains("unknown field 'bad_field' on struct 'TargetGroupTags'"),
+        "error: {err}",
+    );
+    assert!(
+        err.contains("reference target_group.tags.bad_field"),
+        "error should contain the full reference path: {err}",
+    );
+    assert!(
+        err.contains("Did you mean 'bad_fields'?"),
+        "error should suggest the closest struct field: {err}",
+    );
+}
+
+#[test]
+fn attribute_param_nested_known_field_is_valid() {
+    use crate::parser::AttributeParameter;
+
+    let params = vec![AttributeParameter {
+        name: "x".to_string(),
+        type_expr: None,
+        value: Some(Value::resource_ref(
+            "target_group".to_string(),
+            "tags".to_string(),
+            vec!["environment".to_string()],
+        )),
+    }];
+
+    let result = validate_attribute_params_against_target_group_tags(&params);
+
+    assert!(
+        result.is_ok(),
+        "known nested field should validate: {result:?}"
+    );
+}
+
+#[test]
+fn attribute_param_nested_simple_annotation_uses_leaf_type() {
+    use crate::parser::AttributeParameter;
+
+    let params = vec![AttributeParameter {
+        name: "x".to_string(),
+        type_expr: Some(TypeExpr::Simple("environment_name".to_string())),
+        value: Some(Value::resource_ref(
+            "target_group".to_string(),
+            "tags".to_string(),
+            vec!["environment".to_string()],
+        )),
+    }];
+
+    let result = validate_attribute_params_against_target_group_tags(&params);
+
+    assert!(
+        result.is_ok(),
+        "Simple annotation should compare against the narrowed leaf: {result:?}",
+    );
+}
+
+#[test]
+fn unannotated_attribute_param_flags_unknown_resource_attribute_with_suggestion() {
+    use crate::parser::AttributeParameter;
+
+    let params = vec![AttributeParameter {
+        name: "target_group_arn".to_string(),
+        type_expr: None,
+        value: Some(Value::resource_ref(
+            "target_group".to_string(),
+            "target_group_ar".to_string(),
+            vec![],
+        )),
+    }];
+
+    let err = validate_attribute_params_against_target_group(&params).unwrap_err();
+
+    assert!(
+        err.contains("unknown attribute 'target_group_ar'"),
+        "error: {err}",
+    );
+    assert!(
+        err.contains("Did you mean 'target_group_arn'?"),
+        "error should suggest the schema attribute: {err}",
+    );
+}
+
+#[test]
+fn primitive_annotated_attribute_param_flags_unknown_resource_attribute() {
+    use crate::parser::AttributeParameter;
+
+    let params = vec![AttributeParameter {
+        name: "target_group_arn".to_string(),
+        type_expr: Some(TypeExpr::String),
+        value: Some(Value::resource_ref(
+            "target_group".to_string(),
+            "arn".to_string(),
+            vec![],
+        )),
+    }];
+
+    let err = validate_attribute_params_against_target_group(&params).unwrap_err();
+
+    assert!(err.contains("unknown attribute 'arn'"), "error: {err}");
+}
+
+#[test]
+fn unannotated_attribute_param_flags_unknown_resource_attribute_in_nested_value() {
+    use crate::parser::AttributeParameter;
+
+    let params = vec![AttributeParameter {
+        name: "target_group_arns".to_string(),
+        type_expr: None,
+        value: Some(Value::Concrete(ConcreteValue::List(vec![
+            Value::resource_ref("target_group".to_string(), "arn".to_string(), vec![]),
+        ]))),
+    }];
+
+    let err = validate_attribute_params_against_target_group(&params).unwrap_err();
+
+    assert!(err.contains("unknown attribute 'arn'"), "error: {err}");
+}
+
+#[test]
+fn simple_annotated_plain_ref_reports_unknown_attribute_once() {
+    use crate::parser::AttributeParameter;
+
+    let params = vec![AttributeParameter {
+        name: "target_group_arn".to_string(),
+        type_expr: Some(TypeExpr::Simple("target_group_arn".to_string())),
+        value: Some(Value::resource_ref(
+            "target_group".to_string(),
+            "target_group_ar".to_string(),
+            vec![],
+        )),
+    }];
+
+    let err = validate_attribute_params_against_target_group(&params).unwrap_err();
+
+    assert_eq!(
+        err.lines().count(),
+        1,
+        "the direct Simple path must not report the same missing attribute twice: {err}",
+    );
+    assert!(
+        err.contains("Did you mean 'target_group_arn'?"),
+        "the direct Simple path should suggest the schema attribute: {err}",
+    );
+}
+
 #[test]
 fn validate_export_params_rejects_invalid_custom_type() {
     use crate::parser::InferredExportParam;
