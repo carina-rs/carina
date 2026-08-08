@@ -82,6 +82,14 @@ jobs:
       - uses: actions/checkout@v4
       - run: bash scripts/check-provider-boundaries.sh
 
+  docs-spellings:
+    name: Docs Spelling Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/test-check-docs-spellings.sh
+      - run: bash scripts/check-docs-use-new-spellings.sh
+
   check-resources-access:
     name: Check Direct parsed.resources Access
     runs-on: ubuntu-latest
