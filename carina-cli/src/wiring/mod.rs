@@ -1182,14 +1182,38 @@ pub fn validate_module_attribute_param_types<E>(
     base_dir: &Path,
 ) -> Vec<AppError> {
     let mut errors = Vec::new();
+    let mut visited = HashSet::new();
     for import in &parsed.uses {
         let module_path = base_dir.join(&import.path);
-        let Some(module_parsed) = module_resolver::load_module(&module_path) else {
-            continue;
-        };
-        if module_parsed.attribute_params.is_empty() {
-            continue;
-        }
+        validate_module_attribute_params_at_path(
+            ctx,
+            &module_path,
+            Path::new(&import.path),
+            &mut visited,
+            &mut errors,
+        );
+    }
+    errors
+}
+
+fn validate_module_attribute_params_at_path(
+    ctx: &WiringContext,
+    module_path: &Path,
+    diagnostic_path: &Path,
+    visited: &mut HashSet<std::path::PathBuf>,
+    errors: &mut Vec<AppError>,
+) {
+    let guard_path =
+        std::fs::canonicalize(module_path).unwrap_or_else(|_| module_path.to_path_buf());
+    if !visited.insert(guard_path) {
+        return;
+    }
+
+    let Some(module_parsed) = module_resolver::load_module(module_path) else {
+        return;
+    };
+
+    if !module_parsed.attribute_params.is_empty() {
         let bindings =
             carina_core::binding_index::BindingIndex::from_parsed(&module_parsed, ctx.schemas());
         if let Err(joined) = validation::validate_attribute_param_ref_types_with_bindings(
@@ -1198,7 +1222,7 @@ pub fn validate_module_attribute_param_types<E>(
         ) {
             // Preserve the module-path prefix the legacy wrapper emitted
             // so diagnostics point at which imported module failed.
-            let prefix = import.path.to_string();
+            let prefix = diagnostic_path.display().to_string();
             errors.extend(
                 joined
                     .split('\n')
@@ -1207,7 +1231,16 @@ pub fn validate_module_attribute_param_types<E>(
             );
         }
     }
-    errors
+
+    for import in &module_parsed.uses {
+        validate_module_attribute_params_at_path(
+            ctx,
+            &module_path.join(&import.path),
+            &diagnostic_path.join(&import.path),
+            visited,
+            errors,
+        );
+    }
 }
 
 pub async fn get_provider_with_ctx<E>(

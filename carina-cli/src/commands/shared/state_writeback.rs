@@ -206,13 +206,70 @@ pub(crate) struct FinalizeApplyInput<'a> {
 /// depend on the failed resource unresolved, but carina#3498 requires
 /// successfully completed resources from the same run to still be
 /// persisted. Resolved exports are written to `state.exports`; skipped
-/// exports are omitted and surfaced to the operator by the caller.
+/// exports are omitted, surfaced per-export on stdout, and returned to the
+/// caller as [`SkippedExports`] for exit-status handling.
 pub(crate) struct ExportResolution {
     /// Exports that resolved to concrete JSON and are safe to persist.
     resolved: HashMap<String, serde_json::Value>,
     /// Exports omitted because their value still depends on unresolved
     /// apply-time data.
     skipped: Vec<SkippedExport>,
+}
+
+/// Export names that could not be written during an otherwise successful
+/// state writeback.
+///
+/// [`ExportResolution::write_into`] returns this after merging resolved values
+/// into an in-memory state file. Command callers must carry it through the
+/// backend save and only then choose a failing exit status, preserving the
+/// partial-apply writeback contract.
+///
+/// That returned API flow is the real fix; `must_use` is an extra compile-time
+/// tripwire against a future caller silently discarding the summary.
+#[must_use = "skipped export summaries must be handled after state is saved"]
+#[derive(Debug, Default)]
+pub(crate) struct SkippedExports {
+    names: Vec<String>,
+}
+
+impl SkippedExports {
+    #[cfg(test)]
+    pub(crate) fn from_names_for_test(names: &[&str]) -> Self {
+        Self {
+            names: names.iter().map(|name| (*name).to_string()).collect(),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    pub(crate) fn count_description(&self) -> String {
+        format!(
+            "{} export{} not written",
+            self.len(),
+            if self.len() == 1 { "" } else { "s" },
+        )
+    }
+
+    pub(crate) fn write_failure_description(&self) -> String {
+        format!(
+            "{} to state: {}",
+            self.count_description(),
+            self.names.join(", "),
+        )
+    }
+
+    pub(crate) fn failure_message(&self) -> String {
+        format!(
+            "{} (see '! export ...' lines above).",
+            self.write_failure_description(),
+        )
+    }
 }
 
 impl ExportResolution {
@@ -224,21 +281,28 @@ impl ExportResolution {
     /// names absent from both sets are dropped so source-side export
     /// removals still converge (carina#3551, carina#2932).
     ///
-    /// Consumes `self` so the skipped diagnostics cannot be silently
-    /// dropped by a caller that reads only the resolved half
+    /// Consumes `self` and returns a [`SkippedExports`] summary that callers
+    /// thread through state saving into the command's exit status
+    /// (carina#3710). This also prevents callers from reading only the resolved
+    /// half and silently dropping skipped diagnostics
     /// (carina#3551 / CLAUDE.md "Long-term view alongside root-cause").
-    pub(crate) fn write_into(self, state: &mut StateFile) {
+    pub(crate) fn write_into(self, state: &mut StateFile) -> SkippedExports {
+        let Self { resolved, skipped } = self;
         let mut next = HashMap::new();
-        for skipped in &self.skipped {
+        for skipped in &skipped {
             println!("{}", render_skipped(skipped));
             if let Some(prior) = state.exports.get(&skipped.name) {
                 next.insert(skipped.name.clone(), prior.clone());
             }
         }
-        for (name, value) in self.resolved {
+        for (name, value) in resolved {
             next.insert(name, value);
         }
         state.exports = next;
+
+        SkippedExports {
+            names: skipped.into_iter().map(|export| export.name).collect(),
+        }
     }
 
     #[cfg(test)]
@@ -3518,7 +3582,7 @@ mod resolve_exports_tests {
             .exports
             .insert("orphan".to_string(), serde_json::json!("old-orphan"));
 
-        ExportResolution {
+        let skipped = ExportResolution {
             resolved: HashMap::from([("ax".to_string(), serde_json::json!("new-a"))]),
             skipped: vec![SkippedExport {
                 name: "bx".to_string(),
@@ -3527,10 +3591,21 @@ mod resolve_exports_tests {
         }
         .write_into(&mut state);
 
+        assert_eq!(skipped.len(), 1);
         assert_eq!(state.exports.len(), 2);
         assert_eq!(state.exports.get("ax"), Some(&serde_json::json!("new-a")));
         assert_eq!(state.exports.get("bx"), Some(&serde_json::json!("old-b")));
         assert!(!state.exports.contains_key("orphan"));
+    }
+
+    #[test]
+    fn skipped_exports_failure_message_names_each_export() {
+        let skipped = SkippedExports::from_names_for_test(&["role_arn", "policy_arn"]);
+
+        assert_eq!(
+            skipped.failure_message(),
+            "2 exports not written to state: role_arn, policy_arn (see '! export ...' lines above).",
+        );
     }
 }
 
