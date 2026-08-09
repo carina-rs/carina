@@ -2906,7 +2906,8 @@ fn module_and_provider_wrappers_return_vec_app_error() {
     let errors = validate_module_calls(&parsed, base_dir, &provider_ctx);
     assert!(errors.is_empty(), "module_calls: got {errors:?}");
 
-    let errors = validate_module_attribute_param_types(&ctx, &parsed, base_dir);
+    let module_walk = crate::module_walk::ModuleWalk::load(&parsed, base_dir);
+    let errors = validate_module_attribute_param_types(&ctx, &module_walk);
     assert!(
         errors.is_empty(),
         "module_attribute_param_types: got {errors:?}",

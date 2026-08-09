@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use carina_core::config_loader::DuplicateDeclaration;
 use carina_core::module_resolver;
 use carina_core::parser::{BackendConfig, ProviderContext};
 use carina_core::resource::{ConcreteValue, Value};
@@ -28,6 +29,7 @@ use carina_state::{
 };
 
 use crate::error::AppError;
+use crate::module_walk::ModuleWalk;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, compute_anonymous_identifiers_with_ctx,
     resolve_names_with_ctx, validate_attribute_param_ref_types_with_ctx,
@@ -205,37 +207,6 @@ pub fn ensure_backend_lock(
         .map_err(AppError::Backend)
 }
 
-/// Run the common validation and module resolution pipeline.
-///
-/// Steps:
-/// 1. Validate provider region
-/// 2. Validate module call arguments (before expansion)
-/// 3. Resolve module imports and expand module calls
-/// 4. Resolve names (let bindings -> resource names)
-/// 5. Validate resources (schema checks) -- skipped when `skip_resource_validation` is true
-/// 6. Validate resource ref types -- skipped when `skip_resource_validation` is true
-/// 7. Compute anonymous identifiers
-///
-/// `skip_resource_validation` is used by destroy and state refresh, which only need
-/// name resolution and identifier computation without full schema validation.
-/// `prior_inference_errors` must be the errors returned with the loaded configuration:
-/// retry uses them to exclude historically validate-only inference failures while
-/// still surfacing schema-backed errors that bootstrap loading could not detect.
-#[allow(dead_code)] // Used by snapshot tests
-pub fn validate_and_resolve(
-    parsed: &mut carina_core::parser::InferredFile,
-    base_dir: &Path,
-    skip_resource_validation: bool,
-    prior_inference_errors: &[ExportInferenceError],
-) -> Result<(), AppError> {
-    validate_and_resolve_with_config(
-        parsed,
-        base_dir,
-        skip_resource_validation,
-        prior_inference_errors,
-    )
-}
-
 /// Create a `ProviderContext` with custom type validators extracted from
 /// the already-collected schema map and factory-based validation for WASM providers.
 fn enrich_provider_context(
@@ -280,17 +251,46 @@ pub(crate) fn collapse_errors(errors: Vec<AppError>) -> AppError {
     )
 }
 
+pub(crate) fn duplicate_declaration_errors(
+    duplicate_declarations: &[DuplicateDeclaration],
+    module_walk: &ModuleWalk,
+) -> Vec<AppError> {
+    let mut errors: Vec<AppError> = duplicate_declarations
+        .iter()
+        .map(|duplicate| AppError::Validation(duplicate.to_string()))
+        .collect();
+    for module in module_walk.iter() {
+        let prefix = module.diagnostic_path().display();
+        errors.extend(
+            module
+                .loaded()
+                .duplicate_declarations
+                .iter()
+                .map(|duplicate| AppError::Validation(format!("{prefix}: {duplicate}"))),
+        );
+    }
+    errors
+}
+
+/// Run the common validation and module-resolution pipeline.
+///
+/// Callers loading a directory must pass both diagnostic channels from the
+/// same [`LoadedConfig`](carina_core::config_loader::LoadedConfig). Requiring
+/// `duplicate_declarations` here prevents production callers from silently
+/// bypassing directory-level uniqueness validation.
 pub fn validate_and_resolve_with_config(
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
     prior_inference_errors: &[ExportInferenceError],
+    duplicate_declarations: &[DuplicateDeclaration],
 ) -> Result<(), AppError> {
     let errors = validate_and_resolve_errors(
         parsed,
         base_dir,
         skip_resource_validation,
         prior_inference_errors,
+        duplicate_declarations,
     );
     if errors.is_empty() {
         Ok(())
@@ -299,14 +299,14 @@ pub fn validate_and_resolve_with_config(
     }
 }
 
-/// Vec-returning twin of [`validate_and_resolve_with_config`]. `run_validate`
-/// uses it to fold findings into its own accumulator; the `Result`-returning
-/// wrapper above flushes through `collapse_errors` for the rest of the CLI.
+/// Vec-returning twin of [`validate_and_resolve_with_config`]. Both loader
+/// diagnostic channels remain required at this lower-level entry point.
 pub fn validate_and_resolve_errors(
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
     prior_inference_errors: &[ExportInferenceError],
+    duplicate_declarations: &[DuplicateDeclaration],
 ) -> Vec<AppError> {
     let (factories, load_errors) = build_factories_from_providers(&parsed.providers, base_dir);
     validate_and_resolve_errors_with_factories(
@@ -316,6 +316,7 @@ pub fn validate_and_resolve_errors(
         factories,
         load_errors,
         prior_inference_errors,
+        duplicate_declarations,
     )
 }
 
@@ -325,10 +326,9 @@ pub fn validate_and_resolve_errors(
 /// the parsed file's `provider` blocks.
 ///
 /// Exposed so e2e tests can drive the full pipeline (parse → resolve →
-/// validate) against hand-built schemas without standing up a WASM
-/// provider plugin (#2247). The production path goes through the
-/// non-injecting wrapper above; this entry point is not used outside
-/// tests.
+/// validate) against hand-built schemas without standing up a WASM provider
+/// plugin (#2247). Its loader diagnostic channels are required just like the
+/// non-injecting entry point.
 pub fn validate_and_resolve_errors_with_factories(
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
@@ -336,10 +336,23 @@ pub fn validate_and_resolve_errors_with_factories(
     factories: Vec<Box<dyn carina_core::provider::ProviderFactory>>,
     load_errors: HashMap<String, String>,
     prior_inference_errors: &[ExportInferenceError],
+    duplicate_declarations: &[DuplicateDeclaration],
 ) -> Vec<AppError> {
     let ctx = WiringContext::new(factories);
+    let module_walk = if skip_resource_validation {
+        ModuleWalk::default()
+    } else {
+        ModuleWalk::load(parsed, base_dir)
+    };
 
     let mut errors: Vec<AppError> = Vec::new();
+
+    if !skip_resource_validation {
+        errors.extend(duplicate_declaration_errors(
+            duplicate_declarations,
+            &module_walk,
+        ));
+    }
 
     let retry_inference_errors = if skip_resource_validation {
         Vec::new()
@@ -429,9 +442,7 @@ pub fn validate_and_resolve_errors_with_factories(
 
     // Validate module attribute parameter ref types before expansion
     if !skip_resource_validation {
-        errors.extend(validate_module_attribute_param_types(
-            &ctx, parsed, base_dir,
-        ));
+        errors.extend(validate_module_attribute_param_types(&ctx, &module_walk));
     }
 
     // Module expansion assumes the checks above succeeded — feeding
@@ -816,7 +827,7 @@ mod tests {
             is_default: true,
         });
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
-        let result = validate_and_resolve_with_config(&mut parsed, base_dir, false, &[]);
+        let result = validate_and_resolve_with_config(&mut parsed, base_dir, false, &[], &[]);
 
         let err = result.unwrap_err();
         let msg = err.to_string();
@@ -850,7 +861,7 @@ mod tests {
             is_default: true,
         });
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
-        let result = validate_and_resolve_with_config(&mut parsed, base_dir, false, &[]);
+        let result = validate_and_resolve_with_config(&mut parsed, base_dir, false, &[], &[]);
 
         let err = result.unwrap_err();
         let msg = err.to_string();
@@ -896,20 +907,80 @@ exports {
         )
         .expect("load");
         let inference_errors = loaded.inference_errors;
+        let duplicate_declarations = loaded.duplicate_declarations;
         let mut parsed = loaded.parsed;
 
         // With full validation, the typo is rejected.
-        let err =
-            validate_and_resolve_with_config(&mut parsed.clone(), &base, false, &inference_errors)
-                .expect_err("full validation must flag the typo");
+        let err = validate_and_resolve_with_config(
+            &mut parsed.clone(),
+            &base,
+            false,
+            &inference_errors,
+            &duplicate_declarations,
+        )
+        .expect_err("full validation must flag the typo");
         assert!(err.to_string().contains("does not export `missing`"));
 
         // With skip_resource_validation=true, recovery commands pass
         // through despite the typo.
-        let result = validate_and_resolve_with_config(&mut parsed, &base, true, &inference_errors);
+        let result = validate_and_resolve_with_config(
+            &mut parsed,
+            &base,
+            true,
+            &inference_errors,
+            &duplicate_declarations,
+        );
         assert!(
             result.is_ok(),
             "skip_resource_validation=true must bypass upstream field check, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn duplicate_declaration_check_honors_skip_resource_validation() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::write(
+            base.path().join("a.crn"),
+            "exports {\n  x = \"from-a\"\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.path().join("b.crn"),
+            "exports {\n  x = \"from-b\"\n}\n",
+        )
+        .unwrap();
+
+        let loaded = carina_core::config_loader::load_configuration_with_config(
+            base.path(),
+            &ProviderContext::default(),
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .expect("load");
+        let inference_errors = loaded.inference_errors;
+        let duplicate_declarations = loaded.duplicate_declarations;
+        let mut parsed = loaded.parsed;
+
+        let err = validate_and_resolve_with_config(
+            &mut parsed.clone(),
+            base.path(),
+            false,
+            &inference_errors,
+            &duplicate_declarations,
+        )
+        .expect_err("full validation must reject duplicate declarations");
+        assert!(err.to_string().contains("duplicate export 'x'"));
+
+        let result = validate_and_resolve_with_config(
+            &mut parsed,
+            base.path(),
+            true,
+            &inference_errors,
+            &duplicate_declarations,
+        );
+        assert!(
+            result.is_ok(),
+            "skip_resource_validation=true must bypass duplicate declarations, got: {:?}",
             result.err()
         );
     }
@@ -1019,6 +1090,7 @@ exports {
             })],
             HashMap::new(),
             &[],
+            &[],
         );
         assert!(errors.is_empty(), "awscc spelling errors: {errors:?}");
 
@@ -1030,6 +1102,7 @@ exports {
                 enum_provider: "aws",
             })],
             HashMap::new(),
+            &[],
             &[],
         );
         assert!(errors.is_empty(), "aws spelling errors: {errors:?}");

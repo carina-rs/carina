@@ -528,8 +528,16 @@ fn duplicate_export_names_do_not_suppress_a_different_params_schema_typo() {
 
     assert_eq!(
         diags.len(),
-        2,
-        "the first export's inference error must not suppress the distinct same-named export: {diags:#?}",
+        3,
+        "the duplicate declaration and both independent inference errors must be reported: {diags:#?}",
+    );
+    assert!(
+        diags.iter().any(|diag| {
+            diag.contains("duplicate export 'mixed'")
+                && diag.contains("a_mixed.crn")
+                && diag.contains("c_typo.crn")
+        }),
+        "expected the duplicate-export diagnostic with both source files: {diags:#?}",
     );
     assert!(
         diags
@@ -607,6 +615,7 @@ fn prior_heterogeneous_export_error_is_not_rederived_by_plan_style_validation() 
         factories(),
         HashMap::new(),
         &inference_errors,
+        &[],
     );
 
     assert!(

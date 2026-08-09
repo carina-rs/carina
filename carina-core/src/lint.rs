@@ -440,11 +440,14 @@ pub struct DuplicateAttr {
 /// attribute assignments (`key = value`) where the same key appears more
 /// than once in the same block. Returns a list of duplicates found.
 ///
-/// This works on all block types: resource blocks, provider blocks, backend
-/// blocks, and nested blocks.
+/// This works on resource, provider, backend, and nested blocks. Direct members
+/// of declaration blocks (`exports`, `attributes`, and `arguments`) are
+/// excluded because directory loading reports their name collisions as hard
+/// duplicate-declaration errors; emitting a second warning that says the last
+/// value wins would be contradictory.
 pub fn find_duplicate_attrs(source: &str) -> Vec<DuplicateAttr> {
     let mut results = Vec::new();
-    let mut block_stack: Vec<HashMap<String, usize>> = Vec::new();
+    let mut block_stack: Vec<(HashMap<String, usize>, bool)> = Vec::new();
 
     for (line_idx, line) in source.lines().enumerate() {
         let trimmed = line.trim();
@@ -455,8 +458,9 @@ pub fn find_duplicate_attrs(source: &str) -> Vec<DuplicateAttr> {
         let closes = trimmed.chars().filter(|&c| c == '}').count();
 
         // Push new blocks for each opening brace
-        for _ in 0..opens {
-            block_stack.push(HashMap::new());
+        let opens_declaration_block = opens_duplicate_owned_declaration_block(trimmed);
+        for open_index in 0..opens {
+            block_stack.push((HashMap::new(), opens_declaration_block && open_index == 0));
         }
 
         // Check for attribute assignment: `key = value` or `key =`
@@ -475,14 +479,16 @@ pub fn find_duplicate_attrs(source: &str) -> Vec<DuplicateAttr> {
                 && key_part.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
                 // Skip internal attributes
                 && !key_part.starts_with('_')
-                && let Some(current_block) = block_stack.last_mut()
+            && let Some((current_block, suppress_duplicate)) = block_stack.last_mut()
             {
                 if let Some(&first_line) = current_block.get(key_part) {
-                    results.push(DuplicateAttr {
-                        name: key_part.to_string(),
-                        line: line_number,
-                        first_line,
-                    });
+                    if !*suppress_duplicate {
+                        results.push(DuplicateAttr {
+                            name: key_part.to_string(),
+                            line: line_number,
+                            first_line,
+                        });
+                    }
                 } else {
                     current_block.insert(key_part.to_string(), line_number);
                 }
@@ -496,6 +502,21 @@ pub fn find_duplicate_attrs(source: &str) -> Vec<DuplicateAttr> {
     }
 
     results
+}
+
+fn opens_duplicate_owned_declaration_block(trimmed: &str) -> bool {
+    ["exports", "attributes", "arguments"]
+        .into_iter()
+        .any(|keyword| {
+            let Some(after_keyword) = trimmed.strip_prefix(keyword) else {
+                return false;
+            };
+            let has_identifier_boundary = after_keyword
+                .chars()
+                .next()
+                .is_some_and(|character| character == '{' || character.is_whitespace());
+            has_identifier_boundary && after_keyword.contains('{')
+        })
 }
 
 #[cfg(test)]
@@ -687,6 +708,64 @@ provider awscc {
         let results = find_duplicate_attrs(source);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "region");
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_ignores_direct_exports_members() {
+        let source = r#"
+exports {
+    x = "one"
+    x = "two"
+}
+"#;
+
+        assert!(find_duplicate_attrs(source).is_empty());
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_ignores_direct_module_attribute_members() {
+        let source = r#"
+attributes {
+    x = "one"
+    x = "two"
+}
+"#;
+
+        assert!(find_duplicate_attrs(source).is_empty());
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_ignores_direct_argument_members() {
+        // Use assignment-shaped members to prove suppression comes from the
+        // declaration-block frame rather than today's typed-member filter.
+        let source = r#"
+arguments {
+    x = "one"
+    x = "two"
+}
+"#;
+
+        assert!(find_duplicate_attrs(source).is_empty());
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_does_not_treat_identifier_prefix_as_declaration_block() {
+        let source = r#"
+let value = mock.test.Thing {
+    exports_config = {
+        key = "one"
+        key = "two"
+    }
+}
+"#;
+
+        let results = find_duplicate_attrs(source);
+        assert_eq!(
+            results.len(),
+            1,
+            "expected duplicate-key warning: {results:?}"
+        );
+        assert_eq!(results[0].name, "key");
     }
 
     #[test]

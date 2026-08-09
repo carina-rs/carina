@@ -283,6 +283,7 @@ fn apply_path_propagates_module_wait_binding() {
         vec![Box::new(AwsStub) as Box<dyn ProviderFactory>],
         HashMap::new(),
         &inference_errors,
+        &[],
     );
     assert!(
         errors.is_empty(),
@@ -394,6 +395,7 @@ fn full_validation_accepts_expanded_module_internal_wait_target() {
         vec![Box::new(AwsStub) as Box<dyn ProviderFactory>],
         HashMap::new(),
         &inference_errors,
+        &[],
     );
 
     assert!(
@@ -459,6 +461,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         vec![Box::new(AwsStub) as Box<dyn ProviderFactory>],
         HashMap::new(),
         &inference_errors,
+        &[],
     );
     assert!(errs.is_empty(), "expand stage must succeed: {errs:?}");
 

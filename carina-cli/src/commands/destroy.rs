@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use carina_core::parser::ProviderContext;
 
-use super::{DriftCommand, validate_and_resolve_with_config, verify_for_mutation};
+use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::collect_delete_attributes;
 use crate::commands::shared::finalize::handle_finalize_after_execute;
@@ -62,10 +62,17 @@ pub async fn run_destroy(
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let inference_errors = loaded.inference_errors;
+    let duplicate_declarations = loaded.duplicate_declarations;
     let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
-    validate_and_resolve_with_config(&mut parsed, base_dir, true, &inference_errors)?;
+    crate::commands::validate_and_resolve_with_config(
+        &mut parsed,
+        base_dir,
+        true,
+        &inference_errors,
+        &duplicate_declarations,
+    )?;
 
     let verified_backend =
         verify_for_mutation(base_dir, parsed.backend.as_ref(), DriftCommand::Destroy)?;

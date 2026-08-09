@@ -1,6 +1,7 @@
 //! Configuration loading and .crn file discovery utilities
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -10,6 +11,197 @@ use crate::parser::{self, File, InferredFile, ParsedFile, ProviderContext};
 use crate::resource::Value;
 use crate::schema::SchemaRegistry;
 use crate::validation::inference::ExportInferenceError;
+
+/// The syntactic kind of one named declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DeclarationKind {
+    Export,
+    Argument,
+    ModuleAttribute,
+    Binding,
+    UserFunction,
+}
+
+impl DeclarationKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Export => "export",
+            Self::Argument => "argument",
+            Self::ModuleAttribute => "module attribute",
+            Self::Binding => "binding",
+            Self::UserFunction => "function",
+        }
+    }
+}
+
+/// The namespace used to group declarations for uniqueness checks.
+/// Arguments are lexical bindings in the parser, so they intentionally share
+/// the binding namespace while retaining their own [`DeclarationKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum UniquenessNamespace {
+    Export,
+    Binding,
+    ModuleAttribute,
+    UserFunction,
+}
+
+impl DeclarationKind {
+    fn uniqueness_namespace(self) -> UniquenessNamespace {
+        match self {
+            Self::Export => UniquenessNamespace::Export,
+            Self::Argument | Self::Binding => UniquenessNamespace::Binding,
+            Self::ModuleAttribute => UniquenessNamespace::ModuleAttribute,
+            Self::UserFunction => UniquenessNamespace::UserFunction,
+        }
+    }
+}
+
+/// One declaration occurrence before sibling files are merged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationOccurrence {
+    kind: DeclarationKind,
+    file: PathBuf,
+}
+
+impl DeclarationOccurrence {
+    pub fn kind(&self) -> DeclarationKind {
+        self.kind
+    }
+}
+
+/// One duplicate declaration group, retaining every contributing source file.
+///
+/// Paths are relative to the directory whose files were parsed. Repeated paths
+/// are intentional: they preserve multiset semantics for declaration kinds
+/// whose parser AST keeps same-file duplicates (`exports`, `arguments`, and
+/// module `attributes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateDeclaration {
+    name: String,
+    occurrences: Vec<DeclarationOccurrence>,
+}
+
+impl DuplicateDeclaration {
+    /// Construct a duplicate group only when at least two declarations exist.
+    pub(crate) fn new(name: String, occurrences: Vec<DeclarationOccurrence>) -> Option<Self> {
+        (occurrences.len() >= 2).then_some(Self { name, occurrences })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn occurrences(&self) -> &[DeclarationOccurrence] {
+        &self.occurrences
+    }
+
+    /// Whether this group has an occurrence in the named relative file.
+    pub fn occurs_in_file(&self, file_name: &str) -> bool {
+        self.kind_in_file(file_name).is_some()
+    }
+
+    /// The declaration kind contributed by the named relative file.
+    pub fn kind_in_file(&self, file_name: &str) -> Option<DeclarationKind> {
+        self.occurrences
+            .iter()
+            .find(|occurrence| path_matches_file_name(&occurrence.file, file_name))
+            .map(|occurrence| occurrence.kind)
+    }
+
+    /// First contributing relative file, for diagnostics without source spans.
+    pub fn first_file(&self) -> Option<&Path> {
+        self.occurrences
+            .first()
+            .map(|occurrence| occurrence.file.as_path())
+    }
+}
+
+fn path_matches_file_name(path: &Path, file_name: &str) -> bool {
+    path == Path::new(file_name)
+        || path
+            .file_name()
+            .is_some_and(|candidate| candidate == std::ffi::OsStr::new(file_name))
+}
+
+fn write_joined(f: &mut fmt::Formatter<'_>, rendered: &[String]) -> fmt::Result {
+    match rendered {
+        [only] => write!(f, "{only}"),
+        [first, second] => write!(f, "{first} and {second}"),
+        [first, middle @ .., last] => {
+            write!(f, "{first}, ")?;
+            for item in middle {
+                write!(f, "{item}, ")?;
+            }
+            write!(f, "and {last}")
+        }
+        [] => unreachable!("a duplicate group has occurrences"),
+    }
+}
+
+impl fmt::Display for DuplicateDeclaration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let first_kind = self
+            .occurrences
+            .first()
+            .expect("duplicate has a source")
+            .kind;
+        let homogeneous = self
+            .occurrences
+            .iter()
+            .all(|occurrence| occurrence.kind == first_kind);
+
+        if !homogeneous {
+            let mut counts: BTreeMap<(DeclarationKind, &Path), usize> = BTreeMap::new();
+            for occurrence in &self.occurrences {
+                *counts
+                    .entry((occurrence.kind, occurrence.file.as_path()))
+                    .or_default() += 1;
+            }
+            let rendered: Vec<String> = counts
+                .into_iter()
+                .map(|((kind, file), count)| {
+                    if count == 1 {
+                        format!("as {} in {}", kind.label(), file.display())
+                    } else {
+                        format!("as {} {count} times in {}", kind.label(), file.display())
+                    }
+                })
+                .collect();
+            write!(f, "duplicate name '{}': declared ", self.name)?;
+            return write_joined(f, &rendered);
+        }
+
+        let mut counts: BTreeMap<&Path, usize> = BTreeMap::new();
+        for occurrence in &self.occurrences {
+            *counts.entry(occurrence.file.as_path()).or_default() += 1;
+        }
+
+        write!(
+            f,
+            "duplicate {} '{}': declared ",
+            first_kind.label(),
+            self.name
+        )?;
+
+        if counts.len() == 1 {
+            let (file, count) = counts.into_iter().next().expect("duplicate has a source");
+            return write!(f, "{count} times in {}", file.display());
+        }
+
+        let rendered: Vec<String> = counts
+            .into_iter()
+            .map(|(file, count)| {
+                if count == 1 {
+                    file.display().to_string()
+                } else {
+                    format!("{count} times in {}", file.display())
+                }
+            })
+            .collect();
+        write!(f, "in ")?;
+        write_joined(f, &rendered)
+    }
+}
 
 /// Result of loading configuration, includes the file path containing backend block.
 ///
@@ -45,6 +237,10 @@ pub struct LoadedConfig {
     /// looking the export up by name without spawning cascading
     /// "missing export" diagnostics.
     pub inference_errors: Vec<ExportInferenceError>,
+    /// Directory-wide declaration collisions. These are non-blocking at the
+    /// load boundary so editor callers retain the parsed tree; validation
+    /// commands decide whether to treat them as hard errors.
+    pub duplicate_declarations: Vec<DuplicateDeclaration>,
 }
 
 /// A `ParsedFile` produced by `parse_directory_files` after the
@@ -59,17 +255,141 @@ pub struct LoadedConfig {
 /// Consumers unwrap via `into_inner()` to take ownership of the
 /// `ParsedFile`. Test code can use `parsed()` for borrowed inspection.
 #[derive(Debug, Clone)]
-pub struct DirectoryResolvedFile(pub(crate) ParsedFile);
+pub struct DirectoryResolvedFile {
+    parsed: ParsedFile,
+    /// Names present in this file before sibling bindings were seeded. The
+    /// final parse's `variables` map contains sibling seed echoes, so this set
+    /// is required to distinguish local value-let declarations from context.
+    local_variable_names: HashSet<String>,
+}
 
 impl DirectoryResolvedFile {
     #[cfg(test)]
     pub(crate) fn parsed(&self) -> &ParsedFile {
-        &self.0
+        &self.parsed
     }
 
     pub fn into_inner(self) -> ParsedFile {
-        self.0
+        self.parsed
     }
+}
+
+/// Extract directory-wide duplicate declarations from the final per-file
+/// parses, before their name-keyed collections are merged.
+pub(crate) fn find_duplicate_declarations(
+    directory: &Path,
+    parsed_files: &[(PathBuf, DirectoryResolvedFile)],
+) -> Vec<DuplicateDeclaration> {
+    let mut occurrences = BTreeMap::new();
+
+    for (file, resolved) in parsed_files {
+        let relative_file = file
+            .strip_prefix(directory)
+            .unwrap_or(file.as_path())
+            .to_path_buf();
+        collect_file_declarations(
+            &relative_file,
+            &resolved.parsed,
+            &resolved.local_variable_names,
+            &mut occurrences,
+        );
+    }
+
+    duplicate_groups(occurrences)
+}
+
+type DeclarationGroups = BTreeMap<(UniquenessNamespace, String), Vec<DeclarationOccurrence>>;
+
+fn collect_file_declarations(
+    relative_file: &Path,
+    parsed: &ParsedFile,
+    local_variable_names: &HashSet<String>,
+    occurrences: &mut DeclarationGroups,
+) {
+    let mut record = |kind: DeclarationKind, name: &str| {
+        occurrences
+            .entry((kind.uniqueness_namespace(), name.to_string()))
+            .or_default()
+            .push(DeclarationOccurrence {
+                kind,
+                file: relative_file.to_path_buf(),
+            });
+    };
+
+    // These vectors preserve repeated declarations in one file, so record
+    // every element rather than collapsing to a set. Arguments deliberately
+    // group into the binding namespace because the parser registers them as
+    // lexical bindings; their occurrence kind keeps diagnostics precise.
+    for export in &parsed.export_params {
+        record(DeclarationKind::Export, &export.name);
+    }
+    for argument in &parsed.arguments {
+        record(DeclarationKind::Argument, &argument.name);
+    }
+    for attribute in &parsed.attribute_params {
+        record(DeclarationKind::ModuleAttribute, &attribute.name);
+    }
+
+    // Start from ParsedFile's canonical structural-binding inventory, whose
+    // coverage test in parser/ast.rs is the guard against newly added binding
+    // kinds silently escaping this directory-level uniqueness check. A single
+    // let declaration can appear there and in `variables`; collapse that echo
+    // below. Arguments and functions deliberately leave this set because this
+    // pass records them above in their parser-defined namespaces.
+    let argument_names: HashSet<&str> = parsed
+        .arguments
+        .iter()
+        .map(|argument| argument.name.as_str())
+        .collect();
+    let function_names: HashSet<&str> = parsed.user_functions.keys().map(String::as_str).collect();
+    let mut binding_names: BTreeSet<&str> = parsed
+        .structural_binding_names()
+        .into_iter()
+        .filter(|name| !argument_names.contains(name) && !function_names.contains(name))
+        .collect();
+    for name in local_variable_names {
+        if parsed.variables.contains_key(name)
+            && !binding_names.contains(name.as_str())
+            && !argument_names.contains(name.as_str())
+        {
+            binding_names.insert(name);
+        }
+    }
+    for name in binding_names {
+        if name != "_" {
+            record(DeclarationKind::Binding, name);
+        }
+    }
+
+    // The parser already rejects duplicates within one file, but sibling
+    // function maps would otherwise retain whichever file merged last.
+    for name in parsed.user_functions.keys() {
+        record(DeclarationKind::UserFunction, name);
+    }
+}
+
+fn duplicate_groups(occurrences: DeclarationGroups) -> Vec<DuplicateDeclaration> {
+    occurrences
+        .into_iter()
+        .filter_map(|((_namespace, name), occurrences)| {
+            DuplicateDeclaration::new(name, occurrences)
+        })
+        .collect()
+}
+
+/// Find same-file duplicate declarations from an already parsed buffer.
+///
+/// This is the degraded-mode counterpart to directory extraction for editors:
+/// it cannot diagnose cross-file collisions, but it preserves same-block
+/// diagnostics when an unrelated sibling fails to parse.
+pub fn find_duplicate_declarations_in_parsed_file(
+    file_name: &Path,
+    parsed: &ParsedFile,
+) -> Vec<DuplicateDeclaration> {
+    let mut occurrences = BTreeMap::new();
+    let local_variable_names = local_variable_names(parsed);
+    collect_file_declarations(file_name, parsed, &local_variable_names, &mut occurrences);
+    duplicate_groups(occurrences)
 }
 
 /// Load configuration from a directory containing .crn files
@@ -109,6 +429,7 @@ pub fn load_configuration_with_config(
             Ok(v) => v,
             Err(e) => return Err(format!("{}: {}", path.display(), e)),
         };
+        let duplicate_declarations = find_duplicate_declarations(path, &parsed_files);
 
         let empty_parsed = ParsedFile::default;
         let mut merged = empty_parsed();
@@ -199,6 +520,7 @@ pub fn load_configuration_with_config(
             backend_file,
             identifier_scope_errors,
             inference_errors,
+            duplicate_declarations,
         })
     } else {
         Err(format!("Path not found: {}", path.display()))
@@ -226,6 +548,26 @@ pub fn parse_directory_with_overrides(
     config: &ProviderContext,
     overrides: &HashMap<String, String>,
 ) -> Result<ParsedFile, String> {
+    parse_directory_with_overrides_and_diagnostics(dir, config, overrides)
+        .map(|result| result.parsed)
+}
+
+/// Directory parse result for editor and other non-blocking consumers that
+/// need the merged AST together with load-seam diagnostics.
+pub struct DirectoryParseResult {
+    pub parsed: ParsedFile,
+    pub duplicate_declarations: Vec<DuplicateDeclaration>,
+}
+
+/// Diagnostic-preserving variant of [`parse_directory_with_overrides`].
+///
+/// Duplicate declarations do not make the parse fail: LSP callers need the
+/// merged tree to survive while a user is editing a collision.
+pub fn parse_directory_with_overrides_and_diagnostics(
+    dir: &Path,
+    config: &ProviderContext,
+    overrides: &HashMap<String, String>,
+) -> Result<DirectoryParseResult, String> {
     let files = find_crn_files_in_dir(dir)?;
     let mut paths: Vec<(std::path::PathBuf, String)> = files
         .into_iter()
@@ -261,6 +603,7 @@ pub fn parse_directory_with_overrides(
         Ok(v) => v,
         Err(e) => return Err(format!("{}: {}", dir.display(), e)),
     };
+    let duplicate_declarations = find_duplicate_declarations(dir, &parsed_files);
 
     let mut merged = ParsedFile::default();
 
@@ -293,7 +636,10 @@ pub fn parse_directory_with_overrides(
     // the error as a diagnostic; CLI entry points call
     // `parser::check_identifier_scope` themselves (see
     // `load_configuration_with_config`).
-    Ok(merged)
+    Ok(DirectoryParseResult {
+        parsed: merged,
+        duplicate_declarations,
+    })
 }
 
 /// Re-label a parsed file's export-param phase (`File<A>` → `File<B>`)
@@ -489,9 +835,15 @@ pub fn parse_directory_files(
 
     // Pass 2: re-parse each file with the sibling-aware union seeded into `ctx`.
     let mut out = Vec::with_capacity(files.len());
-    for (path, content) in files {
+    for ((path, content), local_variable_names) in files.iter().zip(pass_1a_local_variables) {
         let parsed = parser::parse_with_seeded_bindings(content, config, &final_seeds)?;
-        out.push((path.clone(), DirectoryResolvedFile(parsed)));
+        out.push((
+            path.clone(),
+            DirectoryResolvedFile {
+                parsed,
+                local_variable_names,
+            },
+        ));
     }
     Ok(out)
 }
@@ -1353,6 +1705,342 @@ awscc.ec2.SecurityGroup {
             loaded.identifier_scope_errors.is_empty(),
             "no identifier-scope errors expected, got: {:?}",
             loaded.identifier_scope_errors,
+        );
+    }
+
+    fn duplicate_messages(dir: &Path, sources: &[(&str, &str)]) -> Vec<String> {
+        let files: Vec<_> = sources
+            .iter()
+            .map(|(name, source)| (dir.join(name), (*source).to_string()))
+            .collect();
+        let parsed_files =
+            parse_directory_files(&files, &ProviderContext::default()).expect("parse directory");
+        find_duplicate_declarations(dir, &parsed_files)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    fn duplicate_messages_for_two_copies(parsed: ParsedFile) -> Vec<String> {
+        let temp = tempfile::tempdir().unwrap();
+        let parsed_files: Vec<_> = ["a.crn", "b.crn"]
+            .into_iter()
+            .map(|name| {
+                let parsed = parsed.clone();
+                let local_variable_names = parsed.variables.keys().cloned().collect();
+                (
+                    temp.path().join(name),
+                    DirectoryResolvedFile {
+                        parsed,
+                        local_variable_names,
+                    },
+                )
+            })
+            .collect();
+
+        find_duplicate_declarations(temp.path(), &parsed_files)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn duplicate_extraction_deduplicates_resource_variable_echo() {
+        let temp = tempfile::tempdir().unwrap();
+        let messages = duplicate_messages(
+            temp.path(),
+            &[(
+                "main.crn",
+                "let echoed = mock.test.Thing {\n  name = \"echoed\"\n}\n",
+            )],
+        );
+
+        assert!(messages.is_empty(), "unexpected duplicates: {messages:#?}");
+    }
+
+    #[test]
+    fn duplicate_extraction_excludes_discard_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let messages = duplicate_messages(
+            temp.path(),
+            &[("a.crn", "let _ = \"a\"\n"), ("b.crn", "let _ = \"b\"\n")],
+        );
+
+        assert!(messages.is_empty(), "unexpected duplicates: {messages:#?}");
+    }
+
+    #[test]
+    fn duplicate_extraction_only_treats_underscore_as_discard_in_binding_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let parsed_files: Vec<_> = ["a.crn", "b.crn"]
+            .into_iter()
+            .map(|name| {
+                let parsed = ParsedFile {
+                    export_params: vec![crate::parser::ParsedExportParam {
+                        name: "_".to_string(),
+                        type_expr: None,
+                        value: None,
+                    }],
+                    ..ParsedFile::default()
+                };
+                (
+                    temp.path().join(name),
+                    DirectoryResolvedFile {
+                        parsed,
+                        local_variable_names: HashSet::new(),
+                    },
+                )
+            })
+            .collect();
+        let messages: Vec<_> = find_duplicate_declarations(temp.path(), &parsed_files)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+
+        assert_eq!(
+            messages,
+            vec!["duplicate export '_': declared in a.crn and b.crn"]
+        );
+    }
+
+    #[test]
+    fn duplicate_extraction_counts_value_lets_by_source_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let messages = duplicate_messages(
+            temp.path(),
+            &[("a.crn", "let v = \"a\"\n"), ("b.crn", "let v = \"b\"\n")],
+        );
+
+        assert_eq!(
+            messages,
+            vec!["duplicate binding 'v': declared in a.crn and b.crn"]
+        );
+    }
+
+    #[test]
+    fn duplicate_extraction_covers_resource_bindings() {
+        let mut resource = crate::resource::Resource::new("mock.test.Thing", "shared");
+        resource.binding = Some("shared".to_string());
+        let parsed = ParsedFile {
+            resources: vec![resource],
+            ..ParsedFile::default()
+        };
+
+        assert_eq!(
+            duplicate_messages_for_two_copies(parsed),
+            vec!["duplicate binding 'shared': declared in a.crn and b.crn"]
+        );
+    }
+
+    #[test]
+    fn duplicate_extraction_covers_data_source_bindings() {
+        let mut data_source = crate::resource::DataSource::new("mock.test.Thing", "shared");
+        data_source.binding = Some("shared".to_string());
+        let parsed = ParsedFile {
+            data_sources: vec![data_source],
+            ..ParsedFile::default()
+        };
+
+        assert_eq!(
+            duplicate_messages_for_two_copies(parsed),
+            vec!["duplicate binding 'shared': declared in a.crn and b.crn"]
+        );
+    }
+
+    #[test]
+    fn duplicate_extraction_covers_module_call_bindings() {
+        let parsed = ParsedFile {
+            module_calls: vec![crate::parser::ModuleCall {
+                module_name: "module".to_string(),
+                binding_name: Some("shared".to_string()),
+                arguments: HashMap::new(),
+            }],
+            ..ParsedFile::default()
+        };
+
+        assert_eq!(
+            duplicate_messages_for_two_copies(parsed),
+            vec!["duplicate binding 'shared': declared in a.crn and b.crn"]
+        );
+    }
+
+    #[test]
+    fn duplicate_extraction_covers_wait_bindings() {
+        let parsed = ParsedFile {
+            wait_bindings: vec![crate::parser::WaitBinding {
+                binding: crate::parser::BindingName::from("shared"),
+                target: crate::parser::BindingName::from("target"),
+                until_raw: "target.status == 'ready'".to_string(),
+                until_predicate: crate::parser::UntilPredicateAst {
+                    lhs_segments: vec!["target".to_string(), "status".to_string()],
+                    rhs: Value::Concrete(crate::resource::ConcreteValue::String(
+                        "ready".to_string(),
+                    )),
+                },
+                timeout_secs: None,
+                depends_on: Vec::new(),
+                line: 1,
+            }],
+            ..ParsedFile::default()
+        };
+
+        assert_eq!(
+            duplicate_messages_for_two_copies(parsed),
+            vec!["duplicate binding 'shared': declared in a.crn and b.crn"]
+        );
+    }
+
+    #[test]
+    fn duplicate_extraction_covers_named_provider_bindings() {
+        let parsed = ParsedFile {
+            providers: vec![crate::parser::ProviderConfig {
+                name: "mock".to_string(),
+                attributes: IndexMap::new(),
+                default_tags: IndexMap::new(),
+                source: None,
+                version: None,
+                revision: None,
+                unresolved_attributes: IndexMap::new(),
+                binding: Some("shared".to_string()),
+                is_default: false,
+            }],
+            ..ParsedFile::default()
+        };
+
+        assert_eq!(
+            duplicate_messages_for_two_copies(parsed),
+            vec!["duplicate binding 'shared': declared in a.crn and b.crn"]
+        );
+    }
+
+    #[test]
+    fn duplicate_extraction_groups_cross_file_arguments_with_bindings() {
+        let temp = tempfile::tempdir().unwrap();
+        let messages = duplicate_messages(
+            temp.path(),
+            &[
+                ("a.crn", "arguments {\n  a: String = \"x\"\n}\n"),
+                ("b.crn", "let a = \"y\"\n"),
+            ],
+        );
+
+        assert_eq!(
+            messages,
+            vec!["duplicate name 'a': declared as argument in a.crn and as binding in b.crn"]
+        );
+    }
+
+    #[test]
+    fn duplicate_extraction_keeps_cross_file_argument_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let messages = duplicate_messages(
+            temp.path(),
+            &[
+                ("a.crn", "arguments {\n  a: String = \"x\"\n}\n"),
+                ("b.crn", "arguments {\n  a: String = \"y\"\n}\n"),
+            ],
+        );
+
+        assert_eq!(
+            messages,
+            vec!["duplicate argument 'a': declared in a.crn and b.crn"]
+        );
+    }
+
+    #[test]
+    fn parser_still_rejects_argument_and_binding_in_one_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let files = vec![(
+            temp.path().join("main.crn"),
+            "arguments {\n  a: String = \"x\"\n}\nlet a = \"y\"\n".to_string(),
+        )];
+
+        let error = parse_directory_files(&files, &ProviderContext::default())
+            .expect_err("an argument and let binding share the parser namespace");
+        assert!(
+            matches!(error, parser::ParseError::DuplicateBinding { ref name, .. } if name == "a"),
+            "expected DuplicateBinding for `a`, got: {error:?}",
+        );
+    }
+
+    #[test]
+    fn module_attributes_and_bindings_remain_separate_namespaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let same_file = duplicate_messages(
+            temp.path(),
+            &[(
+                "same.crn",
+                "attributes {\n  shared = \"attribute\"\n}\nlet shared = \"binding\"\n",
+            )],
+        );
+        let cross_file = duplicate_messages(
+            temp.path(),
+            &[
+                ("a.crn", "attributes {\n  shared = \"attribute\"\n}\n"),
+                ("b.crn", "let shared = \"binding\"\n"),
+            ],
+        );
+
+        assert!(
+            same_file.is_empty(),
+            "the parser allows attribute and binding names to overlap: {same_file:#?}",
+        );
+        assert!(
+            cross_file.is_empty(),
+            "directory validation must mirror the parser namespace: {cross_file:#?}",
+        );
+    }
+
+    #[test]
+    fn user_functions_and_bindings_remain_separate_namespaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let same_file = duplicate_messages(
+            temp.path(),
+            &[(
+                "same.crn",
+                "fn f() {\n  \"function\"\n}\nlet f = \"binding\"\n",
+            )],
+        );
+        let cross_kind = duplicate_messages(
+            temp.path(),
+            &[
+                ("a.crn", "fn f() {\n  \"function\"\n}\n"),
+                ("b.crn", "let f = \"binding\"\n"),
+            ],
+        );
+        let duplicate_functions = duplicate_messages(
+            temp.path(),
+            &[
+                ("a.crn", "fn f() {\n  \"first\"\n}\n"),
+                ("b.crn", "fn f() {\n  \"second\"\n}\n"),
+            ],
+        );
+
+        assert!(
+            same_file.is_empty(),
+            "the parser allows function and binding names to overlap: {same_file:#?}",
+        );
+        assert!(
+            cross_kind.is_empty(),
+            "directory validation must keep functions and bindings separate: {cross_kind:#?}",
+        );
+        assert_eq!(
+            duplicate_functions,
+            vec!["duplicate function 'f': declared in a.crn and b.crn"]
+        );
+    }
+
+    #[test]
+    fn duplicate_extraction_uses_multiset_semantics_for_exports() {
+        let temp = tempfile::tempdir().unwrap();
+        let messages = duplicate_messages(
+            temp.path(),
+            &[("main.crn", "exports {\n  x = \"one\"\n  x = \"two\"\n}\n")],
+        );
+
+        assert_eq!(
+            messages,
+            vec!["duplicate export 'x': declared 2 times in main.crn"]
         );
     }
 }

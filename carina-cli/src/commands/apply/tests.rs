@@ -610,6 +610,7 @@ async fn run_apply_cascade_fixture(
         })],
         HashMap::new(),
         &loaded.inference_errors,
+        &loaded.duplicate_declarations,
     );
     assert!(
         validation_errors.is_empty(),
@@ -906,6 +907,7 @@ fn load_and_resolve_module_data_source_fixture(
         })],
         HashMap::new(),
         &loaded.inference_errors,
+        &loaded.duplicate_declarations,
     );
     assert!(
         validation_errors.is_empty(),
@@ -1496,6 +1498,7 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
         vec![Box::new(FailBCreateFactory)],
         HashMap::new(),
         &loaded.inference_errors,
+        &loaded.duplicate_declarations,
     );
     assert!(
         validation_errors.is_empty(),
@@ -1568,6 +1571,7 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
         })],
         HashMap::new(),
         &loaded.inference_errors,
+        &loaded.duplicate_declarations,
     );
     assert!(
         validation_errors.is_empty(),
@@ -1657,6 +1661,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_fails() {
         })],
         HashMap::new(),
         &loaded.inference_errors,
+        &loaded.duplicate_declarations,
     );
     assert!(
         validation_errors.is_empty(),
@@ -1723,6 +1728,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
         })],
         HashMap::new(),
         &loaded.inference_errors,
+        &loaded.duplicate_declarations,
     );
     assert!(
         validation_errors.is_empty(),
@@ -1925,6 +1931,7 @@ awscc.ec2.Subnet {{
         })],
         HashMap::new(),
         &loaded.inference_errors,
+        &loaded.duplicate_declarations,
     );
     assert!(
         validation_errors.is_empty(),
@@ -2012,6 +2019,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         })],
         HashMap::new(),
         &loaded.inference_errors,
+        &loaded.duplicate_declarations,
     );
     assert!(
         validation_errors.is_empty(),
@@ -2062,6 +2070,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         })],
         HashMap::new(),
         &loaded.inference_errors,
+        &loaded.duplicate_declarations,
     );
     assert!(
         validation_errors.is_empty(),
@@ -2156,6 +2165,7 @@ let consumer = mock.iam.Role {{
         })],
         HashMap::new(),
         &loaded.inference_errors,
+        &loaded.duplicate_declarations,
     );
     assert!(
         validation_errors.is_empty(),

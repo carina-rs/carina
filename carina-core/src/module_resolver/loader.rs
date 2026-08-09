@@ -10,6 +10,13 @@ use crate::parser::{ParsedFile, ProviderContext};
 
 use super::error::ModuleError;
 
+/// A parsed module plus non-blocking diagnostics discovered while its sibling
+/// files were still separate.
+pub struct LoadedModule {
+    pub parsed: ParsedFile,
+    pub duplicate_declarations: Vec<crate::config_loader::DuplicateDeclaration>,
+}
+
 /// Get parsed file info for display (supports both module definitions and root configs)
 pub fn get_parsed_file(path: &Path) -> Result<ParsedFile, ModuleError> {
     let content = fs::read_to_string(path)?;
@@ -25,10 +32,15 @@ pub fn get_parsed_file(path: &Path) -> Result<ParsedFile, ModuleError> {
 /// Returns `None` if `path` is not a directory, cannot be read/parsed, or
 /// contains no module definitions (no inputs or outputs).
 pub fn load_module(path: &Path) -> Option<ParsedFile> {
+    load_module_with_diagnostics(path).map(|loaded| loaded.parsed)
+}
+
+/// Diagnostic-preserving variant of [`load_module`].
+pub fn load_module_with_diagnostics(path: &Path) -> Option<LoadedModule> {
     if !path.is_dir() {
         return None;
     }
-    load_directory_module(path)
+    load_directory_module_with_diagnostics(path)
 }
 
 /// Collect `.crn` file paths directly inside `dir_path`, sorted by path.
@@ -56,6 +68,11 @@ pub(super) fn sorted_crn_paths_in(dir_path: &Path) -> std::io::Result<Vec<PathBu
 /// every file's `ParseContext` is seeded with the binding-name union
 /// from sibling `.crn` files (#2817).
 pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
+    load_directory_module_with_diagnostics(dir_path).map(|loaded| loaded.parsed)
+}
+
+/// Diagnostic-preserving variant of [`load_directory_module`].
+fn load_directory_module_with_diagnostics(dir_path: &Path) -> Option<LoadedModule> {
     let paths = sorted_crn_paths_in(dir_path).ok()?;
     let mut files: Vec<(PathBuf, String)> = Vec::with_capacity(paths.len());
     for path in paths {
@@ -65,6 +82,8 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
     }
     let parsed_files =
         crate::config_loader::parse_directory_files(&files, &ProviderContext::default()).ok()?;
+    let duplicate_declarations =
+        crate::config_loader::find_duplicate_declarations(dir_path, &parsed_files);
 
     let mut merged = ParsedFile::default();
     for (file, parsed) in parsed_files {
@@ -82,7 +101,10 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
     if merged.arguments.is_empty() && merged.attribute_params.is_empty() {
         None
     } else {
-        Some(merged)
+        Some(LoadedModule {
+            parsed: merged,
+            duplicate_declarations,
+        })
     }
 }
 
@@ -200,6 +222,38 @@ mod tests {
         let parsed = load_module(dir).expect("module should load");
         let names: Vec<&str> = parsed.arguments.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn load_module_diagnostics_cover_arguments_and_internal_bindings() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+
+        fs::write(
+            dir.join("a.crn"),
+            "arguments {\n  input: String\n}\nlet internal = \"a\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("b.crn"),
+            "arguments {\n  input: String\n}\nlet internal = \"b\"\n",
+        )
+        .unwrap();
+
+        let loaded = load_module_with_diagnostics(dir).expect("module should load");
+        let messages: Vec<String> = loaded
+            .duplicate_declarations
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+
+        assert_eq!(
+            messages,
+            vec![
+                "duplicate argument 'input': declared in a.crn and b.crn",
+                "duplicate binding 'internal': declared in a.crn and b.crn",
+            ]
+        );
     }
 
     #[test]

@@ -31,8 +31,8 @@ mod validation;
 pub use error::ModuleError;
 pub use expander::{instance_prefix_for_call, reconcile_anonymous_module_instances};
 pub use loader::{
-    derive_module_name, get_parsed_file, load_directory_module, load_module,
-    load_module_from_directory,
+    LoadedModule, derive_module_name, get_parsed_file, load_directory_module, load_module,
+    load_module_from_directory, load_module_with_diagnostics,
 };
 pub use resolver::{ModuleResolver, resolve_modules, resolve_modules_with_config};
 

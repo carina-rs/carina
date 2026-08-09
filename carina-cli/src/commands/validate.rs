@@ -11,7 +11,6 @@ use carina_core::lint::find_duplicate_attrs;
 use carina_core::parser::{File, ProviderContext, ResourceRef, UpstreamState};
 use carina_core::resource::ResourceId;
 
-use super::validate_and_resolve_errors;
 use crate::error::AppError;
 use crate::wiring::check_unused_bindings;
 
@@ -86,6 +85,7 @@ pub fn validate_with_factories(
             factories,
             std::collections::HashMap::new(),
             &loaded.inference_errors,
+            &loaded.duplicate_declarations,
         )
         .iter()
         .map(ToString::to_string),
@@ -129,6 +129,7 @@ pub fn validated_resource_ids_with_factories(
         factories,
         std::collections::HashMap::new(),
         &loaded.inference_errors,
+        &loaded.duplicate_declarations,
     );
 
     validated_entries(&parsed)
@@ -290,8 +291,13 @@ pub fn run_validate(
         println!("{}", "Validating...".cyan());
     }
 
-    let validation_errors =
-        validate_and_resolve_errors(&mut parsed, base_dir, false, &loaded.inference_errors);
+    let validation_errors = super::validate_and_resolve_errors(
+        &mut parsed,
+        base_dir,
+        false,
+        &loaded.inference_errors,
+        &loaded.duplicate_declarations,
+    );
     parsed.print_warnings_from(printed_warning_count);
     error_reports.extend(validation_errors.iter().map(ToString::to_string));
 

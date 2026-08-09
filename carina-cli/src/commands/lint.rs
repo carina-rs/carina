@@ -16,6 +16,7 @@ use carina_core::module_resolver;
 use carina_core::parser::ProviderContext;
 
 use crate::error::AppError;
+use crate::module_walk::ModuleWalk;
 use crate::wiring::{WiringContext, build_factories_from_providers};
 
 /// A lint warning with file, line, and message info.
@@ -26,14 +27,16 @@ struct LintWarning {
 }
 
 pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), AppError> {
-    let mut parsed = load_configuration_with_config(
+    let loaded = load_configuration_with_config(
         path,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
-    )?
-    .parsed;
+    )?;
+    let duplicate_declarations = loaded.duplicate_declarations;
+    let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
+    let module_walk = ModuleWalk::load(&parsed, base_dir);
 
     // Resolve modules
     module_resolver::resolve_modules_with_config(&mut parsed, base_dir, provider_context)
@@ -83,6 +86,33 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
 
     // Scan each source file for list literal usage of List<Struct> attributes
     let mut warnings: Vec<LintWarning> = Vec::new();
+    for duplicate in &duplicate_declarations {
+        let file = duplicate
+            .first_file()
+            .map(|relative| path.join(relative))
+            .unwrap_or_else(|| path.to_path_buf());
+        warnings.push(LintWarning {
+            file,
+            // Declaration AST nodes do not carry spans. Keep the finding in
+            // lint's normal file:line shape and anchor it at the file start;
+            // the message retains exact per-file provenance.
+            line: 1,
+            message: duplicate.to_string(),
+        });
+    }
+    for module in module_walk.iter() {
+        for duplicate in &module.loaded().duplicate_declarations {
+            let file = duplicate
+                .first_file()
+                .map(|relative| module.module_path().join(relative))
+                .unwrap_or_else(|| module.module_path().to_path_buf());
+            warnings.push(LintWarning {
+                file,
+                line: 1,
+                message: format!("{}: {duplicate}", module.diagnostic_path().display()),
+            });
+        }
+    }
     // Collect tag keys across all files for cross-file consistency check
     let mut all_tag_keys: Vec<TagKeyEntry> = Vec::new();
     let mut tag_key_files: Vec<PathBuf> = Vec::new();

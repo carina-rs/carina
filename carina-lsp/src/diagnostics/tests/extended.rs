@@ -4321,3 +4321,163 @@ let bucket = awscc.s3.Bucket {
         diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
     );
 }
+
+// =====================================================================
+// Directory-wide duplicate declarations (carina#3714).
+// =====================================================================
+
+#[test]
+fn duplicate_export_across_buffer_and_sibling_is_one_anchored_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path();
+    std::fs::write(
+        base.join("sibling.crn"),
+        "exports {\n  x = \"sibling\"\n}\n",
+    )
+    .unwrap();
+    let source = "exports {\n  x = \"buffer\"\n}\n";
+    let doc = create_document(source);
+
+    let diagnostics = test_engine().analyze_with_filename(&doc, Some("main.crn"), Some(base));
+    let duplicates: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.starts_with("duplicate export 'x'"))
+        .collect();
+
+    assert_eq!(duplicates.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        duplicates[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+    assert_eq!(duplicates[0].range.start.line, 1);
+    assert_eq!(duplicates[0].range.start.character, 2);
+    assert!(duplicates[0].message.contains("main.crn"));
+    assert!(duplicates[0].message.contains("sibling.crn"));
+}
+
+#[test]
+fn duplicate_binding_across_buffer_and_sibling_is_one_anchored_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path();
+    std::fs::write(base.join("sibling.crn"), "let v = \"sibling\"\n").unwrap();
+    let source = "let v = \"buffer\"\n";
+    let doc = create_document(source);
+
+    let diagnostics = test_engine().analyze_with_filename(&doc, Some("main.crn"), Some(base));
+    let duplicates: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.starts_with("duplicate binding 'v'"))
+        .collect();
+
+    assert_eq!(duplicates.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        duplicates[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+    assert_eq!(duplicates[0].range.start.line, 0);
+    assert_eq!(duplicates[0].range.start.character, 4);
+    assert!(duplicates[0].message.contains("main.crn"));
+    assert!(duplicates[0].message.contains("sibling.crn"));
+}
+
+#[test]
+fn duplicate_user_function_anchors_on_exact_identifier() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path();
+    std::fs::write(base.join("sibling.crn"), "fn tag() {\n  \"sibling\"\n}\n").unwrap();
+    let source = "fn tag_name() {\n  \"longer name\"\n}\n\nfn tag() {\n  \"buffer\"\n}\n";
+    let doc = create_document(source);
+
+    let diagnostics = test_engine().analyze_with_filename(&doc, Some("main.crn"), Some(base));
+    let duplicates: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.starts_with("duplicate function 'tag'"))
+        .collect();
+
+    assert_eq!(duplicates.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(duplicates[0].range.start.line, 4);
+    assert_eq!(duplicates[0].range.start.character, 3);
+    assert_eq!(duplicates[0].range.end.line, 4);
+    assert_eq!(duplicates[0].range.end.character, 6);
+}
+
+#[test]
+fn same_block_duplicate_export_has_error_without_last_wins_warning() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path();
+    let source = "exports {\n  x = \"one\"\n  x = \"two\"\n}\n";
+    let doc = create_document(source);
+
+    let diagnostics = test_engine().analyze_with_filename(&doc, Some("main.crn"), Some(base));
+    let duplicates: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.starts_with("duplicate export 'x'"))
+        .collect();
+
+    assert_eq!(duplicates.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        duplicates[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("last value")),
+        "export duplicates must not retain a last-write-wins warning: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn same_block_duplicate_module_attribute_has_error_without_last_wins_warning() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path();
+    let source = "attributes {\n  x = \"one\"\n  x = \"two\"\n}\n";
+    let doc = create_document(source);
+
+    let diagnostics = test_engine().analyze_with_filename(&doc, Some("main.crn"), Some(base));
+    let duplicates: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .starts_with("duplicate module attribute 'x'")
+        })
+        .collect();
+
+    assert_eq!(duplicates.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(
+        duplicates[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("last value")),
+        "module attribute duplicates must not retain a last-write-wins warning: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn same_block_duplicate_export_survives_broken_sibling_parse() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path();
+    std::fs::write(base.join("broken.crn"), "provider gcp { region = ").unwrap();
+    let source = "exports {\n  x = \"one\"\n  x = \"two\"\n}\n";
+    let doc = create_document(source);
+
+    let diagnostics = test_engine().analyze_with_filename(&doc, Some("main.crn"), Some(base));
+    let duplicates: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.starts_with("duplicate export 'x'"))
+        .collect();
+
+    assert_eq!(duplicates.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(duplicates[0].range.start.line, 1);
+    assert_eq!(duplicates[0].range.start.character, 2);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("last value")),
+        "the fallback must not restore the last-write-wins warning: {diagnostics:#?}",
+    );
+}

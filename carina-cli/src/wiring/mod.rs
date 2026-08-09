@@ -47,6 +47,7 @@ use carina_state::{BackendError, StateFile};
 
 use crate::commands::shared::progress::{RefreshProgress, refresh_multi_progress};
 use crate::error::AppError;
+use crate::module_walk::ModuleWalk;
 
 /// Result of creating a plan, with context needed for saving
 pub struct PlanContext {
@@ -1191,22 +1192,33 @@ pub fn validate_module_calls<E>(
     ))
 }
 
-pub fn validate_module_attribute_param_types<E>(
+pub(crate) fn validate_module_attribute_param_types(
     ctx: &WiringContext,
-    parsed: &carina_core::parser::File<E>,
-    base_dir: &Path,
+    module_walk: &ModuleWalk,
 ) -> Vec<AppError> {
     let mut errors = Vec::new();
-    let mut visited = HashSet::new();
-    for import in &parsed.uses {
-        let module_path = base_dir.join(&import.path);
-        validate_module_attribute_params_at_path(
-            ctx,
-            &module_path,
-            Path::new(&import.path),
-            &mut visited,
-            &mut errors,
-        );
+    for module in module_walk.iter() {
+        let module_parsed = &module.loaded().parsed;
+        if module_parsed.attribute_params.is_empty() {
+            continue;
+        }
+        let bindings =
+            carina_core::binding_index::BindingIndex::from_parsed(module_parsed, ctx.schemas());
+        let module_call_attributes =
+            pre_expansion_module_call_attributes(module_parsed, module.module_path(), module_walk);
+        if let Err(joined) =
+            validation::validate_attribute_param_ref_types_with_bindings_and_module_calls(
+                &module_parsed.attribute_params,
+                &bindings,
+                &module_call_attributes,
+            )
+        {
+            // Preserve the module-path prefix the legacy wrapper emitted
+            // so diagnostics point at which imported module failed.
+            errors.extend(joined.split('\n').filter(|s| !s.is_empty()).map(|s| {
+                AppError::Validation(format!("{}: {}", module.diagnostic_path().display(), s))
+            }));
+        }
     }
     errors
 }
@@ -1214,6 +1226,7 @@ pub fn validate_module_attribute_param_types<E>(
 fn pre_expansion_module_call_attributes(
     module_parsed: &carina_core::parser::ParsedFile,
     module_path: &Path,
+    module_walk: &ModuleWalk,
 ) -> validation::PreExpansionModuleCallAttributes {
     let called_aliases: HashSet<&str> = module_parsed
         .module_calls
@@ -1226,11 +1239,9 @@ fn pre_expansion_module_call_attributes(
         if !called_aliases.contains(import.alias.as_str()) {
             continue;
         }
-        // `load_module` is deliberately shallow: it reads this imported
-        // module's declarations but does not recurse into its own imports.
-        // The recursive descent below remains the only descent point, so its
-        // canonical-path `visited` guard continues to own cycle safety.
-        let Some(imported) = module_resolver::load_module(&module_path.join(&import.path)) else {
+        // Reuse the shared walk's loaded snapshot. This keeps attribute type
+        // validation from starting a second filesystem/module traversal.
+        let Some(imported) = module_walk.parsed_at(&module_path.join(&import.path)) else {
             continue;
         };
         attributes_by_alias.insert(
@@ -1254,58 +1265,6 @@ fn pre_expansion_module_call_attributes(
         attributes_by_binding.insert(binding_name.clone(), attribute_names.clone());
     }
     attributes_by_binding
-}
-
-fn validate_module_attribute_params_at_path(
-    ctx: &WiringContext,
-    module_path: &Path,
-    diagnostic_path: &Path,
-    visited: &mut HashSet<std::path::PathBuf>,
-    errors: &mut Vec<AppError>,
-) {
-    let guard_path =
-        std::fs::canonicalize(module_path).unwrap_or_else(|_| module_path.to_path_buf());
-    if !visited.insert(guard_path) {
-        return;
-    }
-
-    let Some(module_parsed) = module_resolver::load_module(module_path) else {
-        return;
-    };
-
-    if !module_parsed.attribute_params.is_empty() {
-        let bindings =
-            carina_core::binding_index::BindingIndex::from_parsed(&module_parsed, ctx.schemas());
-        let module_call_attributes =
-            pre_expansion_module_call_attributes(&module_parsed, module_path);
-        if let Err(joined) =
-            validation::validate_attribute_param_ref_types_with_bindings_and_module_calls(
-                &module_parsed.attribute_params,
-                &bindings,
-                &module_call_attributes,
-            )
-        {
-            // Preserve the module-path prefix the legacy wrapper emitted
-            // so diagnostics point at which imported module failed.
-            let prefix = diagnostic_path.display().to_string();
-            errors.extend(
-                joined
-                    .split('\n')
-                    .filter(|s| !s.is_empty())
-                    .map(|s| AppError::Validation(format!("{}: {}", prefix, s))),
-            );
-        }
-    }
-
-    for import in &module_parsed.uses {
-        validate_module_attribute_params_at_path(
-            ctx,
-            &module_path.join(&import.path),
-            &diagnostic_path.join(&import.path),
-            visited,
-            errors,
-        );
-    }
 }
 
 pub async fn get_provider_with_ctx<E>(
