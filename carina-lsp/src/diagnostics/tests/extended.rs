@@ -774,6 +774,102 @@ awscc.ec2.Vpc {
     );
     let diag = provider_diag.unwrap();
     assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diag.range.start.line, 4);
+    assert_eq!(diag.range.start.character, 0);
+}
+
+#[test]
+fn provider_in_module_with_sibling_arguments_emits_error() {
+    // Issue #3717 repro shape: the open buffer contains only the provider,
+    // while a sibling file carries the marker that makes the directory a
+    // module. Buffer-only classification misses this combination.
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    std::fs::write(
+        base.join("arguments.crn"),
+        r#"arguments {
+    name: String = "test"
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(base.join("providers.crn"), "provider mock { }\n").unwrap();
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join("providers.crn")).unwrap();
+    let doc = create_document(&buffer);
+    let diagnostics = engine.analyze_with_filename(&doc, Some("providers.crn"), Some(&base));
+
+    let provider_diag = diagnostics.iter().find(|diagnostic| {
+        diagnostic
+            .message
+            .contains("provider blocks are not allowed inside modules")
+    });
+    assert!(
+        provider_diag.is_some(),
+        "Should error when a sibling file marks the directory as a module. Got: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+    let diag = provider_diag.unwrap();
+    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diag.range.start.line, 0);
+    assert_eq!(diag.range.start.character, 0);
+}
+
+#[test]
+fn arguments_buffer_with_sibling_provider_has_no_provider_diagnostic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    let arguments = r#"arguments {
+    name: String = "test"
+}
+"#;
+    std::fs::write(base.join("arguments.crn"), arguments).unwrap();
+    std::fs::write(base.join("providers.crn"), "provider mock { }\n").unwrap();
+
+    let engine = test_engine();
+    let doc = create_document(arguments);
+    let diagnostics = engine.analyze_with_filename(&doc, Some("arguments.crn"), Some(&base));
+    let provider_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("provider blocks are not allowed inside modules")
+        })
+        .collect();
+
+    assert!(
+        provider_diagnostics.is_empty(),
+        "a provider diagnostic must only anchor in the buffer that declares it. Got: {provider_diagnostics:?}",
+    );
+}
+
+#[test]
+fn provider_in_root_shaped_directory_no_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    std::fs::write(base.join("providers.crn"), "provider mock { }\n").unwrap();
+    std::fs::write(base.join("values.crn"), "let environment = \"test\"\n").unwrap();
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join("providers.crn")).unwrap();
+    let doc = create_document(&buffer);
+    let diagnostics = engine.analyze_with_filename(&doc, Some("providers.crn"), Some(&base));
+
+    assert!(
+        diagnostics.iter().all(|diagnostic| !diagnostic
+            .message
+            .contains("provider blocks are not allowed inside modules")),
+        "Should not reject a provider when no module marker exists. Got: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
