@@ -8,29 +8,29 @@
 //!   declaration kinds the parser tracks (resource, argument, module
 //!   call, upstream state, import alias, user function, variable,
 //!   structural binding from let-of-if/for/read).
-//! - [`BindingIndex`] — "what schema and which `Resource` does this
-//!   binding point at?" Schema-aware view. Used by validation and the
-//!   LSP. Each entry has both a `Resource` and a `ResourceSchema`.
+//! - [`BindingIndex`] — "what statically known attribute surface does this
+//!   binding point at?" Schema/composition-aware view. Used by validation
+//!   and the LSP.
 //! - [`ResolvedBindings`] — "what attribute values does this binding
 //!   actually carry?" Value-aware view. Used by the resolver and
 //!   executor. Includes upstream-state bindings that have no `Resource`
 //!   or `ResourceSchema`.
 //!
 //! The three are separate types rather than fields on one because their
-//! invariants differ — `BindingIndex` requires both `Resource` and
-//! `ResourceSchema`, `ResolvedBindings` requires only attribute values
-//! (no schema), `BindingNameSet` requires only the name and an origin
-//! tag. Callers that need more than one view hold them side by side.
+//! invariants differ — `BindingIndex` requires a typed validation target,
+//! `ResolvedBindings` requires only attribute values (no schema),
+//! `BindingNameSet` requires only the name and an origin tag. Callers that
+//! need more than one view hold them side by side.
 //!
 //! Built once at the parse → validate boundary, then borrowed. Resource
-//! discovery is **top-level only** (`parsed.resources`) on purpose:
+//! discovery is **top-level only** (`iter_top_level_resources`) on purpose:
 //! for-body template resources carry a parser-synthesised binding name
 //! used for address derivation, but those names are an internal detail
 //! and were never visible to validation's `binding_map` pre-#2231.
 //! Surfacing them through `BindingIndex` would let ResourceRefs name
 //! them, which is a behaviour change neither validation nor the LSP
 //! wants. Wait bindings are then layered on top as aliases of their
-//! target resource schema because `<wait>.<attr>` is addressable DSL.
+//! target validation surface because `<wait>.<attr>` is addressable DSL.
 //! The LSP still walks `iter_all_resources` separately for its own
 //! checks (so for-body type/enum diagnostics fire); only the
 //! binding-name table is scoped.
@@ -38,7 +38,7 @@
 //! ```ignore
 //! let index = BindingIndex::from_parsed(&parsed, &registry);
 //! if let Some(entry) = index.get("vpc") {
-//!     // entry.schema is the resolved schema for the binding
+//!     // entry.target is the statically known validation surface
 //! }
 //! ```
 
@@ -47,22 +47,30 @@ use crate::resource::{Composition, PlanInputState, Resource, ResourceId, State, 
 use crate::schema::{ResourceSchema, SchemaRegistry};
 use std::collections::HashMap;
 
-/// One entry in the binding index. `schema` is non-`Option` because the
-/// builder skips bindings whose schema cannot be resolved — callers never
-/// have to defend against half-populated entries.
-#[derive(Debug)]
-pub struct BindingEntry<'a> {
-    pub schema: &'a ResourceSchema,
+/// Statically known validation surface for a binding.
+#[derive(Debug, Clone, Copy)]
+pub enum BindingTarget<'a> {
+    Schema(&'a ResourceSchema),
+    Composition(&'a Composition),
 }
 
-/// Index of `binding_name → (resource, schema)` for every named binding
-/// declared in `parsed`. Lifetime `'a` ties the index to its inputs so
-/// callers can keep it borrowed without cloning.
+/// One entry in the binding index. The target is non-`Option`: managed/data
+/// bindings whose schemas cannot be resolved are skipped, while compositions
+/// always carry their declared attribute map directly.
+#[derive(Debug)]
+pub struct BindingEntry<'a> {
+    pub target: BindingTarget<'a>,
+}
+
+/// Index of `binding_name → validation target` for every named binding
+/// declared in `parsed`. Lifetime `'a` ties the index to its inputs so callers
+/// can keep it borrowed without cloning.
 ///
-/// `entries` only contains bindings whose schema resolved successfully.
-/// `known_names` records every named binding regardless of schema status,
-/// so callers can tell "unknown binding" apart from "binding exists but
-/// its schema is missing" — those are separate diagnostics.
+/// `entries` contains every composition binding plus managed/data bindings
+/// whose schemas resolved successfully. `known_names` records every named
+/// binding regardless of schema status, so callers can tell "unknown binding"
+/// apart from "binding exists but its schema is missing" — those are separate
+/// diagnostics.
 #[derive(Debug, Default)]
 pub struct BindingIndex<'a> {
     entries: HashMap<String, BindingEntry<'a>>,
@@ -75,10 +83,10 @@ impl<'a> BindingIndex<'a> {
     /// lookup, including the kind-aware split between managed resources
     /// and data sources.
     ///
-    /// Bindings whose schema is missing from the registry are silently
-    /// skipped — callers (validation / LSP) treat unknown resource types
-    /// as a separate diagnostic, so reporting them again here would
-    /// double-count.
+    /// Managed/data bindings whose schema is missing from the registry are
+    /// silently skipped — callers (validation / LSP) treat unknown resource
+    /// types as a separate diagnostic, so reporting them again here would
+    /// double-count. Composition bindings do not need a registry lookup.
     pub fn from_parsed<E>(
         parsed: &'a crate::parser::File<E>,
         registry: &'a SchemaRegistry,
@@ -101,37 +109,36 @@ impl<'a> BindingIndex<'a> {
                 continue;
             };
             known_names.insert(binding_name.to_string());
-            // Schema lookup routes by the typestate arm: managed
-            // resources via `get_for`, data sources via
-            // `get_for_data_source`. A composition resource has no schema,
-            // so it stays in `known_names` but gets no `entries` row,
-            // matching the prior "known binding, schema absent" surface.
-            let schema = match rref {
+            // Schema lookup routes by the typestate arm: managed resources
+            // via `get_for`, data sources via `get_for_data_source`.
+            // Compositions carry their own statically known attribute map.
+            let target = match rref {
                 ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. } => {
-                    registry.get_for(m)
+                    registry.get_for(m).map(BindingTarget::Schema)
                 }
-                ResourceRef::DataSource(d) => registry.get_for_data_source(d),
-                ResourceRef::Composition(_) => None,
+                ResourceRef::DataSource(d) => {
+                    registry.get_for_data_source(d).map(BindingTarget::Schema)
+                }
+                ResourceRef::Composition(c) => Some(BindingTarget::Composition(c)),
             };
-            let Some(schema) = schema else {
+            let Some(target) = target else {
                 continue;
             };
-            entries.insert(binding_name.to_string(), BindingEntry { schema });
+            entries.insert(binding_name.to_string(), BindingEntry { target });
         }
         // Wait bindings are addressable aliases for their target
         // resource (`let ready = wait cert { ... }` means
-        // `ready.certificate_arn` has the same schema surface as
+        // `ready.certificate_arn` has the same validation surface as
         // `cert.certificate_arn`). The target binding has already been
         // processed above for managed resources and data sources. If the
-        // target lacks an entry (composition target, unknown resource
-        // type, or future parser expansion), keep the wait name in
-        // `known_names` so callers preserve the "known binding, schema
-        // absent" diagnostic split.
+        // target lacks an entry (unknown resource type or future parser
+        // expansion), keep the wait name in `known_names` so callers preserve
+        // the "known binding, validation target absent" diagnostic split.
         for wb in &parsed.wait_bindings {
             let wait_name = wb.binding.as_str();
             known_names.insert(wait_name.to_string());
-            if let Some(schema) = entries.get(wb.target.as_str()).map(|entry| entry.schema) {
-                entries.insert(wait_name.to_string(), BindingEntry { schema });
+            if let Some(target) = entries.get(wb.target.as_str()).map(|entry| entry.target) {
+                entries.insert(wait_name.to_string(), BindingEntry { target });
             }
         }
         Self {
@@ -168,7 +175,10 @@ impl<'a> BindingIndex<'a> {
     pub fn schemas_by_name(&self) -> HashMap<&str, &'a ResourceSchema> {
         self.entries
             .iter()
-            .map(|(name, entry)| (name.as_str(), entry.schema))
+            .filter_map(|(name, entry)| match entry.target {
+                BindingTarget::Schema(schema) => Some((name.as_str(), schema)),
+                BindingTarget::Composition(_) => None,
+            })
             .collect()
     }
 }
@@ -845,7 +855,8 @@ impl IterableBindings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse;
+    use crate::parser::{BindingName, UntilPredicateAst, WaitBinding, parse};
+    use crate::resource::{CompositionAttribute, Signature};
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     fn vpc_schema() -> ResourceSchema {
@@ -858,6 +869,27 @@ mod tests {
         let mut r = SchemaRegistry::new();
         r.insert("aws", vpc_schema());
         r
+    }
+
+    fn composition(binding: &str) -> Composition {
+        Composition {
+            id: ResourceId::with_identity("_virtual", binding),
+            signature: Signature {
+                arguments: indexmap::IndexMap::new(),
+                attributes: indexmap::indexmap! {
+                    "target_group_arn".to_string() => CompositionAttribute::from_value(
+                        Value::Concrete(crate::resource::ConcreteValue::String(
+                            "arn:example".to_string(),
+                        )),
+                    ),
+                },
+            },
+            binding: Some(binding.to_string()),
+            dependency_bindings: Default::default(),
+            module_name: "test_module".to_string(),
+            instance: binding.to_string(),
+            quoted_string_attrs: Default::default(),
+        }
     }
 
     #[test]
@@ -873,7 +905,10 @@ let vpc = aws.ec2.Vpc {
 
         let index = BindingIndex::from_parsed(&parsed, &registry);
         let entry = index.get("vpc").expect("vpc binding present");
-        assert_eq!(entry.schema.resource_type, "ec2.Vpc");
+        let BindingTarget::Schema(schema) = entry.target else {
+            panic!("managed binding must carry a schema target");
+        };
+        assert_eq!(schema.resource_type, "ec2.Vpc");
         assert!(index.is_declared("vpc"));
         assert_eq!(index.len(), 1);
     }
@@ -896,8 +931,63 @@ let existing = read aws.ec2.Vpc {
         let entry = index
             .get("existing")
             .expect("data-source binding present in index");
-        assert_eq!(entry.schema.resource_type, "ec2.Vpc");
+        let BindingTarget::Schema(schema) = entry.target else {
+            panic!("data-source binding must carry a schema target");
+        };
+        assert_eq!(schema.resource_type, "ec2.Vpc");
         assert!(index.is_declared("existing"));
+    }
+
+    #[test]
+    fn build_indexes_composition_but_excludes_it_from_schema_projection() {
+        let mut parsed = parse("", &Default::default()).expect("parse");
+        parsed.compositions.push(composition("instance"));
+
+        let registry = SchemaRegistry::new();
+        let index = BindingIndex::from_parsed(&parsed, &registry);
+
+        let entry = index
+            .get("instance")
+            .expect("composition binding must have a typed BindingIndex entry");
+        let BindingTarget::Composition(indexed) = entry.target else {
+            panic!("composition binding must carry a composition target");
+        };
+        assert!(std::ptr::eq(indexed, &parsed.compositions[0]));
+        assert!(index.is_declared("instance"));
+        assert!(
+            !index.schemas_by_name().contains_key("instance"),
+            "schema-only projection must exclude composition entries",
+        );
+    }
+
+    #[test]
+    fn wait_binding_aliases_composition_target() {
+        let mut parsed = parse("", &Default::default()).expect("parse");
+        parsed.compositions.push(composition("instance"));
+        parsed.wait_bindings.push(WaitBinding {
+            binding: BindingName::from("ready"),
+            target: BindingName::from("instance"),
+            until_raw: "instance.target_group_arn == 'ready'".to_string(),
+            until_predicate: UntilPredicateAst {
+                lhs_segments: vec!["instance".to_string(), "target_group_arn".to_string()],
+                rhs: Value::Concrete(crate::resource::ConcreteValue::String("ready".to_string())),
+            },
+            timeout_secs: None,
+            depends_on: Vec::new(),
+            line: 1,
+        });
+
+        let registry = SchemaRegistry::new();
+        let index = BindingIndex::from_parsed(&parsed, &registry);
+
+        let entry = index
+            .get("ready")
+            .expect("wait binding must alias a composition BindingTarget");
+        let BindingTarget::Composition(indexed) = entry.target else {
+            panic!("wait binding must preserve the composition target arm");
+        };
+        assert!(std::ptr::eq(indexed, &parsed.compositions[0]));
+        assert!(!index.schemas_by_name().contains_key("ready"));
     }
 
     #[test]
@@ -1014,9 +1104,11 @@ let vpc = aws.ec2.Vpc {
         let by_name = index.schemas_by_name();
         let schema = by_name.get("vpc").expect("vpc projection present");
         assert_eq!(schema.resource_type, "ec2.Vpc");
-        // The projection borrows from the index — pointer-equal to
-        // `index.get(...).schema`, which is the whole point.
-        assert!(std::ptr::eq(*schema, index.get("vpc").unwrap().schema));
+        // The projection borrows the schema held by the matching target.
+        let BindingTarget::Schema(indexed) = index.get("vpc").unwrap().target else {
+            panic!("managed binding must carry a schema target");
+        };
+        assert!(std::ptr::eq(*schema, indexed));
     }
 
     #[test]

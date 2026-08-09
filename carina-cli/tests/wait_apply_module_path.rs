@@ -115,11 +115,27 @@ impl ProviderFactory for AwsStub {
                     AttributeType::string(),
                 )),
             // distribution_config's exact shape is irrelevant here —
-            // this test asserts wait-binding propagation, not schema
-            // validation of the nested map.
+            // keep it precise enough that the full-validation guard below
+            // exercises the expanded wait target instead of stopping at an
+            // unrelated container-shape mismatch.
             ResourceSchema::new("cloudfront.Distribution").attribute(AttributeSchema::new(
                 "distribution_config",
-                AttributeType::string(),
+                AttributeType::struct_(
+                    "DistributionConfig",
+                    vec![
+                        carina_core::schema::StructField::new("enabled", AttributeType::bool()),
+                        carina_core::schema::StructField::new(
+                            "viewer_certificate",
+                            AttributeType::struct_(
+                                "ViewerCertificate",
+                                vec![carina_core::schema::StructField::new(
+                                    "acm_certificate_arn",
+                                    AttributeType::string(),
+                                )],
+                            ),
+                        ),
+                    ],
+                ),
             )),
         ]
     }
@@ -246,6 +262,7 @@ fn apply_path_propagates_module_wait_binding() {
     )
     .expect("load_configuration_with_config should succeed");
 
+    let inference_errors = loaded.inference_errors;
     let mut parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
 
@@ -265,6 +282,7 @@ fn apply_path_propagates_module_wait_binding() {
         true,
         vec![Box::new(AwsStub) as Box<dyn ProviderFactory>],
         HashMap::new(),
+        &inference_errors,
     );
     assert!(
         errors.is_empty(),
@@ -355,6 +373,47 @@ fn apply_path_propagates_module_wait_binding() {
     );
 }
 
+#[test]
+fn full_validation_accepts_expanded_module_internal_wait_target() {
+    let caller = fixture("caller");
+    let provider_context = ProviderContext::default();
+    let loaded = load_configuration_with_config(
+        &caller,
+        &provider_context,
+        &carina_core::schema::SchemaRegistry::new(),
+    )
+    .expect("load_configuration_with_config should succeed");
+
+    let inference_errors = loaded.inference_errors;
+    let mut parsed = loaded.parsed;
+    let base_dir = get_base_dir(&caller);
+    let errors = validate_and_resolve_errors_with_factories(
+        &mut parsed,
+        base_dir,
+        false,
+        vec![Box::new(AwsStub) as Box<dyn ProviderFactory>],
+        HashMap::new(),
+        &inference_errors,
+    );
+
+    assert!(
+        errors.is_empty(),
+        "full validation must accept a module-internal wait after expansion prefixes its managed-resource target: {:?}",
+        errors.iter().map(ToString::to_string).collect::<Vec<_>>(),
+    );
+    assert!(
+        parsed.wait_bindings.iter().any(|wait| {
+            wait.binding.as_str() == "r.cert_issued" && wait.target.as_str() == "r.cert"
+        }),
+        "the validated wait must retain its prefixed managed-resource target: {:?}",
+        parsed
+            .wait_bindings
+            .iter()
+            .map(|wait| (wait.binding.as_str(), wait.target.as_str()))
+            .collect::<Vec<_>>(),
+    );
+}
+
 struct CollectingObserver {
     failures: Mutex<Vec<String>>,
 }
@@ -388,6 +447,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         &carina_core::schema::SchemaRegistry::new(),
     )
     .expect("load should succeed");
+    let inference_errors = loaded.inference_errors;
     let mut parsed = loaded.parsed;
     let base_dir = get_base_dir(&caller);
 
@@ -398,6 +458,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         true,
         vec![Box::new(AwsStub) as Box<dyn ProviderFactory>],
         HashMap::new(),
+        &inference_errors,
     );
     assert!(errs.is_empty(), "expand stage must succeed: {errs:?}");
 

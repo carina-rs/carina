@@ -4,17 +4,17 @@ pub mod deferred_populate;
 pub mod depends_on;
 pub mod wait;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use indexmap::IndexMap;
 
-use crate::binding_index::BindingIndex;
+use crate::binding_index::{BindingIndex, BindingTarget};
 use crate::deps::collect_dependencies;
 use crate::parser::{
     ModuleCall, ProviderContext, ResourceRef, ResourceTypePath, TypeExpr, validate_custom_type,
 };
 use crate::provider::ProviderFactory;
-use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::resource::{AccessPath, Composition, ConcreteValue, DeferredValue, Value};
 use crate::schema::{AttributeType, SchemaRegistry, Shape, TypeIdentity, suggest_similar_name};
 
 /// Render the trailing `" Did you mean 'X'?"` segment for an unknown
@@ -25,6 +25,53 @@ fn did_you_mean(unknown: &str, known: &[&str]) -> String {
     suggest_similar_name(unknown, known)
         .map(|s| format!(" Did you mean '{}'?", s))
         .unwrap_or_default()
+}
+
+/// Return the shared unknown-attribute diagnostic suffix for a statically
+/// known attribute surface, or `None` when the referenced attribute exists.
+fn unknown_attribute_error<'a>(
+    path: &AccessPath,
+    known_attribute_names: impl IntoIterator<Item = &'a String>,
+) -> Option<String> {
+    let known_attrs: Vec<&str> = known_attribute_names
+        .into_iter()
+        .map(String::as_str)
+        .collect();
+    let ref_attr = path.attribute();
+    if known_attrs.contains(&ref_attr) {
+        return None;
+    }
+
+    let ref_binding = path.binding();
+    Some(format!(
+        "unknown attribute '{}' on '{}' in reference {}.{}{}",
+        ref_attr,
+        ref_binding,
+        ref_binding,
+        ref_attr,
+        did_you_mean(ref_attr, &known_attrs),
+    ))
+}
+
+/// Return the shared unknown-attribute diagnostic suffix for a reference to
+/// a composition's declared attribute surface, or `None` when it exists.
+fn composition_unknown_attribute_error(
+    composition: &Composition,
+    path: &AccessPath,
+) -> Option<String> {
+    unknown_attribute_error(path, composition.signature.attributes.keys())
+}
+
+fn binding_target_unknown_attribute_error(
+    target: BindingTarget<'_>,
+    path: &AccessPath,
+) -> Option<String> {
+    match target {
+        BindingTarget::Schema(schema) => unknown_attribute_error(path, schema.attributes.keys()),
+        BindingTarget::Composition(composition) => {
+            composition_unknown_attribute_error(composition, path)
+        }
+    }
 }
 
 fn check_resource_ref_existence<'a>(
@@ -45,11 +92,10 @@ fn check_resource_ref_existence<'a>(
         return None;
     }
 
-    // Look up the referenced binding's schema. `BindingIndex::get`
-    // returns `Some` only when both the binding and its schema
-    // resolved; `contains_name` distinguishes "unknown binding"
-    // from "known binding, schema absent" so we keep the original
-    // diagnostic shape (only the former gets reported here).
+    // Look up the referenced binding's typed validation target.
+    // `is_declared` distinguishes "unknown binding" from "known managed/data
+    // binding whose schema is absent", preserving the original diagnostic
+    // shape (only the former gets reported here).
     let Some(ref_entry) = bindings.get(ref_binding) else {
         if !bindings.is_declared(ref_binding) {
             all_errors.push(format!(
@@ -60,18 +106,19 @@ fn check_resource_ref_existence<'a>(
         return None;
     };
 
-    let ref_schema = ref_entry.schema;
+    let ref_schema = match ref_entry.target {
+        BindingTarget::Schema(schema) => schema,
+        BindingTarget::Composition(composition) => {
+            if let Some(error) = composition_unknown_attribute_error(composition, ref_path) {
+                all_errors.push(format!("{}: {}", resource_id, error));
+            }
+            return None;
+        }
+    };
     let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
-        let known_attrs: Vec<&str> = ref_schema.attributes.keys().map(|s| s.as_str()).collect();
-        all_errors.push(format!(
-            "{}: unknown attribute '{}' on '{}' in reference {}.{}{}",
-            resource_id,
-            ref_attr,
-            ref_binding,
-            ref_binding,
-            ref_attr,
-            did_you_mean(ref_attr, &known_attrs),
-        ));
+        let error = unknown_attribute_error(ref_path, ref_schema.attributes.keys())
+            .expect("missing schema attribute must produce an existence error");
+        all_errors.push(format!("{}: {}", resource_id, error));
         return None;
     };
 
@@ -94,6 +141,47 @@ fn check_nested_resource_ref_existence(
             all_errors,
         );
     });
+}
+
+/// Validate references carried by module-call argument values against the
+/// post-expansion binding surfaces.
+///
+/// Unknown bindings and enclosing-module argument names are intentionally
+/// ignored here: their resolution belongs to the existing scope/module-call
+/// passes. This walk only closes attribute-existence gaps for binding targets
+/// that have a statically known schema or composition signature.
+pub fn validate_module_call_argument_ref_existence_with_bindings(
+    module_calls: &[ModuleCall],
+    argument_names: &HashSet<String>,
+    bindings: &BindingIndex<'_>,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+
+    for call in module_calls {
+        let call_name = call
+            .binding_name
+            .as_deref()
+            .unwrap_or(call.module_name.as_str());
+        for value in call.arguments.values() {
+            value.visit_resource_refs(&mut |path| {
+                if argument_names.contains(path.binding()) {
+                    return;
+                }
+                let Some(entry) = bindings.get(path.binding()) else {
+                    return;
+                };
+                if let Some(error) = binding_target_unknown_attribute_error(entry.target, path) {
+                    errors.push(format!("module call '{}': {}", call_name, error));
+                }
+            });
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
 }
 
 /// Validate resources against their schemas.
@@ -336,6 +424,30 @@ pub fn validate_attribute_param_ref_types_with_bindings(
     attribute_params: &[crate::parser::AttributeParameter],
     bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
+    validate_attribute_param_ref_types_with_bindings_and_module_calls(
+        attribute_params,
+        bindings,
+        &HashMap::new(),
+    )
+}
+
+/// Pre-expansion module-call attribute surface used only while recursively
+/// validating an imported module's own `attributes {}` block.
+pub type PreExpansionModuleCallAttributes = HashMap<String, BTreeSet<String>>;
+
+/// Validate module attribute parameters before nested module expansion.
+///
+/// [`BindingIndex`] remains the sole post-expansion authority. At this seam,
+/// however, `load_module` intentionally returns an unexpanded parse, so nested
+/// module calls have no [`BindingTarget::Composition`] entry yet. The second
+/// lookup contains only the declared `attributes {}` names loaded from those
+/// calls' imported modules; it is deliberately scoped to this pre-expansion
+/// walk and provides no runtime values or schema types.
+pub fn validate_attribute_param_ref_types_with_bindings_and_module_calls(
+    attribute_params: &[crate::parser::AttributeParameter],
+    bindings: &BindingIndex<'_>,
+    module_call_attributes: &PreExpansionModuleCallAttributes,
+) -> Result<(), String> {
     let mut errors = Vec::new();
 
     for param in attribute_params {
@@ -352,7 +464,14 @@ pub fn validate_attribute_param_ref_types_with_bindings(
             Value::Deferred(DeferredValue::ResourceRef { path }),
         ) = (&param.type_expr, value)
         {
-            check_attribute_param_ref_type(&param.name, expected_type, path, bindings, &mut errors);
+            check_attribute_param_ref_type(
+                &param.name,
+                expected_type,
+                path,
+                bindings,
+                module_call_attributes,
+                &mut errors,
+            );
             continue;
         }
 
@@ -360,7 +479,13 @@ pub fn validate_attribute_param_ref_types_with_bindings(
         // a type annotation. Compatibility remains gated on the direct
         // Simple-annotated path above.
         value.visit_resource_refs(&mut |path| {
-            check_attribute_param_ref_existence(&param.name, path, bindings, &mut errors);
+            check_attribute_param_ref_existence(
+                &param.name,
+                path,
+                bindings,
+                module_call_attributes,
+                &mut errors,
+            );
         });
     }
 
@@ -376,26 +501,34 @@ fn check_attribute_param_ref_type(
     expected_type: &str,
     path: &crate::resource::AccessPath,
     bindings: &BindingIndex<'_>,
+    module_call_attributes: &PreExpansionModuleCallAttributes,
     errors: &mut Vec<String>,
 ) {
     let ref_binding = path.binding();
     let ref_attr = path.attribute();
 
     let Some(ref_entry) = bindings.get(ref_binding) else {
+        check_pre_expansion_module_call_attribute_ref(
+            param_name,
+            path,
+            module_call_attributes,
+            errors,
+        );
         return;
     };
-    let ref_schema = ref_entry.schema;
+    let ref_schema = match ref_entry.target {
+        BindingTarget::Schema(schema) => schema,
+        BindingTarget::Composition(composition) => {
+            if let Some(error) = composition_unknown_attribute_error(composition, path) {
+                errors.push(format!("attribute '{}': {}", param_name, error));
+            }
+            return;
+        }
+    };
     let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
-        let known_attrs: Vec<&str> = ref_schema.attributes.keys().map(|s| s.as_str()).collect();
-        errors.push(format!(
-            "attribute '{}': unknown attribute '{}' on '{}' in reference {}.{}{}",
-            param_name,
-            ref_attr,
-            ref_binding,
-            ref_binding,
-            ref_attr,
-            did_you_mean(ref_attr, &known_attrs),
-        ));
+        let error = unknown_attribute_error(path, ref_schema.attributes.keys())
+            .expect("missing schema attribute must produce an existence error");
+        errors.push(format!("attribute '{}': {}", param_name, error));
         return;
     };
 
@@ -422,30 +555,52 @@ fn check_attribute_param_ref_existence(
     param_name: &str,
     path: &crate::resource::AccessPath,
     bindings: &BindingIndex<'_>,
+    module_call_attributes: &PreExpansionModuleCallAttributes,
     errors: &mut Vec<String>,
 ) {
     let ref_binding = path.binding();
     let ref_attr = path.attribute();
 
     let Some(ref_entry) = bindings.get(ref_binding) else {
+        check_pre_expansion_module_call_attribute_ref(
+            param_name,
+            path,
+            module_call_attributes,
+            errors,
+        );
         return;
     };
-    let ref_schema = ref_entry.schema;
+    let ref_schema = match ref_entry.target {
+        BindingTarget::Schema(schema) => schema,
+        BindingTarget::Composition(composition) => {
+            if let Some(error) = composition_unknown_attribute_error(composition, path) {
+                errors.push(format!("attribute '{}': {}", param_name, error));
+            }
+            return;
+        }
+    };
     let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
-        let known_attrs: Vec<&str> = ref_schema.attributes.keys().map(|s| s.as_str()).collect();
-        errors.push(format!(
-            "attribute '{}': unknown attribute '{}' on '{}' in reference {}.{}{}",
-            param_name,
-            ref_attr,
-            ref_binding,
-            ref_binding,
-            ref_attr,
-            did_you_mean(ref_attr, &known_attrs),
-        ));
+        let error = unknown_attribute_error(path, ref_schema.attributes.keys())
+            .expect("missing schema attribute must produce an existence error");
+        errors.push(format!("attribute '{}': {}", param_name, error));
         return;
     };
 
     let _ = narrow_attribute_param_ref_type(param_name, path, ref_schema, ref_attr_schema, errors);
+}
+
+fn check_pre_expansion_module_call_attribute_ref(
+    param_name: &str,
+    path: &AccessPath,
+    module_call_attributes: &PreExpansionModuleCallAttributes,
+    errors: &mut Vec<String>,
+) {
+    let Some(known_attributes) = module_call_attributes.get(path.binding()) else {
+        return;
+    };
+    if let Some(error) = unknown_attribute_error(path, known_attributes) {
+        errors.push(format!("attribute '{}': {}", param_name, error));
+    }
 }
 
 fn narrow_attribute_param_ref_type<'a>(
@@ -491,17 +646,28 @@ fn narrow_attribute_param_ref_type<'a>(
 pub fn validate_export_param_ref_types_with_bindings(
     export_params: &[crate::parser::InferredExportParam],
     bindings: &BindingIndex<'_>,
+    reported_inference_error_indices: &HashSet<usize>,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
 
-    for param in export_params {
+    for (index, param) in export_params.iter().enumerate() {
         let Some(ref value) = param.value else {
             continue;
         };
-        // Skip the `Unknown` sentinel — the loader's `inference_errors`
-        // channel already reports the missing annotation; emitting a
-        // "type mismatch" here would be a duplicate.
+        // Existence is independent of type knowledge. Inference and this walk
+        // share one dedup rule: if inference has already reported this exact
+        // export-param index, skip its Unknown existence walk entirely;
+        // otherwise check every binding target. Names are display text, not
+        // identity, and can collide across sibling files. The LSP supplies
+        // indices from its post-expansion inference pass, while the CLI combines
+        // its load-time and schema-retry indices.
         if matches!(&param.type_expr, crate::parser::TypeExpr::Unknown) {
+            if reported_inference_error_indices.contains(&index) {
+                continue;
+            }
+            value.visit_resource_refs(&mut |path| {
+                check_unknown_export_ref_existence(&param.name, path, bindings, &mut errors);
+            });
             continue;
         }
 
@@ -512,6 +678,42 @@ pub fn validate_export_param_ref_types_with_bindings(
         Ok(())
     } else {
         Err(errors.join("\n"))
+    }
+}
+
+fn check_unknown_export_ref_existence(
+    param_name: &str,
+    path: &crate::resource::AccessPath,
+    bindings: &BindingIndex<'_>,
+    errors: &mut Vec<String>,
+) {
+    let ref_binding = path.binding();
+    let Some(ref_entry) = bindings.get(ref_binding) else {
+        return;
+    };
+
+    match ref_entry.target {
+        BindingTarget::Schema(schema) => {
+            let ref_attr = path.attribute();
+            if !schema.attributes.contains_key(ref_attr) {
+                let known_attrs: Vec<&str> =
+                    schema.attributes.keys().map(|name| name.as_str()).collect();
+                errors.push(format!(
+                    "export '{}': unknown attribute '{}' on '{}' in reference {}.{}{}",
+                    param_name,
+                    ref_attr,
+                    ref_binding,
+                    ref_binding,
+                    ref_attr,
+                    did_you_mean(ref_attr, &known_attrs),
+                ));
+            }
+        }
+        BindingTarget::Composition(composition) => {
+            if let Some(error) = composition_unknown_attribute_error(composition, path) {
+                errors.push(format!("export '{}': {}", param_name, error));
+            }
+        }
     }
 }
 
@@ -533,7 +735,15 @@ fn collect_ref_type_errors(
             let Some(ref_entry) = bindings.get(ref_binding) else {
                 return;
             };
-            let ref_schema = ref_entry.schema;
+            let ref_schema = match ref_entry.target {
+                BindingTarget::Schema(schema) => schema,
+                BindingTarget::Composition(composition) => {
+                    if let Some(error) = composition_unknown_attribute_error(composition, path) {
+                        errors.push(format!("export '{}': {}", param_name, error));
+                    }
+                    return;
+                }
+            };
             let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
                 let known_attrs: Vec<&str> =
                     ref_schema.attributes.keys().map(|s| s.as_str()).collect();
@@ -1253,9 +1463,10 @@ pub fn validate_module_calls(
 /// using `validate_type_expr_value`. Accumulates all errors.
 ///
 /// Accepts post-inference [`InferredExportParam`]s (#2360 stage 2):
-/// `type_expr` is bare. Sentinel-bearing exports
-/// (`TypeExpr::Unknown`) are skipped — the loader's `inference_errors`
-/// channel surfaces those, and re-checking would double-report.
+/// `type_expr` is bare. Sentinel-bearing exports (`TypeExpr::Unknown`)
+/// skip literal type compatibility here; reference existence is handled
+/// separately by [`validate_export_param_ref_types_with_bindings`], with
+/// inference-reported parameter indices suppressed there.
 pub fn validate_export_params(
     export_params: &[crate::parser::InferredExportParam],
     config: &ProviderContext,

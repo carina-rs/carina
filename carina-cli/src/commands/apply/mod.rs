@@ -757,6 +757,7 @@ async fn run_apply_with_observer_factory(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
+    let inference_errors = loaded.inference_errors;
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let backend_file = loaded.backend_file;
@@ -764,7 +765,7 @@ async fn run_apply_with_observer_factory(
     let base_dir = get_base_dir(path);
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
-    validate_and_resolve_with_config(&mut parsed, base_dir, false)?;
+    validate_and_resolve_with_config(&mut parsed, base_dir, false, &inference_errors)?;
 
     let verified_backend =
         verify_for_mutation(base_dir, parsed.backend.as_ref(), DriftCommand::Apply)?;
@@ -914,13 +915,19 @@ async fn run_apply_with_observer_factory(
                     // reuses the heavier preflight pipeline only for its
                     // resolve+anon-id steps; the schema validation already
                     // ran on the pre-injection configuration.
-                    parsed = load_configuration_with_config(
+                    let reloaded = load_configuration_with_config(
                         path,
                         provider_context,
                         &carina_core::schema::SchemaRegistry::new(),
-                    )?
-                    .parsed;
-                    validate_and_resolve_with_config(&mut parsed, base_dir, true)?;
+                    )?;
+                    let reloaded_inference_errors = reloaded.inference_errors;
+                    parsed = reloaded.parsed;
+                    validate_and_resolve_with_config(
+                        &mut parsed,
+                        base_dir,
+                        true,
+                        &reloaded_inference_errors,
+                    )?;
 
                     let backend_resource_type = backend
                         .resource_type()

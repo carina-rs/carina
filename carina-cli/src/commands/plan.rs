@@ -555,11 +555,12 @@ pub async fn run_plan(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
+    let inference_errors = loaded.inference_errors;
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
 
     let base_dir = get_base_dir(path);
-    validate_and_resolve_with_config(&mut parsed, base_dir, false)?;
+    validate_and_resolve_with_config(&mut parsed, base_dir, false, &inference_errors)?;
 
     let mut plan_backend_config = parsed.backend.as_ref().map(StateBackendConfig::from);
     let mut plan_file_backend_config = parsed.backend.clone();

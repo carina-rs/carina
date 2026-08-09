@@ -941,10 +941,11 @@ pub async fn run_state_refresh(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
+    let inference_errors = loaded.inference_errors;
     let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
-    validate_and_resolve_with_config(&mut parsed, base_dir, true)?;
+    validate_and_resolve_with_config(&mut parsed, base_dir, true, &inference_errors)?;
 
     let verified_backend = verify_for_mutation(
         base_dir,

@@ -4,7 +4,7 @@
 //! [`apply_inference`] is the bridge from `ParsedFile` (where exports
 //! carry `Option<TypeExpr>`) to `InferredFile` (where every export
 //! carries a bare `TypeExpr`, possibly the [`TypeExpr::Unknown`]
-//! sentinel for a failure paired with a `(name, InferenceError)` entry
+//! sentinel for a failure paired with an [`ExportInferenceError`] entry
 //! on the side). The loader runs this once per directory load so
 //! downstream consumers (CLI validate, LSP diagnostics, LSP
 //! completion) see a definitive type per export instead of having to
@@ -30,7 +30,7 @@
 //!   `max`, `map`) is "depends on arguments" — counts as inference
 //!   failure.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::builtins::{BuiltinReturnType, builtin_functions};
 use crate::parser::TypeExpr;
@@ -72,6 +72,21 @@ pub enum InferenceError {
     /// binding-name path in the order they were entered, so the
     /// diagnostic can name which bindings closed the loop.
     CyclicVirtualBinding { cycle: Vec<String> },
+}
+
+/// An export inference failure tied to the parameter's stable position
+/// in `File::export_params`.
+///
+/// `index` is the equality-bearing identity used when a later validation
+/// walk suppresses a diagnostic already reported by inference. `name` is
+/// retained only for user-facing messages: sibling files may legally
+/// contribute duplicate export names, so the name cannot identify a
+/// parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportInferenceError {
+    pub index: usize,
+    pub name: String,
+    pub error: InferenceError,
 }
 
 impl std::fmt::Display for InferenceError {
@@ -142,7 +157,7 @@ pub type InferenceBindings = HashMap<String, InferenceBinding>;
 /// Build an [`InferenceBindings`] map from a `ParsedFile`. Convenience
 /// over [`bindings_from_parts`] for the common case of having a parsed
 /// file in hand.
-pub fn bindings_from_parsed(parsed: &crate::parser::ParsedFile) -> InferenceBindings {
+pub fn bindings_from_parsed<E>(parsed: &crate::parser::File<E>) -> InferenceBindings {
     // carina#3181: pass the typed top-level slices directly so
     // `bindings_from_parts` classifies managed resources, data sources,
     // and (post-expansion) composition rows from their own kinds.
@@ -736,7 +751,7 @@ fn infer_function_call(name: &str) -> Result<TypeExpr, InferenceError> {
 pub fn apply_inference(
     parsed: crate::parser::ParsedFile,
     schemas: &SchemaRegistry,
-) -> (crate::parser::InferredFile, Vec<(String, InferenceError)>) {
+) -> (crate::parser::InferredFile, Vec<ExportInferenceError>) {
     let (inferred_exports, errors) = infer_export_params(&parsed, schemas);
     // Single phase-axis surface (carina#3126): only `export_params`
     // changes phase; every other field moves through `map_export_params`
@@ -756,20 +771,25 @@ pub fn infer_export_params(
     schemas: &SchemaRegistry,
 ) -> (
     Vec<crate::parser::InferredExportParam>,
-    Vec<(String, InferenceError)>,
+    Vec<ExportInferenceError>,
 ) {
     let bindings = bindings_from_parsed(parsed);
     let mut errors = Vec::new();
     let inferred_exports: Vec<crate::parser::InferredExportParam> = parsed
         .export_params
         .iter()
-        .map(|p| {
+        .enumerate()
+        .map(|(index, p)| {
             let type_expr =
                 match infer_type_expr(p.type_expr.as_ref(), p.value.as_ref(), &bindings, schemas) {
                     Ok(Some(ty)) => ty,
                     Ok(None) => TypeExpr::Unknown,
                     Err(e) => {
-                        errors.push((p.name.clone(), e));
+                        errors.push(ExportInferenceError {
+                            index,
+                            name: p.name.clone(),
+                            error: e,
+                        });
                         TypeExpr::Unknown
                     }
                 };
@@ -781,6 +801,68 @@ pub fn infer_export_params(
         })
         .collect();
     (inferred_exports, errors)
+}
+
+/// Retry only sentinel-bearing exports after provider schemas become available.
+///
+/// CLI configuration loading initially runs before provider plugins are wired,
+/// so a schema-backed resource ref can temporarily yield
+/// [`InferenceError::SchemaUnavailable`] and become [`TypeExpr::Unknown`]
+/// without an inference diagnostic. Call this at the provider-wiring boundary
+/// to report errors from those deferred schema lookups. Running before versus
+/// after module expansion affects which authority reports a composition typo:
+/// inference can inspect a post-expansion `Virtual` binding, while the shared
+/// existence walk inspects the composition signature. Either ordering remains
+/// duplicate-safe because parameters already reported by inference are
+/// suppressed by export-param index. Indices already present in `prior_errors`
+/// are skipped so schema-independent failures (for example an `Any`-returning
+/// builtin) are not reported twice.
+///
+/// Successful inference is deliberately discarded and the parameter remains
+/// [`TypeExpr::Unknown`]. [`attribute_type_to_type_expr`] uses lossy sentinels
+/// for nested unions and cycle-cutting refs, so feeding its projection back into
+/// schema compatibility can falsely reject the same value it was inferred from.
+/// This retry exists only to recover errors hidden by bootstrap-time missing
+/// schemas; it is not a second type-upgrade phase.
+///
+/// On the CLI's current pre-expansion retry path, module-call refs remain
+/// `Unknown` without an error because [`InferenceBinding::ModuleCall`] is
+/// deliberately non-inferable. Their declared attribute membership is then
+/// checked against the expanded composition by
+/// [`crate::validation::validate_export_param_ref_types_with_bindings`]. The
+/// LSP runs inference post-expansion and may report the same class through its
+/// `Virtual` binding instead; index suppression gives both paths one diagnostic.
+pub fn retry_unknown_export_inference(
+    parsed: &crate::parser::InferredFile,
+    schemas: &SchemaRegistry,
+    prior_errors: &[ExportInferenceError],
+) -> Vec<ExportInferenceError> {
+    let bindings = bindings_from_parsed(parsed);
+    let prior_error_indices: HashSet<usize> =
+        prior_errors.iter().map(|error| error.index).collect();
+    let mut errors = Vec::new();
+
+    for (index, param) in parsed.export_params.iter().enumerate() {
+        if !matches!(param.type_expr, TypeExpr::Unknown) || prior_error_indices.contains(&index) {
+            continue;
+        }
+        let Some(value) = &param.value else {
+            continue;
+        };
+
+        match infer_type_from_value(value, &bindings, schemas) {
+            Ok(_) => {}
+            Err(InferenceError::NonInferableBinding { .. })
+            | Err(InferenceError::SchemaUnavailable { .. }) => {}
+            Err(error) => errors.push(ExportInferenceError {
+                index,
+                name: param.name.clone(),
+                error,
+            }),
+        }
+    }
+
+    errors
 }
 
 /// Format an inference error pointing at the offending export. The CLI
@@ -1404,8 +1486,80 @@ mod tests {
         assert_eq!(inferred.export_params.len(), 1);
         assert_eq!(inferred.export_params[0].type_expr, TypeExpr::Unknown);
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].0, "zone_id");
-        assert!(matches!(errors[0].1, InferenceError::UnknownType { .. }));
+        assert_eq!(errors[0].index, 0);
+        assert_eq!(errors[0].name, "zone_id");
+        assert!(matches!(
+            errors[0].error,
+            InferenceError::UnknownType { .. }
+        ));
+    }
+
+    #[test]
+    fn retry_unknown_export_inference_surfaces_schema_attribute_error_once_schemas_exist() {
+        let mut parsed = crate::parser::ParsedFile::default();
+        let resource = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
+            .with_binding("main");
+        parsed.resources.push(resource); // allow: direct — fixture test inspection
+        parsed.export_params.push(crate::parser::ParsedExportParam {
+            name: "vpc_id".to_string(),
+            type_expr: None,
+            value: Some(Value::resource_ref(
+                "main".to_string(),
+                "vpc_i".to_string(),
+                vec![],
+            )),
+        });
+
+        let (inferred, initial_errors) = apply_inference(parsed, &SchemaRegistry::new());
+        assert!(
+            initial_errors.is_empty(),
+            "schema-unavailable bootstrap is deferred"
+        );
+        assert_eq!(inferred.export_params[0].type_expr, TypeExpr::Unknown);
+
+        let retry_errors =
+            retry_unknown_export_inference(&inferred, &schemas_with_vpc(), &initial_errors);
+
+        assert_eq!(retry_errors.len(), 1);
+        assert_eq!(retry_errors[0].index, 0);
+        assert_eq!(retry_errors[0].name, "vpc_id");
+        assert!(matches!(
+            &retry_errors[0].error,
+            InferenceError::UnknownAttribute { binding, attribute }
+                if binding == "main" && attribute == "vpc_i"
+        ));
+        assert_eq!(inferred.export_params[0].type_expr, TypeExpr::Unknown);
+    }
+
+    #[test]
+    fn retry_unknown_export_inference_keeps_type_unknown_after_success() {
+        let mut parsed = crate::parser::ParsedFile::default();
+        let resource = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
+            .with_binding("main");
+        parsed.resources.push(resource); // allow: direct — fixture test inspection
+        parsed.export_params.push(crate::parser::ParsedExportParam {
+            name: "vpc_id".to_string(),
+            type_expr: None,
+            value: Some(Value::resource_ref(
+                "main".to_string(),
+                "vpc_id".to_string(),
+                vec![],
+            )),
+        });
+
+        let (inferred, initial_errors) = apply_inference(parsed, &SchemaRegistry::new());
+        assert!(initial_errors.is_empty());
+        assert_eq!(inferred.export_params[0].type_expr, TypeExpr::Unknown);
+
+        let retry_errors =
+            retry_unknown_export_inference(&inferred, &schemas_with_vpc(), &initial_errors);
+
+        assert!(retry_errors.is_empty());
+        assert_eq!(
+            inferred.export_params[0].type_expr,
+            TypeExpr::Unknown,
+            "retry is an existence-error probe, not a second inference pass",
+        );
     }
 
     #[test]
@@ -1511,9 +1665,9 @@ mod tests {
         // and the bindings map can't see the module-call's projection.
         // The inferer must treat the binding as known-but-non-inferable
         // (mirroring `upstream_state`) so the export gets `Unknown`
-        // without a noisy `unknown binding` error. Post-expansion the
-        // CLI re-runs inference and the type is filled in via the
-        // `Virtual` arm exercised by the sibling test above.
+        // without a noisy `unknown binding` error. A post-expansion consumer
+        // such as the LSP can run inference against the `Virtual` arm exercised
+        // by the sibling test above; the CLI retry remains report-only.
         let mut parsed = crate::parser::ParsedFile::default();
         parsed.module_calls.push(crate::parser::ModuleCall {
             module_name: "github_module".to_string(),

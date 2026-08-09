@@ -6,6 +6,9 @@
 //!   known resource binding in the merged directory parse.
 //! - **attribute not in target schema**: `until = cert.statu == ...`
 //!   where the target's schema has `status` but not `statu`.
+//! - **unsupported composition target**: a module-call composition has
+//!   exported values but no provider-backed state for the wait executor
+//!   to poll.
 //!
 //! Operator and shape narrowing (non-`==`, boolean combinators, bare
 //! binding LHS) is enforced upstream by `parse_wait_expr`; the parse
@@ -13,6 +16,15 @@
 
 use crate::parser::{File, ResourceRef};
 use crate::schema::{SchemaKind, SchemaRegistry};
+
+enum WaitTarget {
+    Pollable {
+        provider: String,
+        resource_type: String,
+        schema_kind: SchemaKind,
+    },
+    Composition,
+}
 
 /// A wait-construct diagnostic.
 ///
@@ -37,37 +49,57 @@ pub fn validate_wait_bindings<E>(
     }
     let mut out: Vec<WaitDiagnostic> = Vec::new();
 
-    // Build binding → (provider, resource_type, schema_kind) lookup once.
+    // Build the binding → wait-target lookup once.
     // carina#3181: walk the typed top-level slices so a data-source
     // target (`let x = read ...`) is still found, and carry its
     // `SchemaKind` so the schema lookup below uses the matching kind.
-    // A composition target stores `None` — it is still "found" but has no
-    // schema to check attributes against.
-    let mut by_binding: std::collections::HashMap<String, (String, String, Option<SchemaKind>)> =
+    // Compositions are retained as a distinct target so validation can
+    // reject them explicitly instead of silently treating their missing
+    // provider schema as a reason to skip the predicate check.
+    let mut by_binding: std::collections::HashMap<String, WaitTarget> =
         std::collections::HashMap::new();
     for rref in parsed.iter_top_level_resources() {
         if let Some(b) = rref.binding() {
             let id = rref.id();
-            let schema_kind = match rref {
-                ResourceRef::Resource(_) | ResourceRef::Deferred { .. } => {
-                    Some(SchemaKind::Resource)
-                }
-                ResourceRef::DataSource(_) => Some(SchemaKind::DataSource),
-                ResourceRef::Composition(_) => None,
+            let target = match rref {
+                ResourceRef::Resource(_) | ResourceRef::Deferred { .. } => WaitTarget::Pollable {
+                    provider: id.provider.clone(),
+                    resource_type: id.resource_type.clone(),
+                    schema_kind: SchemaKind::Resource,
+                },
+                ResourceRef::DataSource(_) => WaitTarget::Pollable {
+                    provider: id.provider.clone(),
+                    resource_type: id.resource_type.clone(),
+                    schema_kind: SchemaKind::DataSource,
+                },
+                ResourceRef::Composition(_) => WaitTarget::Composition,
             };
-            by_binding.insert(
-                b.to_string(),
-                (id.provider.clone(), id.resource_type.clone(), schema_kind),
-            );
+            by_binding.insert(b.to_string(), target);
         }
     }
 
     for wb in &parsed.wait_bindings {
-        let Some((provider, resource_type, schema_kind)) = by_binding.get(wb.target.as_str())
-        else {
+        let Some(target) = by_binding.get(wb.target.as_str()) else {
             out.push(WaitDiagnostic {
                 message: format!(
                     "wait `{}`: target binding `{}` is not a known resource",
+                    wb.binding, wb.target
+                ),
+                binding_name: wb.binding.as_str().to_string(),
+                target: wb.target.as_str().to_string(),
+                attribute: None,
+            });
+            continue;
+        };
+        let WaitTarget::Pollable {
+            provider,
+            resource_type,
+            schema_kind,
+        } = target
+        else {
+            out.push(WaitDiagnostic {
+                message: format!(
+                    "wait `{}`: target binding `{}` is a composition; waiting on module-call outputs is not supported",
                     wb.binding, wb.target
                 ),
                 binding_name: wb.binding.as_str().to_string(),
@@ -80,11 +112,6 @@ pub fn validate_wait_bindings<E>(
         // supports only top-level attributes; nested struct fields
         // (`renewal_summary.renewal_status`) are deferred to a follow-up.
         let Some(attr_name) = wb.until_predicate.lhs_segments.get(1) else {
-            continue;
-        };
-        // Virtual resources have no schema — skip the attr check (the
-        // target was still "found", matching pre-typestate behaviour).
-        let Some(schema_kind) = schema_kind else {
             continue;
         };
         let Some(schema) = schemas.get(provider, resource_type, *schema_kind) else {
