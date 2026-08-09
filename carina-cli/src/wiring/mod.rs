@@ -39,7 +39,8 @@ use carina_core::resource::{
     ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, resolve_block_names,
+    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+    resolve_block_names,
 };
 use carina_core::validation;
 use carina_provider_mock::MockProvider;
@@ -129,6 +130,16 @@ impl WiringContext {
                         "tags",
                         AttributeType::map(AttributeType::string()),
                     ))
+                    .attribute(
+                        AttributeSchema::new(
+                            "rules",
+                            AttributeType::list(AttributeType::struct_(
+                                "Rule",
+                                vec![StructField::new("action", AttributeType::string())],
+                            )),
+                        )
+                        .with_block_name("rule"),
+                    )
                     .attribute(
                         AttributeSchema::new("identifier", AttributeType::string()).read_only(),
                     )
@@ -1218,6 +1229,25 @@ pub(crate) fn validate_module_attribute_param_types(
             errors.extend(joined.split('\n').filter(|s| !s.is_empty()).map(|s| {
                 AppError::Validation(format!("{}: {}", module.diagnostic_path().display(), s))
             }));
+        }
+    }
+    errors
+}
+
+/// Reject providers in every recursively loaded module and preserve each
+/// module's import path in the resulting user-facing diagnostic. The module
+/// directory unit deliberately includes imported-but-uncalled nested modules,
+/// matching the duplicate and attribute-type validation policy from
+/// #3711/#3714. The resolver retains its own expansion-phase backstop for
+/// callers that bypass this validation walk.
+pub(crate) fn validate_no_provider_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
+    let mut errors = Vec::new();
+    for module in module_walk.iter() {
+        if let Err(message) = validation::validate_no_provider_in_module(&module.loaded().parsed) {
+            errors.push(AppError::Validation(format!(
+                "{}: {message}",
+                module.diagnostic_path().display()
+            )));
         }
     }
     errors

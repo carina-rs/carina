@@ -97,7 +97,14 @@ impl<'cfg> ModuleResolver<'cfg> {
             return Err(ModuleError::NotFound(path.to_string()));
         }
 
-        // Reject provider blocks inside modules
+        // Expansion-phase backstop for provider blocks inside modules. The
+        // CLI's `validate_no_provider_in_modules` walks are the user-facing
+        // gates: they collect module-path-prefixed diagnostics and stop before
+        // expansion, so validate/plan/apply and lint cannot emit both forms.
+        // The production paths that bypass those walks but still expand are
+        // destroy, state refresh, and apply's backend-bootstrap re-resolve
+        // (`skip_resource_validation = true`). `fixture_plan` also depends on
+        // this backstop as test support.
         if !parsed.providers.is_empty() {
             self.resolving.remove(&canonical);
             return Err(ModuleError::ProviderInModule);

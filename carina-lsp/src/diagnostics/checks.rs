@@ -211,13 +211,24 @@ impl DiagnosticEngine {
     }
 
     /// Check that provider blocks are not defined inside modules.
+    ///
+    /// The marker that identifies the directory as a module can live in a
+    /// sibling `.crn` file, so the merged directory parse takes precedence
+    /// when available. Diagnostics remain anchored to provider declarations
+    /// in the current buffer.
     pub(super) fn check_provider_in_module(
         &self,
         doc: &Document,
         parsed: &ParsedFile,
+        merged: Option<&ParsedFile>,
     ) -> Vec<Diagnostic> {
-        let is_module = !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty();
-        if !is_module || parsed.providers.is_empty() {
+        let validation_input = merged.unwrap_or(parsed);
+        let Err(message) =
+            carina_core::validation::validate_no_provider_in_module(validation_input)
+        else {
+            return Vec::new();
+        };
+        if parsed.providers.is_empty() {
             return Vec::new();
         }
 
@@ -238,7 +249,7 @@ impl DiagnosticEngine {
                     col,
                     end_col,
                     DiagnosticSeverity::ERROR,
-                    "provider blocks are not allowed inside modules. Define providers at the root configuration level.".to_string(),
+                    message.clone(),
                 ));
             }
         }

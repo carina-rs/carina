@@ -35,9 +35,9 @@ use crate::wiring::{
     resolve_names_with_ctx, validate_attribute_param_ref_types_with_ctx,
     validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
     validate_module_attribute_param_types, validate_module_call_argument_refs_with_ctx,
-    validate_module_calls, validate_no_empty_interpolations, validate_provider_region_with_ctx,
-    validate_resource_ref_types_with_ctx, validate_resources_with_ctx,
-    validate_wait_bindings_with_ctx,
+    validate_module_calls, validate_no_empty_interpolations, validate_no_provider_in_modules,
+    validate_provider_region_with_ctx, validate_resource_ref_types_with_ctx,
+    validate_resources_with_ctx, validate_wait_bindings_with_ctx,
 };
 
 #[must_use = "Drifted must be handled before mutating state — apply/destroy must refuse, init/plan must warn"]
@@ -440,8 +440,18 @@ pub fn validate_and_resolve_errors_with_factories(
     // context for custom type validators)
     errors.extend(validate_module_calls(parsed, base_dir, &enriched_context));
 
-    // Validate module attribute parameter ref types before expansion
+    // User-facing provider-in-module validation runs on the recursive module
+    // walk so validate/plan/apply can collect path-prefixed findings alongside
+    // other validation errors. As with the duplicate and attribute-type checks
+    // established in #3711/#3714, the directory unit includes every imported
+    // nested module, even when that import is never called. The `errors` return
+    // immediately below happens before `resolve_modules_with_config`, so the
+    // same run cannot also emit the resolver's expansion-phase
+    // `ProviderInModule` backstop. Destroy and state refresh set
+    // `skip_resource_validation = true`, bypass this walk, and rely on that
+    // resolver backstop while still expanding modules.
     if !skip_resource_validation {
+        errors.extend(validate_no_provider_in_modules(&module_walk));
         errors.extend(validate_module_attribute_param_types(&ctx, &module_walk));
     }
 

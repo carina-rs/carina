@@ -344,7 +344,7 @@ impl DiagnosticEngine {
         // Semantic analysis on parsed file
         if let Some(parsed) = doc.parsed() {
             // Check provider in module
-            diagnostics.extend(self.check_provider_in_module(doc, parsed));
+            diagnostics.extend(self.check_provider_in_module(doc, parsed, merged));
 
             // Check arguments in root. The "is this a root config?"
             // signal — a sibling `backend` block — can live in another

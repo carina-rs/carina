@@ -17,7 +17,9 @@ use carina_core::parser::ProviderContext;
 
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
-use crate::wiring::{WiringContext, build_factories_from_providers};
+use crate::wiring::{
+    WiringContext, build_factories_from_providers, validate_no_provider_in_modules,
+};
 
 /// A lint warning with file, line, and message info.
 struct LintWarning {
@@ -37,10 +39,21 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
 
     let base_dir = get_base_dir(path);
     let module_walk = ModuleWalk::load(&parsed, base_dir);
+    let provider_in_module_findings = validate_no_provider_in_modules(&module_walk);
 
-    // Resolve modules
-    module_resolver::resolve_modules_with_config(&mut parsed, base_dir, provider_context)
-        .map_err(|e| format!("Module resolution error: {}", e))?;
+    // Report provider-in-module through lint's collected, path-prefixed output.
+    // The resolver enforces the same invariant as an expansion backstop, so
+    // do not expand after this gate fails or lint would abort before rendering
+    // the findings below. This deliberately degrades schema-dependent checks:
+    // `iter_top_level_resources` then sees only root-declared resources, so
+    // List<Struct> block-syntax suggestions can disappear even from root files.
+    // The configuration is already blocked; retaining this finding and the
+    // schema-independent text scans is more useful than aborting lint entirely.
+    // Full schema-backed suggestions return once the provider finding is fixed.
+    if provider_in_module_findings.is_empty() {
+        module_resolver::resolve_modules_with_config(&mut parsed, base_dir, provider_context)
+            .map_err(|e| format!("Module resolution error: {}", e))?;
+    }
 
     let (provider_factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(provider_factories);
@@ -85,7 +98,17 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
     }
 
     // Scan each source file for list literal usage of List<Struct> attributes
-    let mut warnings: Vec<LintWarning> = Vec::new();
+    let mut warnings: Vec<LintWarning> = provider_in_module_findings
+        .into_iter()
+        .map(|finding| LintWarning {
+            // The merged module parse does not retain a provider declaration
+            // span. Keep lint's file:line convention at the caller boundary;
+            // the finding itself retains the recursive module-path prefix.
+            file: path.to_path_buf(),
+            line: 1,
+            message: finding.to_string(),
+        })
+        .collect();
     for duplicate in &duplicate_declarations {
         let file = duplicate
             .first_file()
