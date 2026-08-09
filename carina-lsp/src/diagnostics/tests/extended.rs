@@ -5246,3 +5246,402 @@ fn same_block_duplicate_export_survives_broken_sibling_parse() {
         "the fallback must not restore the last-write-wins warning: {diagnostics:#?}",
     );
 }
+
+// =====================================================================
+// Directory-wide tag-key style diagnostics (carina#3718).
+// =====================================================================
+
+fn write_tag_key_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    for (relative_path, source) in files {
+        let path = temp.path().join(relative_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, source).unwrap();
+    }
+    temp
+}
+
+fn tag_key_style_diagnostics(
+    diagnostics: &[tower_lsp::lsp_types::Diagnostic],
+) -> Vec<&tower_lsp::lsp_types::Diagnostic> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.starts_with("Tag key '"))
+        .collect()
+}
+
+#[test]
+fn tag_key_style_warns_on_current_buffer_minority_key_from_sibling_population() {
+    let main = r#"let app = awscc.ec2.Vpc {
+    tags = {
+        managed_by = "carina"
+    }
+}
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        (
+            "db.crn",
+            r#"let db = awscc.rds.Db {
+    tags = {
+        Name = "database"
+        Environment = "production"
+    }
+}
+"#,
+        ),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let style_diagnostics = tag_key_style_diagnostics(&diagnostics);
+
+    assert_eq!(style_diagnostics.len(), 1, "diagnostics: {diagnostics:#?}");
+    let diagnostic = style_diagnostics[0];
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+    );
+    assert_eq!(diagnostic.range.start.line, 2);
+    assert_eq!(diagnostic.range.start.character, 8);
+    assert_eq!(diagnostic.range.end.character, 18);
+    assert_eq!(
+        diagnostic.message,
+        "Tag key 'managed_by' doesn't match the dominant style (PascalCase). Use consistent casing for tag keys."
+    );
+}
+
+#[test]
+fn tag_key_style_diagnostics_are_owned_by_the_current_buffer() {
+    let main = r#"let app = awscc.ec2.Vpc {
+    tags = {
+        Name = "application"
+        Environment = "production"
+    }
+}
+"#;
+    let db = r#"let db = awscc.rds.Db {
+    tags = {
+        managed_by = "carina"
+    }
+}
+"#;
+    let temp = write_tag_key_fixture(&[("main.crn", main), ("db.crn", db)]);
+
+    let main_diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    assert!(
+        tag_key_style_diagnostics(&main_diagnostics).is_empty(),
+        "the majority-style buffer must not own its sibling's warning: {main_diagnostics:#?}"
+    );
+
+    let db_diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "db.crn", db);
+    let db_style_diagnostics = tag_key_style_diagnostics(&db_diagnostics);
+    assert_eq!(
+        db_style_diagnostics.len(),
+        1,
+        "the sibling's own pass must anchor its minority key: {db_diagnostics:#?}"
+    );
+    assert_eq!(db_style_diagnostics[0].range.start.line, 2);
+    assert_eq!(db_style_diagnostics[0].range.start.character, 8);
+}
+
+#[test]
+fn tag_key_style_population_includes_called_module_directories() {
+    let main = r#"let standard_tags = use { source = "./modules/standard-tags" }
+let defaults = standard_tags {}
+
+let app = awscc.ec2.Vpc {
+    tags = {
+        managed_by = "carina"
+    }
+}
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        (
+            "modules/standard-tags/main.crn",
+            r#"attributes {
+    tags = {
+        Name = "defaults"
+        Environment = "production"
+    }
+}
+"#,
+        ),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let style_diagnostics = tag_key_style_diagnostics(&diagnostics);
+
+    assert_eq!(style_diagnostics.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(style_diagnostics[0].range.start.line, 5);
+    assert_eq!(
+        style_diagnostics[0].message,
+        "Tag key 'managed_by' doesn't match the dominant style (PascalCase). Use consistent casing for tag keys."
+    );
+}
+
+#[test]
+fn tag_key_style_population_uses_unsaved_current_buffer_text() {
+    let on_disk_main = r#"let app = awscc.ec2.Vpc {
+    tags = {
+        Name = "application"
+        Environment = "production"
+    }
+}
+"#;
+    let unsaved_main = r#"let app = awscc.ec2.Vpc {
+    tags = {
+        managed_by = "carina"
+    }
+}
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", on_disk_main),
+        (
+            "db.crn",
+            r#"let db = awscc.rds.Db {
+    tags = {
+        Name = "database"
+        Environment = "production"
+    }
+}
+"#,
+        ),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", unsaved_main);
+    let style_diagnostics = tag_key_style_diagnostics(&diagnostics);
+
+    assert_eq!(style_diagnostics.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(style_diagnostics[0].range.start.line, 2);
+    assert_eq!(
+        style_diagnostics[0].message,
+        "Tag key 'managed_by' doesn't match the dominant style (PascalCase). Use consistent casing for tag keys."
+    );
+}
+
+#[test]
+fn tag_key_style_consistent_across_root_and_module_files_has_no_diagnostic() {
+    let main = r#"let standard_tags = use { source = "./modules/standard-tags" }
+let defaults = standard_tags {}
+
+let app = awscc.ec2.Vpc {
+    tags = {
+        Name = "application"
+    }
+}
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        (
+            "db.crn",
+            r#"let db = awscc.rds.Db {
+    tags = {
+        Environment = "production"
+    }
+}
+"#,
+        ),
+        (
+            "modules/standard-tags/main.crn",
+            r#"attributes {
+    tags = {
+        ManagedBy = "carina"
+    }
+}
+"#,
+        ),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+
+    assert!(
+        tag_key_style_diagnostics(&diagnostics).is_empty(),
+        "consistent styles must not warn: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn tag_key_style_warns_when_current_buffer_is_inside_module_directory() {
+    let module_main = r#"attributes {
+    tags = {
+        managed_by = "carina"
+    }
+}
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("modules/net/main.crn", module_main),
+        (
+            "modules/net/defaults.crn",
+            r#"let defaults = awscc.ec2.Vpc {
+    tags = {
+        Name = "network"
+        Environment = "production"
+    }
+}
+"#,
+        ),
+    ]);
+    let module_dir = temp.path().join("modules/net");
+
+    let diagnostics = analyze_with_buffer(&test_engine(), &module_dir, "main.crn", module_main);
+    let style_diagnostics = tag_key_style_diagnostics(&diagnostics);
+
+    assert_eq!(style_diagnostics.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(style_diagnostics[0].range.start.line, 2);
+    assert_eq!(style_diagnostics[0].range.start.character, 8);
+    assert_eq!(style_diagnostics[0].range.end.line, 2);
+    assert_eq!(style_diagnostics[0].range.end.character, 18);
+}
+
+#[test]
+fn tag_key_style_same_basename_module_warning_does_not_anchor_in_root_buffer() {
+    let root_main = r#"let net = use { source = "./modules/net" }
+let network = net {}
+
+let app = awscc.ec2.Vpc {
+    tags = {
+        Name = "application"
+        Environment = "production"
+    }
+}
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", root_main),
+        (
+            "modules/net/main.crn",
+            r#"attributes {
+    tags = {
+        managed_by = "carina"
+    }
+}
+"#,
+        ),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", root_main);
+
+    assert!(
+        tag_key_style_diagnostics(&diagnostics).is_empty(),
+        "modules/net/main.crn must not own root main.crn diagnostics: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn tag_key_style_population_deduplicates_module_imported_by_two_root_files() {
+    let main = r#"let first = use { source = "./modules/shared" }
+let first_defaults = first {}
+
+let app = awscc.ec2.Vpc {
+    tags = {
+        managed_by = "carina"
+        cost_center = "infra"
+        Owner = "team"
+    }
+}
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        (
+            "db.crn",
+            r#"let second = use { source = "./modules/shared" }
+let second_defaults = second {}
+
+let db = awscc.rds.Db {
+    tags = {
+        environment_name = "production"
+        service_name = "database"
+    }
+}
+"#,
+        ),
+        (
+            "modules/shared/main.crn",
+            r#"attributes {
+    tags = {
+        Name = "defaults"
+        Environment = "production"
+    }
+}
+"#,
+        ),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let style_diagnostics = tag_key_style_diagnostics(&diagnostics);
+
+    assert_eq!(
+        style_diagnostics.len(),
+        1,
+        "the 4-snake/3-Pascal population must emit one current-buffer warning: {diagnostics:#?}"
+    );
+    assert_eq!(style_diagnostics[0].range.start.line, 7);
+    assert_eq!(style_diagnostics[0].range.start.character, 8);
+    assert!(style_diagnostics[0].message.starts_with("Tag key 'Owner'"));
+    assert!(style_diagnostics[0].message.contains("(snake_case)"));
+}
+
+#[test]
+fn tag_key_style_population_deduplicates_self_referential_root_directory() {
+    let main = r#"let self_module = use { source = "." }
+let recursive = self_module {}
+
+let app = awscc.ec2.Vpc {
+    tags = {
+        Name = "application"
+        Environment = "production"
+    }
+}
+"#;
+    let db = r#"let db = awscc.rds.Db {
+    tags = {
+        managed_by = "carina"
+    }
+}
+"#;
+    let temp = write_tag_key_fixture(&[("main.crn", main), ("db.crn", db)]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "db.crn", db);
+    let style_diagnostics = tag_key_style_diagnostics(&diagnostics);
+
+    assert_eq!(
+        style_diagnostics.len(),
+        1,
+        "self-imported root keys must not duplicate diagnostics: {diagnostics:#?}"
+    );
+    assert_eq!(style_diagnostics[0].range.start.line, 2);
+    assert_eq!(style_diagnostics[0].range.start.character, 8);
+    assert!(
+        style_diagnostics[0]
+            .message
+            .starts_with("Tag key 'managed_by'")
+    );
+}
+
+#[test]
+fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
+    let temp = tempfile::tempdir().unwrap();
+    let current_file = temp.path().join("main.crn");
+    let sibling_file = temp.path().join("defaults.crn");
+    let current_source = "tags = {\n\u{3000}\u{3000}managed_by = \"carina\"\n}";
+    let sibling_source =
+        "tags = {\n    Name = \"application\"\n    Environment = \"production\"\n}";
+    let merged_result = carina_core::config_loader::DirectoryParseResult {
+        parsed: carina_core::parser::ParsedFile::default(),
+        duplicate_declarations: Vec::new(),
+        source_files: vec![
+            (current_file, current_source.to_string()),
+            (sibling_file, sibling_source.to_string()),
+        ],
+    };
+
+    let diagnostics =
+        test_engine().check_mixed_tag_key_styles("main.crn", temp.path(), &merged_result);
+
+    assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(diagnostics[0].range.start.line, 1);
+    assert_eq!(diagnostics[0].range.start.character, 2);
+    assert_eq!(diagnostics[0].range.end.character, 12);
+}

@@ -557,6 +557,8 @@ pub fn parse_directory_with_overrides(
 pub struct DirectoryParseResult {
     pub parsed: ParsedFile,
     pub duplicate_declarations: Vec<DuplicateDeclaration>,
+    /// Exact source inputs used for the parse, including in-memory overrides.
+    pub source_files: Vec<(PathBuf, String)>,
 }
 
 /// Diagnostic-preserving variant of [`parse_directory_with_overrides`].
@@ -639,6 +641,7 @@ pub fn parse_directory_with_overrides_and_diagnostics(
     Ok(DirectoryParseResult {
         parsed: merged,
         duplicate_declarations,
+        source_files: file_inputs,
     })
 }
 

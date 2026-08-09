@@ -187,6 +187,11 @@ impl DiagnosticEngine {
                 &duplicates,
             ));
         }
+        if let (Some(base), Some(current_file), Some(result)) =
+            (base_path, current_file_name, merged_result.as_ref())
+        {
+            diagnostics.extend(self.check_mixed_tag_key_styles(current_file, base, result));
+        }
         let merged = merged_result.as_ref().map(|result| &result.parsed);
 
         if let (Some(base), Some(merged)) = (base_path, merged) {

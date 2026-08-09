@@ -4,6 +4,8 @@
 //! such as detecting list literal syntax where block syntax is preferred.
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::schema::ResourceSchema;
 
@@ -264,6 +266,10 @@ pub struct TagKeyEntry {
     pub style: TagKeyStyle,
     /// 1-indexed line number
     pub line: usize,
+    /// 0-indexed character offset of the key start.
+    pub column: usize,
+    /// Source file when collected as part of a directory-wide population.
+    pub file: Option<PathBuf>,
 }
 
 /// A warning for tag keys whose casing style is inconsistent with the majority.
@@ -273,8 +279,10 @@ pub struct TagKeyWarning {
     pub expected_style: TagKeyStyle,
     /// 1-indexed line number
     pub line: usize,
-    /// File path (set by the caller when aggregating across files)
-    pub file: Option<std::path::PathBuf>,
+    /// 0-indexed character offset of the key start.
+    pub column: usize,
+    /// File path inherited from the corresponding [`TagKeyEntry`].
+    pub file: Option<PathBuf>,
 }
 
 /// Classify a tag key's casing style.
@@ -302,7 +310,7 @@ fn classify_tag_key_style(name: &str) -> TagKeyStyle {
 
 /// Collect all tag keys from `tags = { ... }` blocks in source text.
 ///
-/// Returns entries with key name, detected style, and line number.
+/// Returns entries with key name, detected style, line, and character column.
 /// Does not judge consistency — call `find_mixed_tag_key_styles` on the aggregated entries.
 pub fn collect_tag_keys(source: &str) -> Vec<TagKeyEntry> {
     let mut entries = Vec::new();
@@ -311,6 +319,7 @@ pub fn collect_tag_keys(source: &str) -> Vec<TagKeyEntry> {
 
     for (line_idx, line) in source.lines().enumerate() {
         let trimmed = line.trim();
+        let trimmed_start_byte = line.len() - line.trim_start().len();
         let line_number = line_idx + 1;
 
         // Skip comment lines
@@ -350,18 +359,99 @@ pub fn collect_tag_keys(source: &str) -> Vec<TagKeyEntry> {
             if !trimmed.starts_with('}')
                 && let Some(eq_pos) = trimmed.find('=')
             {
-                let key = trimmed[..eq_pos].trim();
+                let key_segment = &trimmed[..eq_pos];
+                let key = key_segment.trim();
                 if !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    let key_start_in_trimmed = key_segment.len() - key_segment.trim_start().len();
+                    let key_start_byte = trimmed_start_byte + key_start_in_trimmed;
                     entries.push(TagKeyEntry {
                         key: key.to_string(),
                         style: classify_tag_key_style(key),
                         line: line_number,
+                        column: line[..key_start_byte].chars().count(),
+                        file: None,
                     });
                 }
             }
         }
     }
 
+    entries
+}
+
+/// Collect tag keys from one source file and attach its path to every entry.
+pub fn collect_tag_keys_for_file(source: &str, file: &Path) -> Vec<TagKeyEntry> {
+    collect_tag_keys(source)
+        .into_iter()
+        .map(|mut entry| {
+            entry.file = Some(file.to_path_buf());
+            entry
+        })
+        .collect()
+}
+
+/// Collect the complete tag-key population from root sources and called modules.
+///
+/// `root_inputs` must contain every root `.crn` file. Callers provide the text
+/// so editor buffers can override an on-disk file without changing population
+/// semantics. Root inputs are collected first; called module directories are
+/// then scanned from disk.
+///
+/// Every file has one vote. Canonical paths deduplicate root/module overlap,
+/// symlink aliases, repeated imports, and multiple aliases to one module. When
+/// canonicalization fails, the original path is the identity, matching the
+/// module walk's cycle-guard convention.
+pub fn collect_all_tag_keys<E, S: AsRef<str>>(
+    root_inputs: &[(PathBuf, S)],
+    parsed: &crate::parser::File<E>,
+    base_dir: &Path,
+) -> Vec<TagKeyEntry> {
+    fn canonical_guard_path(path: &Path) -> PathBuf {
+        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    let mut seen_files = HashSet::new();
+    let mut entries = Vec::new();
+    for (file, source) in root_inputs {
+        if seen_files.insert(canonical_guard_path(file)) {
+            entries.extend(collect_tag_keys_for_file(source.as_ref(), file));
+        }
+    }
+
+    let aliases_used: HashSet<&str> = parsed
+        .module_calls
+        .iter()
+        .map(|call| call.module_name.as_str())
+        .collect();
+
+    // The caller already supplied the complete root directory population.
+    // Mark it visited so `source = "."` and symlinks back to the root do not
+    // trigger a redundant directory read.
+    let mut seen_module_dirs = HashSet::from([canonical_guard_path(base_dir)]);
+    for import in &parsed.uses {
+        if !aliases_used.contains(import.alias.as_str()) {
+            continue;
+        }
+        let module_dir = base_dir.join(&import.path);
+        if !module_dir.is_dir() {
+            continue;
+        }
+        if !seen_module_dirs.insert(canonical_guard_path(&module_dir)) {
+            continue;
+        }
+        let Ok(module_files) = crate::config_loader::find_crn_files_in_dir(&module_dir) else {
+            continue;
+        };
+        for module_file in module_files {
+            if !seen_files.insert(canonical_guard_path(&module_file)) {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&module_file) else {
+                continue;
+            };
+            entries.extend(collect_tag_keys_for_file(&content, &module_file));
+        }
+    }
     entries
 }
 
@@ -404,9 +494,25 @@ pub fn find_mixed_tag_key_styles(entries: &[TagKeyEntry]) -> Vec<TagKeyWarning> 
             key: e.key.clone(),
             expected_style: dominant,
             line: e.line,
-            file: None,
+            column: e.column,
+            file: e.file.clone(),
         })
         .collect()
+}
+
+/// Format the shared CLI/LSP message for a mixed tag-key style warning.
+pub fn mixed_tag_key_style_message(warning: &TagKeyWarning) -> String {
+    let style_name = match warning.expected_style {
+        TagKeyStyle::PascalCase => "PascalCase",
+        TagKeyStyle::SnakeCase => "snake_case",
+        // `find_mixed_tag_key_styles` only chooses one of the two counted
+        // casing styles as dominant, so an `Other` warning is invalid state.
+        TagKeyStyle::Other => unreachable!("mixed tag-key dominant style cannot be Other"),
+    };
+    format!(
+        "Tag key '{}' doesn't match the dominant style ({}). Use consistent casing for tag keys.",
+        warning.key, style_name
+    )
 }
 
 /// Rough heuristic to check if a byte position is inside a string literal.
@@ -522,6 +628,7 @@ fn opens_duplicate_owned_declaration_block(trimmed: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::{ModuleCall, ParsedFile, UseStatement};
     use crate::schema::{AttributeType, StructField};
 
     #[test]
@@ -1119,8 +1226,235 @@ tags = {
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].key, "Name");
         assert_eq!(keys[0].style, TagKeyStyle::PascalCase);
+        assert_eq!(keys[0].column, 4);
         assert_eq!(keys[1].key, "environment");
         assert_eq!(keys[1].style, TagKeyStyle::SnakeCase);
+        assert_eq!(keys[1].column, 4);
+    }
+
+    #[test]
+    fn collect_tag_keys_uses_character_column_after_multibyte_whitespace() {
+        let source = "tags = {\n\u{3000}\u{3000}managed_by = \"carina\"\n}";
+
+        let keys = collect_tag_keys(source);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "managed_by");
+        assert_eq!(keys[0].line, 2);
+        assert_eq!(
+            keys[0].column, 2,
+            "two U+3000 spaces are two characters but six UTF-8 bytes"
+        );
+    }
+
+    #[test]
+    fn collect_tag_keys_for_file_attaches_path_and_preserves_position() {
+        let file = PathBuf::from("config/main.crn");
+        let source = "tags = {\n\tmanaged_by = \"carina\"\n}";
+
+        let keys = collect_tag_keys_for_file(source, &file);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].file.as_deref(), Some(file.as_path()));
+        assert_eq!(keys[0].line, 2);
+        assert_eq!(keys[0].column, 1);
+    }
+
+    #[test]
+    fn mixed_tag_key_style_message_matches_cli_text() {
+        let warning = TagKeyWarning {
+            key: "managed_by".to_string(),
+            expected_style: TagKeyStyle::PascalCase,
+            line: 3,
+            column: 8,
+            file: Some(PathBuf::from("main.crn")),
+        };
+
+        assert_eq!(
+            mixed_tag_key_style_message(&warning),
+            "Tag key 'managed_by' doesn't match the dominant style (PascalCase). Use consistent casing for tag keys."
+        );
+    }
+
+    #[test]
+    fn find_mixed_tag_key_styles_propagates_file_and_column_provenance() {
+        let majority_file = PathBuf::from("a.crn");
+        let minority_file = PathBuf::from("b.crn");
+        let mut keys = collect_tag_keys_for_file(
+            "tags = {\n    Name = \"app\"\n    Environment = \"prod\"\n}",
+            &majority_file,
+        );
+        keys.extend(collect_tag_keys_for_file(
+            "tags = {\n    managed_by = \"carina\"\n}",
+            &minority_file,
+        ));
+
+        let warnings = find_mixed_tag_key_styles(&keys);
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].file.as_deref(), Some(minority_file.as_path()));
+        assert_eq!(warnings[0].line, 2);
+        assert_eq!(warnings[0].column, 4);
+    }
+
+    #[test]
+    fn collect_all_tag_keys_deduplicates_two_aliases_to_one_module_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_file = temp.path().join("main.crn");
+        let module_dir = temp.path().join("shared");
+        let module_file = module_dir.join("main.crn");
+        let root_source =
+            "tags = {\n    Name = \"app\"\n    Environment = \"prod\"\n    Owner = \"team\"\n}";
+        let module_source = "attributes {\n  tags = {\n    managed_by = \"carina\"\n    cost_center = \"infra\"\n  }\n}";
+        fs::create_dir_all(&module_dir).unwrap();
+        fs::write(&root_file, root_source).unwrap();
+        fs::write(&module_file, module_source).unwrap();
+
+        let parsed = parsed_with_uses(
+            vec![("first", "./shared"), ("second", "./shared")],
+            vec!["first", "second"],
+        );
+        let root_inputs = vec![(root_file, root_source.to_string())];
+
+        let entries = collect_all_tag_keys(&root_inputs, &parsed, temp.path());
+        let warnings = find_mixed_tag_key_styles(&entries);
+        let warned_keys: Vec<_> = warnings
+            .iter()
+            .map(|warning| warning.key.as_str())
+            .collect();
+
+        assert_eq!(entries.len(), 5, "module keys must have single weight");
+        assert_eq!(warned_keys, vec!["managed_by", "cost_center"]);
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.expected_style == TagKeyStyle::PascalCase)
+        );
+    }
+
+    #[test]
+    fn collect_all_tag_keys_deduplicates_self_referential_root_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let main_file = temp.path().join("main.crn");
+        let db_file = temp.path().join("db.crn");
+        let main_source = "tags = {\n    Name = \"app\"\n    Environment = \"prod\"\n}";
+        let db_source = "tags = {\n    managed_by = \"carina\"\n}";
+        fs::write(&main_file, main_source).unwrap();
+        fs::write(&db_file, db_source).unwrap();
+
+        let parsed = parsed_with_uses(vec![("self_module", ".")], vec!["self_module"]);
+        let root_inputs = vec![
+            (main_file, main_source.to_string()),
+            (db_file.clone(), db_source.to_string()),
+        ];
+
+        let entries = collect_all_tag_keys(&root_inputs, &parsed, temp.path());
+        let warnings = find_mixed_tag_key_styles(&entries);
+
+        assert_eq!(entries.len(), 3, "each root tag key must be counted once");
+        assert_eq!(warnings.len(), 1, "the minority key must warn once");
+        assert_eq!(warnings[0].key, "managed_by");
+        assert_eq!(warnings[0].file.as_deref(), Some(db_file.as_path()));
+    }
+
+    fn parsed_with_uses(uses: Vec<(&str, &str)>, calls: Vec<&str>) -> ParsedFile {
+        ParsedFile {
+            uses: uses
+                .into_iter()
+                .map(|(alias, path)| UseStatement {
+                    alias: alias.to_string(),
+                    path: path.to_string(),
+                })
+                .collect(),
+            module_calls: calls
+                .into_iter()
+                .map(|name| ModuleCall {
+                    module_name: name.to_string(),
+                    binding_name: None,
+                    arguments: HashMap::new(),
+                })
+                .collect(),
+            ..ParsedFile::default()
+        }
+    }
+
+    #[test]
+    fn collect_all_tag_keys_scans_directory_imports() {
+        let temp = tempfile::tempdir().unwrap();
+        let modules_dir = temp.path().join("modules").join("network");
+        fs::create_dir_all(&modules_dir).unwrap();
+        fs::write(
+            modules_dir.join("main.crn"),
+            "let vpc = awscc.ec2.Vpc {\n  tags = {\n    Name = 'x'\n  }\n}\n",
+        )
+        .unwrap();
+
+        let parsed = parsed_with_uses(vec![("net", "./modules/network")], vec!["net"]);
+
+        let results = collect_all_tag_keys::<_, String>(&[], &parsed, temp.path());
+        assert!(
+            results.iter().any(|entry| entry.key == "Name"),
+            "tag key 'Name' must be collected from the module's main.crn; got {:?}",
+            results.iter().map(|entry| &entry.key).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn collect_all_tag_keys_skips_unused_imports() {
+        let temp = tempfile::tempdir().unwrap();
+        let module_dir = temp.path().join("unused");
+        fs::create_dir_all(&module_dir).unwrap();
+        fs::write(
+            module_dir.join("main.crn"),
+            "let vpc = awscc.ec2.Vpc {\n  tags = {\n    Name = 'x'\n  }\n}\n",
+        )
+        .unwrap();
+
+        let parsed = parsed_with_uses(vec![("unused", "./unused")], vec![]);
+
+        let results = collect_all_tag_keys::<_, String>(&[], &parsed, temp.path());
+        assert!(
+            results.is_empty(),
+            "tag keys from uncalled imports must not be collected; got {:?}",
+            results.iter().map(|entry| &entry.key).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn collect_all_tag_keys_skips_nonexistent_module_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let parsed = parsed_with_uses(vec![("missing", "./does-not-exist")], vec!["missing"]);
+
+        let results = collect_all_tag_keys::<_, String>(&[], &parsed, temp.path());
+
+        assert!(results.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_all_tag_keys_deduplicates_real_and_symlinked_module_directories() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real_dir = temp.path().join("real-module");
+        let alias_dir = temp.path().join("module-alias");
+        fs::create_dir(&real_dir).unwrap();
+        fs::write(
+            real_dir.join("main.crn"),
+            "attributes {\n  tags = {\n    Name = \"shared\"\n  }\n}\n",
+        )
+        .unwrap();
+        symlink(&real_dir, &alias_dir).unwrap();
+
+        let parsed = parsed_with_uses(
+            vec![("real", "./real-module"), ("alias", "./module-alias")],
+            vec!["real", "alias"],
+        );
+
+        let results = collect_all_tag_keys::<_, String>(&[], &parsed, temp.path());
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "Name");
     }
 
     #[test]

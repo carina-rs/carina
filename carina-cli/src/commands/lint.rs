@@ -8,9 +8,9 @@ use carina_core::config_loader::{
     find_crn_files_in_dir, get_base_dir, load_configuration_with_config,
 };
 use carina_core::lint::{
-    TagKeyEntry, collect_tag_keys, find_duplicate_attrs, find_list_literal_attrs,
+    TagKeyEntry, collect_all_tag_keys, find_duplicate_attrs, find_list_literal_attrs,
     find_mixed_tag_key_styles, find_non_snake_case_bindings, find_pipe_preferred_direct_calls,
-    list_struct_attr_names,
+    list_struct_attr_names, mixed_tag_key_style_message,
 };
 use carina_core::module_resolver;
 use carina_core::parser::ProviderContext;
@@ -26,6 +26,26 @@ struct LintWarning {
     file: PathBuf,
     line: usize,
     message: String,
+}
+
+fn mixed_tag_key_style_warnings(all_tag_keys: &[TagKeyEntry]) -> Vec<LintWarning> {
+    find_mixed_tag_key_styles(all_tag_keys)
+        .into_iter()
+        .map(|warning| LintWarning {
+            file: warning.file.clone().unwrap_or_default(),
+            line: warning.line,
+            message: mixed_tag_key_style_message(&warning),
+        })
+        .collect()
+}
+
+fn mixed_tag_key_style_warnings_for_population<E>(
+    root_inputs: &[(PathBuf, String)],
+    parsed: &carina_core::parser::File<E>,
+    base_dir: &Path,
+) -> Vec<LintWarning> {
+    let tag_keys = collect_all_tag_keys(root_inputs, parsed, base_dir);
+    mixed_tag_key_style_warnings(&tag_keys)
 }
 
 pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), AppError> {
@@ -136,10 +156,6 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
             });
         }
     }
-    // Collect tag keys across all files for cross-file consistency check
-    let mut all_tag_keys: Vec<TagKeyEntry> = Vec::new();
-    let mut tag_key_files: Vec<PathBuf> = Vec::new();
-
     for (file_path, source) in &source_texts {
         // Check for list literal syntax on List<Struct> attributes
         let hits = find_list_literal_attrs(source, &all_list_struct_attrs);
@@ -196,52 +212,13 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
                 ),
             });
         }
-
-        // Collect tag keys for cross-file consistency check
-        let file_tag_keys = collect_tag_keys(source);
-        for entry in &file_tag_keys {
-            all_tag_keys.push(TagKeyEntry {
-                key: entry.key.clone(),
-                style: entry.style,
-                line: entry.line,
-            });
-            tag_key_files.push(file_path.clone());
-        }
     }
 
-    // Also collect tag keys from every imported module directory so tag-key
-    // style consistency is checked across the whole project (root + modules).
-    for (mf, entry) in collect_tag_keys_from_modules(&parsed, base_dir) {
-        all_tag_keys.push(entry);
-        tag_key_files.push(mf);
-    }
-
-    // Check for mixed tag key styles across all collected keys
-    {
-        let tag_warnings = find_mixed_tag_key_styles(&all_tag_keys);
-        for tw in tag_warnings {
-            let style_name = match tw.expected_style {
-                carina_core::lint::TagKeyStyle::PascalCase => "PascalCase",
-                carina_core::lint::TagKeyStyle::SnakeCase => "snake_case",
-                carina_core::lint::TagKeyStyle::Other => "consistent",
-            };
-            // Find the file for this warning by matching line number
-            let file = all_tag_keys
-                .iter()
-                .zip(tag_key_files.iter())
-                .find(|(e, _)| e.key == tw.key && e.line == tw.line)
-                .map(|(_, f)| f.clone())
-                .unwrap_or_default();
-            warnings.push(LintWarning {
-                file,
-                line: tw.line,
-                message: format!(
-                    "Tag key '{}' doesn't match the dominant style ({}). Use consistent casing for tag keys.",
-                    tw.key, style_name
-                ),
-            });
-        }
-    }
+    warnings.extend(mixed_tag_key_style_warnings_for_population(
+        &source_texts,
+        &parsed,
+        base_dir,
+    ));
 
     if warnings.is_empty() {
         println!("{}", "No lint warnings found.".green().bold());
@@ -263,54 +240,12 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
     }
 }
 
-/// Walk every imported module directory referenced by `parsed.module_calls`
-/// and yield each `.crn` file's tag keys paired with the file path.
-///
-/// Keys off `parsed.uses` (alias → path) rather than `module_calls.module_name`:
-/// the alias need not match the last component of the import path (e.g.
-/// `import net = './modules/network'` uses alias `net` but dir `network`).
-/// Modules are directory-scoped (#1997), so only directory imports that are
-/// actually called from the root config are scanned.
-fn collect_tag_keys_from_modules<E>(
-    parsed: &carina_core::parser::File<E>,
-    base_dir: &std::path::Path,
-) -> Vec<(PathBuf, TagKeyEntry)> {
-    let aliases_used: HashSet<&str> = parsed
-        .module_calls
-        .iter()
-        .map(|c| c.module_name.as_str())
-        .collect();
-
-    let mut out = Vec::new();
-    for import in &parsed.uses {
-        if !aliases_used.contains(import.alias.as_str()) {
-            continue;
-        }
-        let module_dir = base_dir.join(&import.path);
-        if !module_dir.is_dir() {
-            continue;
-        }
-        let Ok(module_files) = find_crn_files_in_dir(&module_dir) else {
-            continue;
-        };
-        for mf in module_files {
-            let Ok(content) = fs::read_to_string(&mf) else {
-                continue;
-            };
-            for entry in collect_tag_keys(&content) {
-                out.push((mf.clone(), entry));
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::lint::collect_tag_keys_for_file;
     use carina_core::parser::{ModuleCall, ParsedFile, UseStatement};
 
-    /// Build a minimal ParsedFile with the given uses and module-call aliases.
     fn parsed_with_uses(uses: Vec<(&str, &str)>, calls: Vec<&str>) -> ParsedFile {
         ParsedFile {
             uses: uses
@@ -333,52 +268,79 @@ mod tests {
     }
 
     #[test]
-    fn collect_tag_keys_from_modules_scans_directory_imports() {
-        // Regression guard for #1997: a module whose import alias differs
-        // from the directory name must still be scanned for tag keys.
-        let tmp = tempfile::tempdir().unwrap();
-        let modules_dir = tmp.path().join("modules").join("network");
-        fs::create_dir_all(&modules_dir).unwrap();
-        fs::write(
-            modules_dir.join("main.crn"),
-            "let vpc = awscc.ec2.Vpc {\n  tags = {\n    Name = 'x'\n  }\n}\n",
-        )
-        .unwrap();
+    fn mixed_tag_key_warnings_keep_each_same_key_same_line_file() {
+        let majority_file = PathBuf::from("majority.crn");
+        let a_file = PathBuf::from("a.crn");
+        let b_file = PathBuf::from("b.crn");
+        let mut entries = collect_tag_keys_for_file(
+            "tags = {\n    Name = \"app\"\n    Environment = \"prod\"\n    Owner = \"team\"\n}",
+            &majority_file,
+        );
+        let minority_source = "tags = {\n\n    managed_by = \"carina\"\n}";
+        entries.extend(collect_tag_keys_for_file(minority_source, &a_file));
+        entries.extend(collect_tag_keys_for_file(minority_source, &b_file));
+
+        let warnings = mixed_tag_key_style_warnings(&entries);
+        let locations: Vec<_> = warnings
+            .iter()
+            .map(|warning| (warning.file.clone(), warning.line))
+            .collect();
+
+        assert_eq!(locations, vec![(a_file, 3), (b_file, 3)]);
+    }
+
+    #[test]
+    fn tag_key_population_deduplicates_two_aliases_to_one_module_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_file = temp.path().join("main.crn");
+        let module_dir = temp.path().join("shared");
+        let module_file = module_dir.join("main.crn");
+        let root_source =
+            "tags = {\n    Name = \"app\"\n    Environment = \"prod\"\n    Owner = \"team\"\n}";
+        let module_source = "attributes {\n  tags = {\n    managed_by = \"carina\"\n    cost_center = \"infra\"\n  }\n}";
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(&root_file, root_source).unwrap();
+        std::fs::write(&module_file, module_source).unwrap();
 
         let parsed = parsed_with_uses(
-            vec![("net", "./modules/network")],
-            vec!["net"], // alias differs from last path component
+            vec![("first", "./shared"), ("second", "./shared")],
+            vec!["first", "second"],
         );
+        let root_inputs = vec![(root_file, root_source.to_string())];
 
-        let results = collect_tag_keys_from_modules(&parsed, tmp.path());
+        let warnings =
+            mixed_tag_key_style_warnings_for_population(&root_inputs, &parsed, temp.path());
+
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().all(|warning| warning.file == module_file));
         assert!(
-            results.iter().any(|(_, entry)| entry.key == "Name"),
-            "tag key 'Name' must be collected from the module's main.crn; got {:?}",
-            results.iter().map(|(_, e)| &e.key).collect::<Vec<_>>()
+            warnings
+                .iter()
+                .all(|warning| warning.message.contains("(PascalCase)"))
         );
     }
 
     #[test]
-    fn collect_tag_keys_from_modules_skips_unused_imports() {
-        // An imported module that is never called from the root config is
-        // not part of the effective plan — skip it to avoid surfacing tag
-        // inconsistencies in dead code.
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("unused");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join("main.crn"),
-            "let vpc = awscc.ec2.Vpc {\n  tags = {\n    Name = 'x'\n  }\n}\n",
-        )
-        .unwrap();
+    fn tag_key_population_deduplicates_self_referential_root_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let main_file = temp.path().join("main.crn");
+        let db_file = temp.path().join("db.crn");
+        let main_source = "tags = {\n    Name = \"app\"\n    Environment = \"prod\"\n}";
+        let db_source = "tags = {\n    managed_by = \"carina\"\n}";
+        std::fs::write(&main_file, main_source).unwrap();
+        std::fs::write(&db_file, db_source).unwrap();
 
-        let parsed = parsed_with_uses(vec![("unused", "./unused")], vec![]); // no call
+        let parsed = parsed_with_uses(vec![("self_module", ".")], vec!["self_module"]);
+        let root_inputs = vec![
+            (main_file, main_source.to_string()),
+            (db_file.clone(), db_source.to_string()),
+        ];
 
-        let results = collect_tag_keys_from_modules(&parsed, tmp.path());
-        assert!(
-            results.is_empty(),
-            "tag keys from uncalled imports must not be collected; got {:?}",
-            results.iter().map(|(_, e)| &e.key).collect::<Vec<_>>()
-        );
+        let warnings =
+            mixed_tag_key_style_warnings_for_population(&root_inputs, &parsed, temp.path());
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].file, db_file);
+        assert_eq!(warnings[0].line, 2);
     }
 }
