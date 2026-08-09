@@ -3708,6 +3708,675 @@ fn exports_type_check_resolves_resource_binding_from_sibling_file() {
     );
 }
 
+// #3716: attributes diagnostics must use the directory-merged parse for
+// binding authority while continuing to anchor diagnostics in the open buffer.
+fn attributes_sibling_resource_engine() -> DiagnosticEngine {
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity, legacy_validator,
+    };
+
+    let target_group_schema = ResourceSchema::new("stub.TargetGroup").attribute(
+        AttributeSchema::new("target_group_arn", AttributeType::string()),
+    );
+    let vpc_id_type = AttributeType::refined_string_with_validator(
+        Some(TypeIdentity::bare("VpcId")),
+        None,
+        None,
+        legacy_validator(|_| Ok(())),
+        None,
+    );
+    let subnet_id_type = AttributeType::refined_string_with_validator(
+        Some(TypeIdentity::bare("SubnetId")),
+        None,
+        None,
+        legacy_validator(|_| Ok(())),
+        None,
+    );
+    let vpc_schema = ResourceSchema::new("stub.Vpc")
+        .attribute(AttributeSchema::new("vpc_id", vpc_id_type))
+        .attribute(AttributeSchema::new("subnet_id", subnet_id_type))
+        .attribute(AttributeSchema::new(
+            "config",
+            AttributeType::struct_(
+                "VpcConfig",
+                vec![StructField::new("name", AttributeType::string())],
+            ),
+        ));
+    let arn_type = AttributeType::refined_string_with_validator(
+        Some(TypeIdentity::bare("Arn")),
+        None,
+        None,
+        legacy_validator(|_| Ok(())),
+        None,
+    );
+    let policy_arn_type = AttributeType::refined_string_with_validator(
+        Some(TypeIdentity::new(Some("aws"), ["iam", "Policy"], "Arn")),
+        None,
+        None,
+        legacy_validator(|_| Ok(())),
+        None,
+    );
+    let role_schema = ResourceSchema::new("stub.Role")
+        .attribute(AttributeSchema::new("arn", arn_type))
+        .attribute(AttributeSchema::new("policy_arn", policy_arn_type));
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", target_group_schema);
+    schemas.insert("test", vpc_schema);
+    schemas.insert("test", role_schema);
+    custom_engine(schemas)
+}
+
+// Untyped dotted refs participate in both the directory-aware text scan and
+// the AST channel. Bare binding refs have no dot for the text scan and use
+// only the AST value anchor.
+#[test]
+fn attributes_block_resolves_untyped_binding_from_sibling_file() {
+    let engine = attributes_sibling_resource_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("main.crn"),
+        "let target_group = test.stub.TargetGroup {}\n",
+    )
+    .unwrap();
+    let attributes = "attributes {\n  target_group_arn = target_group.target_group_arn\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+    let text_scan_undefined = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Undefined resource: 'target_group'")
+        })
+        .count();
+    let ast_undefined = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Undefined resource 'target_group' in attributes")
+        })
+        .count();
+
+    assert_eq!(
+        text_scan_undefined,
+        0,
+        "sibling-defined target_group must not be reported as undefined: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(ast_undefined, 0);
+    assert!(diagnostics.is_empty());
+}
+
+#[test]
+fn attributes_block_untyped_unknown_sibling_attribute_uses_core_diagnostic() {
+    let engine = attributes_sibling_resource_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("main.crn"), "let tg = test.stub.TargetGroup {}\n").unwrap();
+    let attributes = "attributes {\n  x = tg.no_such\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+    let unknown_attributes: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("attribute 'x': unknown attribute 'no_such' on 'tg'")
+        })
+        .collect();
+
+    assert_eq!(
+        unknown_attributes.len(),
+        1,
+        "the untyped core error must surface exactly once: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(unknown_attributes[0].range.start.line, 1);
+    assert_eq!(unknown_attributes[0].range.start.character, 2);
+    assert_eq!(unknown_attributes[0].range.end.character, 3);
+}
+
+#[test]
+fn attributes_block_untyped_known_sibling_attribute_has_no_diagnostic() {
+    let engine = attributes_sibling_resource_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("main.crn"), "let tg = test.stub.TargetGroup {}\n").unwrap();
+    let attributes = "attributes {\n  x = tg.target_group_arn\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+
+    assert!(
+        diagnostics.is_empty(),
+        "a valid untyped sibling attribute must stay diagnostic-free: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn attributes_block_untyped_param_anchor_respects_name_boundary() {
+    let engine = attributes_sibling_resource_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("main.crn"), "let tg = test.stub.TargetGroup {}\n").unwrap();
+    let attributes = "attributes {\n  x_long = tg.target_group_arn\n  x = tg.no_such\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+    let unknown_attributes: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("attribute 'x': unknown attribute 'no_such' on 'tg'")
+        })
+        .collect();
+
+    assert_eq!(unknown_attributes.len(), 1, "diagnostics: {diagnostics:?}");
+    assert_eq!(unknown_attributes[0].range.start.line, 2);
+    assert_eq!(unknown_attributes[0].range.start.character, 2);
+}
+
+#[test]
+fn attributes_block_multiline_map_keeps_later_param_anchor_visible() {
+    let engine = attributes_sibling_resource_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("main.crn"), "let tg = test.stub.TargetGroup {}\n").unwrap();
+    let attributes =
+        "attributes {\n  cfg = {\n    tags = tg.no_such\n  }\n  other: String = tg.also_bad\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+    let cfg_errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("attribute 'cfg': unknown attribute 'no_such' on 'tg'")
+        })
+        .collect();
+    let other_errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("attribute 'other': unknown attribute 'also_bad' on 'tg'")
+        })
+        .collect();
+
+    assert_eq!(cfg_errors.len(), 1, "diagnostics: {diagnostics:?}");
+    assert_eq!(other_errors.len(), 1, "diagnostics: {diagnostics:?}");
+    assert_eq!(diagnostics.len(), 2, "diagnostics: {diagnostics:?}");
+    assert_eq!(other_errors[0].range.start.line, 4);
+    assert_eq!(other_errors[0].range.start.character, 2);
+    assert_eq!(other_errors[0].range.end.line, 4);
+    assert_eq!(other_errors[0].range.end.character, 7);
+}
+
+#[test]
+fn attributes_block_nested_map_entry_does_not_steal_later_param_anchor() {
+    let engine = attributes_sibling_resource_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("main.crn"), "let tg = test.stub.TargetGroup {}\n").unwrap();
+    let attributes = "attributes {\n  cfg = {\n    other = 1\n  }\n  other = tg.no_such\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+    let other_errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("attribute 'other': unknown attribute 'no_such' on 'tg'")
+        })
+        .collect();
+
+    assert_eq!(other_errors.len(), 1, "diagnostics: {diagnostics:?}");
+    assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:?}");
+    assert_eq!(other_errors[0].range.start.line, 4);
+    assert_eq!(other_errors[0].range.start.character, 2);
+    assert_eq!(other_errors[0].range.end.line, 4);
+    assert_eq!(other_errors[0].range.end.character, 7);
+}
+
+#[test]
+fn attributes_block_untyped_bare_undefined_binding_uses_ast_value_anchor() {
+    let engine = attributes_sibling_resource_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    let attributes = "attributes {\n  x = missing\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+    let ast_undefined: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Undefined resource 'missing' in attributes 'x'")
+        })
+        .collect();
+
+    assert_eq!(ast_undefined.len(), 1, "diagnostics: {diagnostics:?}");
+    assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:?}");
+    assert_eq!(ast_undefined[0].range.start.line, 1);
+    assert_eq!(ast_undefined[0].range.start.character, 6);
+    assert_eq!(ast_undefined[0].range.end.character, 13);
+}
+
+#[test]
+fn attributes_block_untyped_dotted_enum_is_not_an_undefined_binding() {
+    let engine = test_engine_with_wait_target();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    let attributes =
+        "attributes {\n  status = aws.s3.BucketVersioning.VersioningStatus.enabled\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+    let undefined = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("Undefined resource"))
+        .count();
+
+    assert_eq!(undefined, 0, "diagnostics: {diagnostics:?}");
+}
+
+#[test]
+fn attributes_block_resolves_typed_binding_from_sibling_file() {
+    let engine = attributes_sibling_resource_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("main.crn"),
+        "let target_group = test.stub.TargetGroup {}\n",
+    )
+    .unwrap();
+    let attributes =
+        "attributes {\n  target_group_arn: String = target_group.target_group_arn\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+    let undefined = diagnostics.iter().find(|diagnostic| {
+        diagnostic.message.contains("Undefined resource")
+            && diagnostic.message.contains("target_group")
+    });
+
+    assert!(
+        undefined.is_none(),
+        "sibling-defined target_group must not be reported as undefined: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn attributes_block_still_reports_truly_undefined_sibling_reference() {
+    let engine = attributes_sibling_resource_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("main.crn"),
+        "let target_group = test.stub.TargetGroup {}\n",
+    )
+    .unwrap();
+    let attributes = "attributes {\n  target_group_arn = missing.target_group_arn\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+
+    let text_scan_undefined = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("Undefined resource: 'missing'"))
+        .count();
+    let ast_undefined = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Undefined resource 'missing' in attributes")
+        })
+        .count();
+
+    assert_eq!(
+        text_scan_undefined,
+        1,
+        "a genuinely missing binding must still be reported: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(ast_undefined, 1);
+    assert_eq!(diagnostics.len(), 2);
+}
+
+#[test]
+fn attributes_block_typed_undefined_reference_uses_ast_diagnostic() {
+    let engine = attributes_sibling_resource_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("main.crn"),
+        "let target_group = test.stub.TargetGroup {}\n",
+    )
+    .unwrap();
+    let attributes = "attributes {\n  x: String = missing.attr\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+    let typed_undefined = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Undefined resource 'missing' in attributes 'x'")
+        })
+        .count();
+
+    assert_eq!(
+        typed_undefined,
+        1,
+        "the merged parse must preserve the typed AST undefined-reference diagnostic: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn attributes_block_builtin_string_accepts_sibling_refined_string_like_core() {
+    let engine = attributes_sibling_resource_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("main.crn"), "let vpc = test.stub.Vpc {}\n").unwrap();
+    let attributes = "attributes {\n  x: String = vpc.vpc_id\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+
+    assert!(
+        diagnostics.is_empty(),
+        "String versus a refined string attribute must match core validation: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn attributes_block_reports_unknown_attribute_on_sibling_binding() {
+    let engine = attributes_sibling_resource_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("main.crn"), "let tg = test.stub.TargetGroup {}\n").unwrap();
+    let attributes = "attributes {\n  x: String = tg.no_such\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+    let unknown_attributes: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("attribute 'x': unknown attribute 'no_such' on 'tg'")
+        })
+        .collect();
+
+    assert_eq!(
+        unknown_attributes.len(),
+        1,
+        "the shared validator must report the sibling attribute typo exactly once: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "the shared validator must be the only attributes-ref existence authority: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(unknown_attributes[0].range.start.line, 1);
+    assert_eq!(unknown_attributes[0].range.start.character, 2);
+}
+
+#[test]
+fn attributes_block_simple_annotation_uses_core_narrowed_snake_equality() {
+    let engine = attributes_sibling_resource_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("main.crn"), "let role = test.stub.Role {}\n").unwrap();
+    let attributes = "attributes {\n  p: Arn = role.policy_arn\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("attribute 'p': type mismatch")
+                && diagnostic.message.contains("role.policy_arn")
+        })
+        .collect();
+
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "Simple annotations must use core's narrowed snake-name equality: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn attributes_block_segmented_ref_reports_unknown_struct_field() {
+    let engine = attributes_sibling_resource_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("main.crn"), "let vpc = test.stub.Vpc {}\n").unwrap();
+    let attributes = "attributes {\n  x: String = vpc.config.no_such\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+    let unknown_fields: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("attribute 'x': unknown field 'no_such' on struct 'VpcConfig'")
+        })
+        .collect();
+
+    assert_eq!(
+        unknown_fields.len(),
+        1,
+        "segmented refs must use core narrowing and report unknown fields once: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(unknown_fields[0].range.start.line, 1);
+    assert_eq!(unknown_fields[0].range.start.character, 2);
+}
+
+#[test]
+fn attributes_block_sibling_custom_type_mismatch_emits_one_diagnostic() {
+    let engine = attributes_sibling_resource_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("main.crn"), "let vpc = test.stub.Vpc {}\n").unwrap();
+    let attributes = "attributes {\n  x: SubnetId = vpc.vpc_id\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+    let mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .to_ascii_lowercase()
+                .contains("type mismatch")
+                && diagnostic.message.contains("vpc.vpc_id")
+        })
+        .count();
+
+    assert_eq!(
+        mismatches,
+        1,
+        "SubnetId versus sibling VpcId must emit exactly one mismatch: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+fn attributes_same_name_in_two_files_fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    &'static str,
+    &'static str,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    let mismatching =
+        "let vpc = test.stub.Vpc {}\n\nattributes {\n  region: SubnetId = vpc.vpc_id\n}\n";
+    let correct = "attributes {\n  region: String = \"ap-northeast-1\"\n}\n";
+    std::fs::write(base.join("a.crn"), mismatching).unwrap();
+    std::fs::write(base.join("b.crn"), correct).unwrap();
+    (tmp, base, mismatching, correct)
+}
+
+#[test]
+fn attributes_block_does_not_anchor_sibling_mismatch_in_current_buffer() {
+    let engine = attributes_sibling_resource_engine();
+    let (_tmp, base, _mismatching, correct) = attributes_same_name_in_two_files_fixture();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "b.crn", correct);
+    let type_mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .to_ascii_lowercase()
+                .contains("type mismatch")
+        })
+        .collect();
+
+    assert!(
+        type_mismatches.is_empty(),
+        "the correct region in b.crn must not receive a.crn's mismatch: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn attributes_block_reports_sibling_mismatch_in_its_own_buffer() {
+    let engine = attributes_sibling_resource_engine();
+    let (_tmp, base, mismatching, _correct) = attributes_same_name_in_two_files_fixture();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "a.crn", mismatching);
+    let type_mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .to_ascii_lowercase()
+                .contains("type mismatch")
+                && diagnostic.message.contains("vpc.vpc_id")
+        })
+        .collect();
+
+    assert_eq!(
+        type_mismatches.len(),
+        1,
+        "a.crn must report its own region mismatch exactly once: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(type_mismatches[0].range.start.line, 3);
+    assert_eq!(type_mismatches[0].range.start.character, 2);
+}
+
+#[test]
+fn attributes_block_type_mismatch_resolves_binding_from_sibling_file() {
+    let engine = attributes_sibling_resource_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("main.crn"), "let vpc = test.stub.Vpc {}\n").unwrap();
+    let attributes = "attributes {\n  vpc_id: SubnetId = vpc.vpc_id\n}\n";
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .to_ascii_lowercase()
+                .contains("type mismatch")
+                && diagnostic.message.contains("vpc.vpc_id")
+        }),
+        "SubnetId versus sibling VpcId must produce a type mismatch: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
 /// Build the multi-file fixture used by the #2442 sibling-fn tests.
 /// Layout:
 ///   `<tmp>/helpers.crn`   — `fn double(x: Int) { x }`
