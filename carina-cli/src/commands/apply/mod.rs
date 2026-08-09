@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use carina_core::parser::{ProviderConfig, ProviderContext};
 
-use super::{DriftCommand, validate_and_resolve_with_config, verify_for_mutation};
+use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::{PlanFile, collect_delete_attributes};
 use crate::commands::shared::effect_execution::{
@@ -758,6 +758,7 @@ async fn run_apply_with_observer_factory(
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let inference_errors = loaded.inference_errors;
+    let duplicate_declarations = loaded.duplicate_declarations;
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
     let backend_file = loaded.backend_file;
@@ -765,7 +766,13 @@ async fn run_apply_with_observer_factory(
     let base_dir = get_base_dir(path);
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
     let ctx = WiringContext::new(factories);
-    validate_and_resolve_with_config(&mut parsed, base_dir, false, &inference_errors)?;
+    crate::commands::validate_and_resolve_with_config(
+        &mut parsed,
+        base_dir,
+        false,
+        &inference_errors,
+        &duplicate_declarations,
+    )?;
 
     let verified_backend =
         verify_for_mutation(base_dir, parsed.backend.as_ref(), DriftCommand::Apply)?;
@@ -921,12 +928,14 @@ async fn run_apply_with_observer_factory(
                         &carina_core::schema::SchemaRegistry::new(),
                     )?;
                     let reloaded_inference_errors = reloaded.inference_errors;
+                    let reloaded_duplicate_declarations = reloaded.duplicate_declarations;
                     parsed = reloaded.parsed;
-                    validate_and_resolve_with_config(
+                    crate::commands::validate_and_resolve_with_config(
                         &mut parsed,
                         base_dir,
                         true,
                         &reloaded_inference_errors,
+                        &reloaded_duplicate_declarations,
                     )?;
 
                     let backend_resource_type = backend
@@ -1887,6 +1896,14 @@ async fn run_apply_from_plan_with_observer_factory(
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     )?;
+    let module_walk = crate::module_walk::ModuleWalk::load(&current_config.parsed, base_dir);
+    let duplicate_errors = crate::commands::duplicate_declaration_errors(
+        &current_config.duplicate_declarations,
+        &module_walk,
+    );
+    if !duplicate_errors.is_empty() {
+        return Err(crate::commands::collapse_errors(duplicate_errors));
+    }
     let verified_backend = verify_for_mutation(
         base_dir,
         current_config.parsed.backend.as_ref(),

@@ -15,9 +15,7 @@ use carina_core::value::{
 };
 use carina_state::{BackendConfig as StateBackendConfig, StateBackend, StateFile, create_backend};
 
-use super::{
-    BackendDriftStatus, drift_warning, inspect_backend_drift, validate_and_resolve_with_config,
-};
+use super::{BackendDriftStatus, drift_warning, inspect_backend_drift};
 use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::display::{print_plan, refresh_plan_separator};
@@ -556,11 +554,18 @@ pub async fn run_plan(
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let inference_errors = loaded.inference_errors;
+    let duplicate_declarations = loaded.duplicate_declarations;
     let mut parsed = loaded.parsed;
     let unresolved_parsed = loaded.unresolved_parsed;
 
     let base_dir = get_base_dir(path);
-    validate_and_resolve_with_config(&mut parsed, base_dir, false, &inference_errors)?;
+    crate::commands::validate_and_resolve_with_config(
+        &mut parsed,
+        base_dir,
+        false,
+        &inference_errors,
+        &duplicate_declarations,
+    )?;
 
     let mut plan_backend_config = parsed.backend.as_ref().map(StateBackendConfig::from);
     let mut plan_file_backend_config = parsed.backend.clone();

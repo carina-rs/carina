@@ -8,6 +8,7 @@ use crate::document::Document;
 use crate::position;
 use carina_core::binding_index::{BindingIndex, BindingTarget};
 use carina_core::builtins;
+use carina_core::config_loader::{DeclarationKind, DirectoryParseResult, DuplicateDeclaration};
 use carina_core::parser::{ArgumentParameter, ParsedFile, TypeExpr};
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::suggest_similar_name;
@@ -396,32 +397,142 @@ impl DiagnosticEngine {
         doc: &Document,
         current_file_name: Option<&str>,
         base_path: &std::path::Path,
-    ) -> Option<ParsedFile> {
+    ) -> Option<DirectoryParseResult> {
         let mut overrides: HashMap<String, String> = HashMap::new();
         if let Some(name) = current_file_name {
             overrides.insert(name.to_string(), doc.text());
         }
-        let mut merged = carina_core::config_loader::parse_directory_with_overrides(
-            base_path,
-            &self.provider_context,
-            &overrides,
-        )
-        .ok()?;
+        let mut result =
+            carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
+                base_path,
+                &self.provider_context,
+                &overrides,
+            )
+            .ok()?;
         // Module expansion is a no-op for configs without `module_call`, and
         // safe to ignore-if-fails for module-loading errors (sibling LSP
         // checks like `check_module_calls` already report those). We only
         // care about reaching finalize on the typical case.
         let _ = carina_core::module_resolver::resolve_modules_with_config(
-            &mut merged,
+            &mut result.parsed,
             base_path,
             &self.provider_context,
         );
         let _ = carina_core::parser::resolve_provider_unresolved_attributes(
-            &mut merged,
+            &mut result.parsed,
             &self.provider_context,
         );
-        let _ = carina_core::parser::finalize_provider_configs(&mut merged);
-        Some(merged)
+        let _ = carina_core::parser::finalize_provider_configs(&mut result.parsed);
+        Some(result)
+    }
+
+    /// Render duplicate declaration groups that contain a declaration in the
+    /// current buffer. The loader owns provenance; this layer only locates the
+    /// corresponding name in the editor text because declaration AST nodes do
+    /// not carry spans.
+    pub(super) fn duplicate_declaration_diagnostics(
+        &self,
+        doc: &Document,
+        current_file_name: Option<&str>,
+        duplicates: &[DuplicateDeclaration],
+    ) -> Vec<Diagnostic> {
+        duplicates
+            .iter()
+            .filter(|duplicate| {
+                current_file_name
+                    .map(|name| duplicate.occurs_in_file(name))
+                    .unwrap_or(true)
+            })
+            .filter_map(|duplicate| {
+                let kind = current_file_name
+                    .and_then(|name| duplicate.kind_in_file(name))
+                    .or_else(|| {
+                        duplicate
+                            .occurrences()
+                            .first()
+                            .map(|occurrence| occurrence.kind())
+                    })?;
+                let position = match kind {
+                    DeclarationKind::Export => {
+                        self.find_exports_param_position(doc, duplicate.name())
+                    }
+                    DeclarationKind::Binding => {
+                        self.find_let_binding_position(&doc.text(), duplicate.name())
+                    }
+                    DeclarationKind::Argument => self.find_declaration_block_param_position(
+                        doc,
+                        "arguments",
+                        duplicate.name(),
+                    ),
+                    DeclarationKind::ModuleAttribute => self.find_declaration_block_param_position(
+                        doc,
+                        "attributes",
+                        duplicate.name(),
+                    ),
+                    DeclarationKind::UserFunction => {
+                        self.find_user_function_position(doc, duplicate.name())
+                    }
+                }?;
+                Some(carina_diagnostic(
+                    position.0,
+                    position.1,
+                    position.1 + duplicate.name().chars().count() as u32,
+                    DiagnosticSeverity::ERROR,
+                    duplicate.to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    fn find_declaration_block_param_position(
+        &self,
+        doc: &Document,
+        block_name: &str,
+        param_name: &str,
+    ) -> Option<(u32, u32)> {
+        let mut in_block = false;
+        for (line_idx, line) in doc.text().lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with(block_name) && trimmed.contains('{') {
+                in_block = true;
+                continue;
+            }
+            if in_block && trimmed == "}" {
+                in_block = false;
+                continue;
+            }
+            if in_block
+                && trimmed.starts_with(param_name)
+                && trimmed[param_name.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character == ':' || character.is_whitespace())
+            {
+                return Some((line_idx as u32, position::leading_whitespace_chars(line)));
+            }
+        }
+        None
+    }
+
+    fn find_user_function_position(
+        &self,
+        doc: &Document,
+        function_name: &str,
+    ) -> Option<(u32, u32)> {
+        let prefix = format!("fn {function_name}");
+        for (line_idx, line) in doc.text().lines().enumerate() {
+            let trimmed = line.trim();
+            if let Some(after_name) = trimmed.strip_prefix(&prefix)
+                && after_name
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character == '(' || character.is_whitespace())
+            {
+                let leading = position::leading_whitespace_chars(line);
+                return Some((line_idx as u32, leading + 3));
+            }
+        }
+        None
     }
 
     /// Run finalize-against-a-buffer in isolation so the engine can surface

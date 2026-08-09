@@ -24,10 +24,7 @@ use carina_state::{
     load_state_from_url, resolve_backend_for_read,
 };
 
-use super::{
-    BackendDriftStatus, DriftCommand, inspect_backend_drift, validate_and_resolve_with_config,
-    verify_for_mutation,
-};
+use super::{BackendDriftStatus, DriftCommand, inspect_backend_drift, verify_for_mutation};
 use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overrides};
 use crate::error::AppError;
 use crate::wiring::{
@@ -942,10 +939,17 @@ pub async fn run_state_refresh(
         &carina_core::schema::SchemaRegistry::new(),
     )?;
     let inference_errors = loaded.inference_errors;
+    let duplicate_declarations = loaded.duplicate_declarations;
     let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
-    validate_and_resolve_with_config(&mut parsed, base_dir, true, &inference_errors)?;
+    crate::commands::validate_and_resolve_with_config(
+        &mut parsed,
+        base_dir,
+        true,
+        &inference_errors,
+        &duplicate_declarations,
+    )?;
 
     let verified_backend = verify_for_mutation(
         base_dir,

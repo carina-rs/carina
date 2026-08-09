@@ -20,7 +20,7 @@ use carina_core::schema::{
 };
 use carina_state::{StateFile, check_and_migrate};
 
-use crate::commands::validate_and_resolve;
+use crate::commands::validate_and_resolve_with_config;
 use crate::wiring::{
     WiringContext, add_deferred_create_effects,
     adopt_unique_state_identity_for_unresolved_anonymous,
@@ -75,9 +75,17 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
 
     let loaded = load_configuration(&fixture_pathbuf).unwrap();
     let inference_errors = loaded.inference_errors;
+    let duplicate_declarations = loaded.duplicate_declarations;
     let mut parsed = loaded.parsed;
     let base_dir = get_base_dir(&fixture_pathbuf);
-    validate_and_resolve(&mut parsed, base_dir, true, &inference_errors).unwrap();
+    validate_and_resolve_with_config(
+        &mut parsed,
+        base_dir,
+        true,
+        &inference_errors,
+        &duplicate_declarations,
+    )
+    .unwrap();
 
     let mut state_file: Option<StateFile> = if state_path.exists() {
         let json = std::fs::read_to_string(&state_path).unwrap();

@@ -501,9 +501,10 @@ impl ResolvedBindings {
     /// then wait aliases. The post-apply layering in
     /// `state_writeback.rs` uses the same order, so a same-stack
     /// collision resolves identically on the pre-apply and post-apply
-    /// sides. (Same-name collisions are independently rejected by the
-    /// parser's `DuplicateBinding` check, so the order is observable
-    /// only in test code that constructs colliding inputs by hand.)
+    /// sides. Same-file collisions are rejected by the parser and
+    /// cross-file collisions by the directory loader's duplicate-
+    /// declaration validation, so the order is observable only in test
+    /// code that constructs colliding inputs by hand.
     pub fn pre_apply(inputs: PreApplyInputs<'_>) -> Self {
         let mut bindings = Self::build_managed_core(
             inputs.managed,

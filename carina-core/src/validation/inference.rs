@@ -197,14 +197,13 @@ pub fn bindings_from_parsed<E>(parsed: &crate::parser::File<E>) -> InferenceBind
 ///
 /// Insert order is upstream-states first, resources second, so a
 /// resource binding wins on collision with an `upstream_state` of the
-/// same name. The duplicate-binding diagnostic fires elsewhere in
-/// validation, but during a mid-edit the LSP can transiently see both —
-/// preferring the resource means downstream inference still gets the
-/// precise type instead of degrading to `NonInferableBinding`. Two
-/// resource bindings with the same name (also illegal but possible
-/// mid-edit) silently last-write-wins on the standard `HashMap` insert
-/// semantics; the duplicate-binding check elsewhere is the gate that
-/// reports it to the user.
+/// same name. The directory loader's duplicate-declaration channel is
+/// the validation gate for these cross-file collisions, but during a
+/// mid-edit the LSP deliberately keeps the merged parse alive — preferring
+/// the resource means downstream inference still gets the precise type
+/// instead of degrading to `NonInferableBinding`. Two resource bindings
+/// with the same name likewise remain deterministic here while the loader
+/// diagnostic reports the collision to the user.
 pub fn bindings_from_parts(
     resources: &[crate::resource::Resource],
     data_sources: &[crate::resource::DataSource],

@@ -1826,6 +1826,34 @@ mod substitute_placeholder_tests {
             !names.contains("plain_value_name"),
             "plain value lets must be excluded from structural binding names"
         );
+
+        // Coverage contract: this destructure must remain exhaustive. Adding a
+        // field to `File` must fail to compile here until the author classifies
+        // it as either binding-bearing (and updates `structural_binding_names`
+        // plus this fixture) or explicitly non-binding-bearing. Do not add a
+        // `..` rest pattern.
+        let File {
+            providers: _,
+            resources: _,
+            data_sources: _,
+            compositions: _,
+            variables: _,
+            uses: _,
+            module_calls: _,
+            arguments: _,
+            attribute_params: _,
+            export_params: _,
+            backend: _,
+            state_blocks: _,
+            user_functions: _,
+            upstream_states: _,
+            wait_bindings: _,
+            requires: _,
+            structural_bindings: _,
+            warnings: _,
+            deferred_for_expressions: _,
+            expansion_trace: _,
+        } = parsed;
     }
 
     #[test]

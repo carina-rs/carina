@@ -30,11 +30,12 @@ fn share_provider_attrs_resolves_default_tags() {
     // bypasses provider-plugin loading; the mock provider's WASM is not
     // available in the test environment, but we only need pipeline
     // semantics here.
-    carina_cli::commands::validate_and_resolve(
+    carina_cli::commands::validate_and_resolve_with_config(
         &mut config.parsed,
         &fixture,
         true,
         &config.inference_errors,
+        &config.duplicate_declarations,
     )
     .expect("validate_and_resolve must succeed");
 

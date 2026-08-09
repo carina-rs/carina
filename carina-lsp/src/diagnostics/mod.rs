@@ -162,10 +162,34 @@ impl DiagnosticEngine {
         // filtering, and exports type validation (#2134). The buffer is
         // substituted for its on-disk copy so diagnostics update on
         // keystrokes.
-        let merged =
+        let merged_result =
             base_path.and_then(|base| self.parse_merged_with_buffer(doc, current_file_name, base));
+        if let Some(result) = merged_result.as_ref() {
+            diagnostics.extend(self.duplicate_declaration_diagnostics(
+                doc,
+                current_file_name,
+                &result.duplicate_declarations,
+            ));
+        } else if let Some(parsed) = doc.parsed() {
+            // An unrelated broken sibling makes the directory parse fail, but
+            // the current buffer's successful parse still retains same-file
+            // declaration multiplicity. Reuse the loader extractor so export,
+            // argument, and module-attribute duplicates remain visible without
+            // recreating directory provenance that is unavailable in this mode.
+            let file_name = current_file_name.unwrap_or("<buffer>.crn");
+            let duplicates = carina_core::config_loader::find_duplicate_declarations_in_parsed_file(
+                Path::new(file_name),
+                parsed,
+            );
+            diagnostics.extend(self.duplicate_declaration_diagnostics(
+                doc,
+                current_file_name,
+                &duplicates,
+            ));
+        }
+        let merged = merged_result.as_ref().map(|result| &result.parsed);
 
-        if let (Some(base), Some(merged)) = (base_path, merged.as_ref()) {
+        if let (Some(base), Some(merged)) = (base_path, merged) {
             diagnostics.extend(self.check_upstream_state_field_references(doc, merged, base));
             diagnostics.extend(self.check_for_iterable_bindings(doc, merged, current_file_name));
         }
@@ -176,7 +200,7 @@ impl DiagnosticEngine {
         // same pass against the merged parse so users see the same
         // "unknown provider instance" / "no default instance for kind"
         // message before they run `carina validate`.
-        if let Some(merged) = merged.as_ref() {
+        if let Some(merged) = merged {
             for err in carina_core::parser::check_provider_instance_routing(merged) {
                 diagnostics.push(parse_error_to_diagnostic(&err));
             }
@@ -225,7 +249,7 @@ impl DiagnosticEngine {
         // don't over-fire for `arguments {}` blocks in files outside
         // any known project root.
         if self.provider_context.customs_loaded {
-            let custom_type_findings = match merged.as_ref() {
+            let custom_type_findings = match merged {
                 Some(m) => {
                     let mut parsed = m.clone();
                     let mut findings = carina_core::validation::resolve_file_type_exprs(
@@ -265,7 +289,7 @@ impl DiagnosticEngine {
 
         // Prefer the directory-merged parse so cross-file binding refs
         // resolve; fall back to the buffer-only parse otherwise.
-        if let Some(parsed) = merged.as_ref() {
+        if let Some(parsed) = merged {
             diagnostics.extend(self.check_depends_on(doc, parsed));
             diagnostics.extend(self.check_wait_bindings(doc, parsed));
             diagnostics.extend(self.check_deferred_populate_refs(doc, parsed));
@@ -299,7 +323,7 @@ impl DiagnosticEngine {
         // When no `base_path` is available at all, the buffer-only scan
         // remains the last resort.
         let declared_providers = self.extract_declared_provider_names(&text);
-        let known_bindings: HashSet<String> = match (merged.as_ref(), base_path) {
+        let known_bindings: HashSet<String> = match (merged, base_path) {
             (Some(merged), _) => carina_core::binding_index::BindingNameSet::from_parsed(merged)
                 .iter_names()
                 .map(String::from)
@@ -326,7 +350,7 @@ impl DiagnosticEngine {
             // signal — a sibling `backend` block — can live in another
             // .crn file in the same directory, so the check needs the
             // merged directory parse when available (#2198).
-            diagnostics.extend(self.check_arguments_in_root(doc, parsed, merged.as_ref()));
+            diagnostics.extend(self.check_arguments_in_root(doc, parsed, merged));
 
             // Check provider region
             diagnostics.extend(self.check_provider_region(doc, parsed));
@@ -346,7 +370,7 @@ impl DiagnosticEngine {
             // back to the buffer parse only when directory merging failed. This
             // deliberately gives both composition-attribute existence checks
             // and `check_resource_ref_type_mismatch` directory-wide targets.
-            let binding_input = merged.as_ref().unwrap_or(parsed);
+            let binding_input = merged.unwrap_or(parsed);
             let binding_index =
                 carina_core::binding_index::BindingIndex::from_parsed(binding_input, &self.schemas);
             // Schema-only consumers retain the borrow-valued projection and
@@ -935,12 +959,7 @@ impl DiagnosticEngine {
             // elsewhere in the directory) — without that fallback,
             // every sibling-defined fn would redline as Unknown the
             // moment any sibling fails to parse.
-            diagnostics.extend(self.check_unknown_functions(
-                doc,
-                parsed,
-                merged.as_ref(),
-                base_path,
-            ));
+            diagnostics.extend(self.check_unknown_functions(doc, parsed, merged, base_path));
 
             // Check attributes blocks
             diagnostics.extend(self.check_attributes_blocks(doc, parsed));
@@ -952,15 +971,9 @@ impl DiagnosticEngine {
             // rely on the local-to-file checks that `check_exports_blocks`
             // performs (e.g. type annotation sanity, literal-value shape).
             let sibling_bindings = merged
-                .as_ref()
                 .map(exports_sibling_bindings_from)
                 .unwrap_or_default();
-            diagnostics.extend(self.check_exports_blocks(
-                doc,
-                parsed,
-                merged.as_ref(),
-                &sibling_bindings,
-            ));
+            diagnostics.extend(self.check_exports_blocks(doc, parsed, merged, &sibling_bindings));
 
             // Unused `let` detection. When a merged parse is available,
             // run the core check against it (so references from sibling
@@ -968,7 +981,7 @@ impl DiagnosticEngine {
             // declared in the current file — the LSP warning surface is
             // per-document. Without a merged parse there are no sibling
             // references to consider, so run the per-file check.
-            let unused_binding_names: Vec<String> = match merged.as_ref() {
+            let unused_binding_names: Vec<String> = match merged {
                 Some(merged) => {
                     let current_file_bindings: HashSet<String> = parsed
                         .iter_all_resources()
