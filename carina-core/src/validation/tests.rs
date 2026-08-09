@@ -1,6 +1,6 @@
 use super::*;
 use crate::parser::{BindingName, ParsedFile, ProviderContext, UntilPredicateAst, WaitBinding};
-use crate::resource::Resource;
+use crate::resource::{Composition, CompositionAttribute, Resource, ResourceId, Signature};
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
 
 fn empty_parsed() -> ParsedFile {
@@ -562,6 +562,78 @@ fn make_schema(resource_type: &str, attrs: Vec<(&str, AttributeType)>) -> Resour
         default_wait_interval: None,
         defs: std::collections::BTreeMap::new(),
     }
+}
+
+fn make_composition(binding: &str, attributes: &[&str]) -> Composition {
+    Composition {
+        id: ResourceId::with_identity("_virtual", binding),
+        signature: Signature {
+            arguments: IndexMap::new(),
+            attributes: attributes
+                .iter()
+                .map(|name| {
+                    (
+                        (*name).to_string(),
+                        CompositionAttribute::from_value(Value::Concrete(ConcreteValue::String(
+                            format!("{name}-value"),
+                        ))),
+                    )
+                })
+                .collect(),
+        },
+        binding: Some(binding.to_string()),
+        dependency_bindings: Default::default(),
+        module_name: "test_module".to_string(),
+        instance: binding.to_string(),
+        quoted_string_attrs: Default::default(),
+    }
+}
+
+#[test]
+fn resource_ref_validation_checks_composition_attribute_membership_only() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        make_schema(
+            "test.Consumer",
+            vec![("target_group_arn", AttributeType::bool())],
+        ),
+    );
+
+    let valid = Resource::with_provider("awscc", "test.Consumer", "valid", None).with_attribute(
+        "target_group_arn",
+        Value::resource_ref(
+            "instance".to_string(),
+            "target_group_arn".to_string(),
+            vec!["runtime_field".to_string()],
+        ),
+    );
+    let invalid = Resource::with_provider("awscc", "test.Consumer", "invalid", None)
+        .with_attribute(
+            "target_group_arn",
+            Value::resource_ref(
+                "instance".to_string(),
+                "target_group_ar".to_string(),
+                vec![],
+            ),
+        );
+
+    let mut parsed = empty_parsed();
+    parsed
+        .compositions
+        .push(make_composition("instance", &["target_group_arn"]));
+    parsed.resources.extend([valid, invalid]); // allow: direct — fixture test inspection
+
+    let err = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new()).unwrap_err();
+    assert_eq!(
+        err.lines().count(),
+        1,
+        "declared composition attrs skip schema type/narrowing; only the miss should fail: {err}",
+    );
+    assert!(
+        err.contains("unknown attribute 'target_group_ar' on 'instance'"),
+        "expected composition membership error, got: {err}",
+    );
 }
 
 #[test]
@@ -2100,6 +2172,94 @@ fn attribute_param_ref_type_mismatch_detected() {
 }
 
 #[test]
+fn attribute_param_ref_existence_checks_composition_attribute_membership_only() {
+    use crate::parser::AttributeParameter;
+
+    let params = vec![
+        AttributeParameter {
+            name: "valid".to_string(),
+            type_expr: None,
+            value: Some(Value::resource_ref(
+                "instance".to_string(),
+                "target_group_arn".to_string(),
+                vec!["runtime_field".to_string()],
+            )),
+        },
+        AttributeParameter {
+            name: "invalid".to_string(),
+            type_expr: None,
+            value: Some(Value::resource_ref(
+                "instance".to_string(),
+                "target_group_ar".to_string(),
+                vec![],
+            )),
+        },
+    ];
+    let mut parsed = empty_parsed();
+    parsed
+        .compositions
+        .push(make_composition("instance", &["target_group_arn"]));
+    let schemas = SchemaRegistry::new();
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+
+    let err = validate_attribute_param_ref_types_with_bindings(&params, &bindings).unwrap_err();
+
+    assert_eq!(
+        err.lines().count(),
+        1,
+        "declared composition attr should pass without segment narrowing: {err}",
+    );
+    assert!(
+        err.contains("attribute 'invalid': unknown attribute 'target_group_ar' on 'instance'"),
+        "expected composition membership error, got: {err}",
+    );
+}
+
+#[test]
+fn attribute_param_ref_type_checks_composition_attribute_membership_only() {
+    use crate::parser::AttributeParameter;
+
+    let params = vec![
+        AttributeParameter {
+            name: "valid".to_string(),
+            type_expr: Some(TypeExpr::Simple("unrelated_type".to_string())),
+            value: Some(Value::resource_ref(
+                "instance".to_string(),
+                "target_group_arn".to_string(),
+                vec!["runtime_field".to_string()],
+            )),
+        },
+        AttributeParameter {
+            name: "invalid".to_string(),
+            type_expr: Some(TypeExpr::Simple("unrelated_type".to_string())),
+            value: Some(Value::resource_ref(
+                "instance".to_string(),
+                "target_group_ar".to_string(),
+                vec![],
+            )),
+        },
+    ];
+    let mut parsed = empty_parsed();
+    parsed
+        .compositions
+        .push(make_composition("instance", &["target_group_arn"]));
+    let schemas = SchemaRegistry::new();
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+
+    let err = validate_attribute_param_ref_types_with_bindings(&params, &bindings).unwrap_err();
+
+    assert_eq!(
+        err.lines().count(),
+        1,
+        "declared composition attr should skip type compatibility and narrowing: {err}",
+    );
+    assert!(
+        err.contains("attribute 'invalid': unknown attribute 'target_group_ar' on 'instance'"),
+        "expected composition membership error, got: {err}",
+    );
+}
+
+#[test]
 fn attribute_param_ref_types_flags_unknown_attribute_inside_nested_struct() {
     use crate::parser::AttributeParameter;
     use crate::schema::{AttributeSchema, ResourceSchema};
@@ -2830,7 +2990,8 @@ fn validate_export_param_ref_types_map_accepts_compatible_types() {
     let mut parsed = empty_parsed();
     parsed.resources.push(registry_prod); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
+    let result =
+        validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new());
     assert!(
         result.is_ok(),
         "map(String) = {{ prod = registry_prod.account_id (String) }} should pass, got: {:?}",
@@ -2878,7 +3039,8 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
     let mut parsed = empty_parsed();
     parsed.resources.push(registry_prod); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
+    let result =
+        validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new());
     assert!(
         result.is_err(),
         "map(Bool) = {{ prod = registry_prod.account_id }} (String) should be flagged as type mismatch"
@@ -2920,10 +3082,127 @@ fn export_param_ref_types_flags_unknown_attribute() {
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
+    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new())
+        .unwrap_err();
     assert!(
         err.contains("export 'x': unknown attribute 'bad_attr' on 'vpc' in reference vpc.bad_attr"),
         "expected export unknown attribute error, got: {err}",
+    );
+}
+
+#[test]
+fn export_param_ref_types_check_composition_attribute_membership_only() {
+    use crate::parser::InferredExportParam;
+
+    let exports = vec![
+        InferredExportParam {
+            name: "valid".to_string(),
+            type_expr: TypeExpr::Bool,
+            value: Some(Value::resource_ref(
+                "instance".to_string(),
+                "target_group_arn".to_string(),
+                vec!["runtime_field".to_string()],
+            )),
+        },
+        InferredExportParam {
+            name: "invalid".to_string(),
+            type_expr: TypeExpr::Bool,
+            value: Some(Value::resource_ref(
+                "instance".to_string(),
+                "target_group_ar".to_string(),
+                vec![],
+            )),
+        },
+    ];
+    let mut parsed = empty_parsed();
+    parsed
+        .compositions
+        .push(make_composition("instance", &["target_group_arn"]));
+    let schemas = SchemaRegistry::new();
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+
+    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new())
+        .unwrap_err();
+
+    assert_eq!(
+        err.lines().count(),
+        1,
+        "declared composition attr should skip type compatibility and narrowing: {err}",
+    );
+    assert!(
+        err.contains("export 'invalid': unknown attribute 'target_group_ar' on 'instance'"),
+        "expected composition membership error, got: {err}",
+    );
+}
+
+#[test]
+fn unknown_type_export_checks_both_authorities_except_reported_indices() {
+    use crate::parser::InferredExportParam;
+
+    let schema_resource =
+        Resource::with_provider("awscc", "elbv2.TargetGroup", "tg", None).with_binding("tg");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        make_schema(
+            "elbv2.TargetGroup",
+            vec![("target_group_arn", AttributeType::string())],
+        ),
+    );
+    let exports = vec![
+        InferredExportParam {
+            name: "composition_bad".to_string(),
+            type_expr: TypeExpr::Unknown,
+            value: Some(Value::resource_ref(
+                "instance".to_string(),
+                "target_group_ar".to_string(),
+                vec![],
+            )),
+        },
+        InferredExportParam {
+            name: "schema_bad".to_string(),
+            type_expr: TypeExpr::Unknown,
+            value: Some(Value::resource_ref(
+                "tg".to_string(),
+                "target_group_ar".to_string(),
+                vec![],
+            )),
+        },
+    ];
+    let mut parsed = empty_parsed();
+    parsed.resources.push(schema_resource); // allow: direct — fixture test inspection
+    parsed
+        .compositions
+        .push(make_composition("instance", &["target_group_arn"]));
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+
+    let all_errors =
+        validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new())
+            .unwrap_err();
+    assert_eq!(
+        all_errors.lines().count(),
+        2,
+        "an unreported Unknown export must check Schema and Composition targets: {all_errors}",
+    );
+    assert!(all_errors.contains("export 'composition_bad': unknown attribute"));
+    assert!(all_errors.contains("export 'schema_bad': unknown attribute"));
+
+    let reported_indices = HashSet::from([1]);
+    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings, &reported_indices)
+        .unwrap_err();
+
+    assert_eq!(
+        err.lines().count(),
+        1,
+        "only the exact index already reported by inference should be suppressed: {err}",
+    );
+    assert!(
+        err.contains("export 'composition_bad': unknown attribute 'target_group_ar' on 'instance'"),
+        "expected only the composition-backed miss, got: {err}",
+    );
+    assert!(
+        !err.contains("schema_bad"),
+        "the inference-reported index must not be walked again: {err}",
     );
 }
 
@@ -2976,7 +3255,8 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
     });
 
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
+    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new())
+        .unwrap_err();
     assert!(
         err.contains(
             "export 'x': unknown attribute 'bad_attr' on 'cert_issued' in reference cert_issued.bad_attr"
@@ -3025,7 +3305,8 @@ fn export_param_ref_types_flags_unknown_struct_field_inside_path() {
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings).unwrap_err();
+    let err = validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new())
+        .unwrap_err();
     assert!(
         err.contains(
             "export 'x': unknown attribute 'bad_field' on 'vpc' in reference vpc.config.bad_field"
@@ -3035,25 +3316,34 @@ fn export_param_ref_types_flags_unknown_struct_field_inside_path() {
 }
 
 #[test]
-fn validate_export_param_ref_types_skips_unknown_sentinel() {
+fn validate_export_param_ref_types_skips_reported_unknown_index() {
     use crate::parser::InferredExportParam;
 
-    // Sentinel-bearing exports are surfaced via `inference_errors`,
-    // so the ref-type validator must skip them silently — emitting a
-    // duplicate diagnostic here would double-report the same issue.
+    let schema_resource =
+        Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None).with_binding("vpc");
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        make_schema("ec2.Vpc", vec![("vpc_id", AttributeType::string())]),
+    );
     let exports = vec![InferredExportParam {
         name: "zone_id".to_string(),
         type_expr: TypeExpr::Unknown,
-        value: Some(Value::Concrete(ConcreteValue::String(
-            "ignored".to_string(),
-        ))),
+        value: Some(Value::resource_ref(
+            "vpc".to_string(),
+            "bad_attr".to_string(),
+            vec![],
+        )),
     }];
 
-    let bindings = crate::binding_index::BindingIndex::default();
-    let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
+    let mut parsed = empty_parsed();
+    parsed.resources.push(schema_resource); // allow: direct — fixture test inspection
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let result =
+        validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::from([0]));
     assert!(
         result.is_ok(),
-        "Unknown sentinel must be skipped, got {:?}",
+        "the exact Unknown parameter already reported by inference must be skipped, got {:?}",
         result
     );
 }
@@ -3095,7 +3385,8 @@ fn validate_export_param_ref_types_against_inferred_inputs() {
     let mut parsed = empty_parsed();
     parsed.resources.push(registry_prod); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let result = validate_export_param_ref_types_with_bindings(&exports, &bindings);
+    let result =
+        validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new());
     assert!(result.is_ok(), "got {:?}", result);
 }
 

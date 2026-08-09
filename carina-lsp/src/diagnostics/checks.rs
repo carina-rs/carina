@@ -6,10 +6,11 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::document::Document;
 use crate::position;
+use carina_core::binding_index::{BindingIndex, BindingTarget};
 use carina_core::builtins;
 use carina_core::parser::{ArgumentParameter, ParsedFile, TypeExpr};
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
-use carina_core::schema::{ResourceSchema, suggest_similar_name};
+use carina_core::schema::suggest_similar_name;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
 use super::{DiagnosticEngine, carina_diagnostic};
@@ -1397,9 +1398,9 @@ impl DiagnosticEngine {
         // `infer_export_params` borrows the parse (avoiding the per-keystroke
         // deep clone the full `apply_inference` would force) so the LSP
         // can derive the post-inference shape without rebuilding the
-        // whole `InferredFile`. Use the merged parse when available so
-        // sibling-file `let` bindings (module calls, upstream_states)
-        // are visible to inference (#2493).
+        // whole `InferredFile`. Use the merged, module-expanded parse when
+        // available so sibling-file bindings are visible and module calls
+        // appear as inferable `Virtual` compositions (#2493).
         let inference_input = merged.unwrap_or(parsed);
         let (inferred_export_params, inference_errors) =
             carina_core::validation::inference::infer_export_params(inference_input, &self.schemas);
@@ -1409,23 +1410,35 @@ impl DiagnosticEngine {
         // `merged`) won't anchor in this buffer and are skipped here —
         // the buffer that owns the export will surface them on its
         // own pass.
-        for (name, err) in &inference_errors {
-            if let Some((line, col)) = self.find_exports_param_position(doc, name) {
+        for inference_error in &inference_errors {
+            if let Some((line, col)) = self.find_exports_param_position(doc, &inference_error.name)
+            {
                 diagnostics.push(carina_diagnostic(
                     line,
                     col,
-                    col + name.len() as u32,
+                    col + inference_error.name.len() as u32,
                     DiagnosticSeverity::WARNING,
-                    carina_core::validation::inference::format_inference_error(name, err),
+                    carina_core::validation::inference::format_inference_error(
+                        &inference_error.name,
+                        &inference_error.error,
+                    ),
                 ));
             }
         }
+        // Inference and the Unknown-type existence walk share export-param
+        // indices as their diagnostic identity. The LSP inference input is
+        // post-expansion, so it can report composition misses through a
+        // `Virtual` binding; suppressing those exact indices prevents the
+        // composition authority from reporting the same typo again.
+        let reported_inference_error_indices: HashSet<usize> =
+            inference_errors.iter().map(|error| error.index).collect();
         let export_bindings =
             carina_core::binding_index::BindingIndex::from_parsed(inference_input, &self.schemas);
         if let Err(ref_errors) =
             carina_core::validation::validate_export_param_ref_types_with_bindings(
                 &inferred_export_params,
                 &export_bindings,
+                &reported_inference_error_indices,
             )
         {
             for error_msg in ref_errors.split('\n') {
@@ -1736,7 +1749,7 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         parsed: &ParsedFile,
-        binding_schema_map: &HashMap<&str, &ResourceSchema>,
+        binding_index: &BindingIndex<'_>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
@@ -1746,26 +1759,21 @@ impl DiagnosticEngine {
                 if attr_name.starts_with('_') {
                     continue;
                 }
-                self.collect_ref_attr_diagnostics(
-                    doc,
-                    attr_value,
-                    binding_schema_map,
-                    &mut diagnostics,
-                );
+                self.collect_ref_attr_diagnostics(doc, attr_value, binding_index, &mut diagnostics);
             }
         }
 
         // Also check module call arguments
         for call in &parsed.module_calls {
             for value in call.arguments.values() {
-                self.collect_ref_attr_diagnostics(doc, value, binding_schema_map, &mut diagnostics);
+                self.collect_ref_attr_diagnostics(doc, value, binding_index, &mut diagnostics);
             }
         }
 
         // Also check attribute parameter values
         for attr_param in &parsed.attribute_params {
             if let Some(value) = &attr_param.value {
-                self.collect_ref_attr_diagnostics(doc, value, binding_schema_map, &mut diagnostics);
+                self.collect_ref_attr_diagnostics(doc, value, binding_index, &mut diagnostics);
             }
         }
 
@@ -1777,23 +1785,56 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         value: &Value,
-        binding_schema_map: &HashMap<&str, &ResourceSchema>,
+        binding_index: &BindingIndex<'_>,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
         value.visit_resource_refs(&mut |path| {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
-            let Some(ref_schema) = binding_schema_map.get(binding_name) else {
+            let Some(entry) = binding_index.get(binding_name) else {
                 return;
             };
-            if ref_schema.attributes.contains_key(attribute_name) {
-                return;
-            }
-            // Attribute not found - build "did you mean" suggestion
-            let known_attrs: Vec<&str> = ref_schema.attributes.keys().map(|s| s.as_str()).collect();
-            let suggestion = suggest_similar_name(attribute_name, &known_attrs)
-                .map(|s| format!(" Did you mean '{}'?", s))
-                .unwrap_or_default();
+            let message = match entry.target {
+                BindingTarget::Schema(ref_schema) => {
+                    if ref_schema.attributes.contains_key(attribute_name) {
+                        return;
+                    }
+                    let known_attrs: Vec<&str> = ref_schema
+                        .attributes
+                        .keys()
+                        .map(|name| name.as_str())
+                        .collect();
+                    let suggestion = suggest_similar_name(attribute_name, &known_attrs)
+                        .map(|suggestion| format!(" Did you mean '{}'?", suggestion))
+                        .unwrap_or_default();
+                    format!(
+                        "Unknown attribute '{}' on '{}' (type '{}'){}",
+                        attribute_name, binding_name, ref_schema.resource_type, suggestion,
+                    )
+                }
+                BindingTarget::Composition(composition) => {
+                    if composition
+                        .signature
+                        .attributes
+                        .contains_key(attribute_name)
+                    {
+                        return;
+                    }
+                    let known_attrs: Vec<&str> = composition
+                        .signature
+                        .attributes
+                        .keys()
+                        .map(|name| name.as_str())
+                        .collect();
+                    let suffix = suggest_similar_name(attribute_name, &known_attrs)
+                        .map(|suggestion| format!(". Did you mean '{}'?", suggestion))
+                        .unwrap_or_else(|| ".".to_string());
+                    format!(
+                        "Unknown attribute '{}' on '{}'{}",
+                        attribute_name, binding_name, suffix,
+                    )
+                }
+            };
 
             let ref_text = format!("{}.{}", binding_name, attribute_name);
             if let Some((line, col)) = self.find_ref_value_position(doc, &ref_text) {
@@ -1804,10 +1845,7 @@ impl DiagnosticEngine {
                     attr_col,
                     attr_col + attribute_name.len() as u32,
                     DiagnosticSeverity::WARNING,
-                    format!(
-                        "Unknown attribute '{}' on '{}' (type '{}'){}",
-                        attribute_name, binding_name, ref_schema.resource_type, suggestion,
-                    ),
+                    message,
                 ));
             }
         });

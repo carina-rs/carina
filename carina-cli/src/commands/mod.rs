@@ -22,6 +22,7 @@ use carina_core::module_resolver;
 use carina_core::parser::{BackendConfig, ProviderContext};
 use carina_core::resource::{ConcreteValue, Value};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
+use carina_core::validation::inference::ExportInferenceError;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, BackendLock, StateBackend, create_backend,
 };
@@ -31,9 +32,10 @@ use crate::wiring::{
     WiringContext, build_factories_from_providers, compute_anonymous_identifiers_with_ctx,
     resolve_names_with_ctx, validate_attribute_param_ref_types_with_ctx,
     validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
-    validate_module_attribute_param_types, validate_module_calls, validate_no_empty_interpolations,
-    validate_provider_region_with_ctx, validate_resource_ref_types_with_ctx,
-    validate_resources_with_ctx, validate_wait_bindings_with_ctx,
+    validate_module_attribute_param_types, validate_module_call_argument_refs_with_ctx,
+    validate_module_calls, validate_no_empty_interpolations, validate_provider_region_with_ctx,
+    validate_resource_ref_types_with_ctx, validate_resources_with_ctx,
+    validate_wait_bindings_with_ctx,
 };
 
 #[must_use = "Drifted must be handled before mutating state — apply/destroy must refuse, init/plan must warn"]
@@ -216,13 +218,22 @@ pub fn ensure_backend_lock(
 ///
 /// `skip_resource_validation` is used by destroy and state refresh, which only need
 /// name resolution and identifier computation without full schema validation.
+/// `prior_inference_errors` must be the errors returned with the loaded configuration:
+/// retry uses them to exclude historically validate-only inference failures while
+/// still surfacing schema-backed errors that bootstrap loading could not detect.
 #[allow(dead_code)] // Used by snapshot tests
 pub fn validate_and_resolve(
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
+    prior_inference_errors: &[ExportInferenceError],
 ) -> Result<(), AppError> {
-    validate_and_resolve_with_config(parsed, base_dir, skip_resource_validation)
+    validate_and_resolve_with_config(
+        parsed,
+        base_dir,
+        skip_resource_validation,
+        prior_inference_errors,
+    )
 }
 
 /// Create a `ProviderContext` with custom type validators extracted from
@@ -273,8 +284,14 @@ pub fn validate_and_resolve_with_config(
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
+    prior_inference_errors: &[ExportInferenceError],
 ) -> Result<(), AppError> {
-    let errors = validate_and_resolve_errors(parsed, base_dir, skip_resource_validation);
+    let errors = validate_and_resolve_errors(
+        parsed,
+        base_dir,
+        skip_resource_validation,
+        prior_inference_errors,
+    );
     if errors.is_empty() {
         Ok(())
     } else {
@@ -289,6 +306,7 @@ pub fn validate_and_resolve_errors(
     parsed: &mut carina_core::parser::InferredFile,
     base_dir: &Path,
     skip_resource_validation: bool,
+    prior_inference_errors: &[ExportInferenceError],
 ) -> Vec<AppError> {
     let (factories, load_errors) = build_factories_from_providers(&parsed.providers, base_dir);
     validate_and_resolve_errors_with_factories(
@@ -297,6 +315,7 @@ pub fn validate_and_resolve_errors(
         skip_resource_validation,
         factories,
         load_errors,
+        prior_inference_errors,
     )
 }
 
@@ -316,10 +335,36 @@ pub fn validate_and_resolve_errors_with_factories(
     skip_resource_validation: bool,
     factories: Vec<Box<dyn carina_core::provider::ProviderFactory>>,
     load_errors: HashMap<String, String>,
+    prior_inference_errors: &[ExportInferenceError],
 ) -> Vec<AppError> {
     let ctx = WiringContext::new(factories);
 
     let mut errors: Vec<AppError> = Vec::new();
+
+    let retry_inference_errors = if skip_resource_validation {
+        Vec::new()
+    } else {
+        carina_core::validation::inference::retry_unknown_export_inference(
+            parsed,
+            ctx.schemas(),
+            prior_inference_errors,
+        )
+    };
+    // A later Unknown-type existence walk suppresses precisely the export
+    // parameters already reported by either inference pass. The vector index
+    // is the identity: export names are user supplied and may collide across
+    // sibling files.
+    let reported_inference_error_indices: HashSet<usize> = prior_inference_errors
+        .iter()
+        .chain(&retry_inference_errors)
+        .map(|error| error.index)
+        .collect();
+    errors.extend(retry_inference_errors.iter().map(|inference_error| {
+        AppError::Validation(carina_core::validation::inference::format_inference_error(
+            &inference_error.name,
+            &inference_error.error,
+        ))
+    }));
 
     // `arguments` is a module-input declaration; the CLI only ever feeds
     // root configurations into this function (modules go through
@@ -447,6 +492,11 @@ pub fn validate_and_resolve_errors_with_factories(
         for us in &parsed.upstream_states {
             argument_names.insert(us.binding.clone());
         }
+        errors.extend(validate_module_call_argument_refs_with_ctx(
+            &ctx,
+            parsed,
+            &argument_names,
+        ));
         errors.extend(validate_resource_ref_types_with_ctx(
             &ctx,
             parsed,
@@ -471,6 +521,7 @@ pub fn validate_and_resolve_errors_with_factories(
         if let Err(msg) = carina_core::validation::validate_export_param_ref_types_with_bindings(
             &parsed.export_params,
             &export_bindings,
+            &reported_inference_error_indices,
         ) {
             errors.extend(split_validation_message(&msg));
         }
@@ -765,7 +816,7 @@ mod tests {
             is_default: true,
         });
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
-        let result = validate_and_resolve_with_config(&mut parsed, base_dir, false);
+        let result = validate_and_resolve_with_config(&mut parsed, base_dir, false, &[]);
 
         let err = result.unwrap_err();
         let msg = err.to_string();
@@ -799,7 +850,7 @@ mod tests {
             is_default: true,
         });
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
-        let result = validate_and_resolve_with_config(&mut parsed, base_dir, false);
+        let result = validate_and_resolve_with_config(&mut parsed, base_dir, false, &[]);
 
         let err = result.unwrap_err();
         let msg = err.to_string();
@@ -844,16 +895,18 @@ exports {
             &carina_core::schema::SchemaRegistry::new(),
         )
         .expect("load");
+        let inference_errors = loaded.inference_errors;
         let mut parsed = loaded.parsed;
 
         // With full validation, the typo is rejected.
-        let err = validate_and_resolve_with_config(&mut parsed.clone(), &base, false)
-            .expect_err("full validation must flag the typo");
+        let err =
+            validate_and_resolve_with_config(&mut parsed.clone(), &base, false, &inference_errors)
+                .expect_err("full validation must flag the typo");
         assert!(err.to_string().contains("does not export `missing`"));
 
         // With skip_resource_validation=true, recovery commands pass
         // through despite the typo.
-        let result = validate_and_resolve_with_config(&mut parsed, &base, true);
+        let result = validate_and_resolve_with_config(&mut parsed, &base, true, &inference_errors);
         assert!(
             result.is_ok(),
             "skip_resource_validation=true must bypass upstream field check, got: {:?}",
@@ -965,6 +1018,7 @@ exports {
                 enum_provider: "awscc",
             })],
             HashMap::new(),
+            &[],
         );
         assert!(errors.is_empty(), "awscc spelling errors: {errors:?}");
 
@@ -976,6 +1030,7 @@ exports {
                 enum_provider: "aws",
             })],
             HashMap::new(),
+            &[],
         );
         assert!(errors.is_empty(), "aws spelling errors: {errors:?}");
 

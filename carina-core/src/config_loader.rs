@@ -9,7 +9,7 @@ use indexmap::IndexMap;
 use crate::parser::{self, File, InferredFile, ParsedFile, ProviderContext};
 use crate::resource::Value;
 use crate::schema::SchemaRegistry;
-use crate::validation::inference::InferenceError;
+use crate::validation::inference::ExportInferenceError;
 
 /// Result of loading configuration, includes the file path containing backend block.
 ///
@@ -21,7 +21,8 @@ use crate::validation::inference::InferenceError;
 pub struct LoadedConfig {
     /// Post-inference file: every export carries a bare `TypeExpr`
     /// (possibly the `TypeExpr::Unknown` sentinel for failed inference,
-    /// in which case a matching entry appears in `inference_errors`).
+    /// with a matching indexed entry in `inference_errors` when inference
+    /// produced a reportable failure).
     pub parsed: InferredFile,
     /// Resources before reference resolution, for unused binding detection.
     /// After `resolve_resource_refs`, intermediate `ResourceRef` values are resolved away,
@@ -43,7 +44,7 @@ pub struct LoadedConfig {
     /// carries `TypeExpr::Unknown` so downstream consumers can keep
     /// looking the export up by name without spawning cascading
     /// "missing export" diagnostics.
-    pub inference_errors: Vec<(String, InferenceError)>,
+    pub inference_errors: Vec<ExportInferenceError>,
 }
 
 /// A `ParsedFile` produced by `parse_directory_files` after the

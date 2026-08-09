@@ -387,6 +387,21 @@ pub fn validate_resource_ref_types_with_ctx<E>(
     ))
 }
 
+pub fn validate_module_call_argument_refs_with_ctx<E>(
+    ctx: &WiringContext,
+    parsed: &carina_core::parser::File<E>,
+    argument_names: &HashSet<String>,
+) -> Vec<AppError> {
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed(parsed, ctx.schemas());
+    lift_validation_result(
+        validation::validate_module_call_argument_ref_existence_with_bindings(
+            &parsed.module_calls,
+            argument_names,
+            &bindings,
+        ),
+    )
+}
+
 pub fn validate_attribute_param_ref_types_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E>,
@@ -1196,6 +1211,51 @@ pub fn validate_module_attribute_param_types<E>(
     errors
 }
 
+fn pre_expansion_module_call_attributes(
+    module_parsed: &carina_core::parser::ParsedFile,
+    module_path: &Path,
+) -> validation::PreExpansionModuleCallAttributes {
+    let called_aliases: HashSet<&str> = module_parsed
+        .module_calls
+        .iter()
+        .map(|call| call.module_name.as_str())
+        .collect();
+    let mut attributes_by_alias: HashMap<String, BTreeSet<String>> = HashMap::new();
+
+    for import in &module_parsed.uses {
+        if !called_aliases.contains(import.alias.as_str()) {
+            continue;
+        }
+        // `load_module` is deliberately shallow: it reads this imported
+        // module's declarations but does not recurse into its own imports.
+        // The recursive descent below remains the only descent point, so its
+        // canonical-path `visited` guard continues to own cycle safety.
+        let Some(imported) = module_resolver::load_module(&module_path.join(&import.path)) else {
+            continue;
+        };
+        attributes_by_alias.insert(
+            import.alias.clone(),
+            imported
+                .attribute_params
+                .iter()
+                .map(|attribute| attribute.name.clone())
+                .collect(),
+        );
+    }
+
+    let mut attributes_by_binding = HashMap::new();
+    for call in &module_parsed.module_calls {
+        let Some(binding_name) = &call.binding_name else {
+            continue;
+        };
+        let Some(attribute_names) = attributes_by_alias.get(&call.module_name) else {
+            continue;
+        };
+        attributes_by_binding.insert(binding_name.clone(), attribute_names.clone());
+    }
+    attributes_by_binding
+}
+
 fn validate_module_attribute_params_at_path(
     ctx: &WiringContext,
     module_path: &Path,
@@ -1216,10 +1276,15 @@ fn validate_module_attribute_params_at_path(
     if !module_parsed.attribute_params.is_empty() {
         let bindings =
             carina_core::binding_index::BindingIndex::from_parsed(&module_parsed, ctx.schemas());
-        if let Err(joined) = validation::validate_attribute_param_ref_types_with_bindings(
-            &module_parsed.attribute_params,
-            &bindings,
-        ) {
+        let module_call_attributes =
+            pre_expansion_module_call_attributes(&module_parsed, module_path);
+        if let Err(joined) =
+            validation::validate_attribute_param_ref_types_with_bindings_and_module_calls(
+                &module_parsed.attribute_params,
+                &bindings,
+                &module_call_attributes,
+            )
+        {
             // Preserve the module-path prefix the legacy wrapper emitted
             // so diagnostics point at which imported module failed.
             let prefix = diagnostic_path.display().to_string();

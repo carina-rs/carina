@@ -339,15 +339,18 @@ impl DiagnosticEngine {
                 diagnostics.extend(self.check_module_calls(doc, parsed, base));
                 diagnostics.extend(self.check_upstream_state_sources(doc, parsed, base));
             }
-            // Build the canonical `binding_name → (resource, schema)`
-            // index once via the shared `BindingIndex` (#2231) so the LSP
-            // and `carina-core::validation` cannot drift over which
-            // bindings exist or how their schemas are looked up. The
-            // reference-checking helpers below consume a borrow-valued
-            // map, so no per-keystroke `ResourceSchema::clone()` is
-            // needed.
+            // Build the canonical validation-target index from the merged,
+            // module-expanded parse when available. The checks still walk the
+            // buffer-only AST for source anchoring, but their binding authority
+            // must include sibling resources and expanded compositions. Fall
+            // back to the buffer parse only when directory merging failed. This
+            // deliberately gives both composition-attribute existence checks
+            // and `check_resource_ref_type_mismatch` directory-wide targets.
+            let binding_input = merged.as_ref().unwrap_or(parsed);
             let binding_index =
-                carina_core::binding_index::BindingIndex::from_parsed(parsed, &self.schemas);
+                carina_core::binding_index::BindingIndex::from_parsed(binding_input, &self.schemas);
+            // Schema-only consumers retain the borrow-valued projection and
+            // avoid per-keystroke `ResourceSchema::clone()` work.
             let binding_schema_map = binding_index.schemas_by_name();
 
             // Check resource types — include for-body template resources so
@@ -988,11 +991,7 @@ impl DiagnosticEngine {
             diagnostics.extend(self.check_single_quoted_interpolation_warnings(parsed));
 
             // Check for unknown attributes on resource references (typo detection)
-            diagnostics.extend(self.check_resource_ref_attributes(
-                doc,
-                parsed,
-                &binding_schema_map,
-            ));
+            diagnostics.extend(self.check_resource_ref_attributes(doc, parsed, &binding_index));
         }
 
         // Check for duplicate attribute keys (text-based, works without parsed file)

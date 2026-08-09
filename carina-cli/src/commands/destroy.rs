@@ -56,15 +56,16 @@ pub async fn run_destroy(
     provider_context: &ProviderContext,
     cancel: CancellationToken,
 ) -> Result<(), AppError> {
-    let mut parsed = load_configuration_with_config(
+    let loaded = load_configuration_with_config(
         path,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
-    )?
-    .parsed;
+    )?;
+    let inference_errors = loaded.inference_errors;
+    let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
-    validate_and_resolve_with_config(&mut parsed, base_dir, true)?;
+    validate_and_resolve_with_config(&mut parsed, base_dir, true, &inference_errors)?;
 
     let verified_backend =
         verify_for_mutation(base_dir, parsed.backend.as_ref(), DriftCommand::Destroy)?;

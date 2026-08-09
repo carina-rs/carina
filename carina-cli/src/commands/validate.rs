@@ -85,6 +85,7 @@ pub fn validate_with_factories(
             false,
             factories,
             std::collections::HashMap::new(),
+            &loaded.inference_errors,
         )
         .iter()
         .map(ToString::to_string),
@@ -127,6 +128,7 @@ pub fn validated_resource_ids_with_factories(
         false,
         factories,
         std::collections::HashMap::new(),
+        &loaded.inference_errors,
     );
 
     validated_entries(&parsed)
@@ -140,11 +142,16 @@ pub fn validated_resource_ids_with_factories(
 /// `inference::format_inference_error` helper so the CLI and LSP keep
 /// emitting the same wording.
 fn format_inference_errors(
-    errors: &[(String, carina_core::validation::inference::InferenceError)],
+    errors: &[carina_core::validation::inference::ExportInferenceError],
 ) -> Vec<String> {
     errors
         .iter()
-        .map(|(name, err)| carina_core::validation::inference::format_inference_error(name, err))
+        .map(|inference_error| {
+            carina_core::validation::inference::format_inference_error(
+                &inference_error.name,
+                &inference_error.error,
+            )
+        })
         .collect()
 }
 
@@ -283,7 +290,8 @@ pub fn run_validate(
         println!("{}", "Validating...".cyan());
     }
 
-    let validation_errors = validate_and_resolve_errors(&mut parsed, base_dir, false);
+    let validation_errors =
+        validate_and_resolve_errors(&mut parsed, base_dir, false, &loaded.inference_errors);
     parsed.print_warnings_from(printed_warning_count);
     error_reports.extend(validation_errors.iter().map(ToString::to_string));
 

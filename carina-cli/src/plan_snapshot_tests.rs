@@ -1634,8 +1634,15 @@ fn plan_snapshot_exports_multifile_string_let_attr_access_rejected() {
         "{}/tests/fixtures/plan_display/exports_multifile_string_let_attr_access_rejected",
         env!("CARGO_MANIFEST_DIR")
     ));
-    let mut parsed = load_configuration(&fixture_path).unwrap().parsed;
-    let errors = crate::commands::validate_and_resolve_errors(&mut parsed, &fixture_path, true);
+    let loaded = load_configuration(&fixture_path).unwrap();
+    let inference_errors = loaded.inference_errors;
+    let mut parsed = loaded.parsed;
+    let errors = crate::commands::validate_and_resolve_errors(
+        &mut parsed,
+        &fixture_path,
+        true,
+        &inference_errors,
+    );
     let message = errors
         .iter()
         .map(ToString::to_string)

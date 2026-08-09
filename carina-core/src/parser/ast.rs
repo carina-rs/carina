@@ -309,10 +309,11 @@ pub enum TypeExpr {
     /// Sentinel for inference failure: an unannotated export whose
     /// rhs could not be statically typed. Produced *only* by
     /// `apply_inference`, never by the parser. Type-comparison
-    /// predicates reject `Unknown` against any concrete receiver, so
-    /// the `inference_errors` channel surfaces the actionable
-    /// "type annotation required" message instead of a cascade of
-    /// "missing export" diagnostics. See #2360 stage 2.
+    /// predicates reject `Unknown` against any concrete receiver. When
+    /// inference has a concrete failure reason, the `inference_errors`
+    /// channel surfaces the actionable "type annotation required"
+    /// message; non-inferable values remain `Unknown` for later
+    /// existence-only validation. See #2360 stage 2.
     Unknown,
 }
 
@@ -974,7 +975,9 @@ pub struct WaitBinding {
 /// definitive type by construction: the loader runs `apply_inference`
 /// after parse + resolve, which fills in either the user's annotation,
 /// the rhs-inferred type, or the [`TypeExpr::Unknown`] sentinel for
-/// failed inference (paired with an entry in `LoadedConfig.inference_errors`).
+/// failed or deferred inference (paired with an entry in
+/// `LoadedConfig.inference_errors` when inference produced a reportable
+/// failure).
 #[derive(Debug, Clone, PartialEq)]
 pub struct InferredExportParam {
     pub name: String,

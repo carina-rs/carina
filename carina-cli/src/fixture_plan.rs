@@ -73,9 +73,11 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let fixture_pathbuf = fixture_path.to_path_buf();
     let state_path = fixture_path.join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
 
-    let mut parsed = load_configuration(&fixture_pathbuf).unwrap().parsed;
+    let loaded = load_configuration(&fixture_pathbuf).unwrap();
+    let inference_errors = loaded.inference_errors;
+    let mut parsed = loaded.parsed;
     let base_dir = get_base_dir(&fixture_pathbuf);
-    validate_and_resolve(&mut parsed, base_dir, true).unwrap();
+    validate_and_resolve(&mut parsed, base_dir, true, &inference_errors).unwrap();
 
     let mut state_file: Option<StateFile> = if state_path.exists() {
         let json = std::fs::read_to_string(&state_path).unwrap();

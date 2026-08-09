@@ -1827,6 +1827,69 @@ target_id = caller.account_id
 }
 
 #[test]
+fn resource_ref_type_mismatch_resolves_binding_from_sibling_file() {
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, legacy_validator,
+    };
+
+    let source_schema = ResourceSchema::new("source.Item").attribute(AttributeSchema::new(
+        "source_id",
+        AttributeType::refined_string_with_validator(
+            Some(TypeIdentity::bare("SourceId")),
+            None,
+            None,
+            legacy_validator(|_| Ok(())),
+            None,
+        ),
+    ));
+    let sink_schema = ResourceSchema::new("sink.Item").attribute(AttributeSchema::new(
+        "target_id",
+        AttributeType::refined_string_with_validator(
+            Some(TypeIdentity::bare("TargetId")),
+            None,
+            None,
+            legacy_validator(|_| Ok(())),
+            None,
+        ),
+    ));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", source_schema);
+    schemas.insert("test", sink_schema);
+    let engine = custom_engine(schemas);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("source.crn"),
+        "let source_item = test.source.Item {}\n",
+    )
+    .unwrap();
+    let sink = r#"let sink_item = test.sink.Item {
+  target_id = source_item.source_id
+}
+"#;
+    std::fs::write(base.join("sink.crn"), sink).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "sink.crn", sink);
+    let mismatch = diagnostics.iter().find(|diagnostic| {
+        diagnostic.message.contains("Type mismatch")
+            && diagnostic.message.contains("TargetId")
+            && diagnostic.message.contains("SourceId")
+            && diagnostic.message.contains("source_item.source_id")
+    });
+
+    assert!(
+        mismatch.is_some(),
+        "resource ref type checking must resolve schema bindings from sibling files: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
 fn exports_cross_file_ref_no_false_positive() {
     // Regression: when exports.crn references a binding from a sibling file,
     // the parser produces a ResourceRef for `binding.attr`.
@@ -2221,10 +2284,9 @@ fn exports_referencing_module_call_attribute_does_not_require_annotation() {
     // `role_arn = github_actions_carina.role_arn` where
     // `let github_actions_carina = github { ... }` invokes a module)
     // must not surface a `type annotation required: unknown binding`
-    // warning. The LSP doesn't run module expansion, so the inferer
-    // sees the binding as `ModuleCall` (known-but-non-inferable, like
-    // upstream_state) and the export gets `TypeExpr::Unknown` without
-    // a hard error.
+    // warning. The LSP's directory-merged parse runs module expansion,
+    // so inference sees the call as a `Virtual` composition and derives
+    // the declared attribute through that post-expansion surface.
     let engine = DiagnosticEngine::new(
         Arc::new(SchemaRegistry::new()),
         vec!["awscc".to_string()],
@@ -2264,6 +2326,185 @@ fn exports_referencing_module_call_attribute_does_not_require_annotation() {
         undefined.is_none(),
         "module-call binding must not be flagged as unknown. Got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn module_call_export_typo_is_reported_once_after_lsp_expansion() {
+    let engine = DiagnosticEngine::new(
+        Arc::new(SchemaRegistry::new()),
+        vec!["awscc".to_string()],
+        Arc::new(vec![]),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let module_dir = tmp.path().join("github_module");
+    std::fs::create_dir_all(&module_dir).unwrap();
+    std::fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  name: String\n}\nattributes {\n  role_arn: String = name\n}\n",
+    )
+    .unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("main.crn"),
+        "let github = use { source = '../github_module' }\nlet github_actions_carina = github { name = 'demo' }\n",
+    )
+    .unwrap();
+    let exports = "exports {\n  role_arn = github_actions_carina.role_ar\n}\n";
+    std::fs::write(base.join("exports.crn"), exports).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "exports.crn", exports);
+    let typo_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("role_ar")
+                && diagnostic
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("unknown attribute")
+        })
+        .collect();
+
+    assert_eq!(
+        typo_diagnostics.len(),
+        1,
+        "post-expansion inference and the existence walk must not duplicate the typo: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn module_call_attribute_typo_in_resource_value_uses_expanded_binding_index() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let consumer_schema = ResourceSchema::new("test.Consumer")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new(
+            "target_group_arn",
+            AttributeType::string(),
+        ));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", consumer_schema);
+    let engine = custom_engine(schemas);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let module_dir = tmp.path().join("component_module");
+    std::fs::create_dir_all(&module_dir).unwrap();
+    std::fs::write(
+        module_dir.join("main.crn"),
+        "arguments {\n  name: String\n}\nattributes {\n  role_arn: String = name\n}\n",
+    )
+    .unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("main.crn"),
+        "let component = use { source = '../component_module' }\nlet instance = component { name = 'demo' }\n",
+    )
+    .unwrap();
+    let resources = r#"let consumer = awscc.test.Consumer {
+  name             = "caller"
+  target_group_arn = instance.role_ar
+}
+"#;
+    std::fs::write(base.join("resources.crn"), resources).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "resources.crn", resources);
+    let typo_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("role_ar")
+                && diagnostic
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("unknown attribute")
+        })
+        .collect();
+
+    assert_eq!(
+        typo_diagnostics.len(),
+        1,
+        "resource references must validate module-call attributes against the expanded composition: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        typo_diagnostics[0].message,
+        "Unknown attribute 'role_ar' on 'instance'. Did you mean 'role_arn'?",
+        "composition diagnostics should follow the LSP's own unknown-attribute wording",
+    );
+}
+
+#[test]
+fn schema_attribute_typo_in_module_call_argument_is_reported() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let target_group_schema = ResourceSchema::new("elbv2.TargetGroup")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new(
+            "target_group_arn",
+            AttributeType::string(),
+        ));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", target_group_schema);
+    let engine = custom_engine(schemas);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let consumer_module = tmp.path().join("consumer_module");
+    std::fs::create_dir_all(&consumer_module).unwrap();
+    std::fs::write(
+        consumer_module.join("main.crn"),
+        "arguments {\n  arn: String\n}\nattributes {\n  arn = arn\n}\n",
+    )
+    .unwrap();
+
+    let base = tmp.path().join("caller");
+    std::fs::create_dir_all(&base).unwrap();
+    let source = r#"let consumer = use { source = '../consumer_module' }
+
+let tg = awscc.elbv2.TargetGroup {
+  name = "caller"
+}
+
+let b = consumer {
+  arn = tg.target_group_ar
+}
+"#;
+    std::fs::write(base.join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "main.crn", source);
+    let typo_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("target_group_ar")
+                && diagnostic
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("unknown attribute")
+        })
+        .collect();
+
+    assert_eq!(
+        typo_diagnostics.len(),
+        1,
+        "the LSP module-call argument walk should report the schema-backed typo once: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        typo_diagnostics[0]
+            .message
+            .contains("on 'tg' (type 'elbv2.TargetGroup')"),
+        "the LSP diagnostic should resolve the argument ref through tg's schema: {:?}",
+        typo_diagnostics[0].message,
     );
 }
 
