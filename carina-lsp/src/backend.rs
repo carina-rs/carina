@@ -5,7 +5,7 @@ use std::sync::Arc;
 use carina_core::formatter::{self, FormatConfig};
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{self as provider_mod, ProviderFactory};
-use carina_core::schema::CompletionValue;
+use carina_core::schema::{CompletionValue, SchemaRegistry, collect_all_block_names};
 use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -31,8 +31,18 @@ pub fn document_end_position(text: &str) -> (u32, u32) {
     (last_line, last_char)
 }
 
+fn format_document_with_schemas(
+    text: &str,
+    config: &FormatConfig,
+    schemas: &SchemaRegistry,
+) -> std::result::Result<String, formatter::FormatParseError> {
+    let block_names = collect_all_block_names(schemas);
+    formatter::format_with_block_names(text, config, &block_names)
+}
+
 /// Schema-dependent providers that are rebuilt when provider configs change.
 struct ProviderState {
+    schemas: Arc<SchemaRegistry>,
     diagnostic_engine: DiagnosticEngine,
     completion_provider: CompletionProvider,
     hover_provider: HoverProvider,
@@ -75,6 +85,7 @@ impl ProviderState {
             .collect();
         let factories_arc = Arc::new(factories);
         Self {
+            schemas: Arc::clone(&schemas),
             diagnostic_engine: DiagnosticEngine::new(
                 Arc::clone(&schemas),
                 provider_names.clone(),
@@ -185,6 +196,10 @@ impl ProviderStates {
         // Check import map for module files
         let canonical = file_path.canonicalize().unwrap_or(file_path.to_path_buf());
         if let Some(callers) = self.import_map.get(&canonical) {
+            // `state_for_path` is shared by formatting, completion, and hover.
+            // Sort here so its caller-state fallback is deterministic.
+            let mut callers: Vec<&PathBuf> = callers.iter().collect();
+            callers.sort();
             for caller_dir in callers {
                 let mut dir = Some(caller_dir.as_path());
                 while let Some(d) = dir {
@@ -571,8 +586,20 @@ impl LanguageServer for Backend {
         if let Some(doc) = self.documents.get(uri) {
             let text = doc.text();
             let config = FormatConfig::default();
+            let base_path = uri
+                .to_file_path()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+            let schemas = {
+                let providers = self.providers.read().await;
+                let state = base_path
+                    .as_ref()
+                    .map(|p| providers.state_for_path(p))
+                    .unwrap_or(&providers.empty);
+                Arc::clone(&state.schemas)
+            };
 
-            match formatter::format(&text, &config) {
+            match format_document_with_schemas(&text, &config, &schemas) {
                 Ok(formatted) => {
                     if formatted == text {
                         return Ok(None);
@@ -843,7 +870,118 @@ fn should_reload_for_event(event: &FileEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::provider::{BoxFuture, Provider, ProviderResult};
+    use carina_core::resource::Value;
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
     use indexmap::IndexMap;
+
+    struct BlockSchemaFactory {
+        block_name: &'static str,
+    }
+
+    impl ProviderFactory for BlockSchemaFactory {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn display_name(&self) -> &str {
+            "Mock"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(
+            &self,
+            _attributes: &IndexMap<String, Value>,
+        ) -> std::result::Result<(), String> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            String::new()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _attributes: &IndexMap<String, Value>,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            Box::pin(async { unreachable!("formatting tests do not instantiate providers") })
+        }
+
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            let rules = AttributeType::list(AttributeType::struct_(
+                "Rule",
+                vec![StructField::new("action", AttributeType::string())],
+            ));
+            vec![
+                ResourceSchema::new("test.resource").attribute(
+                    AttributeSchema::new("rules", rules).with_block_name(self.block_name),
+                ),
+            ]
+        }
+    }
+
+    fn provider_state(block_name: &'static str) -> ProviderState {
+        ProviderState::new(
+            vec![Box::new(BlockSchemaFactory { block_name })],
+            HashMap::new(),
+            vec![],
+            None,
+            vec![],
+        )
+    }
+
+    #[test]
+    fn formatting_without_eligible_block_names_matches_plain_format() {
+        let input = r#"awscc.ec2.ipam {
+  description="regional IPAM"
+  tags = ["network", "shared"]
+}
+"#;
+        let config = FormatConfig::default();
+        let schemas = SchemaRegistry::new();
+        let expected = formatter::format(input, &config).unwrap();
+
+        let actual = format_document_with_schemas(input, &config, &schemas).unwrap();
+
+        assert_eq!(actual.as_bytes(), expected.as_bytes());
+    }
+
+    #[test]
+    fn imported_module_uses_lexicographically_first_caller_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first_caller = tmp.path().join("a-caller");
+        let last_caller = tmp.path().join("z-caller");
+        let module = tmp.path().join("module");
+        std::fs::create_dir_all(&first_caller).unwrap();
+        std::fs::create_dir_all(&last_caller).unwrap();
+        std::fs::create_dir_all(&module).unwrap();
+        let first_caller = first_caller.canonicalize().unwrap();
+        let last_caller = last_caller.canonicalize().unwrap();
+        let module = module.canonicalize().unwrap();
+
+        let mut states = ProviderStates::new();
+        states
+            .by_dir
+            .insert(first_caller.clone(), provider_state("first_rule"));
+        states
+            .by_dir
+            .insert(last_caller.clone(), provider_state("last_rule"));
+        states
+            .import_map
+            .insert(module.clone(), vec![last_caller, first_caller]);
+
+        let state = states.state_for_path(&module);
+        let block_names = collect_all_block_names(&state.schemas);
+
+        assert_eq!(
+            block_names.get("rules").map(String::as_str),
+            Some("first_rule")
+        );
+    }
 
     fn file_event(path: &std::path::Path, typ: FileChangeType) -> FileEvent {
         FileEvent {
