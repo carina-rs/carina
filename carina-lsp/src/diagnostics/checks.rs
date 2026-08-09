@@ -437,6 +437,41 @@ impl DiagnosticEngine {
         Some(result)
     }
 
+    /// Check tag-key casing against the directory-wide CLI population while
+    /// anchoring diagnostics only in the current editor buffer.
+    pub(super) fn check_mixed_tag_key_styles(
+        &self,
+        current_file_name: &str,
+        base_path: &std::path::Path,
+        merged_result: &DirectoryParseResult,
+    ) -> Vec<Diagnostic> {
+        // Reuse the exact root sources that fed the merged parse. The shared
+        // core assembler also adds the CLI-equivalent module population.
+        let tag_keys = carina_core::lint::collect_all_tag_keys(
+            &merged_result.source_files,
+            &merged_result.parsed,
+            base_path,
+        );
+
+        let current_path = base_path.join(current_file_name);
+        carina_core::lint::find_mixed_tag_key_styles(&tag_keys)
+            .into_iter()
+            .filter(|warning| warning.file.as_deref() == Some(current_path.as_path()))
+            .filter_map(|warning| {
+                let line_index = warning.line.checked_sub(1)?;
+                let start_col = warning.column as u32;
+                let end_col = start_col + warning.key.chars().count() as u32;
+                Some(carina_diagnostic(
+                    line_index as u32,
+                    start_col,
+                    end_col,
+                    DiagnosticSeverity::WARNING,
+                    carina_core::lint::mixed_tag_key_style_message(&warning),
+                ))
+            })
+            .collect()
+    }
+
     /// Render duplicate declaration groups that contain a declaration in the
     /// current buffer. The loader owns provenance; this layer only locates the
     /// corresponding name in the editor text because declaration AST nodes do
