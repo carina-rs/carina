@@ -961,8 +961,14 @@ impl DiagnosticEngine {
             // moment any sibling fails to parse.
             diagnostics.extend(self.check_unknown_functions(doc, parsed, merged, base_path));
 
-            // Check attributes blocks
-            diagnostics.extend(self.check_attributes_blocks(doc, parsed));
+            // Check the current buffer's attributes against directory-wide
+            // binding authority while keeping diagnostics owned by this file.
+            diagnostics.extend(self.check_attributes_blocks(
+                doc,
+                parsed,
+                &binding_index,
+                &known_bindings,
+            ));
 
             // Exports type check. When a merged parse is available the
             // sibling-binding → resource-type map is built from it so
@@ -970,6 +976,9 @@ impl DiagnosticEngine {
             // visible (#2134); otherwise fall back to an empty map and
             // rely on the local-to-file checks that `check_exports_blocks`
             // performs (e.g. type annotation sanity, literal-value shape).
+            // On that degraded path the legacy export pre-check gets no
+            // sibling projection; attributes instead builds its shared
+            // BindingIndex from the buffer parse.
             let sibling_bindings = merged
                 .map(exports_sibling_bindings_from)
                 .unwrap_or_default();
@@ -1509,8 +1518,8 @@ fn check_resource_ref_type_mismatch(
 /// Build the binding-name → resource-type map that
 /// [`check_exports_blocks`] uses to type-check cross-file references.
 /// Replaces the hand-rolled `Backend::scan_sibling_context` output —
-/// merged parse sees every resource in the directory, including those
-/// declared in sibling files (#2134).
+/// merged parse sees every managed resource in the directory, including
+/// those declared in sibling files (#2134).
 fn exports_sibling_bindings_from(merged: &ParsedFile) -> HashMap<String, String> {
     merged
         .resources

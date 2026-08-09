@@ -1113,37 +1113,42 @@ impl DiagnosticEngine {
     }
 
     /// Check attributes blocks for type mismatches and undefined binding references.
+    /// Buffer parameters are iterated while directory-wide context provides binding authority.
     pub(super) fn check_attributes_blocks(
         &self,
         doc: &Document,
         parsed: &ParsedFile,
+        binding_index: &BindingIndex<'_>,
+        known_bindings: &HashSet<String>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        // Collect defined binding names from parsed resources, including
-        // bindings declared inside for-body templates.
-        let mut defined_bindings: HashSet<String> = HashSet::new();
-        for rref in parsed.iter_all_resources() {
-            if let Some(binding_name) = rref.binding() {
-                defined_bindings.insert(binding_name.to_string());
-            }
-        }
-
         for attr_param in &parsed.attribute_params {
             if let Some(value) = &attr_param.value {
-                // Check for undefined binding references — both shapes
+                // Check for undefined binding references in parser-native shapes
                 // (`Value::Deferred(DeferredValue::ResourceRef)` for `name.attr`, `Value::Deferred(DeferredValue::BindingRef)`
                 // for bare `name`, since #2847).
                 let undefined_binding = match value {
                     Value::Deferred(DeferredValue::ResourceRef { path })
-                        if !defined_bindings.contains(path.binding()) =>
+                        if !known_bindings.contains(path.binding()) =>
                     {
                         Some(path.binding().to_string())
                     }
                     Value::Deferred(DeferredValue::BindingRef { binding })
-                        if !defined_bindings.contains(binding) =>
+                        if !known_bindings.contains(binding) =>
                     {
                         Some(binding.clone())
+                    }
+                    // A single-file parse cannot classify an undeclared bare
+                    // identifier as a binding, so untyped attribute values use
+                    // the parser's enum-identifier fallback until directory
+                    // binding authority is available here.
+                    Value::Concrete(ConcreteValue::EnumIdentifier(identifier))
+                        if attr_param.type_expr.is_none()
+                            && !identifier.as_str().contains('.')
+                            && !known_bindings.contains(identifier.as_str()) =>
+                    {
+                        Some(identifier.to_string())
                     }
                     _ => None,
                 };
@@ -1163,10 +1168,15 @@ impl DiagnosticEngine {
                     ));
                 }
 
-                // Type validation (only when explicit type annotation is present)
-                if let Some(ref type_expr) = attr_param.type_expr
-                    && let Some(type_error) =
-                        self.validate_attributes_type(type_expr, value, &HashMap::new())
+                // Concrete/default-value validation is already shared with core.
+                // Deferred resource refs intentionally pass through this function;
+                // the BindingIndex-backed validator below is their sole authority.
+                if let Some(type_expr) = &attr_param.type_expr
+                    && let Some(type_error) = carina_core::validation::validate_type_expr_value(
+                        type_expr,
+                        value,
+                        &self.provider_context,
+                    )
                     && let Some((line, col)) =
                         self.find_attributes_param_position(doc, &attr_param.name)
                 {
@@ -1178,26 +1188,31 @@ impl DiagnosticEngine {
                         type_error,
                     ));
                 }
+            }
+        }
 
-                // ResourceRef type validation: check that the referenced attribute's
-                // schema type is compatible with the declared TypeExpr
-                if let Some(ref type_expr) = attr_param.type_expr
-                    && let Value::Deferred(DeferredValue::ResourceRef { path }) = value
-                    && let Some(ref_type_error) = self.check_attribute_ref_type(
-                        type_expr,
-                        path,
-                        &attr_param.name,
-                        &parsed.resources,
-                    )
-                    && let Some((line, col)) =
-                        self.find_attributes_value_position(doc, &attr_param.name)
-                {
+        if let Err(ref_errors) =
+            carina_core::validation::validate_attribute_param_ref_types_with_bindings(
+                &parsed.attribute_params,
+                binding_index,
+            )
+        {
+            // Ownership comes from passing only this buffer's parameters to core;
+            // the supplied BindingIndex adds context without adding sibling params.
+            for error_msg in ref_errors.lines() {
+                let Some(param_name) = error_msg
+                    .strip_prefix("attribute '")
+                    .and_then(|rest| rest.split('\'').next())
+                else {
+                    continue;
+                };
+                if let Some((line, col)) = self.find_attributes_param_position(doc, param_name) {
                     diagnostics.push(carina_diagnostic(
                         line,
                         col,
-                        col + path.to_dot_string().len() as u32,
+                        col + param_name.len() as u32,
                         DiagnosticSeverity::WARNING,
-                        ref_type_error,
+                        error_msg.to_string(),
                     ));
                 }
             }
@@ -1206,60 +1221,9 @@ impl DiagnosticEngine {
         diagnostics
     }
 
-    /// Check a ResourceRef value against the declared TypeExpr by looking up
-    /// the referenced resource's schema attribute type.
-    fn check_attribute_ref_type(
-        &self,
-        type_expr: &TypeExpr,
-        path: &carina_core::resource::AccessPath,
-        param_name: &str,
-        resources: &[carina_core::resource::Resource],
-    ) -> Option<String> {
-        let expected_type = match type_expr {
-            TypeExpr::Simple(name) => name.as_str(),
-            _ => return None,
-        };
-
-        let ref_binding = path.binding();
-        let ref_attr = path.attribute();
-
-        // Find the referenced resource
-        let ref_resource = resources
-            .iter()
-            .find(|r| r.binding.as_deref() == Some(ref_binding))?;
-        let ref_schema = self.schemas.get_for(ref_resource)?;
-        let ref_attr_schema = ref_schema.attributes.get(ref_attr)?;
-        let ref_type_name = ref_attr_schema.attr_type.type_name();
-        let ref_type_snake = carina_core::parser::pascal_to_snake(&ref_type_name);
-
-        if ref_type_snake == expected_type {
-            return None;
-        }
-
-        Some(format!(
-            "attribute '{}': type mismatch: expected {}, got {} (from {}.{})",
-            param_name, expected_type, ref_type_snake, ref_binding, ref_attr
-        ))
-    }
-
-    /// Validate an attributes value against its declared type, with
-    /// cross-file ref awareness so a `ResourceRef` whose head lives in
-    /// a sibling `.crn` is resolved against the schema instead of being
-    /// silently skipped.
-    fn validate_attributes_type(
-        &self,
-        type_expr: &TypeExpr,
-        value: &Value,
-        sibling_bindings: &HashMap<String, String>,
-    ) -> Option<String> {
-        self.validate_type_with_ref_awareness(type_expr, value, sibling_bindings)
-    }
-
-    /// Look up `binding.attr` against `sibling_bindings` + the schema
-    /// registry, then compare the resolved schema type against
-    /// `type_expr`. Returns the formatted diagnostic on mismatch, or
-    /// `None` if the binding/attr cannot be resolved (deferred to the CLI).
-    fn check_cross_file_ref_type(
+    /// Resolve an export's `binding.attr` value against the sibling-binding
+    /// projection before applying the export's declared type.
+    fn check_export_ref_type(
         &self,
         type_expr: &TypeExpr,
         binding: &str,
@@ -1295,9 +1259,9 @@ impl DiagnosticEngine {
         ))
     }
 
-    /// Type-check a value against a TypeExpr, resolving cross-file references
-    /// against sibling bindings and schemas for proper type checking.
-    fn validate_type_with_ref_awareness(
+    /// Type-check an export value, resolving cross-file references against
+    /// sibling bindings and schemas.
+    fn validate_export_type_with_ref_awareness(
         &self,
         type_expr: &TypeExpr,
         value: &Value,
@@ -1313,7 +1277,7 @@ impl DiagnosticEngine {
             (_, Value::Deferred(DeferredValue::ResourceRef { path }))
                 if path.segments().is_empty() =>
             {
-                self.check_cross_file_ref_type(
+                self.check_export_ref_type(
                     type_expr,
                     path.binding(),
                     path.attribute(),
@@ -1330,7 +1294,7 @@ impl DiagnosticEngine {
             (TypeExpr::List(inner), Value::Concrete(ConcreteValue::List(items))) => {
                 for (i, item) in items.iter().enumerate() {
                     if let Some(e) =
-                        self.validate_type_with_ref_awareness(inner, item, sibling_bindings)
+                        self.validate_export_type_with_ref_awareness(inner, item, sibling_bindings)
                     {
                         return Some(format!("Element {}: {}", i, e));
                     }
@@ -1341,7 +1305,7 @@ impl DiagnosticEngine {
             (TypeExpr::Map(inner), Value::Concrete(ConcreteValue::Map(map))) => {
                 for (key, val) in map {
                     if let Some(e) =
-                        self.validate_type_with_ref_awareness(inner, val, sibling_bindings)
+                        self.validate_export_type_with_ref_awareness(inner, val, sibling_bindings)
                     {
                         return Some(format!("Key '{}': {}", key, e));
                     }
@@ -1356,8 +1320,11 @@ impl DiagnosticEngine {
                 }
                 for (name, field_ty) in fields {
                     if let Some(v) = map.get(name)
-                        && let Some(e) =
-                            self.validate_type_with_ref_awareness(field_ty, v, sibling_bindings)
+                        && let Some(e) = self.validate_export_type_with_ref_awareness(
+                            field_ty,
+                            v,
+                            sibling_bindings,
+                        )
                     {
                         return Some(format!("field '{}': {}", name, e));
                     }
@@ -1373,41 +1340,59 @@ impl DiagnosticEngine {
         }
     }
 
+    /// Find the direct-member line for an attributes parameter and return its
+    /// name and value columns. Nested map members are excluded by brace depth.
+    fn find_attributes_param_line_positions(
+        &self,
+        doc: &Document,
+        param_name: &str,
+    ) -> Option<(u32, u32, u32)> {
+        let text = doc.text();
+        let mut brace_depth = 0usize;
+
+        for (line_idx, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+
+            if brace_depth == 0 {
+                if trimmed.starts_with("attributes ") && trimmed.contains('{') {
+                    brace_depth = line.matches('{').count();
+                    brace_depth = brace_depth.saturating_sub(line.matches('}').count());
+                }
+                continue;
+            }
+
+            if brace_depth == 1
+                && let Some(after_name) = trimmed.strip_prefix(param_name)
+                && (after_name.starts_with(':') || after_name.trim_start().starts_with('='))
+                && let Some(eq_byte_pos) = line.find('=')
+            {
+                let after_eq = &line[eq_byte_pos + 1..];
+                let trimmed_after = after_eq.trim_start();
+                let ws_after_eq = after_eq.len() - trimmed_after.len();
+                let value_col = position::byte_offset_to_char_offset(line, eq_byte_pos)
+                    + 1
+                    + ws_after_eq as u32;
+                return Some((
+                    line_idx as u32,
+                    position::leading_whitespace_chars(line),
+                    value_col,
+                ));
+            }
+
+            brace_depth = brace_depth.saturating_add(line.matches('{').count());
+            brace_depth = brace_depth.saturating_sub(line.matches('}').count());
+        }
+        None
+    }
+
     /// Find the position of an attributes parameter name in the document.
     fn find_attributes_param_position(
         &self,
         doc: &Document,
         param_name: &str,
     ) -> Option<(u32, u32)> {
-        let text = doc.text();
-        let mut in_attributes_block = false;
-
-        for (line_idx, line) in text.lines().enumerate() {
-            let trimmed = line.trim();
-
-            if trimmed.starts_with("attributes ") && trimmed.contains('{') {
-                in_attributes_block = true;
-                continue;
-            }
-
-            if in_attributes_block {
-                if trimmed == "}" {
-                    in_attributes_block = false;
-                    continue;
-                }
-
-                // Look for "param_name:" pattern
-                if trimmed.starts_with(param_name)
-                    && trimmed[param_name.len()..]
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c == ':')
-                {
-                    return Some((line_idx as u32, position::leading_whitespace_chars(line)));
-                }
-            }
-        }
-        None
+        self.find_attributes_param_line_positions(doc, param_name)
+            .map(|(line, name_col, _)| (line, name_col))
     }
 
     /// Find the position of the value expression in an attributes parameter line.
@@ -1416,45 +1401,8 @@ impl DiagnosticEngine {
         doc: &Document,
         param_name: &str,
     ) -> Option<(u32, u32)> {
-        let text = doc.text();
-        let mut in_attributes_block = false;
-
-        for (line_idx, line) in text.lines().enumerate() {
-            let trimmed = line.trim();
-
-            if trimmed.starts_with("attributes ") && trimmed.contains('{') {
-                in_attributes_block = true;
-                continue;
-            }
-
-            if in_attributes_block {
-                if trimmed == "}" {
-                    in_attributes_block = false;
-                    continue;
-                }
-
-                // Look for "param_name: type = value" pattern
-                if trimmed.starts_with(param_name)
-                    && trimmed[param_name.len()..]
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c == ':')
-                {
-                    // Find the "=" and return position after it
-                    if let Some(eq_byte_pos) = line.find('=') {
-                        let after_eq = &line[eq_byte_pos + 1..];
-                        let trimmed_after = after_eq.trim_start();
-                        // Whitespace after '=' is ASCII, so byte diff == char count
-                        let ws_after_eq = after_eq.len() - trimmed_after.len();
-                        let value_col = position::byte_offset_to_char_offset(line, eq_byte_pos)
-                            + 1
-                            + ws_after_eq as u32;
-                        return Some((line_idx as u32, value_col));
-                    }
-                }
-            }
-        }
-        None
+        self.find_attributes_param_line_positions(doc, param_name)
+            .map(|(line, _, value_col)| (line, value_col))
     }
 
     /// Validate export parameter values against their type annotations.
@@ -1476,7 +1424,7 @@ impl DiagnosticEngine {
         for param in &parsed.export_params {
             if let (Some(type_expr), Some(value)) = (&param.type_expr, &param.value)
                 && let Some(type_error) =
-                    self.validate_attributes_type(type_expr, value, sibling_bindings)
+                    self.validate_export_type_with_ref_awareness(type_expr, value, sibling_bindings)
                 && let Some((line, col)) = self.find_exports_param_position(doc, &param.name)
             {
                 diagnostics.push(carina_diagnostic(
@@ -1856,6 +1804,8 @@ impl DiagnosticEngine {
     /// When a ResourceRef like `igw.internet_gateway_idd` references an attribute
     /// that doesn't exist in the referenced resource's schema, emit a warning
     /// with a "did you mean" suggestion if a similar attribute exists.
+    /// Attribute-parameter refs are excluded because `check_attributes_blocks`
+    /// maps their shared core validation errors instead.
     pub(super) fn check_resource_ref_attributes(
         &self,
         doc: &Document,
@@ -1877,13 +1827,6 @@ impl DiagnosticEngine {
         // Also check module call arguments
         for call in &parsed.module_calls {
             for value in call.arguments.values() {
-                self.collect_ref_attr_diagnostics(doc, value, binding_index, &mut diagnostics);
-            }
-        }
-
-        // Also check attribute parameter values
-        for attr_param in &parsed.attribute_params {
-            if let Some(value) = &attr_param.value {
                 self.collect_ref_attr_diagnostics(doc, value, binding_index, &mut diagnostics);
             }
         }
