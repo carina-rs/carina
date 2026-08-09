@@ -5016,3 +5016,43 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
     assert!(rendered.contains("provider resolved from file://"));
     assert!(rendered.contains("not controlled by carina-providers.lock"));
 }
+
+#[test]
+fn formatting_factory_loader_returns_lock_constraint_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let source = "github.com/carina-rs/carina-provider-awscc";
+    let mut lock = carina_provider_resolver::LockFile::default();
+    lock.upsert(carina_provider_resolver::LockEntry {
+        name: "awscc".into(),
+        source: source.into(),
+        kind: carina_provider_resolver::LockEntryKind::Version {
+            version: "1.0.0".into(),
+            constraint: None,
+        },
+        sha256: "fixture".into(),
+        registry: None,
+    });
+    lock.save(&base.join("carina-providers.lock")).unwrap();
+    let config = ProviderConfig {
+        name: "awscc".into(),
+        source: Some(source.into()),
+        version: Some(carina_core::version_constraint::VersionConstraint::parse("^2.0.0").unwrap()),
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+
+    let (factories, load_errors) = build_factories_from_providers_for_formatting(&[config], base);
+
+    assert!(factories.is_empty());
+    assert!(!load_errors.is_empty());
+    assert!(
+        load_errors
+            .values()
+            .any(|error| error.contains("locked at version 1.0.0"))
+    );
+}

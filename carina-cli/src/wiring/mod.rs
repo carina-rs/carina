@@ -187,6 +187,35 @@ pub fn build_factories_from_providers(
         std::process::exit(1);
     }
 
+    build_factories_from_providers_impl(providers, base_dir, true)
+}
+
+/// Best-effort factory loading for schema-aware formatting.
+///
+/// Provider resolution is optional on this path: a missing, invalid, or stale
+/// provider installation must fall back to plain formatting rather than make
+/// `carina fmt` fail or emit a hard provider error.
+/// Suppressed provider and lock-constraint failures are returned as load errors
+/// so `--check` can report degraded conversion without failing formatting.
+pub(crate) fn build_factories_from_providers_for_formatting(
+    providers: &[ProviderConfig],
+    base_dir: &Path,
+) -> (Vec<Box<dyn ProviderFactory>>, HashMap<String, String>) {
+    if let Err(error) = carina_provider_resolver::validate_lock_constraints(base_dir, providers) {
+        return (
+            Vec::new(),
+            HashMap::from([("carina-providers.lock".to_string(), error)]),
+        );
+    }
+
+    build_factories_from_providers_impl(providers, base_dir, false)
+}
+
+fn build_factories_from_providers_impl(
+    providers: &[ProviderConfig],
+    base_dir: &Path,
+    report_errors: bool,
+) -> (Vec<Box<dyn ProviderFactory>>, HashMap<String, String>) {
     let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
     let mut load_errors: HashMap<String, String> = HashMap::new();
 
@@ -201,7 +230,9 @@ pub fn build_factories_from_providers(
                 Ok(installed) => installed,
                 Err(e) => {
                     let reason = format!("Provider '{}' {}", config.name, e);
-                    eprintln!("{}", reason.red());
+                    if report_errors {
+                        eprintln!("{}", reason.red());
+                    }
                     load_errors.insert(config.name.clone(), reason);
                     continue;
                 }
@@ -211,7 +242,9 @@ pub fn build_factories_from_providers(
                 "Unsupported source format for provider '{}': {}. Use file:// or github.com/owner/repo.",
                 config.name, source
             );
-            eprintln!("{}", reason.red());
+            if report_errors {
+                eprintln!("{}", reason.red());
+            }
             load_errors.insert(config.name.clone(), reason);
             continue;
         };
@@ -221,7 +254,9 @@ pub fn build_factories_from_providers(
                 "Provider '{}': native binaries are no longer supported. Use a .wasm component instead.",
                 config.name
             );
-            eprintln!("{}", reason.red());
+            if report_errors {
+                eprintln!("{}", reason.red());
+            }
             load_errors.insert(config.name.clone(), reason);
             continue;
         }
@@ -238,7 +273,9 @@ pub fn build_factories_from_providers(
                     let reason = installed
                         .with_load_error(carina_plugin_host::WasmProviderLoadError::Other(message))
                         .to_string();
-                    eprintln!("{}", reason.red());
+                    if report_errors {
+                        eprintln!("{}", reason.red());
+                    }
                     load_errors.insert(config.name.clone(), reason);
                     continue;
                 }
@@ -249,7 +286,9 @@ pub fn build_factories_from_providers(
                 // renders the structured host chain first, followed by the
                 // resolver-owned provenance and mode-accurate hint.
                 let reason = error.to_string();
-                eprintln!("{}", reason.red());
+                if report_errors {
+                    eprintln!("{}", reason.red());
+                }
                 load_errors.insert(config.name.clone(), reason);
             }
         }

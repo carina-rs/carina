@@ -763,6 +763,29 @@ mod tests {
     }
 
     #[test]
+    fn plain_format_preserves_schema_converted_block_syntax_byte_for_byte() {
+        let input = r#"awscc.ec2.ipam {
+  operating_regions = [{
+    region_name = "ap-northeast-1"
+  }]
+}
+"#;
+        let config = FormatConfig::default();
+        let block_names: std::collections::HashMap<String, String> = [(
+            "operating_regions".to_string(),
+            "operating_region".to_string(),
+        )]
+        .into_iter()
+        .collect();
+
+        let converted = format_with_block_names(input, &config, &block_names).unwrap();
+        let plain = format(&converted, &config).unwrap();
+
+        assert!(converted.contains("  operating_region {\n"));
+        assert_eq!(converted.as_bytes(), plain.as_bytes());
+    }
+
+    #[test]
     fn test_convert_list_literal_to_block_syntax_multiple_items() {
         // Multiple items in `= [{...}, {...}]` should become multiple blocks
         let input = r#"awscc.s3.Bucket {
