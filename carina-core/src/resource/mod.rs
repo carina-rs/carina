@@ -10,6 +10,7 @@ use std::ops::Deref;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+use crate::explicit::ExplicitFields;
 use crate::schema::{AttributeType, ResourceSchema, Shape, TypeIdentity, struct_fields_with_defs};
 
 pub use enum_value::{
@@ -1725,33 +1726,75 @@ fn lists_equal_hashed(a: &[Value], b: &[Value]) -> bool {
 }
 
 /// Merge desired value with saved state to fill in unmanaged nested fields.
-/// For Maps: start with saved, overlay desired fields on top (desired wins).
-/// For Lists: match elements by similarity, merge each pair.
-/// For cross-type Map/List([Map]): unwrap the single-element list and merge as Maps.
-/// For other types: return desired as-is.
-pub fn merge_with_saved(desired: &Value, saved: &Value) -> Value {
+///
+/// `prior_explicit` is the authoring tree for this value. At each map node:
+/// - [`ExplicitFields::Unrecorded`], [`ExplicitFields::Leaf`], or a shape mismatch keeps the
+///   legacy full merge;
+/// - a saved key absent from prior authored children is unmanaged and is retained;
+/// - a saved key present in prior authored children but absent from desired was removed by the
+///   user and is omitted;
+/// - matching desired/saved children recurse with that child's prior authoring node.
+///
+/// Removal detection is intentionally limited to matching map/`Struct` positions. A
+/// [`ExplicitFields::List`] element is a union across all authored list elements, so it cannot
+/// safely prove that a field belonged to any particular element. Lists therefore use the legacy
+/// full merge for every element.
+pub(crate) fn merge_with_saved(
+    desired: &Value,
+    saved: &Value,
+    prior_explicit: &ExplicitFields,
+) -> Value {
     match (desired, saved) {
         (
             Value::Concrete(ConcreteValue::Map(desired_map)),
             Value::Concrete(ConcreteValue::Map(saved_map)),
-        ) => {
-            let mut merged = saved_map.clone();
-            for (k, v) in desired_map {
-                let merged_v = if let Some(saved_v) = saved_map.get(k) {
-                    merge_with_saved(v, saved_v)
-                } else {
-                    v.clone()
-                };
-                merged.insert(k.clone(), merged_v);
-            }
-            Value::Concrete(ConcreteValue::Map(merged))
-        }
+        ) => merge_maps(desired_map, saved_map, prior_explicit),
         (
             Value::Concrete(ConcreteValue::List(desired_list)),
             Value::Concrete(ConcreteValue::List(saved_list)),
-        ) => Value::Concrete(ConcreteValue::List(merge_lists(desired_list, saved_list))),
+        ) => {
+            // A List element tree is the union of every prior element's authored fields. It
+            // cannot identify which element authored a key, so using it for removal decisions
+            // could erase provider-populated values from heterogeneous elements.
+            Value::Concrete(ConcreteValue::List(merge_lists(desired_list, saved_list)))
+        }
         _ => desired.clone(),
     }
+}
+
+fn merge_maps(
+    desired: &IndexMap<String, Value>,
+    saved: &IndexMap<String, Value>,
+    prior_explicit: &ExplicitFields,
+) -> Value {
+    let prior_children = match prior_explicit {
+        ExplicitFields::Struct { children } => Some(children),
+        ExplicitFields::Unrecorded | ExplicitFields::Leaf | ExplicitFields::List { .. } => None,
+    };
+
+    let mut merged = saved.clone();
+    if let Some(children) = prior_children {
+        merged.retain(|key, _| {
+            let was_authored = children
+                .get(key)
+                .is_some_and(|child| !matches!(child, ExplicitFields::Unrecorded));
+            desired.contains_key(key) || !was_authored
+        });
+    }
+    for (key, desired_value) in desired {
+        let merged_value = match saved.get(key) {
+            Some(saved_value) => merge_with_saved(
+                desired_value,
+                saved_value,
+                prior_children
+                    .and_then(|children| children.get(key))
+                    .unwrap_or(&ExplicitFields::Unrecorded),
+            ),
+            None => desired_value.clone(),
+        };
+        merged.insert(key.clone(), merged_value);
+    }
+    Value::Concrete(ConcreteValue::Map(merged))
 }
 
 /// Merge two lists by pairing elements via similarity score, then merging each pair.
@@ -1790,7 +1833,11 @@ fn merge_lists_quadratic(desired: &[Value], saved: &[Value]) -> Vec<Value> {
 
         if let Some(idx) = best_idx {
             used[idx] = true;
-            result.push(merge_with_saved(d, &saved[idx]));
+            result.push(merge_with_saved(
+                d,
+                &saved[idx],
+                &ExplicitFields::Unrecorded,
+            ));
         } else {
             result.push(d.clone());
         }
@@ -1855,7 +1902,11 @@ fn merge_lists_hashed(desired: &[Value], saved: &[Value]) -> Vec<Value> {
 
         if let Some(idx) = best_idx {
             used[idx] = true;
-            result.push(merge_with_saved(d, &saved[idx]));
+            result.push(merge_with_saved(
+                d,
+                &saved[idx],
+                &ExplicitFields::Unrecorded,
+            ));
         } else {
             result.push(d.clone());
         }

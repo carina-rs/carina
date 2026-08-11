@@ -1,4 +1,5 @@
 use super::*;
+use crate::explicit::ExplicitFields;
 
 #[test]
 fn value_serde_round_trip() {
@@ -624,7 +625,7 @@ fn merge_with_saved_map_fills_extra_keys() {
         ),
     ])));
 
-    let merged = merge_with_saved(&desired, &saved);
+    let merged = merge_with_saved(&desired, &saved, &ExplicitFields::Unrecorded);
     let expected = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "hostname_type".to_string(),
@@ -653,7 +654,7 @@ fn merge_with_saved_desired_wins() {
         ("b".to_string(), Value::Concrete(ConcreteValue::Int(20))),
     ])));
 
-    let merged = merge_with_saved(&desired, &saved);
+    let merged = merge_with_saved(&desired, &saved, &ExplicitFields::Unrecorded);
     let expected = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         ("a".to_string(), Value::Concrete(ConcreteValue::Int(10))),
         ("b".to_string(), Value::Concrete(ConcreteValue::Int(20))),
@@ -679,7 +680,7 @@ fn merge_with_saved_list_of_maps() {
         ])),
     )]));
 
-    let merged = merge_with_saved(&desired, &saved);
+    let merged = merge_with_saved(&desired, &saved, &ExplicitFields::Unrecorded);
     let expected = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
         ConcreteValue::Map(IndexMap::from([
             ("port".to_string(), Value::Concrete(ConcreteValue::Int(80))),
@@ -696,7 +697,7 @@ fn merge_with_saved_list_of_maps() {
 fn merge_with_saved_non_map() {
     let desired = Value::Concrete(ConcreteValue::String("hello".to_string()));
     let saved = Value::Concrete(ConcreteValue::String("world".to_string()));
-    let merged = merge_with_saved(&desired, &saved);
+    let merged = merge_with_saved(&desired, &saved, &ExplicitFields::Unrecorded);
     assert_eq!(
         merged,
         Value::Concrete(ConcreteValue::String("hello".to_string()))
@@ -704,8 +705,243 @@ fn merge_with_saved_non_map() {
 
     let desired = Value::Concrete(ConcreteValue::Int(42));
     let saved = Value::Concrete(ConcreteValue::Int(99));
-    let merged = merge_with_saved(&desired, &saved);
+    let merged = merge_with_saved(&desired, &saved, &ExplicitFields::Unrecorded);
     assert_eq!(merged, Value::Concrete(ConcreteValue::Int(42)));
+}
+
+#[test]
+fn merge_with_saved_does_not_reinject_authored_removed_key() {
+    let desired = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let saved = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "web_acl_id".to_string(),
+        Value::Concrete(ConcreteValue::String("arn:aws:wafv2:acl/test".to_string())),
+    )])));
+    let prior = ExplicitFields::Struct {
+        children: HashMap::from([("web_acl_id".to_string(), ExplicitFields::Leaf)]),
+    };
+
+    let merged = merge_with_saved(&desired, &saved, &prior);
+
+    assert_eq!(merged, Value::Concrete(ConcreteValue::Map(IndexMap::new())));
+}
+
+#[test]
+fn merge_with_saved_reinjects_unauthored_saved_key() {
+    let desired = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let saved = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "server_default".to_string(),
+        Value::Concrete(ConcreteValue::Bool(false)),
+    )])));
+    let prior = ExplicitFields::Struct {
+        children: HashMap::new(),
+    };
+
+    let merged = merge_with_saved(&desired, &saved, &prior);
+
+    assert_eq!(merged, saved);
+}
+
+#[test]
+fn merge_with_saved_reinjects_saved_key_with_unrecorded_child() {
+    let desired = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let saved = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "previous_value".to_string(),
+        Value::Concrete(ConcreteValue::Int(42)),
+    )])));
+    let prior = ExplicitFields::Struct {
+        children: HashMap::from([("previous_value".to_string(), ExplicitFields::Unrecorded)]),
+    };
+
+    let merged = merge_with_saved(&desired, &saved, &prior);
+
+    assert_eq!(merged, saved);
+}
+
+#[test]
+fn merge_with_saved_unrecorded_reinjects_all_saved_keys() {
+    let desired = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
+    let saved = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "previous_value".to_string(),
+        Value::Concrete(ConcreteValue::Int(42)),
+    )])));
+
+    let merged = merge_with_saved(&desired, &saved, &ExplicitFields::Unrecorded);
+
+    assert_eq!(merged, saved);
+}
+
+#[test]
+fn merge_with_saved_applies_authoring_recursively_to_maps_and_lists() {
+    let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "settings".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "nested".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "kept".to_string(),
+                    Value::Concrete(ConcreteValue::Int(1)),
+                )]))),
+            )]))),
+        ),
+        (
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([(
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("primary".to_string())),
+                )])),
+            )])),
+        ),
+    ])));
+    let saved = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "settings".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "nested".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    ("kept".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+                    (
+                        "removed".to_string(),
+                        Value::Concrete(ConcreteValue::Int(2)),
+                    ),
+                    (
+                        "server_default".to_string(),
+                        Value::Concrete(ConcreteValue::Int(3)),
+                    ),
+                ]))),
+            )]))),
+        ),
+        (
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([
+                    (
+                        "name".to_string(),
+                        Value::Concrete(ConcreteValue::String("primary".to_string())),
+                    ),
+                    (
+                        "removed".to_string(),
+                        Value::Concrete(ConcreteValue::Bool(true)),
+                    ),
+                    (
+                        "server_default".to_string(),
+                        Value::Concrete(ConcreteValue::Bool(false)),
+                    ),
+                ])),
+            )])),
+        ),
+    ])));
+    let prior = ExplicitFields::Struct {
+        children: HashMap::from([
+            (
+                "settings".to_string(),
+                ExplicitFields::Struct {
+                    children: HashMap::from([(
+                        "nested".to_string(),
+                        ExplicitFields::Struct {
+                            children: HashMap::from([
+                                ("kept".to_string(), ExplicitFields::Leaf),
+                                ("removed".to_string(), ExplicitFields::Leaf),
+                            ]),
+                        },
+                    )]),
+                },
+            ),
+            (
+                "items".to_string(),
+                ExplicitFields::List {
+                    element: Box::new(ExplicitFields::Struct {
+                        children: HashMap::from([
+                            ("name".to_string(), ExplicitFields::Leaf),
+                            ("removed".to_string(), ExplicitFields::Leaf),
+                        ]),
+                    }),
+                },
+            ),
+        ]),
+    };
+
+    let merged = merge_with_saved(&desired, &saved, &prior);
+    let expected = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "settings".to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "nested".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    ("kept".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+                    (
+                        "server_default".to_string(),
+                        Value::Concrete(ConcreteValue::Int(3)),
+                    ),
+                ]))),
+            )]))),
+        ),
+        (
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([
+                    (
+                        "name".to_string(),
+                        Value::Concrete(ConcreteValue::String("primary".to_string())),
+                    ),
+                    (
+                        "removed".to_string(),
+                        Value::Concrete(ConcreteValue::Bool(true)),
+                    ),
+                    (
+                        "server_default".to_string(),
+                        Value::Concrete(ConcreteValue::Bool(false)),
+                    ),
+                ])),
+            )])),
+        ),
+    ])));
+    assert_eq!(merged, expected);
+}
+
+#[test]
+fn merge_with_saved_does_not_apply_union_authoring_to_individual_list_elements() {
+    let desired = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("port".to_string(), Value::Concrete(ConcreteValue::Int(80))),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String("web".to_string())),
+            ),
+        ]))),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "port".to_string(),
+            Value::Concrete(ConcreteValue::Int(443)),
+        )]))),
+    ]));
+    let saved = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("port".to_string(), Value::Concrete(ConcreteValue::Int(80))),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String("web".to_string())),
+            ),
+        ]))),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("port".to_string(), Value::Concrete(ConcreteValue::Int(443))),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String("provider-default".to_string())),
+            ),
+        ]))),
+    ]));
+    let prior = ExplicitFields::List {
+        element: Box::new(ExplicitFields::Struct {
+            children: HashMap::from([
+                ("port".to_string(), ExplicitFields::Leaf),
+                ("description".to_string(), ExplicitFields::Leaf),
+            ]),
+        }),
+    };
+
+    let merged = merge_with_saved(&desired, &saved, &prior);
+
+    assert_eq!(merged, saved);
 }
 
 #[test]

@@ -11,7 +11,7 @@ use futures::stream::{self, StreamExt};
 use carina_core::binding_index::{ResolvedBindings, WaitAliasSpec};
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
-use carina_core::differ::create_plan_with_cascades;
+use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
 use carina_core::executor::normalized::apply_desired_normalization;
 use carina_core::executor::{
     DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
@@ -1552,6 +1552,7 @@ async fn run_apply_locked(
         &wait_bindings,
     );
     crate::wiring::add_deposed_delete_effects(&mut plan, &state_file);
+    block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
 
     // Add state block effects (import/removed/moved) to the plan.
     // carina#3329: resolve `import { id = "${…}|…" }` interpolations

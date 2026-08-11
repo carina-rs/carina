@@ -1,5 +1,7 @@
+use super::comparison::SavedAttr;
 use super::*;
 
+use crate::explicit::ExplicitFields;
 use crate::resource::{CanonicalEnumValue, ConcreteValue, DeferredValue, Value};
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
@@ -958,7 +960,10 @@ fn key_should_enter_patch_saved_merge_preserves_unmanaged_nested_fields() {
         AttrComparison {
             from: Some(&current),
             to: &desired,
-            saved: Some(&saved),
+            saved: Some(SavedAttr {
+                value: &saved,
+                authoring: &ExplicitFields::Unrecorded,
+            }),
             type_info: Some(TypedAttr {
                 attr_type: &attr_type,
                 defs: crate::schema::empty_defs_for_schema_walks(),
