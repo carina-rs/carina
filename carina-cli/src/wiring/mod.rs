@@ -15,7 +15,7 @@ use futures::stream::{self, StreamExt};
 use carina_core::binding_index::{PreApplyInputs, ResolvedBindings, WaitAliasSpec};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::binding_matches_deferred_template;
-use carina_core::differ::create_plan_with_cascades;
+use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
 use carina_core::effect::{
     DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration, NonEmptyDeletes,
 };
@@ -2678,6 +2678,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         &wait_bindings,
     );
     add_deposed_delete_effects(&mut plan, state_file);
+    block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
 
     // Add state block effects (import/removed/moved) to the plan.
     // carina#3329: pass the same override-aware bindings + upstream_binding_names

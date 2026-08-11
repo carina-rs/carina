@@ -501,10 +501,16 @@ pub(crate) struct TypedAttr<'a> {
     pub(crate) defs: &'a BTreeMap<String, AttributeType>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SavedAttr<'a> {
+    pub(crate) value: &'a Value,
+    pub(crate) authoring: &'a ExplicitFields,
+}
+
 pub(crate) struct AttrComparison<'a> {
     pub(crate) from: Option<&'a Value>,
     pub(crate) to: &'a Value,
-    pub(crate) saved: Option<&'a Value>,
+    pub(crate) saved: Option<SavedAttr<'a>>,
     pub(crate) type_info: Option<TypedAttr<'a>>,
     pub(crate) secret_ctx: Option<&'a SecretHashContext>,
 }
@@ -520,8 +526,8 @@ pub(crate) fn should_patch_attr(cmp: AttrComparison<'_>) -> bool {
         .unwrap_or((None, empty_defs_for_schema_walks()));
 
     match cmp.saved {
-        Some(saved_value) => {
-            let effective_to = merge_with_saved(cmp.to, saved_value);
+        Some(saved) => {
+            let effective_to = merge_with_saved(cmp.to, saved.value, saved.authoring);
             !type_aware_equal(from_value, &effective_to, attr_type, defs, cmp.secret_ctx)
         }
         None => !type_aware_equal(from_value, cmp.to, attr_type, defs, cmp.secret_ctx),
@@ -692,7 +698,20 @@ pub(super) fn find_changed_attributes(
             AttrComparison {
                 from: projected_current.get(key),
                 to: desired_value,
-                saved: saved.and_then(|s| s.get(key)),
+                saved: saved.and_then(|saved| {
+                    saved.get(key).map(|value| SavedAttr {
+                        value,
+                        authoring: match prev_explicit {
+                            Some(ExplicitFields::Struct { children }) => {
+                                children.get(key).unwrap_or(&ExplicitFields::Unrecorded)
+                            }
+                            Some(authoring @ ExplicitFields::Unrecorded) => authoring,
+                            Some(ExplicitFields::Leaf | ExplicitFields::List { .. }) | None => {
+                                &ExplicitFields::Unrecorded
+                            }
+                        },
+                    })
+                }),
                 type_info,
                 secret_ctx: secret_ctx.as_ref(),
             },

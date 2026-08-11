@@ -291,6 +291,7 @@ pub fn create_plan(
         wait_bindings,
     );
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces);
+    block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
     build.plan
 }
 
@@ -329,6 +330,7 @@ pub fn create_plan_with_cascades(
         registry,
     );
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces);
+    block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
     build.plan
 }
 
@@ -504,26 +506,10 @@ fn create_plan_parts(
             });
             // Use stored dependency bindings from state file if available,
             // otherwise fall back to extracting from state attributes
-            let dependencies = if let Some(dep_bindings) = orphan_dependencies.get(id) {
-                dep_bindings.iter().cloned().collect()
-            } else {
-                let temp_resource = Resource {
-                    id: id.clone(),
-                    // `state.attributes` is `HashMap` — no source order
-                    // survives round-tripping through the provider. The
-                    // ordering of this synthetic temp resource doesn't
-                    // matter (it only feeds the dependency walker), so
-                    // a plain clone-through `wrap_map` is fine.
-                    attributes: state.attributes.clone().into_iter().collect(),
-                    directives: directives.clone(),
-                    prefixes: HashMap::new(),
-                    binding: None,
-                    dependency_bindings: BTreeSet::new(),
-                    module_source: None,
-                    quoted_string_attrs: std::collections::HashSet::new(),
-                };
-                get_resource_dependencies(&temp_resource)
-            };
+            let dependencies = orphan_dependencies
+                .get(id)
+                .map(|dep_bindings| dep_bindings.iter().cloned().collect())
+                .unwrap_or_else(|| dependencies_from_prior_state(state, directives.clone()));
             plan.add(Effect::Delete {
                 id: ResolvedResourceId::new(id.clone()),
                 identifier,
@@ -714,6 +700,86 @@ fn create_plan_parts(
         plan,
         pending_replaces,
     }
+}
+
+/// Add apply-time ordering from consumer updates to deletes using each consumer's prior
+/// dependencies.
+///
+/// The reference is absent from the new desired resource when a user removes it, so the desired
+/// dependency graph cannot recover this edge. `Effect::Update::from` preserves prior value-ref
+/// bindings, while `prior_directives` restores prior `depends_on`-only bindings. Matching their
+/// union against each delete's old binding gives the inverse edge needed by
+/// `Effect::Delete::blocked_by_updates`.
+///
+/// A new inverse edge is skipped when the desired consumer still depends on the delete binding.
+/// The guard is required because:
+///
+/// 1. a delete-before-create replacement with a still-referencing consumer would otherwise form
+///    `Update(consumer) -> Create(producer) -> Delete(producer) -> Update(consumer)`;
+/// 2. a binding reused by a declaration that produces no effect can make the scheduler's
+///    create-or-delete lookup choose the delete and close the same cycle; and
+/// 3. still-referencing consumers of create-before-destroy replacements are already ordered by
+///    the replacement machinery's `consumer_updates`.
+///
+/// Existing `blocked_by_updates` entries are preserved; this pass only adds missing inverse edges.
+pub fn block_deletes_on_prior_consumer_updates(
+    plan: &mut Plan,
+    prior_directives: &HashMap<ResourceId, Directives>,
+) {
+    let consumers: Vec<(ResourceIdentity, HashSet<String>, HashSet<String>)> = plan
+        .effects()
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Update { from, to, .. } => Some((
+                resource_identity(&to.id),
+                dependencies_from_prior_state(
+                    from,
+                    prior_directives.get(&from.id).cloned().unwrap_or_default(),
+                ),
+                get_resource_dependencies(to.as_resource()),
+            )),
+            _ => None,
+        })
+        .collect();
+
+    for effect in plan.effects_mut() {
+        let Effect::Delete {
+            id,
+            binding,
+            blocked_by_updates,
+            ..
+        } = effect
+        else {
+            continue;
+        };
+        let delete_identity = id.identity();
+        for (consumer_identity, prior_dependencies, desired_dependencies) in &consumers {
+            if consumer_identity == delete_identity {
+                continue;
+            }
+            let should_add_inverse_edge = binding.as_ref().is_some_and(|binding| {
+                prior_dependencies.contains(binding) && !desired_dependencies.contains(binding)
+            });
+            if should_add_inverse_edge {
+                blocked_by_updates.insert(consumer_identity.clone());
+            }
+        }
+    }
+}
+
+fn dependencies_from_prior_state(state: &State, directives: Directives) -> HashSet<String> {
+    let prior_resource = Resource {
+        id: state.id.clone(),
+        // State attributes are a `HashMap`; source order is irrelevant to dependency walking.
+        attributes: state.attributes.clone().into_iter().collect(),
+        directives,
+        prefixes: HashMap::new(),
+        binding: None,
+        dependency_bindings: state.dependency_bindings.clone(),
+        module_source: None,
+        quoted_string_attrs: HashSet::new(),
+    };
+    get_resource_dependencies(&prior_resource)
 }
 
 fn resource_identity(id: &ResourceId) -> ResourceIdentity {

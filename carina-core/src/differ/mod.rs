@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use crate::resource::{Resource, ResourceId, State, Value};
 use crate::schema::ResourceSchema;
 
-pub use plan::{create_plan, create_plan_with_cascades};
+pub use plan::{block_deletes_on_prior_consumer_updates, create_plan, create_plan_with_cascades};
 
 // Imports used by test submodules (accessible via `use super::*;`)
 #[cfg(test)]

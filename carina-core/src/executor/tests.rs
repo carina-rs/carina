@@ -3447,6 +3447,86 @@ fn test_build_dependency_levels_respects_delete_dependencies() {
     );
 }
 
+#[test]
+fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
+    let consumer_id = ResourceId::with_identity("test.Consumer", "consumer");
+    let orphan_id = ResourceId::with_identity("test.Dependency", "dependency");
+    let desired = Resource::new("test.Consumer", "consumer")
+        .with_binding("consumer")
+        .with_attribute("version", Value::Concrete(ConcreteValue::Int(2)));
+    let consumer_state = State::existing(
+        consumer_id.clone(),
+        HashMap::from([(
+            "version".to_string(),
+            Value::Concrete(ConcreteValue::Int(1)),
+        )]),
+    )
+    .with_dependency_bindings(std::collections::BTreeSet::from(["dependency".to_string()]));
+    let orphan_state = State::existing(
+        orphan_id.clone(),
+        HashMap::from([(
+            "_binding".to_string(),
+            Value::Concrete(ConcreteValue::String("dependency".to_string())),
+        )]),
+    )
+    .with_identifier("dependency-id");
+    let current_states = HashMap::from([
+        (consumer_id, consumer_state),
+        (orphan_id.clone(), orphan_state),
+    ]);
+    let plan = crate::differ::create_plan(
+        &[desired],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_map(
+            current_states,
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        ),
+        &HashMap::new(),
+        &crate::schema::SchemaRegistry::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+    );
+
+    let update_idx = plan
+        .effects()
+        .iter()
+        .position(|effect| matches!(effect, Effect::Update { .. }))
+        .expect("Consumer must be updated");
+    let delete_idx = plan
+        .effects()
+        .iter()
+        .position(|effect| effect.resource_id() == &orphan_id)
+        .expect("Orphan dependency must be deleted");
+    let Effect::Delete {
+        blocked_by_updates, ..
+    } = &plan.effects()[delete_idx]
+    else {
+        panic!("Expected orphan Delete");
+    };
+    assert_eq!(
+        blocked_by_updates,
+        &HashSet::from([ResourceIdentity::new("consumer")])
+    );
+
+    let levels = build_dependency_levels(plan.effects(), &HashMap::new(), &[]);
+    let update_level = levels
+        .iter()
+        .position(|level| level.contains(&update_idx))
+        .unwrap();
+    let delete_level = levels
+        .iter()
+        .position(|level| level.contains(&delete_idx))
+        .unwrap();
+    assert!(
+        update_level < delete_level,
+        "Consumer update must run before orphan delete; levels: {levels:?}"
+    );
+}
+
 /// Characterization test for #1306: build_dependency_levels and dependency analysis
 /// must produce consistent results. This test verifies that after refactoring
 /// build_dependency_levels to reuse the same dependency analysis, the level assignments

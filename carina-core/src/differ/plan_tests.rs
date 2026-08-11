@@ -1,12 +1,13 @@
 use super::*;
 
 use indexmap::IndexMap;
+use std::collections::{BTreeSet, HashSet};
 
 use crate::explicit::ExplicitFields;
 use crate::plan::{
     PlanErrorKind, PreventDestroyAction, ReplacementCannotCoexistError, SchemaNotRegisteredError,
 };
-use crate::resource::{ConcreteValue, DataSource};
+use crate::resource::{ConcreteValue, DataSource, ResolvedResource, ResourceIdentity};
 
 /// Build an `ExplicitFields::Struct` whose children are all `Leaf` —
 /// the shape `state v5 → v6` reads produce, and a convenient way to
@@ -795,6 +796,537 @@ fn server_default_struct_field_does_not_appear_in_diff() {
         matches!(result, Diff::NoChange(_)),
         "Server-side default struct leaf must not surface in diff, got: {:?}",
         result
+    );
+}
+
+#[test]
+fn nested_authored_field_removal_produces_update_patch_without_removed_field() {
+    let distribution_id =
+        ResourceId::with_identity("awscc.cloudfront.Distribution", "distribution");
+    let desired_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "enabled".to_string(),
+        Value::Concrete(ConcreteValue::Bool(true)),
+    )])));
+    let desired = Resource::new("awscc.cloudfront.Distribution", "distribution")
+        .with_attribute("distribution_config", desired_config);
+
+    let current_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "enabled".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        ),
+        (
+            "web_acl_id".to_string(),
+            Value::Concrete(ConcreteValue::String("arn:aws:wafv2:acl/test".to_string())),
+        ),
+    ])));
+    let current_attrs = HashMap::from([("distribution_config".to_string(), current_config)]);
+    let current = State::existing(distribution_id.clone(), current_attrs.clone());
+    let saved_attrs = HashMap::from([(distribution_id, current_attrs)]);
+    let prev_explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "distribution_config".to_string(),
+            ExplicitFields::Struct {
+                children: HashMap::from([
+                    ("enabled".to_string(), ExplicitFields::Leaf),
+                    ("web_acl_id".to_string(), ExplicitFields::Leaf),
+                ]),
+            },
+        )]),
+    };
+
+    let result = diff(
+        &desired,
+        &current,
+        saved_attrs.get(&desired.id),
+        Some(&prev_explicit),
+        None,
+    );
+    let Diff::Update {
+        from,
+        to,
+        changed_attributes,
+        ..
+    } = result
+    else {
+        panic!("Expected nested authored removal to produce Update");
+    };
+
+    assert_eq!(changed_attributes, vec!["distribution_config".to_string()]);
+    let patch =
+        crate::provider::build_update_patch(&changed_attributes, &ResolvedResource::new(to), &from);
+    assert_eq!(patch.ops.len(), 1);
+    assert_eq!(patch.ops[0].kind, crate::provider::PatchOpKind::Replace);
+    let Some(Value::Concrete(ConcreteValue::Map(patch_config))) = &patch.ops[0].value else {
+        panic!("Expected replacement value to be the desired distribution config");
+    };
+    assert!(
+        !patch_config.contains_key("web_acl_id"),
+        "Update patch must not merge the removed nested field back into the desired value"
+    );
+}
+
+#[test]
+fn saved_server_default_nested_field_not_authored_remains_no_change() {
+    let bucket_id = ResourceId::with_identity("s3.Bucket", "test");
+    let desired_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "rule".to_string(),
+        Value::Concrete(ConcreteValue::String("expire".to_string())),
+    )])));
+    let desired = Resource::new("s3.Bucket", "test")
+        .with_attribute("lifecycle_configuration", desired_config);
+
+    let current_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "rule".to_string(),
+            Value::Concrete(ConcreteValue::String("expire".to_string())),
+        ),
+        (
+            "transition_default_minimum_object_size".to_string(),
+            Value::Concrete(ConcreteValue::String(
+                "all_storage_classes_128K".to_string(),
+            )),
+        ),
+    ])));
+    let current_attrs = HashMap::from([("lifecycle_configuration".to_string(), current_config)]);
+    let current = State::existing(bucket_id, current_attrs.clone());
+    let prev_explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "lifecycle_configuration".to_string(),
+            ExplicitFields::Struct {
+                children: HashMap::from([("rule".to_string(), ExplicitFields::Leaf)]),
+            },
+        )]),
+    };
+
+    let result = diff(
+        &desired,
+        &current,
+        Some(&current_attrs),
+        Some(&prev_explicit),
+        None,
+    );
+
+    assert!(
+        matches!(result, Diff::NoChange(_)),
+        "Saved server default absent from prior authoring must remain unmanaged, got {result:?}"
+    );
+}
+
+#[test]
+fn list_union_authoring_does_not_turn_provider_field_into_removal() {
+    let resource_id = ResourceId::with_identity("example.Listener", "listener");
+    let desired_rules = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("port".to_string(), Value::Concrete(ConcreteValue::Int(80))),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String("web".to_string())),
+            ),
+        ]))),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "port".to_string(),
+            Value::Concrete(ConcreteValue::Int(443)),
+        )]))),
+    ]));
+    let current_rules = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("port".to_string(), Value::Concrete(ConcreteValue::Int(80))),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String("web".to_string())),
+            ),
+        ]))),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("port".to_string(), Value::Concrete(ConcreteValue::Int(443))),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String("provider-default".to_string())),
+            ),
+        ]))),
+    ]));
+    let desired =
+        Resource::new("example.Listener", "listener").with_attribute("rules", desired_rules);
+    let current_attrs = HashMap::from([("rules".to_string(), current_rules)]);
+    let current = State::existing(resource_id, current_attrs.clone());
+    let prev_explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "rules".to_string(),
+            ExplicitFields::List {
+                element: Box::new(ExplicitFields::Struct {
+                    children: HashMap::from([
+                        ("port".to_string(), ExplicitFields::Leaf),
+                        ("description".to_string(), ExplicitFields::Leaf),
+                    ]),
+                }),
+            },
+        )]),
+    };
+
+    let result = diff(
+        &desired,
+        &current,
+        Some(&current_attrs),
+        Some(&prev_explicit),
+        None,
+    );
+
+    assert!(
+        matches!(result, Diff::NoChange(_)),
+        "List-union authoring must not unset a field populated on only one element, got {result:?}"
+    );
+}
+
+#[test]
+fn migrated_leaf_authoring_for_map_preserves_provider_nested_fields() {
+    let resource_id = ResourceId::with_identity("example.Service", "service");
+    let desired_settings = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "mode".to_string(),
+        Value::Concrete(ConcreteValue::String("active".to_string())),
+    )])));
+    let current_settings = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "mode".to_string(),
+            Value::Concrete(ConcreteValue::String("active".to_string())),
+        ),
+        (
+            "provider_default".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        ),
+    ])));
+    let desired =
+        Resource::new("example.Service", "service").with_attribute("settings", desired_settings);
+    let current_attrs = HashMap::from([("settings".to_string(), current_settings)]);
+    let current = State::existing(resource_id, current_attrs.clone());
+    let prev_explicit = ExplicitFields::Struct {
+        children: HashMap::from([("settings".to_string(), ExplicitFields::Leaf)]),
+    };
+
+    let result = diff(
+        &desired,
+        &current,
+        Some(&current_attrs),
+        Some(&prev_explicit),
+        None,
+    );
+
+    assert!(
+        matches!(result, Diff::NoChange(_)),
+        "Migrated Leaf authoring must retain nested provider fields, got {result:?}"
+    );
+}
+
+#[test]
+fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
+    let distribution_id =
+        ResourceId::with_identity("awscc.cloudfront.Distribution", "distribution");
+    let web_acl_id = ResourceId::with_identity("awscc.wafv2.WebACL", "web-acl");
+    let desired_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "enabled".to_string(),
+        Value::Concrete(ConcreteValue::Bool(true)),
+    )])));
+    let desired = Resource::new("awscc.cloudfront.Distribution", "distribution")
+        .with_binding("distribution")
+        .with_attribute("distribution_config", desired_config);
+
+    let current_config = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "enabled".to_string(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        ),
+        (
+            "web_acl_id".to_string(),
+            Value::Concrete(ConcreteValue::String("arn:aws:wafv2:acl/test".to_string())),
+        ),
+    ])));
+    let distribution_attrs = HashMap::from([("distribution_config".to_string(), current_config)]);
+    let distribution_state = State::existing(distribution_id.clone(), distribution_attrs.clone())
+        .with_dependency_bindings(BTreeSet::from(["web_acl".to_string()]));
+    let web_acl_state = State::existing(
+        web_acl_id.clone(),
+        HashMap::from([(
+            "_binding".to_string(),
+            Value::Concrete(ConcreteValue::String("web_acl".to_string())),
+        )]),
+    )
+    .with_identifier("arn:aws:wafv2:acl/test");
+    let current_states = HashMap::from([
+        (distribution_id.clone(), distribution_state),
+        (web_acl_id.clone(), web_acl_state),
+    ]);
+    let saved_attrs = HashMap::from([(distribution_id.clone(), distribution_attrs)]);
+    let prev_explicit = HashMap::from([(
+        distribution_id,
+        ExplicitFields::Struct {
+            children: HashMap::from([(
+                "distribution_config".to_string(),
+                ExplicitFields::Struct {
+                    children: HashMap::from([
+                        ("enabled".to_string(), ExplicitFields::Leaf),
+                        ("web_acl_id".to_string(), ExplicitFields::Leaf),
+                    ]),
+                },
+            )]),
+        },
+    )]);
+
+    let plan = create_plan(
+        &[desired],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_map(
+            current_states,
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        ),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &saved_attrs,
+        &prev_explicit,
+        &HashMap::new(),
+        &[],
+    );
+
+    let update = plan
+        .effects()
+        .iter()
+        .find(|effect| matches!(effect, Effect::Update { .. }))
+        .expect("Distribution must be updated");
+    let Effect::Update {
+        from,
+        to,
+        changed_attributes,
+    } = update
+    else {
+        unreachable!();
+    };
+    assert_eq!(changed_attributes, &["distribution_config".to_string()]);
+    let patch = crate::provider::build_update_patch(changed_attributes, to, from);
+    let Some(Value::Concrete(ConcreteValue::Map(patch_config))) = &patch.ops[0].value else {
+        panic!("Expected distribution_config replacement value");
+    };
+    assert!(!patch_config.contains_key("web_acl_id"));
+
+    let delete = plan
+        .effects()
+        .iter()
+        .find(|effect| effect.resource_id() == &web_acl_id)
+        .expect("WebACL must be deleted");
+    let Effect::Delete {
+        blocked_by_updates, ..
+    } = delete
+    else {
+        panic!("Expected orphan WebACL Delete");
+    };
+    assert_eq!(
+        blocked_by_updates,
+        &HashSet::from([ResourceIdentity::new("distribution")])
+    );
+}
+
+#[test]
+fn replaced_producer_delete_waits_for_consumer_that_dropped_prior_reference() {
+    use crate::schema::{AttributeSchema, AttributeType};
+
+    let producer_id = ResourceId::with_identity("example.Producer", "producer-id");
+    let consumer_id = ResourceId::with_identity("example.Consumer", "consumer-id");
+    let producer = Resource::new("example.Producer", "producer-id")
+        .with_binding("producer")
+        .with_attribute(
+            "replace_key",
+            Value::Concrete(ConcreteValue::String("new".to_string())),
+        );
+    let consumer = Resource::new("example.Consumer", "consumer-id").with_binding("consumer");
+    let producer_state = State::existing(
+        producer_id.clone(),
+        HashMap::from([(
+            "replace_key".to_string(),
+            Value::Concrete(ConcreteValue::String("old".to_string())),
+        )]),
+    )
+    .with_identifier("producer-old");
+    let consumer_state = State::existing(
+        consumer_id.clone(),
+        HashMap::from([(
+            "producer_id".to_string(),
+            Value::Concrete(ConcreteValue::String("producer-old".to_string())),
+        )]),
+    )
+    .with_dependency_bindings(BTreeSet::from(["producer".to_string()]));
+    let current_states = HashMap::from([
+        (producer_id.clone(), producer_state),
+        (consumer_id.clone(), consumer_state),
+    ]);
+    let prev_explicit = HashMap::from([(consumer_id, explicit_top_level(&["producer_id"]))]);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("example.Producer")
+            .attribute(AttributeSchema::new("replace_key", AttributeType::string()).create_only()),
+    );
+
+    let plan = create_plan(
+        &[producer, consumer],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_map(
+            current_states,
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        ),
+        &HashMap::new(),
+        &schemas,
+        &HashMap::new(),
+        &prev_explicit,
+        &HashMap::new(),
+        &[],
+    );
+
+    let delete = plan
+        .effects()
+        .iter()
+        .find(|effect| matches!(effect, Effect::Delete { id, .. } if id.as_inner() == &producer_id))
+        .expect("Replacement must contain the old producer Delete");
+    let Effect::Delete {
+        blocked_by_updates, ..
+    } = delete
+    else {
+        unreachable!();
+    };
+    assert_eq!(
+        blocked_by_updates,
+        &HashSet::from([ResourceIdentity::new("consumer-id")])
+    );
+}
+
+#[test]
+fn prior_consumer_edge_is_not_added_when_desired_still_depends_on_delete_binding() {
+    let dependency_id = ResourceId::with_identity("example.Dependency", "dependency-id");
+    let consumer_id = ResourceId::with_identity("example.Consumer", "consumer-id");
+    let consumer = Resource::new("example.Consumer", "consumer-id")
+        .with_binding("consumer")
+        .with_dependency_bindings(BTreeSet::from(["dependency".to_string()]))
+        .with_attribute("version", Value::Concrete(ConcreteValue::Int(2)));
+    let consumer_state = State::existing(
+        consumer_id.clone(),
+        HashMap::from([(
+            "version".to_string(),
+            Value::Concrete(ConcreteValue::Int(1)),
+        )]),
+    )
+    .with_dependency_bindings(BTreeSet::from(["dependency".to_string()]));
+    let dependency_state = State::existing(
+        dependency_id.clone(),
+        HashMap::from([(
+            "_binding".to_string(),
+            Value::Concrete(ConcreteValue::String("dependency".to_string())),
+        )]),
+    )
+    .with_identifier("dependency-old");
+    let current_states = HashMap::from([
+        (consumer_id, consumer_state),
+        (dependency_id.clone(), dependency_state),
+    ]);
+
+    let plan = create_plan(
+        &[consumer],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_map(
+            current_states,
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        ),
+        &HashMap::new(),
+        &SchemaRegistry::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+    );
+
+    let delete = plan
+        .effects()
+        .iter()
+        .find(|effect| effect.resource_id() == &dependency_id)
+        .expect("Orphan dependency must be deleted");
+    let Effect::Delete {
+        blocked_by_updates, ..
+    } = delete
+    else {
+        panic!("Expected orphan Delete");
+    };
+    assert!(
+        blocked_by_updates.is_empty(),
+        "The inverse pass must not add an edge while the desired consumer still depends on the binding"
+    );
+}
+
+#[test]
+fn orphan_delete_waits_for_consumer_update_from_prior_depends_on() {
+    let dependency_id = ResourceId::with_identity("example.Dependency", "dependency-id");
+    let consumer_id = ResourceId::with_identity("example.Consumer", "consumer-id");
+    let consumer = Resource::new("example.Consumer", "consumer-id")
+        .with_binding("consumer")
+        .with_attribute("version", Value::Concrete(ConcreteValue::Int(2)));
+    let consumer_state = State::existing(
+        consumer_id.clone(),
+        HashMap::from([(
+            "version".to_string(),
+            Value::Concrete(ConcreteValue::Int(1)),
+        )]),
+    );
+    let dependency_state = State::existing(
+        dependency_id.clone(),
+        HashMap::from([(
+            "_binding".to_string(),
+            Value::Concrete(ConcreteValue::String("dependency".to_string())),
+        )]),
+    )
+    .with_identifier("dependency-old");
+    let current_states = HashMap::from([
+        (consumer_id.clone(), consumer_state),
+        (dependency_id.clone(), dependency_state),
+    ]);
+    let directives_map = HashMap::from([(
+        consumer_id,
+        Directives {
+            depends_on: vec!["dependency".to_string()],
+            ..Default::default()
+        },
+    )]);
+
+    let plan = create_plan(
+        &[consumer],
+        &[],
+        &crate::provider::ProviderRouter::new(),
+        &crate::resource::into_plan_input_map(
+            current_states,
+            &crate::schema::SchemaRegistry::new(),
+            &[],
+        ),
+        &directives_map,
+        &SchemaRegistry::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &[],
+    );
+
+    let delete = plan
+        .effects()
+        .iter()
+        .find(|effect| effect.resource_id() == &dependency_id)
+        .expect("Orphan dependency must be deleted");
+    let Effect::Delete {
+        blocked_by_updates, ..
+    } = delete
+    else {
+        panic!("Expected orphan Delete");
+    };
+    assert_eq!(
+        blocked_by_updates,
+        &HashSet::from([ResourceIdentity::new("consumer-id")])
     );
 }
 

@@ -970,6 +970,83 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
     );
 }
 
+#[test]
+fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
+    use carina_core::effect::{Effect, EffectGeneration};
+    use carina_core::plan::Plan;
+    use carina_core::resource::{
+        ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value,
+    };
+    use carina_state::state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
+    use std::collections::{BTreeSet, HashMap};
+
+    let producer_id =
+        ResourceId::with_provider_identity("aws", "example.Producer", "producer-id", None);
+    let consumer_id =
+        ResourceId::with_provider_identity("aws", "example.Consumer", "consumer-id", None);
+    let mut producer_row = ResourceState::new("example.Producer", "producer-id", "aws");
+    producer_row.binding = Some("producer".to_string());
+    producer_row.deposed.push(DeposedInstance {
+        key: DeposedKey::new_unique(),
+        identifier: "producer-old".to_string(),
+        provider_instance: None,
+        attributes: HashMap::new(),
+        dependency_bindings: BTreeSet::new(),
+    });
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(producer_row)
+        .expect("test state setup must be valid");
+
+    let from = State::existing(
+        consumer_id.clone(),
+        HashMap::from([(
+            "version".to_string(),
+            Value::Concrete(ConcreteValue::Int(1)),
+        )]),
+    )
+    .with_dependency_bindings(BTreeSet::from(["producer".to_string()]));
+    let to = Resource::with_provider("aws", "example.Consumer", "consumer-id", None)
+        .with_binding("consumer")
+        .with_attribute("version", Value::Concrete(ConcreteValue::Int(2)));
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        from: Box::new(from),
+        to: ResolvedResource::new(to),
+        changed_attributes: vec!["version".to_string()],
+    });
+
+    add_deposed_delete_effects(&mut plan, &Some(state_file.clone()));
+    carina_core::differ::block_deletes_on_prior_consumer_updates(
+        &mut plan,
+        &state_file.build_directives(),
+    );
+
+    let delete = plan
+        .effects()
+        .iter()
+        .find(|effect| {
+            matches!(effect, Effect::Delete {
+                id,
+                generation: EffectGeneration::Deposed(_),
+                ..
+            } if id.as_inner() == &producer_id)
+        })
+        .expect("Deposed producer Delete must be added");
+    let Effect::Delete {
+        blocked_by_updates, ..
+    } = delete
+    else {
+        unreachable!();
+    };
+    assert_eq!(blocked_by_updates.len(), 1);
+    assert!(
+        blocked_by_updates
+            .iter()
+            .any(|identity| identity.as_str() == "consumer-id")
+    );
+}
+
 /// carina#3324 regression: an import block targeting a let-bound
 /// resource whose `directives { provider = <name> }` routes it to a
 /// named provider instance must still suppress the resource's Create
