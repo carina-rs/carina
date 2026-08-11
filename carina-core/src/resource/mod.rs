@@ -1735,28 +1735,60 @@ fn lists_equal_hashed(a: &[Value], b: &[Value]) -> bool {
 ///   user and is omitted;
 /// - matching desired/saved children recurse with that child's prior authoring node.
 ///
-/// Removal detection is intentionally limited to matching map/`Struct` positions. A
-/// [`ExplicitFields::List`] element is a union across all authored list elements, so it cannot
-/// safely prove that a field belonged to any particular element. Lists therefore use the legacy
-/// full merge for every element.
+/// Removal detection at list positions requires a stored-index-aligned
+/// [`ExplicitFields::ListElements`] node. Legacy list authoring shapes keep the conservative full
+/// merge for every element.
+#[derive(Clone, Copy)]
+pub(crate) struct SavedValueViews<'a> {
+    projected: &'a Value,
+    raw: &'a Value,
+}
+
+impl<'a> SavedValueViews<'a> {
+    pub(crate) fn new(projected: &'a Value, raw: &'a Value) -> Self {
+        Self { projected, raw }
+    }
+
+    pub(crate) fn same(value: &'a Value) -> Self {
+        Self::new(value, value)
+    }
+}
+
 pub(crate) fn merge_with_saved(
     desired: &Value,
-    saved: &Value,
+    saved: SavedValueViews<'_>,
     prior_explicit: &ExplicitFields,
 ) -> Value {
-    match (desired, saved) {
+    match (desired, saved.projected) {
         (
             Value::Concrete(ConcreteValue::Map(desired_map)),
-            Value::Concrete(ConcreteValue::Map(saved_map)),
-        ) => merge_maps(desired_map, saved_map, prior_explicit),
+            Value::Concrete(ConcreteValue::Map(projected_saved_map)),
+        ) => {
+            let raw_saved_map = match saved.raw {
+                Value::Concrete(ConcreteValue::Map(raw_saved_map)) => raw_saved_map,
+                _ => projected_saved_map,
+            };
+            merge_maps(
+                desired_map,
+                projected_saved_map,
+                raw_saved_map,
+                prior_explicit,
+            )
+        }
         (
             Value::Concrete(ConcreteValue::List(desired_list)),
-            Value::Concrete(ConcreteValue::List(saved_list)),
+            Value::Concrete(ConcreteValue::List(projected_saved_list)),
         ) => {
-            // A List element tree is the union of every prior element's authored fields. It
-            // cannot identify which element authored a key, so using it for removal decisions
-            // could erase provider-populated values from heterogeneous elements.
-            Value::Concrete(ConcreteValue::List(merge_lists(desired_list, saved_list)))
+            let raw_saved_list = match saved.raw {
+                Value::Concrete(ConcreteValue::List(raw_saved_list)) => raw_saved_list,
+                _ => projected_saved_list,
+            };
+            Value::Concrete(ConcreteValue::List(merge_lists(
+                desired_list,
+                projected_saved_list,
+                raw_saved_list,
+                prior_explicit,
+            )))
         }
         _ => desired.clone(),
     }
@@ -1764,15 +1796,19 @@ pub(crate) fn merge_with_saved(
 
 fn merge_maps(
     desired: &IndexMap<String, Value>,
-    saved: &IndexMap<String, Value>,
+    projected_saved: &IndexMap<String, Value>,
+    raw_saved: &IndexMap<String, Value>,
     prior_explicit: &ExplicitFields,
 ) -> Value {
     let prior_children = match prior_explicit {
         ExplicitFields::Struct { children } => Some(children),
-        ExplicitFields::Unrecorded | ExplicitFields::Leaf | ExplicitFields::List { .. } => None,
+        ExplicitFields::Unrecorded
+        | ExplicitFields::Leaf
+        | ExplicitFields::List { .. }
+        | ExplicitFields::ListElements { .. } => None,
     };
 
-    let mut merged = saved.clone();
+    let mut merged = projected_saved.clone();
     if let Some(children) = prior_children {
         merged.retain(|key, _| {
             let was_authored = children
@@ -1782,14 +1818,22 @@ fn merge_maps(
         });
     }
     for (key, desired_value) in desired {
-        let merged_value = match saved.get(key) {
-            Some(saved_value) => merge_with_saved(
-                desired_value,
-                saved_value,
-                prior_children
-                    .and_then(|children| children.get(key))
-                    .unwrap_or(&ExplicitFields::Unrecorded),
-            ),
+        let merged_value = match projected_saved.get(key) {
+            Some(projected_saved_value) => {
+                let child_views = raw_saved
+                    .get(key)
+                    .map(|raw_saved_value| {
+                        SavedValueViews::new(projected_saved_value, raw_saved_value)
+                    })
+                    .unwrap_or_else(|| SavedValueViews::same(projected_saved_value));
+                merge_with_saved(
+                    desired_value,
+                    child_views,
+                    prior_children
+                        .and_then(|children| children.get(key))
+                        .unwrap_or(&ExplicitFields::Unrecorded),
+                )
+            }
             None => desired_value.clone(),
         };
         merged.insert(key.clone(), merged_value);
@@ -1797,24 +1841,24 @@ fn merge_maps(
     Value::Concrete(ConcreteValue::Map(merged))
 }
 
-/// Merge two lists by pairing elements via similarity score, then merging each pair.
+/// Pair desired list indices to saved list indices via similarity score.
 ///
 /// For large lists, uses hash-based bucketing to narrow candidate matches.
 /// For small lists, uses the simple O(n^2) scan.
-fn merge_lists(desired: &[Value], saved: &[Value]) -> Vec<Value> {
+pub(crate) fn pair_list_elements(desired: &[Value], saved: &[Value]) -> Vec<Option<usize>> {
     if desired.is_empty() {
-        return desired.to_vec();
+        return Vec::new();
     }
     if saved.len() < HASH_THRESHOLD {
-        return merge_lists_quadratic(desired, saved);
+        return pair_list_elements_quadratic(desired, saved);
     }
-    merge_lists_hashed(desired, saved)
+    pair_list_elements_hashed(desired, saved)
 }
 
-/// O(n^2) merge for small lists.
-fn merge_lists_quadratic(desired: &[Value], saved: &[Value]) -> Vec<Value> {
+/// O(n^2) pairing for small lists.
+fn pair_list_elements_quadratic(desired: &[Value], saved: &[Value]) -> Vec<Option<usize>> {
     let mut used = vec![false; saved.len()];
-    let mut result = Vec::with_capacity(desired.len());
+    let mut pairs = Vec::with_capacity(desired.len());
 
     for d in desired {
         let mut best_idx = None;
@@ -1833,24 +1877,18 @@ fn merge_lists_quadratic(desired: &[Value], saved: &[Value]) -> Vec<Value> {
 
         if let Some(idx) = best_idx {
             used[idx] = true;
-            result.push(merge_with_saved(
-                d,
-                &saved[idx],
-                &ExplicitFields::Unrecorded,
-            ));
-        } else {
-            result.push(d.clone());
         }
+        pairs.push(best_idx);
     }
 
-    result
+    pairs
 }
 
-/// Hash-based merge for large lists.
+/// Hash-assisted pairing for large lists.
 /// For Map values, tries exact hash match first, then falls back to scanning
 /// same-discriminant elements for best similarity. For non-Map values, uses
 /// hash bucketing for O(1) lookup.
-fn merge_lists_hashed(desired: &[Value], saved: &[Value]) -> Vec<Value> {
+fn pair_list_elements_hashed(desired: &[Value], saved: &[Value]) -> Vec<Option<usize>> {
     // Build hash buckets for saved elements
     let mut saved_buckets: HashMap<u64, Vec<usize>> = HashMap::new();
     for (j, item) in saved.iter().enumerate() {
@@ -1861,7 +1899,7 @@ fn merge_lists_hashed(desired: &[Value], saved: &[Value]) -> Vec<Value> {
     }
 
     let mut used = vec![false; saved.len()];
-    let mut result = Vec::with_capacity(desired.len());
+    let mut pairs = Vec::with_capacity(desired.len());
 
     for d in desired {
         let hash = d.canonical_hash();
@@ -1902,17 +1940,59 @@ fn merge_lists_hashed(desired: &[Value], saved: &[Value]) -> Vec<Value> {
 
         if let Some(idx) = best_idx {
             used[idx] = true;
-            result.push(merge_with_saved(
-                d,
-                &saved[idx],
-                &ExplicitFields::Unrecorded,
-            ));
-        } else {
-            result.push(d.clone());
         }
+        pairs.push(best_idx);
     }
 
-    result
+    pairs
+}
+
+/// Merge two lists using projected saved values for value pairing and raw saved values to
+/// corroborate stored-index authoring attribution.
+fn merge_lists(
+    desired: &[Value],
+    projected_saved: &[Value],
+    raw_saved: &[Value],
+    prior_explicit: &ExplicitFields,
+) -> Vec<Value> {
+    let aligned_elements = match prior_explicit {
+        ExplicitFields::ListElements { elements }
+            if elements.len() == projected_saved.len()
+                && raw_saved.len() == projected_saved.len() =>
+        {
+            Some(elements)
+        }
+        _ => None,
+    };
+
+    let projected_pairs = pair_list_elements(desired, projected_saved);
+    let raw_pairs = pair_list_elements(desired, raw_saved);
+
+    projected_pairs
+        .into_iter()
+        .zip(raw_pairs)
+        .enumerate()
+        .map(
+            |(desired_index, (projected_index, raw_index))| match projected_index {
+                Some(projected_index) => {
+                    // Writeback assigned `elements` using raw-list pairing, while the legacy value
+                    // merge pairs against the projected list. Only matching indices corroborate the
+                    // authored claim; disagreement is uncertainty and must stay conservative.
+                    let authoring = aligned_elements
+                        .filter(|_| raw_index == Some(projected_index))
+                        .map(|elements| &elements[projected_index])
+                        .unwrap_or(&ExplicitFields::Unrecorded);
+                    let projected_value = &projected_saved[projected_index];
+                    let saved_views = raw_saved
+                        .get(projected_index)
+                        .map(|raw_value| SavedValueViews::new(projected_value, raw_value))
+                        .unwrap_or_else(|| SavedValueViews::same(projected_value));
+                    merge_with_saved(&desired[desired_index], saved_views, authoring)
+                }
+                None => desired[desired_index].clone(),
+            },
+        )
+        .collect()
 }
 
 /// Compute a similarity score between two Values.

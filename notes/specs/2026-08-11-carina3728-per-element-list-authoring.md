@@ -136,16 +136,21 @@ per-element records cannot be produced. It is not deprecated.
 6. **Pairing remains schema-blind.** Element matching depends only on
    `Value` similarity and `ExplicitFields`. Neither the merge nor the
    authoring builder takes `AttributeType`.
-7. **Projection preserves stored indices.** Plan-time merge consumes the
-   `projected_saved` list, not the raw saved list
-   (`carina-core/src/differ/comparison.rs:677`). Projection must therefore
-   remain a one-to-one, length- and order-preserving map over list items
-   for both legacy `List` and the new `ListElements` union arm. The
-   existing `List` arm already has this shape
-   (`carina-core/src/explicit.rs:168`). Dropping an item would trip the
-   length guard, but reordering would preserve length and silently assign
-   authoring to the wrong saved element. Either change is forbidden
-   without revisiting this design.
+7. **Projection preserves stored indices and attribution is
+   corroborated.** Plan-time value merging keeps the legacy pairing over
+   `projected_saved`, while a second pairing over the raw saved list
+   reconstructs the view used to assign stored-index authoring at
+   writeback. A projected pair at index `j` may consult `elements[j]`
+   only when the raw pairing independently selects the same `j`; a
+   disagreement degrades to `Unrecorded`. Projection can strip
+   provider-only map keys and change both similarity scores and canonical
+   hash buckets, so projected pairing alone cannot safely attribute an
+   authoring record. Projection must remain a one-to-one, length- and
+   order-preserving map over list items for both legacy `List` and the new
+   `ListElements` union arm. That invariant ensures raw index `j` and
+   projected index `j` still denote the same stored element when the two
+   pairings corroborate one another. Dropping or reordering an item is
+   forbidden without revisiting this design.
 
 The alignment invariant is the cornerstone. It avoids the problem D3
 identified because it does not try to preserve an index across provider
@@ -283,18 +288,31 @@ previous provider response.
 ## Plan-time consumption
 
 `find_changed_attributes` projects current and saved state and threads
-the prior attribute's authoring tree through `SavedAttr`
+both the raw and projected saved views, together with the prior
+attribute's authoring tree, through `SavedAttr`
 (`carina-core/src/differ/comparison.rs:673` and
 `carina-core/src/differ/comparison.rs:704`). `merge_with_saved` consumes
-that tree.
+that bundle. Map recursion descends both views by the same key. A key in
+the projected map is expected to exist in raw saved state because
+projection only filters; if malformed input violates that expectation,
+the projected child is used as both views, the conservative degenerate
+case.
 
 Change the concrete-list arm at `carina-core/src/resource/mod.rs:1753`
 to pass `prior_explicit` into `merge_lists`. The quadratic and hashed
-helpers then use the saved index selected by the shared pairing mapping:
+helpers compute two mappings through the same shared pairing function:
 
 ```text
-prior is ListElements and elements.len() == saved.len()
-    => recurse with elements[saved_index]
+pairs_projected = pair_list_elements(desired, projected_saved)
+pairs_raw = pair_list_elements(desired, raw_saved)
+
+value pair for desired[i] is projected index j
+    => merge desired[i] with projected_saved[j]
+
+prior is ListElements
+and elements.len() == projected_saved.len() == raw_saved.len()
+and pairs_projected[i] == pairs_raw[i] == Some(j)
+    => recurse with elements[j]
 otherwise
     => recurse with Unrecorded
 ```
@@ -304,12 +322,24 @@ This replaces the two hard-coded `Unrecorded` arguments at
 `carina-core/src/resource/mod.rs:1908`. The result order remains desired
 order, exactly as today.
 
+The split is deliberate. Value pairing remains on `projected_saved`,
+byte-for-byte preserving legacy merge fidelity and its ability to fill
+server fields into effective desired values. Authoring records were
+assigned by raw pairing at writeback, however, and projection can raise
+similarity scores or change hash-bucket priority. When raw and projected
+pairings select different stored indices, neither record is safe to
+attribute to that desired element. Corroboration therefore retains the
+legitimate-removal path when both views agree and applies invariant 4's
+`Unrecorded` fallback when they disagree.
+
 The length equality guard is required even though v10 writers uphold the
-alignment invariant. If a state file is manually edited or partially
-corrupted, trusting the prefix of a short or long vector could assign
-authoring to the wrong element. A mismatch therefore degrades the whole
-list node to legacy merge, not merely the missing indices. The next
-successful writeback reconstructs a correctly-sized vector.
+alignment invariant. The record vector, raw saved list, and projected
+saved list must all have equal length. If a state file is manually edited
+or partially corrupted, trusting the prefix of a short or long vector
+could assign authoring to the wrong element. A mismatch therefore
+degrades the whole list node to legacy merge, not merely the missing
+indices. The next successful writeback reconstructs a correctly-sized
+vector.
 
 When the prior node is `List { element }`, `Leaf`, `Unrecorded`,
 `Struct`, or any other shape mismatch, list merging is byte-for-byte the
@@ -385,12 +415,19 @@ Keep that property explicit: whenever `ListElements` participates in
 | `ListElements(E)` and `Unrecorded` | `List { element: U(E) }` |
 | `ListElements(E)` and `Struct { .. }` | `List { element: U(E) }`; this is a malformed mixed-shape union, and projecting a map through the resulting list tree still takes the conservative shape-mismatch pass-through |
 
-The rules are symmetric in operand order. No call to `merge` returns
-`ListElements`; it is intentionally a lossy cross-element union seam.
-All existing non-`ListElements` cases retain their behavior. After this
-change, production uses of `merge` are union projection, conservative
-fallback construction, and recursive union work; raw list construction
-no longer folds away element records.
+The rules are symmetric in operand order. When `ListElements` is a root
+operand, `merge` never returns `ListElements` at the root; it is
+intentionally a lossy cross-element union seam. A nested `ListElements`
+can survive as an unmatched child of an asymmetrically merged `Struct`
+(for example, merging `Struct { a: ListElements }` with
+`Struct { b: Leaf }`). That behavior is safe because merge results are
+transient and are never persisted as row authoring, and projection
+reduces any nested vector to its union when it later consumes it. A unit
+test pins this survival so changing the asymmetric union behavior is a
+conscious decision. All existing non-`ListElements` cases retain their
+behavior. After this change, production uses of `merge` are union
+projection, conservative fallback construction, and recursive union
+work; raw list construction no longer folds away element records.
 
 ## State schema v10
 
@@ -420,12 +457,16 @@ record. The future-version guard is at
 `carina-state/src/state/mod.rs:892`.
 
 The carina#3280 repair path inside
-`from_provider_state_for_resource_and_schema` remains otherwise
-unchanged. Add an idempotency arm next to the existing unexpected
-top-level `List` arm at `carina-state/src/state/mod.rs:1519` so an
-existing top-level `ListElements` is cloned rather than collapsed to
-`Unrecorded`. A populated root `Struct` already preserves nested
-`ListElements` by cloning its children.
+`from_provider_state_for_resource_and_schema` has no desired attributes
+with which to realign authoring after a fresh provider read. Its
+idempotent-preserve branches therefore recursively demote every
+`ListElements` in the prior tree to legacy `List { element: U(E) }`
+instead of cloning aligned vectors. This applies both to an unexpected
+top-level `ListElements` and to vectors nested inside a preserved,
+populated root `Struct` (or legacy `List`). A provider reorder can then
+lose only per-element precision, never leave a stale same-length vector
+pointing at different stored elements. The next writeback with real
+desired values available reconstructs aligned `ListElements`.
 
 The `Unrecorded` self-heal rebuild at
 `carina-state/src/state/mod.rs:1503` may continue calling raw
@@ -555,17 +596,20 @@ merge.
 - `carina-core/src/explicit.rs` — add `ListElements`; make
   `build_from_value` emit it for every concrete list; add aligned and
   conservative construction helpers; define the lossy `merge` cases;
-  project it through a union; update top-level pass-through and tests.
+  project it through a union; make raw `build_from_resource`
+  crate-private with its persistence warning; update top-level
+  pass-through and tests.
 - `carina-core/src/resource/mod.rs` — extract one shared list pairing
-  mapping from the quadratic/hash-assisted merge paths; thread prior
-  authoring through `merge_lists`; select `elements[saved_index]` only
-  under the length invariant.
+  function from the quadratic/hash-assisted merge paths; thread both
+  saved views and prior authoring through `merge_lists`; select
+  `elements[saved_index]` only under the length invariant and when raw
+  and projected pairing corroborate that index.
 - `carina-core/src/resource/tests.rs` — replace the #3727 conservative
   guard's new-variant counterpart with precise paired behavior while
   retaining a separate legacy-`List` regression test.
 - `carina-core/src/differ/comparison.rs` — add `ListElements` to the
-  exhaustive unexpected-root fallback. The existing projection and
-  `SavedAttr` plumbing already carries the nested node.
+  exhaustive unexpected-root fallback and carry both raw and projected
+  saved views through `SavedAttr`.
 - `carina-core/src/differ/plan_tests.rs` and/or
   `carina-core/src/differ/comparison_tests.rs` — add the end-to-end
   list-of-structs removal case.
@@ -573,9 +617,9 @@ merge.
 ### carina-state
 
 - `carina-state/src/state/mod.rs` — call the aligned builder at the row
-  writeback seam, bump v9 → v10 with a version-history line, and preserve
-  an unexpected top-level `ListElements` in the carina#3280 idempotency
-  repair. Do not add a migration function; do not change
+  writeback seam, bump v9 → v10 with a version-history line, and
+  recursively demote `ListElements` in the carina#3280 idempotency
+  preserve branches. Do not add a migration function; do not change
   `build_explicit` or `is_empty_explicit`.
 - `carina-state/src/state/tests.rs` — cover stored-order pairing,
   provider-added/unmatched elements, nested alignment, repair
@@ -602,9 +646,11 @@ itself introduces no code or manifest changes.
    empty list, a scalar list, a list of heterogeneous maps, and a nested
    list. Assert `StringList` and a whole deferred/unknown value remain
    `Leaf`.
-3. **Union algebra and projection.** Pin every new `merge` combination
-   above, prove no result is `ListElements`, and show projection uses the
-   same union for every current element regardless of current order.
+3. **Union algebra and projection.** Pin every new root `merge`
+   combination above, prove no root result is `ListElements`, pin the
+   intentional nested-survival case for an unmatched `Struct` child,
+   and show projection uses the same union for every current element
+   regardless of current order.
 4. **Writeback pairing.** Cover aligned same-order and reordered values;
    provider-returned extra elements; provider-returned missing elements;
    score-0 ambiguity degrading to `Unrecorded`; duplicates; nested lists;
@@ -612,9 +658,10 @@ itself introduces no code or manifest changes.
 5. **Paired saved merge.** Starting from two heterogeneous rules, remove
    an authored field from only one desired element. Assert the field is
    dropped only from effective desired for that paired element, while a
-   same-named provider default on its sibling remains. Run the assertion
-   through both the small quadratic path and a large-list/hash-assisted
-   path or directly assert the shared pairing mapping is common to both.
+   same-named provider default on its sibling remains. Run corroborated
+   attribution through both the small quadratic path and a
+   large-list/hash-assisted path, including a raw/projected disagreement
+   that must degrade to `Unrecorded`.
 6. **Diff-level reproduction.** Add a list-of-structs plan/differ test
    that is impossible to satisfy today: the previously-authored
    `description` is absent from the new desired element, current still
@@ -664,16 +711,17 @@ emits it. The emitter PR then switches construction and state writeback
 and bumps v10 atomically. Emitter-first is unsafe because a state file
 could contain a kind that planning does not understand.
 
-There is one concrete coupling to respect: state writeback already calls
-`build_from_resource` at `carina-state/src/state/mod.rs:1473`.
-Therefore changing `build_from_value` to return `ListElements` is itself
-an emission switch even if the edit is physically in carina-core. A
-mergeable consumer-first PR must either leave that builder behavior
-legacy until the emitter PR or explicitly keep production writeback on a
-legacy builder. The final builder switch, aligned row construction, all
-consumer arms, and the v10 bump must never be separated. Dormant
-consumer support is safe; emitted records without complete consumers or
-without the version bump are not.
+There is one concrete coupling to respect: final state writeback calls
+`build_from_resource_for_stored_values` at the row-construction seam,
+while the `Unrecorded` self-heal uses `build_from_value` on stored-order
+provider values. Therefore changing `build_from_value` to return
+`ListElements` is itself an emission switch even if the edit is
+physically in carina-core. A mergeable consumer-first PR must either
+leave that builder behavior legacy until the emitter PR or explicitly
+keep production writeback on a legacy builder. The final builder switch,
+aligned row construction, all consumer arms, and the v10 bump must never
+be separated. Dormant consumer support is safe; emitted records without
+complete consumers or without the version bump are not.
 
 ## Summary
 
@@ -685,9 +733,10 @@ without the version bump are not.
 <!-- derived-from #state-schema-v10 -->
 
 `ListElements` records authoring in the stored row's list order, paired
-once from desired and provider-returned values during writeback. Planning
-reuses its existing desired-to-saved pairing to select the corresponding
-record. Any missing evidence falls back to `Unrecorded` or legacy
-`List`, making imprecision non-destructive. Projection stays an
-order-independent union, v9 rows remain valid and conservative, and v10
-protects older binaries from the new serde kind.
+once from desired and provider-returned values during writeback.
+Planning keeps projected-list pairing for value merging and consults a
+stored-index record only when an independent raw-list pairing selects
+the same index. Any missing or conflicting evidence falls back to
+`Unrecorded` or legacy `List`, making imprecision non-destructive.
+Projection stays an order-independent union, v9 rows remain valid and
+conservative, and v10 protects older binaries from the new serde kind.

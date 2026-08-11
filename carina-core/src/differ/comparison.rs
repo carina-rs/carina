@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, HashMap};
 use indexmap::IndexMap;
 
 use crate::explicit::{self, ExplicitFields};
-use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value, merge_with_saved};
+use crate::resource::{
+    ConcreteValue, DeferredValue, ResourceId, SavedValueViews, Value, merge_with_saved,
+};
 use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
 use crate::value::{SECRET_PREFIX, SecretHashContext, argon2id_hash, value_to_json_with_context};
 
@@ -503,7 +505,7 @@ pub(crate) struct TypedAttr<'a> {
 
 #[derive(Clone, Copy)]
 pub(crate) struct SavedAttr<'a> {
-    pub(crate) value: &'a Value,
+    pub(crate) views: SavedValueViews<'a>,
     pub(crate) authoring: &'a ExplicitFields,
 }
 
@@ -527,7 +529,7 @@ pub(crate) fn should_patch_attr(cmp: AttrComparison<'_>) -> bool {
 
     match cmp.saved {
         Some(saved) => {
-            let effective_to = merge_with_saved(cmp.to, saved.value, saved.authoring);
+            let effective_to = merge_with_saved(cmp.to, saved.views, saved.authoring);
             !type_aware_equal(from_value, &effective_to, attr_type, defs, cmp.secret_ctx)
         }
         None => !type_aware_equal(from_value, cmp.to, attr_type, defs, cmp.secret_ctx),
@@ -674,11 +676,12 @@ pub(super) fn find_changed_attributes(
         Some(e) => explicit::project_attributes(current.clone(), e),
         None => current.clone(),
     };
-    let projected_saved = match (saved, prev_explicit) {
+    let raw_saved = saved;
+    let projected_saved = match (raw_saved, prev_explicit) {
         (Some(s), Some(e)) => Some(explicit::project_attributes(s.clone(), e)),
         _ => None,
     };
-    let saved = projected_saved.as_ref().or(saved);
+    let projected_saved = projected_saved.as_ref().or(raw_saved);
 
     for (key, desired_value) in desired {
         let type_info = schema.and_then(|s| {
@@ -698,17 +701,23 @@ pub(super) fn find_changed_attributes(
             AttrComparison {
                 from: projected_current.get(key),
                 to: desired_value,
-                saved: saved.and_then(|saved| {
-                    saved.get(key).map(|value| SavedAttr {
-                        value,
+                saved: projected_saved.and_then(|projected_saved| {
+                    projected_saved.get(key).map(|projected_value| SavedAttr {
+                        views: raw_saved
+                            .and_then(|raw_saved| raw_saved.get(key))
+                            .map(|raw_value| SavedValueViews::new(projected_value, raw_value))
+                            .unwrap_or_else(|| SavedValueViews::same(projected_value)),
                         authoring: match prev_explicit {
                             Some(ExplicitFields::Struct { children }) => {
                                 children.get(key).unwrap_or(&ExplicitFields::Unrecorded)
                             }
                             Some(authoring @ ExplicitFields::Unrecorded) => authoring,
-                            Some(ExplicitFields::Leaf | ExplicitFields::List { .. }) | None => {
-                                &ExplicitFields::Unrecorded
-                            }
+                            Some(
+                                ExplicitFields::Leaf
+                                | ExplicitFields::List { .. }
+                                | ExplicitFields::ListElements { .. },
+                            )
+                            | None => &ExplicitFields::Unrecorded,
                         },
                     })
                 }),

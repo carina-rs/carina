@@ -83,7 +83,9 @@ impl StateFile {
     ///     pending delete, including provider-instance routing); rows
     ///     with `identifier: None` are retained while `deposed` is
     ///     non-empty.
-    pub const CURRENT_VERSION: u32 = 9;
+    /// v10: Added `ExplicitFields::ListElements`, aligned by index with the
+    ///      stored list value in the same resource row.
+    pub const CURRENT_VERSION: u32 = 10;
 
     /// Create a new empty state file
     pub fn new() -> Self {
@@ -922,9 +924,9 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
             // legacy-corruption shape produced by an older for-loop
             // expansion path; it is structurally ambiguous with "user
             // authored an empty struct at the top level" (which the
-            // current code never legitimately emits — `build_from_resource`
-            // produces this shape only when `resource.attributes` is
-            // empty, and the v8 writeback path emits `Unrecorded`
+            // current code never legitimately emits — the resource
+            // authoring builders produce this shape only when
+            // `resource.attributes` is empty, and the writeback path emits `Unrecorded`
             // instead). Rewriting every top-level empty Struct to
             // `Unrecorded` on read makes the variant the single
             // source of truth and lets every `match` arm be exhaustive
@@ -1040,8 +1042,8 @@ pub struct ResourceState {
     /// Replaces the flat `desired_keys: Vec<String>` (state ≤ v5);
     /// the v5 reader lifts each top-level key to a `Leaf` child of
     /// the root `Struct`. The next plan/apply rebuilds a full tree
-    /// from the resource's authored `Value` via
-    /// `carina_core::explicit::build_from_resource`.
+    /// from the resource's authored `Value` via the aligned
+    /// `carina_core::explicit::build_from_resource_for_stored_values`.
     #[serde(default, skip_serializing_if = "is_empty_explicit")]
     pub explicit: ExplicitFields,
     /// The binding name for this resource (from `let` bindings in DSL).
@@ -1461,7 +1463,7 @@ impl ResourceState {
         // Record the structural shape the user wrote in their .crn,
         // so the differ can project actual-state through it and skip
         // server-side defaults the user never authored (refs awscc#206).
-        // carina#3280: when `build_from_resource` would produce an
+        // carina#3280: when the aligned resource builder would produce an
         // empty top-level `Struct` (the user authored no attributes —
         // bodyless resource like `aws.sts.CallerIdentity {}`, or the
         // `carina state import` path that constructs a `Resource`
@@ -1470,7 +1472,7 @@ impl ResourceState {
         // legacy-corruption marker, which forced callers to
         // disambiguate by runtime convention; `Unrecorded` is the
         // typed signal for "no authoring record".
-        let built = explicit::build_from_resource(resource);
+        let built = explicit::build_from_resource_for_stored_values(resource, &state.attributes);
         rs.explicit = match built {
             ExplicitFields::Struct { ref children } if children.is_empty() => {
                 // Three sub-cases when `resource.attributes` is empty:
@@ -1487,8 +1489,9 @@ impl ResourceState {
                 //    self-healed in a previous apply, or the resource
                 //    legitimately has no DSL body but was applied
                 //    once before and recorded an authoring tree from
-                //    the provider's read). Preserve the populated
-                //    `Struct` — collapsing it to `Unrecorded` would
+                //    the provider's read). Preserve its authoring
+                //    restriction, demoting aligned lists to unions;
+                //    collapsing the whole tree to `Unrecorded` would
                 //    flip-flop the row on every apply.
                 //
                 // 3. Green-field write: prior row is `None` or
@@ -1508,23 +1511,24 @@ impl ResourceState {
                             ExplicitFields::Struct { children: rebuilt }
                         }
                     }
-                    Some(ExplicitFields::Struct { children }) if !children.is_empty() => {
-                        // Idempotent re-apply: keep the populated
-                        // authoring record. Cloning the children is
-                        // cheap (HashMap of small Leaf/Struct trees).
-                        ExplicitFields::Struct {
-                            children: children.clone(),
-                        }
+                    Some(prior @ ExplicitFields::Struct { children }) if !children.is_empty() => {
+                        // No desired values exist to realign vectors after this provider read.
+                        // Preserve the tree while demoting every aligned list to its conservative
+                        // union so a same-length reorder cannot leave stale index attribution.
+                        explicit::demote_list_elements_to_union(prior)
                     }
-                    Some(ExplicitFields::List { element }) => {
+                    Some(prior @ ExplicitFields::List { .. }) => {
                         // Top-level `List` is structurally improbable
-                        // (`build_from_resource` always produces a
+                        // (the resource builders always produce a
                         // root `Struct`), but if a prior write ever
-                        // landed one, preserve it for the same
-                        // idempotency reason.
-                        ExplicitFields::List {
-                            element: element.clone(),
-                        }
+                        // landed one, preserve its conservative shape
+                        // while recursively demoting nested vectors.
+                        explicit::demote_list_elements_to_union(prior)
+                    }
+                    Some(prior @ ExplicitFields::ListElements { .. }) => {
+                        // A top-level aligned vector cannot be realigned without desired values.
+                        // Demote it rather than preserving stale stored-index attribution.
+                        explicit::demote_list_elements_to_union(prior)
                     }
                     // None (no prior row), Leaf (default), or
                     // Some(Struct { children: {} }) — the last is
@@ -1755,9 +1759,9 @@ fn migrate_v5_desired_keys_to_explicit(
 /// always the legacy-corruption pattern (the older for-loop expansion
 /// path that lost child attributes before reaching writeback), never a
 /// legitimate "user authored an empty struct at top level" — the
-/// current `build_from_resource` produces this shape only when
-/// `resource.attributes` is empty, and the v8 writeback path emits
-/// `Unrecorded` for that case instead. Migrating eliminates the
+/// the resource authoring builders produce this shape only when
+/// `resource.attributes` is empty, and the writeback path emits `Unrecorded`
+/// for that case instead. Migrating eliminates the
 /// runtime ambiguity that callers used to disambiguate by convention.
 fn migrate_v6_empty_struct_to_unrecorded(state: &mut StateFile) {
     for rs in state.resources.iter_mut() {

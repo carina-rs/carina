@@ -978,6 +978,157 @@ fn list_union_authoring_does_not_turn_provider_field_into_removal() {
 }
 
 #[test]
+fn list_elements_authored_field_removal_produces_update_for_paired_element() {
+    let resource_id = ResourceId::with_identity("example.Listener", "listener");
+    let rule = |port, description: Option<&str>| {
+        let mut fields = IndexMap::from([(
+            "port".to_string(),
+            Value::Concrete(ConcreteValue::Int(port)),
+        )]);
+        if let Some(description) = description {
+            fields.insert(
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String(description.to_string())),
+            );
+        }
+        Value::Concrete(ConcreteValue::Map(fields))
+    };
+    let desired_rules = Value::Concrete(ConcreteValue::List(vec![rule(80, None), rule(443, None)]));
+    let current_rules = Value::Concrete(ConcreteValue::List(vec![
+        rule(443, Some("provider-default")),
+        rule(80, Some("web")),
+    ]));
+    let desired =
+        Resource::new("example.Listener", "listener").with_attribute("rules", desired_rules);
+    let current_attrs = HashMap::from([("rules".to_string(), current_rules)]);
+    let current = State::existing(resource_id, current_attrs.clone());
+    let prev_explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "rules".to_string(),
+            ExplicitFields::ListElements {
+                elements: vec![
+                    ExplicitFields::Struct {
+                        children: HashMap::from([("port".to_string(), ExplicitFields::Leaf)]),
+                    },
+                    ExplicitFields::Struct {
+                        children: HashMap::from([
+                            ("port".to_string(), ExplicitFields::Leaf),
+                            ("description".to_string(), ExplicitFields::Leaf),
+                        ]),
+                    },
+                ],
+            },
+        )]),
+    };
+
+    let ExplicitFields::Struct { children } = &prev_explicit else {
+        unreachable!();
+    };
+    let effective_desired = crate::resource::merge_with_saved(
+        &desired.attributes["rules"],
+        crate::resource::SavedValueViews::same(&current_attrs["rules"]),
+        &children["rules"],
+    );
+    let Value::Concrete(ConcreteValue::List(effective_rules)) = effective_desired else {
+        panic!("expected effective desired rules list");
+    };
+    let Value::Concrete(ConcreteValue::Map(port_80)) = &effective_rules[0] else {
+        panic!("expected port 80 map");
+    };
+    let Value::Concrete(ConcreteValue::Map(port_443)) = &effective_rules[1] else {
+        panic!("expected port 443 map");
+    };
+    assert!(!port_80.contains_key("description"));
+    assert_eq!(
+        port_443.get("description"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "provider-default".to_string()
+        )))
+    );
+
+    let result = diff(
+        &desired,
+        &current,
+        Some(&current_attrs),
+        Some(&prev_explicit),
+        None,
+    );
+
+    let Diff::Update {
+        changed_attributes, ..
+    } = result
+    else {
+        panic!("Expected the paired authored-field removal to produce an Update");
+    };
+    assert_eq!(changed_attributes, vec!["rules".to_string()]);
+}
+
+#[test]
+fn unchanged_dsl_after_writeback_pairs_raw_saved_list_without_phantom_removal() {
+    let cfg = |with_timeout: bool| {
+        let mut fields = IndexMap::from([(
+            "retries".to_string(),
+            Value::Concrete(ConcreteValue::Int(3)),
+        )]);
+        if with_timeout {
+            fields.insert(
+                "timeout".to_string(),
+                Value::Concrete(ConcreteValue::Int(30)),
+            );
+        }
+        Value::Concrete(ConcreteValue::Map(fields))
+    };
+    let rule = |with_description: bool, with_timeout: bool| {
+        let mut fields = IndexMap::from([("cfg".to_string(), cfg(with_timeout))]);
+        if with_description {
+            fields.insert(
+                "desc".to_string(),
+                Value::Concrete(ConcreteValue::String(String::new())),
+            );
+        }
+        Value::Concrete(ConcreteValue::Map(fields))
+    };
+
+    let authored = Resource::new("example.Listener", "listener").with_attribute(
+        "rules",
+        Value::Concrete(ConcreteValue::List(vec![
+            rule(false, false),
+            rule(true, false),
+        ])),
+    );
+    let saved_attributes = HashMap::from([(
+        "rules".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![
+            rule(true, true),
+            rule(true, true),
+        ])),
+    )]);
+    let prior =
+        crate::explicit::build_from_resource_for_stored_values(&authored, &saved_attributes);
+    let ExplicitFields::Struct { children } = &prior else {
+        panic!("expected resource-root Struct");
+    };
+    let ExplicitFields::ListElements { elements } = &children["rules"] else {
+        panic!("expected stored-index-aligned ListElements");
+    };
+    assert!(matches!(elements[1], ExplicitFields::Unrecorded));
+
+    let current = State::existing(authored.id.clone(), saved_attributes.clone());
+    let result = diff(
+        &authored,
+        &current,
+        Some(&saved_attributes),
+        Some(&prior),
+        None,
+    );
+
+    assert!(
+        matches!(result, Diff::NoChange(_)),
+        "unchanged DSL after aligned writeback must not remove a sibling provider default, got {result:?}"
+    );
+}
+
+#[test]
 fn migrated_leaf_authoring_for_map_preserves_provider_nested_fields() {
     let resource_id = ResourceId::with_identity("example.Service", "service");
     let desired_settings = Value::Concrete(ConcreteValue::Map(IndexMap::from([(

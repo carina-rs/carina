@@ -2,6 +2,30 @@ use super::*;
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap};
 
+fn list_rule(port: i64, description: Option<&str>) -> Value {
+    let mut fields = IndexMap::from([(
+        "port".to_string(),
+        Value::Concrete(ConcreteValue::Int(port)),
+    )]);
+    if let Some(description) = description {
+        fields.insert(
+            "description".to_string(),
+            Value::Concrete(ConcreteValue::String(description.to_string())),
+        );
+    }
+    Value::Concrete(ConcreteValue::Map(fields))
+}
+
+fn assert_explicit_struct_keys(explicit: &ExplicitFields, expected: &[&str]) {
+    let ExplicitFields::Struct { children } = explicit else {
+        panic!("expected Struct, got {explicit:?}");
+    };
+    assert_eq!(children.len(), expected.len());
+    for key in expected {
+        assert!(children.contains_key(*key), "missing authored key {key}");
+    }
+}
+
 #[test]
 fn test_state_file_new() {
     let state = StateFile::new();
@@ -814,6 +838,97 @@ fn test_from_provider_state_without_existing() {
 }
 
 #[test]
+fn from_provider_state_aligns_reordered_nested_and_provider_added_list_elements() {
+    let nested_group = |rules| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("id".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+            (
+                "rules".to_string(),
+                Value::Concrete(ConcreteValue::List(rules)),
+            ),
+        ])))
+    };
+    let mut resource = Resource::with_provider("mock", "listener.Listener", "listener", None);
+    resource.set_attr(
+        "rules".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![
+            list_rule(80, Some("web")),
+            list_rule(443, None),
+        ])),
+    );
+    resource.set_attr(
+        "groups".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![nested_group(vec![
+            list_rule(80, Some("web")),
+            list_rule(443, None),
+        ])])),
+    );
+    let provider_state = State::existing(
+        resource.id.clone(),
+        HashMap::from([
+            (
+                "rules".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![
+                    list_rule(443, Some("provider-default")),
+                    list_rule(22, Some("provider-added")),
+                    list_rule(80, Some("web")),
+                ])),
+            ),
+            (
+                "groups".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![nested_group(vec![
+                    list_rule(443, Some("provider-default")),
+                    list_rule(80, Some("web")),
+                ])])),
+            ),
+        ]),
+    )
+    .with_identifier("listener-id");
+
+    let row = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let stored_rules = row.attributes["rules"].as_array().expect("stored rules");
+    assert_eq!(stored_rules.len(), 3);
+    assert_eq!(stored_rules[0]["port"], 443);
+    assert_eq!(stored_rules[1]["port"], 22);
+    assert_eq!(stored_rules[2]["port"], 80);
+    let ExplicitFields::Struct { children } = &row.explicit else {
+        panic!("expected resource-root Struct");
+    };
+    let ExplicitFields::ListElements { elements } = &children["rules"] else {
+        panic!("expected aligned rules ListElements");
+    };
+    assert_eq!(elements.len(), stored_rules.len());
+    assert_explicit_struct_keys(&elements[0], &["port"]);
+    assert_eq!(elements[1], ExplicitFields::Unrecorded);
+    assert_explicit_struct_keys(&elements[2], &["port", "description"]);
+
+    let ExplicitFields::ListElements { elements: groups } = &children["groups"] else {
+        panic!("expected aligned groups ListElements");
+    };
+    let ExplicitFields::Struct {
+        children: group_children,
+    } = &groups[0]
+    else {
+        panic!("expected group Struct");
+    };
+    let ExplicitFields::ListElements {
+        elements: nested_rules,
+    } = &group_children["rules"]
+    else {
+        panic!("expected nested aligned ListElements");
+    };
+    assert_explicit_struct_keys(&nested_rules[0], &["port"]);
+    assert_explicit_struct_keys(&nested_rules[1], &["port", "description"]);
+}
+
+#[test]
 fn test_from_provider_state_repairs_unrecorded_from_state_attrs() {
     // carina#3280: when the prior on-disk row carries `Unrecorded` (the
     // legacy-corruption marker, emitted by the v6→v7 migration for rows
@@ -877,7 +992,7 @@ fn test_from_provider_state_emits_unrecorded_for_fresh_empty_body_resource() {
     // carina#3280: a green-field write of a resource with no DSL
     // attributes (e.g. `aws.sts.CallerIdentity {}`, or `carina state
     // import`) must emit `Unrecorded` — NOT `Struct { children: {} }`.
-    // Pre-fix `build_from_resource` produced the ambiguous empty
+    // Pre-fix resource authoring produced the ambiguous empty
     // Struct shape, which the differ used to interpret as "user
     // authored an empty struct, drop every server-side attribute".
     // The typed signal removes the ambiguity at the source.
@@ -920,7 +1035,7 @@ fn test_from_provider_state_preserves_populated_struct_when_resource_attrs_empty
     // carina#3280 idempotency: after the self-heal path runs once, the
     // on-disk row carries a populated `Struct`. On the next apply (no
     // DSL change), `resource.attributes` is still empty (the user's
-    // bodyless DSL hasn't changed), so `build_from_resource` produces
+    // bodyless DSL hasn't changed), so the aligned builder produces
     // `Struct { children: {} }` again. Without the preservation arm,
     // the empty-Struct collapse would overwrite the populated record
     // with `Unrecorded`, flip-flopping the row on every apply and
@@ -965,6 +1080,117 @@ fn test_from_provider_state_preserves_populated_struct_when_resource_attrs_empty
          got {:?}",
         rs.explicit
     );
+}
+
+#[test]
+fn test_from_provider_state_demotes_top_level_list_elements_when_resource_attrs_empty() {
+    let resource = Resource::with_provider("mock", "test.Resource", "empty", None);
+    let provider_state = State::existing(
+        resource.id.clone(),
+        HashMap::from([(
+            "provider_value".to_string(),
+            Value::Concrete(ConcreteValue::String("value".to_string())),
+        )]),
+    )
+    .with_identifier("resource-id");
+    let mut existing = ResourceState::new("test.Resource", "empty", "mock");
+    let populated = ExplicitFields::ListElements {
+        elements: vec![ExplicitFields::Struct {
+            children: HashMap::from([("id".to_string(), ExplicitFields::Leaf)]),
+        }],
+    };
+    existing.explicit = populated.clone();
+
+    let row = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &provider_state,
+        Some(&existing),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        row.explicit,
+        ExplicitFields::List {
+            element: Box::new(ExplicitFields::Struct {
+                children: HashMap::from([("id".to_string(), ExplicitFields::Leaf)]),
+            }),
+        }
+    );
+}
+
+#[test]
+fn bodyless_refresh_demotes_reordered_list_elements_and_merge_stays_conservative() {
+    use carina_core::differ::{Diff, diff};
+
+    let resource = Resource::with_provider("mock", "listener.Listener", "listener", None);
+    let reordered_provider = State::existing(
+        resource.id.clone(),
+        HashMap::from([(
+            "rules".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                list_rule(443, Some("provider-default")),
+                list_rule(80, Some("web")),
+            ])),
+        )]),
+    )
+    .with_identifier("listener-id");
+    let mut existing = ResourceState::new("listener.Listener", "listener", "mock");
+    existing.explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "rules".to_string(),
+            ExplicitFields::ListElements {
+                elements: vec![
+                    ExplicitFields::Struct {
+                        children: HashMap::from([
+                            ("port".to_string(), ExplicitFields::Leaf),
+                            ("description".to_string(), ExplicitFields::Leaf),
+                        ]),
+                    },
+                    ExplicitFields::Struct {
+                        children: HashMap::from([("port".to_string(), ExplicitFields::Leaf)]),
+                    },
+                ],
+            },
+        )]),
+    };
+
+    let row = ResourceState::from_provider_state_for_resource_and_schema(
+        &resource,
+        &reordered_provider,
+        Some(&existing),
+        None,
+    )
+    .unwrap();
+    let ExplicitFields::Struct { children } = &row.explicit else {
+        panic!("expected preserved root Struct");
+    };
+    let ExplicitFields::List { element } = &children["rules"] else {
+        panic!("reordered provider values must demote nested ListElements");
+    };
+    assert_explicit_struct_keys(element, &["port", "description"]);
+
+    let mut state = StateFile::new();
+    state.upsert_resource(row.clone()).unwrap();
+    let saved = state.build_saved_attrs();
+    let reauthored = Resource::with_provider("mock", "listener.Listener", "listener", None)
+        .with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(vec![
+                list_rule(80, None),
+                list_rule(443, None),
+            ])),
+        );
+    assert!(matches!(
+        diff(
+            &reauthored,
+            &reordered_provider,
+            saved.get(&resource.id),
+            Some(&row.explicit),
+            None,
+        ),
+        Diff::NoChange(_)
+    ));
 }
 
 #[test]
@@ -1435,13 +1661,13 @@ fn test_build_orphan_dependencies() {
 }
 
 #[test]
-fn test_state_file_version_is_v9() {
+fn test_state_file_version_is_v10() {
     let state = StateFile::new();
-    assert_eq!(state.version, 9);
+    assert_eq!(state.version, 10);
 }
 
 #[test]
-fn v8_state_migrates_to_v9_with_empty_deposed() {
+fn v8_state_migrates_to_v10_with_empty_deposed() {
     use super::check_and_migrate;
 
     let json = r#"{
@@ -1460,10 +1686,10 @@ fn v8_state_migrates_to_v9_with_empty_deposed() {
         ]
     }"#;
 
-    let outcome = check_and_migrate(json).expect("v8 state should migrate to v9");
+    let outcome = check_and_migrate(json).expect("v8 state should migrate to v10");
     let migration = outcome
         .migration
-        .expect("v8 read should report a v9 migration");
+        .expect("v8 read should report a v10 migration");
     assert_eq!(migration.from, 8);
     assert_eq!(migration.to, StateFile::CURRENT_VERSION);
     let row = outcome
@@ -2987,6 +3213,283 @@ fn current_state_writes_and_reads_full_explicit_tree() {
     let back = check_and_migrate(&json).expect("read").into_state();
     assert_eq!(back.version, StateFile::CURRENT_VERSION);
     assert_eq!(back.resources[0].explicit, state.resources[0].explicit);
+}
+
+#[test]
+fn v10_list_elements_state_round_trip_preserves_empty_and_populated_vectors() {
+    let mut state = StateFile::new();
+    let mut populated =
+        ResourceState::new("listener.Listener", "populated", "mock").with_identifier("one");
+    populated.explicit = ExplicitFields::Struct {
+        children: HashMap::from([(
+            "rules".to_string(),
+            ExplicitFields::ListElements {
+                elements: vec![ExplicitFields::Leaf, ExplicitFields::Unrecorded],
+            },
+        )]),
+    };
+    let mut empty = ResourceState::new("listener.Listener", "empty", "mock").with_identifier("two");
+    empty.explicit = ExplicitFields::ListElements {
+        elements: Vec::new(),
+    };
+    state.upsert_resource(populated).unwrap();
+    state.upsert_resource(empty).unwrap();
+
+    let json = serde_json::to_string(&state).unwrap();
+    assert!(json.contains(r#""kind":"list-elements""#));
+    assert!(json.contains(r#""elements":[]"#));
+    let back = check_and_migrate(&json).unwrap().into_state();
+
+    assert_eq!(back.version, 10);
+    assert_eq!(back.resources[0].explicit, state.resources[0].explicit);
+    assert_eq!(back.resources[1].explicit, state.resources[1].explicit);
+}
+
+#[test]
+fn v9_legacy_list_survives_v10_lift_stays_conservative_and_self_heals_on_writeback() {
+    use carina_core::differ::{Diff, diff};
+
+    let json = r#"{
+        "version": 9,
+        "serial": 1,
+        "lineage": "test-lineage",
+        "carina_version": "0.4.0",
+        "resources": [{
+            "resource_type": "listener.Listener",
+            "identity": "listener",
+            "provider": "mock",
+            "identifier": "listener-id",
+            "attributes": {
+                "rules": [
+                    {"port": 80, "description": "web"},
+                    {"port": 443, "description": "provider-default"}
+                ]
+            },
+            "explicit": {
+                "kind": "struct",
+                "children": {
+                    "rules": {
+                        "kind": "list",
+                        "element": {
+                            "kind": "struct",
+                            "children": {
+                                "port": {"kind": "leaf"},
+                                "description": {"kind": "leaf"}
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }"#;
+    let outcome = check_and_migrate(json).expect("v9 state must lift without a custom migration");
+    assert_eq!(outcome.migration.unwrap().from, 9);
+    assert_eq!(outcome.state.version, 10);
+    let state = outcome.state;
+    let row = state
+        .find_resource("mock", "listener.Listener", "listener")
+        .expect("legacy row");
+    let legacy_explicit = row.explicit.clone();
+    let ExplicitFields::Struct { children } = &legacy_explicit else {
+        panic!("expected legacy root Struct");
+    };
+    assert!(matches!(children["rules"], ExplicitFields::List { .. }));
+
+    let serialized = serde_json::to_string(&state).unwrap();
+    let round_tripped = check_and_migrate(&serialized).unwrap().into_state();
+    assert_eq!(round_tripped.resources[0].explicit, legacy_explicit);
+
+    let desired = Resource::with_provider("mock", "listener.Listener", "listener", None)
+        .with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(vec![
+                list_rule(80, None),
+                list_rule(443, None),
+            ])),
+        );
+    let current_attributes = HashMap::from([(
+        "rules".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![
+            list_rule(80, Some("web")),
+            list_rule(443, Some("provider-default")),
+        ])),
+    )]);
+    let current = State::existing(desired.id.clone(), current_attributes.clone())
+        .with_identifier("listener-id");
+    assert!(matches!(
+        diff(
+            &desired,
+            &current,
+            Some(&current_attributes),
+            Some(&legacy_explicit),
+            None,
+        ),
+        Diff::NoChange(_)
+    ));
+
+    let rewritten = ResourceState::from_provider_state_for_resource_and_schema(
+        &desired,
+        &current,
+        Some(row),
+        None,
+    )
+    .unwrap();
+    let ExplicitFields::Struct { children } = rewritten.explicit else {
+        panic!("expected rewritten root Struct");
+    };
+    let ExplicitFields::ListElements { elements } = &children["rules"] else {
+        panic!("v10 writeback must replace legacy List with ListElements");
+    };
+    assert_eq!(elements.len(), 2);
+    assert_explicit_struct_keys(&elements[0], &["port"]);
+    assert_explicit_struct_keys(&elements[1], &["port"]);
+}
+
+#[test]
+fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignment() {
+    use carina_core::differ::{Diff, diff};
+
+    let authored = Resource::with_provider("mock", "listener.Listener", "listener", None)
+        .with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(vec![
+                list_rule(80, Some("web")),
+                list_rule(443, None),
+            ])),
+        );
+    let first_provider = State::existing(
+        authored.id.clone(),
+        HashMap::from([(
+            "rules".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                list_rule(80, Some("web")),
+                list_rule(443, Some("provider-default")),
+            ])),
+        )]),
+    )
+    .with_identifier("listener-id");
+    let first_row = ResourceState::from_provider_state_for_resource_and_schema(
+        &authored,
+        &first_provider,
+        None,
+        None,
+    )
+    .unwrap();
+    let ExplicitFields::Struct {
+        children: first_children,
+    } = &first_row.explicit
+    else {
+        panic!("expected first root Struct");
+    };
+    let ExplicitFields::ListElements {
+        elements: first_elements,
+    } = &first_children["rules"]
+    else {
+        panic!("expected first aligned ListElements");
+    };
+    assert_explicit_struct_keys(&first_elements[0], &["port", "description"]);
+    assert_explicit_struct_keys(&first_elements[1], &["port"]);
+
+    let mut first_state = StateFile::new();
+    first_state.upsert_resource(first_row.clone()).unwrap();
+    let saved = first_state.build_saved_attrs();
+    let removed = Resource::with_provider("mock", "listener.Listener", "listener", None)
+        .with_attribute(
+            "rules",
+            Value::Concrete(ConcreteValue::List(vec![
+                list_rule(80, None),
+                list_rule(443, None),
+            ])),
+        );
+    let removal = diff(
+        &removed,
+        &first_provider,
+        saved.get(&authored.id),
+        Some(&first_row.explicit),
+        None,
+    );
+    let Diff::Update {
+        changed_attributes, ..
+    } = removal
+    else {
+        panic!("removing the authored port 80 description must update rules");
+    };
+    assert_eq!(changed_attributes, vec!["rules".to_string()]);
+
+    // This current view is exactly the effective merged list the plan must compare against: the
+    // authored field is gone from port 80, while port 443 keeps its provider default. `NoChange`
+    // here discriminates the saved index used for both per-element decisions.
+    let expected_effective = State::existing(
+        authored.id.clone(),
+        HashMap::from([(
+            "rules".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                list_rule(80, None),
+                list_rule(443, Some("provider-default")),
+            ])),
+        )]),
+    )
+    .with_identifier("listener-id");
+    let Value::Concrete(ConcreteValue::List(expected_rules)) =
+        &expected_effective.attributes["rules"]
+    else {
+        panic!("expected effective rules list");
+    };
+    let Value::Concrete(ConcreteValue::Map(port_80)) = &expected_rules[0] else {
+        panic!("expected port 80 rule");
+    };
+    let Value::Concrete(ConcreteValue::Map(port_443)) = &expected_rules[1] else {
+        panic!("expected port 443 rule");
+    };
+    assert!(!port_80.contains_key("description"));
+    assert_eq!(
+        port_443.get("description"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "provider-default".to_string()
+        )))
+    );
+    assert!(matches!(
+        diff(
+            &removed,
+            &expected_effective,
+            saved.get(&authored.id),
+            Some(&first_row.explicit),
+            None,
+        ),
+        Diff::NoChange(_)
+    ));
+
+    let reordered_provider = State::existing(
+        authored.id.clone(),
+        HashMap::from([(
+            "rules".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                list_rule(443, Some("provider-default")),
+                list_rule(80, Some("web")),
+            ])),
+        )]),
+    )
+    .with_identifier("listener-id");
+    let second_row = ResourceState::from_provider_state_for_resource_and_schema(
+        &authored,
+        &reordered_provider,
+        Some(&first_row),
+        None,
+    )
+    .unwrap();
+    let stored = second_row.attributes["rules"]
+        .as_array()
+        .expect("stored reordered rules");
+    assert_eq!(stored[0]["port"], 443);
+    assert_eq!(stored[1]["port"], 80);
+    let ExplicitFields::Struct { children } = &second_row.explicit else {
+        panic!("expected root Struct");
+    };
+    let ExplicitFields::ListElements { elements } = &children["rules"] else {
+        panic!("expected realigned ListElements");
+    };
+    assert_explicit_struct_keys(&elements[0], &["port"]);
+    assert_explicit_struct_keys(&elements[1], &["port", "description"]);
 }
 
 #[test]
