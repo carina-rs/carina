@@ -1392,7 +1392,9 @@ mod post_apply_states_tests {
                 }
             ]
         });
-        let state: StateFile = serde_json::from_value(json).unwrap();
+        let state = carina_state::check_and_migrate(&json.to_string())
+            .unwrap()
+            .into_state();
 
         let post = PostApplyStates::from_current_and_state(&current_states, &state);
         let entry = post.as_map().get(&id).expect("merged entry");
@@ -1525,8 +1527,9 @@ mod apply_state_save_tests {
 
         assert_aligned(&state);
         let serialized = serde_json::to_string(&state).expect("serialize state");
-        let round_tripped: StateFile =
-            serde_json::from_str(&serialized).expect("deserialize state");
+        let round_tripped = carina_state::check_and_migrate(&serialized)
+            .expect("deserialize state")
+            .into_state();
         assert_aligned(&round_tripped);
     }
 

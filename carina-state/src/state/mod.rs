@@ -47,9 +47,15 @@ struct UncheckedStateFile {
     exports: HashMap<String, serde_json::Value>,
 }
 
-impl<'de> Deserialize<'de> for StateFile {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let unchecked = UncheckedStateFile::deserialize(deserializer)?;
+impl StateFile {
+    /// Crate-private validated parse seam. `StateFile` intentionally has no
+    /// public `Deserialize` impl: every external parse must go through the
+    /// version gate ([`check_and_migrate`] or [`check_and_migrate_bytes`]), so
+    /// consumers cannot read future-version or unmigrated state files
+    /// (carina#3731). Parsing here still validates duplicate identities on
+    /// every parse (carina#2858).
+    pub(crate) fn from_json_str(content: &str) -> Result<Self, serde_json::Error> {
+        let unchecked: UncheckedStateFile = serde_json::from_str(content)?;
         let state = Self {
             version: unchecked.version,
             serial: unchecked.serial,
@@ -60,12 +66,10 @@ impl<'de> Deserialize<'de> for StateFile {
         };
         state
             .validate_unique_identities()
-            .map_err(serde::de::Error::custom)?;
+            .map_err(<serde_json::Error as serde::de::Error>::custom)?;
         Ok(state)
     }
-}
 
-impl StateFile {
     /// Current state file format version
     /// v2: Added identifier field to ResourceState
     /// v3: Added binding and dependency_bindings fields to ResourceState
@@ -888,22 +892,21 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
 
     let mut migration: Option<MigrationInfo> = None;
     let mut state: StateFile = match check.version {
-        v if v == StateFile::CURRENT_VERSION => serde_json::from_str(content).map_err(|e| {
+        v if v == StateFile::CURRENT_VERSION => StateFile::from_json_str(content).map_err(|e| {
             BackendError::InvalidState(format!("Failed to parse state file: {}", e))
         })?,
         v if v > StateFile::CURRENT_VERSION => {
-            return Err(BackendError::InvalidState(format!(
-                "State file version {} is newer than supported version {}. Please upgrade Carina.",
-                v,
-                StateFile::CURRENT_VERSION
-            )));
+            return Err(BackendError::StateVersionTooNew {
+                found: v,
+                supported: StateFile::CURRENT_VERSION,
+            });
         }
         v => {
             migration = Some(MigrationInfo {
                 from: v,
                 to: StateFile::CURRENT_VERSION,
             });
-            let mut state: StateFile = serde_json::from_str(content).map_err(|e| {
+            let mut state = StateFile::from_json_str(content).map_err(|e| {
                 BackendError::InvalidState(format!(
                     "Failed to migrate state file from v{}: {}",
                     v, e
