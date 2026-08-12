@@ -14,6 +14,8 @@ use time::format_description::well_known::Rfc3339;
 
 use carina_core::parser::ProviderConfig;
 
+use crate::signing::{self, ExpectedIdentity};
+
 /// Distinguishes the three shapes a lock entry can take. Encoded as a tagged
 /// enum so that invalid field combinations (e.g. `version = ""` *and*
 /// `revision = "main"`, the root cause of #2028) can't be constructed at
@@ -75,20 +77,111 @@ pub struct LockEntry {
 /// Registry-only pinning metadata. Kept outside [`LockEntryKind`] so the
 /// version/revision/file shape remains a closed tagged enum.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "RegistryLockSerde", into = "RegistryLockSerde")]
 pub struct RegistryLock {
     pub resolved_hostname: String,
     pub api_base_url: String,
     pub discovery_sha256: String,
-    #[serde(default)]
     pub sequence_present: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequence: Option<u64>,
-    #[serde(default)]
     pub valid_until_present: bool,
-    #[serde(default)]
     pub signature_present: bool,
-    #[serde(default)]
+    pub pin: Option<IdentityPin>,
     pub transparency_log_present: bool,
+}
+
+/// A signing-identity pin whose identity and issuer are always present together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityPin {
+    pub certificate_identity: String,
+    pub certificate_oidc_issuer: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RegistryLockSerde {
+    resolved_hostname: String,
+    api_base_url: String,
+    discovery_sha256: String,
+    #[serde(default)]
+    sequence_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sequence: Option<u64>,
+    #[serde(default)]
+    valid_until_present: bool,
+    #[serde(default)]
+    signature_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    certificate_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    certificate_oidc_issuer: Option<String>,
+    #[serde(default)]
+    transparency_log_present: bool,
+}
+
+impl TryFrom<RegistryLockSerde> for RegistryLock {
+    type Error = String;
+
+    fn try_from(value: RegistryLockSerde) -> Result<Self, Self::Error> {
+        let pin = match (value.certificate_identity, value.certificate_oidc_issuer) {
+            (Some(certificate_identity), Some(certificate_oidc_issuer)) => Some(IdentityPin {
+                certificate_identity,
+                certificate_oidc_issuer,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(
+                    "registry lock is inconsistent: certificate_identity and certificate_oidc_issuer must either both be set or both be absent"
+                        .to_string(),
+                );
+            }
+        };
+        Ok(Self {
+            resolved_hostname: value.resolved_hostname,
+            api_base_url: value.api_base_url,
+            discovery_sha256: value.discovery_sha256,
+            sequence_present: value.sequence_present,
+            sequence: value.sequence,
+            valid_until_present: value.valid_until_present,
+            signature_present: value.signature_present,
+            pin,
+            transparency_log_present: value.transparency_log_present,
+        })
+    }
+}
+
+impl From<RegistryLock> for RegistryLockSerde {
+    fn from(value: RegistryLock) -> Self {
+        let (certificate_identity, certificate_oidc_issuer) =
+            value.pin.map_or((None, None), |pin| {
+                (
+                    Some(pin.certificate_identity),
+                    Some(pin.certificate_oidc_issuer),
+                )
+            });
+        Self {
+            resolved_hostname: value.resolved_hostname,
+            api_base_url: value.api_base_url,
+            discovery_sha256: value.discovery_sha256,
+            sequence_present: value.sequence_present,
+            sequence: value.sequence,
+            valid_until_present: value.valid_until_present,
+            signature_present: value.signature_present,
+            certificate_identity,
+            certificate_oidc_issuer,
+            transparency_log_present: value.transparency_log_present,
+        }
+    }
+}
+
+impl RegistryLock {
+    fn expected_identity(&self) -> Option<ExpectedIdentity> {
+        self.pin.as_ref().map(|pin| {
+            ExpectedIdentity::pinned(
+                pin.certificate_identity.clone(),
+                pin.certificate_oidc_issuer.clone(),
+            )
+        })
+    }
 }
 
 /// The full carina-providers.lock file.
@@ -115,7 +208,7 @@ impl LockFile {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("Failed to read {}: {e}", path.display())),
         };
-        let lock: Self = toml::from_str(&content).map_err(|e| {
+        let lock = toml::from_str(&content).map_err(|e| {
             format!(
                 "Failed to parse {}: {e}\nhint: delete {} and re-run `carina init`.",
                 path.display(),
@@ -388,6 +481,8 @@ pub fn download_url_wasm(source: &str, version: &str) -> Result<String, String> 
 
 const DEFAULT_REGISTRY_HOST: &str = "registry.carina-rs.dev";
 const MAX_SEQUENCE_FAST_FORWARD: u64 = 1_000_000;
+const MAX_SIGNATURE_BUNDLE_BYTES: usize = 1024 * 1024;
+const IDENTITY_REPIN_REMEDIATION: &str = "After verifying out-of-band that this is intended (a legitimate signing-identity change or a deliberate downgrade to a pre-signing version), remove that provider's entry from carina-providers.lock and re-run carina init to re-pin.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProviderSource {
@@ -509,10 +604,33 @@ struct RegistryVersion {
 struct RegistryDownload {
     download_url: String,
     shasum: String,
-    #[serde(default)]
-    signature: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_registry_signature")]
+    signature: Option<RegistrySignature>,
     #[serde(default)]
     transparency_log: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistrySignature {
+    r#type: String,
+    certificate_identity: String,
+    certificate_oidc_issuer: String,
+    bundle_url: String,
+}
+
+fn deserialize_registry_signature<'de, D>(
+    deserializer: D,
+) -> Result<Option<RegistrySignature>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    RegistrySignature::deserialize(deserializer)
+        .map(Some)
+        .map_err(|error| {
+            serde::de::Error::custom(signing::verification_failure(format!(
+                "malformed registry signature block: {error}"
+            )))
+        })
 }
 
 fn parse_provider_source(source: &str) -> Result<ProviderSource, String> {
@@ -855,6 +973,10 @@ pub fn cache_path_wasm(base_dir: &Path, source: &str, version: &str) -> PathBuf 
 
 /// Compute SHA256 hex digest of a file.
 pub fn sha256_file(path: &Path) -> io::Result<String> {
+    Ok(sha256_digest_hex(&sha256_file_digest(path)?))
+}
+
+fn sha256_file_digest(path: &Path) -> io::Result<Sha256> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 8192];
@@ -865,7 +987,28 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
         }
         hasher.update(&buffer[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher)
+}
+
+fn sha256_digest_hex(digest: &Sha256) -> String {
+    format!("{:x}", digest.clone().finalize())
+}
+
+fn hash_and_check(
+    wasm_path: &Path,
+    expected_shasum: &str,
+    context: &str,
+) -> Result<Sha256, String> {
+    let artifact_digest = sha256_file_digest(wasm_path)
+        .map_err(|error| format!("Failed to hash WASM binary: {error}"))?;
+    let actual_hash = sha256_digest_hex(&artifact_digest);
+    if actual_hash != expected_shasum {
+        let _ = fs::remove_file(wasm_path);
+        return Err(format!(
+            "SHA256 mismatch for {context}. Expected registry shasum {expected_shasum}, got {actual_hash}. Re-run `carina init` to re-download."
+        ));
+    }
+    Ok(artifact_digest)
 }
 
 /// Download a file from a URL and save it to a path.
@@ -986,18 +1129,26 @@ fn verify_or_record_version_cache(
     Ok(())
 }
 
+struct VerifiedRegistryLockPin {
+    existing_constraint: Option<String>,
+    expected_identity: Option<ExpectedIdentity>,
+}
+
 fn verify_registry_lock_pin(
     lock_file: &LockFile,
     source: &RegistrySource,
     version: &str,
     expected_shasum: &str,
     registry: &ResolvedRegistry,
-    signature_present: bool,
+    signature: Option<&RegistrySignature>,
     transparency_log_present: bool,
-) -> Result<Option<String>, String> {
+) -> Result<VerifiedRegistryLockPin, String> {
     let source_key = source.source_key();
     let Some(entry) = lock_file.find_by_source(&source_key) else {
-        return Ok(None);
+        return Ok(VerifiedRegistryLockPin {
+            existing_constraint: None,
+            expected_identity: None,
+        });
     };
     if matches!(&entry.kind, LockEntryKind::Version { version: locked, .. } if locked == version)
         && entry.sha256 != expected_shasum
@@ -1008,9 +1159,12 @@ fn verify_registry_lock_pin(
         ));
     }
     let Some(locked_registry) = &entry.registry else {
-        return Ok(match &entry.kind {
-            LockEntryKind::Version { constraint, .. } => constraint.clone(),
-            _ => None,
+        return Ok(VerifiedRegistryLockPin {
+            existing_constraint: match &entry.kind {
+                LockEntryKind::Version { constraint, .. } => constraint.clone(),
+                _ => None,
+            },
+            expected_identity: None,
         });
     };
     if locked_registry.resolved_hostname != registry.hostname {
@@ -1027,9 +1181,25 @@ fn verify_registry_lock_pin(
             "registry discovery document pin mismatch for {source_key}"
         ));
     }
-    if locked_registry.signature_present && !signature_present {
+    if locked_registry.signature_present && signature.is_none() {
         return Err(format!(
-            "registry signature field disappeared for {source_key}"
+            "the resolved version of {source_key} has no registry signature, but carina-providers.lock records this provider as signed; downgrades from signed to unsigned versions are refused and have no override. {IDENTITY_REPIN_REMEDIATION}"
+        ));
+    }
+    let expected_identity = locked_registry.expected_identity();
+    if let (Some(expected_identity), Some(signature)) = (&expected_identity, signature) {
+        let (certificate_identity, certificate_oidc_issuer) = expected_identity.values();
+        if signature.certificate_identity != certificate_identity
+            || signature.certificate_oidc_issuer != certificate_oidc_issuer
+        {
+            return Err(format!(
+                "registry signature identity for {source_key} differs from the carina-providers.lock pin; signature verification has no override. {IDENTITY_REPIN_REMEDIATION}"
+            ));
+        }
+    }
+    if expected_identity.is_some() && signature.is_none() {
+        return Err(format!(
+            "registry signature is missing for identity-pinned provider {source_key}; signature verification has no override. {IDENTITY_REPIN_REMEDIATION}"
         ));
     }
     if locked_registry.transparency_log_present && !transparency_log_present {
@@ -1037,10 +1207,45 @@ fn verify_registry_lock_pin(
             "registry transparency_log field disappeared for {source_key}"
         ));
     }
-    Ok(match &entry.kind {
-        LockEntryKind::Version { constraint, .. } => constraint.clone(),
-        _ => None,
+    Ok(VerifiedRegistryLockPin {
+        existing_constraint: match &entry.kind {
+            LockEntryKind::Version { constraint, .. } => constraint.clone(),
+            _ => None,
+        },
+        expected_identity,
     })
+}
+
+fn fetch_signature_bundle<H: RegistryHttp>(
+    signature: &RegistrySignature,
+    http: &H,
+) -> Result<Vec<u8>, String> {
+    if !signature.bundle_url.starts_with("https://") {
+        return Err(signing::verification_failure(format!(
+            "signature bundle URL must use HTTPS: {}",
+            signature.bundle_url
+        )));
+    }
+    let response = http.get(&signature.bundle_url).map_err(|error| {
+        format!(
+            "cannot fetch the signature bundle from {} ({error}); signature verification cannot proceed and has no override",
+            signature.bundle_url
+        )
+    })?;
+    if response.status != 200 {
+        return Err(format!(
+            "cannot fetch the signature bundle from {} (HTTP {}); signature verification cannot proceed and has no override",
+            signature.bundle_url, response.status
+        ));
+    }
+    if response.body.len() > MAX_SIGNATURE_BUNDLE_BYTES {
+        return Err(signing::verification_failure(format!(
+            "signature bundle from {} is {} bytes, exceeding the {MAX_SIGNATURE_BUNDLE_BYTES}-byte limit",
+            signature.bundle_url,
+            response.body.len()
+        )));
+    }
+    Ok(response.body)
 }
 
 fn resolve_registry_provider_with_http<H: RegistryHttp>(
@@ -1066,52 +1271,78 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
     }
     let download = fetch_registry_download(&registry, source, version, http)?;
     let signature_present = download.signature.is_some();
+    if let Some(signature) = &download.signature {
+        signing::ensure_supported_signature_type(&signature.r#type)?;
+    }
     let transparency_log_present = download.transparency_log.is_some();
-    let existing_constraint = verify_registry_lock_pin(
+    let VerifiedRegistryLockPin {
+        existing_constraint,
+        expected_identity: pinned_identity,
+    } = verify_registry_lock_pin(
         lock_file,
         source,
         version,
         &download.shasum,
         &registry,
-        signature_present,
+        download.signature.as_ref(),
         transparency_log_present,
     )?;
+    let source_key = source.source_key();
+    let provider_context = format!("registry provider '{name}' ({source_key}@{version})");
+    let signed = download.signature.as_ref().map(|signature| {
+        (
+            signature,
+            pinned_identity.unwrap_or_else(|| {
+                ExpectedIdentity::first_use(
+                    signature.certificate_identity.clone(),
+                    signature.certificate_oidc_issuer.clone(),
+                )
+            }),
+        )
+    });
 
-    let wasm_path = cache_path_wasm(base_dir, &source.source_key(), version);
-    if wasm_path.exists() {
-        let actual_hash =
-            sha256_file(&wasm_path).map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
-        if actual_hash != download.shasum {
-            let _ = fs::remove_file(&wasm_path);
-            return Err(format!(
-                "SHA256 mismatch for cached registry provider '{}' ({}@{}). Expected registry shasum {}, got {}. Re-run `carina init` to re-download.",
-                name,
-                source.source_key(),
-                version,
-                download.shasum,
-                actual_hash
-            ));
-        }
+    let wasm_path = cache_path_wasm(base_dir, &source_key, version);
+    let artifact_digest = if wasm_path.exists() {
+        hash_and_check(
+            &wasm_path,
+            &download.shasum,
+            &format!("cached {provider_context}"),
+        )?
     } else {
         http.download_to_file(&download.download_url, &wasm_path)?;
-        let actual_hash =
-            sha256_file(&wasm_path).map_err(|e| format!("Failed to hash WASM binary: {e}"))?;
-        if actual_hash != download.shasum {
-            let _ = fs::remove_file(&wasm_path);
-            return Err(format!(
-                "SHA256 mismatch for registry provider '{}' ({}@{}). Expected registry shasum {}, got {}.",
-                name,
-                source.source_key(),
-                version,
-                download.shasum,
-                actual_hash
-            ));
+        hash_and_check(&wasm_path, &download.shasum, &provider_context)?
+    };
+
+    let verified_identity = match signed {
+        Some((signature, expected_identity)) => {
+            let bundle = fetch_signature_bundle(signature, http)
+                .map_err(|error| format!("{provider_context}: {error}"))?;
+            match signing::verify(artifact_digest, &bundle, &expected_identity) {
+                Ok(identity) => Some((identity, expected_identity)),
+                Err(error) => {
+                    let _ = fs::remove_file(&wasm_path);
+                    return Err(format!("{provider_context}: {error}"));
+                }
+            }
         }
-    }
+        None => None,
+    };
+    let pin = verified_identity.map(|(identity, expected_identity)| {
+        let (certificate_identity, certificate_oidc_issuer) = identity.into_parts();
+        if expected_identity.is_first_use() {
+            eprintln!(
+                "carina: pinned signing identity for {source_key}: {certificate_identity} (issuer {certificate_oidc_issuer})"
+            );
+        }
+        IdentityPin {
+            certificate_identity,
+            certificate_oidc_issuer,
+        }
+    });
 
     lock_file.upsert(LockEntry {
         name: name.to_string(),
-        source: source.source_key(),
+        source: source_key,
         kind: LockEntryKind::Version {
             version: version.to_string(),
             constraint: existing_constraint,
@@ -1125,6 +1356,7 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
             sequence: versions.sequence,
             valid_until_present: versions.valid_until.is_some(),
             signature_present,
+            pin,
             transparency_log_present,
         }),
     });
@@ -2107,8 +2339,16 @@ pub fn validate_lock_constraints(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use indexmap::IndexMap;
     use std::io::Write;
+
+    const SIGNED_FIXTURE_ARTIFACT: &[u8] = include_bytes!("signing/testdata/a.txt");
+    const SIGNED_FIXTURE_BUNDLE: &[u8] = include_bytes!("signing/testdata/bundle.sigstore.json");
+    const SIGNED_FIXTURE_IDENTITY: &str = "https://github.com/sigstore-conformance/extremely-dangerous-public-oidc-beacon/.github/workflows/extremely-dangerous-oidc-beacon.yml@refs/heads/main";
+    const SIGNED_FIXTURE_ISSUER: &str = "https://token.actions.githubusercontent.com";
+    const SIGNED_FIXTURE_BUNDLE_URL: &str = "https://downloads.example.test/aws.sigstore.json";
 
     fn version_entry(source: &str, version: &str) -> LockEntry {
         LockEntry {
@@ -2499,6 +2739,61 @@ sha256 = "abc"
     }
 
     #[test]
+    fn registry_identity_pin_toml_roundtrip_preserves_flat_bytes() {
+        let lock = LockFile {
+            provider: vec![LockEntry {
+                name: "aws".into(),
+                source: "carina-rs/aws".into(),
+                kind: LockEntryKind::Version {
+                    version: "0.5.0".into(),
+                    constraint: None,
+                },
+                sha256: "abc".into(),
+                registry: Some(RegistryLock {
+                    resolved_hostname: "registry.carina-rs.dev".into(),
+                    api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
+                    discovery_sha256: "def".into(),
+                    sequence_present: true,
+                    sequence: Some(7),
+                    valid_until_present: true,
+                    signature_present: true,
+                    pin: Some(IdentityPin {
+                        certificate_identity: SIGNED_FIXTURE_IDENTITY.into(),
+                        certificate_oidc_issuer: SIGNED_FIXTURE_ISSUER.into(),
+                    }),
+                    transparency_log_present: false,
+                }),
+            }],
+        };
+        let expected = format!(
+            r#"[[provider]]
+name = "aws"
+source = "carina-rs/aws"
+mode = "version"
+version = "0.5.0"
+sha256 = "abc"
+
+[provider.registry]
+resolved_hostname = "registry.carina-rs.dev"
+api_base_url = "https://registry.carina-rs.dev/v1/providers/"
+discovery_sha256 = "def"
+sequence_present = true
+sequence = 7
+valid_until_present = true
+signature_present = true
+certificate_identity = {SIGNED_FIXTURE_IDENTITY:?}
+certificate_oidc_issuer = {SIGNED_FIXTURE_ISSUER:?}
+transparency_log_present = false
+"#
+        );
+
+        let serialized = toml::to_string_pretty(&lock).unwrap();
+        assert_eq!(serialized, expected);
+        let reparsed: LockFile = toml::from_str(&serialized).unwrap();
+        assert_eq!(toml::to_string_pretty(&reparsed).unwrap(), expected);
+    }
+
+    #[test]
     fn upsert_replaces_existing_entry_by_source() {
         let source = "github.com/carina-rs/carina-provider-awscc";
         let mut lock = LockFile::default();
@@ -2699,6 +2994,17 @@ sha256 = "abc"
     }
 
     impl FakeRegistryHttp {
+        fn response(mut self, url: &str, status: u16, body: &[u8]) -> Self {
+            self.responses.insert(
+                url.to_string(),
+                HttpResponse {
+                    status,
+                    body: body.to_vec(),
+                },
+            );
+            self
+        }
+
         fn json(mut self, url: &str, body: &str) -> Self {
             self.responses.insert(
                 url.to_string(),
@@ -2732,6 +3038,15 @@ sha256 = "abc"
                 .unwrap()
                 .iter()
                 .any(|url| url.contains(needle))
+        }
+
+        fn request_count(&self, url: &str) -> usize {
+            self.requested
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|requested| requested.as_str() == url)
+                .count()
         }
     }
 
@@ -2784,13 +3099,621 @@ sha256 = "abc"
                         "filename":"carina-provider-aws-v0.5.0.wasm",
                         "download_url":"https://downloads.example.test/aws.wasm",
                         "shasum":"{shasum}",
-                        "shasum_authored_by":"registry",
-                        "signature":{{"type":"sigstore-bundle"}}
+                        "shasum_authored_by":"registry"
                     }}"#
                 ),
             )
             .bytes("https://downloads.example.test/aws.wasm", download_body)
             .downloadable_bytes("https://downloads.example.test/aws.wasm", download_body)
+    }
+
+    fn signed_registry_http(bundle: &[u8], bundle_status: u16) -> FakeRegistryHttp {
+        let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
+        FakeRegistryHttp::default()
+            .json(
+                "https://registry.carina-rs.dev/.well-known/carina.json",
+                r#"{"providers.v1":"/v1/providers/"}"#,
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/versions",
+                r#"{"sequence":7,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
+            )
+            .json(
+                "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+                &format!(
+                    r#"{{
+                        "protocols":["1"],
+                        "filename":"carina-provider-aws-v0.5.0.wasm",
+                        "download_url":"https://downloads.example.test/aws.wasm",
+                        "shasum":"{shasum}",
+                        "shasum_authored_by":"registry",
+                        "signature":{{
+                            "type":"sigstore-bundle",
+                            "certificate_identity":"{SIGNED_FIXTURE_IDENTITY}",
+                            "certificate_oidc_issuer":"{SIGNED_FIXTURE_ISSUER}",
+                            "bundle_url":"{SIGNED_FIXTURE_BUNDLE_URL}"
+                        }}
+                    }}"#
+                ),
+            )
+            .response(SIGNED_FIXTURE_BUNDLE_URL, bundle_status, bundle)
+            .downloadable_bytes(
+                "https://downloads.example.test/aws.wasm",
+                SIGNED_FIXTURE_ARTIFACT,
+            )
+    }
+
+    #[test]
+    fn registry_source_verifies_signature_and_pins_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
+        let mut lock_file = LockFile::default();
+
+        let path = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(path).unwrap(), SIGNED_FIXTURE_ARTIFACT);
+        let registry = lock_file
+            .find_by_source("carina-rs/aws")
+            .unwrap()
+            .registry
+            .as_ref()
+            .unwrap();
+        assert!(registry.signature_present);
+        let pin = registry.pin.as_ref().unwrap();
+        assert_eq!(pin.certificate_identity, SIGNED_FIXTURE_IDENTITY);
+        assert_eq!(pin.certificate_oidc_issuer, SIGNED_FIXTURE_ISSUER);
+
+        let lock_path = dir.path().join("carina-providers.lock");
+        lock_file.save(&lock_path).unwrap();
+        let lock_contents = fs::read_to_string(lock_path).unwrap();
+        assert!(
+            lock_contents.contains(&format!(
+                "certificate_identity = {SIGNED_FIXTURE_IDENTITY:?}"
+            )),
+            "{lock_contents}"
+        );
+        assert!(
+            lock_contents.contains(&format!(
+                "certificate_oidc_issuer = {SIGNED_FIXTURE_ISSUER:?}"
+            )),
+            "{lock_contents}"
+        );
+    }
+
+    #[test]
+    fn registry_source_prints_first_use_pin_notice_once() {
+        const CHILD_ENV: &str = "CARINA_TEST_FIRST_USE_PIN_NOTICE";
+        const TEST_NAME: &str =
+            "provider_resolver::tests::registry_source_prints_first_use_pin_notice_once";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let dir = tempfile::tempdir().unwrap();
+            let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
+            let mut lock_file = LockFile::default();
+            resolve_provider_with_http(
+                dir.path(),
+                "carina-rs/aws",
+                "0.5.0",
+                "aws",
+                &mut lock_file,
+                &http,
+            )
+            .unwrap();
+            resolve_provider_with_http(
+                dir.path(),
+                "carina-rs/aws",
+                "0.5.0",
+                "aws",
+                &mut lock_file,
+                &http,
+            )
+            .unwrap();
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([TEST_NAME, "--exact", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "child test failed: {output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let notice = format!(
+            "carina: pinned signing identity for carina-rs/aws: {SIGNED_FIXTURE_IDENTITY} (issuer {SIGNED_FIXTURE_ISSUER})"
+        );
+        assert_eq!(stderr.matches(&notice).count(), 1, "{stderr}");
+    }
+
+    #[test]
+    fn registry_source_reverifies_cached_artifact_against_pinned_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
+        let mut lock_file = LockFile::default();
+
+        resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .unwrap();
+        resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .unwrap();
+
+        assert_eq!(http.request_count(SIGNED_FIXTURE_BUNDLE_URL), 2);
+        assert_eq!(
+            http.request_count("https://downloads.example.test/aws.wasm"),
+            1
+        );
+    }
+
+    #[test]
+    fn registry_source_rejects_declared_identity_mismatch_before_artifact_download() {
+        let initial_dir = tempfile::tempdir().unwrap();
+        let initial_http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
+        let mut lock_file = LockFile::default();
+        resolve_provider_with_http(
+            initial_dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &initial_http,
+        )
+        .unwrap();
+        let pinned_dir = tempfile::tempdir().unwrap();
+        let lock_path = pinned_dir.path().join("carina-providers.lock");
+        lock_file.save(&lock_path).unwrap();
+        let mut lock_file = LockFile::load(&lock_path).unwrap().unwrap();
+
+        let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
+        let mismatched_http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
+            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            &format!(
+                r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"sigstore-bundle","certificate_identity":"https://github.com/example/other/.github/workflows/release.yml@refs/heads/main","certificate_oidc_issuer":"{SIGNED_FIXTURE_ISSUER}","bundle_url":"{SIGNED_FIXTURE_BUNDLE_URL}"}}}}"#
+            ),
+        );
+
+        let error = resolve_provider_with_http(
+            pinned_dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &mismatched_http,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("identity"), "{error}");
+        assert!(error.contains("no override"), "{error}");
+        assert!(error.contains("verifying out-of-band"), "{error}");
+        assert!(error.contains("re-run carina init to re-pin"), "{error}");
+        assert!(!mismatched_http.was_requested("https://downloads.example.test/aws.wasm"));
+        assert!(!mismatched_http.was_requested(SIGNED_FIXTURE_BUNDLE_URL));
+    }
+
+    #[test]
+    fn registry_source_rejects_signature_downgrade_when_identity_is_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial_http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
+        let mut lock_file = LockFile::default();
+        resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &initial_http,
+        )
+        .unwrap();
+        lock_file
+            .provider
+            .iter_mut()
+            .find(|entry| entry.source == "carina-rs/aws")
+            .unwrap()
+            .registry
+            .as_mut()
+            .unwrap()
+            .signature_present = false;
+
+        let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
+        let unsigned_http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
+            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            &format!(
+                r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}"}}"#
+            ),
+        );
+
+        let error = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &unsigned_http,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("signature"), "{error}");
+        assert!(error.contains("no override"), "{error}");
+        assert!(error.contains("identity-pinned provider"), "{error}");
+        assert!(error.contains("verifying out-of-band"), "{error}");
+        assert!(error.contains("re-run carina init to re-pin"), "{error}");
+        assert!(!unsigned_http.was_requested("https://downloads.example.test/aws.wasm"));
+    }
+
+    #[test]
+    fn registry_source_upgrades_presence_only_signature_lock_with_identity_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
+        let mut lock_file = LockFile::default();
+        lock_file.upsert(LockEntry {
+            name: "aws".into(),
+            source: "carina-rs/aws".into(),
+            kind: LockEntryKind::Version {
+                version: "0.5.0".into(),
+                constraint: None,
+            },
+            sha256: shasum,
+            registry: Some(RegistryLock {
+                resolved_hostname: "registry.carina-rs.dev".into(),
+                api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
+                discovery_sha256: sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
+                sequence_present: true,
+                sequence: Some(7),
+                valid_until_present: true,
+                signature_present: true,
+                pin: None,
+                transparency_log_present: false,
+            }),
+        });
+        let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
+
+        resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .unwrap();
+
+        let registry = lock_file
+            .find_by_source("carina-rs/aws")
+            .unwrap()
+            .registry
+            .as_ref()
+            .unwrap();
+        let pin = registry.pin.as_ref().unwrap();
+        assert_eq!(pin.certificate_identity, SIGNED_FIXTURE_IDENTITY);
+        assert_eq!(pin.certificate_oidc_issuer, SIGNED_FIXTURE_ISSUER);
+    }
+
+    #[test]
+    fn registry_source_rejects_oversized_signature_bundle_and_retains_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let oversized = vec![b' '; MAX_SIGNATURE_BUNDLE_BYTES + 1];
+        let http = signed_registry_http(&oversized, 200);
+        let mut lock_file = LockFile::default();
+
+        let error = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("exceeding"), "{error}");
+        assert!(error.contains("no override"), "{error}");
+        assert_eq!(
+            fs::read(cache_path_wasm(dir.path(), "carina-rs/aws", "0.5.0")).unwrap(),
+            SIGNED_FIXTURE_ARTIFACT
+        );
+    }
+
+    #[test]
+    fn registry_source_rejects_non_https_signature_bundle_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
+        let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
+            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            &format!(
+                r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"sigstore-bundle","certificate_identity":"{SIGNED_FIXTURE_IDENTITY}","certificate_oidc_issuer":"{SIGNED_FIXTURE_ISSUER}","bundle_url":"http://downloads.example.test/aws.sigstore.json"}}}}"#
+            ),
+        );
+        let mut lock_file = LockFile::default();
+
+        let error = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("HTTPS"), "{error}");
+        assert!(error.contains("no override"), "{error}");
+        assert_eq!(
+            fs::read(cache_path_wasm(dir.path(), "carina-rs/aws", "0.5.0")).unwrap(),
+            SIGNED_FIXTURE_ARTIFACT
+        );
+    }
+
+    #[test]
+    fn lock_load_rejects_partial_registry_identity_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        let one_sided_pin = format!(
+            r#"[[provider]]
+name = "aws"
+source = "carina-rs/aws"
+mode = "version"
+version = "0.5.0"
+sha256 = "abc"
+
+[provider.registry]
+resolved_hostname = "registry.carina-rs.dev"
+api_base_url = "https://registry.carina-rs.dev/v1/providers/"
+discovery_sha256 = "def"
+sequence_present = true
+sequence = 7
+valid_until_present = true
+signature_present = true
+certificate_identity = {SIGNED_FIXTURE_IDENTITY:?}
+transparency_log_present = false
+"#
+        );
+
+        let direct_error = toml::from_str::<LockFile>(&one_sided_pin).unwrap_err();
+        assert!(
+            direct_error.to_string().contains("inconsistent"),
+            "{direct_error}"
+        );
+        fs::write(&lock_path, one_sided_pin).unwrap();
+
+        let error = LockFile::load(&lock_path).unwrap_err();
+        assert!(error.contains("inconsistent"), "{error}");
+        assert!(error.contains("certificate_identity"), "{error}");
+    }
+
+    #[test]
+    fn registry_source_rejects_tampered_signature_bundle_and_removes_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bundle: serde_json::Value = serde_json::from_slice(SIGNED_FIXTURE_BUNDLE).unwrap();
+        let encoded = bundle["verificationMaterial"]["tlogEntries"][0]["canonicalizedBody"]
+            .as_str()
+            .unwrap();
+        let mut canonicalized_body = BASE64_STANDARD.decode(encoded).unwrap();
+        canonicalized_body[0] ^= 1;
+        bundle["verificationMaterial"]["tlogEntries"][0]["canonicalizedBody"] =
+            serde_json::json!(BASE64_STANDARD.encode(canonicalized_body));
+        let bundle = serde_json::to_vec(&bundle).unwrap();
+        let http = signed_registry_http(&bundle, 200);
+        let mut lock_file = LockFile::default();
+
+        let error = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("signature verification"), "{error}");
+        assert!(error.contains("no override"), "{error}");
+        assert!(
+            error.contains("registry provider 'aws' (carina-rs/aws@0.5.0)"),
+            "{error}"
+        );
+        assert!(!cache_path_wasm(dir.path(), "carina-rs/aws", "0.5.0").exists());
+    }
+
+    #[test]
+    fn registry_source_rejects_unknown_signature_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
+        let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
+            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            &format!(
+                r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"something-else","certificate_identity":"{SIGNED_FIXTURE_IDENTITY}","certificate_oidc_issuer":"{SIGNED_FIXTURE_ISSUER}","bundle_url":"{SIGNED_FIXTURE_BUNDLE_URL}"}}}}"#
+            ),
+        );
+        let mut lock_file = LockFile::default();
+
+        let error = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("something-else"), "{error}");
+        assert!(!http.was_requested("aws.wasm"));
+    }
+
+    #[test]
+    fn registry_source_rejects_signature_bundle_http_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial_http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
+        let mut lock_file = LockFile::default();
+        resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &initial_http,
+        )
+        .unwrap();
+        let http = signed_registry_http(b"not found", 404);
+
+        let error = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("404"), "{error}");
+        assert!(
+            error.contains("cannot fetch the signature bundle"),
+            "{error}"
+        );
+        assert!(
+            error.contains("signature verification cannot proceed"),
+            "{error}"
+        );
+        assert!(error.contains("no override"), "{error}");
+        assert!(
+            error.contains("registry provider 'aws' (carina-rs/aws@0.5.0)"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("Sigstore signature verification failed"),
+            "{error}"
+        );
+        let wasm_path = cache_path_wasm(dir.path(), "carina-rs/aws", "0.5.0");
+        assert_eq!(fs::read(wasm_path).unwrap(), SIGNED_FIXTURE_ARTIFACT);
+        assert_eq!(
+            http.request_count("https://downloads.example.test/aws.wasm"),
+            0
+        );
+    }
+
+    #[test]
+    fn registry_source_rejects_signature_bundle_transport_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
+        let unavailable_bundle_url = "https://downloads.example.test/unavailable.sigstore.json";
+        let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
+            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            &format!(
+                r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"sigstore-bundle","certificate_identity":"{SIGNED_FIXTURE_IDENTITY}","certificate_oidc_issuer":"{SIGNED_FIXTURE_ISSUER}","bundle_url":"{unavailable_bundle_url}"}}}}"#
+            ),
+        );
+        let mut lock_file = LockFile::default();
+
+        let error = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("cannot fetch the signature bundle"),
+            "{error}"
+        );
+        assert!(error.contains("unexpected test URL"), "{error}");
+        assert!(
+            error.contains("signature verification cannot proceed"),
+            "{error}"
+        );
+        assert!(error.contains("no override"), "{error}");
+        assert!(
+            error.contains("registry provider 'aws' (carina-rs/aws@0.5.0)"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("Sigstore signature verification failed"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(cache_path_wasm(dir.path(), "carina-rs/aws", "0.5.0")).unwrap(),
+            SIGNED_FIXTURE_ARTIFACT
+        );
+    }
+
+    #[test]
+    fn registry_source_rejects_malformed_signature_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
+        let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
+            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            &format!(
+                r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"sigstore-bundle"}}}}"#
+            ),
+        );
+        let mut lock_file = LockFile::default();
+
+        let error = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("signature"), "{error}");
+        assert!(error.contains("no override"), "{error}");
+        assert!(!http.was_requested("aws.wasm"));
+    }
+
+    #[test]
+    fn registry_source_does_not_treat_null_signature_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
+        let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
+            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            &format!(
+                r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":null}}"#
+            ),
+        );
+        let mut lock_file = LockFile::default();
+
+        let error = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.starts_with("Failed to parse registry JSON from"),
+            "{error}"
+        );
+        assert!(error.contains("malformed registry signature"), "{error}");
+        assert!(error.contains("no override"), "{error}");
+        assert!(!http.was_requested("aws.wasm"));
     }
 
     #[test]
@@ -2829,7 +3752,7 @@ sha256 = "abc"
         );
         assert!(registry.sequence_present);
         assert_eq!(registry.sequence, Some(7));
-        assert!(registry.signature_present);
+        assert!(!registry.signature_present);
     }
 
     #[test]
@@ -2919,6 +3842,7 @@ sha256 = "abc"
                 sequence: Some(7),
                 valid_until_present: true,
                 signature_present: false,
+                pin: None,
                 transparency_log_present: false,
             }),
         });
@@ -2993,6 +3917,7 @@ sha256 = "abc"
                 sequence: Some(7),
                 valid_until_present: true,
                 signature_present: false,
+                pin: None,
                 transparency_log_present: false,
             }),
         });
@@ -3160,6 +4085,7 @@ sha256 = "abc"
                 sequence: Some(7),
                 valid_until_present: true,
                 signature_present: false,
+                pin: None,
                 transparency_log_present: false,
             }),
         });
@@ -3202,6 +4128,7 @@ sha256 = "abc"
                 sequence: Some(7),
                 valid_until_present: false,
                 signature_present: false,
+                pin: None,
                 transparency_log_present: false,
             }),
         });
@@ -3244,6 +4171,7 @@ sha256 = "abc"
                 sequence: Some(7),
                 valid_until_present: true,
                 signature_present: false,
+                pin: None,
                 transparency_log_present: false,
             }),
         });
@@ -3286,6 +4214,7 @@ sha256 = "abc"
                 sequence: Some(7),
                 valid_until_present: true,
                 signature_present: false,
+                pin: None,
                 transparency_log_present: false,
             }),
         });
@@ -3330,6 +4259,7 @@ sha256 = "abc"
                 sequence: Some(7),
                 valid_until_present: true,
                 signature_present: true,
+                pin: None,
                 transparency_log_present: false,
             }),
         });
@@ -3343,7 +4273,21 @@ sha256 = "abc"
             &http,
         )
         .unwrap_err();
-        assert!(err.contains("signature"), "{err}");
+        assert!(
+            err.contains(
+                "the resolved version of carina-rs/aws has no registry signature, but carina-providers.lock records this provider as signed"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains("downgrades from signed to unsigned versions are refused"),
+            "{err}"
+        );
+        assert!(
+            err.contains("deliberate downgrade to a pre-signing version"),
+            "{err}"
+        );
+        assert!(err.contains("re-run carina init to re-pin"), "{err}");
     }
 
     #[test]
@@ -3387,6 +4331,7 @@ sha256 = "abc"
                 sequence: Some(7),
                 valid_until_present: true,
                 signature_present: true,
+                pin: None,
                 transparency_log_present: false,
             }),
         });
@@ -3443,6 +4388,7 @@ sha256 = "abc"
                 sequence: Some(7),
                 valid_until_present: true,
                 signature_present: true,
+                pin: None,
                 transparency_log_present: false,
             }),
         });
@@ -3633,7 +4579,7 @@ sha256 = "abc"
         let http = registry_http(body, &shasum).json(
             "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
             &format!(
-                r#"{{"protocols":["1"],"filename":"aws.wasm","download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","shasum_authored_by":"registry","signature":{{"type":"sigstore-bundle"}}}}"#
+                r#"{{"protocols":["1"],"filename":"aws.wasm","download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","shasum_authored_by":"registry","signature":{{"type":"sigstore-bundle","certificate_identity":"identity","certificate_oidc_issuer":"issuer","bundle_url":"https://downloads.example.test/bundle.sigstore.json"}}}}"#
             ),
         );
         let mut lock_file = LockFile::default();
@@ -3653,6 +4599,7 @@ sha256 = "abc"
                 sequence: Some(7),
                 valid_until_present: true,
                 signature_present: true,
+                pin: None,
                 transparency_log_present: true,
             }),
         });
