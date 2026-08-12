@@ -19,7 +19,11 @@ semver = "1"
 serde_json = "1"
 zip = "2"
 dirs = "6"
-time = { version = "0.3", features = ["parsing"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+sigstore = { version = "0.14", default-features = false, features = ["verify", "rustls-tls"] }
+sigstore_protobuf_specs = "0.5.1"
+p256 = "0.13"
+base64 = "0.22"
 
 [dev-dependencies]
 indexmap = "2"
