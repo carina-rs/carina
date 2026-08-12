@@ -1,0 +1,63 @@
+{
+  "version": 7,
+  "serial": 1,
+  "lineage": "test-lineage-list-diff-best-first-mid-insert",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "iam.RolePolicy",
+      "identity": "policy",
+      "provider": "awscc",
+      "identifier": "carina-registry|carina-registry-publish",
+      "attributes": {
+        "policy_name": "carina-registry-publish",
+        "role_name": "carina-registry",
+        "statement": [
+          {
+            "sid": "ManagePublishStackRoles",
+            "effect": "Allow",
+            "action": [
+              "iam:CreateRole",
+              "iam:DeleteRole"
+            ],
+            "resource": [
+              "arn:aws:iam::*:role/carina-registry-publish-api-task",
+              "arn:aws:iam::*:role/carina-registry-policy-write"
+            ]
+          },
+          {
+            "sid": "AllowRegistryExecution",
+            "effect": "Allow",
+            "action": [
+              "iam:PassRole"
+            ],
+            "resource": [
+              "arn:aws:iam::*:role/carina-registry-publish-api-execution"
+            ],
+            "provider_default_field": "provider-only"
+          }
+        ]
+      },
+      "protected": false,
+      "directives": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "binding": "policy",
+      "dependency_bindings": [],
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "policy_name": {
+            "kind": "leaf"
+          },
+          "role_name": {
+            "kind": "leaf"
+          },
+          "statement": {
+            "kind": "leaf"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -554,18 +554,15 @@ required for #3728.
 
 The display layer has its own two-phase list-of-maps pairing in
 `compute_list_of_maps_diff_parts`
-(`carina-core/src/detail_rows.rs:1422`): schema-aware exact matches first
-(`carina-core/src/detail_rows.rs:1465`), then unmatched elements paired
-with `value::map_similarity` (`carina-core/src/detail_rows.rs:1492` and
-`carina-core/src/value.rs:1435`). It does not consume the merge's pairing
-mapping.
+(`carina-core/src/detail_rows.rs:1366`): schema-aware exact matches first,
+then unmatched elements are paired with the shared
+`resource::pair_list_elements` routine
+(`carina-core/src/detail_rows.rs:1437`; also used by the merge/writeback path).
+It does not consume the merge's pairing mapping.
 
-In a rare heuristic tie or schema-normalization case, plan correctness
-may identify one modified pair while display partitions the same values
-as a different modified pair or as add/remove. Unifying those matchers
-is a separate display design and is out of scope. This change must not
-make `detail_rows` index current provider output with the stored
-`ListElements` vector.
+The display still must not index current provider output with the stored
+`ListElements` vector; sharing the pairing decision does not make the display
+consume authoring metadata.
 
 ### No DSL-level explicit null/unset
 

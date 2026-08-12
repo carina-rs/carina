@@ -598,8 +598,12 @@ DetailRow::PrettyAttribute { key, value } => {
 Add the import at the top of `display/mod.rs`:
 
 ```rust
-use carina_core::value::{format_value, format_value_pretty, format_value_with_key, is_list_of_maps, map_similarity};
+use carina_core::value::{format_value, format_value_pretty, format_value_with_key, is_list_of_maps};
 ```
+
+List-element similarity is now handled internally by the shared
+`resource::pair_list_elements` API; the CLI display module does not import a
+separate scorer.
 
 **Verification**:
 

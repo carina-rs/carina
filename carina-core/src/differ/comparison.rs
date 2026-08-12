@@ -10,7 +10,9 @@ use crate::resource::{
     ConcreteValue, DeferredValue, ResourceId, SavedValueViews, Value, merge_with_saved,
 };
 use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
-use crate::value::{SECRET_PREFIX, SecretHashContext, argon2id_hash, value_to_json_with_context};
+use crate::value::{
+    SECRET_PREFIX, SecretHashContext, argon2id_hash, contains_secret, value_to_json_with_context,
+};
 
 /// Type-aware semantic comparison of two Values.
 ///
@@ -529,7 +531,8 @@ pub(crate) fn should_patch_attr(cmp: AttrComparison<'_>) -> bool {
 
     match cmp.saved {
         Some(saved) => {
-            let effective_to = merge_with_saved(cmp.to, saved.views, saved.authoring);
+            let effective_to =
+                merge_with_saved(cmp.to, saved.views, saved.authoring, attr_type, defs);
             !type_aware_equal(from_value, &effective_to, attr_type, defs, cmp.secret_ctx)
         }
         None => !type_aware_equal(from_value, cmp.to, attr_type, defs, cmp.secret_ctx),
@@ -616,15 +619,6 @@ pub(crate) fn secret_grafted_comparison_view<'a>(
         _ => return None,
     };
     Some(view)
-}
-
-fn contains_secret(value: &Value) -> bool {
-    match value {
-        Value::Deferred(DeferredValue::Secret(_)) => true,
-        Value::Concrete(ConcreteValue::Map(map)) => map.values().any(contains_secret),
-        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_secret),
-        _ => false,
-    }
 }
 
 /// Find changed attributes between desired and current state.

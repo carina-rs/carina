@@ -629,6 +629,8 @@ fn merge_with_saved_map_fills_extra_keys() {
         &desired,
         SavedValueViews::same(&saved),
         &ExplicitFields::Unrecorded,
+        None,
+        crate::schema::empty_defs_for_schema_walks(),
     );
     let expected = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
@@ -662,6 +664,8 @@ fn merge_with_saved_desired_wins() {
         &desired,
         SavedValueViews::same(&saved),
         &ExplicitFields::Unrecorded,
+        None,
+        crate::schema::empty_defs_for_schema_walks(),
     );
     let expected = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         ("a".to_string(), Value::Concrete(ConcreteValue::Int(10))),
@@ -692,6 +696,8 @@ fn merge_with_saved_list_of_maps() {
         &desired,
         SavedValueViews::same(&saved),
         &ExplicitFields::Unrecorded,
+        None,
+        crate::schema::empty_defs_for_schema_walks(),
     );
     let expected = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
         ConcreteValue::Map(IndexMap::from([
@@ -713,6 +719,8 @@ fn merge_with_saved_non_map() {
         &desired,
         SavedValueViews::same(&saved),
         &ExplicitFields::Unrecorded,
+        None,
+        crate::schema::empty_defs_for_schema_walks(),
     );
     assert_eq!(
         merged,
@@ -725,6 +733,8 @@ fn merge_with_saved_non_map() {
         &desired,
         SavedValueViews::same(&saved),
         &ExplicitFields::Unrecorded,
+        None,
+        crate::schema::empty_defs_for_schema_walks(),
     );
     assert_eq!(merged, Value::Concrete(ConcreteValue::Int(42)));
 }
@@ -740,7 +750,13 @@ fn merge_with_saved_does_not_reinject_authored_removed_key() {
         children: HashMap::from([("web_acl_id".to_string(), ExplicitFields::Leaf)]),
     };
 
-    let merged = merge_with_saved(&desired, SavedValueViews::same(&saved), &prior);
+    let merged = merge_with_saved(
+        &desired,
+        SavedValueViews::same(&saved),
+        &prior,
+        None,
+        crate::schema::empty_defs_for_schema_walks(),
+    );
 
     assert_eq!(merged, Value::Concrete(ConcreteValue::Map(IndexMap::new())));
 }
@@ -756,7 +772,13 @@ fn merge_with_saved_reinjects_unauthored_saved_key() {
         children: HashMap::new(),
     };
 
-    let merged = merge_with_saved(&desired, SavedValueViews::same(&saved), &prior);
+    let merged = merge_with_saved(
+        &desired,
+        SavedValueViews::same(&saved),
+        &prior,
+        None,
+        crate::schema::empty_defs_for_schema_walks(),
+    );
 
     assert_eq!(merged, saved);
 }
@@ -772,7 +794,13 @@ fn merge_with_saved_reinjects_saved_key_with_unrecorded_child() {
         children: HashMap::from([("previous_value".to_string(), ExplicitFields::Unrecorded)]),
     };
 
-    let merged = merge_with_saved(&desired, SavedValueViews::same(&saved), &prior);
+    let merged = merge_with_saved(
+        &desired,
+        SavedValueViews::same(&saved),
+        &prior,
+        None,
+        crate::schema::empty_defs_for_schema_walks(),
+    );
 
     assert_eq!(merged, saved);
 }
@@ -789,6 +817,8 @@ fn merge_with_saved_unrecorded_reinjects_all_saved_keys() {
         &desired,
         SavedValueViews::same(&saved),
         &ExplicitFields::Unrecorded,
+        None,
+        crate::schema::empty_defs_for_schema_walks(),
     );
 
     assert_eq!(merged, saved);
@@ -885,7 +915,13 @@ fn merge_with_saved_applies_authoring_recursively_to_maps_and_lists() {
         ]),
     };
 
-    let merged = merge_with_saved(&desired, SavedValueViews::same(&saved), &prior);
+    let merged = merge_with_saved(
+        &desired,
+        SavedValueViews::same(&saved),
+        &prior,
+        None,
+        crate::schema::empty_defs_for_schema_walks(),
+    );
     let expected = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "settings".to_string(),
@@ -963,7 +999,13 @@ fn merge_with_saved_does_not_apply_union_authoring_to_individual_list_elements()
         }),
     };
 
-    let merged = merge_with_saved(&desired, SavedValueViews::same(&saved), &prior);
+    let merged = merge_with_saved(
+        &desired,
+        SavedValueViews::same(&saved),
+        &prior,
+        None,
+        crate::schema::empty_defs_for_schema_walks(),
+    );
 
     assert_eq!(merged, saved);
 }
@@ -1010,6 +1052,8 @@ fn merge_with_saved_list_elements_drops_only_paired_authored_field_in_both_paths
             &Value::Concrete(ConcreteValue::List(desired.clone())),
             SavedValueViews::same(&Value::Concrete(ConcreteValue::List(saved))),
             &prior,
+            None,
+            crate::schema::empty_defs_for_schema_walks(),
         );
         desired[1] = rule(443, Some("provider-default"));
 
@@ -1076,8 +1120,18 @@ fn merge_with_saved_requires_raw_projected_corroboration_in_both_pairing_paths()
             });
         }
 
-        let projected_pairs = pair_list_elements(&desired, &projected_saved);
-        let raw_pairs = pair_list_elements(&desired, &raw_saved);
+        let projected_pairs = pair_list_elements(
+            &desired,
+            &projected_saved,
+            None,
+            crate::schema::empty_defs_for_schema_walks(),
+        );
+        let raw_pairs = pair_list_elements(
+            &desired,
+            &raw_saved,
+            None,
+            crate::schema::empty_defs_for_schema_walks(),
+        );
         assert_eq!(projected_pairs[0], Some(0));
         assert_eq!(raw_pairs[0], None);
 
@@ -1088,6 +1142,8 @@ fn merge_with_saved_requires_raw_projected_corroboration_in_both_pairing_paths()
             &desired,
             SavedValueViews::new(&projected_saved, &raw_saved),
             &ExplicitFields::ListElements { elements },
+            None,
+            crate::schema::empty_defs_for_schema_walks(),
         );
         let Value::Concrete(ConcreteValue::List(merged)) = merged else {
             panic!("expected merged list");
@@ -1101,6 +1157,431 @@ fn merge_with_saved_requires_raw_projected_corroboration_in_both_pairing_paths()
             "saved length {saved_len} must degrade divergent attribution to Unrecorded"
         );
     }
+}
+
+#[test]
+fn pair_list_elements_commits_best_scores_before_lower_scores() {
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string()));
+    let map = |entries: &[(&str, &str)]| {
+        Value::Concrete(ConcreteValue::Map(
+            entries
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), string(value)))
+                .collect(),
+        ))
+    };
+    for saved_len in [1, HASH_THRESHOLD] {
+        let mut saved = vec![map(&[
+            ("sid", "ManagePublishStackRoles"),
+            ("effect", "Allow"),
+            ("action", "iam:CreateRole"),
+        ])];
+        let mut desired = vec![
+            map(&[
+                ("sid", "ECRRepository"),
+                ("effect", "Allow"),
+                ("action", "ecr:CreateRepository"),
+            ]),
+            map(&[
+                ("sid", "ManagePublishStackRoles"),
+                ("effect", "Allow"),
+                ("action", "iam:DeleteRole"),
+            ]),
+        ];
+        for index in 1..saved_len {
+            let filler = map(&[("sid", &format!("filler-{index}"))]);
+            saved.push(filler.clone());
+            desired.push(filler);
+        }
+
+        let pairs = pair_list_elements(
+            &desired,
+            &saved,
+            None,
+            crate::schema::empty_defs_for_schema_walks(),
+        );
+        assert_eq!(
+            &pairs[..2],
+            &[None, Some(0)],
+            "saved length {saved_len} must commit the score-2 pair first"
+        );
+    }
+}
+
+#[test]
+fn pair_list_elements_preserves_stable_indices_for_indistinguishable_peers_in_both_paths() {
+    for len in [2, HASH_THRESHOLD] {
+        let peer = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "effect".to_string(),
+            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+        )])));
+        let desired = vec![peer.clone(); len];
+        let saved = vec![peer; len];
+
+        assert_eq!(
+            pair_list_elements(
+                &desired,
+                &saved,
+                None,
+                crate::schema::empty_defs_for_schema_walks(),
+            ),
+            (0..len).map(Some).collect::<Vec<_>>(),
+            "list length {len} must retain stable positional pairing"
+        );
+    }
+}
+
+#[test]
+fn pair_list_elements_handles_secrets_in_both_paths() {
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string()));
+    let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
+    let record = |id: i64, secret_value: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("id".to_string(), Value::Concrete(ConcreteValue::Int(id))),
+            ("secret".to_string(), secret(secret_value)),
+        ])))
+    };
+    let defs = crate::schema::empty_defs_for_schema_walks();
+
+    for len in [2, HASH_THRESHOLD] {
+        let mut desired_scalars = vec![secret("same")];
+        let mut saved_scalars = vec![secret("same")];
+        let mut desired_maps = vec![record(0, "desired-only"), record(1, "same")];
+        let mut saved_maps = vec![record(0, "saved-only"), record(1, "same")];
+        for index in desired_scalars.len()..len {
+            let filler = string(&format!("filler-{index}"));
+            desired_scalars.push(filler.clone());
+            saved_scalars.push(filler);
+        }
+        for index in desired_maps.len()..len {
+            let filler = record(index as i64, &format!("secret-{index}"));
+            desired_maps.push(filler.clone());
+            saved_maps.push(filler);
+        }
+        let expected = (0..len).map(Some).collect::<Vec<_>>();
+
+        assert_eq!(
+            pair_list_elements(&desired_scalars, &saved_scalars, None, defs),
+            expected,
+            "equal secrets must pair at list length {len}"
+        );
+        assert_eq!(
+            pair_list_elements(&desired_maps, &saved_maps, None, defs),
+            expected,
+            "a changed secret must pair through its matching id at list length {len}"
+        );
+    }
+}
+
+#[test]
+fn pair_list_elements_secret_plaintext_pairing_is_threshold_independent() {
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string()));
+    let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
+    let attr_type = AttributeType::string();
+    let defs = crate::schema::empty_defs_for_schema_walks();
+
+    for len in [2, HASH_THRESHOLD] {
+        let mut desired = vec![secret("p")];
+        let mut saved = vec![string("p")];
+        for index in 1..len {
+            let filler = string(&format!("filler-{index}"));
+            desired.push(filler.clone());
+            saved.push(filler);
+        }
+
+        let pairs = pair_list_elements(&desired, &saved, Some(&attr_type), defs);
+        let expected = (0..len).map(Some).collect::<Vec<_>>();
+        assert_eq!(
+            pairs, expected,
+            "Secret plaintext pairing changed at list length {len}: {pairs:?}"
+        );
+    }
+}
+
+#[test]
+fn pair_list_elements_struct_secret_field_pairing_is_threshold_independent() {
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string()));
+    let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
+    let record = |credential: Value, label: &str| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("credential".to_string(), credential),
+            ("label".to_string(), string(label)),
+        ])))
+    };
+    let attr_type = AttributeType::struct_(
+        "Credential",
+        vec![
+            crate::schema::StructField::new("credential", AttributeType::string()),
+            crate::schema::StructField::new("label", AttributeType::string()),
+        ],
+    );
+    let defs = crate::schema::empty_defs_for_schema_walks();
+
+    for len in [2, HASH_THRESHOLD] {
+        let mut desired = vec![record(secret("p"), "desired-only")];
+        let mut saved = vec![record(string("p"), "saved-only")];
+        for index in 1..len {
+            let filler = record(
+                string(&format!("credential-{index}")),
+                &format!("filler-{index}"),
+            );
+            desired.push(filler.clone());
+            saved.push(filler);
+        }
+
+        let pairs = pair_list_elements(&desired, &saved, Some(&attr_type), defs);
+        let expected = (0..len).map(Some).collect::<Vec<_>>();
+        assert_eq!(
+            pairs, expected,
+            "Struct secret-field pairing changed at list length {len}: {pairs:?}"
+        );
+    }
+}
+
+#[test]
+fn pair_list_elements_secret_hash_pairing_is_threshold_independent() {
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string()));
+    let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
+    let serialized = serde_json::to_string("p").expect("string serialization must succeed");
+    let state_hash = format!(
+        "{}{}",
+        crate::value::SECRET_PREFIX,
+        crate::value::argon2id_hash(serialized.as_bytes(), None)
+    );
+    let attr_type = AttributeType::string();
+    let defs = crate::schema::empty_defs_for_schema_walks();
+
+    for len in [2, HASH_THRESHOLD] {
+        let mut desired = vec![secret("p")];
+        let mut saved = vec![string(&state_hash)];
+        for index in 1..len {
+            let filler = string(&format!("filler-{index}"));
+            desired.push(filler.clone());
+            saved.push(filler);
+        }
+
+        let pairs = pair_list_elements(&desired, &saved, Some(&attr_type), defs);
+        let expected = (0..len).map(Some).collect::<Vec<_>>();
+        assert_eq!(
+            pairs, expected,
+            "Secret state-hash pairing changed at list length {len}: {pairs:?}"
+        );
+    }
+}
+
+#[test]
+fn pair_list_elements_handles_unknown_and_mixed_shapes_in_both_paths() {
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string()));
+    let map = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "id".to_string(),
+        Value::Concrete(ConcreteValue::Int(7)),
+    )])));
+    let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForKey));
+    let defs = crate::schema::empty_defs_for_schema_walks();
+
+    for len in [3, HASH_THRESHOLD] {
+        let mut desired = vec![map.clone(), string("scalar"), unknown.clone()];
+        let mut saved = vec![string("scalar"), unknown.clone(), map.clone()];
+        for index in desired.len()..len {
+            let filler = string(&format!("filler-{index}"));
+            desired.push(filler.clone());
+            saved.push(filler);
+        }
+        let mut expected = (0..len).map(Some).collect::<Vec<_>>();
+        expected[..3].copy_from_slice(&[Some(2), Some(0), None]);
+
+        assert_eq!(
+            pair_list_elements(&desired, &saved, None, defs),
+            expected,
+            "mixed shapes and unequal Unknowns must retain their semantics at list length {len}"
+        );
+    }
+}
+
+#[test]
+fn hashed_shared_field_pairing_matches_fully_materialized_best_first_reference() {
+    fn reference(desired: &[Value], saved: &[Value]) -> Vec<Option<usize>> {
+        let defs = crate::schema::empty_defs_for_schema_walks();
+        let mut candidates = Vec::new();
+        for (desired_index, desired_value) in desired.iter().enumerate() {
+            for (saved_index, saved_value) in saved.iter().enumerate() {
+                let score = similarity_score(desired_value, saved_value, None, defs);
+                if score > 0 {
+                    candidates.push((score, desired_index, saved_index));
+                }
+            }
+        }
+
+        let mut preferred_saved = vec![None; desired.len()];
+        let mut reserved = vec![false; saved.len()];
+        for (desired_index, preferred_slot) in preferred_saved.iter_mut().enumerate() {
+            let best_score = candidates
+                .iter()
+                .filter(|(_, candidate_desired, _)| *candidate_desired == desired_index)
+                .map(|(score, _, _)| *score)
+                .max()
+                .unwrap_or(0);
+            let fallback = candidates
+                .iter()
+                .filter(|(score, candidate_desired, _)| {
+                    *candidate_desired == desired_index && *score == best_score
+                })
+                .map(|(_, _, saved_index)| *saved_index)
+                .min();
+            let preferred = candidates
+                .iter()
+                .filter(|(score, candidate_desired, saved_index)| {
+                    *candidate_desired == desired_index
+                        && *score == best_score
+                        && !reserved[*saved_index]
+                })
+                .map(|(_, _, saved_index)| *saved_index)
+                .min()
+                .or(fallback);
+            if let Some(saved_index) = preferred {
+                *preferred_slot = Some(saved_index);
+                reserved[saved_index] = true;
+            }
+        }
+
+        candidates.sort_by(
+            |(score_a, desired_a, saved_a), (score_b, desired_b, saved_b)| {
+                let preferred_a = preferred_saved[*desired_a] == Some(*saved_a);
+                let preferred_b = preferred_saved[*desired_b] == Some(*saved_b);
+                score_b
+                    .cmp(score_a)
+                    .then_with(|| preferred_b.cmp(&preferred_a))
+                    .then_with(|| desired_a.cmp(desired_b))
+                    .then_with(|| saved_a.cmp(saved_b))
+            },
+        );
+
+        let mut pairs = vec![None; desired.len()];
+        let mut used = vec![false; saved.len()];
+        for (_, desired_index, saved_index) in candidates {
+            if pairs[desired_index].is_none() && !used[saved_index] {
+                pairs[desired_index] = Some(saved_index);
+                used[saved_index] = true;
+            }
+        }
+        pairs
+    }
+
+    let statement = |sid: usize, action: usize, resource: usize| {
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "sid".to_string(),
+                Value::Concrete(ConcreteValue::String(format!("Sid{sid}"))),
+            ),
+            (
+                "effect".to_string(),
+                Value::Concrete(ConcreteValue::String("Allow".to_string())),
+            ),
+            (
+                "action".to_string(),
+                Value::Concrete(ConcreteValue::String(format!("Action{action}"))),
+            ),
+            (
+                "resource".to_string(),
+                Value::Concrete(ConcreteValue::String(format!("Resource{resource}"))),
+            ),
+        ])))
+    };
+
+    for variant in 0..32 {
+        let desired = (0..HASH_THRESHOLD)
+            .map(|index| statement(index % 5, (index + variant) % 7, (index * 3) % 11))
+            .collect::<Vec<_>>();
+        let saved = (0..HASH_THRESHOLD)
+            .map(|index| {
+                let source = (index * 7 + variant) % HASH_THRESHOLD;
+                statement(
+                    source % 5,
+                    (source + variant / 2) % 7,
+                    (source * 3 + variant / 3) % 11,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            pair_list_elements(
+                &desired,
+                &saved,
+                None,
+                crate::schema::empty_defs_for_schema_walks(),
+            ),
+            reference(&desired, &saved),
+            "shared-field compressed pairing drifted for variant {variant}"
+        );
+    }
+}
+
+#[test]
+fn union_typed_string_or_list_pairing_uses_the_list_element_schema() {
+    let enum_type = AttributeType::enum_(
+        TypeIdentity::bare("Effect"),
+        Some(vec!["Allow".to_string()]),
+        vec![("Allow".to_string(), "allow".to_string())],
+        None,
+        None,
+    );
+    let attr_type = AttributeType::union(vec![
+        AttributeType::string(),
+        AttributeType::unordered_list(enum_type),
+    ]);
+    let mut desired = vec![Value::Concrete(ConcreteValue::enum_identifier("allow"))];
+    let mut saved = vec![Value::Concrete(ConcreteValue::String("Allow".to_string()))];
+    for index in 1..HASH_THRESHOLD {
+        let filler = Value::Concrete(ConcreteValue::String(format!("filler-{index}")));
+        desired.push(filler.clone());
+        saved.push(filler);
+    }
+    let defs = crate::schema::empty_defs_for_schema_walks();
+
+    assert_eq!(
+        pair_list_elements(
+            &desired,
+            &saved,
+            list_element_type(Some(&attr_type), defs),
+            defs,
+        ),
+        (0..HASH_THRESHOLD).map(Some).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn similarity_score_counts_shared_map_entries() {
+    let first = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("a".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+        ("b".to_string(), Value::Concrete(ConcreteValue::Int(2))),
+    ])));
+    let second = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        ("a".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+        ("b".to_string(), Value::Concrete(ConcreteValue::Int(3))),
+    ])));
+    assert_eq!(
+        similarity_score(
+            &first,
+            &second,
+            None,
+            crate::schema::empty_defs_for_schema_walks(),
+        ),
+        1
+    );
+}
+
+#[test]
+fn similarity_score_accepts_equal_scalars() {
+    let scalar = Value::Concrete(ConcreteValue::Int(1));
+    assert_eq!(
+        similarity_score(
+            &scalar,
+            &scalar,
+            None,
+            crate::schema::empty_defs_for_schema_walks(),
+        ),
+        1
+    );
 }
 
 #[test]
@@ -1140,7 +1621,13 @@ fn merge_with_saved_malformed_list_elements_length_uses_conservative_full_merge(
         }],
     };
 
-    let merged = merge_with_saved(&desired, SavedValueViews::same(&saved), &malformed);
+    let merged = merge_with_saved(
+        &desired,
+        SavedValueViews::same(&saved),
+        &malformed,
+        None,
+        crate::schema::empty_defs_for_schema_walks(),
+    );
 
     assert_eq!(merged, saved);
 }
@@ -1244,6 +1731,87 @@ fn lists_equal_performance_large_list() {
 }
 
 #[test]
+fn pair_list_elements_performance_large_list() {
+    #[derive(Clone, Copy)]
+    enum Fixture {
+        AllDistinct,
+        SharedEffect,
+    }
+
+    let build = |n: usize, fixture: Fixture| {
+        (0..n)
+            .map(|index| {
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    (
+                        "sid".to_string(),
+                        Value::Concrete(ConcreteValue::String(format!("Statement{index}"))),
+                    ),
+                    (
+                        "effect".to_string(),
+                        Value::Concrete(ConcreteValue::String(match fixture {
+                            Fixture::AllDistinct => format!("Effect{index}"),
+                            Fixture::SharedEffect => "Allow".to_string(),
+                        })),
+                    ),
+                    (
+                        "action".to_string(),
+                        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                            ConcreteValue::String(format!("service:Action{index}")),
+                        )])),
+                    ),
+                    (
+                        "resource".to_string(),
+                        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                            ConcreteValue::String(format!("arn:carina:resource/{index}")),
+                        )])),
+                    ),
+                ])))
+            })
+            .collect::<Vec<_>>()
+    };
+    let measure = |n, fixture| {
+        let desired = build(n, fixture);
+        let mut saved = desired.clone();
+        saved.reverse();
+        let start = std::time::Instant::now();
+        let pairs = pair_list_elements(
+            &desired,
+            &saved,
+            None,
+            crate::schema::empty_defs_for_schema_walks(),
+        );
+        let elapsed = start.elapsed();
+        assert_eq!(pairs[0], Some(n - 1));
+        assert_eq!(pairs[n - 1], Some(0));
+        elapsed
+    };
+
+    for fixture in [Fixture::AllDistinct, Fixture::SharedEffect] {
+        let name = match fixture {
+            Fixture::AllDistinct => "all-distinct",
+            Fixture::SharedEffect => "shared-effect",
+        };
+        for n in [100, 400, 800] {
+            eprintln!("pair_list_elements {name} n={n}: {:?}", measure(n, fixture));
+        }
+    }
+
+    // The known quadratic implementation takes about one second at n=800,
+    // projecting to well over 30 seconds at n=5000. Two seconds leaves ample
+    // headroom for slow debug CI while still reliably catching that regression.
+    for (name, fixture) in [
+        ("all-distinct", Fixture::AllDistinct),
+        ("shared-effect", Fixture::SharedEffect),
+    ] {
+        let large_elapsed = measure(5_000, fixture);
+        assert!(
+            large_elapsed < std::time::Duration::from_secs(2),
+            "pair_list_elements with 5000 {name} maps took {large_elapsed:?}, expected < 2s"
+        );
+    }
+}
+
+#[test]
 fn merge_lists_large_list_correctness() {
     // Verify merge_lists works correctly with large lists
     let n = 50;
@@ -1268,7 +1836,14 @@ fn merge_lists_large_list_correctness() {
         })
         .collect();
 
-    let merged = merge_lists(&desired, &saved, &saved, &ExplicitFields::Unrecorded);
+    let merged = merge_lists(
+        &desired,
+        &saved,
+        &saved,
+        &ExplicitFields::Unrecorded,
+        None,
+        crate::schema::empty_defs_for_schema_walks(),
+    );
     assert_eq!(merged.len(), n as usize);
 
     // Each merged element should have both port and protocol
@@ -1295,6 +1870,14 @@ fn canonical_hash_consistency() {
     // Different values should (usually) produce different hashes
     let v3 = Value::Concrete(ConcreteValue::Int(43));
     assert_ne!(v1.canonical_hash(), v3.canonical_hash());
+
+    let positive_zero = Value::Concrete(ConcreteValue::Float(0.0));
+    let negative_zero = Value::Concrete(ConcreteValue::Float(-0.0));
+    assert!(positive_zero.semantically_equal(&negative_zero));
+    assert_eq!(
+        positive_zero.canonical_hash(),
+        negative_zero.canonical_hash()
+    );
 
     // Maps with same content should hash the same regardless of insertion order
     let m1 = Value::Concrete(ConcreteValue::Map(IndexMap::from([
