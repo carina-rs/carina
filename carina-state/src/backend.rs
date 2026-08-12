@@ -49,6 +49,12 @@ pub enum BackendError {
     #[error("Invalid state file: {0}")]
     InvalidState(String),
 
+    /// The state file was written by a newer Carina than this binary supports
+    #[error(
+        "State file version {found} is newer than supported version {supported}. Please upgrade Carina."
+    )]
+    StateVersionTooNew { found: u32, supported: u32 },
+
     /// State lineage mismatch (prevents accidental state overwrites)
     #[error("State lineage mismatch: expected {expected}, got {actual}")]
     LineageMismatch { expected: String, actual: String },

@@ -27,6 +27,12 @@ fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
 }
 
+fn state_file_from_json(json: serde_json::Value) -> StateFile {
+    carina_state::check_and_migrate(&json.to_string())
+        .expect("test state should pass the version gate")
+        .into_state()
+}
+
 struct FailBCreateFactory;
 
 impl ProviderFactory for FailBCreateFactory {
@@ -3165,7 +3171,6 @@ fn format_duration_zero() {
 fn resolve_exports_resolves_cross_file_resource_refs() {
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
     use carina_core::resource::Value;
-    use carina_state::StateFile;
 
     // Build a state file with a resource that has a binding and attributes
     let state = {
@@ -3188,7 +3193,7 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
                 }
             ]
         });
-        serde_json::from_value::<StateFile>(json).unwrap()
+        state_file_from_json(json)
     };
 
     // Export param references registry_prod.account_id using the
@@ -3247,7 +3252,6 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
     // `unresolved reference <call>.<attr>`.
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
     use carina_core::resource::{AccessPath, Composition, DeferredValue, Value};
-    use carina_state::StateFile;
 
     let state = {
         let json = serde_json::json!({
@@ -3268,7 +3272,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
                 }
             ]
         });
-        serde_json::from_value::<StateFile>(json).unwrap()
+        state_file_from_json(json)
     };
 
     let mut role_resource =
@@ -3351,7 +3355,6 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
     // regression that broke after a single hop would surface.
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
     use carina_core::resource::{AccessPath, Composition, DeferredValue, Value};
-    use carina_state::StateFile;
 
     let state = {
         let json = serde_json::json!({
@@ -3372,7 +3375,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
                 }
             ]
         });
-        serde_json::from_value::<StateFile>(json).unwrap()
+        state_file_from_json(json)
     };
 
     let mut role_resource = Resource::with_provider("awscc", "iam.Role", "outer.inner.role", None);
@@ -3508,7 +3511,6 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         AccessPath, Composition, ConcreteValue, DeferredValue, ResourceId, State as ResourceState,
         Value,
     };
-    use carina_state::StateFile;
     use std::collections::HashMap;
 
     let pre_apply_arn = "arn:aws:iam::123456789012:role/role-OLD";
@@ -3534,7 +3536,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
                 }
             ]
         });
-        serde_json::from_value::<StateFile>(json).unwrap()
+        state_file_from_json(json)
     };
 
     // Step (b): pre-apply `current_states` — what the head-of-
@@ -3674,7 +3676,6 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
         AccessPath, ConcreteValue, DataSource, DeferredValue, ResourceId, State as ResourceState,
         Value,
     };
-    use carina_state::StateFile;
     use std::collections::HashMap;
 
     let new_arn = "arn:aws:iam::412038850359:role/aws-reserved/sso.amazonaws.com/ap-northeast-1/AWSReservedSSO_AdministratorAccess_ed2ecac126d82b94";
@@ -3690,7 +3691,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
             "carina_version": "0.4.0",
             "resources": []
         });
-        serde_json::from_value::<StateFile>(json).unwrap()
+        state_file_from_json(json)
     };
 
     // The authored data source: `let admin_access_roles = read aws.iam.Roles { ... }`.

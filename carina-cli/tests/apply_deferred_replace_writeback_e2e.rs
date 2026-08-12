@@ -12,7 +12,7 @@ use carina_core::plan::Plan;
 use carina_core::resource::{
     ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, State, Value,
 };
-use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
+use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile, check_and_migrate};
 use indexmap::IndexMap;
 use tempfile::TempDir;
 
@@ -256,8 +256,9 @@ fn apply_saved_plan_deferred_replace_persists_new_child_and_siblings() {
     let output = scenario.apply_plan(&plan_path);
     assert_success("carina apply plan", &output);
 
-    let saved: StateFile =
-        serde_json::from_str(&fs::read_to_string(&scenario.state_path).unwrap()).unwrap();
+    let saved = check_and_migrate(&fs::read_to_string(&scenario.state_path).unwrap())
+        .unwrap()
+        .into_state();
     let validation = saved
         .find_resource("mock", "test.resource", "validation_records[0]")
         .expect("new validation record state must be persisted");

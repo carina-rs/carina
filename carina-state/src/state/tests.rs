@@ -452,7 +452,7 @@ fn test_state_file_serialization() {
         .expect("test state setup must be valid");
 
     let json = serde_json::to_string_pretty(&state).unwrap();
-    let deserialized: StateFile = serde_json::from_str(&json).unwrap();
+    let deserialized = StateFile::from_json_str(&json).unwrap();
 
     assert_eq!(deserialized.version, state.version);
     assert_eq!(deserialized.serial, state.serial);
@@ -538,7 +538,7 @@ fn state_file_has_legacy_name_overrides_detects_v7_shape() {
             }
         ]
     });
-    let state: StateFile = serde_json::from_value(legacy_json).unwrap();
+    let state = StateFile::from_json_str(&legacy_json.to_string()).unwrap();
 
     assert!(state.has_legacy_name_overrides());
     let affected = state.legacy_name_override_resources();
@@ -566,7 +566,7 @@ fn state_file_has_legacy_name_overrides_detects_v7_shape() {
             }
         ]
     });
-    let typed_only: StateFile = serde_json::from_value(typed_only_json).unwrap();
+    let typed_only = StateFile::from_json_str(&typed_only_json.to_string()).unwrap();
     assert!(!typed_only.has_legacy_name_overrides());
     assert!(typed_only.legacy_name_override_resources().is_empty());
 }
@@ -1736,8 +1736,8 @@ fn v9_deposed_entries_round_trip() {
         .expect("v9 state with deposed entries should load")
         .into_state();
     let serialized = serde_json::to_value(&state).expect("state should serialize");
-    let reloaded: StateFile =
-        serde_json::from_value(serialized.clone()).expect("serialized v9 state should reload");
+    let reloaded = StateFile::from_json_str(&serialized.to_string())
+        .expect("serialized v9 state should reload");
     assert_eq!(
         serde_json::to_value(reloaded).expect("reloaded state should serialize"),
         serialized
@@ -2027,24 +2027,34 @@ fn older_migration_rejects_duplicate_created_by_canonicalization() {
 fn test_check_and_migrate_future_version_returns_error() {
     use super::check_and_migrate;
 
-    let json = r#"{
-        "version": 999,
+    let found = StateFile::CURRENT_VERSION + 1;
+    let json = format!(
+        r#"{{
+        "version": {found},
         "serial": 0,
         "lineage": "test-lineage",
         "carina_version": "0.1.0",
         "resources": []
-    }"#;
-
-    let result = check_and_migrate(json);
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("999"),
-        "error should mention the unsupported version"
+    }}"#
     );
+
+    let error = check_and_migrate(&json).expect_err("future state version must be rejected");
     assert!(
-        err.contains("Please upgrade Carina"),
-        "error should suggest upgrading"
+        matches!(
+            &error,
+            BackendError::StateVersionTooNew {
+                found: actual_found,
+                supported,
+            } if *actual_found == found && *supported == StateFile::CURRENT_VERSION
+        ),
+        "future state versions must return the typed version-gate error"
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "State file version {found} is newer than supported version {}. Please upgrade Carina.",
+            StateFile::CURRENT_VERSION
+        )
     );
 }
 

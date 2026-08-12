@@ -85,13 +85,24 @@ fn format_deferred_state_refresh_warning(
 
 /// Read local state file for shell completion.
 ///
-/// Tries `carina.state.json` in the current directory. Returns `None` if the
-/// file does not exist or cannot be parsed (completion simply produces no
-/// candidates in that case).
+/// Tries `carina.state.json` in the current directory. Missing or invalid files
+/// degrade silently to no candidates. Older files are migrated in memory;
+/// future versions print the version-gate error and produce no candidates.
 fn read_local_state_for_completion() -> Option<StateFile> {
     let path = std::path::Path::new("carina.state.json");
     let contents = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&contents).ok()
+    match parse_local_state_for_completion(&contents) {
+        Ok(state) => Some(state),
+        Err(e @ BackendError::StateVersionTooNew { .. }) => {
+            eprintln!("{e}");
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+fn parse_local_state_for_completion(contents: &str) -> Result<StateFile, BackendError> {
+    carina_state::check_and_migrate(contents).map(|migrated| migrated.into_state())
 }
 
 /// Shell completion function for `state lookup` queries.
@@ -2110,8 +2121,9 @@ mod tests {
         ));
         let contents = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("Failed to read fixture {}: {}", path.display(), e));
-        serde_json::from_str(&contents)
+        carina_state::check_and_migrate(&contents)
             .unwrap_or_else(|e| panic!("Failed to parse fixture {}: {}", path.display(), e))
+            .into_state()
     }
 
     // --- find_resource_by_query tests ---
@@ -2384,6 +2396,58 @@ mod tests {
             .collect();
         values.sort();
         values
+    }
+
+    #[test]
+    fn completion_future_state_version_is_rejected_without_candidates() {
+        let found = StateFile::CURRENT_VERSION + 1;
+        let contents = json!({
+            "version": found,
+            "serial": 0,
+            "lineage": "future-completion-test",
+            "carina_version": "future",
+            "resources": []
+        })
+        .to_string();
+
+        let result = parse_local_state_for_completion(&contents);
+        assert!(
+            matches!(
+                result.as_ref(),
+                Err(BackendError::StateVersionTooNew {
+                    found: actual_found,
+                    supported,
+                }) if *actual_found == found && *supported == StateFile::CURRENT_VERSION
+            ),
+            "completion must preserve the typed future-version classification"
+        );
+    }
+
+    #[test]
+    fn completion_migrates_v8_state_before_producing_candidates() {
+        let contents = json!({
+            "version": 8,
+            "serial": 3,
+            "lineage": "v8-completion-test",
+            "carina_version": "0.4.0",
+            "resources": [{
+                "resource_type": "ec2.Vpc",
+                "identity": "main-vpc",
+                "provider": "awscc",
+                "identifier": "vpc-123",
+                "attributes": { "vpc_id": "vpc-123" },
+                "binding": "vpc"
+            }]
+        })
+        .to_string();
+
+        let state = parse_local_state_for_completion(&contents)
+            .expect("older state should migrate for completion");
+        assert_eq!(state.version, StateFile::CURRENT_VERSION);
+        assert_eq!(
+            candidate_values(&complete_state_lookup_from(&state, "v")),
+            vec!["vpc"]
+        );
     }
 
     #[test]

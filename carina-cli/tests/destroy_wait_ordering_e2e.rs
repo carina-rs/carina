@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
+use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile, check_and_migrate};
 use tempfile::TempDir;
 
 const DELETE_DELAY_MS: &str = "1500";
@@ -236,8 +236,9 @@ let lst = mock.test.resource {{
     }
 
     fn written_state(&self) -> StateFile {
-        serde_json::from_str(&fs::read_to_string(&self.state_path).unwrap())
+        check_and_migrate(&fs::read_to_string(&self.state_path).unwrap())
             .expect("written state should deserialize")
+            .into_state()
     }
 }
 

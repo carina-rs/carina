@@ -833,7 +833,7 @@ mod tests {
 
         // Verify the state file contains valid JSON (not partial/corrupt)
         let content = std::fs::read_to_string(&state_path).unwrap();
-        let parsed: StateFile = serde_json::from_str(&content).unwrap();
+        let parsed = StateFile::from_json_str(&content).unwrap();
         assert_eq!(parsed.serial, 1);
 
         // Verify no temp file is left behind
@@ -858,7 +858,7 @@ mod tests {
 
         // Verify the file contains the updated state (not corrupted)
         let content = std::fs::read_to_string(&state_path).unwrap();
-        let parsed: StateFile = serde_json::from_str(&content).unwrap();
+        let parsed = StateFile::from_json_str(&content).unwrap();
         assert_eq!(parsed.serial, 2);
 
         // Verify no temp file is left behind
