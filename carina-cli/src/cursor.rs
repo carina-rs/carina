@@ -23,7 +23,7 @@
 //! 2. [`install_panic_restore_hook`] — a panic hook that covers the abnormal
 //!    panic exit path unwinding can't: a panic with `panic = "abort"` does
 //!    not unwind. SIGINT/SIGTERM cursor restoration is handled by the unified
-//!    shutdown listener before its second-signal `std::process::exit` path.
+//!    shutdown supervisor before its signal-driven `std::process::exit` paths.
 //! 3. [`CursorReveal`] — a scoped *inverse* guard for interactive
 //!    confirmation prompts (apply/destroy "Enter a value:" / "Type 'yes'").
 //!    With the cursor hidden command-wide the user would otherwise type

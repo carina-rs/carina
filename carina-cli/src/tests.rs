@@ -24,6 +24,7 @@ use crate::commands::apply::{
     ApplyResult, detect_drift, finalize_apply, refresh_pending_states, save_state_locked,
 };
 use crate::commands::plan::{CurrentStateEntry, PlanFile};
+use crate::commands::shared::finalize::StatePersistence;
 use crate::commands::shared::state_writeback::{
     ApplyStateSave, FinalizeApplyInput, PostApplyStates, build_state_after_apply,
     queue_state_refresh,
@@ -1531,20 +1532,23 @@ async fn lock_released_on_write_state_failure() {
 
     // This mirrors the pattern used in run_apply_locked / run_apply_from_plan_locked:
     // call finalize_apply (which may fail), then always release lock in the caller.
-    let op_result = finalize_apply(FinalizeApplyInput {
-        result: &result,
-        state_file: Some(StateFile::new()),
-        sorted_resources: &[],
-        data_sources: &[],
-        current_states: &HashMap::new(),
-        plan: &Plan::new(),
-        backend: &backend,
-        lock: Some(&lock),
-        schemas: &SchemaRegistry::new(),
-        export_params: Some(&[]),
-        wait_aliases: &[],
-        pre_resolve_compositions: &[],
-    })
+    let op_result = finalize_apply(
+        FinalizeApplyInput {
+            result: &result,
+            state_file: Some(StateFile::new()),
+            sorted_resources: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            plan: &Plan::new(),
+            backend: &backend,
+            lock: Some(&lock),
+            schemas: &SchemaRegistry::new(),
+            export_params: Some(&[]),
+            wait_aliases: &[],
+            pre_resolve_compositions: &[],
+        },
+        StatePersistence::Normal,
+    )
     .await;
 
     // Caller always releases the lock
@@ -1671,20 +1675,23 @@ async fn finalize_apply_uses_write_state_locked() {
         failed_refreshes: HashSet::new(),
     };
 
-    let op_result = finalize_apply(FinalizeApplyInput {
-        result: &result,
-        state_file: Some(StateFile::new()),
-        sorted_resources: &[],
-        data_sources: &[],
-        current_states: &HashMap::new(),
-        plan: &Plan::new(),
-        backend: &backend,
-        lock: Some(&lock),
-        schemas: &SchemaRegistry::new(),
-        export_params: Some(&[]),
-        wait_aliases: &[],
-        pre_resolve_compositions: &[],
-    })
+    let op_result = finalize_apply(
+        FinalizeApplyInput {
+            result: &result,
+            state_file: Some(StateFile::new()),
+            sorted_resources: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            plan: &Plan::new(),
+            backend: &backend,
+            lock: Some(&lock),
+            schemas: &SchemaRegistry::new(),
+            export_params: Some(&[]),
+            wait_aliases: &[],
+            pre_resolve_compositions: &[],
+        },
+        StatePersistence::Normal,
+    )
     .await;
 
     assert!(op_result.is_ok(), "finalize_apply should succeed");
@@ -1804,7 +1811,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
         &backend,
         Some(&lock),
         std::path::Path::new("."),
-        tokio_util::sync::CancellationToken::new(),
+        carina_core::shutdown::ShutdownToken::running(),
     )
     .await;
     assert!(result.is_ok(), "refresh should succeed: {:?}", result);
@@ -1848,7 +1855,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
         &backend,
         Some(&lock),
         std::path::Path::new("."),
-        tokio_util::sync::CancellationToken::new(),
+        carina_core::shutdown::ShutdownToken::running(),
     )
     .await;
     assert!(result.is_ok(), "refresh should succeed: {:?}", result);
@@ -1910,7 +1917,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
         &backend,
         Some(&lock),
         std::path::Path::new("."),
-        tokio_util::sync::CancellationToken::new(),
+        carina_core::shutdown::ShutdownToken::running(),
     )
     .await;
 
@@ -1981,20 +1988,23 @@ async fn finalize_apply_without_lock_uses_write_state() {
         failed_refreshes: HashSet::new(),
     };
 
-    let op_result = finalize_apply(FinalizeApplyInput {
-        result: &result,
-        state_file: Some(StateFile::new()),
-        sorted_resources: &[],
-        data_sources: &[],
-        current_states: &HashMap::new(),
-        plan: &Plan::new(),
-        backend: &backend,
-        lock: None, // No lock
-        schemas: &SchemaRegistry::new(),
-        export_params: Some(&[]),
-        wait_aliases: &[],
-        pre_resolve_compositions: &[],
-    })
+    let op_result = finalize_apply(
+        FinalizeApplyInput {
+            result: &result,
+            state_file: Some(StateFile::new()),
+            sorted_resources: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            plan: &Plan::new(),
+            backend: &backend,
+            lock: None, // No lock
+            schemas: &SchemaRegistry::new(),
+            export_params: Some(&[]),
+            wait_aliases: &[],
+            pre_resolve_compositions: &[],
+        },
+        StatePersistence::Normal,
+    )
     .await;
 
     assert!(op_result.is_ok(), "finalize_apply should succeed");
@@ -2950,20 +2960,23 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
         failed_refreshes: HashSet::new(),
     };
 
-    let op_result = finalize_apply(FinalizeApplyInput {
-        result: &result,
-        state_file: Some(state_in),
-        sorted_resources: &[],
-        data_sources: &[],
-        current_states: &HashMap::new(),
-        plan: &Plan::new(),
-        backend: &backend,
-        lock: Some(&lock),
-        schemas: &SchemaRegistry::new(),
-        export_params: Some(&[]),
-        wait_aliases: &[],
-        pre_resolve_compositions: &[],
-    })
+    let op_result = finalize_apply(
+        FinalizeApplyInput {
+            result: &result,
+            state_file: Some(state_in),
+            sorted_resources: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            plan: &Plan::new(),
+            backend: &backend,
+            lock: Some(&lock),
+            schemas: &SchemaRegistry::new(),
+            export_params: Some(&[]),
+            wait_aliases: &[],
+            pre_resolve_compositions: &[],
+        },
+        StatePersistence::Normal,
+    )
     .await;
 
     assert!(op_result.is_ok(), "finalize_apply failed: {:?}", op_result);
@@ -3012,20 +3025,23 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
         failed_refreshes: HashSet::new(),
     };
 
-    let op_result = finalize_apply(FinalizeApplyInput {
-        result: &result,
-        state_file: Some(state_in),
-        sorted_resources: &[],
-        data_sources: &[],
-        current_states: &HashMap::new(),
-        plan: &Plan::new(),
-        backend: &backend,
-        lock: Some(&lock),
-        schemas: &SchemaRegistry::new(),
-        export_params: None,
-        wait_aliases: &[],
-        pre_resolve_compositions: &[],
-    })
+    let op_result = finalize_apply(
+        FinalizeApplyInput {
+            result: &result,
+            state_file: Some(state_in),
+            sorted_resources: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            plan: &Plan::new(),
+            backend: &backend,
+            lock: Some(&lock),
+            schemas: &SchemaRegistry::new(),
+            export_params: None,
+            wait_aliases: &[],
+            pre_resolve_compositions: &[],
+        },
+        StatePersistence::Normal,
+    )
     .await;
 
     assert!(op_result.is_ok(), "finalize_apply failed: {:?}", op_result);
@@ -3097,20 +3113,23 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
         },
     ];
 
-    let op_result = finalize_apply(FinalizeApplyInput {
-        result: &result,
-        state_file: Some(StateFile::new()),
-        sorted_resources: &sorted_resources,
-        data_sources: &[],
-        current_states: &result.current_states,
-        plan: &Plan::new(),
-        backend: &backend,
-        lock: Some(&lock),
-        schemas: &SchemaRegistry::new(),
-        export_params: Some(&export_params),
-        wait_aliases: &[],
-        pre_resolve_compositions: &[],
-    })
+    let op_result = finalize_apply(
+        FinalizeApplyInput {
+            result: &result,
+            state_file: Some(StateFile::new()),
+            sorted_resources: &sorted_resources,
+            data_sources: &[],
+            current_states: &result.current_states,
+            plan: &Plan::new(),
+            backend: &backend,
+            lock: Some(&lock),
+            schemas: &SchemaRegistry::new(),
+            export_params: Some(&export_params),
+            wait_aliases: &[],
+            pre_resolve_compositions: &[],
+        },
+        StatePersistence::Normal,
+    )
     .await;
 
     let skipped =

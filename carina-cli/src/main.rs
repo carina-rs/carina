@@ -317,8 +317,6 @@ async fn main() {
     let provider_context = create_provider_context();
 
     let cli = Cli::parse();
-    let cancel_token = tokio_util::sync::CancellationToken::new();
-    let _shutdown_listener = carina_cli::signal::spawn_shutdown_listener(cancel_token.clone());
 
     // Command-wide cursor hide (#3158 — rationale in `cursor.rs`). Placed
     // after `Cli::parse()` because that exits the process itself on
@@ -326,188 +324,201 @@ async fn main() {
     // before dispatch so all user-visible output runs cursor-hidden.
     let _cursor_guard = carina_cli::cursor::CursorGuard::stdout();
 
-    // Handle Plan separately since it returns Result<bool, String>
-    if let Commands::Plan {
-        path,
-        out,
-        detailed_exitcode,
-        detail,
-        tui,
-        refresh,
-        json,
-        check_iam,
-        strict_iam,
-    } = cli.command
-    {
-        match run_plan(
-            &path,
-            out.as_deref(),
+    let completion = carina_cli::signal::run_with_shutdown(|shutdown| async move {
+        // Handle Plan separately since it returns Result<bool, String>
+        if let Commands::Plan {
+            path,
+            out,
+            detailed_exitcode,
             detail,
             tui,
             refresh,
             json,
             check_iam,
             strict_iam,
-            &provider_context,
-        )
-        .await
+        } = cli.command
         {
-            Ok(has_changes) => {
-                if detailed_exitcode && has_changes {
-                    // process::exit skips Drop — restore the cursor first
-                    // (#3158); claim-once with the guard/net.
-                    carina_cli::cursor::restore_cursor();
-                    std::process::exit(2);
+            match run_plan(
+                &path,
+                out.as_deref(),
+                detail,
+                tui,
+                refresh,
+                json,
+                check_iam,
+                strict_iam,
+                &provider_context,
+            )
+            .await
+            {
+                Ok(has_changes) => {
+                    if detailed_exitcode && has_changes {
+                        return CommandCompletion::Exit(2);
+                    }
+                    return CommandCompletion::Success;
+                }
+                Err(e) => {
+                    return CommandCompletion::Error(e);
                 }
             }
-            Err(e) => {
-                handle_app_error(e);
-            }
         }
-        return;
-    }
 
-    let result = match cli.command {
-        Commands::Validate { path, json } => run_validate(&path, json, &provider_context),
-        Commands::Plan { .. } => unreachable!(),
-        Commands::Apply {
-            path,
-            auto_approve,
-            lock,
-            parallelism,
-            accept_legacy_name_overrides,
-        } => {
-            if path.extension().is_some_and(|ext| ext == "json") {
-                run_apply_from_plan(
-                    &path,
-                    auto_approve,
-                    lock,
-                    parallelism,
-                    accept_legacy_name_overrides,
-                    &provider_context,
-                    cancel_token.clone(),
-                )
-                .await
-            } else {
-                run_apply(
-                    &path,
-                    auto_approve,
-                    lock,
-                    parallelism,
-                    accept_legacy_name_overrides,
-                    &provider_context,
-                    cancel_token.clone(),
-                )
-                .await
+        let result = match cli.command {
+            Commands::Validate { path, json } => run_validate(&path, json, &provider_context),
+            Commands::Plan { .. } => unreachable!(),
+            Commands::Apply {
+                path,
+                auto_approve,
+                lock,
+                parallelism,
+                accept_legacy_name_overrides,
+            } => {
+                if path.extension().is_some_and(|ext| ext == "json") {
+                    run_apply_from_plan(
+                        &path,
+                        auto_approve,
+                        lock,
+                        parallelism,
+                        accept_legacy_name_overrides,
+                        &provider_context,
+                        shutdown.clone(),
+                    )
+                    .await
+                } else {
+                    run_apply(
+                        &path,
+                        auto_approve,
+                        lock,
+                        parallelism,
+                        accept_legacy_name_overrides,
+                        &provider_context,
+                        shutdown.clone(),
+                    )
+                    .await
+                }
             }
-        }
-        Commands::Destroy {
-            path,
-            auto_approve,
-            lock,
-            refresh,
-            force,
-            parallelism,
-        } => {
-            run_destroy(
-                &path,
+            Commands::Destroy {
+                path,
                 auto_approve,
                 lock,
                 refresh,
                 force,
                 parallelism,
-                &provider_context,
-                cancel_token.clone(),
-            )
-            .await
-        }
-        Commands::Export { name, json, raw } => {
-            let format = if raw {
-                commands::export::OutputFormat::Raw
-            } else if json {
-                commands::export::OutputFormat::Json
-            } else {
-                commands::export::OutputFormat::Human
-            };
-            let path = PathBuf::from(".");
-            commands::export::run_export(&path, name, format, &provider_context).await
-        }
-        Commands::Fmt {
-            path,
-            check,
-            diff,
-            recursive,
-        } => run_fmt(&path, check, diff, recursive),
-        Commands::Module { command } => run_module_command(command, &provider_context),
-        Commands::ForceUnlock { lock_id, path } => {
-            run_force_unlock(&lock_id, &path, &provider_context).await
-        }
-        Commands::State { command } => {
-            run_state_command(command, &provider_context, cancel_token.clone()).await
-        }
-        Commands::Init {
-            path,
-            upgrade,
-            locked,
-            migrate_state,
-            force,
-        } => {
-            if let Err(e) =
-                commands::init::run_init(&path, upgrade, locked, migrate_state, force).await
-            {
-                // process::exit skips Drop — restore the cursor first
-                // (#3158); claim-once with the guard/net.
-                carina_cli::cursor::restore_cursor();
-                eprintln!("{}", format!("Error: {e}").red());
-                std::process::exit(1);
+            } => {
+                run_destroy(
+                    &path,
+                    auto_approve,
+                    lock,
+                    refresh,
+                    force,
+                    parallelism,
+                    &provider_context,
+                    shutdown.clone(),
+                )
+                .await
             }
-            Ok(())
-        }
-        Commands::Lint { path } => run_lint(&path, &provider_context),
-        Commands::Completions { shell } => {
-            generate(shell, &mut Cli::command(), "carina", &mut std::io::stdout());
-            Ok(())
-        }
-        Commands::Skills { command } => {
-            let output = match command {
-                SkillsCommands::List => Ok(skills::run_skills_list()),
-                SkillsCommands::Install => skills::run_skills_install(),
-                SkillsCommands::Update => skills::run_skills_update(),
-                SkillsCommands::Reinstall => skills::run_skills_reinstall(),
-                SkillsCommands::Uninstall => skills::run_skills_uninstall(),
-                SkillsCommands::Status => skills::run_skills_status(),
-            };
-            match output {
-                Ok(text) => {
-                    println!("{text}");
-                    Ok(())
+            Commands::Export { name, json, raw } => {
+                let format = if raw {
+                    commands::export::OutputFormat::Raw
+                } else if json {
+                    commands::export::OutputFormat::Json
+                } else {
+                    commands::export::OutputFormat::Human
+                };
+                let path = PathBuf::from(".");
+                commands::export::run_export(&path, name, format, &provider_context).await
+            }
+            Commands::Fmt {
+                path,
+                check,
+                diff,
+                recursive,
+            } => run_fmt(&path, check, diff, recursive),
+            Commands::Module { command } => run_module_command(command, &provider_context),
+            Commands::ForceUnlock { lock_id, path } => {
+                run_force_unlock(&lock_id, &path, &provider_context).await
+            }
+            Commands::State { command } => {
+                run_state_command(command, &provider_context, shutdown.clone()).await
+            }
+            Commands::Init {
+                path,
+                upgrade,
+                locked,
+                migrate_state,
+                force,
+            } => commands::init::run_init(&path, upgrade, locked, migrate_state, force)
+                .await
+                .map_err(error::AppError::from),
+            Commands::Lint { path } => run_lint(&path, &provider_context),
+            Commands::Completions { shell } => {
+                generate(shell, &mut Cli::command(), "carina", &mut std::io::stdout());
+                Ok(())
+            }
+            Commands::Skills { command } => {
+                let output = match command {
+                    SkillsCommands::List => Ok(skills::run_skills_list()),
+                    SkillsCommands::Install => skills::run_skills_install(),
+                    SkillsCommands::Update => skills::run_skills_update(),
+                    SkillsCommands::Reinstall => skills::run_skills_reinstall(),
+                    SkillsCommands::Uninstall => skills::run_skills_uninstall(),
+                    SkillsCommands::Status => skills::run_skills_status(),
+                };
+                match output {
+                    Ok(text) => {
+                        println!("{text}");
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
             }
-        }
-        Commands::Docs { list, search, name } => {
-            let output: Result<String, error::AppError> = if list {
-                Ok(docs::run_docs_list())
-            } else if let Some(query) = search {
-                Ok(docs::run_docs_search(&query))
-            } else if let Some(doc_name) = name {
-                docs::run_docs_show(&doc_name)
-            } else {
-                Ok(docs::run_docs_default())
-            };
-            match output {
-                Ok(text) => {
-                    println!("{text}");
-                    Ok(())
+            Commands::Docs { list, search, name } => {
+                let output: Result<String, error::AppError> = if list {
+                    Ok(docs::run_docs_list())
+                } else if let Some(query) = search {
+                    Ok(docs::run_docs_search(&query))
+                } else if let Some(doc_name) = name {
+                    docs::run_docs_show(&doc_name)
+                } else {
+                    Ok(docs::run_docs_default())
+                };
+                match output {
+                    Ok(text) => {
+                        println!("{text}");
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
             }
-        }
-    };
+        };
 
-    if let Err(e) = result {
-        handle_app_error(e);
+        match result {
+            Ok(()) => CommandCompletion::Success,
+            Err(e) => CommandCompletion::Error(e),
+        }
+    })
+    .await;
+
+    match completion {
+        CommandCompletion::Success => {}
+        CommandCompletion::Exit(code) => {
+            // process::exit skips Drop — restore the cursor first (#3158).
+            carina_cli::cursor::restore_cursor();
+            std::process::exit(code);
+        }
+        CommandCompletion::Error(error) => handle_app_error(error),
     }
+}
+
+/// A completed command's requested process outcome.
+///
+/// This value is produced inside the shutdown supervisor and interpreted only
+/// after the command future has returned, so ordinary error/status exits cannot
+/// bypass command-owned cleanup.
+enum CommandCompletion {
+    Success,
+    Exit(i32),
+    Error(error::AppError),
 }
 
 /// Outcome of rendering an `AppError`: the text to write to stderr

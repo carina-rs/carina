@@ -34,6 +34,7 @@ pub mod resolver;
 mod resolver_split_tests;
 pub mod resource;
 pub mod schema;
+pub mod shutdown;
 pub mod upstream_exports;
 pub mod utils;
 pub mod validation;

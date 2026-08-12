@@ -44,7 +44,6 @@ use carina_core::resource::{DataSource, ResourceId, State, Value};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 use indexmap::IndexMap;
 use std::sync::Mutex;
-use tokio_util::sync::CancellationToken;
 
 fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
     match outcome {
@@ -563,8 +562,15 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         schemas: ctx.schemas(),
         parallelism: carina_core::executor::TEST_UNCAPPED,
     };
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &observer,
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await,
+    );
     let failures = observer.failures.lock().unwrap().clone();
     (result.failure_count, result.skip_count, failures)
 }

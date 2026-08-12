@@ -22,7 +22,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
-use tokio_util::sync::CancellationToken;
+
+use crate::shutdown::ShutdownToken;
+use crate::shutdown::testing::{TestShutdownTrigger as ShutdownTrigger, shutdown_channel};
+
+fn uncancelled_shutdown() -> ShutdownToken {
+    ShutdownToken::running()
+}
+
+#[test]
+fn executor_test_fixtures_do_not_use_raw_cancellation_tokens() {
+    let retired_type = ["tokio_util::sync::", "CancellationToken"].concat();
+    assert!(
+        !include_str!("tests.rs").contains(&retired_type),
+        "executor fixtures must exercise the full ShutdownToken state machine"
+    );
+}
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
@@ -775,8 +790,6 @@ fn create_independent_create_plan<const N: usize>(names: [&str; N]) -> Plan {
 struct DelayedCountingProvider {
     default_delay: std::time::Duration,
     delays: HashMap<String, std::time::Duration>,
-    cancel_after_create: Option<String>,
-    cancel: Option<CancellationToken>,
     started: Arc<Mutex<Vec<String>>>,
 }
 
@@ -785,8 +798,6 @@ impl DelayedCountingProvider {
         Self {
             default_delay,
             delays: HashMap::new(),
-            cancel_after_create: None,
-            cancel: None,
             started: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -834,19 +845,12 @@ impl Provider for DelayedCountingProvider {
         let id = id.clone();
         let delay = self.delay_for(&id);
         let started = self.started.clone();
-        let cancel_after_create = self.cancel_after_create.clone();
-        let cancel = self.cancel.clone();
         Box::pin(async move {
             started
                 .lock()
                 .unwrap()
                 .push(id.identity_or_empty().to_string());
             tokio::time::sleep(delay).await;
-            if cancel_after_create.as_deref() == Some(id.identity_or_empty())
-                && let Some(cancel) = cancel
-            {
-                cancel.cancel();
-            }
             Ok(crate::provider::CreateOutcome::Success {
                 state: ok_state(&id),
             })
@@ -981,19 +985,22 @@ impl Provider for PendingWaitProvider {
 struct CancelsAfterSuccesses {
     successes: AtomicUsize,
     threshold: usize,
-    token: CancellationToken,
+    trigger: ShutdownTrigger,
+    token: ShutdownToken,
 }
 
 impl CancelsAfterSuccesses {
     fn new(threshold: usize) -> Self {
+        let (trigger, token) = shutdown_channel();
         Self {
             successes: AtomicUsize::new(0),
             threshold,
-            token: CancellationToken::new(),
+            trigger,
+            token,
         }
     }
 
-    fn token(&self) -> CancellationToken {
+    fn token(&self) -> ShutdownToken {
         self.token.clone()
     }
 }
@@ -1003,7 +1010,7 @@ impl ExecutionObserver for CancelsAfterSuccesses {
         if matches!(event, ExecutionEvent::EffectSucceeded { .. }) {
             let successes = self.successes.fetch_add(1, Ordering::Relaxed) + 1;
             if successes >= self.threshold {
-                self.token.cancel();
+                self.trigger.request_graceful_shutdown();
             }
         }
     }
@@ -1011,36 +1018,54 @@ impl ExecutionObserver for CancelsAfterSuccesses {
 
 struct CancelsWhenStarted {
     name: String,
-    token: CancellationToken,
+    trigger: ShutdownTrigger,
+    token: ShutdownToken,
+    cleanup_priority: bool,
 }
 
 impl CancelsWhenStarted {
     fn new(name: &str) -> Self {
+        let (trigger, token) = shutdown_channel();
         Self {
             name: name.to_string(),
-            token: CancellationToken::new(),
+            trigger,
+            token,
+            cleanup_priority: false,
         }
     }
 
-    fn token(&self) -> CancellationToken {
+    fn with_cleanup_priority(name: &str) -> Self {
+        let (trigger, token) = shutdown_channel();
+        Self {
+            name: name.to_string(),
+            trigger,
+            token,
+            cleanup_priority: true,
+        }
+    }
+
+    fn token(&self) -> ShutdownToken {
         self.token.clone()
     }
 }
 
 struct CancelsWhenWaitStarted {
     binding: String,
-    token: CancellationToken,
+    trigger: ShutdownTrigger,
+    token: ShutdownToken,
 }
 
 impl CancelsWhenWaitStarted {
     fn new(binding: &str) -> Self {
+        let (trigger, token) = shutdown_channel();
         Self {
             binding: binding.to_string(),
-            token: CancellationToken::new(),
+            trigger,
+            token,
         }
     }
 
-    fn token(&self) -> CancellationToken {
+    fn token(&self) -> ShutdownToken {
         self.token.clone()
     }
 }
@@ -1052,27 +1077,30 @@ impl ExecutionObserver for CancelsWhenWaitStarted {
         } = event
             && identity.as_str() == self.binding
         {
-            self.token.cancel();
+            self.trigger.request_graceful_shutdown();
         }
     }
 }
 
 struct RecordingCancelsWhenWaitStarted {
     binding: String,
-    token: CancellationToken,
+    trigger: ShutdownTrigger,
+    token: ShutdownToken,
     events: Mutex<Vec<String>>,
 }
 
 impl RecordingCancelsWhenWaitStarted {
     fn new(binding: &str) -> Self {
+        let (trigger, token) = shutdown_channel();
         Self {
             binding: binding.to_string(),
-            token: CancellationToken::new(),
+            trigger,
+            token,
             events: Mutex::new(Vec::new()),
         }
     }
 
-    fn token(&self) -> CancellationToken {
+    fn token(&self) -> ShutdownToken {
         self.token.clone()
     }
 
@@ -1092,7 +1120,7 @@ impl ExecutionObserver for RecordingCancelsWhenWaitStarted {
         } = event
             && identity.as_str() == self.binding
         {
-            self.token.cancel();
+            self.trigger.request_graceful_shutdown();
         }
     }
 }
@@ -1102,8 +1130,161 @@ impl ExecutionObserver for CancelsWhenStarted {
         if let ExecutionEvent::EffectStarted { effect } = event
             && effect.resource_id().identity_or_empty() == self.name
         {
-            self.token.cancel();
+            if self.cleanup_priority {
+                self.trigger.prioritize_cleanup();
+            } else {
+                self.trigger.request_graceful_shutdown();
+            }
         }
+    }
+}
+
+struct PendingRefreshProvider;
+
+impl Provider for PendingRefreshProvider {
+    fn name(&self) -> &str {
+        "pending-refresh"
+    }
+
+    fn read(
+        &self,
+        _id: &ResourceId,
+        _identifier: Option<&str>,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(std::future::pending())
+    }
+
+    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        self.read(&resource.id, None, ReadRequest)
+    }
+
+    fn create(
+        &self,
+        _id: &ResourceId,
+        _request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
+        Box::pin(async { Err(ProviderError::internal("create not used")) })
+    }
+
+    fn update(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
+        Box::pin(async { Err(ProviderError::api_error("update failed")) })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async { Err(ProviderError::internal("delete not used")) })
+    }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+struct PrioritizeCleanupOnRefresh {
+    trigger: ShutdownTrigger,
+}
+
+impl ExecutionObserver for PrioritizeCleanupOnRefresh {
+    fn on_event(&self, event: &ExecutionEvent) {
+        if matches!(event, ExecutionEvent::RefreshStarted) {
+            self.trigger.prioritize_cleanup();
+        }
+    }
+}
+
+struct ControlledReadyCreateProvider {
+    ready: Arc<std::sync::atomic::AtomicBool>,
+    started: Arc<Notify>,
+    waker: Arc<Mutex<Option<std::task::Waker>>>,
+}
+
+impl ControlledReadyCreateProvider {
+    fn new() -> Self {
+        Self {
+            ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            started: Arc::new(Notify::new()),
+            waker: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn complete(&self) {
+        self.ready.store(true, Ordering::SeqCst);
+        if let Some(waker) = self.waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
+}
+
+impl Provider for ControlledReadyCreateProvider {
+    fn name(&self) -> &str {
+        "controlled-ready-create"
+    }
+
+    fn read(
+        &self,
+        _id: &ResourceId,
+        _identifier: Option<&str>,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { Err(ProviderError::internal("read not used")) })
+    }
+
+    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        self.read(&resource.id, None, ReadRequest)
+    }
+
+    fn create(
+        &self,
+        id: &ResourceId,
+        _request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
+        let id = id.clone();
+        let ready = Arc::clone(&self.ready);
+        let started = Arc::clone(&self.started);
+        let waker = Arc::clone(&self.waker);
+        Box::pin(std::future::poll_fn(move |cx| {
+            started.notify_one();
+            if ready.load(Ordering::SeqCst) {
+                std::task::Poll::Ready(Ok(crate::provider::CreateOutcome::Success {
+                    state: ok_state(&id),
+                }))
+            } else {
+                *waker.lock().unwrap() = Some(cx.waker().clone());
+                std::task::Poll::Pending
+            }
+        }))
+    }
+
+    fn update(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
+        Box::pin(async { Err(ProviderError::internal("update not used")) })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async { Err(ProviderError::internal("delete not used")) })
+    }
+
+    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -1159,7 +1340,7 @@ async fn execute_plan_returns_completed_when_not_cancelled() {
     };
 
     let observer = MockObserver::new();
-    let cancel = CancellationToken::new();
+    let cancel = uncancelled_shutdown();
 
     let outcome = execute_plan(&provider, input, &observer, cancel).await;
 
@@ -1195,8 +1376,8 @@ async fn execute_plan_with_pre_cancelled_token_returns_cancelled_at_t4_or_later(
     };
 
     let observer = MockObserver::new();
-    let cancel = CancellationToken::new();
-    cancel.cancel();
+    let (shutdown, cancel) = shutdown_channel();
+    shutdown.request_graceful_shutdown();
 
     let outcome = execute_plan(&provider, input, &observer, cancel).await;
 
@@ -1228,8 +1409,8 @@ async fn execute_plan_with_empty_plan_and_pre_cancelled_token_returns_completed(
         parallelism: crate::executor::TEST_UNCAPPED,
     };
     let observer = MockObserver::new();
-    let cancel = CancellationToken::new();
-    cancel.cancel();
+    let (shutdown, cancel) = shutdown_channel();
+    shutdown.request_graceful_shutdown();
 
     let outcome = execute_plan(&provider, input, &observer, cancel).await;
 
@@ -1461,6 +1642,141 @@ async fn execute_plan_cancelled_while_effect_in_flight_records_that_effect() {
 }
 
 #[tokio::test]
+async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_effects() {
+    let provider = DelayedCountingProvider::new(std::time::Duration::ZERO)
+        .with_delay("r2", std::time::Duration::from_secs(60));
+    let observer = CancelsWhenStarted::with_cleanup_priority("r2");
+    let shutdown = observer.token();
+    let plan = create_independent_create_plan(["r1", "r2", "r3"]);
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        execute_plan(&provider, input, &observer, shutdown),
+    )
+    .await
+    .expect("cleanup priority must abandon the delayed in-flight effect");
+    let result = match outcome {
+        ExecutionOutcome::Cancelled(result) => result,
+        ExecutionOutcome::Completed(_) => panic!("cleanup-priority run returned Completed"),
+    };
+
+    assert!(
+        result
+            .applied_states
+            .contains_key(&ResourceId::with_identity("test", "r1")),
+        "the effect completed before escalation must remain available for state writeback"
+    );
+    assert!(
+        !result
+            .applied_states
+            .contains_key(&ResourceId::with_identity("test", "r2")),
+        "the abandoned in-flight effect has no trustworthy completion result"
+    );
+    assert_eq!(provider.started_names(), vec!["r1", "r2"]);
+}
+
+#[tokio::test]
+async fn execute_plan_harvests_ready_effect_before_cleanup_priority() {
+    let (trigger, shutdown) = shutdown_channel();
+    let provider = ControlledReadyCreateProvider::new();
+    let resource = make_resource("ready", &[]);
+    let id = resource.id.clone();
+    let mut plan = Plan::new();
+    plan.add(create_effect(resource));
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let execution = execute_plan(&provider, input, &observer, shutdown);
+    tokio::pin!(execution);
+    tokio::select! {
+        _ = provider.started.notified() => {}
+        outcome = &mut execution => panic!("execution completed before the provider was released: {}", matches!(outcome, ExecutionOutcome::Completed(_))),
+    }
+
+    provider.complete();
+    trigger.prioritize_cleanup();
+    let outcome = execution.await;
+    let result = match outcome {
+        ExecutionOutcome::Cancelled(result) => result,
+        ExecutionOutcome::Completed(_) => panic!("cleanup-priority run returned Completed"),
+    };
+
+    assert_eq!(result.success_count, 1);
+    assert!(
+        result.applied_states.contains_key(&id),
+        "a provider result that was already ready must be harvested before shutdown"
+    );
+}
+
+#[tokio::test]
+async fn execute_plan_cleanup_priority_abandons_a_pending_failure_refresh() {
+    let provider = PendingRefreshProvider;
+    let mut desired = make_resource("target", &[]);
+    desired.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
+    let id = desired.id.clone();
+    let current = State::existing(
+        id,
+        HashMap::from([("value".to_string(), Value::Concrete(ConcreteValue::Int(1)))]),
+    )
+    .with_identifier("target-id");
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        from: Box::new(current),
+        to: resolved(desired),
+        changed_attributes: vec!["value".to_string()],
+    });
+    let (trigger, shutdown) = shutdown_channel();
+    let observer = PrioritizeCleanupOnRefresh { trigger };
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        execute_plan(&provider, input, &observer, shutdown),
+    )
+    .await
+    .expect("cleanup priority must abandon a pending state refresh");
+
+    assert!(matches!(outcome, ExecutionOutcome::Cancelled(_)));
+}
+
+#[tokio::test]
 async fn test_simple_create() {
     let provider = MockProvider::new();
     let resource = make_resource("a", &[]);
@@ -1487,7 +1803,7 @@ async fn test_simple_create() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 1);
     assert_eq!(result.failure_count, 0);
@@ -1535,7 +1851,7 @@ async fn partial_create_records_state_and_diagnostic() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 0);
     assert_eq!(result.failure_count, 0);
@@ -1587,7 +1903,7 @@ async fn test_apply_renormalizes_after_resolution() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(result.success_count, 1);
 
     let captured = provider.captured_create_resources();
@@ -1646,7 +1962,7 @@ async fn test_apply_reapplies_enum_alias_stage() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(result.success_count, 1);
 
     let captured = provider.captured_create_resources();
@@ -1709,7 +2025,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(result.success_count, 1);
 
     let reqs = provider.captured_update_requests();
@@ -1765,7 +2081,7 @@ async fn test_apply_reapplies_canonicalize_stage() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(result.success_count, 1);
 
     let captured = provider.captured_create_resources();
@@ -1826,7 +2142,7 @@ async fn test_apply_renormalizes_update_path() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(result.success_count, 1);
 
     let reqs = provider.captured_update_requests();
@@ -1913,7 +2229,7 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(result.success_count, 1);
 
     let reqs = provider.captured_update_requests();
@@ -2023,7 +2339,7 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(result.success_count, 1);
 
     let reqs = provider.captured_update_requests();
@@ -2083,7 +2399,7 @@ async fn test_apply_effective_changed_skips_internal_and_write_only_attributes()
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(result.success_count, 1);
 
     let reqs = provider.captured_update_requests();
@@ -2147,7 +2463,7 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(result.success_count, 1);
 
     let reqs = provider.captured_update_requests();
@@ -2216,7 +2532,7 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(result.success_count, 1);
 
     let reqs = provider.captured_update_requests();
@@ -2274,7 +2590,7 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(result.success_count, 2, "both creates should succeed");
 
     let captured = provider.captured_create_resources();
@@ -2422,7 +2738,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
     // real-infra smoke); this test cannot even express the old shape
     // because the trait is now async — that is the point.
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(
         result.success_count, 2,
         "both creates must complete — no self-deadlock acquiring the \
@@ -2482,7 +2798,7 @@ async fn test_simple_delete() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 1);
     assert!(
@@ -2522,7 +2838,7 @@ async fn test_failed_effect_propagates_to_dependent() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.failure_count, 1);
     assert_eq!(result.skip_count, 1);
@@ -2562,7 +2878,7 @@ async fn test_observer_events_emitted_correctly() {
 
     let observer = MockObserver::new();
     let _ =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     let events = observer.events();
     assert_eq!(events.len(), 2);
@@ -2596,7 +2912,7 @@ async fn test_read_effect_is_no_op() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 0);
     assert_eq!(result.failure_count, 0);
@@ -2641,7 +2957,7 @@ async fn test_independent_effects_run_in_parallel() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 3);
     assert_eq!(result.failure_count, 0);
@@ -2696,7 +3012,7 @@ async fn test_parallel_failure_skips_dependents() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     // vpc + subnet_b succeed, subnet_a fails, subnet_c skipped
     assert_eq!(result.success_count, 2);
@@ -2748,7 +3064,7 @@ async fn test_dependency_levels_sequential_chain() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 3);
 
@@ -2989,7 +3305,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 3);
     assert_eq!(result.failure_count, 0);
@@ -3204,7 +3520,7 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> usize {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 13);
     assert_eq!(result.failure_count, 0);
@@ -3275,7 +3591,7 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(result.success_count, 2);
     assert_eq!(result.failure_count, 0);
     provider.max_active()
@@ -3366,7 +3682,7 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
         State::existing(c_id, id_attr("id-c")).with_identifier("id-c")
     ));
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 2);
 
@@ -3612,7 +3928,7 @@ async fn test_update_effect_binding_map_propagation() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 1);
     assert_eq!(result.failure_count, 0);
@@ -3744,7 +4060,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 2, "Both resources should succeed");
     assert_eq!(result.failure_count, 0, "No failures expected");
@@ -4124,7 +4440,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
     let observer = MockObserver::new();
 
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(result.failure_count, 0, "events: {:?}", observer.events());
 
     let calls = provider.create_calls();
@@ -4230,7 +4546,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(
         result.success_count,
@@ -4381,7 +4697,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(
         result.failure_count,
@@ -4463,7 +4779,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(result.success_count, 2);
     // The wait's captured State is keyed under a synthetic `__wait`
     // ResourceId. This is what guarantees state writeback never sees
@@ -4584,7 +4900,7 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     // Cert succeeds; the record fails at apply-time resolution
     // *before* reaching the provider — no `create` call for the
@@ -4768,7 +5084,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(
         result.failure_count,
@@ -4978,7 +5294,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(
         result.failure_count,
@@ -5027,7 +5343,7 @@ async fn deferred_create_returns_error_when_upstream_binding_missing() {
     };
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.failure_count, 1);
     assert!(observer.events().iter().any(|event| {
@@ -5070,7 +5386,7 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
     };
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.failure_count, 1);
     assert!(observer.events().iter().any(|event| {
@@ -5121,7 +5437,7 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
     };
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.failure_count, 1);
     assert!(observer.events().iter().any(|event| {
@@ -5220,7 +5536,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
     let observer = MockObserver::new();
 
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     assert_eq!(
         result.failure_count,
         0,
@@ -5313,7 +5629,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
     };
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.failure_count, 1);
     assert!(
@@ -5559,7 +5875,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
 
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        execute_plan(&provider, input, &observer, CancellationToken::new()),
+        execute_plan(&provider, input, &observer, uncancelled_shutdown()),
     )
     .await
     .expect("expanded DeferredReplace deletes must stay in in_flight");
@@ -5747,7 +6063,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(
         result.failure_count,
@@ -5889,7 +6205,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(
         result.failure_count,
@@ -6025,7 +6341,7 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.success_count, 1);
     assert_eq!(result.failure_count, 1);
@@ -6108,7 +6424,7 @@ async fn test_apply_time_data_source_read_retries_throttling_errors() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.failure_count, 0);
     assert_eq!(result.success_count, 1);
@@ -6204,7 +6520,7 @@ async fn test_pre_apply_data_source_read_remains_noop_in_executor() {
 
     let observer = MockObserver::new();
     let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
 
     assert_eq!(result.failure_count, 0, "events: {:?}", observer.events());
     assert_eq!(result.success_count, 1);

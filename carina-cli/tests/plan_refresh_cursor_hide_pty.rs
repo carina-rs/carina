@@ -221,18 +221,8 @@ fn plan_error_path_does_not_leave_cursor_hidden_on_pty() {
     assert_cursor_not_left_hidden(&raw);
 }
 
-// NOTE on SIGINT/SIGTERM coverage:
-//
-// There is intentionally no PTY test that sends Ctrl+C mid-spinner. The
-// mock provider has no delay hook, so the refresh completes in
-// milliseconds: a `0x03` written right after spawn almost always lands
-// *before* the cursor is ever hidden, so the run never enters the guarded
-// state and the test would pass vacuously. Forcing a deterministic "spinner
-// has started, now signal" handshake would require a test-only delay seam in
-// the provider read path, which does not exist and is out of scope for #3153.
-//
-// Cursor restoration for SIGINT/SIGTERM now flows through the unified
-// shutdown listener's second-signal process-exit path, while cursor.rs keeps
-// deterministic unit coverage for the claim-once restore protocol and panic
-// hook. A real end-to-end SIGINT regression test with a readiness handshake
-// is tracked as a follow-up issue (#3157).
+// SIGINT/SIGTERM registration and top-level supervisor wiring are exercised by
+// apply_real_signal_cleanup_e2e.rs. That test uses the mock provider's
+// readiness-file delay seam before sending real OS signals. These PTY tests
+// remain focused on cursor rendering/restoration rather than duplicating the
+// process-level shutdown contract.

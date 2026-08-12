@@ -280,6 +280,32 @@ async fn write_state_locked_succeeds_for_held_lock() {
 }
 
 #[tokio::test]
+async fn cancellation_cleanup_write_and_release_preserve_the_lock_protocol() {
+    let backend = mock_backend().await;
+    backend.init().await.unwrap();
+    let lock = backend.acquire_lock("apply").await.unwrap();
+    let mut state = StateFile::new();
+    state.increment_serial();
+
+    backend
+        .write_state_locked_for_cleanup(&state, &lock)
+        .await
+        .unwrap();
+    backend.release_lock_for_cleanup(&lock).await.unwrap();
+
+    let persisted = backend.read_state().await.unwrap().unwrap().into_state();
+    assert_eq!(persisted.lineage, state.lineage);
+    assert_eq!(persisted.serial, state.serial);
+    assert!(
+        matches!(
+            backend.release_lock(&lock).await,
+            Err(BackendError::LockNotFound(_))
+        ),
+        "cleanup release must remove the lock only after the state write succeeds"
+    );
+}
+
+#[tokio::test]
 async fn write_state_locked_rejects_write_when_lock_not_held() {
     // The negative half of the lock gate: once the lock object is gone,
     // `write_state_locked` must refuse to write. Without this case

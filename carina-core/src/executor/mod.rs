@@ -39,8 +39,8 @@ use crate::resource::{
 use crate::value::SerializationError;
 use crate::wait::WaitObservation;
 
+use crate::shutdown::ShutdownToken;
 use parallel::execute_effects_sequential;
-use tokio_util::sync::CancellationToken;
 
 pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
 
@@ -356,10 +356,10 @@ pub async fn execute_plan(
     provider: &dyn Provider,
     mut input: ExecutionInput<'_>,
     observer: &dyn ExecutionObserver,
-    cancel: CancellationToken,
+    shutdown: ShutdownToken,
 ) -> ExecutionOutcome {
     let (result, was_cancelled) =
-        execute_effects_sequential(provider, &mut input, observer, &cancel).await;
+        execute_effects_sequential(provider, &mut input, observer, &shutdown).await;
     if was_cancelled {
         ExecutionOutcome::Cancelled(result)
     } else {

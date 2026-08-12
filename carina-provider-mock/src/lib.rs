@@ -249,6 +249,32 @@ impl MockProvider {
             .map(Duration::from_millis)
     }
 
+    fn create_delay_for(id: &ResourceId) -> Option<Duration> {
+        let target = env::var("CARINA_MOCK_CREATE_DELAY_MS_FOR").ok()?;
+        if target != Self::resource_key(id) {
+            return None;
+        }
+        env::var("CARINA_MOCK_CREATE_DELAY_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|millis| *millis > 0)
+            .map(Duration::from_millis)
+    }
+
+    fn signal_ready(path_env: &str) -> ProviderResult<()> {
+        let Some(path) = env::var_os(path_env).map(PathBuf::from) else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                ProviderError::internal("Failed to create mock readiness directory").with_cause(err)
+            })?;
+        }
+        fs::write(path, "ready\n").map_err(|err| {
+            ProviderError::internal("Failed to write mock readiness file").with_cause(err)
+        })
+    }
+
     async fn create_resource(
         &self,
         id: ResourceId,
@@ -256,6 +282,11 @@ impl MockProvider {
     ) -> ProviderResult<CreateOutcome> {
         if let Some(err) = Self::create_fail_error_for(&id) {
             return Err(err);
+        }
+
+        if let Some(delay) = Self::create_delay_for(&id) {
+            Self::signal_ready("CARINA_MOCK_CREATE_READY_PATH")?;
+            tokio::time::sleep(delay).await;
         }
 
         let mut states = self.load_states();
@@ -523,6 +554,7 @@ impl Provider for MockProvider {
             }
 
             if let Some(delay) = Self::delete_delay_for(&id) {
+                Self::signal_ready("CARINA_MOCK_DELETE_READY_PATH")?;
                 tokio::time::sleep(delay).await;
             }
 

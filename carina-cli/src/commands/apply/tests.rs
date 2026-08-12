@@ -21,7 +21,7 @@ mod cancellation_fixture;
 
 use cancellation_fixture::ApplyCancellationFixture;
 
-static MOCK_PROVIDER_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
@@ -1477,6 +1477,56 @@ async fn apply_cancel_token_integration_persists_completed_state_releases_lock_a
         "target_group must not be in state (cancelled before completion)"
     );
     assert!(!fixture.lock_path().exists(), "lock file must be released");
+}
+
+#[tokio::test]
+async fn apply_cleanup_priority_persists_completed_state_and_releases_lock() {
+    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
+    let fixture = ApplyCancellationFixture::new()
+        .with_resources(["a_completed", "z_blocked"])
+        .with_blocked_create("z_blocked");
+    let shutdown = fixture.cancel_token();
+    let observer_factory = fixture.observer_factory();
+
+    let apply = run_apply_with_observer_factory(
+        fixture.config_path(),
+        true,
+        true,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+        fixture.provider_context(),
+        shutdown,
+        &observer_factory,
+    );
+    tokio::pin!(apply);
+    tokio::select! {
+        () = fixture.wait_for_blocked_create() => {}
+        result = &mut apply => panic!("apply returned before the blocking create started: {result:?}"),
+    }
+    fixture.prioritize_cleanup();
+    let err = tokio::time::timeout(Duration::from_millis(250), &mut apply)
+        .await
+        .expect("cleanup priority must abandon the blocked provider create")
+        .unwrap_err();
+
+    assert!(matches!(err, AppError::Interrupted));
+    let state = fixture.read_state().await;
+    assert!(
+        state
+            .find_resource("mock", "test.resource", "a_completed")
+            .is_some(),
+        "the result folded before cleanup priority must be flushed"
+    );
+    assert!(
+        state
+            .find_resource("mock", "test.resource", "z_blocked")
+            .is_none(),
+        "the abandoned create must not be persisted"
+    );
+    assert!(
+        !fixture.lock_path().exists(),
+        "cleanup must release the lock"
+    );
 }
 
 #[tokio::test]
@@ -3795,7 +3845,7 @@ impl tokio::io::AsyncRead for NeverReady {
 #[tokio::test]
 async fn confirm_apply_returns_confirmed_on_yes() {
     let input = &b"yes\n"[..];
-    let cancel = CancellationToken::new();
+    let cancel = carina_core::shutdown::ShutdownToken::running();
     let outcome = confirm_apply(input, cancel, false).await.unwrap();
     assert_eq!(outcome, ApplyConfirmation::Confirmed);
 }
@@ -3803,7 +3853,7 @@ async fn confirm_apply_returns_confirmed_on_yes() {
 #[tokio::test]
 async fn confirm_apply_returns_cancelled_on_no() {
     let input = &b"no\n"[..];
-    let cancel = CancellationToken::new();
+    let cancel = carina_core::shutdown::ShutdownToken::running();
     let outcome = confirm_apply(input, cancel, false).await.unwrap();
     assert_eq!(outcome, ApplyConfirmation::Cancelled);
 }
@@ -3811,7 +3861,7 @@ async fn confirm_apply_returns_cancelled_on_no() {
 #[tokio::test]
 async fn confirm_apply_returns_cancelled_on_empty_input() {
     let input = &b"\n"[..];
-    let cancel = CancellationToken::new();
+    let cancel = carina_core::shutdown::ShutdownToken::running();
     let outcome = confirm_apply(input, cancel, false).await.unwrap();
     assert_eq!(outcome, ApplyConfirmation::Cancelled);
 }
@@ -3820,7 +3870,7 @@ async fn confirm_apply_returns_cancelled_on_empty_input() {
 async fn confirm_apply_auto_approve_skips_read() {
     // Reader would hang forever; auto_approve must short-circuit without reading.
     let input = tokio::io::BufReader::new(tokio::io::empty());
-    let cancel = CancellationToken::new();
+    let cancel = carina_core::shutdown::ShutdownToken::running();
     let outcome = confirm_apply(input, cancel, true).await.unwrap();
     assert_eq!(outcome, ApplyConfirmation::Confirmed);
 }
@@ -3828,18 +3878,18 @@ async fn confirm_apply_auto_approve_skips_read() {
 #[tokio::test]
 async fn confirm_apply_returns_interrupted_when_cancel_fires_after_subscription() {
     let reader = tokio::io::BufReader::new(NeverReady);
-    let cancel = CancellationToken::new();
+    let (trigger, cancel) = carina_core::shutdown::testing::shutdown_channel();
     let waiting = tokio::spawn(confirm_apply(reader, cancel.clone(), false));
     tokio::task::yield_now().await;
-    cancel.cancel();
+    trigger.request_graceful_shutdown();
     let err = waiting.await.unwrap().unwrap_err();
     assert!(matches!(err, AppError::Interrupted));
 }
 
 #[tokio::test]
 async fn confirm_apply_returns_interrupted_when_cancel_token_fires() {
-    let token = CancellationToken::new();
-    token.cancel();
+    let (trigger, token) = carina_core::shutdown::testing::shutdown_channel();
+    trigger.request_graceful_shutdown();
     let reader = tokio::io::BufReader::new(NeverReady);
     let err = confirm_apply(reader, token, false).await.unwrap_err();
     assert!(matches!(err, AppError::Interrupted));
@@ -4135,7 +4185,7 @@ mod saved_plan_version_tests {
             std::num::NonZeroUsize::new(8).unwrap(),
             false,
             &carina_core::parser::ProviderContext::default(),
-            tokio_util::sync::CancellationToken::new(),
+            carina_core::shutdown::ShutdownToken::running(),
         )
         .await;
 
@@ -4191,7 +4241,7 @@ mod saved_plan_version_tests {
             std::num::NonZeroUsize::new(8).unwrap(),
             false,
             &carina_core::parser::ProviderContext::default(),
-            tokio_util::sync::CancellationToken::new(),
+            carina_core::shutdown::ShutdownToken::running(),
         )
         .await;
 
@@ -4296,7 +4346,7 @@ mod saved_plan_version_tests {
             std::num::NonZeroUsize::new(8).unwrap(),
             false,
             &carina_core::parser::ProviderContext::default(),
-            tokio_util::sync::CancellationToken::new(),
+            carina_core::shutdown::ShutdownToken::running(),
         )
         .await;
 

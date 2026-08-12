@@ -966,6 +966,7 @@ dependencies = [
  "indexmap",
  "indicatif",
  "insta",
+ "libc",
  "portable-pty",
  "regex-lite",
  "semver",

@@ -20,15 +20,19 @@ use carina_core::parser::WaitBinding;
 use carina_core::plan::Plan;
 use carina_core::provider::Provider;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+#[cfg(test)]
+use carina_core::shutdown::testing::TestShutdownTrigger;
+use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_state::{LockInfo, StateBackend, StateFile};
-use tokio_util::sync::CancellationToken;
 
 use carina_core::parser::ProviderContext;
 
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::collect_delete_attributes;
-use crate::commands::shared::finalize::handle_finalize_after_execute;
+use crate::commands::shared::finalize::{
+    StatePersistence, finalize_after_execute, release_lock_after_execute,
+};
 use crate::commands::shared::progress::{
     RefreshProgress, format_duration, refresh_multi_progress, spinner_style,
 };
@@ -54,7 +58,7 @@ pub async fn run_destroy(
     force: bool,
     parallelism: NonZeroUsize,
     provider_context: &ProviderContext,
-    cancel: CancellationToken,
+    cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     let loaded = load_configuration_with_config(
         path,
@@ -120,13 +124,13 @@ pub async fn run_destroy(
         force,
         base_dir,
         parallelism,
-        cancel,
+        cancel.clone(),
     )
     .await;
 
     // Always release lock if it was acquired
     if let Some(ref li) = lock_info {
-        let release_result = backend.release_lock(li).await.map_err(AppError::Backend);
+        let release_result = release_lock_after_execute(backend.as_ref(), li, &cancel).await;
 
         if release_result.is_ok()
             && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
@@ -154,9 +158,9 @@ async fn run_destroy_locked(
     force: bool,
     base_dir: &std::path::Path,
     parallelism: NonZeroUsize,
-    cancel: CancellationToken,
+    cancel: ShutdownToken,
 ) -> Result<(), AppError> {
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
+    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
     let ctx = WiringContext::new(factories);
 
     // Read current state from backend. carina#3315: persist any older-schema
@@ -254,10 +258,18 @@ async fn run_destroy_locked(
             }
 
             let result: Result<(ResourceId, State), AppError> = if refresh_cancelled {
-                refresh_in_flight.next().await.unwrap()
+                tokio::select! {
+                    biased;
+                    _ = cancel.cleanup_priority_requested() => break,
+                    result = refresh_in_flight.next() => result.unwrap(),
+                }
             } else {
                 tokio::select! {
                     biased;
+                    _ = cancel.cleanup_priority_requested() => {
+                        refresh_cancelled = true;
+                        break;
+                    }
                     _ = cancel.cancelled() => {
                         refresh_cancelled = true;
                         continue;
@@ -311,10 +323,18 @@ async fn run_destroy_locked(
                 }
 
                 let result: Result<(ResourceId, State), AppError> = if refresh_cancelled {
-                    orphan_in_flight.next().await.unwrap()
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cleanup_priority_requested() => break,
+                        result = orphan_in_flight.next() => result.unwrap(),
+                    }
                 } else {
                     tokio::select! {
                         biased;
+                        _ = cancel.cleanup_priority_requested() => {
+                            refresh_cancelled = true;
+                            break;
+                        }
                         _ = cancel.cancelled() => {
                             refresh_cancelled = true;
                             continue;
@@ -619,16 +639,22 @@ async fn run_destroy_locked(
 
     let mut in_flight = FuturesUnordered::new();
 
-    loop {
+    'destroy: loop {
         let undispatched_at_loop_start = all_indices
             .iter()
             .filter(|&&idx| !dispatched.contains(&idx))
             .count();
-        if cancel.is_cancelled()
-            && !cancelled
-            && (undispatched_at_loop_start > 0 || !in_flight.is_empty())
-        {
-            cancelled = true;
+        match cancel.phase() {
+            ShutdownPhase::CleanupPriority => {
+                cancelled = true;
+                break 'destroy;
+            }
+            ShutdownPhase::Graceful
+                if !cancelled && (undispatched_at_loop_start > 0 || !in_flight.is_empty()) =>
+            {
+                cancelled = true;
+            }
+            ShutdownPhase::Running | ShutdownPhase::Graceful => {}
         }
 
         if !cancelled {
@@ -648,7 +674,7 @@ async fn run_destroy_locked(
 
             // Process newly ready resources
             for idx in newly_ready {
-                if cancel.is_cancelled() {
+                if shutdown_requested(&cancel) {
                     cancelled = true;
                     break;
                 }
@@ -707,15 +733,21 @@ async fn run_destroy_locked(
                             ))
                             .ok();
 
-                        match wait_for_deletion(
-                            &provider,
-                            &dep_id,
-                            &dep_identifier,
-                            180,
-                            std::time::Duration::from_secs(10),
-                        )
-                        .await
-                        {
+                        let wait_result = tokio::select! {
+                            biased;
+                            _ = cancel.cleanup_priority_requested() => {
+                                cancelled = true;
+                                break 'destroy;
+                            }
+                            result = wait_for_deletion(
+                                &provider,
+                                &dep_id,
+                                &dep_identifier,
+                                180,
+                                std::time::Duration::from_secs(10),
+                            ) => result,
+                        };
+                        match wait_result {
                             WaitResult::Deleted => {
                                 multi
                                     .println(format!(
@@ -820,6 +852,7 @@ async fn run_destroy_locked(
                             },
                         )
                         .await;
+                    observe_destroy_result_ready_for_tests().await;
                     (
                         idx,
                         resource_id,
@@ -895,16 +928,24 @@ async fn run_destroy_locked(
         // Wait for the next deletion to complete
         let (finished_idx, resource_id, identifier, generation, started, delete_result) =
             if cancelled {
-                in_flight.next().await.unwrap()
+                tokio::select! {
+                    biased;
+                    finished = in_flight.next() => finished.unwrap(),
+                    _ = cancel.cleanup_priority_requested() => break 'destroy,
+                }
             } else {
                 tokio::select! {
                     biased;
+                    finished = in_flight.next() => {
+                        finished.unwrap()
+                    }
+                    _ = cancel.cleanup_priority_requested() => {
+                        cancelled = true;
+                        break 'destroy;
+                    }
                     _ = cancel.cancelled() => {
                         cancelled = true;
                         continue;
-                    }
-                    finished = in_flight.next() => {
-                        finished.unwrap()
                     }
                 }
             };
@@ -1004,11 +1045,12 @@ async fn run_destroy_locked(
             }
         }
     }
+    drop(in_flight);
 
     // Handle any remaining timed-out resources that no parent waited on.
     if !cancelled {
         for (dep_idx, (dep_id, dep_identifier, dep_generation)) in &timed_out_resources {
-            if cancel.is_cancelled() {
+            if shutdown_requested(&cancel) {
                 cancelled = true;
                 break;
             }
@@ -1021,6 +1063,10 @@ async fn run_destroy_locked(
 
             let outcome = tokio::select! {
                 biased;
+                _ = cancel.cleanup_priority_requested() => {
+                    cancelled = true;
+                    break;
+                }
                 _ = cancel.cancelled() => {
                     cancelled = true;
                     break;
@@ -1078,14 +1124,22 @@ async fn run_destroy_locked(
     println!();
     println!("{}", "Saving state...".cyan());
 
-    let finalize_result = finalize_destroy(FinalizeDestroyInput {
-        backend,
-        lock,
-        state_file,
-        destroyed_instances: &destroyed_instances,
-    })
-    .await;
-    handle_finalize_after_execute(finalize_result, cancelled)?;
+    finalize_after_execute(
+        |persistence| {
+            finalize_destroy(
+                FinalizeDestroyInput {
+                    backend,
+                    lock,
+                    state_file,
+                    destroyed_instances: &destroyed_instances,
+                },
+                persistence,
+            )
+        },
+        cancelled,
+        &cancel,
+    )
+    .await?;
 
     println!();
     if failure_count == 0 && skip_count == 0 {
@@ -1109,17 +1163,46 @@ static DESTROY_SUCCESS_CANCEL_AFTER: std::sync::Mutex<Option<DestroySuccessCance
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
-struct DestroySuccessCancelHook {
-    threshold: usize,
-    cancel: CancellationToken,
+static DESTROY_READY_RESULT_BARRIER: std::sync::Mutex<Option<DestroyReadyResultBarrier>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct DestroyReadyResultBarrier {
+    reached: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
 }
 
 #[cfg(test)]
-pub(crate) fn set_destroy_success_cancel_after(threshold: usize, cancel: CancellationToken) {
+impl DestroyReadyResultBarrier {
+    fn new() -> Self {
+        Self {
+            reached: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    pub(crate) async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+struct DestroySuccessCancelHook {
+    threshold: usize,
+    trigger: TestShutdownTrigger,
+}
+
+#[cfg(test)]
+pub(crate) fn set_destroy_success_cancel_after(threshold: usize, trigger: TestShutdownTrigger) {
     *DESTROY_SUCCESS_CANCEL_AFTER
         .lock()
         .expect("destroy success cancel hook lock") =
-        Some(DestroySuccessCancelHook { threshold, cancel });
+        Some(DestroySuccessCancelHook { threshold, trigger });
 }
 
 #[cfg(test)]
@@ -1130,10 +1213,41 @@ pub(crate) fn clear_destroy_success_cancel_after() {
 }
 
 #[cfg(test)]
+pub(crate) fn install_destroy_ready_result_barrier() -> DestroyReadyResultBarrier {
+    let barrier = DestroyReadyResultBarrier::new();
+    *DESTROY_READY_RESULT_BARRIER
+        .lock()
+        .expect("destroy ready result barrier lock") = Some(barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+pub(crate) fn clear_destroy_ready_result_barrier() {
+    *DESTROY_READY_RESULT_BARRIER
+        .lock()
+        .expect("destroy ready result barrier lock") = None;
+}
+
+#[cfg(test)]
+async fn observe_destroy_result_ready_for_tests() {
+    let barrier = DESTROY_READY_RESULT_BARRIER
+        .lock()
+        .expect("destroy ready result barrier lock")
+        .take();
+    if let Some(barrier) = barrier {
+        barrier.reached.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(not(test))]
+async fn observe_destroy_result_ready_for_tests() {}
+
+#[cfg(test)]
 fn observe_destroy_success_for_tests(
     success_count: usize,
     _resource_id: &ResourceId,
-    _cancel: &CancellationToken,
+    _cancel: &ShutdownToken,
 ) {
     if let Some(hook) = DESTROY_SUCCESS_CANCEL_AFTER
         .lock()
@@ -1141,7 +1255,14 @@ fn observe_destroy_success_for_tests(
         .as_ref()
         && success_count == hook.threshold
     {
-        hook.cancel.cancel();
+        hook.trigger.request_graceful_shutdown();
+    }
+}
+
+fn shutdown_requested(shutdown: &ShutdownToken) -> bool {
+    match shutdown.phase() {
+        ShutdownPhase::Running => false,
+        ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => true,
     }
 }
 
@@ -1149,7 +1270,7 @@ fn observe_destroy_success_for_tests(
 fn observe_destroy_success_for_tests(
     _success_count: usize,
     _resource_id: &ResourceId,
-    _cancel: &CancellationToken,
+    _cancel: &ShutdownToken,
 ) {
 }
 
@@ -1503,7 +1624,10 @@ pub(crate) struct FinalizeDestroyInput<'a> {
     pub destroyed_instances: &'a [DestroyedInstance],
 }
 
-pub(crate) async fn finalize_destroy(input: FinalizeDestroyInput<'_>) -> Result<(), AppError> {
+pub(crate) async fn finalize_destroy(
+    input: FinalizeDestroyInput<'_>,
+    persistence: StatePersistence,
+) -> Result<(), AppError> {
     let mut state = input.state_file.unwrap_or_default();
 
     // NOTE: apply_destroy_to_state currently clears state.exports unconditionally.
@@ -1513,9 +1637,20 @@ pub(crate) async fn finalize_destroy(input: FinalizeDestroyInput<'_>) -> Result<
     apply_destroy_to_state(&mut state, input.destroyed_instances);
 
     if let Some(lock) = input.lock {
-        crate::commands::apply::save_state_locked(input.backend, lock, &mut state).await?;
+        crate::commands::apply::save_state_locked_after_execute(
+            input.backend,
+            lock,
+            &mut state,
+            persistence,
+        )
+        .await?;
     } else {
-        crate::commands::apply::save_state_unlocked(input.backend, &mut state).await?;
+        crate::commands::apply::save_state_unlocked_after_execute(
+            input.backend,
+            &mut state,
+            persistence,
+        )
+        .await?;
     }
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
     Ok(())
@@ -1638,6 +1773,97 @@ mod tests {
             state.exports.is_empty(),
             "exports must be cleared on partial destroy"
         );
+    }
+
+    #[tokio::test]
+    async fn destroy_cleanup_priority_persists_completed_deletion_and_releases_lock() {
+        let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
+            .lock()
+            .await;
+        let fixture = DestroyCancellationFixture::new()
+            .with_existing_resources(["z_blocked", "a_completed"])
+            .with_blocked_delete("z_blocked");
+        let shutdown = fixture.cancel_token();
+
+        let destroy = run_destroy(
+            fixture.config_path(),
+            true,
+            true,
+            false,
+            false,
+            NonZeroUsize::new(1).unwrap(),
+            fixture.provider_context(),
+            shutdown,
+        );
+        tokio::pin!(destroy);
+        tokio::select! {
+            () = fixture.wait_for_blocked_delete() => {}
+            result = &mut destroy => panic!("destroy returned before the blocking delete started: {result:?}"),
+        }
+        fixture.prioritize_cleanup();
+        let err = tokio::time::timeout(Duration::from_millis(250), &mut destroy)
+            .await
+            .expect("cleanup priority must abandon the blocked provider delete")
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Interrupted));
+        let state = fixture.read_state().await;
+        assert!(
+            state
+                .find_resource("mock", "test.resource", "a_completed")
+                .is_none(),
+            "the deletion folded before cleanup priority must be flushed"
+        );
+        assert!(
+            state
+                .find_resource("mock", "test.resource", "z_blocked")
+                .is_some(),
+            "the abandoned deletion must remain in state"
+        );
+        assert!(
+            !fixture.lock_path().exists(),
+            "cleanup must release the lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_harvests_ready_deletion_before_cleanup_priority() {
+        let fixture = DestroyCancellationFixture::new()
+            .with_existing_resources(["ready"])
+            .with_delete_result_barrier();
+        let shutdown = fixture.cancel_token();
+
+        let destroy = run_destroy(
+            fixture.config_path(),
+            true,
+            true,
+            false,
+            false,
+            NonZeroUsize::new(1).unwrap(),
+            fixture.provider_context(),
+            shutdown,
+        );
+        tokio::pin!(destroy);
+
+        tokio::select! {
+            () = fixture.wait_for_delete_result() => {}
+            result = &mut destroy => {
+                panic!("destroy returned before its provider result was released: {result:?}");
+            }
+        }
+
+        fixture.release_delete_result_and_prioritize_cleanup();
+        let err = destroy.await.unwrap_err();
+
+        assert!(matches!(err, AppError::Interrupted));
+        let state = fixture.read_state().await;
+        assert!(
+            state
+                .find_resource("mock", "test.resource", "ready")
+                .is_none(),
+            "a deletion result that was already ready must be harvested before shutdown"
+        );
+        assert!(!fixture.lock_path().exists(), "lock must be released");
     }
 
     /// A mock provider whose `read()` returns a sequence of results.

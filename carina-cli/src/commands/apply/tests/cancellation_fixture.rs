@@ -4,17 +4,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use carina_core::executor::{ExecutionEvent, ExecutionObserver};
 use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
+use carina_core::shutdown::ShutdownToken;
+use carina_core::shutdown::testing::TestShutdownTrigger;
 use carina_state::LocalBackend;
-use tokio_util::sync::CancellationToken;
 
-use crate::commands::shared::cancellation_test_support::CancellationFixtureBase;
+use crate::commands::shared::cancellation_test_support::{CancellationFixtureBase, ScopedEnv};
 use crate::commands::shared::observer::CliObserver;
 
 struct CancellingObserver {
     inner: CliObserver,
     success_count: Arc<AtomicUsize>,
     threshold: usize,
-    cancel: CancellationToken,
+    shutdown_trigger: TestShutdownTrigger,
 }
 
 impl ExecutionObserver for CancellingObserver {
@@ -23,7 +24,7 @@ impl ExecutionObserver for CancellingObserver {
         if matches!(event, ExecutionEvent::EffectSucceeded { .. }) {
             let successes = self.success_count.fetch_add(1, Ordering::SeqCst) + 1;
             if successes == self.threshold {
-                self.cancel.cancel();
+                self.shutdown_trigger.request_graceful_shutdown();
             }
         }
     }
@@ -34,6 +35,8 @@ pub(super) struct ApplyCancellationFixture {
     provider_context: ProviderContext,
     cancel_after_successes: Option<usize>,
     success_count: Arc<AtomicUsize>,
+    provider_ready_path: Option<std::path::PathBuf>,
+    _provider_env: Vec<ScopedEnv>,
 }
 
 impl ApplyCancellationFixture {
@@ -43,6 +46,8 @@ impl ApplyCancellationFixture {
             provider_context: ProviderContext::default(),
             cancel_after_successes: None,
             success_count: Arc::new(AtomicUsize::new(0)),
+            provider_ready_path: None,
+            _provider_env: Vec::new(),
         }
     }
 
@@ -96,8 +101,40 @@ impl ApplyCancellationFixture {
         self
     }
 
-    pub(super) fn cancel_token(&self) -> CancellationToken {
-        self.base.cancel_token()
+    pub(super) fn with_blocked_create(mut self, name: &str) -> Self {
+        let ready_path = self.base.readiness_path("mock-create-ready");
+        self._provider_env = vec![
+            ScopedEnv::set(
+                "CARINA_MOCK_CREATE_DELAY_MS_FOR",
+                format!("test.resource.{name}"),
+            ),
+            ScopedEnv::set("CARINA_MOCK_CREATE_DELAY_MS", "60000"),
+            ScopedEnv::set("CARINA_MOCK_CREATE_READY_PATH", &ready_path),
+        ];
+        self.provider_ready_path = Some(ready_path);
+        self
+    }
+
+    pub(super) async fn wait_for_blocked_create(&self) {
+        let ready_path = self
+            .provider_ready_path
+            .as_ref()
+            .expect("blocked create must be configured");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !ready_path.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("mock provider did not signal that the blocked create started");
+    }
+
+    pub(super) fn prioritize_cleanup(&self) {
+        self.base.shutdown_trigger().prioritize_cleanup();
+    }
+
+    pub(super) fn cancel_token(&self) -> ShutdownToken {
+        self.base.shutdown_token()
     }
 
     pub(super) async fn read_state(&self) -> carina_state::StateFile {
@@ -127,7 +164,7 @@ impl ApplyCancellationFixture {
                     inner: CliObserver::new(plan),
                     success_count: Arc::clone(&self.success_count),
                     threshold,
-                    cancel: self.base.cancel_token(),
+                    shutdown_trigger: self.base.shutdown_trigger(),
                 })
             } else {
                 Box::new(CliObserver::new(plan))

@@ -7,6 +7,9 @@ description = "Core library for Carina, a functional infrastructure management t
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+test-shutdown = []
+
 [dependencies]
 carina-provider-protocol = { path = "../carina-provider-protocol" }
 futures = "0.3"

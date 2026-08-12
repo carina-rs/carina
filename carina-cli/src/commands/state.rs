@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use colored::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
-use tokio_util::sync::CancellationToken;
 
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
@@ -17,6 +16,7 @@ use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
 use carina_core::resource::{
     ConcreteValue, DataSource, ResolvedDataSource, Resource, ResourceId, State, Value,
 };
+use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, DeposedInstance, DeposedKey, LockInfo,
@@ -25,6 +25,7 @@ use carina_state::{
 };
 
 use super::{BackendDriftStatus, DriftCommand, inspect_backend_drift, verify_for_mutation};
+use crate::commands::shared::finalize::release_lock_after_execute;
 use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overrides};
 use crate::error::AppError;
 use crate::wiring::{
@@ -32,6 +33,13 @@ use crate::wiring::{
     get_provider_with_ctx, read_data_source_with_retry, reconcile_anonymous_identifiers_with_ctx,
     reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
 };
+
+fn shutdown_requested(shutdown: &ShutdownToken) -> bool {
+    match shutdown.phase() {
+        ShutdownPhase::Running => false,
+        ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => true,
+    }
+}
 
 /// Convert a lock acquisition error into an `AppError`.
 ///
@@ -271,7 +279,7 @@ pub enum StateCommands {
 pub async fn run_state_command(
     command: StateCommands,
     provider_context: &ProviderContext,
-    cancel: CancellationToken,
+    cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     match command {
         StateCommands::BucketDelete {
@@ -887,7 +895,7 @@ async fn run_state_bucket_delete(
         .resource_type()
         .ok_or("Backend does not specify a resource type")?;
     let base_dir = get_base_dir(path);
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
+    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
     let ctx = WiringContext::new(factories);
     let factory = provider_mod::find_factory(ctx.factories(), backend_provider_name)
         .ok_or_else(|| format!("No provider factory found for '{}'", backend_provider_name))?;
@@ -942,7 +950,7 @@ pub async fn run_state_refresh(
     path: &Path,
     lock: bool,
     provider_context: &ProviderContext,
-    cancel: CancellationToken,
+    cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     let loaded = load_configuration_with_config(
         path,
@@ -998,13 +1006,13 @@ pub async fn run_state_refresh(
         backend.as_ref(),
         lock_info.as_ref(),
         base_dir,
-        cancel,
+        cancel.clone(),
     )
     .await;
 
     // Always release lock if it was acquired
     if let Some(ref li) = lock_info {
-        let release_result = backend.release_lock(li).await.map_err(AppError::Backend);
+        let release_result = release_lock_after_execute(backend.as_ref(), li, &cancel).await;
 
         if release_result.is_ok() && matches!(op_result, Err(AppError::Interrupted)) {
             println!("  {} Lock released", "✓".green());
@@ -1022,9 +1030,9 @@ pub(crate) async fn run_state_refresh_locked(
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
     base_dir: &std::path::Path,
-    cancel: CancellationToken,
+    cancel: ShutdownToken,
 ) -> Result<(), AppError> {
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
+    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
     let ctx = WiringContext::new(factories);
 
     // Read current state from backend. carina#3315: persist any older-schema
@@ -1090,7 +1098,7 @@ pub(crate) async fn run_state_refresh_locked(
         .collect();
     let (mut current_states, already_refreshed) =
         refresh_existing_resources_until_cancelled(&provider, managed_reads, &cancel).await?;
-    if cancel.is_cancelled() {
+    if shutdown_requested(&cancel) {
         return Err(AppError::Interrupted);
     }
 
@@ -1164,7 +1172,7 @@ pub(crate) async fn run_state_refresh_locked(
     })
     .await?;
     sorted_resources = resorted;
-    if cancel.is_cancelled() {
+    if shutdown_requested(&cancel) {
         return Err(AppError::Interrupted);
     }
 
@@ -1240,13 +1248,13 @@ pub(crate) async fn run_state_refresh_locked(
                     continue;
                 }
             };
-            if cancel.is_cancelled() {
+            if shutdown_requested(&cancel) {
                 return Err(AppError::Interrupted);
             }
             let fresh_state = read_data_source_with_retry(&provider, &resource)
                 .await
                 .map_err(AppError::Provider)?;
-            if cancel.is_cancelled() {
+            if shutdown_requested(&cancel) {
                 return Err(AppError::Interrupted);
             }
             current_states.insert(resource.id.clone(), fresh_state);
@@ -1330,7 +1338,7 @@ pub(crate) async fn run_state_refresh_locked(
         &cancel,
     )
     .await?;
-    if cancel.is_cancelled() {
+    if shutdown_requested(&cancel) {
         return Err(AppError::Interrupted);
     }
 
@@ -1426,13 +1434,13 @@ fn format_state_refresh_summary(
 async fn refresh_existing_resources_until_cancelled(
     provider: &dyn Provider,
     reads: Vec<(ResourceId, String)>,
-    cancel: &CancellationToken,
+    cancel: &ShutdownToken,
 ) -> Result<(HashMap<ResourceId, State>, HashSet<ResourceId>), AppError> {
     let mut current_states = HashMap::new();
     let mut refreshed = HashSet::new();
     let mut read_iter = reads.into_iter();
     let mut in_flight = FuturesUnordered::new();
-    let mut refresh_cancelled = cancel.is_cancelled();
+    let mut refresh_cancelled = shutdown_requested(cancel);
 
     loop {
         while !refresh_cancelled && in_flight.len() < 5 {
@@ -1457,10 +1465,18 @@ async fn refresh_existing_resources_until_cancelled(
         }
 
         let result: Result<(ResourceId, State), AppError> = if refresh_cancelled {
-            in_flight.next().await.unwrap()
+            tokio::select! {
+                biased;
+                _ = cancel.cleanup_priority_requested() => break,
+                result = in_flight.next() => result.unwrap(),
+            }
         } else {
             tokio::select! {
                 biased;
+                _ = cancel.cleanup_priority_requested() => {
+                    refresh_cancelled = true;
+                    break;
+                }
                 _ = cancel.cancelled() => {
                     refresh_cancelled = true;
                     continue;
@@ -1517,7 +1533,7 @@ async fn refresh_deposed_generations_until_cancelled<P>(
     state: &mut carina_state::StateFile,
     desired_resources: &[Resource],
     schemas: &carina_core::schema::SchemaRegistry,
-    cancel: &CancellationToken,
+    cancel: &ShutdownToken,
 ) -> Result<DeposedRefreshSummary, AppError>
 where
     P: Provider + ProviderNormalizer + ?Sized,
@@ -1531,18 +1547,20 @@ where
     };
 
     for target in targets {
-        if cancel.is_cancelled() {
+        if shutdown_requested(cancel) {
             return Err(AppError::Interrupted);
         }
 
-        let read_result = provider
-            .read(
+        let read_result = tokio::select! {
+            biased;
+            _ = cancel.cleanup_priority_requested() => return Err(AppError::Interrupted),
+            result = provider.read(
                 &target.id,
                 Some(target.identifier.as_str()),
                 carina_core::provider::ReadRequest,
-            )
-            .await;
-        if cancel.is_cancelled() {
+            ) => result,
+        };
+        if shutdown_requested(cancel) {
             return Err(AppError::Interrupted);
         }
 
@@ -1597,7 +1615,7 @@ where
             schemas,
         )
         .await;
-        if cancel.is_cancelled() {
+        if shutdown_requested(cancel) {
             return Err(AppError::Interrupted);
         }
         let schema = schemas.get_for(&masking_resource);
@@ -2645,7 +2663,7 @@ mod tests {
             &mut state,
             &[desired],
             &SchemaRegistry::new(),
-            &CancellationToken::new(),
+            &ShutdownToken::running(),
         )
         .await
         .unwrap();
@@ -2702,7 +2720,7 @@ mod tests {
             &mut state,
             &[],
             &SchemaRegistry::new(),
-            &CancellationToken::new(),
+            &ShutdownToken::running(),
         )
         .await
         .unwrap();
@@ -2755,7 +2773,7 @@ mod tests {
             &mut state,
             &[desired],
             &SchemaRegistry::new(),
-            &CancellationToken::new(),
+            &ShutdownToken::running(),
         )
         .await
         .unwrap();
@@ -2812,7 +2830,7 @@ mod tests {
             &mut state,
             &[],
             &schemas,
-            &CancellationToken::new(),
+            &ShutdownToken::running(),
         )
         .await
         .unwrap();
@@ -2862,7 +2880,7 @@ mod tests {
             &mut state,
             &[],
             &SchemaRegistry::new(),
-            &CancellationToken::new(),
+            &ShutdownToken::running(),
         )
         .await
         .unwrap();
@@ -2928,7 +2946,7 @@ mod tests {
             &mut state,
             &[],
             &SchemaRegistry::new(),
-            &CancellationToken::new(),
+            &ShutdownToken::running(),
         )
         .await
         .unwrap();
@@ -2953,7 +2971,7 @@ mod tests {
             &mut state,
             &[],
             &SchemaRegistry::new(),
-            &CancellationToken::new(),
+            &ShutdownToken::running(),
         )
         .await
         .unwrap();
@@ -3166,7 +3184,7 @@ mod tests {
             &mut state,
             &[],
             &SchemaRegistry::new(),
-            &CancellationToken::new(),
+            &ShutdownToken::running(),
         )
         .await
         .unwrap();
@@ -3235,7 +3253,7 @@ mod tests {
             &mut state,
             std::slice::from_ref(&desired),
             &schemas,
-            &CancellationToken::new(),
+            &ShutdownToken::running(),
         )
         .await
         .unwrap();
@@ -3264,7 +3282,7 @@ mod tests {
             &mut state,
             std::slice::from_ref(&desired),
             &schemas,
-            &CancellationToken::new(),
+            &ShutdownToken::running(),
         )
         .await
         .unwrap();
@@ -3332,7 +3350,7 @@ mod tests {
             &mut state,
             &[wrong_instance, right_instance],
             &SchemaRegistry::new(),
-            &CancellationToken::new(),
+            &ShutdownToken::running(),
         )
         .await
         .unwrap();
@@ -3372,7 +3390,7 @@ mod tests {
             &mut state,
             &[],
             &SchemaRegistry::new(),
-            &CancellationToken::new(),
+            &ShutdownToken::running(),
         )
         .await
         .unwrap();
