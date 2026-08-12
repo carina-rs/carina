@@ -1908,7 +1908,6 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     use carina_core::effect::Effect;
     use carina_core::parser::{ProviderContext, parse};
     use carina_state::state::{ResourceState, StateFile};
-    use tokio_util::sync::CancellationToken;
 
     fn string(value: &str) -> Value {
         Value::Concrete(ConcreteValue::String(value.to_string()))
@@ -2071,7 +2070,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         &provider,
         input,
         &NoopExecutionObserver,
-        CancellationToken::new(),
+        carina_core::shutdown::ShutdownToken::running(),
     )
     .await;
     let result = match outcome {
@@ -5042,7 +5041,7 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
         default_tags: IndexMap::new(),
     };
 
-    let (factories, errors) = build_factories_from_providers(&[config], base);
+    let (factories, errors) = build_factories_from_providers(&[config], base).unwrap();
     let rendered = errors
         .get("awscc")
         .expect("missing locked artifact must reach the CLI diagnostic boundary");
@@ -5132,4 +5131,43 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
             .values()
             .any(|error| error.contains("locked at version 1.0.0"))
     );
+}
+
+#[test]
+fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    let source = "github.com/carina-rs/carina-provider-awscc";
+    let mut lock = carina_provider_resolver::LockFile::default();
+    lock.upsert(carina_provider_resolver::LockEntry {
+        name: "awscc".into(),
+        source: source.into(),
+        kind: carina_provider_resolver::LockEntryKind::Version {
+            version: "1.0.0".into(),
+            constraint: None,
+        },
+        sha256: "fixture".into(),
+        registry: None,
+    });
+    lock.save(&base.join("carina-providers.lock")).unwrap();
+    let config = ProviderConfig {
+        name: "awscc".into(),
+        source: Some(source.into()),
+        version: Some(carina_core::version_constraint::VersionConstraint::parse("^2.0.0").unwrap()),
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+
+    let result = build_factories_from_providers(&[config], base);
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("mismatched provider lock must be returned as an error"),
+    };
+
+    assert!(error.to_string().contains("locked at version 1.0.0"));
+    assert!(error.to_string().contains("carina init --upgrade"));
 }

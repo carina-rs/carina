@@ -4,6 +4,7 @@ use carina_core::effect::{Effect, resolve_import_identifier};
 use carina_core::executor::ExecutionResult;
 use carina_core::plan::Plan;
 use carina_core::provider::{Provider, ReadRequest};
+use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
 use colored::Colorize;
 
 /// Execute import effects by reading the resource from the provider.
@@ -15,9 +16,14 @@ pub(crate) async fn execute_import_effects(
     plan: &Plan,
     provider: &dyn Provider,
     result: &mut ExecutionResult,
+    shutdown: &ShutdownToken,
 ) {
     for effect in plan.effects() {
         if let Effect::Import { id, identifier } = effect {
+            if shutdown_requested(shutdown) {
+                return;
+            }
+
             // carina#3329: the identifier is a `Value` so an
             // interpolation referencing a deferred upstream-state ref
             // can survive plan-time display as `(known after upstream
@@ -40,10 +46,14 @@ pub(crate) async fn execute_import_effects(
                 id,
                 identifier_str
             );
-            match provider
-                .read(id, Some(identifier_str.as_str()), ReadRequest)
-                .await
-            {
+            let read = provider.read(id, Some(identifier_str.as_str()), ReadRequest);
+            tokio::pin!(read);
+            let read_result = tokio::select! {
+                biased;
+                _ = shutdown.cleanup_priority_requested() => return,
+                result = &mut read => result,
+            };
+            match read_result {
                 Ok(state) => {
                     if state.exists {
                         println!("  {} Imported {}", "✓".green(), id);
@@ -65,6 +75,13 @@ pub(crate) async fn execute_import_effects(
                 }
             }
         }
+    }
+}
+
+fn shutdown_requested(shutdown: &ShutdownToken) -> bool {
+    match shutdown.phase() {
+        ShutdownPhase::Running => false,
+        ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => true,
     }
 }
 
@@ -235,7 +252,7 @@ mod tests {
 
         let recorder = ReadRecorder::new();
         let mut result = empty_result();
-        execute_import_effects(&plan, &recorder, &mut result).await;
+        execute_import_effects(&plan, &recorder, &mut result, &ShutdownToken::running()).await;
 
         assert_eq!(
             recorder.read_count(),
@@ -265,7 +282,7 @@ mod tests {
 
         let recorder = ReadRecorder::new();
         let mut result = empty_result();
-        execute_import_effects(&plan, &recorder, &mut result).await;
+        execute_import_effects(&plan, &recorder, &mut result, &ShutdownToken::running()).await;
 
         let reads = recorder.reads.lock().unwrap();
         assert_eq!(reads.len(), 1);

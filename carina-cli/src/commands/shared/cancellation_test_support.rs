@@ -1,8 +1,44 @@
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+use carina_core::shutdown::ShutdownToken;
+use carina_core::shutdown::testing::{TestShutdownTrigger, shutdown_channel};
 use carina_state::{LocalBackend, StateBackend, StateFile};
 use tempfile::TempDir;
-use tokio_util::sync::CancellationToken;
+
+pub(crate) static MOCK_PROVIDER_ENV_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+pub(crate) struct ScopedEnv {
+    name: &'static str,
+    previous: Option<OsString>,
+}
+
+impl ScopedEnv {
+    pub(crate) fn set(name: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let previous = std::env::var_os(name);
+        // SAFETY: cancellation tests hold MOCK_PROVIDER_ENV_LOCK for the
+        // lifetime of every ScopedEnv value.
+        unsafe {
+            std::env::set_var(name, value);
+        }
+        Self { name, previous }
+    }
+}
+
+impl Drop for ScopedEnv {
+    fn drop(&mut self) {
+        // SAFETY: cancellation tests hold MOCK_PROVIDER_ENV_LOCK until after
+        // their fixture (and therefore these guards) is dropped.
+        unsafe {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.name, previous);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+}
 
 pub(crate) struct CancellationFixtureBase {
     _dir: TempDir,
@@ -11,7 +47,8 @@ pub(crate) struct CancellationFixtureBase {
     state_path: PathBuf,
     lock_path: PathBuf,
     backend: LocalBackend,
-    cancel: CancellationToken,
+    shutdown_trigger: TestShutdownTrigger,
+    shutdown: ShutdownToken,
 }
 
 impl CancellationFixtureBase {
@@ -23,6 +60,7 @@ impl CancellationFixtureBase {
         let lock_path = state_path.with_extension("lock");
         let backend = LocalBackend::with_path(state_path.clone());
 
+        let (shutdown_trigger, shutdown) = shutdown_channel();
         Self {
             _dir: dir,
             config_path,
@@ -30,7 +68,8 @@ impl CancellationFixtureBase {
             state_path,
             lock_path,
             backend,
-            cancel: CancellationToken::new(),
+            shutdown_trigger,
+            shutdown,
         }
     }
 
@@ -82,7 +121,15 @@ impl CancellationFixtureBase {
         &self.backend
     }
 
-    pub(crate) fn cancel_token(&self) -> CancellationToken {
-        self.cancel.clone()
+    pub(crate) fn readiness_path(&self, name: &str) -> PathBuf {
+        self.config_path.join(name)
+    }
+
+    pub(crate) fn shutdown_token(&self) -> ShutdownToken {
+        self.shutdown.clone()
+    }
+
+    pub(crate) fn shutdown_trigger(&self) -> TestShutdownTrigger {
+        self.shutdown_trigger.clone()
     }
 }

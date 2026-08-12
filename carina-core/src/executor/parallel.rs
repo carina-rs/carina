@@ -4,13 +4,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use tokio_util::sync::CancellationToken;
-
 #[cfg(test)]
 use crate::effect::deps::UnresolvedResource;
 use crate::effect::{DeletedInstanceKey, Effect};
 use crate::provider::Provider;
 use crate::resource::{Resource, ResourceId, Value};
+use crate::shutdown::{ShutdownPhase, ShutdownToken};
 
 use super::basic::{
     BasicEffectCtx, ExecutionState, RenormalizePipeline, count_actionable_effects,
@@ -217,7 +216,7 @@ pub(super) async fn execute_effects_sequential(
     provider: &dyn Provider,
     input: &mut ExecutionInput<'_>,
     observer: &dyn ExecutionObserver,
-    cancel: &CancellationToken,
+    shutdown: &ShutdownToken,
 ) -> (ExecutionResult, bool) {
     let mut success_count = 0;
     let mut failure_count = 0;
@@ -277,17 +276,23 @@ pub(super) async fn execute_effects_sequential(
     let mut in_flight: WaitAwareInFlight<'_, SingleEffectResult> = WaitAwareInFlight::new();
     let mut cancelled = false;
 
-    loop {
+    'execution: loop {
         let undispatched_at_loop_start = actionable_indices
             .iter()
             .filter(|&&idx| !dispatched.contains(&idx))
             .count();
-        if cancel.is_cancelled()
-            && !cancelled
-            && (undispatched_at_loop_start > 0 || !in_flight.is_empty())
-        {
-            cancelled = true;
-            in_flight.signal_in_flight_waits();
+        match shutdown.phase() {
+            ShutdownPhase::CleanupPriority => {
+                cancelled = true;
+                break 'execution;
+            }
+            ShutdownPhase::Graceful
+                if !cancelled && (undispatched_at_loop_start > 0 || !in_flight.is_empty()) =>
+            {
+                cancelled = true;
+                in_flight.signal_in_flight_waits();
+            }
+            ShutdownPhase::Running | ShutdownPhase::Graceful => {}
         }
 
         // Find newly ready effects: all deps completed and not yet dispatched
@@ -616,23 +621,8 @@ pub(super) async fn execute_effects_sequential(
 
         // Wait for the next effect to complete
         let (finished_idx, result) = if cancelled {
-            let Some(finished) = in_flight
-                .check_terminal(count_undispatched(&dispatched, &failed_indices))
-                .cancel_if_terminal()
-                .next_completed()
-                .await
-            else {
-                break;
-            };
-            finished
-        } else {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => {
-                    cancelled = true;
-                    in_flight.signal_in_flight_waits();
-                    continue;
-                }
                 finished = in_flight
                     .check_terminal(count_undispatched(&dispatched, &failed_indices))
                     .cancel_if_terminal()
@@ -641,6 +631,31 @@ pub(super) async fn execute_effects_sequential(
                         break;
                     };
                     finished
+                }
+                _ = shutdown.cleanup_priority_requested() => {
+                    break 'execution;
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                finished = in_flight
+                    .check_terminal(count_undispatched(&dispatched, &failed_indices))
+                    .cancel_if_terminal()
+                    .next_completed() => {
+                    let Some(finished) = finished else {
+                        break;
+                    };
+                    finished
+                }
+                _ = shutdown.cleanup_priority_requested() => {
+                    cancelled = true;
+                    break 'execution;
+                }
+                _ = shutdown.cancelled() => {
+                    cancelled = true;
+                    in_flight.signal_in_flight_waits();
+                    continue;
                 }
             }
         };
@@ -774,13 +789,27 @@ pub(super) async fn execute_effects_sequential(
             .drop_without_awaiting();
     }
 
-    let failed_refreshes = refresh_pending_states(
-        provider,
-        &mut input.current_states,
-        &pending_refreshes,
-        observer,
-    )
-    .await;
+    // Cleanup-priority mode deliberately drops unresolved provider futures so
+    // the caller can persist the results already folded into `applied_states`.
+    drop(in_flight);
+    let (failed_refreshes, refresh_cancelled) = match shutdown.phase() {
+        ShutdownPhase::CleanupPriority => (HashSet::new(), true),
+        ShutdownPhase::Running | ShutdownPhase::Graceful => {
+            let refresh = refresh_pending_states(
+                provider,
+                &mut input.current_states,
+                &pending_refreshes,
+                observer,
+            );
+            tokio::pin!(refresh);
+            tokio::select! {
+                biased;
+                _ = shutdown.cleanup_priority_requested() => (HashSet::new(), true),
+                failed = &mut refresh => (failed, false),
+            }
+        }
+    };
+    cancelled |= refresh_cancelled;
 
     let result = ExecutionResult {
         success_count,
@@ -1061,7 +1090,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            execute_effects_sequential(&provider, &mut input, &observer, &CancellationToken::new()),
+            execute_effects_sequential(&provider, &mut input, &observer, &ShutdownToken::running()),
         )
         .await
         .expect("wait should be skipped as unsatisfiable instead of timing out");
@@ -1171,7 +1200,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            execute_effects_sequential(&provider, &mut input, &observer, &CancellationToken::new()),
+            execute_effects_sequential(&provider, &mut input, &observer, &ShutdownToken::running()),
         )
         .await
         .expect("wait should be skipped as unsatisfiable instead of polling until timeout");

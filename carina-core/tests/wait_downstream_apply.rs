@@ -43,7 +43,6 @@ use carina_core::provider::{
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
 use carina_core::schema::SchemaRegistry;
-use tokio_util::sync::CancellationToken;
 
 fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
     match outcome {
@@ -319,8 +318,15 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         parallelism: carina_core::executor::TEST_UNCAPPED,
     };
 
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &observer,
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await,
+    );
 
     let failures = observer.failures.lock().unwrap().clone();
     assert_eq!(
@@ -477,8 +483,15 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         parallelism: carina_core::executor::TEST_UNCAPPED,
     };
 
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, CancellationToken::new()).await);
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &observer,
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await,
+    );
     let failures = observer.failures.lock().unwrap().clone();
     assert_eq!(
         result.failure_count, 0,

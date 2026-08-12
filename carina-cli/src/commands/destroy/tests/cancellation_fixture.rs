@@ -1,21 +1,28 @@
 use carina_core::parser::ProviderContext;
+use carina_core::shutdown::ShutdownToken;
 use carina_state::{LocalBackend, ResourceState, StateFile};
-use tokio_util::sync::CancellationToken;
 
-use crate::commands::shared::cancellation_test_support::CancellationFixtureBase;
+use crate::commands::shared::cancellation_test_support::{CancellationFixtureBase, ScopedEnv};
 
 pub(super) struct DestroyCancellationFixture {
     base: CancellationFixtureBase,
     provider_context: ProviderContext,
+    ready_result_barrier: Option<crate::commands::destroy::DestroyReadyResultBarrier>,
+    provider_ready_path: Option<std::path::PathBuf>,
+    _provider_env: Vec<ScopedEnv>,
 }
 
 impl DestroyCancellationFixture {
     pub(super) fn new() -> Self {
         crate::commands::destroy::clear_destroy_success_cancel_after();
+        crate::commands::destroy::clear_destroy_ready_result_barrier();
 
         Self {
             base: CancellationFixtureBase::new(),
             provider_context: ProviderContext::default(),
+            ready_result_barrier: None,
+            provider_ready_path: None,
+            _provider_env: Vec::new(),
         }
     }
 
@@ -62,12 +69,69 @@ impl DestroyCancellationFixture {
     /// being reached and the next dispatch site observing cancel; the test must
     /// therefore use `NonZeroUsize::new(1).unwrap()` parallelism to be deterministic.
     pub(super) fn cancel_after_successes(self, count: usize) -> Self {
-        crate::commands::destroy::set_destroy_success_cancel_after(count, self.base.cancel_token());
+        crate::commands::destroy::set_destroy_success_cancel_after(
+            count,
+            self.base.shutdown_trigger(),
+        );
         self
     }
 
-    pub(super) fn cancel_token(&self) -> CancellationToken {
-        self.base.cancel_token()
+    pub(super) fn with_blocked_delete(mut self, name: &str) -> Self {
+        let ready_path = self.base.readiness_path("mock-delete-ready");
+        self._provider_env = vec![
+            ScopedEnv::set(
+                "CARINA_MOCK_DELETE_DELAY_MS_FOR",
+                format!("test.resource.{name}"),
+            ),
+            ScopedEnv::set("CARINA_MOCK_DELETE_DELAY_MS", "60000"),
+            ScopedEnv::set("CARINA_MOCK_DELETE_READY_PATH", &ready_path),
+        ];
+        self.provider_ready_path = Some(ready_path);
+        self
+    }
+
+    pub(super) async fn wait_for_blocked_delete(&self) {
+        let ready_path = self
+            .provider_ready_path
+            .as_ref()
+            .expect("blocked delete must be configured");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !ready_path.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("mock provider did not signal that the blocked delete started");
+    }
+
+    pub(super) fn prioritize_cleanup(&self) {
+        self.base.shutdown_trigger().prioritize_cleanup();
+    }
+
+    pub(super) fn with_delete_result_barrier(mut self) -> Self {
+        self.ready_result_barrier =
+            Some(crate::commands::destroy::install_destroy_ready_result_barrier());
+        self
+    }
+
+    pub(super) async fn wait_for_delete_result(&self) {
+        self.ready_result_barrier
+            .as_ref()
+            .expect("delete result barrier must be installed")
+            .reached()
+            .await;
+    }
+
+    pub(super) fn release_delete_result_and_prioritize_cleanup(&self) {
+        self.ready_result_barrier
+            .as_ref()
+            .expect("delete result barrier must be installed")
+            .release();
+        self.base.shutdown_trigger().prioritize_cleanup();
+    }
+
+    pub(super) fn cancel_token(&self) -> ShutdownToken {
+        self.base.shutdown_token()
     }
 
     pub(super) async fn read_state(&self) -> StateFile {
@@ -94,5 +158,6 @@ impl DestroyCancellationFixture {
 impl Drop for DestroyCancellationFixture {
     fn drop(&mut self) {
         crate::commands::destroy::clear_destroy_success_cancel_after();
+        crate::commands::destroy::clear_destroy_ready_result_barrier();
     }
 }

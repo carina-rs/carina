@@ -308,7 +308,11 @@ pub fn validate_and_resolve_errors(
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Vec<AppError> {
-    let (factories, load_errors) = build_factories_from_providers(&parsed.providers, base_dir);
+    let (factories, load_errors) = match build_factories_from_providers(&parsed.providers, base_dir)
+    {
+        Ok(loaded) => loaded,
+        Err(error) => return vec![error],
+    };
     validate_and_resolve_errors_with_factories(
         parsed,
         base_dir,

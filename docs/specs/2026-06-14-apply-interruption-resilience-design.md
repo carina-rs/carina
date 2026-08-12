@@ -1,6 +1,7 @@
 # Apply 中断時のリソース永続化とロック解放（設計）
 
-対象 issue: [carina-rs/carina#3498](https://github.com/carina-rs/carina/issues/3498)
+対象 issue: [carina-rs/carina#3498](https://github.com/carina-rs/carina/issues/3498)、
+[carina-rs/carina#3542](https://github.com/carina-rs/carina/issues/3542)
 
 ## 解こうとしていること
 
@@ -47,6 +48,20 @@ SIGTERM は素通りで OS のデフォルト処理に渡され、carina プロ�
 の方。SIGTERM ハンドラだけ足しても、`tokio::select!` で future を drop する
 seam が残る限り state は救えない。
 
+### #3542 で判明した追加の中断経路
+
+#3498 の初期修正後は SIGINT と SIGTERM の両方を受け取れていたが、signal
+listener は command future から独立した task のままだった。初回シグナルは
+cancel token を fire する一方、2 回目は `std::process::exit(130)` を直接呼ぶ。
+この形では、command future が state 保存とロック解放をまだ実行中でも listener
+だけでプロセスを終了できる。
+
+GitHub Actions のキャンセルは人間による連打ではなく、固定の
+SIGINT → 7.5 秒 → SIGTERM → 2.5 秒 → SIGKILL という sequence である。
+したがって 2 回目の SIGTERM は例外ではなく毎回到達し、旧 listener は残りの
+約 2.5 秒を cleanup に使わず即座に捨てていた。#3542 の修正ではこの 2 回目を
+「即時終了」ではなく「cleanup 優先」への phase 遷移として扱う。
+
 ## 採用案
 
 `execute_plan` の戻り値の型を変えて、「中断したかどうか」を呼び出し側が
@@ -67,7 +82,7 @@ pub async fn execute_plan(
     provider: &dyn Provider,
     input: ExecutionInput<'_>,
     observer: &dyn ExecutionObserver,
-    cancel: CancellationToken,
+    shutdown: ShutdownToken,
 ) -> ExecutionOutcome
 ```
 
@@ -108,57 +123,78 @@ apply.rs / destroy.rs どちらも同じ seam を通る。**この点が単な�
 
 ### Cancel のセマンティクス
 
-cancel token が fire したら:
+初回シグナルで graceful shutdown が fire したら:
 
 - まだ投入していない effect は捨てる
 - in-flight の effect は完了まで `await` する
 - 完了した結果は `Completed` と同じ判定基準で `applied_states` に詰める
 - すべての in-flight が捌けたら `Cancelled(result)` を返す
 
-「in-flight も即座に諦める」案は、AWS API call を発行した時点で
+graceful phase で「in-flight も即座に諦める」案は、AWS API call を発行した時点で
 リソースが AWS 側に物理的に生まれている可能性があり、その生成を
 state に記録しないと issue #3498 の症状を再現する。AWS API call は
 HTTP リクエストを送ってしまえば carina から止められないという物理的
 制約があるので、「呼んだ以上は結果を待って state に書く」を正しい
 方針とする。
 
-cancel から見て「shutdown が長引く」問題は CI のキャンセル猶予側で
-吸収する話で、carina の seam にこの種の制約を漏らさない。実運用上は
-in-flight が完了する数十秒〜数分のうちに次のシグナルが来ない限り、
-2 段階目の `process::exit(130)` には届かない。届いた場合は次節の
-「2 回目のシグナル」に倣う。
+2 回目のシグナルでは cleanup-priority phase を fire する。この phase では
+未完了の in-flight future を drop し、それまでに `ExecutionResult` へ回収済みの
+結果だけを返す。command path はその結果で state を保存してロックを解放する。
+これは通常の graceful cancel より結果回収を狭める trade-off だが、GitHub
+Actions が SIGKILL するまでの残り 2.5 秒で、回収済み state とロックを守るための
+明示的な escalation である。このとき放棄した Create は、provider future の結果を
+回収する前に AWS API が成功していれば、AWS 側では作成済みなのに state には存在しない
+状態になり得る。次回 apply が同じリソースを重複作成し得る、issue #3498 と同じ危険を
+cleanup-priority は意図的に受け入れる。したがって graceful phase ではこの放棄を行わず、
+2 回目のシグナル後に state とロックを守る最終手段としてだけ使う。
 
 ### 統一シグナルハンドラ
 
-SIGINT と SIGTERM の両方で同じ `CancellationToken` を fire する
-ハンドラに置き換える。現在の `signal::run_with_ctrl_c` の
-`tokio::select!` を使う実装は捨てる。
+SIGINT と SIGTERM の両方を command-scoped supervisor で扱う。
+`CancellationToken` だけを持つ独立 task や、command future と競争してそれを
+drop する `tokio::select!` は持たない。
 
 具体的な形:
 
-- `main.rs` 立ち上がりで `CancellationToken` を生成し、apply/destroy
-  などのトップレベルに引き渡す
-- `signal_hook` あるいは `tokio::signal::unix` の `SignalKind` で
-  SIGINT と SIGTERM を待つ tokio task を 1 本立て、初回シグナルで
-  `token.cancel()` を呼ぶ
-- 同じ task の中で 2 回目のシグナルを待ち、来たら
-  `crate::cursor::restore_cursor()` + `std::process::exit(130)` を実行
-- カーソル復元のための `signal_hook` ハンドラはこの中に統合する。
-  cursor.rs の独立した signal ハンドラ登録は撤去できる
+- `main.rs` の command dispatch 全体を `run_with_shutdown` に渡す
+- `carina-core` の supervisor が private な書き込み capability と read-only な
+  `ShutdownToken` を生成し、command future には token だけを渡す
+- 初回シグナルで graceful shutdown、2 回目で cleanup priority を request する
+- 2 回目から command future の完了と 2 秒の hard-coded deadline を競争させ、
+  どちらかに到達した後で `std::process::exit(130)` を呼ぶ。2 秒は GitHub
+  Actions の固定された SIGTERM → 2.5 秒 → SIGKILL の窓に収めるためで、CLI
+  flag や環境変数にはしない
+- 2 秒のうち最初の 1 秒を state 保存に割り当て、後半 1 秒をロック解放用に
+  予約する。state 保存が遅くてもロック解放を開始する機会を失わせない
+- S3 の cancellation cleanup だけは各 API call を 300ms・1 attempt に制限する。
+  normal apply の SDK timeout / retry は変えない。state PUT より先にロックを解放したり
+  両者を並行実行したりすると、別 process がロック取得後に旧 process の PUT が着地する
+  ため禁止する。代わりに conditional renewal の所有権確認を state PUT に再利用して、
+  state 側を lock GET + renewal PUT + state PUT の 3 call、release を GET + DELETE の
+  2 call に収め、必ず state → release の順序を保つ
+- 3 回目のシグナルだけは emergency escape hatch として即時終了する
+- カーソル復元は process exit 実装に統合する
 
-`run_with_ctrl_c` は `Future` 単体を select でラップする抽象だった
-ので、呼び出し側を `cancel_token.clone()` を渡す形に書き換える際に
-撤去する。confirm prompt 中の cancel も同じ token を見るように
-`read_line_with_interrupt` を `read_line_until_cancelled` 風に
-変える。
+signal-driven な process exit capability と command future を supervisor が
+同時に所有する。外部に公開する API は「command future を supervisor に渡す」
+形だけなので、cleanup を所有する future と無関係な detached listener を作る
+状態は型として表現できない。apply/destroy 固有の opt-in ではなく dispatch 全体の
+境界なので、将来 mutating command が増えても自動的に同じ supervisor 配下に入る。
+
+`run_with_ctrl_c` は `Future` 単体を select でラップして drop できる抽象だった
+ので撤去する。confirm prompt 中の cancel も同じ `ShutdownToken` を見るように
+`read_line_until_cancelled` へ統一する。
 
 ### apply.rs の流れ
 
 ```text
 ロック取得
-  └─ execute_plan(cancel_token).await
+  └─ execute_plan(shutdown_token).await
        ├─ Completed(result) → finalize_apply → state 保存 → ロック解放
-       └─ Cancelled(result) → finalize_apply → state 保存 → ロック解放 → Interrupted
+       └─ Cancelled(result)
+            ├─ graceful → in-flight 完了を回収
+            └─ cleanup priority → in-flight を放棄
+               → finalize_apply → state 保存 → ロック解放 → Interrupted
 ```
 
 state 保存とロック解放は中断経路でも同じコードパス。
@@ -171,9 +207,9 @@ destroy.rs にも同じ書き換えを入れる。両者は plan を実行する
 ## 何を直さないか
 
 streaming state save、すなわち 1 effect ごとの state flush は今回の
-スコープから外す。「graceful な cancel 後に in-flight 完了を待つ」を
-入れた時点で、CI step の猶予内で起きる SIGTERM / SIGINT による損失は
-カバーできる。SIGKILL や kernel OOM、ホスト消失のような「猶予が無い」
+スコープから外す。「graceful な cancel 後に in-flight 完了を待ち、2 回目では
+cleanup を優先する」ところまでを対象にする。SIGKILL や kernel OOM、
+ホスト消失のような「猶予が無い」
 中断はそもそも graceful な cleanup の対象外で、streaming save でも
 完全には救えない。streaming にすると S3 への CAS 書き込みや serial bump
 の頻度設計、トランザクション境界の見直しが必要になり、性質の違う仕事
@@ -193,21 +229,24 @@ drift 検出や live AWS との reconciliation も別議論。今回は「carina
 
 - `carina-core/src/executor/`: `execute_plan` のシグネチャ、戻り値型
   `ExecutionOutcome` の追加、cancel token を見る制御フロー
-- `carina-cli/src/signal.rs`: `run_with_ctrl_c` 撤去、cancel token を
-  fire する統一ハンドラ
+- `carina-cli/src/signal.rs`: Unix signal と process exit の adapter
 - `carina-cli/src/commands/apply/mod.rs`: 戻り値 match、finalize 経路の
   整理
 - `carina-cli/src/commands/destroy.rs`: 同上
 - `carina-cli/src/cursor.rs`: cursor restore のシグナルハンドラを統一
   ハンドラに統合（独立登録の撤去）
-- `carina-cli/src/main.rs`: cancel token の生成と引き渡し
+- `carina-cli/src/main.rs`: command dispatch 全体を supervisor に引き渡す
+- `carina-core/src/shutdown.rs`: command future と signal-driven exit を同時に所有する
+  supervisor、graceful / cleanup-priority の phase を持つ `ShutdownToken`、2 秒の
+  cleanup deadline。phase を進める capability は supervisor 内部だけが持つ
 - `Cargo.toml`: `tokio-util` を `carina-cli` と `carina-core` の依存
   に追加（あるいは自前の軽量 CancellationToken を carina-core 内に置く
   かは実装フェーズで Codex に判断させる）
 
-import / state surgery 系コマンドは `execute_plan` を呼んでいないため
-影響無し。ただし将来 mutating コマンドを追加するときは同じ seam を通る
-ので、自動的に救済される。
+import / state surgery 系コマンドも top-level dispatch として同じ supervisor
+配下に入る。executor の phase-aware な中断が必要な処理には `ShutdownToken` を
+渡すが、signal listener と cleanup future の lifetime は command 種別によらず
+常に supervisor が結び付ける。
 
 ## テスト戦略
 
@@ -228,17 +267,23 @@ import / state surgery 系コマンドは `execute_plan` を呼んでいない�
   こと、ロックが解放されていること、終了コードが `Interrupted` 由来で
   あること
 - SIGTERM でも同じこと
-- 2 回目の同じシグナルで `process::exit(130)` 経由で即死すること
-  （カーソル復元は通っていること）
+- 2 回目のシグナルでは cleanup が完了してから exit 130 になること
+- cleanup が 2 秒を超えたら deadline 後に exit 130 になること
+- state 保存が 1 秒を超えても、残り時間でロック解放を開始すること
+- 3 回目のシグナルでは即時に exit 130 になること
+- apply と destroy の両方で、cleanup-priority phase に回収済み state の保存と
+  ロック解放まで到達すること
 
-state バックエンド側のテストは現状の `acquire_lock` / `release_lock` を
-追加変更しないので不要。
+state バックエンド側では cancellation 専用 S3 operation が 1 attempt / 300ms に
+固定され、3 回の state call と 2 回の release call が 2 秒未満に収まることを検証する。
+CLI 側では call ごとの遅延を注入できる fake backend で、slow-but-bounded な全 5 call が
+deadline 内に完了することと、state flush が遅い場合も release が実行されることを検証する。
 
-issue #3498 を厳密に再現するには直接 mock provider を使った
-`carina apply` の統合テストで cancel token を fire させ、その後 state
-ファイルが正しく書かれていることを assert する。CI で reliable に
-シグナルを送るのは難しいので、`signal` モジュールを経由しない直接の
-cancel token fire でテストを書く形になる。
+issue #3498 の end-to-end 回帰テストは built binary を subprocess として起動する。
+mock provider が後続 Create の開始を readiness file で通知してから実 SIGINT を送り、
+stderr の Interrupt 受信行を handshake にして実 SIGTERM を送る。exit 130、完了済み
+resource の state 保存、放棄 resource の非保存、local lock file の削除を同時に検証し、
+Unix signal 登録と top-level `run_with_shutdown` wiring まで unit-test seam と分けて覆う。
 
 ## 失敗モードと残るリスク
 
@@ -250,9 +295,8 @@ cancel token fire でテストを書く形になる。
   state も書かれないし、ロックも残る。これは TTL ベースのロック自動
   期限切れと既存の `force-unlock` で復旧する想定で、コードでは追加
   対応しない。
-- `Cancelled(result)` の `finalize_apply` 中に二度目のシグナルが来て
-  `process::exit(130)` した場合、state 書き込みの途中で死ぬ可能性が
-  ある。state ファイル書き込みは local backend では tempfile + rename
-  で atomic、S3 backend では単発 PutObject なので、結果としては
-  「途中で死んだら state は古いまま」になる。これは現状と同じ挙動で
-  退行ではない。
+- cleanup-priority の 2 秒 deadline 内に state 保存とロック解放が終わらない
+  場合は exit 130 になる。state 保存は 1 秒で打ち切って後半をロック解放に
+  予約する。state ファイル書き込みは local backend では
+  tempfile + rename で atomic、S3 backend では単発 PutObject なので、中途半端な
+  state は公開しない。ただし deadline 到達時点で未完了の stage は失われ得る。

@@ -114,6 +114,9 @@ pub struct WiringContext {
     schemas: SchemaRegistry,
 }
 
+/// Provider factories paired with provider-specific load diagnostics.
+pub type ProviderFactoryLoad = (Vec<Box<dyn ProviderFactory>>, HashMap<String, String>);
+
 impl WiringContext {
     pub fn new(factories: Vec<Box<dyn ProviderFactory>>) -> Self {
         let mut schemas = provider_mod::collect_schemas(&factories);
@@ -174,20 +177,18 @@ impl WiringContext {
 /// later in `get_provider_with_ctx`).
 ///
 /// Returns `(factories, load_errors)` where `load_errors` maps provider names
-/// to their failure reasons, so callers can show accurate diagnostics.
+/// to their failure reasons, so callers can show accurate diagnostics. A stale
+/// lock constraint is returned to the supervised command rather than exiting.
 pub fn build_factories_from_providers(
     providers: &[ProviderConfig],
     base_dir: &Path,
-) -> (Vec<Box<dyn ProviderFactory>>, HashMap<String, String>) {
-    if let Err(e) = carina_provider_resolver::validate_lock_constraints(base_dir, providers) {
-        // process::exit skips Drop — restore the cursor first (#3158);
-        // claim-once with the command-wide guard/net.
-        crate::cursor::restore_cursor();
-        eprintln!("{}", e.red());
-        std::process::exit(1);
-    }
+) -> Result<ProviderFactoryLoad, AppError> {
+    carina_provider_resolver::validate_lock_constraints(base_dir, providers)
+        .map_err(AppError::Config)?;
 
-    build_factories_from_providers_impl(providers, base_dir, true)
+    Ok(build_factories_from_providers_impl(
+        providers, base_dir, true,
+    ))
 }
 
 /// Best-effort factory loading for schema-aware formatting.
@@ -1623,7 +1624,7 @@ pub async fn create_providers_from_configs(
     configs: &[ProviderConfig],
     base_dir: &Path,
 ) -> Result<(ProviderRouter, WiringContext), AppError> {
-    let (factories, _) = build_factories_from_providers(configs, base_dir);
+    let (factories, _) = build_factories_from_providers(configs, base_dir)?;
     let ctx = WiringContext::new(factories);
     let mut router = ProviderRouter::new();
 
@@ -2121,7 +2122,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     resolved_state_block_targets: &ResolvedStateBlockTargets,
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
+    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
     let ctx = WiringContext::new(factories);
     create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,

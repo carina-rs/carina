@@ -2,12 +2,15 @@
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
+use aws_sdk_s3::config::retry::RetryConfig;
+use aws_sdk_s3::config::timeout::TimeoutConfig;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{PublicAccessBlockConfiguration, ServerSideEncryption};
 
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use carina_core::utils::convert_region_value;
 
@@ -16,6 +19,24 @@ use crate::lock::LockInfo;
 use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migration_once};
 
 const REGION_UNRESOLVED_MESSAGE: &str = "S3 backend has no region: set `region` in the backend block, or configure AWS_REGION / a profile region";
+
+// GitHub Actions cancellation is SIGINT -> 7.5s -> SIGTERM -> 2.5s ->
+// SIGKILL. Cleanup has a 2s hard deadline. The S3 cancellation path performs
+// at most three ordered state calls and two lock-release calls, so a 300ms
+// single-attempt cap leaves 500ms for scheduling and local serialization while
+// preserving the normal client's retry/timeout behavior outside cancellation.
+const CLEANUP_S3_OPERATION_TIMEOUT: Duration = Duration::from_millis(300);
+
+fn cleanup_operation_config() -> aws_sdk_s3::config::Builder {
+    aws_sdk_s3::Config::builder()
+        .retry_config(RetryConfig::standard().with_max_attempts(1))
+        .timeout_config(
+            TimeoutConfig::builder()
+                .operation_timeout(CLEANUP_S3_OPERATION_TIMEOUT)
+                .operation_attempt_timeout(CLEANUP_S3_OPERATION_TIMEOUT)
+                .build(),
+        )
+}
 
 /// Provider name reported for the storage resource (the state bucket).
 const BACKEND_PROVIDER_NAME: &str = "aws";
@@ -181,6 +202,62 @@ impl S3Backend {
         Ok(self.read_lock_with_etag().await?.map(|(lock, _)| lock))
     }
 
+    async fn read_lock_with_etag_for_cleanup(&self) -> BackendResult<Option<(LockInfo, String)>> {
+        self.with_cleanup_operation_timeout("s3.GetObject", async {
+            let result = self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(self.lock_key())
+                .customize()
+                .config_override(cleanup_operation_config())
+                .send()
+                .await;
+
+            match result {
+                Ok(output) => {
+                    let etag = output.e_tag().map(ToOwned::to_owned).ok_or_else(|| {
+                        BackendError::Configuration(format!(
+                            "Lock object {}/{} missing ETag",
+                            self.bucket,
+                            self.lock_key()
+                        ))
+                    })?;
+                    let body = output
+                        .body
+                        .collect()
+                        .await
+                        .map_err(|e| BackendError::Io(e.to_string()))?;
+                    let lock = serde_json::from_slice(&body.into_bytes())
+                        .map_err(|e| BackendError::Serialization(e.to_string()))?;
+                    Ok(Some((lock, etag)))
+                }
+                Err(err) if is_not_found_error(&err) => Ok(None),
+                Err(err) => Err(BackendError::Aws(Box::new(
+                    AwsError::from_sdk_error("s3.GetObject", err)
+                        .bucket(&self.bucket)
+                        .key(self.lock_key()),
+                ))),
+            }
+        })
+        .await
+    }
+
+    async fn with_cleanup_operation_timeout<T>(
+        &self,
+        operation: &'static str,
+        future: impl std::future::Future<Output = BackendResult<T>>,
+    ) -> BackendResult<T> {
+        tokio::time::timeout(CLEANUP_S3_OPERATION_TIMEOUT, future)
+            .await
+            .map_err(|_| {
+                BackendError::Io(format!(
+                    "Cancellation cleanup {operation} timed out after {}ms",
+                    CLEANUP_S3_OPERATION_TIMEOUT.as_millis()
+                ))
+            })?
+    }
+
     fn lock_body(lock: &LockInfo) -> BackendResult<Vec<u8>> {
         carina_core::utils::pretty_with_newline_bytes(lock)
             .map_err(|e| BackendError::Serialization(e.to_string()))
@@ -200,6 +277,76 @@ impl S3Backend {
 
     async fn replace_lock_if_match(&self, lock: &LockInfo, etag: &str) -> BackendResult<bool> {
         self.write_lock(lock, None, Some(etag)).await
+    }
+
+    async fn replace_lock_if_match_for_cleanup(
+        &self,
+        lock: &LockInfo,
+        etag: &str,
+    ) -> BackendResult<bool> {
+        let body = Self::lock_body(lock)?;
+        self.with_cleanup_operation_timeout("s3.PutObject", async {
+            let mut request = self
+                .client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(self.lock_key())
+                .body(ByteStream::from(body))
+                .content_type("application/json")
+                .if_match(etag);
+
+            if self.encrypt {
+                request = request.server_side_encryption(ServerSideEncryption::Aes256);
+            }
+
+            match request
+                .customize()
+                .config_override(cleanup_operation_config())
+                .send()
+                .await
+            {
+                Ok(_) => Ok(true),
+                Err(err) if is_conditional_write_conflict(&err) => Ok(false),
+                Err(err) => Err(BackendError::Aws(Box::new(
+                    AwsError::from_sdk_error("s3.PutObject", err)
+                        .bucket(&self.bucket)
+                        .key(self.lock_key()),
+                ))),
+            }
+        })
+        .await
+    }
+
+    async fn write_state_for_cleanup_operation(&self, state: &StateFile) -> BackendResult<()> {
+        let body = Self::state_body(state)?;
+        self.with_cleanup_operation_timeout("s3.PutObject", async {
+            let mut request = self
+                .client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .body(ByteStream::from(body))
+                .content_type("application/json");
+
+            if self.encrypt {
+                request = request.server_side_encryption(ServerSideEncryption::Aes256);
+            }
+
+            request
+                .customize()
+                .config_override(cleanup_operation_config())
+                .send()
+                .await
+                .map_err(|err| {
+                    BackendError::Aws(Box::new(
+                        AwsError::from_sdk_error("s3.PutObject", err)
+                            .bucket(&self.bucket)
+                            .key(&self.key),
+                    ))
+                })?;
+            Ok(())
+        })
+        .await
     }
 
     /// Write a lock file to S3 using conditional headers for atomic acquisition.
@@ -260,6 +407,29 @@ impl S3Backend {
             })?;
 
         Ok(())
+    }
+
+    async fn delete_lock_for_cleanup(&self) -> BackendResult<()> {
+        let lock_key = self.lock_key();
+        self.with_cleanup_operation_timeout("s3.DeleteObject", async {
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&lock_key)
+                .customize()
+                .config_override(cleanup_operation_config())
+                .send()
+                .await
+                .map_err(|err| {
+                    BackendError::Aws(Box::new(
+                        AwsError::from_sdk_error("s3.DeleteObject", err)
+                            .bucket(&self.bucket)
+                            .key(&lock_key),
+                    ))
+                })?;
+            Ok(())
+        })
+        .await
     }
 
     /// Get the bucket name
@@ -411,6 +581,48 @@ impl StateBackend for S3Backend {
         self.write_state(state).await
     }
 
+    async fn write_state_for_cleanup(&self, state: &StateFile) -> BackendResult<()> {
+        self.write_state_for_cleanup_operation(state).await
+    }
+
+    async fn write_state_locked_for_cleanup(
+        &self,
+        state: &StateFile,
+        lock: &LockInfo,
+    ) -> BackendResult<()> {
+        // Releasing first, or racing release against this write, is unsafe:
+        // another process could acquire the now-free lock after our ownership
+        // check but before the unconditional state PUT. Keep state-before-release.
+        // We also cannot skip renewal because a long apply may be near its TTL;
+        // the conditional renewal both proves ownership and establishes a fresh
+        // exclusive lease. Reusing that proof for the state PUT removes the
+        // second lock GET from the normal renew + write_state_locked sequence.
+        let Some((existing_lock, etag)) = self.read_lock_with_etag_for_cleanup().await? else {
+            return Err(BackendError::LockNotHeld(
+                "lock file no longer exists".to_string(),
+            ));
+        };
+
+        if existing_lock.id != lock.id {
+            return Err(BackendError::LockNotHeld(format!(
+                "lock {} was replaced by {}",
+                lock.id, existing_lock.id
+            )));
+        }
+
+        let renewed = lock.renewed();
+        if !self
+            .replace_lock_if_match_for_cleanup(&renewed, &etag)
+            .await?
+        {
+            return Err(BackendError::LockNotHeld(
+                "lock was modified concurrently during cancellation cleanup".to_string(),
+            ));
+        }
+
+        self.write_state_for_cleanup_operation(state).await
+    }
+
     async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()> {
         // Verify the lock exists and matches
         if let Some(existing_lock) = self.read_lock().await? {
@@ -425,6 +637,21 @@ impl StateBackend for S3Backend {
         }
 
         self.delete_lock().await
+    }
+
+    async fn release_lock_for_cleanup(&self, lock: &LockInfo) -> BackendResult<()> {
+        let Some((existing_lock, _etag)) = self.read_lock_with_etag_for_cleanup().await? else {
+            return Err(BackendError::LockNotFound(lock.id.clone()));
+        };
+
+        if existing_lock.id != lock.id {
+            return Err(BackendError::LockMismatch {
+                expected: lock.id.clone(),
+                actual: existing_lock.id,
+            });
+        }
+
+        self.delete_lock_for_cleanup().await
     }
 
     async fn force_unlock(&self, lock_id: &str) -> BackendResult<()> {
@@ -733,6 +960,31 @@ mod tests {
                 && message.contains("ec2.Vpc")
                 && message.contains("network")),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn cancellation_cleanup_s3_operations_have_a_bounded_single_attempt_budget() {
+        let config = cleanup_operation_config().build();
+        let retry = config
+            .retry_config()
+            .expect("cleanup operation must override the SDK retry policy");
+        let timeout = config
+            .timeout_config()
+            .expect("cleanup operation must override the SDK timeout policy");
+
+        assert_eq!(
+            retry.max_attempts(),
+            1,
+            "cleanup cannot spend time retrying"
+        );
+        assert_eq!(
+            timeout.operation_timeout(),
+            Some(CLEANUP_S3_OPERATION_TIMEOUT)
+        );
+        assert!(
+            CLEANUP_S3_OPERATION_TIMEOUT * 5 < carina_core::shutdown::CLEANUP_DEADLINE,
+            "three state calls plus two lock-release calls must fit inside the 2s cleanup deadline"
         );
     }
 

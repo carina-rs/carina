@@ -23,9 +23,9 @@ use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, 
 #[cfg(test)]
 use carina_core::resource::ConcreteValue;
 use carina_core::resource::{DataSource, Resource, ResourceId, State, Value};
+use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
 use carina_state::{BackendLock, LockInfo, StateBackend, StateFile};
-use tokio_util::sync::CancellationToken;
 
 use carina_core::parser::{ProviderConfig, ProviderContext};
 
@@ -35,7 +35,9 @@ use crate::commands::plan::{PlanFile, collect_delete_attributes};
 use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
 };
-use crate::commands::shared::finalize::handle_finalize_after_execute;
+use crate::commands::shared::finalize::{
+    StatePersistence, finalize_after_execute, release_lock_after_execute,
+};
 use crate::commands::shared::observer::CliObserver;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::{
@@ -185,7 +187,7 @@ pub async fn execute_effects(
     current_states: &mut HashMap<ResourceId, State>,
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     compositions: &[carina_core::resource::Composition],
-    cancel: CancellationToken,
+    cancel: ShutdownToken,
     parallelism: NonZeroUsize,
 ) -> ExecutionOutcome {
     let observer = cli_observer_factory(plan);
@@ -201,7 +203,7 @@ pub async fn execute_effects(
         unresolved_resources,
         compositions,
         DeferredDataSourceReads::none(),
-        cancel,
+        cancel.clone(),
         parallelism,
         observer,
     )
@@ -221,7 +223,7 @@ async fn execute_effects_with_observer(
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
     compositions: &[carina_core::resource::Composition],
     deferred_data_source_reads: DeferredDataSourceReads,
-    cancel: CancellationToken,
+    cancel: ShutdownToken,
     parallelism: NonZeroUsize,
     observer: Box<dyn ExecutionObserver>,
 ) -> ExecutionOutcome {
@@ -448,6 +450,7 @@ pub async fn refresh_pending_states(
 /// unresolved exports into the command's exit status (carina#3710).
 pub(crate) async fn finalize_apply(
     input: FinalizeApplyInput<'_>,
+    persistence: StatePersistence,
 ) -> Result<SkippedExports, AppError> {
     println!();
     println!("{}", "Saving state...".cyan());
@@ -487,9 +490,9 @@ pub(crate) async fn finalize_apply(
     };
 
     if let Some(lock) = input.lock {
-        save_state_locked(input.backend, lock, &mut state).await?;
+        save_state_locked_after_execute(input.backend, lock, &mut state, persistence).await?;
     } else {
-        save_state_unlocked(input.backend, &mut state).await?;
+        save_state_unlocked_after_execute(input.backend, &mut state, persistence).await?;
     }
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
@@ -514,6 +517,24 @@ pub async fn save_state_locked(
         .map_err(AppError::Backend)
 }
 
+pub(crate) async fn save_state_locked_after_execute(
+    backend: &dyn StateBackend,
+    lock: &LockInfo,
+    state: &mut StateFile,
+    persistence: StatePersistence,
+) -> Result<(), AppError> {
+    match persistence {
+        StatePersistence::Normal => save_state_locked(backend, lock, state).await,
+        StatePersistence::CancellationCleanup => {
+            state.increment_serial();
+            backend
+                .write_state_locked_for_cleanup(state, lock)
+                .await
+                .map_err(AppError::Backend)
+        }
+    }
+}
+
 /// Write state without lock validation.
 ///
 /// Used when `--lock=false` is specified. Increments the serial number and
@@ -524,6 +545,23 @@ pub async fn save_state_unlocked(
 ) -> Result<(), AppError> {
     state.increment_serial();
     backend.write_state(state).await.map_err(AppError::Backend)
+}
+
+pub(crate) async fn save_state_unlocked_after_execute(
+    backend: &dyn StateBackend,
+    state: &mut StateFile,
+    persistence: StatePersistence,
+) -> Result<(), AppError> {
+    match persistence {
+        StatePersistence::Normal => save_state_unlocked(backend, state).await,
+        StatePersistence::CancellationCleanup => {
+            state.increment_serial();
+            backend
+                .write_state_for_cleanup(state)
+                .await
+                .map_err(AppError::Backend)
+        }
+    }
 }
 
 /// Read state from the backend and, if `check_and_migrate` lifted the
@@ -725,7 +763,7 @@ pub async fn run_apply(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
     provider_context: &ProviderContext,
-    cancel: CancellationToken,
+    cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     run_apply_with_observer_factory(
         path,
@@ -734,7 +772,7 @@ pub async fn run_apply(
         parallelism,
         accept_legacy_name_overrides,
         provider_context,
-        cancel,
+        cancel.clone(),
         &cli_observer_factory,
     )
     .await
@@ -749,7 +787,7 @@ async fn run_apply_with_observer_factory(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
     provider_context: &ProviderContext,
-    cancel: CancellationToken,
+    cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_>,
 ) -> Result<(), AppError> {
     let loaded = load_configuration_with_config(
@@ -764,7 +802,7 @@ async fn run_apply_with_observer_factory(
     let backend_file = loaded.backend_file;
 
     let base_dir = get_base_dir(path);
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir);
+    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
     let ctx = WiringContext::new(factories);
     crate::commands::validate_and_resolve_with_config(
         &mut parsed,
@@ -1021,7 +1059,7 @@ async fn run_apply_with_observer_factory(
         lock_info.as_ref(),
         base_dir,
         provider_context,
-        cancel,
+        cancel.clone(),
         observer_factory,
         parallelism,
         accept_legacy_name_overrides,
@@ -1030,7 +1068,7 @@ async fn run_apply_with_observer_factory(
 
     // Always release lock if it was acquired
     if let Some(ref li) = lock_info {
-        let release_result = backend.release_lock(li).await.map_err(AppError::Backend);
+        let release_result = release_lock_after_execute(backend.as_ref(), li, &cancel).await;
 
         if release_result.is_ok()
             && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
@@ -1062,7 +1100,7 @@ async fn run_apply_locked(
     lock: Option<&LockInfo>,
     base_dir: &std::path::Path,
     provider_context: &ProviderContext,
-    cancel: CancellationToken,
+    cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_>,
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
@@ -1726,7 +1764,7 @@ async fn run_apply_locked(
         &unresolved_resources,
         &parsed.compositions,
         deferred_data_source_reads,
-        cancel,
+        cancel.clone(),
         parallelism,
         observer,
     )
@@ -1734,7 +1772,7 @@ async fn run_apply_locked(
     let (mut result, cancelled) = split_execution_outcome(outcome);
 
     // Execute import effects: read imported resources from the provider
-    execute_import_effects(&plan, &provider, &mut result).await;
+    execute_import_effects(&plan, &provider, &mut result, &cancel).await;
 
     // Execute remove and move effects (state-only, logged for user feedback)
     execute_state_only_effects(&plan, &mut result);
@@ -1745,22 +1783,30 @@ async fn run_apply_locked(
     // provider-level default tags. Otherwise the next plan projects the
     // tags out of `current` and surfaces a spurious `tags: (none) → ...`
     // diff (refs awscc#206).
-    let finalize_result = finalize_apply(FinalizeApplyInput {
-        result: &result,
-        state_file,
-        sorted_resources: override_aware_resources.resources(),
-        data_sources: &data_sources_for_plan,
-        current_states: &current_states,
-        plan: &plan,
-        backend,
-        lock,
-        schemas,
-        export_params: Some(&parsed.export_params),
-        wait_aliases: &wait_aliases,
-        pre_resolve_compositions: &pre_resolve_compositions,
-    })
-    .await;
-    let skipped_exports = handle_finalize_after_execute(finalize_result, cancelled)?;
+    let skipped_exports = finalize_after_execute(
+        |persistence| {
+            finalize_apply(
+                FinalizeApplyInput {
+                    result: &result,
+                    state_file,
+                    sorted_resources: override_aware_resources.resources(),
+                    data_sources: &data_sources_for_plan,
+                    current_states: &current_states,
+                    plan: &plan,
+                    backend,
+                    lock,
+                    schemas,
+                    export_params: Some(&parsed.export_params),
+                    wait_aliases: &wait_aliases,
+                    pre_resolve_compositions: &pre_resolve_compositions,
+                },
+                persistence,
+            )
+        },
+        cancelled,
+        &cancel,
+    )
+    .await?;
 
     finish_apply(
         &result,
@@ -1797,7 +1843,7 @@ pub async fn run_apply_from_plan(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
     provider_context: &ProviderContext,
-    cancel: CancellationToken,
+    cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     run_apply_from_plan_with_observer_factory(
         plan_path,
@@ -1806,7 +1852,7 @@ pub async fn run_apply_from_plan(
         parallelism,
         accept_legacy_name_overrides,
         provider_context,
-        cancel,
+        cancel.clone(),
         &cli_observer_factory,
     )
     .await
@@ -1821,7 +1867,7 @@ async fn run_apply_from_plan_with_observer_factory(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
     provider_context: &ProviderContext,
-    cancel: CancellationToken,
+    cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_>,
 ) -> Result<(), AppError> {
     // Read and deserialize the plan file
@@ -1946,7 +1992,7 @@ async fn run_apply_from_plan_with_observer_factory(
         backend.as_ref(),
         lock_info.as_ref(),
         base_dir,
-        cancel,
+        cancel.clone(),
         observer_factory,
         parallelism,
         accept_legacy_name_overrides,
@@ -1955,7 +2001,7 @@ async fn run_apply_from_plan_with_observer_factory(
 
     // Always release lock if it was acquired
     if let Some(ref li) = lock_info {
-        let release_result = backend.release_lock(li).await.map_err(AppError::Backend);
+        let release_result = release_lock_after_execute(backend.as_ref(), li, &cancel).await;
 
         if release_result.is_ok()
             && (op_result.is_ok() || matches!(op_result, Err(AppError::Interrupted)))
@@ -1984,7 +2030,7 @@ async fn run_apply_from_plan_locked(
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
     base_dir: &std::path::Path,
-    cancel: CancellationToken,
+    cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_>,
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
@@ -2203,7 +2249,7 @@ async fn run_apply_from_plan_locked(
         &unresolved_resources,
         plan_compositions,
         deferred_data_source_reads,
-        cancel,
+        cancel.clone(),
         parallelism,
         observer,
     )
@@ -2211,42 +2257,50 @@ async fn run_apply_from_plan_locked(
     let (mut result, cancelled) = split_execution_outcome(outcome);
 
     // Execute import effects: read imported resources from the provider
-    execute_import_effects(plan, &provider, &mut result).await;
+    execute_import_effects(plan, &provider, &mut result, &cancel).await;
 
     // Execute remove and move effects (state-only, logged for user feedback)
     execute_state_only_effects(plan, &mut result);
     let resources_finished = Instant::now();
 
     // Build schemas for write-only attribute persistence
-    let (factories, _) = build_factories_from_providers(&plan_file.provider_configs, base_dir);
+    let (factories, _) = build_factories_from_providers(&plan_file.provider_configs, base_dir)?;
     let ctx = WiringContext::new(factories);
 
-    let finalize_result = finalize_apply(FinalizeApplyInput {
-        result: &result,
-        state_file,
-        sorted_resources,
-        data_sources: plan_data_sources,
-        current_states: &current_states,
-        plan,
-        backend,
-        lock,
-        schemas: ctx.schemas(),
-        // Saved plan files do not persist `export_params` today, so
-        // pass `None` to preserve `state.exports` rather than wipe it.
-        // Source-driven `carina apply` reconciles exports from the
-        // `.crn` directly (#2932).
-        export_params: None,
-        // No export resolution runs here (export_params is None), but
-        // the field is required; pass the reconstructed aliases so the
-        // value is correct if a future plan file persists export_params.
-        wait_aliases: &wait_aliases,
-        // Same rationale as `export_params: None`: no export
-        // resolution runs from the `apply --plan` path, so no
-        // pre-resolve composition snapshot is needed.
-        pre_resolve_compositions: &[],
-    })
-    .await;
-    let skipped_exports = handle_finalize_after_execute(finalize_result, cancelled)?;
+    let skipped_exports = finalize_after_execute(
+        |persistence| {
+            finalize_apply(
+                FinalizeApplyInput {
+                    result: &result,
+                    state_file,
+                    sorted_resources,
+                    data_sources: plan_data_sources,
+                    current_states: &current_states,
+                    plan,
+                    backend,
+                    lock,
+                    schemas: ctx.schemas(),
+                    // Saved plan files do not persist `export_params` today, so
+                    // pass `None` to preserve `state.exports` rather than wipe it.
+                    // Source-driven `carina apply` reconciles exports from the
+                    // `.crn` directly (#2932).
+                    export_params: None,
+                    // No export resolution runs here (export_params is None), but
+                    // the field is required; pass the reconstructed aliases so the
+                    // value is correct if a future plan file persists export_params.
+                    wait_aliases: &wait_aliases,
+                    // Same rationale as `export_params: None`: no export
+                    // resolution runs from the `apply --plan` path, so no
+                    // pre-resolve composition snapshot is needed.
+                    pre_resolve_compositions: &[],
+                },
+                persistence,
+            )
+        },
+        cancelled,
+        &cancel,
+    )
+    .await?;
 
     finish_apply(
         &result,
@@ -2332,7 +2386,7 @@ fn finish_apply(
 /// export-only paths so both use identical wording and behavior.
 pub(crate) async fn confirm_apply<R>(
     reader: R,
-    cancel: CancellationToken,
+    cancel: ShutdownToken,
     auto_approve: bool,
 ) -> Result<ApplyConfirmation, AppError>
 where

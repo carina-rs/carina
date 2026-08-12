@@ -414,6 +414,34 @@ pub trait StateBackend: Send + Sync {
     /// acquired by another process.
     async fn write_state_locked(&self, state: &StateFile, lock: &LockInfo) -> BackendResult<()>;
 
+    /// Write state during cancellation cleanup.
+    ///
+    /// Remote backends override this entry point with the fixed, short
+    /// operation budget needed by the process shutdown deadline. The default
+    /// preserves the normal write contract for local and test backends.
+    async fn write_state_for_cleanup(&self, state: &StateFile) -> BackendResult<()> {
+        self.write_state(state).await
+    }
+
+    /// Renew ownership and write state during cancellation cleanup.
+    ///
+    /// The default preserves the lock protocol. Remote backends may collapse
+    /// redundant ownership reads, but must renew or otherwise establish an
+    /// exclusive lease before writing state.
+    async fn write_state_locked_for_cleanup(
+        &self,
+        state: &StateFile,
+        lock: &LockInfo,
+    ) -> BackendResult<()> {
+        let renewed = self.renew_lock(lock).await?;
+        self.write_state_locked(state, &renewed).await
+    }
+
+    /// Release a lock during cancellation cleanup using a bounded remote path.
+    async fn release_lock_for_cleanup(&self, lock: &LockInfo) -> BackendResult<()> {
+        self.release_lock(lock).await
+    }
+
     /// Force release a lock by its ID
     ///
     /// This is an administrative operation that should be used with caution
