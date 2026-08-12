@@ -961,7 +961,7 @@ fn key_should_enter_patch_saved_merge_preserves_unmanaged_nested_fields() {
             from: Some(&current),
             to: &desired,
             saved: Some(SavedAttr {
-                value: &saved,
+                views: crate::resource::SavedValueViews::same(&saved),
                 authoring: &ExplicitFields::Unrecorded,
             }),
             type_info: Some(TypedAttr {

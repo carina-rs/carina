@@ -1410,6 +1410,7 @@ mod apply_state_save_tests {
     use carina_core::effect::{
         DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes,
     };
+    use carina_core::explicit::ExplicitFields;
     use carina_core::parser::{DeferredForExpression, ForBinding};
     use carina_core::plan::Plan;
     use carina_core::provider::ProviderRouter;
@@ -1444,6 +1445,89 @@ mod apply_state_save_tests {
             )]),
         )
         .with_identifier(format!("{name}-id"))
+    }
+
+    #[test]
+    fn apply_writeback_stores_list_and_aligned_authoring_atomically_across_round_trip() {
+        let rule = |port, description: Option<&str>| {
+            let mut fields = indexmap::IndexMap::from([(
+                "port".to_string(),
+                Value::Concrete(ConcreteValue::Int(port)),
+            )]);
+            if let Some(description) = description {
+                fields.insert(
+                    "description".to_string(),
+                    Value::Concrete(ConcreteValue::String(description.to_string())),
+                );
+            }
+            Value::Concrete(ConcreteValue::Map(fields))
+        };
+        let resource = Resource::with_provider("mock", "listener.Listener", "listener", None)
+            .with_attribute(
+                "rules",
+                Value::Concrete(ConcreteValue::List(vec![
+                    rule(80, Some("web")),
+                    rule(443, None),
+                ])),
+            );
+        let id = resource.id.clone();
+        let applied_state = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "rules".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![
+                    rule(443, Some("provider-default")),
+                    rule(80, Some("web")),
+                ])),
+            )]),
+        )
+        .with_identifier("listener-id");
+        let state = build_state_after_apply(ApplyStateSave {
+            state_file: None,
+            sorted_resources: &[resource],
+            runtime_synthesized_resources: &[],
+            current_states: &HashMap::new(),
+            applied_states: &HashMap::from([(id, applied_state)]),
+            plan: &Plan::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &HashSet::new(),
+            schemas: &SchemaRegistry::new(),
+        })
+        .expect("apply writeback");
+
+        let assert_aligned = |state: &StateFile| {
+            let row = state
+                .find_resource("mock", "listener.Listener", "listener")
+                .expect("written listener row");
+            let stored = row.attributes["rules"].as_array().expect("stored rules");
+            assert_eq!(stored.len(), 2);
+            assert_eq!(stored[0]["port"], 443);
+            assert_eq!(stored[1]["port"], 80);
+            let ExplicitFields::Struct { children } = &row.explicit else {
+                panic!("expected root Struct");
+            };
+            let ExplicitFields::ListElements { elements } = &children["rules"] else {
+                panic!("expected aligned ListElements");
+            };
+            assert_eq!(elements.len(), stored.len());
+            let ExplicitFields::Struct { children: first } = &elements[0] else {
+                panic!("expected first Struct authoring");
+            };
+            assert_eq!(first.len(), 1);
+            assert!(first.contains_key("port"));
+            let ExplicitFields::Struct { children: second } = &elements[1] else {
+                panic!("expected second Struct authoring");
+            };
+            assert_eq!(second.len(), 2);
+            assert!(second.contains_key("port"));
+            assert!(second.contains_key("description"));
+        };
+
+        assert_aligned(&state);
+        let serialized = serde_json::to_string(&state).expect("serialize state");
+        let round_tripped: StateFile =
+            serde_json::from_str(&serialized).expect("deserialize state");
+        assert_aligned(&round_tripped);
     }
 
     #[test]

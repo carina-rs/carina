@@ -7,7 +7,7 @@
 //!
 //! See `notes/specs/2026-05-10-explicit-fields-design.md`.
 
-use crate::resource::{ConcreteValue, Resource, Value};
+use crate::resource::{ConcreteValue, Resource, Value, pair_list_elements};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -24,6 +24,8 @@ use std::collections::HashMap;
 ///   server-only and are removed by projection.
 /// - `List`: the user wrote a list of structs here. `element` is the
 ///   union of authoring across all elements.
+/// - `ListElements`: one authoring tree per element, indexed by the
+///   stored list in the same state row.
 /// - `Unrecorded`: no authoring record for this position. See the
 ///   per-variant doc on `Unrecorded` and carina#3280 for the
 ///   motivation — splitting it off from `Struct { children: {} }`
@@ -40,6 +42,12 @@ pub enum ExplicitFields {
     List {
         element: Box<ExplicitFields>,
     },
+    /// Per-element authoring records indexed by the stored list value
+    /// in the same state row. This does not provide identity across
+    /// provider reads; plan-time list pairing selects the stored index.
+    ListElements {
+        elements: Vec<ExplicitFields>,
+    },
     /// No authoring record for this position. Top-level callers
     /// (`project_attributes`) treat this as "pass attrs through, the
     /// authoring shape is whatever the user wrote in `.crn` right
@@ -55,8 +63,10 @@ pub enum ExplicitFields {
 
 /// Build an `ExplicitFields::Struct` rooted at a resource's top-level
 /// attributes. Underscore-prefixed keys (internal attributes) are
-/// excluded.
-pub fn build_from_resource(resource: &Resource) -> ExplicitFields {
+/// excluded. Lists are recorded in the resource value's order; state
+/// writeback must use [`build_from_resource_for_stored_values`] instead.
+#[cfg(test)]
+pub(crate) fn build_from_resource(resource: &Resource) -> ExplicitFields {
     ExplicitFields::Struct {
         children: resource
             .attributes
@@ -67,10 +77,35 @@ pub fn build_from_resource(resource: &Resource) -> ExplicitFields {
     }
 }
 
+/// Build a resource authoring tree whose list records are aligned to
+/// the provider-returned values that will be stored in the same row.
+///
+/// Desired lists without a concrete stored-list counterpart fall back
+/// to the legacy union [`ExplicitFields::List`] representation rather
+/// than recording indices that cannot be justified.
+pub fn build_from_resource_for_stored_values(
+    resource: &Resource,
+    stored_attributes: &HashMap<String, Value>,
+) -> ExplicitFields {
+    ExplicitFields::Struct {
+        children: resource
+            .attributes
+            .iter()
+            .filter(|(key, _)| !key.starts_with('_'))
+            .map(|(key, desired)| {
+                (
+                    key.clone(),
+                    build_from_value_for_stored_value(desired, stored_attributes.get(key)),
+                )
+            })
+            .collect(),
+    }
+}
+
 /// Build an `ExplicitFields` tree describing the structural shape of a
 /// `Value`. `Value::Concrete(ConcreteValue::Map)` is treated as a struct (each key becomes a
-/// struct child); `Value::Concrete(ConcreteValue::List)` becomes a `List` whose element is the
-/// union of authoring across all elements; everything else is a `Leaf`.
+/// struct child); every `Value::Concrete(ConcreteValue::List)` becomes `ListElements` in the
+/// value's own order; everything else is a `Leaf`.
 pub fn build_from_value(value: &Value) -> ExplicitFields {
     match value {
         Value::Concrete(ConcreteValue::Map(fields)) => ExplicitFields::Struct {
@@ -79,24 +114,131 @@ pub fn build_from_value(value: &Value) -> ExplicitFields {
                 .map(|(k, v)| (k.clone(), build_from_value(v)))
                 .collect(),
         },
-        Value::Concrete(ConcreteValue::List(items)) => ExplicitFields::List {
-            element: Box::new(
-                items
-                    .iter()
-                    .map(build_from_value)
-                    .fold(ExplicitFields::Leaf, merge),
-            ),
+        Value::Concrete(ConcreteValue::List(items)) => ExplicitFields::ListElements {
+            elements: items.iter().map(build_from_value).collect(),
         },
         _ => ExplicitFields::Leaf,
     }
 }
 
-/// Combine two `ExplicitFields` trees by union semantics. Used to fold
-/// the per-element trees of a list-of-structs into a single common
-/// element shape.
+fn build_from_value_for_stored_value(desired: &Value, stored: Option<&Value>) -> ExplicitFields {
+    match desired {
+        Value::Concrete(ConcreteValue::Map(desired_fields)) => {
+            let stored_fields = match stored {
+                Some(Value::Concrete(ConcreteValue::Map(fields))) => Some(fields),
+                _ => None,
+            };
+            ExplicitFields::Struct {
+                children: desired_fields
+                    .iter()
+                    .map(|(key, desired_child)| {
+                        (
+                            key.clone(),
+                            build_from_value_for_stored_value(
+                                desired_child,
+                                stored_fields.and_then(|fields| fields.get(key)),
+                            ),
+                        )
+                    })
+                    .collect(),
+            }
+        }
+        Value::Concrete(ConcreteValue::List(desired_items)) => match stored {
+            Some(Value::Concrete(ConcreteValue::List(stored_items))) => {
+                let mut elements = vec![ExplicitFields::Unrecorded; stored_items.len()];
+                for (desired_index, stored_index) in pair_list_elements(desired_items, stored_items)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if let Some(stored_index) = stored_index {
+                        elements[stored_index] = build_from_value_for_stored_value(
+                            &desired_items[desired_index],
+                            Some(&stored_items[stored_index]),
+                        );
+                    }
+                }
+                ExplicitFields::ListElements { elements }
+            }
+            _ => build_legacy_list(desired_items),
+        },
+        _ => ExplicitFields::Leaf,
+    }
+}
+
+fn build_legacy_list(items: &[Value]) -> ExplicitFields {
+    ExplicitFields::List {
+        element: Box::new(
+            items
+                .iter()
+                .map(build_from_value_conservatively)
+                .fold(ExplicitFields::Leaf, merge),
+        ),
+    }
+}
+
+fn build_from_value_conservatively(value: &Value) -> ExplicitFields {
+    match value {
+        Value::Concrete(ConcreteValue::Map(fields)) => ExplicitFields::Struct {
+            children: fields
+                .iter()
+                .map(|(key, value)| (key.clone(), build_from_value_conservatively(value)))
+                .collect(),
+        },
+        Value::Concrete(ConcreteValue::List(items)) => build_legacy_list(items),
+        _ => ExplicitFields::Leaf,
+    }
+}
+
+fn union_elements(elements: impl IntoIterator<Item = ExplicitFields>) -> ExplicitFields {
+    elements.into_iter().fold(ExplicitFields::Leaf, merge)
+}
+
+/// Conservatively discard every stored-index-aligned list vector in an authoring tree.
+///
+/// This is used when a fresh provider read replaces stored values but no desired values exist to
+/// realign their authoring records. Each vector becomes its legacy union restriction, including
+/// vectors nested inside structs and lists.
+pub fn demote_list_elements_to_union(explicit: &ExplicitFields) -> ExplicitFields {
+    match explicit {
+        ExplicitFields::Leaf => ExplicitFields::Leaf,
+        ExplicitFields::Unrecorded => ExplicitFields::Unrecorded,
+        ExplicitFields::Struct { children } => ExplicitFields::Struct {
+            children: children
+                .iter()
+                .map(|(key, child)| (key.clone(), demote_list_elements_to_union(child)))
+                .collect(),
+        },
+        ExplicitFields::List { element } => ExplicitFields::List {
+            element: Box::new(demote_list_elements_to_union(element)),
+        },
+        ExplicitFields::ListElements { elements } => ExplicitFields::List {
+            element: Box::new(union_elements(
+                elements.iter().map(demote_list_elements_to_union),
+            )),
+        },
+    }
+}
+
+/// Combine two `ExplicitFields` trees by union semantics.
+///
+/// A root `ListElements` operand is always reduced to a legacy `List` union before it crosses this
+/// seam, so this function never returns `ListElements` at the root. An unmatched nested struct
+/// child can retain its existing shape; merge results are transient and are never persisted as row
+/// authoring.
 pub fn merge(a: ExplicitFields, b: ExplicitFields) -> ExplicitFields {
     use ExplicitFields::*;
     match (a, b) {
+        (ListElements { elements: a }, ListElements { elements: b }) => List {
+            element: Box::new(merge(union_elements(a), union_elements(b))),
+        },
+        (ListElements { elements }, List { element })
+        | (List { element }, ListElements { elements }) => List {
+            element: Box::new(merge(union_elements(elements), *element)),
+        },
+        (ListElements { elements }, Leaf | Unrecorded | Struct { .. })
+        | (Leaf | Unrecorded | Struct { .. }, ListElements { elements }) => List {
+            element: Box::new(union_elements(elements)),
+        },
         (Leaf, b) => b,
         (a, Leaf) => a,
         // `Unrecorded` carries no shape information, so merging it
@@ -175,16 +317,31 @@ pub fn project(value: Value, explicit: &ExplicitFields) -> Value {
             // shape mismatch: keep value as-is.
             v => v,
         },
+        ExplicitFields::ListElements { elements } => {
+            let union = union_elements(elements.iter().cloned());
+            match value {
+                Value::Concrete(ConcreteValue::List(items)) => {
+                    Value::Concrete(ConcreteValue::List(
+                        items
+                            .into_iter()
+                            .map(|item| project(item, &union))
+                            .collect(),
+                    ))
+                }
+                // shape mismatch: keep value as-is.
+                v => v,
+            }
+        }
     }
 }
 
 /// Apply `project` to every entry of a top-level attribute map. The
 /// outer `explicit` is expected to be `ExplicitFields::Struct` (the
-/// shape `build_from_resource` produces); `Unrecorded` (no authoring
+/// shape the resource builders produce); `Unrecorded` (no authoring
 /// record — emitted by the carina#3280 legacy-corruption repair)
-/// passes attrs through unchanged. `Leaf` / `List` at the top level
-/// shouldn't occur for a resource's full attribute set and pass
-/// through conservatively.
+/// passes attrs through unchanged. `Leaf` / `List` / `ListElements` at
+/// the top level shouldn't occur for a resource's full attribute set
+/// and pass through conservatively.
 pub fn project_attributes(
     attrs: HashMap<String, Value>,
     explicit: &ExplicitFields,
@@ -200,16 +357,57 @@ pub fn project_attributes(
         // filtering. The `from_provider_state` repair rebuilds a
         // populated `Struct` on the next write.
         ExplicitFields::Unrecorded => attrs,
-        // Top-level Leaf / List shouldn't occur for a resource's full
-        // attribute set; pass through conservatively.
-        ExplicitFields::Leaf | ExplicitFields::List { .. } => attrs,
+        // Top-level Leaf / List / ListElements shouldn't occur for a
+        // resource's full attribute set; pass through conservatively.
+        ExplicitFields::Leaf
+        | ExplicitFields::List { .. }
+        | ExplicitFields::ListElements { .. } => attrs,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource::{DeferredValue, UnknownReason};
     use indexmap::IndexMap;
+
+    fn rule(port: i64, description: Option<&str>) -> Value {
+        let mut fields = IndexMap::from([(
+            "port".to_string(),
+            Value::Concrete(ConcreteValue::Int(port)),
+        )]);
+        if let Some(description) = description {
+            fields.insert(
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String(description.to_string())),
+            );
+        }
+        Value::Concrete(ConcreteValue::Map(fields))
+    }
+
+    fn build_attribute_explicit(desired: Value, stored: Option<Value>) -> ExplicitFields {
+        let resource =
+            Resource::new("example.Listener", "listener").with_attribute("items", desired);
+        let stored_attributes = stored
+            .map(|stored| HashMap::from([("items".to_string(), stored)]))
+            .unwrap_or_default();
+        let ExplicitFields::Struct { mut children } =
+            build_from_resource_for_stored_values(&resource, &stored_attributes)
+        else {
+            panic!("expected resource-root Struct");
+        };
+        children.remove("items").expect("items authoring")
+    }
+
+    fn assert_struct_keys(explicit: &ExplicitFields, expected: &[&str]) {
+        let ExplicitFields::Struct { children } = explicit else {
+            panic!("expected Struct, got {explicit:?}");
+        };
+        assert_eq!(children.len(), expected.len());
+        for key in expected {
+            assert!(children.contains_key(*key), "missing authored key {key}");
+        }
+    }
 
     #[test]
     fn leaf_is_default() {
@@ -248,6 +446,20 @@ mod tests {
     }
 
     #[test]
+    fn list_elements_round_trips_with_exact_serde_kind() {
+        let e = ExplicitFields::ListElements {
+            elements: vec![ExplicitFields::Leaf, ExplicitFields::Unrecorded],
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"list-elements","elements":[{"kind":"leaf"},{"kind":"unrecorded"}]}"#
+        );
+        let back: ExplicitFields = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+    }
+
+    #[test]
     fn variant_serializes_kebab_case() {
         let leaf_json = serde_json::to_string(&ExplicitFields::Leaf).unwrap();
         assert_eq!(leaf_json, r#"{"kind":"leaf"}"#);
@@ -277,26 +489,78 @@ mod tests {
     }
 
     #[test]
-    fn build_from_value_list_unions_element_authoring() {
+    fn build_from_value_emits_list_elements_for_every_concrete_list_shape() {
+        assert_eq!(
+            build_from_value(&Value::Concrete(ConcreteValue::List(Vec::new()))),
+            ExplicitFields::ListElements {
+                elements: Vec::new()
+            }
+        );
+
+        let scalar_list = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Int(1)),
+            Value::Concrete(ConcreteValue::String("two".to_string())),
+        ]));
+        assert_eq!(
+            build_from_value(&scalar_list),
+            ExplicitFields::ListElements {
+                elements: vec![ExplicitFields::Leaf, ExplicitFields::Leaf]
+            }
+        );
+
         let mut e1 = IndexMap::new();
         e1.insert("a".into(), Value::Concrete(ConcreteValue::Int(1)));
         e1.insert("b".into(), Value::Concrete(ConcreteValue::Int(1)));
         let mut e2 = IndexMap::new();
         e2.insert("b".into(), Value::Concrete(ConcreteValue::Int(2)));
         e2.insert("c".into(), Value::Concrete(ConcreteValue::Int(2)));
-        let v = Value::Concrete(ConcreteValue::List(vec![
+        let heterogeneous_maps = Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::Map(e1)),
             Value::Concrete(ConcreteValue::Map(e2)),
         ]));
-        let ExplicitFields::List { element } = build_from_value(&v) else {
-            panic!("expected List");
+        let ExplicitFields::ListElements { elements } = build_from_value(&heterogeneous_maps)
+        else {
+            panic!("expected ListElements");
         };
-        let ExplicitFields::Struct { children } = *element else {
-            panic!("expected Struct element");
+        assert_eq!(elements.len(), 2);
+        let ExplicitFields::Struct { children: first } = &elements[0] else {
+            panic!("expected first Struct element");
         };
-        let mut keys: Vec<&str> = children.keys().map(|s| s.as_str()).collect();
-        keys.sort();
-        assert_eq!(keys, vec!["a", "b", "c"]);
+        let ExplicitFields::Struct { children: second } = &elements[1] else {
+            panic!("expected second Struct element");
+        };
+        assert_eq!(first.len(), 2);
+        assert!(first.contains_key("a"));
+        assert!(first.contains_key("b"));
+        assert_eq!(second.len(), 2);
+        assert!(second.contains_key("b"));
+        assert!(second.contains_key("c"));
+
+        let nested = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::List(vec![Value::Concrete(ConcreteValue::Int(1))]),
+        )]));
+        assert_eq!(
+            build_from_value(&nested),
+            ExplicitFields::ListElements {
+                elements: vec![ExplicitFields::ListElements {
+                    elements: vec![ExplicitFields::Leaf]
+                }]
+            }
+        );
+
+        assert_eq!(
+            build_from_value(&Value::Concrete(ConcreteValue::StringList(vec![
+                "one".to_string(),
+                "two".to_string(),
+            ]))),
+            ExplicitFields::Leaf
+        );
+        assert_eq!(
+            build_from_value(&Value::Deferred(DeferredValue::Unknown(
+                UnknownReason::ForValue,
+            ))),
+            ExplicitFields::Leaf
+        );
     }
 
     #[test]
@@ -315,6 +579,217 @@ mod tests {
         };
         assert!(children.contains_key("name"));
         assert!(!children.contains_key("_internal"));
+    }
+
+    #[test]
+    fn aligned_builder_pairs_same_order_and_reordered_by_stored_index() {
+        let desired = Value::Concrete(ConcreteValue::List(vec![
+            rule(80, Some("web")),
+            rule(443, None),
+        ]));
+        let same_order = build_attribute_explicit(
+            desired.clone(),
+            Some(Value::Concrete(ConcreteValue::List(vec![
+                rule(80, Some("web")),
+                rule(443, Some("provider-default")),
+            ]))),
+        );
+        let ExplicitFields::ListElements { elements } = same_order else {
+            panic!("expected aligned ListElements");
+        };
+        assert_struct_keys(&elements[0], &["port", "description"]);
+        assert_struct_keys(&elements[1], &["port"]);
+
+        let reordered = build_attribute_explicit(
+            desired,
+            Some(Value::Concrete(ConcreteValue::List(vec![
+                rule(443, Some("provider-default")),
+                rule(80, Some("web")),
+            ]))),
+        );
+        let ExplicitFields::ListElements { elements } = reordered else {
+            panic!("expected aligned ListElements");
+        };
+        assert_struct_keys(&elements[0], &["port"]);
+        assert_struct_keys(&elements[1], &["port", "description"]);
+    }
+
+    #[test]
+    fn aligned_builder_handles_extra_missing_zero_score_and_duplicate_elements() {
+        let desired = Value::Concrete(ConcreteValue::List(vec![
+            rule(80, Some("web")),
+            rule(443, None),
+        ]));
+        let extra = build_attribute_explicit(
+            desired.clone(),
+            Some(Value::Concrete(ConcreteValue::List(vec![
+                rule(443, Some("provider-default")),
+                rule(22, Some("provider-added")),
+                rule(80, Some("web")),
+            ]))),
+        );
+        let ExplicitFields::ListElements { elements } = extra else {
+            panic!("expected aligned ListElements");
+        };
+        assert_eq!(elements.len(), 3);
+        assert_struct_keys(&elements[0], &["port"]);
+        assert_eq!(elements[1], ExplicitFields::Unrecorded);
+        assert_struct_keys(&elements[2], &["port", "description"]);
+
+        let missing = build_attribute_explicit(
+            desired,
+            Some(Value::Concrete(ConcreteValue::List(vec![rule(
+                443,
+                Some("provider-default"),
+            )]))),
+        );
+        let ExplicitFields::ListElements { elements } = missing else {
+            panic!("expected aligned ListElements");
+        };
+        assert_eq!(elements.len(), 1);
+        assert_struct_keys(&elements[0], &["port"]);
+
+        let no_match = build_attribute_explicit(
+            Value::Concrete(ConcreteValue::List(vec![rule(80, None)])),
+            Some(Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([(
+                    "name".to_string(),
+                    Value::Concrete(ConcreteValue::String("unrelated".to_string())),
+                )])),
+            )]))),
+        );
+        assert_eq!(
+            no_match,
+            ExplicitFields::ListElements {
+                elements: vec![ExplicitFields::Unrecorded]
+            }
+        );
+
+        let duplicate = build_attribute_explicit(
+            Value::Concrete(ConcreteValue::List(vec![
+                rule(80, Some("web")),
+                rule(80, Some("web")),
+            ])),
+            Some(Value::Concrete(ConcreteValue::List(vec![
+                rule(80, Some("web")),
+                rule(80, Some("web")),
+            ]))),
+        );
+        let ExplicitFields::ListElements { elements } = duplicate else {
+            panic!("expected aligned ListElements");
+        };
+        assert_struct_keys(&elements[0], &["port", "description"]);
+        assert_struct_keys(&elements[1], &["port", "description"]);
+    }
+
+    #[test]
+    fn aligned_builder_empty_desired_list_records_unrecorded_for_every_stored_element() {
+        let aligned = build_attribute_explicit(
+            Value::Concrete(ConcreteValue::List(Vec::new())),
+            Some(Value::Concrete(ConcreteValue::List(vec![
+                rule(80, Some("provider-default")),
+                rule(443, Some("provider-default")),
+            ]))),
+        );
+
+        assert_eq!(
+            aligned,
+            ExplicitFields::ListElements {
+                elements: vec![ExplicitFields::Unrecorded, ExplicitFields::Unrecorded],
+            }
+        );
+    }
+
+    #[test]
+    fn aligned_builder_deferred_unknown_desired_value_is_leaf() {
+        let aligned = build_attribute_explicit(
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            Some(Value::Concrete(ConcreteValue::List(vec![rule(
+                80,
+                Some("provider-default"),
+            )]))),
+        );
+
+        assert_eq!(aligned, ExplicitFields::Leaf);
+    }
+
+    #[test]
+    fn aligned_builder_recurses_into_nested_lists_and_falls_back_to_legacy_union() {
+        let nested_desired = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([
+                ("id".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+                (
+                    "nested".to_string(),
+                    Value::Concrete(ConcreteValue::List(vec![
+                        rule(80, Some("web")),
+                        rule(443, None),
+                    ])),
+                ),
+            ])),
+        )]));
+        let nested_stored = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([
+                ("id".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+                (
+                    "nested".to_string(),
+                    Value::Concrete(ConcreteValue::List(vec![
+                        rule(443, Some("provider-default")),
+                        rule(80, Some("web")),
+                    ])),
+                ),
+            ])),
+        )]));
+        let nested = build_attribute_explicit(nested_desired, Some(nested_stored));
+        let ExplicitFields::ListElements { elements } = nested else {
+            panic!("expected outer ListElements");
+        };
+        let ExplicitFields::Struct { children } = &elements[0] else {
+            panic!("expected outer Struct");
+        };
+        let ExplicitFields::ListElements {
+            elements: inner_elements,
+        } = &children["nested"]
+        else {
+            panic!("expected nested ListElements");
+        };
+        assert_struct_keys(&inner_elements[0], &["port"]);
+        assert_struct_keys(&inner_elements[1], &["port", "description"]);
+
+        for stored in [
+            None,
+            Some(Value::Concrete(ConcreteValue::String(
+                "shape-mismatch".to_string(),
+            ))),
+        ] {
+            let fallback = build_attribute_explicit(
+                Value::Concrete(ConcreteValue::List(vec![
+                    rule(80, Some("web")),
+                    rule(443, None),
+                ])),
+                stored,
+            );
+            let ExplicitFields::List { element } = fallback else {
+                panic!("missing or mismatched stored list must use legacy List");
+            };
+            assert_struct_keys(&element, &["port", "description"]);
+        }
+
+        let nested_fallback = build_attribute_explicit(
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(IndexMap::from([(
+                    "nested".to_string(),
+                    Value::Concrete(ConcreteValue::List(vec![rule(80, None)])),
+                )])),
+            )])),
+            None,
+        );
+        let ExplicitFields::List { element } = nested_fallback else {
+            panic!("expected conservative outer List");
+        };
+        let ExplicitFields::Struct { children } = &*element else {
+            panic!("expected conservative element Struct");
+        };
+        assert!(matches!(children["nested"], ExplicitFields::List { .. }));
     }
 
     #[test]
@@ -338,6 +813,111 @@ mod tests {
             children: HashMap::from([("a".into(), ExplicitFields::Leaf)]),
         };
         assert!(matches!(merge(a, b), ExplicitFields::Struct { .. }));
+    }
+
+    #[test]
+    fn merge_reduces_every_list_elements_combination_to_legacy_union() {
+        let fields = |keys: &[&str]| ExplicitFields::Struct {
+            children: keys
+                .iter()
+                .map(|key| ((*key).to_string(), ExplicitFields::Leaf))
+                .collect(),
+        };
+        let list = |keys: &[&str]| ExplicitFields::List {
+            element: Box::new(fields(keys)),
+        };
+        let elements = ExplicitFields::ListElements {
+            elements: vec![fields(&["a"]), fields(&["b"])],
+        };
+        let cases = vec![
+            (
+                ExplicitFields::ListElements {
+                    elements: vec![fields(&["c"])],
+                },
+                list(&["a", "b", "c"]),
+            ),
+            (list(&["d"]), list(&["a", "b", "d"])),
+            (ExplicitFields::Leaf, list(&["a", "b"])),
+            (ExplicitFields::Unrecorded, list(&["a", "b"])),
+            (fields(&["malformed"]), list(&["a", "b"])),
+        ];
+
+        for (other, expected) in cases {
+            let left = merge(elements.clone(), other.clone());
+            let right = merge(other, elements.clone());
+            assert_eq!(left, expected);
+            assert_eq!(right, expected);
+            assert!(!matches!(left, ExplicitFields::ListElements { .. }));
+            assert!(!matches!(right, ExplicitFields::ListElements { .. }));
+        }
+    }
+
+    #[test]
+    fn merge_can_preserve_list_elements_in_an_unmatched_nested_struct_child() {
+        let nested = ExplicitFields::ListElements {
+            elements: vec![ExplicitFields::Struct {
+                children: HashMap::from([("id".to_string(), ExplicitFields::Leaf)]),
+            }],
+        };
+        let merged = merge(
+            ExplicitFields::Struct {
+                children: HashMap::from([("a".to_string(), nested.clone())]),
+            },
+            ExplicitFields::Struct {
+                children: HashMap::from([("b".to_string(), ExplicitFields::Leaf)]),
+            },
+        );
+
+        let ExplicitFields::Struct { children } = merged else {
+            panic!("expected root Struct");
+        };
+        assert_eq!(children["a"], nested);
+    }
+
+    #[test]
+    fn demote_list_elements_to_union_recursively_removes_root_and_nested_vectors() {
+        let aligned = ExplicitFields::ListElements {
+            elements: vec![
+                ExplicitFields::Struct {
+                    children: HashMap::from([
+                        ("id".to_string(), ExplicitFields::Leaf),
+                        (
+                            "nested".to_string(),
+                            ExplicitFields::ListElements {
+                                elements: vec![ExplicitFields::Struct {
+                                    children: HashMap::from([(
+                                        "value".to_string(),
+                                        ExplicitFields::Leaf,
+                                    )]),
+                                }],
+                            },
+                        ),
+                    ]),
+                },
+                ExplicitFields::Unrecorded,
+            ],
+        };
+
+        let demoted = demote_list_elements_to_union(&aligned);
+        let ExplicitFields::List { element } = demoted else {
+            panic!("expected root legacy List");
+        };
+        let ExplicitFields::Struct { children } = &*element else {
+            panic!("expected unioned Struct element");
+        };
+        assert!(matches!(children["nested"], ExplicitFields::List { .. }));
+
+        fn contains_list_elements(explicit: &ExplicitFields) -> bool {
+            match explicit {
+                ExplicitFields::ListElements { .. } => true,
+                ExplicitFields::Struct { children } => {
+                    children.values().any(contains_list_elements)
+                }
+                ExplicitFields::List { element } => contains_list_elements(element),
+                ExplicitFields::Leaf | ExplicitFields::Unrecorded => false,
+            }
+        }
+        assert!(!contains_list_elements(element.as_ref()));
     }
 
     #[test]
@@ -444,6 +1024,83 @@ mod tests {
             assert_eq!(fields.len(), 1);
             assert!(fields.contains_key("authored"));
         }
+    }
+
+    #[test]
+    fn project_list_variants_preserve_indices_and_apply_one_union_to_every_item() {
+        let item = |sentinel: &str| {
+            Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                (
+                    "sentinel".to_string(),
+                    Value::Concrete(ConcreteValue::String(sentinel.to_string())),
+                ),
+                (
+                    "authored_a".to_string(),
+                    Value::Concrete(ConcreteValue::Int(1)),
+                ),
+                (
+                    "authored_b".to_string(),
+                    Value::Concrete(ConcreteValue::Int(2)),
+                ),
+                ("server".to_string(), Value::Concrete(ConcreteValue::Int(3))),
+            ])))
+        };
+        let value = Value::Concrete(ConcreteValue::List(vec![
+            item("third"),
+            item("first"),
+            item("second"),
+        ]));
+        let union = ExplicitFields::Struct {
+            children: HashMap::from([
+                ("sentinel".to_string(), ExplicitFields::Leaf),
+                ("authored_a".to_string(), ExplicitFields::Leaf),
+                ("authored_b".to_string(), ExplicitFields::Leaf),
+            ]),
+        };
+        let legacy = ExplicitFields::List {
+            element: Box::new(union),
+        };
+        let per_element = ExplicitFields::ListElements {
+            elements: vec![
+                ExplicitFields::Struct {
+                    children: HashMap::from([
+                        ("sentinel".to_string(), ExplicitFields::Leaf),
+                        ("authored_a".to_string(), ExplicitFields::Leaf),
+                    ]),
+                },
+                ExplicitFields::Struct {
+                    children: HashMap::from([
+                        ("sentinel".to_string(), ExplicitFields::Leaf),
+                        ("authored_b".to_string(), ExplicitFields::Leaf),
+                    ]),
+                },
+            ],
+        };
+
+        let legacy_projected = project(value.clone(), &legacy);
+        let per_element_projected = project(value, &per_element);
+        assert_eq!(legacy_projected, per_element_projected);
+
+        let Value::Concrete(ConcreteValue::List(items)) = per_element_projected else {
+            panic!("expected projected list");
+        };
+        assert_eq!(items.len(), 3);
+        let sentinels: Vec<&str> = items
+            .iter()
+            .map(|item| {
+                let Value::Concrete(ConcreteValue::Map(fields)) = item else {
+                    panic!("expected projected map");
+                };
+                assert_eq!(fields.len(), 3);
+                assert!(!fields.contains_key("server"));
+                let Some(Value::Concrete(ConcreteValue::String(sentinel))) = fields.get("sentinel")
+                else {
+                    panic!("expected sentinel string");
+                };
+                sentinel.as_str()
+            })
+            .collect();
+        assert_eq!(sentinels, vec!["third", "first", "second"]);
     }
 
     #[test]
