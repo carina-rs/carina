@@ -1028,6 +1028,8 @@ fn list_elements_authored_field_removal_produces_update_for_paired_element() {
         &desired.attributes["rules"],
         crate::resource::SavedValueViews::same(&current_attrs["rules"]),
         &children["rules"],
+        None,
+        crate::schema::empty_defs_for_schema_walks(),
     );
     let Value::Concrete(ConcreteValue::List(effective_rules)) = effective_desired else {
         panic!("expected effective desired rules list");
@@ -1104,7 +1106,7 @@ fn unchanged_dsl_after_writeback_pairs_raw_saved_list_without_phantom_removal() 
         ])),
     )]);
     let prior =
-        crate::explicit::build_from_resource_for_stored_values(&authored, &saved_attributes);
+        crate::explicit::build_from_resource_for_stored_values(&authored, &saved_attributes, None);
     let ExplicitFields::Struct { children } = &prior else {
         panic!("expected resource-root Struct");
     };

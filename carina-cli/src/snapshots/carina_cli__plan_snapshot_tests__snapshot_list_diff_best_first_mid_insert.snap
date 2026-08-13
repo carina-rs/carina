@@ -1,0 +1,23 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  ~ awscc.iam.RolePolicy policy
+      statement:
+        ~ {
+            resource:
+              + "arn:aws:iam::*:role/carina-registry-publish-api-execution"
+              # (2 unchanged elements hidden)
+            # (3 unchanged fields hidden)
+          }
+        + {
+            action: ["ecr:CreateRepository"]
+            effect: "Allow"
+            resource: ["arn:aws:ecr:*:*:repository/carina-registry-publish-api"]
+            sid: "ECRRepository"
+          }
+      # (2 unchanged attributes hidden)
+
+Plan: 0 to add, 1 to change, 0 to destroy.

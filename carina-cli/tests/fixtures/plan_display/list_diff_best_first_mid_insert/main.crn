@@ -1,0 +1,42 @@
+# #3722: inserting a statement before a modified peer must render as one
+# addition plus the peer's minimal field diff. Every statement shares
+# `effect = "Allow"`, so the inserted statement is a positive-score candidate
+# for both saved statements and exercises contested best-first pairing.
+
+provider awscc {}
+
+let policy = awscc.iam.RolePolicy {
+  policy_name = "carina-registry-publish"
+  role_name   = "carina-registry"
+  statement = [
+    {
+      sid      = "ECRRepository"
+      effect   = "Allow"
+      action   = ["ecr:CreateRepository"]
+      resource = ["arn:aws:ecr:*:*:repository/carina-registry-publish-api"]
+    },
+    {
+      sid    = "ManagePublishStackRoles"
+      effect = "Allow"
+      action = [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+      ]
+      resource = [
+        "arn:aws:iam::*:role/carina-registry-publish-api-task",
+        "arn:aws:iam::*:role/carina-registry-policy-write",
+        "arn:aws:iam::*:role/carina-registry-publish-api-execution",
+      ]
+    },
+    {
+      sid      = "AllowRegistryExecution"
+      effect   = "Allow"
+      action   = ["iam:PassRole"]
+      resource = ["arn:aws:iam::*:role/carina-registry-publish-api-execution"]
+    },
+  ]
+}
+
+exports {
+  policy_name = policy.policy_name
+}

@@ -7,10 +7,12 @@
 //!
 //! See `notes/specs/2026-05-10-explicit-fields-design.md`.
 
+use crate::diff_helpers::{list_element_type, map_entry_subtype};
 use crate::resource::{ConcreteValue, Resource, Value, pair_list_elements};
+use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Tree describing which fields the user explicitly wrote in their
 /// `.crn` for this resource. Each variant corresponds to a `Value`
@@ -80,13 +82,22 @@ pub(crate) fn build_from_resource(resource: &Resource) -> ExplicitFields {
 /// Build a resource authoring tree whose list records are aligned to
 /// the provider-returned values that will be stored in the same row.
 ///
+/// When `schema` is present, list similarity and every recursive field walk
+/// use the same schema-aware equality as differ-side saved-value merging. This
+/// keeps the projected/raw corroboration gate aligned with the authoring index
+/// selected during writeback.
+///
 /// Desired lists without a concrete stored-list counterpart fall back
 /// to the legacy union [`ExplicitFields::List`] representation rather
 /// than recording indices that cannot be justified.
 pub fn build_from_resource_for_stored_values(
     resource: &Resource,
     stored_attributes: &HashMap<String, Value>,
+    schema: Option<&ResourceSchema>,
 ) -> ExplicitFields {
+    let defs = schema
+        .map(|schema| &schema.defs)
+        .unwrap_or(empty_defs_for_schema_walks());
     ExplicitFields::Struct {
         children: resource
             .attributes
@@ -95,7 +106,14 @@ pub fn build_from_resource_for_stored_values(
             .map(|(key, desired)| {
                 (
                     key.clone(),
-                    build_from_value_for_stored_value(desired, stored_attributes.get(key)),
+                    build_from_value_for_stored_value(
+                        desired,
+                        stored_attributes.get(key),
+                        schema
+                            .and_then(|schema| schema.attributes.get(key))
+                            .map(|attribute| &attribute.attr_type),
+                        defs,
+                    ),
                 )
             })
             .collect(),
@@ -121,7 +139,12 @@ pub fn build_from_value(value: &Value) -> ExplicitFields {
     }
 }
 
-fn build_from_value_for_stored_value(desired: &Value, stored: Option<&Value>) -> ExplicitFields {
+fn build_from_value_for_stored_value(
+    desired: &Value,
+    stored: Option<&Value>,
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> ExplicitFields {
     match desired {
         Value::Concrete(ConcreteValue::Map(desired_fields)) => {
             let stored_fields = match stored {
@@ -137,6 +160,8 @@ fn build_from_value_for_stored_value(desired: &Value, stored: Option<&Value>) ->
                             build_from_value_for_stored_value(
                                 desired_child,
                                 stored_fields.and_then(|fields| fields.get(key)),
+                                map_entry_subtype(attr_type, key, defs),
+                                defs,
                             ),
                         )
                     })
@@ -145,15 +170,19 @@ fn build_from_value_for_stored_value(desired: &Value, stored: Option<&Value>) ->
         }
         Value::Concrete(ConcreteValue::List(desired_items)) => match stored {
             Some(Value::Concrete(ConcreteValue::List(stored_items))) => {
+                let item_type = list_element_type(attr_type, defs);
                 let mut elements = vec![ExplicitFields::Unrecorded; stored_items.len()];
-                for (desired_index, stored_index) in pair_list_elements(desired_items, stored_items)
-                    .into_iter()
-                    .enumerate()
+                for (desired_index, stored_index) in
+                    pair_list_elements(desired_items, stored_items, item_type, defs)
+                        .into_iter()
+                        .enumerate()
                 {
                     if let Some(stored_index) = stored_index {
                         elements[stored_index] = build_from_value_for_stored_value(
                             &desired_items[desired_index],
                             Some(&stored_items[stored_index]),
+                            item_type,
+                            defs,
                         );
                     }
                 }
@@ -392,7 +421,7 @@ mod tests {
             .map(|stored| HashMap::from([("items".to_string(), stored)]))
             .unwrap_or_default();
         let ExplicitFields::Struct { mut children } =
-            build_from_resource_for_stored_values(&resource, &stored_attributes)
+            build_from_resource_for_stored_values(&resource, &stored_attributes, None)
         else {
             panic!("expected resource-root Struct");
         };
@@ -612,6 +641,84 @@ mod tests {
         };
         assert_struct_keys(&elements[0], &["port"]);
         assert_struct_keys(&elements[1], &["port", "description"]);
+    }
+
+    #[test]
+    fn aligned_builder_pairing_matches_schema_aware_differ_pairing() {
+        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+        let effect_type = AttributeType::enum_(
+            crate::schema::TypeIdentity::bare("Effect"),
+            Some(vec!["Allow".to_string()]),
+            vec![("Allow".to_string(), "allow".to_string())],
+            None,
+            None,
+        );
+        let item_type = AttributeType::struct_(
+            "Statement",
+            vec![
+                StructField::new("effect", effect_type),
+                StructField::new("description", AttributeType::string()),
+            ],
+        );
+        let schema = ResourceSchema::new("example.Listener").attribute(AttributeSchema::new(
+            "items",
+            AttributeType::unordered_list(item_type),
+        ));
+        let desired_item = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "effect".to_string(),
+                Value::Concrete(ConcreteValue::enum_identifier("allow")),
+            ),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String("authored".to_string())),
+            ),
+        ])));
+        let stored_item = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "effect".to_string(),
+                Value::Concrete(ConcreteValue::String("Allow".to_string())),
+            ),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String("provider".to_string())),
+            ),
+        ])));
+        let desired = Value::Concrete(ConcreteValue::List(vec![desired_item]));
+        let stored = Value::Concrete(ConcreteValue::List(vec![stored_item]));
+        let resource =
+            Resource::new("example.Listener", "listener").with_attribute("items", desired);
+        let stored_attributes = HashMap::from([("items".to_string(), stored)]);
+
+        let ExplicitFields::Struct { children } =
+            build_from_resource_for_stored_values(&resource, &stored_attributes, Some(&schema))
+        else {
+            panic!("expected resource-root Struct");
+        };
+        let ExplicitFields::ListElements { elements } = &children["items"] else {
+            panic!("expected stored-index-aligned ListElements");
+        };
+        let Value::Concrete(ConcreteValue::List(desired_items)) = &resource.attributes["items"]
+        else {
+            panic!("expected desired list");
+        };
+        let Value::Concrete(ConcreteValue::List(stored_items)) = &stored_attributes["items"] else {
+            panic!("expected stored list");
+        };
+        let list_type = &schema.attributes["items"].attr_type;
+        let item_type = list_element_type(Some(list_type), &schema.defs);
+        let differ_pairs = pair_list_elements(desired_items, stored_items, item_type, &schema.defs);
+        let writeback_paired_indices: Vec<usize> = elements
+            .iter()
+            .enumerate()
+            .filter_map(|(index, element)| {
+                (!matches!(element, ExplicitFields::Unrecorded)).then_some(index)
+            })
+            .collect();
+        assert_eq!(differ_pairs, vec![Some(0)]);
+        assert_eq!(writeback_paired_indices, vec![0]);
+        assert_struct_keys(&elements[0], &["effect", "description"]);
     }
 
     #[test]

@@ -36,6 +36,119 @@ pub(crate) fn schema_aware_equal(
     }
 }
 
+/// Resolve the subtype for map entry `key`: a `Map`'s `value` type, a
+/// `Struct` field's type, or `None`. This is a field-search walk, so it
+/// deliberately peels every enclosing `List` until it reaches a `Map` or
+/// `Struct`; nested `List<Map>`/`List<Struct>` types therefore still resolve
+/// their entries (carina#3073). This differs intentionally from
+/// [`list_element_type`], which consumes exactly one list boundary. Uses the
+/// canonical `build_accepted_field_map` so a `block_name`-aliased struct field
+/// resolves like `validate_struct`.
+///
+/// `defs` is the enclosing schema's `defs` map; any [`AttributeType::Ref`]
+/// reached during unwrap is peeled against it. Without this, a
+/// `Ref`-typed attribute returns `None` for every entry and schema-aware
+/// equality silently degrades to its schema-blind fallback.
+pub(crate) fn map_entry_subtype<'a>(
+    attr_type: Option<&'a AttributeType>,
+    key: &str,
+    defs: &'a BTreeMap<String, AttributeType>,
+) -> Option<&'a AttributeType> {
+    let mut t = attr_type?;
+    loop {
+        match t.shape_with_defs(defs) {
+            crate::schema::Shape::List {
+                element_type: inner,
+                ..
+            } => t = inner,
+            crate::schema::Shape::Map { value, .. } => return Some(value),
+            crate::schema::Shape::Struct { .. } => {
+                let fields = crate::schema::struct_fields_with_defs(t, defs)
+                    .expect("Shape::Struct must expose struct fields internally");
+                return crate::schema::build_accepted_field_map(fields)
+                    .get(key)
+                    .map(|field| &field.field_type);
+            }
+            crate::schema::Shape::Union => {
+                t = union_member_for_walk(t, defs, UnionWalkTarget::MapEntry)?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum UnionWalkTarget {
+    MapEntry,
+    ListElement,
+}
+
+/// Select a Union member that has the shape required by the current walk.
+///
+/// List-element walks require a `List` member. Map-entry walks prefer a direct
+/// `Struct`/`Map` member because they are resolving a field by key, then fall
+/// back to a `List` wrapper so shapes such as `Union[String, List<Struct>]`
+/// continue to work. Selection is therefore independent of member declaration
+/// order when a Union contains both a map-like and a list member. This helper
+/// shares only Union-member selection; each caller retains its own traversal
+/// depth because the two walks answer different questions.
+fn union_member_for_walk<'a>(
+    attr_type: &'a AttributeType,
+    defs: &'a BTreeMap<String, AttributeType>,
+    target: UnionWalkTarget,
+) -> Option<&'a AttributeType> {
+    let members = crate::schema::union_members_with_defs(attr_type, defs)
+        .expect("Shape::Union must expose union members internally");
+    match target {
+        UnionWalkTarget::ListElement => members.iter().find(|member| {
+            matches!(
+                member.shape_with_defs(defs),
+                crate::schema::Shape::List { .. }
+            )
+        }),
+        UnionWalkTarget::MapEntry => members
+            .iter()
+            .find(|member| {
+                matches!(
+                    member.shape_with_defs(defs),
+                    crate::schema::Shape::Struct { .. } | crate::schema::Shape::Map { .. }
+                )
+            })
+            .or_else(|| {
+                members.iter().find(|member| {
+                    matches!(
+                        member.shape_with_defs(defs),
+                        crate::schema::Shape::List { .. }
+                    )
+                })
+            }),
+    }
+}
+
+/// Return the immediate element type for a list-shaped attribute.
+///
+/// Callers that are already walking a list element may pass the element type
+/// itself; in that case it is returned unchanged. Leading `Ref` nodes are
+/// always peeled with the enclosing schema's definitions. For a `Union`, the
+/// List member is selected regardless of declaration order, then its immediate
+/// element type is returned. Nested lists are not flattened: recursive callers
+/// invoke this helper once for each `Value::List` boundary they cross.
+pub(crate) fn list_element_type<'a>(
+    attr_type: Option<&'a AttributeType>,
+    defs: &'a BTreeMap<String, AttributeType>,
+) -> Option<&'a AttributeType> {
+    let mut current = attr_type?;
+    loop {
+        match current.shape_with_defs(defs) {
+            crate::schema::Shape::List { element_type, .. } => return Some(element_type),
+            crate::schema::Shape::Union => {
+                current = union_member_for_walk(current, defs, UnionWalkTarget::ListElement)?;
+            }
+            _ => return Some(current.resolve_refs_with_defs(defs).as_attr()),
+        }
+    }
+}
+
 /// Count non-internal attributes that are equal in both `from` and `to`.
 ///
 /// Internal attributes (prefixed with `_`) are excluded from the count.
@@ -229,6 +342,103 @@ pub fn compute_string_list_diff(old: &[String], new: &[String]) -> StringListDif
 mod tests {
     use super::*;
     use crate::resource::ConcreteValue;
+    use crate::schema::StructField;
+
+    fn struct_or_list_union(struct_first: bool) -> AttributeType {
+        let struct_member = AttributeType::struct_(
+            "Entry",
+            vec![StructField::new("enabled", AttributeType::bool())],
+        );
+        let list_member = AttributeType::list(AttributeType::string());
+        AttributeType::union(if struct_first {
+            vec![struct_member, list_member]
+        } else {
+            vec![list_member, struct_member]
+        })
+    }
+
+    #[test]
+    fn list_element_type_selects_list_member_regardless_of_union_order() {
+        let defs = empty_defs_for_schema_walks();
+        for struct_first in [true, false] {
+            let attr_type = struct_or_list_union(struct_first);
+            let element = list_element_type(Some(&attr_type), defs)
+                .expect("Union contains a List element type");
+            assert!(
+                matches!(
+                    element.shape_with_defs(defs),
+                    crate::schema::Shape::String { .. }
+                ),
+                "expected String list element with struct_first={struct_first}, got {:?}",
+                element.shape_with_defs(defs)
+            );
+        }
+    }
+
+    #[test]
+    fn map_entry_subtype_selects_struct_member_regardless_of_union_order() {
+        let defs = empty_defs_for_schema_walks();
+        for struct_first in [true, false] {
+            let attr_type = struct_or_list_union(struct_first);
+            let field_type = map_entry_subtype(Some(&attr_type), "enabled", defs)
+                .expect("Union contains a Struct with the requested field");
+            assert!(
+                matches!(field_type.shape_with_defs(defs), crate::schema::Shape::Bool),
+                "expected Bool field type with struct_first={struct_first}, got {:?}",
+                field_type.shape_with_defs(defs)
+            );
+        }
+    }
+
+    #[test]
+    fn nested_list_helpers_keep_one_level_element_and_field_search_semantics() {
+        let defs = empty_defs_for_schema_walks();
+        let attr_type = AttributeType::list(AttributeType::list(AttributeType::struct_(
+            "Entry",
+            vec![StructField::new("sid", AttributeType::string())],
+        )));
+
+        let immediate_element =
+            list_element_type(Some(&attr_type), defs).expect("outer List has an element type");
+        assert!(
+            matches!(
+                immediate_element.shape_with_defs(defs),
+                crate::schema::Shape::List { .. }
+            ),
+            "list-element lookup must consume only the outer List"
+        );
+        let nested_element = list_element_type(Some(immediate_element), defs)
+            .expect("inner List has an element type");
+        assert!(
+            matches!(
+                nested_element.shape_with_defs(defs),
+                crate::schema::Shape::Struct { .. }
+            ),
+            "a second value-list recursion must reach the Struct"
+        );
+
+        let field_type = map_entry_subtype(Some(&attr_type), "sid", defs)
+            .expect("field search must cross both List wrappers");
+        assert!(matches!(
+            field_type.shape_with_defs(defs),
+            crate::schema::Shape::String { .. }
+        ));
+    }
+
+    #[test]
+    fn list_element_type_unwraps_union_typed_string_or_list_of_strings() {
+        let attr_type = AttributeType::union(vec![
+            AttributeType::string(),
+            AttributeType::list(AttributeType::string()),
+        ]);
+        let defs = empty_defs_for_schema_walks();
+
+        let element = list_element_type(Some(&attr_type), defs).expect("Union contains a List");
+        assert!(matches!(
+            element.shape_with_defs(defs),
+            crate::schema::Shape::String { .. }
+        ));
+    }
 
     #[test]
     fn test_compute_unchanged_count_basic() {

@@ -16,7 +16,8 @@ use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
 use carina_core::resource::{ResourceId, State, Value};
 use carina_core::schema::{
-    AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, TypeIdentity,
+    AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, StructField,
+    TypeIdentity,
 };
 use carina_state::{StateFile, check_and_migrate};
 
@@ -472,6 +473,9 @@ fn fixture_provider_factories(fixture_path: &Path) -> Vec<Box<dyn ProviderFactor
     match fixture_path.file_name().and_then(|name| name.to_str()) {
         Some("dynamic_enum_az_no_diff") => vec![Box::new(DynamicEnumFixtureFactory)],
         Some("enum_display") => vec![Box::new(EnumDisplayFixtureFactory)],
+        Some("list_diff_best_first_mid_insert") => {
+            vec![Box::new(BestFirstPairingFixtureFactory)]
+        }
         Some("moved_claims_precede_heuristics") => {
             vec![Box::new(MovedClaimsPrecedeHeuristicsFixtureFactory)]
         }
@@ -482,6 +486,59 @@ fn fixture_provider_factories(fixture_path: &Path) -> Vec<Box<dyn ProviderFactor
             vec![Box::new(Route53HostedZoneFixtureFactory)]
         }
         _ => vec![],
+    }
+}
+
+struct BestFirstPairingFixtureFactory;
+
+impl ProviderFactory for BestFirstPairingFixtureFactory {
+    fn name(&self) -> &str {
+        "awscc"
+    }
+
+    fn display_name(&self) -> &str {
+        "AWS Cloud Control fixture provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::new()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &indexmap::IndexMap<String, Value>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
+        "test-region".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &indexmap::IndexMap<String, Value>,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schemas(&self) -> Vec<ResourceSchema> {
+        let statement = AttributeType::list(AttributeType::struct_(
+            "Statement",
+            vec![
+                StructField::new("sid", AttributeType::string()),
+                StructField::new("effect", AttributeType::string()),
+                StructField::new("action", AttributeType::list(AttributeType::string())),
+                StructField::new("resource", AttributeType::list(AttributeType::string())),
+            ],
+        ));
+        vec![
+            ResourceSchema::new("iam.RolePolicy")
+                .attribute(AttributeSchema::new("policy_name", AttributeType::string()).required())
+                .attribute(AttributeSchema::new("role_name", AttributeType::string()).required())
+                .attribute(AttributeSchema::new("statement", statement).required()),
+        ]
     }
 }
 

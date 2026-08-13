@@ -2,7 +2,8 @@
 
 mod enum_value;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::borrow::Borrow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
@@ -10,8 +11,11 @@ use std::ops::Deref;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+use crate::diff_helpers::{list_element_type, map_entry_subtype, schema_aware_equal};
 use crate::explicit::ExplicitFields;
-use crate::schema::{AttributeType, ResourceSchema, Shape, TypeIdentity, struct_fields_with_defs};
+use crate::schema::{
+    AttributeType, DslMap, ResourceSchema, Shape, TypeIdentity, struct_fields_with_defs,
+};
 
 pub use enum_value::{
     CanonicalEnumValue, EnumValueResolver, RawEnumIdentifier, RawEnumIdentifierParts,
@@ -1534,8 +1538,14 @@ impl Value {
             Value::Concrete(ConcreteValue::CanonicalEnum(c)) => c.hash(hasher),
             Value::Concrete(ConcreteValue::Int(i)) => i.hash(hasher),
             Value::Concrete(ConcreteValue::Float(f)) => {
-                // Use bits for deterministic hashing (NaN == NaN for our purposes)
-                f.to_bits().hash(hasher);
+                // Float equality treats +0.0 and -0.0 as equal, so their
+                // canonical hashes must also agree. Other values use their
+                // bits for deterministic hashing (NaN never compares equal).
+                if *f == 0.0 {
+                    0.0_f64.to_bits().hash(hasher);
+                } else {
+                    f.to_bits().hash(hasher);
+                }
             }
             Value::Concrete(ConcreteValue::Bool(b)) => b.hash(hasher),
             Value::Concrete(ConcreteValue::Duration(d)) => d.as_secs().hash(hasher),
@@ -1758,6 +1768,8 @@ pub(crate) fn merge_with_saved(
     desired: &Value,
     saved: SavedValueViews<'_>,
     prior_explicit: &ExplicitFields,
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
 ) -> Value {
     match (desired, saved.projected) {
         (
@@ -1773,6 +1785,8 @@ pub(crate) fn merge_with_saved(
                 projected_saved_map,
                 raw_saved_map,
                 prior_explicit,
+                attr_type,
+                defs,
             )
         }
         (
@@ -1788,6 +1802,8 @@ pub(crate) fn merge_with_saved(
                 projected_saved_list,
                 raw_saved_list,
                 prior_explicit,
+                attr_type,
+                defs,
             )))
         }
         _ => desired.clone(),
@@ -1799,6 +1815,8 @@ fn merge_maps(
     projected_saved: &IndexMap<String, Value>,
     raw_saved: &IndexMap<String, Value>,
     prior_explicit: &ExplicitFields,
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
 ) -> Value {
     let prior_children = match prior_explicit {
         ExplicitFields::Struct { children } => Some(children),
@@ -1832,6 +1850,8 @@ fn merge_maps(
                     prior_children
                         .and_then(|children| children.get(key))
                         .unwrap_or(&ExplicitFields::Unrecorded),
+                    map_entry_subtype(attr_type, key, defs),
+                    defs,
                 )
             }
             None => desired_value.clone(),
@@ -1841,110 +1861,518 @@ fn merge_maps(
     Value::Concrete(ConcreteValue::Map(merged))
 }
 
-/// Pair desired list indices to saved list indices via similarity score.
+/// Pair each desired-list index to at most one saved-list index.
 ///
-/// For large lists, uses hash-based bucketing to narrow candidate matches.
-/// For small lists, uses the simple O(n^2) scan.
-pub(crate) fn pair_list_elements(desired: &[Value], saved: &[Value]) -> Vec<Option<usize>> {
-    if desired.is_empty() {
-        return Vec::new();
+/// Every positive-score candidate is computed before any element is consumed.
+/// Candidates are then committed from highest score to lowest score. Equal
+/// scores preserve stable list-order preferences when equivalent alternatives
+/// exist. This keeps legacy assignments for indistinguishable peers without
+/// allowing a lower score to beat a higher one. Accepting every positive score
+/// preserves the existing score-1 fallback behavior.
+///
+/// Below [`HASH_THRESHOLD`] every pair is scored directly. Larger lists use
+/// canonical-hash buckets to generate only pairs that can share an equal field
+/// (or equal scalar), then run the exact same global best-first commit phase.
+/// Hash collisions only add a candidate: [`similarity_score`] remains the
+/// authority before a candidate can be committed.
+pub(crate) fn pair_list_elements<D, S>(
+    desired: &[D],
+    saved: &[S],
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> Vec<Option<usize>>
+where
+    D: Borrow<Value>,
+    S: Borrow<Value>,
+{
+    let candidates = if desired.len().max(saved.len()) < HASH_THRESHOLD {
+        pair_candidates_quadratic(desired, saved, attr_type, defs)
+    } else {
+        pair_candidates_hashed(desired, saved, attr_type, defs)
+    };
+
+    // Assign each desired element one stable, schema-aware preference before
+    // committing anything. Preferences are not pair commits: every explicit
+    // candidate and every implicit complete-row score has already been
+    // computed, and score remains the first ordering key. Choosing an
+    // unreserved equal-best saved index when possible is the O(n + m)
+    // equivalent of the former desired×saved reservation matrix.
+    let mut preferred_saved = vec![None; desired.len()];
+    let mut preferred_score = vec![0; desired.len()];
+    let mut preference_reserved = vec![false; saved.len()];
+    for (desired_index, preferred_slot) in preferred_saved.iter_mut().enumerate() {
+        let entries = &candidates.entries[candidates.desired_offsets[desired_index]
+            ..candidates.desired_offsets[desired_index + 1]];
+        let best_score = entries
+            .iter()
+            .map(|(score, _, _)| *score)
+            .max()
+            .unwrap_or(0)
+            .max(candidates.implicit_scores[desired_index]);
+        if best_score == 0 {
+            continue;
+        }
+        preferred_score[desired_index] = best_score;
+        let preferred = if candidates.implicit_scores[desired_index] == best_score {
+            // Every saved index has this score. Prefer the first index not
+            // already reserved by an earlier desired element, matching the
+            // explicit-candidate tie rule without materializing n×m edges.
+            (0..saved.len())
+                .find(|saved_index| !preference_reserved[*saved_index])
+                .or((!saved.is_empty()).then_some(0))
+        } else {
+            let fallback = entries
+                .iter()
+                .filter(|(score, _, _)| *score == best_score)
+                .map(|(_, _, saved_index)| *saved_index)
+                .min();
+            entries
+                .iter()
+                .filter(|(score, _, saved_index)| {
+                    *score == best_score && !preference_reserved[*saved_index]
+                })
+                .map(|(_, _, saved_index)| *saved_index)
+                .min()
+                .or(fallback)
+        };
+        if let Some(saved_index) = preferred {
+            *preferred_slot = Some(saved_index);
+            preference_reserved[saved_index] = true;
+        }
     }
-    if saved.len() < HASH_THRESHOLD {
-        return pair_list_elements_quadratic(desired, saved);
-    }
-    pair_list_elements_hashed(desired, saved)
-}
 
-/// O(n^2) pairing for small lists.
-fn pair_list_elements_quadratic(desired: &[Value], saved: &[Value]) -> Vec<Option<usize>> {
-    let mut used = vec![false; saved.len()];
-    let mut pairs = Vec::with_capacity(desired.len());
-
-    for d in desired {
-        let mut best_idx = None;
-        let mut best_score = 0;
-
-        for (j, s) in saved.iter().enumerate() {
-            if used[j] {
+    // Commit by the same total order as the former explicit edge sort:
+    // descending score, preferred candidates first, then desired and saved
+    // list order. Score levels let a complete row of equal-score candidates
+    // stay compressed instead of allocating or visiting every edge.
+    let mut score_levels = BTreeSet::new();
+    score_levels.extend(candidates.entries.iter().map(|(score, _, _)| *score));
+    score_levels.extend(
+        candidates
+            .implicit_scores
+            .iter()
+            .copied()
+            .filter(|score| *score > 0),
+    );
+    let mut pairs = vec![None; desired.len()];
+    let mut available_saved: BTreeSet<usize> = (0..saved.len()).collect();
+    for score in score_levels.into_iter().rev() {
+        // Preferred candidates sort before every non-preferred candidate at
+        // the same score.
+        for desired_index in 0..desired.len() {
+            if pairs[desired_index].is_some() || preferred_score[desired_index] != score {
                 continue;
             }
-            let score = similarity_score(d, s);
-            if score > best_score {
-                best_score = score;
-                best_idx = Some(j);
+            let Some(saved_index) = preferred_saved[desired_index] else {
+                continue;
+            };
+            if available_saved.remove(&saved_index) {
+                pairs[desired_index] = Some(saved_index);
             }
         }
 
-        if let Some(idx) = best_idx {
-            used[idx] = true;
+        // Non-preferred candidates sort by desired index and then saved index.
+        for (desired_index, pair) in pairs.iter_mut().enumerate() {
+            if pair.is_some() {
+                continue;
+            }
+            let saved_index = if candidates.implicit_scores[desired_index] == score {
+                // A complete-row score means every still-available saved edge
+                // has at least this score. If one had a higher score, the
+                // explicit candidate would already have consumed one of its
+                // endpoints in an earlier score phase. Therefore the first
+                // available saved index is exactly the next edge in the old
+                // global sort order.
+                available_saved.first().copied()
+            } else {
+                candidates.entries[candidates.desired_offsets[desired_index]
+                    ..candidates.desired_offsets[desired_index + 1]]
+                    .iter()
+                    .find_map(|(candidate_score, _, saved_index)| {
+                        (*candidate_score == score && available_saved.contains(saved_index))
+                            .then_some(*saved_index)
+                    })
+            };
+            if let Some(saved_index) = saved_index {
+                available_saved.remove(&saved_index);
+                *pair = Some(saved_index);
+            }
         }
-        pairs.push(best_idx);
     }
-
     pairs
 }
 
-/// Hash-assisted pairing for large lists.
-/// For Map values, tries exact hash match first, then falls back to scanning
-/// same-discriminant elements for best similarity. For non-Map values, uses
-/// hash bucketing for O(1) lookup.
-fn pair_list_elements_hashed(desired: &[Value], saved: &[Value]) -> Vec<Option<usize>> {
-    // Build hash buckets for saved elements
-    let mut saved_buckets: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (j, item) in saved.iter().enumerate() {
-        saved_buckets
-            .entry(item.canonical_hash())
-            .or_default()
-            .push(j);
+type PairCandidate = (usize, usize, usize);
+
+struct PairCandidates {
+    entries: Vec<PairCandidate>,
+    desired_offsets: Vec<usize>,
+    /// Per desired index, a positive score shared by every saved index.
+    /// Explicit entries override it where selective fields add more matches.
+    implicit_scores: Vec<usize>,
+}
+
+fn pair_candidates_quadratic<D, S>(
+    desired: &[D],
+    saved: &[S],
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> PairCandidates
+where
+    D: Borrow<Value>,
+    S: Borrow<Value>,
+{
+    let mut entries = Vec::new();
+    let mut desired_offsets = Vec::with_capacity(desired.len() + 1);
+    desired_offsets.push(0);
+    for (desired_index, desired_value) in desired.iter().enumerate() {
+        for (saved_index, saved_value) in saved.iter().enumerate() {
+            let score = similarity_score(
+                desired_value.borrow(),
+                saved_value.borrow(),
+                attr_type,
+                defs,
+            );
+            if score > 0 {
+                entries.push((score, desired_index, saved_index));
+            }
+        }
+        desired_offsets.push(entries.len());
     }
+    PairCandidates {
+        entries,
+        desired_offsets,
+        implicit_scores: vec![0; desired.len()],
+    }
+}
 
-    let mut used = vec![false; saved.len()];
-    let mut pairs = Vec::with_capacity(desired.len());
-
-    for d in desired {
-        let hash = d.canonical_hash();
-        let mut best_idx = None;
-        let mut best_score = 0;
-
-        // First, check exact hash matches (most common case for identical elements)
-        if let Some(bucket) = saved_buckets.get(&hash) {
-            for &j in bucket {
-                if used[j] {
-                    continue;
+/// Generate a complete representation of the positive-score candidate set.
+///
+/// Map elements are indexed by `(field key, schema-aware field hash)`, so a
+/// desired/saved pair is scored only if at least one field could compare equal.
+/// Non-map elements are indexed by their schema-aware whole-value hashes.
+/// A field proven equal across every saved element is stored once as an
+/// implicit complete-row contribution rather than expanding its bucket for
+/// every desired element. Selective fields still produce explicit, exact
+/// scores. Thus all candidates are scored before commitment while ubiquitous
+/// values such as IAM `effect: "Allow"` do not create n×m entries.
+///
+/// Coarse fallback hashes for structural schema shapes may admit collisions,
+/// but never exclude a pair that [`schema_aware_equal`] could accept. A dense
+/// but non-universal bucket can still make the worst case quadratic; the
+/// universal-field compression covers the common policy-statement shape while
+/// preserving exactly the same pairing decisions.
+fn pair_candidates_hashed<D, S>(
+    desired: &[D],
+    saved: &[S],
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> PairCandidates
+where
+    D: Borrow<Value>,
+    S: Borrow<Value>,
+{
+    let mut map_field_buckets: HashMap<&str, HashMap<u64, Vec<usize>>> = HashMap::new();
+    let mut value_buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (saved_index, saved_value) in saved.iter().enumerate() {
+        match saved_value.borrow() {
+            Value::Concrete(ConcreteValue::Map(map)) => {
+                for (key, value) in map {
+                    let field_type = map_entry_subtype(attr_type, key, defs);
+                    for value_hash in pairing_hashes(value, field_type, defs) {
+                        map_field_buckets
+                            .entry(key)
+                            .or_default()
+                            .entry(value_hash)
+                            .or_default()
+                            .push(saved_index);
+                    }
                 }
-                let score = similarity_score(d, &saved[j]);
-                if score > best_score {
-                    best_score = score;
-                    best_idx = Some(j);
+            }
+            value => {
+                for value_hash in pairing_hashes(value, attr_type, defs) {
+                    value_buckets
+                        .entry(value_hash)
+                        .or_default()
+                        .push(saved_index);
                 }
             }
         }
+    }
 
-        // For Maps, also check other saved Maps for partial matches
-        // (a Map may have extra fields from saved state, giving a different hash)
-        if matches!(d, Value::Concrete(ConcreteValue::Map(_))) {
-            for (j, s) in saved.iter().enumerate() {
-                if used[j] || matches!(best_idx, Some(bi) if bi == j) {
-                    continue;
+    // Identify hash buckets that really are one schema-aware equivalence class
+    // spanning every saved element. The equality verification makes the
+    // compression exact even when canonical hashes collide or enum spellings
+    // reach the same schema-normalized hash.
+    let mut universal_map_fields: HashMap<&str, HashMap<u64, &Value>> = HashMap::new();
+    for (key, value_buckets) in &map_field_buckets {
+        let field_type = map_entry_subtype(attr_type, key, defs);
+        let Some(representative) = saved.first().and_then(|saved_value| {
+            let Value::Concrete(ConcreteValue::Map(map)) = saved_value.borrow() else {
+                return None;
+            };
+            map.get(*key)
+        }) else {
+            continue;
+        };
+        for (value_hash, bucket) in value_buckets {
+            if bucket.len() != saved.len()
+                || !bucket.iter().copied().eq(0..saved.len())
+                || !saved.iter().all(|saved_value| {
+                    let Value::Concrete(ConcreteValue::Map(map)) = saved_value.borrow() else {
+                        return false;
+                    };
+                    map.get(*key).is_some_and(|value| {
+                        schema_aware_equal(representative, value, field_type, defs)
+                    })
+                })
+            {
+                continue;
+            }
+            universal_map_fields
+                .entry(key)
+                .or_default()
+                .insert(*value_hash, representative);
+        }
+    }
+
+    let mut universal_values = HashMap::new();
+    if let Some(representative) = saved.first().map(Borrow::borrow) {
+        for (value_hash, bucket) in &value_buckets {
+            if bucket.len() == saved.len()
+                && bucket.iter().copied().eq(0..saved.len())
+                && saved.iter().all(|saved_value| {
+                    schema_aware_equal(representative, saved_value.borrow(), attr_type, defs)
+                })
+            {
+                universal_values.insert(*value_hash, representative);
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    let mut desired_offsets = Vec::with_capacity(desired.len() + 1);
+    let mut implicit_scores = Vec::with_capacity(desired.len());
+    desired_offsets.push(0);
+    let mut possible_saved = Vec::new();
+    for (desired_index, desired_value) in desired.iter().enumerate() {
+        possible_saved.clear();
+        let mut implicit_score = 0;
+        match desired_value.borrow() {
+            Value::Concrete(ConcreteValue::Map(map)) => {
+                for (key, value) in map {
+                    let field_type = map_entry_subtype(attr_type, key, defs);
+                    let value_hashes = pairing_hashes(value, field_type, defs);
+                    let field_is_universal =
+                        universal_map_fields
+                            .get(key.as_str())
+                            .is_some_and(|universal_buckets| {
+                                value_hashes.iter().any(|value_hash| {
+                                    universal_buckets.get(value_hash).is_some_and(
+                                        |representative| {
+                                            schema_aware_equal(
+                                                value,
+                                                representative,
+                                                field_type,
+                                                defs,
+                                            )
+                                        },
+                                    )
+                                })
+                            });
+                    if field_is_universal {
+                        implicit_score += 1;
+                        continue;
+                    }
+                    if let Some(field_buckets) = map_field_buckets.get(key.as_str()) {
+                        for value_hash in value_hashes {
+                            if let Some(bucket) = field_buckets.get(&value_hash) {
+                                possible_saved.extend(bucket.iter().copied());
+                            }
+                        }
+                    }
                 }
-                if !matches!(s, Value::Concrete(ConcreteValue::Map(_))) {
-                    continue;
-                }
-                let score = similarity_score(d, s);
-                if score > best_score {
-                    best_score = score;
-                    best_idx = Some(j);
+            }
+            value => {
+                let value_hashes = pairing_hashes(value, attr_type, defs);
+                let value_is_universal = value_hashes.iter().any(|value_hash| {
+                    universal_values
+                        .get(value_hash)
+                        .is_some_and(|representative| {
+                            schema_aware_equal(value, representative, attr_type, defs)
+                        })
+                });
+                if value_is_universal {
+                    implicit_score = 1;
+                } else {
+                    for value_hash in value_hashes {
+                        let Some(bucket) = value_buckets.get(&value_hash) else {
+                            continue;
+                        };
+                        possible_saved.extend(bucket.iter().copied());
+                    }
                 }
             }
         }
-
-        if let Some(idx) = best_idx {
-            used[idx] = true;
+        possible_saved.sort_unstable();
+        possible_saved.dedup();
+        for saved_index in possible_saved.iter().copied() {
+            let score = similarity_score(
+                desired_value.borrow(),
+                saved[saved_index].borrow(),
+                attr_type,
+                defs,
+            );
+            if score > 0 {
+                entries.push((score, desired_index, saved_index));
+            }
         }
-        pairs.push(best_idx);
+        desired_offsets.push(entries.len());
+        implicit_scores.push(implicit_score);
     }
+    PairCandidates {
+        entries,
+        desired_offsets,
+        implicit_scores,
+    }
+}
 
-    pairs
+fn pairing_hashes(
+    value: &Value,
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> Vec<u64> {
+    let mut hashes = vec![value.canonical_hash()];
+    match value {
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            // `type_aware_equal` checks Secret before schema dispatch. A
+            // secret can equal either its plaintext inner String or its
+            // `_secret:argon2:...` state representation, so candidate
+            // generation must expose both relations as well. Recursive inner
+            // hashes cover plaintext (including schema normalizations); the
+            // fixed tag deliberately admits every state-secret spelling for
+            // exact verification by `similarity_score`.
+            hashes.extend(pairing_hashes(inner, attr_type, defs));
+            hashes.push(secret_state_pairing_hash());
+        }
+        Value::Concrete(ConcreteValue::String(value))
+            if value.starts_with(crate::value::SECRET_PREFIX) =>
+        {
+            hashes.push(secret_state_pairing_hash());
+        }
+        _ => {}
+    }
+    if let Some(attr_type) = attr_type {
+        append_schema_pairing_hashes(value, attr_type, defs, &mut hashes, 0);
+    }
+    hashes.sort_unstable();
+    hashes.dedup();
+    hashes
+}
+
+fn secret_state_pairing_hash() -> u64 {
+    pairing_component_hash(0x08, &crate::value::SECRET_PREFIX)
+}
+
+fn append_schema_pairing_hashes(
+    value: &Value,
+    attr_type: &AttributeType,
+    defs: &BTreeMap<String, AttributeType>,
+    hashes: &mut Vec<u64>,
+    depth: usize,
+) {
+    if depth == 16 {
+        hashes.push(pairing_component_hash(0xff, &0_u8));
+        return;
+    }
+    match attr_type.shape_with_defs(defs) {
+        Shape::String {
+            to_dsl: Some(transform),
+            ..
+        } => {
+            if let Value::Concrete(ConcreteValue::String(text)) = value {
+                hashes.push(pairing_component_hash(0x01, &transform.apply(text)));
+            }
+        }
+        Shape::String { to_dsl: None, .. } | Shape::Bool | Shape::Duration => {}
+        Shape::Int { .. } | Shape::Float { .. } => {
+            if let Some(hash) = numeric_pairing_hash(value) {
+                hashes.push(hash);
+            }
+        }
+        Shape::Enum {
+            values,
+            dsl_aliases,
+            to_dsl,
+            ..
+        } => {
+            let text = match value {
+                Value::Concrete(ConcreteValue::String(text)) => Some(text.as_str()),
+                Value::Concrete(ConcreteValue::EnumIdentifier(text)) => Some(text.as_str()),
+                Value::Concrete(ConcreteValue::CanonicalEnum(value)) => Some(value.api_value()),
+                _ => None,
+            };
+            if let Some(text) = text {
+                let valid_values: Vec<&str> =
+                    values.into_iter().flatten().map(String::as_str).collect();
+                let trailing = crate::utils::extract_enum_value_with_values(text, &valid_values);
+                let dsl_map = DslMap::new(dsl_aliases, to_dsl);
+                let canonical = dsl_map.api_for(&dsl_map.dsl_for(trailing));
+                hashes.push(pairing_component_hash(
+                    0x02,
+                    &canonical.to_ascii_lowercase(),
+                ));
+            }
+        }
+        Shape::List { ordered, .. } => {
+            if let Value::Concrete(ConcreteValue::List(items)) = value {
+                hashes.push(pairing_component_hash(0x03, &(ordered, items.len())));
+            }
+        }
+        Shape::Map { .. } => {
+            if let Value::Concrete(ConcreteValue::Map(map)) = value {
+                let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                hashes.push(pairing_component_hash(0x04, &(map.len(), keys)));
+            }
+        }
+        Shape::Struct { .. } => {
+            if matches!(value, Value::Concrete(ConcreteValue::Map(_))) {
+                // Struct equality tolerates omitted default-valued fields, so
+                // raw map hashes are not a complete equivalence key.
+                hashes.push(pairing_component_hash(0x05, &0_u8));
+            }
+        }
+        Shape::Union => {
+            let members = crate::schema::union_members_with_defs(attr_type, defs)
+                .expect("Shape::Union must expose union members internally");
+            for member in members {
+                append_schema_pairing_hashes(value, member, defs, hashes, depth + 1);
+            }
+        }
+    }
+}
+
+fn numeric_pairing_hash(value: &Value) -> Option<u64> {
+    match value {
+        Value::Concrete(ConcreteValue::Int(value)) => Some(pairing_component_hash(0x06, value)),
+        Value::Concrete(ConcreteValue::Float(value)) => {
+            let integer = *value as i64;
+            if integer as f64 == *value {
+                Some(pairing_component_hash(0x06, &integer))
+            } else {
+                Some(pairing_component_hash(0x07, &value.to_bits()))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn pairing_component_hash<T: Hash>(tag: u8, value: &T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tag.hash(&mut hasher);
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Merge two lists using projected saved values for value pairing and raw saved values to
@@ -1954,6 +2382,8 @@ fn merge_lists(
     projected_saved: &[Value],
     raw_saved: &[Value],
     prior_explicit: &ExplicitFields,
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
 ) -> Vec<Value> {
     let aligned_elements = match prior_explicit {
         ExplicitFields::ListElements { elements }
@@ -1965,8 +2395,9 @@ fn merge_lists(
         _ => None,
     };
 
-    let projected_pairs = pair_list_elements(desired, projected_saved);
-    let raw_pairs = pair_list_elements(desired, raw_saved);
+    let item_type = list_element_type(attr_type, defs);
+    let projected_pairs = pair_list_elements(desired, projected_saved, item_type, defs);
+    let raw_pairs = pair_list_elements(desired, raw_saved, item_type, defs);
 
     projected_pairs
         .into_iter()
@@ -1987,7 +2418,13 @@ fn merge_lists(
                         .get(projected_index)
                         .map(|raw_value| SavedValueViews::new(projected_value, raw_value))
                         .unwrap_or_else(|| SavedValueViews::same(projected_value));
-                    merge_with_saved(&desired[desired_index], saved_views, authoring)
+                    merge_with_saved(
+                        &desired[desired_index],
+                        saved_views,
+                        authoring,
+                        item_type,
+                        defs,
+                    )
                 }
                 None => desired[desired_index].clone(),
             },
@@ -1999,23 +2436,24 @@ fn merge_lists(
 /// For Maps: count matching key-value pairs.
 /// For equal scalars: return 1.
 /// Otherwise: return 0.
-fn similarity_score(a: &Value, b: &Value) -> usize {
+fn similarity_score(
+    a: &Value,
+    b: &Value,
+    attr_type: Option<&AttributeType>,
+    defs: &BTreeMap<String, AttributeType>,
+) -> usize {
     match (a, b) {
         (Value::Concrete(ConcreteValue::Map(am)), Value::Concrete(ConcreteValue::Map(bm))) => am
             .iter()
             .filter(|(k, v)| {
                 bm.get(*k)
-                    .map(|bv| v.semantically_equal(bv))
+                    .map(|bv| {
+                        schema_aware_equal(v, bv, map_entry_subtype(attr_type, k, defs), defs)
+                    })
                     .unwrap_or(false)
             })
             .count(),
-        _ => {
-            if a.semantically_equal(b) {
-                1
-            } else {
-                0
-            }
-        }
+        _ => usize::from(schema_aware_equal(a, b, attr_type, defs)),
     }
 }
 

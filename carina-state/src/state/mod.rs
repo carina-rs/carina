@@ -1475,7 +1475,8 @@ impl ResourceState {
         // legacy-corruption marker, which forced callers to
         // disambiguate by runtime convention; `Unrecorded` is the
         // typed signal for "no authoring record".
-        let built = explicit::build_from_resource_for_stored_values(resource, &state.attributes);
+        let built =
+            explicit::build_from_resource_for_stored_values(resource, &state.attributes, schema);
         rs.explicit = match built {
             ExplicitFields::Struct { ref children } if children.is_empty() => {
                 // Three sub-cases when `resource.attributes` is empty:

@@ -657,9 +657,29 @@ pub(crate) fn format_value_into<S: FormatSink>(
 pub fn contains_secret(value: &Value) -> bool {
     match value {
         Value::Deferred(DeferredValue::Secret(_)) => true,
-        Value::Concrete(ConcreteValue::Map(map)) => map.values().any(contains_secret),
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_secret),
-        _ => false,
+        Value::Concrete(ConcreteValue::Map(map)) => map.values().any(contains_secret),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => parts
+            .iter()
+            .any(|part| matches!(part, InterpolationPart::Expr(value) if contains_secret(value))),
+        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            args.iter().any(contains_secret)
+        }
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Unknown(_),
+        ) => false,
     }
 }
 
@@ -1427,23 +1447,6 @@ pub fn as_string_list(value: &Value) -> Option<Vec<String>> {
 pub fn needs_trailing_separator(value: &Value) -> bool {
     is_list_of_maps(value)
         && matches!(value, Value::Concrete(ConcreteValue::List(items)) if items.len() >= 2)
-}
-
-/// Count the number of shared key-value pairs between two map Values.
-/// Uses semantically_equal for value comparison so nested lists are order-insensitive.
-/// Returns 0 if either value is not a Map.
-pub fn map_similarity(a: &Value, b: &Value) -> usize {
-    match (a, b) {
-        (Value::Concrete(ConcreteValue::Map(ma)), Value::Concrete(ConcreteValue::Map(mb))) => ma
-            .iter()
-            .filter(|(k, v)| {
-                mb.get(*k)
-                    .map(|bv| v.semantically_equal(bv))
-                    .unwrap_or(false)
-            })
-            .count(),
-        _ => 0,
-    }
 }
 
 /// Returns true when `attr_type` is exactly the IAM-style
@@ -3110,34 +3113,6 @@ mod tests {
     }
 
     #[test]
-    fn test_map_similarity_matching() {
-        let mut m1 = IndexMap::new();
-        m1.insert("a".to_string(), Value::Concrete(ConcreteValue::Int(1)));
-        m1.insert("b".to_string(), Value::Concrete(ConcreteValue::Int(2)));
-        let mut m2 = IndexMap::new();
-        m2.insert("a".to_string(), Value::Concrete(ConcreteValue::Int(1)));
-        m2.insert("b".to_string(), Value::Concrete(ConcreteValue::Int(3)));
-        assert_eq!(
-            map_similarity(
-                &Value::Concrete(ConcreteValue::Map(m1)),
-                &Value::Concrete(ConcreteValue::Map(m2))
-            ),
-            1
-        );
-    }
-
-    #[test]
-    fn test_map_similarity_non_maps() {
-        assert_eq!(
-            map_similarity(
-                &Value::Concrete(ConcreteValue::Int(1)),
-                &Value::Concrete(ConcreteValue::Int(1))
-            ),
-            0
-        );
-    }
-
-    #[test]
     fn test_value_to_json_secret_produces_hash() {
         let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
             ConcreteValue::String("my-password".to_string()),
@@ -3330,6 +3305,23 @@ mod tests {
                 redacted
             ),
         }
+    }
+
+    #[test]
+    fn contains_secret_walks_interpolations_and_function_arguments() {
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("sensitive".to_string()),
+        ))));
+        let interpolation = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("prefix-".to_string()),
+            InterpolationPart::Expr(secret),
+        ]));
+        let function_call = Value::Deferred(DeferredValue::FunctionCall {
+            name: "format".to_string(),
+            args: vec![interpolation],
+        });
+
+        assert!(contains_secret(&function_call));
     }
 
     #[test]

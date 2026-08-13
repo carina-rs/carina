@@ -1807,6 +1807,39 @@ fn snapshot_list_diff_modified_with_unchanged() {
     insta::assert_snapshot!(output);
 }
 
+/// #3722: a statement inserted before a modified peer must remain an addition.
+/// All unmatched statements share `effect = "Allow"`, so the inserted element
+/// can greedily steal either saved statement unless pairing globally commits
+/// the higher-score peers first.
+#[test]
+fn snapshot_list_diff_best_first_mid_insert() {
+    let (plan, schemas, _moved) = build_plan_from_fixture("list_diff_best_first_mid_insert");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &HashMap::new(),
+        &[],
+        &[],
+        None,
+        None,
+    ));
+    assert!(
+        output.contains("sid: \"ECRRepository\""),
+        "inserted statement must render as an added element: {output}"
+    );
+    assert!(
+        output.contains("arn:aws:iam::*:role/carina-registry-publish-api-execution"),
+        "existing statement's added ARN must remain visible: {output}"
+    );
+    assert!(
+        !output.contains("\"ManagePublishStackRoles\" →"),
+        "best-first pairing must not render the existing SID as renamed: {output}"
+    );
+    insta::assert_snapshot!(output);
+}
+
 /// #2943: a List<String> field inside a list-of-maps modified element
 /// that grew by trailing entries must render multi-line with `+` lines
 /// for added entries, not as a single inline `field: [a, b, ...] →

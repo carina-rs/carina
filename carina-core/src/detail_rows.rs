@@ -8,13 +8,16 @@ use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 
-use crate::diff_helpers::{compute_map_diff, compute_unchanged_count, schema_aware_equal};
+use crate::diff_helpers::{
+    compute_map_diff, compute_unchanged_count, list_element_type, map_entry_subtype,
+    schema_aware_equal,
+};
 use crate::effect::{DeletedInstanceKey, Effect, EffectGeneration};
 use crate::non_empty::NonEmptyVec;
 use crate::plan::ReplaceDisplayInfo;
-use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value};
+use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value, pair_list_elements};
 use crate::schema::{AttributeType, ResourceSchema, SchemaRegistry, empty_defs_for_schema_walks};
-use crate::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
+use crate::value::{format_value, format_value_with_key, is_list_of_maps};
 
 /// Controls how much detail is shown in plan output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,65 +305,6 @@ pub enum ListOfMapsDiffField {
         added: Vec<String>,
         removed: Vec<String>,
     },
-}
-
-/// Resolve the subtype for map entry `key`: a `Map`'s `value` type, a
-/// `Struct` field's type, or `None`. `List`/`Union` are unwrapped so a
-/// nested `List<Map>`/`List<Struct>` still resolves its entries
-/// (carina#3073). Uses the canonical `build_accepted_field_map` so a
-/// `block_name`-aliased struct field resolves like `validate_struct`.
-///
-/// `defs` is the enclosing schema's `defs` map; any [`AttributeType::Ref`]
-/// reached during unwrap is peeled against it. Without this, a
-/// `Ref`-typed attribute (cyclic CFN: `lifecycle_configuration:
-/// Ref("LifecycleConfiguration")`) returns `None` for every entry —
-/// the plan-display detail rows lose schema-aware classification and
-/// the `# n unchanged attributes hidden` tally drifts (same bug class
-/// as carina#3349; carina#3340 walk-site doc-comment names
-/// `detail_rows` as a Ref-aware walker).
-fn map_entry_subtype<'a>(
-    attr_type: Option<&'a AttributeType>,
-    key: &str,
-    defs: &'a std::collections::BTreeMap<String, AttributeType>,
-) -> Option<&'a AttributeType> {
-    let mut t = attr_type?;
-    loop {
-        // Project onto `Shape` so any `Ref` chain is peeled at the
-        // type level (carina#3349). The wildcard arm cannot
-        // silently drop a `Ref` because `Shape` has no `Ref`
-        // variant. `shape(defs)` panics on a dangling `Ref` —
-        // schema-construction bug, surfaced loudly.
-        match t.shape_with_defs(defs) {
-            crate::schema::Shape::List {
-                element_type: inner,
-                ..
-            } => t = inner,
-            crate::schema::Shape::Map { value, .. } => return Some(value),
-            crate::schema::Shape::Struct { .. } => {
-                let fields = crate::schema::struct_fields_with_defs(t, defs)
-                    .expect("Shape::Struct must expose struct fields internally");
-                // Canonical field accessor — resolves `block_name`
-                // aliases too, matching `validate_struct` /
-                // `collect_struct` (#2214).
-                return crate::schema::build_accepted_field_map(fields)
-                    .get(key)
-                    .map(|f| &f.field_type);
-            }
-            crate::schema::Shape::Union => {
-                let members = crate::schema::union_members_with_defs(t, defs)
-                    .expect("Shape::Union must expose union members internally");
-                t = members.iter().find(|m| {
-                    matches!(
-                        &m.kind,
-                        crate::schema::AttrTypeKind::Struct { .. }
-                            | crate::schema::AttrTypeKind::Map { .. }
-                            | crate::schema::AttrTypeKind::List { .. }
-                    )
-                })?;
-            }
-            _ => return None,
-        }
-    }
 }
 
 /// Build detail rows for an effect.
@@ -1441,23 +1385,9 @@ fn compute_list_of_maps_diff_parts(
     };
 
     // The element type for the list (e.g. the IAM policy `statement`
-    // `Struct`); used for schema-aware item/field equality below.
-    // Peel any leading `Ref` so a `Ref("…")` attribute whose def is
-    // `List<Struct>` still drops into the List arm — same bug class
-    // as carina#3349. `resolve_refs` is a no-op on non-Ref inputs.
-    let attr_type_peeled = attr_type.map(|t| t.resolve_refs_with_defs(defs).as_attr());
-    let item_type = match attr_type_peeled.map(|t| (&t.kind, t)) {
-        Some((
-            crate::schema::AttrTypeKind::List {
-                element_type: inner,
-                ..
-            },
-            _,
-        )) => Some(inner.as_ref()),
-        // The attribute itself may already be the element type when
-        // this is reached recursively from a Map value.
-        _ => attr_type_peeled,
-    };
+    // `Struct`); shared with differ/writeback list walks so Ref peeling
+    // and already-at-element call sites cannot drift.
+    let item_type = list_element_type(attr_type, defs);
 
     let mut old_matched = vec![false; old_items.len()];
     let mut new_matched = vec![false; new_items.len()];
@@ -1489,26 +1419,27 @@ fn compute_list_of_maps_diff_parts(
         .map(|(i, _)| i)
         .collect();
 
-    // Phase 2: Pair unmatched items by similarity
+    // Phase 2: pair unmatched items through the same schema-aware,
+    // best-first routine used by differ and writeback.
     let mut paired: Vec<(usize, usize)> = Vec::new();
     let mut paired_old = vec![false; unmatched_old.len()];
     let mut paired_new = vec![false; unmatched_new.len()];
 
-    for (ui_new, &ni) in unmatched_new.iter().enumerate() {
-        let mut best_oi_idx = None;
-        let mut best_sim = 0usize;
-        for (ui_old, &oi) in unmatched_old.iter().enumerate() {
-            if paired_old[ui_old] {
-                continue;
-            }
-            let sim = map_similarity(&old_items[oi], &new_items[ni]);
-            if sim > best_sim {
-                best_sim = sim;
-                best_oi_idx = Some(ui_old);
-            }
-        }
-        if let Some(ui_old) = best_oi_idx.filter(|_| best_sim > 0) {
-            paired.push((unmatched_old[ui_old], ni));
+    let unmatched_new_items: Vec<&Value> = unmatched_new
+        .iter()
+        .map(|&index| &new_items[index])
+        .collect();
+    let unmatched_old_items: Vec<&Value> = unmatched_old
+        .iter()
+        .map(|&index| &old_items[index])
+        .collect();
+    for (ui_new, ui_old) in
+        pair_list_elements(&unmatched_new_items, &unmatched_old_items, item_type, defs)
+            .into_iter()
+            .enumerate()
+    {
+        if let Some(ui_old) = ui_old {
+            paired.push((unmatched_old[ui_old], unmatched_new[ui_new]));
             paired_old[ui_old] = true;
             paired_new[ui_new] = true;
         }
@@ -3911,7 +3842,7 @@ mod tests {
             ConcreteValue::String("new".to_string()),
         ))));
 
-        // Same `sid` on both sides so `map_similarity > 0` → Phase 2
+        // Same `sid` on both sides so the similarity score is positive → Phase 2
         // pairs them. A different `effect` key forces Phase 1
         // exact-match to fail so the pair is *modified*, not unchanged.
         let mut old_stmt = indexmap::IndexMap::new();
@@ -3961,6 +3892,171 @@ mod tests {
             password_changed,
             "secret rotation as a paired-element peer must keep its Changed field, got: {modified:?}"
         );
+    }
+
+    /// carina#3722: a newly inserted statement that appears first must not
+    /// steal the only old statement from a more-similar modified statement.
+    #[test]
+    fn list_of_maps_best_first_pairing_prevents_greedy_steal() {
+        let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string()));
+        let strings = |values: &[&str]| {
+            Value::Concrete(ConcreteValue::List(
+                values.iter().map(|value| string(value)).collect(),
+            ))
+        };
+        let statement = |sid: &str, action: &[&str], resource: &[&str]| {
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                ("sid".to_string(), string(sid)),
+                ("effect".to_string(), string("Allow")),
+                ("action".to_string(), strings(action)),
+                ("resource".to_string(), strings(resource)),
+            ])))
+        };
+
+        let old_value = Value::Concrete(ConcreteValue::List(vec![statement(
+            "ManagePublishStackRoles",
+            &["iam:CreateRole", "iam:DeleteRole"],
+            &[
+                "arn:aws:iam::*:role/carina-registry-publish-api-task",
+                "arn:aws:iam::*:role/carina-registry-policy-write",
+            ],
+        )]));
+        let new_value = Value::Concrete(ConcreteValue::List(vec![
+            statement(
+                "ECRRepository",
+                &["ecr:CreateRepository"],
+                &["arn:aws:ecr:*:*:repository/carina-registry-publish-api"],
+            ),
+            statement(
+                "ManagePublishStackRoles",
+                &["iam:CreateRole", "iam:DeleteRole"],
+                &[
+                    "arn:aws:iam::*:role/carina-registry-publish-api-task",
+                    "arn:aws:iam::*:role/carina-registry-policy-write",
+                    "arn:aws:iam::*:role/carina-registry-publish-api-execution",
+                ],
+            ),
+        ]));
+
+        let (_unchanged, modified, added, removed) = compute_list_of_maps_diff_parts(
+            Some(&old_value),
+            &new_value,
+            None,
+            crate::schema::empty_defs_for_schema_walks(),
+            DetailLevel::Full,
+        );
+
+        assert_eq!(
+            added.len(),
+            1,
+            "expected only the inserted statement: {added:?}"
+        );
+        assert!(
+            removed.is_empty(),
+            "old statement must be paired: {removed:?}"
+        );
+        assert_eq!(
+            modified.len(),
+            1,
+            "expected the role statement modification"
+        );
+        assert!(
+            !modified[0].fields.as_slice().iter().any(
+                |field| matches!(field, ListOfMapsDiffField::Changed { key, .. } if key == "sid")
+            ),
+            "the modified statement must retain its sid: {:?}",
+            modified[0]
+        );
+    }
+
+    /// carina#3736 finding 2: similarity uses the element schema too,
+    /// not only the exact-match phase surrounding it.
+    #[test]
+    fn list_of_maps_similarity_pairs_enum_alias_fields_with_schema() {
+        let enum_type = |name: &str, api: &str, dsl: &str| {
+            AttributeType::enum_(
+                crate::schema::TypeIdentity::bare(name),
+                Some(vec![api.to_string()]),
+                vec![(api.to_string(), dsl.to_string())],
+                None,
+                None,
+            )
+        };
+        let element_type = AttributeType::struct_(
+            "Statement",
+            vec![
+                StructField::new("effect", enum_type("Effect", "Allow", "allow")),
+                StructField::new("mode", enum_type("Mode", "Enabled", "enabled")),
+                StructField::new("scope", enum_type("Scope", "Regional", "regional")),
+                StructField::new("description", AttributeType::string()),
+            ],
+        );
+        let list_type = AttributeType::unordered_list(element_type);
+        let old_item = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+            (
+                "effect".to_string(),
+                Value::Concrete(ConcreteValue::enum_identifier("allow")),
+            ),
+            (
+                "mode".to_string(),
+                Value::Concrete(ConcreteValue::enum_identifier("enabled")),
+            ),
+            (
+                "scope".to_string(),
+                Value::Concrete(ConcreteValue::enum_identifier("regional")),
+            ),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String("before".to_string())),
+            ),
+        ])));
+        let new_item = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+            (
+                "effect".to_string(),
+                Value::Concrete(ConcreteValue::String("Allow".to_string())),
+            ),
+            (
+                "mode".to_string(),
+                Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+            ),
+            (
+                "scope".to_string(),
+                Value::Concrete(ConcreteValue::String("Regional".to_string())),
+            ),
+            (
+                "description".to_string(),
+                Value::Concrete(ConcreteValue::String("after".to_string())),
+            ),
+        ])));
+        let old_value = Value::Concrete(ConcreteValue::List(vec![old_item]));
+        let new_value = Value::Concrete(ConcreteValue::List(vec![new_item]));
+
+        let (_unchanged, modified, added, removed) = compute_list_of_maps_diff_parts(
+            Some(&old_value),
+            &new_value,
+            Some(&list_type),
+            crate::schema::empty_defs_for_schema_walks(),
+            DetailLevel::Full,
+        );
+
+        assert!(
+            added.is_empty(),
+            "schema-equivalent enum fields must pair: {added:?}"
+        );
+        assert!(
+            removed.is_empty(),
+            "schema-equivalent enum fields must pair: {removed:?}"
+        );
+        assert_eq!(
+            modified.len(),
+            1,
+            "the genuine sibling change must remain visible"
+        );
+        assert_eq!(modified[0].fields.as_slice().len(), 1);
+        assert!(matches!(
+            &modified[0].fields.as_slice()[0],
+            ListOfMapsDiffField::Changed { key, .. } if key == "description"
+        ));
     }
 
     /// Negative (carina#3075, mirrors the carina#3073 fallback

@@ -38,6 +38,8 @@ plan-list-diff-removed-struct:
 	$(PLAN_FIXTURE) list_diff_removed_struct
 plan-list-diff-modified-with-unchanged:
 	$(PLAN_FIXTURE) list_diff_modified_with_unchanged
+plan-list-diff-best-first-mid-insert:
+	$(PLAN_FIXTURE) list_diff_best_first_mid_insert
 plan-list-diff-modified-with-unchanged-nested:
 	$(PLAN_FIXTURE) list_diff_modified_with_unchanged_nested
 plan-list-diff-paired-all-unchanged-dropped:
@@ -134,6 +136,8 @@ plan-fixtures:
 	@$(MAKE) plan-list-diff-removed-struct
 	@echo "---"
 	@$(MAKE) plan-list-diff-modified-with-unchanged
+	@echo "---"
+	@$(MAKE) plan-list-diff-best-first-mid-insert
 	@echo "---"
 	@$(MAKE) plan-list-diff-modified-with-unchanged-nested
 	@echo "---"
