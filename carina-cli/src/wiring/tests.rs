@@ -771,8 +771,7 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
     // `moved` block addresses are routing-agnostic by construction
     // (the type makes routing unrepresentable here).
     let state_blocks = vec![StateBlock::Moved {
-        from: StateBlockAddress::new("aws", "route53.RecordSet", "old_record"),
-        to: StateBlockAddress::new("aws", "route53.RecordSet", "new_record"),
+        addresses: MovedAddresses::new("aws", "route53.RecordSet", "old_record", "new_record"),
     }];
 
     let moved_pairs = materialize_moved_states(
@@ -800,6 +799,51 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
         !current_states.contains_key(&routed_from),
         "old routed key must be removed after move",
     );
+}
+
+#[test]
+fn same_type_moved_block_parses_and_materializes_state() {
+    use carina_core::parser::{ProviderContext, parse};
+    use carina_core::resource::{ResourceId, State};
+    use carina_state::state::{ResourceState, StateFile};
+
+    let parsed = parse(
+        r#"
+            moved {
+                from = awscc.s3.Bucket 'old_bucket'
+                to   = awscc.s3.Bucket 'new_bucket'
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .expect("same-type moved block must parse");
+
+    let from = ResourceId::with_provider_identity("awscc", "s3.Bucket", "old_bucket", None);
+    let to = ResourceId::with_provider_identity("awscc", "s3.Bucket", "new_bucket", None);
+    let mut current_states = HashMap::from([(
+        from.clone(),
+        State::existing(from.clone(), HashMap::new()).with_identifier("bucket-123"),
+    )]);
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(ResourceState::new("s3.Bucket", "old_bucket", "awscc"))
+        .expect("test state setup must be valid");
+
+    let moved_pairs = materialize_moved_states(
+        &mut current_states,
+        &mut HashMap::new(),
+        &mut crate::empty_lifted_saved_attrs(),
+        &parsed.state_blocks,
+        &Some(state_file),
+    );
+
+    assert_eq!(moved_pairs, vec![(from.clone(), to.clone())]);
+    assert!(!current_states.contains_key(&from));
+    let moved = current_states
+        .get(&to)
+        .expect("source state must be transferred to the destination address");
+    assert_eq!(moved.id, to);
+    assert_eq!(moved.identifier.as_deref(), Some("bucket-123"));
 }
 
 /// Sibling of `import_suppresses_create_when_target_resource_is_routed_to_named_instance`:
@@ -1121,8 +1165,7 @@ fn test_materialize_moved_states_warns_on_missing_from() {
     use carina_state::state::{ResourceState, StateFile};
 
     let state_blocks = vec![StateBlock::Moved {
-        from: StateBlockAddress::new("awscc", "s3.Bucket", "old_bucket"),
-        to: StateBlockAddress::new("awscc", "s3.Bucket", "new_bucket"),
+        addresses: MovedAddresses::new("awscc", "s3.Bucket", "old_bucket", "new_bucket"),
     }];
     let mut warnings = Vec::new();
     let moved_pairs = materialize_moved_states_with_warning_sink(
@@ -1418,8 +1461,7 @@ fn test_plan_allows_from_absent_to_present_idempotent_noop() {
     let desired = Vec::new();
     let state_file = Some(bucket_state_file(&["already_moved"]));
     let state_blocks = vec![StateBlock::Moved {
-        from: StateBlockAddress::new("awscc", "s3.Bucket", "old_name"),
-        to: StateBlockAddress::new("awscc", "s3.Bucket", "already_moved"),
+        addresses: MovedAddresses::new("awscc", "s3.Bucket", "old_name", "already_moved"),
     }];
     let mut warnings = Vec::new();
 
@@ -1772,10 +1814,10 @@ fn test_stale_moved_block_releases_claims() {
         "subnet-a",
     )];
     let state_blocks = vec![StateBlock::Moved {
-        from: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", "does_not_exist"),
-        to: StateBlockAddress::new(
+        addresses: MovedAddresses::new(
             "awscc",
             "ec2.SubnetRouteTableAssociation",
+            "does_not_exist",
             "ec2_subnet_route_table_association_aaaaaaaa",
         ),
     }];
@@ -1832,8 +1874,12 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
             .expect("test state setup must be valid");
         resources.push(desired_association(&desired_name, &binding, &subnet_id));
         state_blocks.push(StateBlock::Moved {
-            from: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", &old_name),
-            to: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", &desired_name),
+            addresses: MovedAddresses::new(
+                "awscc",
+                "ec2.SubnetRouteTableAssociation",
+                &old_name,
+                &desired_name,
+            ),
         });
 
         let old_id = ResourceId::with_provider_identity(

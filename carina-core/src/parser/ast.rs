@@ -669,6 +669,60 @@ impl std::fmt::Display for StateBlockAddress {
     }
 }
 
+/// The two routing-agnostic addresses in a `moved` block.
+///
+/// carina#3749: a move changes only a resource's identity. The provider and
+/// resource type are stored once so a parsed move cannot represent a transfer
+/// between different resource schemas.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MovedAddresses {
+    provider: String,
+    resource_type: String,
+    from_name: crate::resource::ResourceIdentity,
+    to_name: crate::resource::ResourceIdentity,
+}
+
+impl MovedAddresses {
+    /// Construct same-type source and destination addresses for a move.
+    pub fn new(
+        provider: impl Into<String>,
+        resource_type: impl Into<String>,
+        from_name: impl Into<String>,
+        to_name: impl Into<String>,
+    ) -> Self {
+        let from_name = from_name.into();
+        let to_name = to_name.into();
+        Self {
+            provider: provider.into(),
+            resource_type: resource_type.into(),
+            from_name: crate::resource::ResourceIdentity::new(
+                crate::utils::canonicalize_map_key_address(&from_name),
+            ),
+            to_name: crate::resource::ResourceIdentity::new(
+                crate::utils::canonicalize_map_key_address(&to_name),
+            ),
+        }
+    }
+
+    /// Build the full source address.
+    pub fn from(&self) -> StateBlockAddress {
+        StateBlockAddress {
+            provider: self.provider.clone(),
+            resource_type: self.resource_type.clone(),
+            name: self.from_name.clone(),
+        }
+    }
+
+    /// Build the full destination address.
+    pub fn to(&self) -> StateBlockAddress {
+        StateBlockAddress {
+            provider: self.provider.clone(),
+            resource_type: self.resource_type.clone(),
+            name: self.to_name.clone(),
+        }
+    }
+}
+
 /// State manipulation block (import, removed, moved)
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StateBlock {
@@ -695,10 +749,8 @@ pub enum StateBlock {
     },
     /// Rename/move a resource in state without destroy/recreate
     Moved {
-        /// Old resource address (routing-agnostic).
-        from: StateBlockAddress,
-        /// New resource address (routing-agnostic).
-        to: StateBlockAddress,
+        /// Same-type source and destination addresses.
+        addresses: MovedAddresses,
     },
 }
 

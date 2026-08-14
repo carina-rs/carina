@@ -4191,7 +4191,9 @@ fn parse_moved_block() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(result.state_blocks.len(), 1);
     match &result.state_blocks[0] {
-        StateBlock::Moved { from, to } => {
+        StateBlock::Moved { addresses } => {
+            let from = addresses.from();
+            let to = addresses.to();
             assert_eq!(from.provider, "awscc");
             assert_eq!(from.resource_type, "ec2.Subnet");
             assert_eq!(from.name_str(), "old-name");
@@ -4201,6 +4203,38 @@ fn parse_moved_block() {
         }
         other => panic!("Expected Moved, got {:?}", other),
     }
+}
+
+#[test]
+fn parse_moved_block_rejects_different_resource_types() {
+    let input = r#"
+        moved {
+            from = aws.svc.Source 'a'
+            to   = aws.svc.Dest 'b'
+        }
+    "#;
+
+    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Invalid expression at line 0: moved block requires 'from' and 'to' to use the same provider and resource type (got 'aws.svc.Source' and 'aws.svc.Dest'); a provider or resource type change is not a move. Remove the moved block and let the plan delete and create the resource, or use 'removed' and 'import' to preserve the existing cloud resource"
+    );
+}
+
+#[test]
+fn parse_moved_block_rejects_different_providers() {
+    let input = r#"
+        moved {
+            from = aws.svc.X 'a'
+            to   = awscc.svc.X 'b'
+        }
+    "#;
+
+    let err = parse(input, &ProviderContext::default()).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Invalid expression at line 0: moved block requires 'from' and 'to' to use the same provider and resource type (got 'aws.svc.X' and 'awscc.svc.X'); a provider or resource type change is not a move. Remove the moved block and let the plan delete and create the resource, or use 'removed' and 'import' to preserve the existing cloud resource"
+    );
 }
 
 #[test]
@@ -4243,7 +4277,8 @@ fn moved_block_accepts_three_map_key_address_forms() {
             .unwrap_or_else(|e| panic!("parse failed for {label}: {e:?}"));
         assert_eq!(result.state_blocks.len(), 1);
         match &result.state_blocks[0] {
-            StateBlock::Moved { to, .. } => {
+            StateBlock::Moved { addresses } => {
+                let to = addresses.to();
                 assert_eq!(
                     to.name_str(),
                     "_accounts.registry_prod",
@@ -4269,7 +4304,8 @@ fn moved_block_keeps_non_identifier_safe_key_in_quoted_form() {
     "#;
     let result = parse(input, &ProviderContext::default()).unwrap();
     match &result.state_blocks[0] {
-        StateBlock::Moved { to, .. } => {
+        StateBlock::Moved { addresses } => {
+            let to = addresses.to();
             assert_eq!(to.name_str(), "_envs['prod-east']");
         }
         other => panic!("Expected Moved, got {:?}", other),

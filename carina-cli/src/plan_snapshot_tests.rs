@@ -1103,8 +1103,8 @@ fn collect_unused_let_bindings_in_fixtures(
             .state_blocks
             .iter()
             .filter_map(|sb| {
-                if let carina_core::parser::StateBlock::Moved { to, .. } = sb {
-                    Some(to.name_str().to_string())
+                if let carina_core::parser::StateBlock::Moved { addresses } = sb {
+                    Some(addresses.to().name_str().to_string())
                 } else {
                     None
                 }

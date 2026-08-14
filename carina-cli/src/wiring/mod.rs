@@ -30,6 +30,8 @@ use carina_core::identifier::{
 };
 use carina_core::module_resolver;
 use carina_core::override_aware::OverrideAwareResources;
+#[cfg(test)]
+use carina_core::parser::MovedAddresses;
 use carina_core::parser::{ProviderConfig, StateBlock, StateBlockAddress, WarningKind};
 use carina_core::plan::Plan;
 use carina_core::provider::{
@@ -2800,7 +2802,9 @@ fn materialize_moved_states_with_warning_sink(
     let mut moved_pairs = Vec::new();
 
     for block in state_blocks {
-        if let StateBlock::Moved { from, to } = block {
+        if let StateBlock::Moved { addresses } = block {
+            let from = addresses.from();
+            let to = addresses.to();
             // carina#3324: `from`/`to` are parsed from
             // `moved { from = X 'a', to = X 'b' }`, which has no
             // syntax for `provider_instance`. The state-resident
@@ -2852,9 +2856,9 @@ fn materialize_moved_states_with_warning_sink(
             // the resolution is independent of map-population
             // ordering — a routed entry in any of the three is the
             // right routing for the destination.
-            let resolved_to = find_desired_id(to, current_states.keys())
-                .or_else(|| find_desired_id(to, prev_explicit.keys()))
-                .or_else(|| find_desired_id(to, saved_attrs.resource_ids()))
+            let resolved_to = find_desired_id(&to, current_states.keys())
+                .or_else(|| find_desired_id(&to, prev_explicit.keys()))
+                .or_else(|| find_desired_id(&to, saved_attrs.resource_ids()))
                 .unwrap_or_else(|| to.to_unrouted_resource_id());
 
             // Transfer state from the old name to the new name so the
@@ -2902,10 +2906,9 @@ pub fn resolve_state_blocks(
 
     for block in blocks {
         match block {
-            StateBlock::Moved {
-                from: moved_from,
-                to: moved_to,
-            } => {
+            StateBlock::Moved { addresses } => {
+                let moved_from = addresses.from();
+                let moved_to = addresses.to();
                 if state_file.as_ref().is_some_and(|sf| {
                     sf.find_resource(
                         &moved_from.provider,
@@ -2914,8 +2917,8 @@ pub fn resolve_state_blocks(
                     )
                     .is_some()
                 }) {
-                    from.insert(moved_from.clone());
-                    to.insert(moved_to.clone());
+                    from.insert(moved_from);
+                    to.insert(moved_to);
                 }
             }
             StateBlock::Removed { from: removed_from } => {
