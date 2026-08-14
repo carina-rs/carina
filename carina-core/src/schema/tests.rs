@@ -4256,15 +4256,23 @@ mod schema_validate_attr_struct_tests {
 
         let errors = schema.validate_collect(&mixed);
         assert_eq!(errors.len(), 1, "mixed union value must be rejected");
-        assert!(matches!(
-            &errors[0].1,
-            TypeError::UnknownStructField {
-                struct_name,
-                field,
-                ..
-            } if (struct_name == "RetentionDays" && field == "years")
-                || (struct_name == "RetentionYears" && field == "days")
-        ));
+        let TypeError::UnionStructMismatch {
+            reason,
+            supplied_fields,
+            alternatives,
+        } = &errors[0].1
+        else {
+            panic!("expected UnionStructMismatch, got {:?}", errors[0].1)
+        };
+        assert_eq!(reason, &UnionStructMismatchReason::ConflictingAlternatives);
+        assert_eq!(supplied_fields, &["days", "years"]);
+        assert_eq!(
+            alternatives
+                .iter()
+                .map(|alternative| alternative.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["RetentionDays", "RetentionYears"]
+        );
     }
 
     #[test]
@@ -4730,9 +4738,800 @@ fn expected_enum_variant_serde_round_trip() {
 // On a Union failure, surface the closest-matching member's error rather
 // than a generic TypeMismatch. "Closest" is measured by structural
 // distance: same outer constructor (Map↔Struct, List↔List, String↔
-// Enum/Custom) wins over an unrelated member. Tie-broken by
-// declaration order, so the existing Map/Struct case continues to pick
-// the Struct member's error first.
+// Enum/Custom) wins over an unrelated member. Unique failures stay
+// verbatim; tied closed-Struct failures become an alternatives diagnostic.
+
+fn retention_union() -> AttributeType {
+    AttributeType::union(vec![
+        AttributeType::struct_(
+            "RetentionDays".to_string(),
+            vec![StructField::new("days", AttributeType::int()).required()],
+        ),
+        AttributeType::struct_(
+            "RetentionYears".to_string(),
+            vec![StructField::new("years", AttributeType::int()).required()],
+        ),
+    ])
+}
+
+fn required_int_struct(name: &str, fields: &[&str]) -> AttributeType {
+    AttributeType::struct_(
+        name.to_string(),
+        fields
+            .iter()
+            .map(|field| StructField::new(*field, AttributeType::int()).required())
+            .collect(),
+    )
+}
+
+fn union_map(entries: Vec<(&str, Value)>) -> Value {
+    Value::Concrete(ConcreteValue::Map(
+        entries
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect(),
+    ))
+}
+
+/// Exercise all public validation paths that own Union diagnostics. Keeping
+/// them in every assertion prevents either the schema-aware CLI/LSP path or
+/// the standalone path from silently retaining the old first-arm behavior.
+fn union_errors_from_public_paths(
+    union: &AttributeType,
+    value: &Value,
+) -> Vec<(&'static str, TypeError)> {
+    let schema = Schema::flat(union.clone());
+    let standalone = union
+        .validate(value)
+        .expect_err("AttributeType::validate must reject the value");
+    let schema_attr = schema
+        .validate_attr(union, value)
+        .expect_err("Schema::validate_attr must reject the value");
+    let collected = schema.validate_collect(value);
+    assert_eq!(
+        collected.len(),
+        1,
+        "Schema::validate_collect must produce one union-level error, got {collected:?}"
+    );
+
+    vec![
+        ("AttributeType::validate", standalone),
+        ("Schema::validate_attr", schema_attr),
+        ("Schema::validate_collect", collected[0].1.clone()),
+    ]
+}
+
+fn assert_union_valid_through_public_paths(union: &AttributeType, value: &Value) {
+    let schema = Schema::flat(union.clone());
+    assert!(
+        union.validate(value).is_ok(),
+        "AttributeType::validate rejected {value:?}"
+    );
+    assert!(
+        schema.validate_attr(union, value).is_ok(),
+        "Schema::validate_attr rejected {value:?}"
+    );
+    assert!(
+        schema.validate_collect(value).is_empty(),
+        "Schema::validate_collect rejected {value:?}"
+    );
+}
+
+fn assert_retention_alternative_metadata(path: &str, alternatives: &[UnionStructAlternative]) {
+    assert_eq!(alternatives.len(), 2, "{path} lost a tied alternative");
+    assert_eq!(alternatives[0].name, "RetentionDays");
+    assert_eq!(alternatives[0].accepted_fields, vec!["days".to_string()]);
+    assert_eq!(alternatives[0].required_fields, vec!["days".to_string()]);
+    assert_eq!(alternatives[1].name, "RetentionYears");
+    assert_eq!(alternatives[1].accepted_fields, vec!["years".to_string()]);
+    assert_eq!(alternatives[1].required_fields, vec!["years".to_string()]);
+}
+
+#[test]
+fn union_struct_tie_reports_fields_from_multiple_alternatives() {
+    let union = retention_union();
+    let value = union_map(vec![
+        ("days", Value::Concrete(ConcreteValue::Int(30))),
+        ("years", Value::Concrete(ConcreteValue::Int(1))),
+    ]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        let TypeError::UnionStructMismatch {
+            reason,
+            supplied_fields,
+            alternatives,
+        } = &err
+        else {
+            panic!("{path} must return structured UnionStructMismatch, got {err:?}")
+        };
+        assert_eq!(reason, &UnionStructMismatchReason::ConflictingAlternatives);
+        assert_eq!(supplied_fields, &["days", "years"]);
+        assert_retention_alternative_metadata(path, alternatives);
+        assert_eq!(
+            err.to_string(),
+            "Expected exactly one of 'days' or 'years', but both were supplied",
+            "{path} must render the mixed-alternative diagnostic concisely"
+        );
+    }
+}
+
+#[test]
+fn union_struct_diagnostic_uses_recognized_field_sets_not_cardinality() {
+    let union = AttributeType::union(vec![
+        AttributeType::struct_(
+            "Days".to_string(),
+            vec![
+                StructField::new("days", AttributeType::int()).required(),
+                StructField::new("unit", AttributeType::string()),
+            ],
+        ),
+        required_int_struct("Years", &["years"]),
+    ]);
+    let value = union_map(vec![
+        ("days", Value::Concrete(ConcreteValue::Int(30))),
+        ("years", Value::Concrete(ConcreteValue::Int(1))),
+        (
+            "unit",
+            Value::Concrete(ConcreteValue::String("calendar".to_string())),
+        ),
+    ]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        assert!(
+            matches!(
+                &err,
+                TypeError::UnionStructMismatch {
+                    reason: UnionStructMismatchReason::ConflictingAlternatives,
+                    ..
+                }
+            ),
+            "{path} must retain both non-empty recognized field sets"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Expected exactly one of 'days' or 'years', but both were supplied",
+            "{path} must not choose Days merely because it recognizes two fields"
+        );
+    }
+}
+
+#[test]
+fn union_struct_superset_recognized_set_does_not_hide_other_alternatives() {
+    let union = AttributeType::union(vec![
+        required_int_struct("Days", &["days"]),
+        required_int_struct("Years", &["years"]),
+        required_int_struct("Both", &["days", "years", "tz"]),
+    ]);
+    let value = union_map(vec![
+        ("days", Value::Concrete(ConcreteValue::Int(30))),
+        ("years", Value::Concrete(ConcreteValue::Int(1))),
+    ]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        assert!(
+            matches!(&err, TypeError::UnionStructMismatch { .. }),
+            "{path} must retain the Days and Years alternatives"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Expected one of these forms: 'days', 'years', or ('days', 'years', and 'tz')",
+            "{path} must not choose Both merely because it recognizes both supplied fields"
+        );
+    }
+}
+
+#[test]
+fn union_struct_tie_reports_no_alternative_for_empty_map() {
+    let union = retention_union();
+    let value = union_map(vec![]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        let TypeError::UnionStructMismatch {
+            reason,
+            supplied_fields,
+            alternatives,
+        } = &err
+        else {
+            panic!("{path} must return structured UnionStructMismatch, got {err:?}")
+        };
+        assert_eq!(
+            reason,
+            &UnionStructMismatchReason::NoAlternativeSatisfied {
+                unrecognized_fields: vec![]
+            }
+        );
+        assert!(supplied_fields.is_empty());
+        assert_retention_alternative_metadata(path, alternatives);
+        assert_eq!(
+            err.to_string(),
+            "Expected exactly one of 'days' or 'years', but none were supplied",
+            "{path} must render the empty-alternative diagnostic concisely"
+        );
+    }
+}
+
+#[test]
+fn union_struct_tie_reports_unrecognized_fields_and_all_alternatives() {
+    let union = retention_union();
+    let value = union_map(vec![("months", Value::Concrete(ConcreteValue::Int(3)))]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        let TypeError::UnionStructMismatch {
+            reason,
+            supplied_fields,
+            alternatives,
+        } = &err
+        else {
+            panic!("{path} must return structured UnionStructMismatch, got {err:?}")
+        };
+        assert_eq!(
+            reason,
+            &UnionStructMismatchReason::NoAlternativeSatisfied {
+                unrecognized_fields: vec!["months".to_string()]
+            }
+        );
+        assert_eq!(supplied_fields, &["months"]);
+        assert_retention_alternative_metadata(path, alternatives);
+        assert_eq!(
+            err.to_string(),
+            "Unknown field 'months': expected exactly one of 'days' or 'years'",
+            "{path} must render the unknown-field diagnostic concisely"
+        );
+    }
+}
+
+#[test]
+fn union_struct_three_alternatives_render_as_one_readable_list() {
+    let union = AttributeType::union(vec![
+        AttributeType::struct_(
+            "RetentionDays".to_string(),
+            vec![StructField::new("days", AttributeType::int()).required()],
+        ),
+        AttributeType::struct_(
+            "RetentionWeeks".to_string(),
+            vec![StructField::new("weeks", AttributeType::int()).required()],
+        ),
+        AttributeType::struct_(
+            "RetentionYears".to_string(),
+            vec![StructField::new("years", AttributeType::int()).required()],
+        ),
+    ]);
+    let value = union_map(vec![]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        assert_eq!(
+            err.to_string(),
+            "Expected exactly one of 'days', 'weeks', or 'years', but none were supplied",
+            "{path} must render three alternatives as a readable list"
+        );
+    }
+}
+
+#[test]
+fn union_struct_multi_field_alternatives_render_each_field_set_once() {
+    let union = AttributeType::union(vec![
+        AttributeType::struct_(
+            "DateRange".to_string(),
+            vec![
+                StructField::new("start", AttributeType::string()).required(),
+                StructField::new("end", AttributeType::string()).required(),
+            ],
+        ),
+        AttributeType::struct_(
+            "DayMode".to_string(),
+            vec![
+                StructField::new("days", AttributeType::int()).required(),
+                StructField::new("mode", AttributeType::string()).required(),
+            ],
+        ),
+    ]);
+    let value = union_map(vec![]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        assert_eq!(
+            err.to_string(),
+            "Expected exactly one of ('start' and 'end') or ('days' and 'mode'), but none were supplied",
+            "{path} must group each multi-field alternative without dumping metadata"
+        );
+    }
+}
+
+#[test]
+fn union_struct_shared_required_field_advice_names_complete_valid_forms() {
+    let union = AttributeType::union(vec![
+        required_int_struct("A", &["a", "b"]),
+        required_int_struct("B", &["b", "c"]),
+    ]);
+    let expected = "Expected one of these forms: ('a' and 'b') or ('b' and 'c')";
+
+    for value in [
+        union_map(vec![]),
+        union_map(vec![
+            ("a", Value::Concrete(ConcreteValue::Int(1))),
+            ("b", Value::Concrete(ConcreteValue::Int(2))),
+            ("c", Value::Concrete(ConcreteValue::Int(3))),
+        ]),
+    ] {
+        for (path, err) in union_errors_from_public_paths(&union, &value) {
+            assert_eq!(
+                err.to_string(),
+                expected,
+                "{path} must retain the shared required field in every advised form"
+            );
+        }
+    }
+
+    let corrected_a = union_map(vec![
+        ("a", Value::Concrete(ConcreteValue::Int(1))),
+        ("b", Value::Concrete(ConcreteValue::Int(2))),
+    ]);
+    let corrected_b = union_map(vec![
+        ("b", Value::Concrete(ConcreteValue::Int(2))),
+        ("c", Value::Concrete(ConcreteValue::Int(3))),
+    ]);
+    assert_union_valid_through_public_paths(&union, &corrected_a);
+    assert_union_valid_through_public_paths(&union, &corrected_b);
+}
+
+#[test]
+fn union_struct_superset_arms_do_not_claim_xor() {
+    let union = AttributeType::union(vec![
+        required_int_struct("Days", &["days"]),
+        required_int_struct("DaysWithExtra", &["days", "extra"]),
+    ]);
+    let value = union_map(vec![]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        assert_eq!(
+            err.to_string(),
+            "Expected one of these forms: 'days' or ('days' and 'extra')",
+            "{path} must not claim mutually exclusive forms for a subset relation"
+        );
+    }
+
+    let days = union_map(vec![("days", Value::Concrete(ConcreteValue::Int(30)))]);
+    let days_with_extra = union_map(vec![
+        ("days", Value::Concrete(ConcreteValue::Int(30))),
+        ("extra", Value::Concrete(ConcreteValue::Int(1))),
+    ]);
+    assert_union_valid_through_public_paths(&union, &days);
+    assert_union_valid_through_public_paths(&union, &days_with_extra);
+}
+
+#[test]
+fn union_struct_overlapping_optional_arms_do_not_demand_optional_fields() {
+    let union = AttributeType::union(vec![
+        AttributeType::struct_(
+            "DaysWithExtra".to_string(),
+            vec![
+                StructField::new("days", AttributeType::int()).required(),
+                StructField::new("extra", AttributeType::int()),
+            ],
+        ),
+        AttributeType::struct_(
+            "DaysWithOther".to_string(),
+            vec![
+                StructField::new("days", AttributeType::int()).required(),
+                StructField::new("other", AttributeType::int()),
+            ],
+        ),
+    ]);
+    let value = union_map(vec![]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        assert_eq!(
+            err.to_string(),
+            "Expected one of these forms: 'days' (`DaysWithExtra`) or 'days' (`DaysWithOther`)",
+            "{path} must name the shared required field without demanding either optional field"
+        );
+    }
+
+    let corrected = union_map(vec![("days", Value::Concrete(ConcreteValue::Int(30)))]);
+    assert_union_valid_through_public_paths(&union, &corrected);
+}
+
+#[test]
+fn union_struct_partial_conflict_lists_every_declared_arm() {
+    let union = AttributeType::union(vec![
+        required_int_struct("RetentionDays", &["days"]),
+        required_int_struct("RetentionWeeks", &["weeks"]),
+        required_int_struct("RetentionMonths", &["months"]),
+        required_int_struct("RetentionYears", &["years"]),
+        required_int_struct("RetentionDecades", &["decades"]),
+    ]);
+    let value = union_map(vec![
+        ("days", Value::Concrete(ConcreteValue::Int(30))),
+        ("years", Value::Concrete(ConcreteValue::Int(1))),
+    ]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        let TypeError::UnionStructMismatch { alternatives, .. } = &err else {
+            panic!("{path} must return UnionStructMismatch, got {err:?}")
+        };
+        assert_eq!(
+            alternatives
+                .iter()
+                .map(|alternative| alternative.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "RetentionDays",
+                "RetentionWeeks",
+                "RetentionMonths",
+                "RetentionYears",
+                "RetentionDecades"
+            ],
+            "{path} must carry every declared arm, not only tied failures"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Expected exactly one of 'days', 'weeks', 'months', 'years', or 'decades', but more than one was supplied",
+            "{path} must not narrow the declared options to the tied arms"
+        );
+    }
+
+    let corrected = union_map(vec![("months", Value::Concrete(ConcreteValue::Int(3)))]);
+    assert_union_valid_through_public_paths(&union, &corrected);
+}
+
+#[test]
+fn union_struct_four_by_four_rendering_is_bounded() {
+    let union = AttributeType::union(vec![
+        required_int_struct(
+            "Alpha",
+            &["alpha_one", "alpha_two", "alpha_three", "alpha_four"],
+        ),
+        required_int_struct(
+            "Bravo",
+            &["bravo_one", "bravo_two", "bravo_three", "bravo_four"],
+        ),
+        required_int_struct(
+            "Charlie",
+            &[
+                "charlie_one",
+                "charlie_two",
+                "charlie_three",
+                "charlie_four",
+            ],
+        ),
+        required_int_struct(
+            "Delta",
+            &["delta_one", "delta_two", "delta_three", "delta_four"],
+        ),
+    ]);
+    let value = union_map(vec![]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            "Expected exactly one of ('alpha_one', 'alpha_two', 'alpha_three', and 'alpha_four') or 3 more alternatives, but none were supplied",
+            "{path} must elide whole alternatives without truncating a field name"
+        );
+        assert!(
+            message.chars().count() <= 160,
+            "{path} rendered an unbounded {}-character message: {message}",
+            message.chars().count()
+        );
+        assert!(!message.contains(['\n', ';']));
+    }
+}
+
+#[test]
+fn union_struct_long_field_rendering_is_bounded() {
+    let union = AttributeType::union(vec![
+        required_int_struct(
+            "PrimaryRetentionForm",
+            &[
+                "primary_retention_period_in_calendar_days",
+                "primary_retention_archive_transition_policy",
+            ],
+        ),
+        required_int_struct(
+            "SecondaryRetentionForm",
+            &[
+                "secondary_retention_period_in_calendar_years",
+                "secondary_retention_archive_transition_policy",
+            ],
+        ),
+    ]);
+    let value = union_map(vec![]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            "Expected exactly one of `PrimaryRetentionForm` or `SecondaryRetentionForm`, but none were supplied",
+            "{path} must use visibly quoted type names when field sets cannot fit"
+        );
+        assert!(
+            message.chars().count() <= 160,
+            "{path} rendered an unbounded {}-character message: {message}",
+            message.chars().count()
+        );
+        assert!(!message.contains(['\n', ';']));
+    }
+}
+
+#[test]
+fn union_struct_unknown_field_restores_similar_name_suggestion() {
+    let union = retention_union();
+    let value = union_map(vec![("dayz", Value::Concrete(ConcreteValue::Int(30)))]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        assert_eq!(
+            err.to_string(),
+            "Unknown field 'dayz', did you mean 'days'? Expected exactly one of 'days' or 'years'",
+            "{path} must preserve the sibling struct diagnostic's typo suggestion"
+        );
+    }
+
+    let corrected = union_map(vec![("days", Value::Concrete(ConcreteValue::Int(30)))]);
+    assert_union_valid_through_public_paths(&union, &corrected);
+}
+
+#[test]
+fn union_struct_empty_arm_name_is_visibly_a_type_name() {
+    let union = AttributeType::union(vec![
+        AttributeType::struct_("EmptyArm".to_string(), vec![]),
+        required_int_struct("RetentionDays", &["days"]),
+    ]);
+    let value = union_map(vec![("zzz", Value::Concrete(ConcreteValue::Int(1)))]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        assert_eq!(
+            err.to_string(),
+            "Unknown field 'zzz': expected one of these forms: empty `EmptyArm` form or 'days'",
+            "{path} must distinguish a struct name from field names"
+        );
+    }
+
+    assert_union_valid_through_public_paths(&union, &union_map(vec![]));
+}
+
+#[test]
+fn union_struct_ambiguous_field_sets_quote_type_names() {
+    let union = AttributeType::union(vec![
+        AttributeType::struct_(
+            "IntVariant".to_string(),
+            vec![StructField::new("value", AttributeType::int()).required()],
+        ),
+        AttributeType::struct_(
+            "StringVariant".to_string(),
+            vec![StructField::new("value", AttributeType::string()).required()],
+        ),
+    ]);
+    let value = union_map(vec![("value", Value::Concrete(ConcreteValue::Bool(true)))]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        assert_eq!(
+            err.to_string(),
+            "Expected one of these forms: 'value' (`IntVariant`) or 'value' (`StringVariant`)",
+            "{path} must visibly distinguish type names from fields"
+        );
+    }
+}
+
+#[test]
+fn union_struct_tie_with_only_shared_fields_reports_no_satisfied_alternative() {
+    let union = AttributeType::union(vec![
+        AttributeType::struct_(
+            "RetentionDays".to_string(),
+            vec![
+                StructField::new("label", AttributeType::string()).required(),
+                StructField::new("days", AttributeType::int()).required(),
+            ],
+        ),
+        AttributeType::struct_(
+            "RetentionYears".to_string(),
+            vec![
+                StructField::new("label", AttributeType::string()).required(),
+                StructField::new("years", AttributeType::int()).required(),
+            ],
+        ),
+    ]);
+    let value = union_map(vec![(
+        "label",
+        Value::Concrete(ConcreteValue::String("archive".to_string())),
+    )]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        let TypeError::UnionStructMismatch { reason, .. } = &err else {
+            panic!("{path} must return UnionStructMismatch, got {err:?}")
+        };
+        assert_eq!(
+            reason,
+            &UnionStructMismatchReason::NoAlternativeSatisfied {
+                unrecognized_fields: vec![]
+            },
+            "{path} must not call a field accepted by every arm conflicting"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Expected one of these forms: ('label' and 'days') or ('label' and 'years')",
+            "{path} must retain the shared required field in every form"
+        );
+    }
+
+    let corrected = union_map(vec![
+        (
+            "label",
+            Value::Concrete(ConcreteValue::String("archive".to_string())),
+        ),
+        ("days", Value::Concrete(ConcreteValue::Int(30))),
+    ]);
+    assert_union_valid_through_public_paths(&union, &corrected);
+}
+
+#[test]
+fn union_struct_accepts_days_alternative_through_all_public_paths() {
+    let union = retention_union();
+    let value = union_map(vec![("days", Value::Concrete(ConcreteValue::Int(30)))]);
+    assert_union_valid_through_public_paths(&union, &value);
+}
+
+#[test]
+fn union_struct_accepts_years_alternative_through_all_public_paths() {
+    let union = retention_union();
+    let value = union_map(vec![("years", Value::Concrete(ConcreteValue::Int(1)))]);
+    assert_union_valid_through_public_paths(&union, &value);
+}
+
+#[test]
+fn union_struct_unique_field_match_preserves_detailed_member_error_verbatim() {
+    let union = retention_union();
+    let value = union_map(vec![(
+        "days",
+        Value::Concrete(ConcreteValue::String("x".to_string())),
+    )]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        assert_eq!(
+            err.to_string(),
+            "Struct field 'days': Type mismatch: expected Int, got String",
+            "{path} must preserve the unique RetentionDays member error"
+        );
+    }
+}
+
+#[test]
+fn nested_union_preserves_inner_struct_alternative_diagnostic() {
+    let union = AttributeType::union(vec![retention_union(), AttributeType::bool()]);
+    let value = union_map(vec![
+        ("days", Value::Concrete(ConcreteValue::Int(30))),
+        ("years", Value::Concrete(ConcreteValue::Int(1))),
+    ]);
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        assert_eq!(
+            err.to_string(),
+            "Expected exactly one of 'days' or 'years', but both were supplied",
+            "{path} discarded or changed the nested union diagnostic"
+        );
+    }
+}
+
+#[test]
+fn scalar_union_without_a_shape_match_keeps_generic_type_mismatch() {
+    let union = AttributeType::union(vec![AttributeType::int(), AttributeType::bool()]);
+    let value = Value::Concrete(ConcreteValue::String("neither".to_string()));
+    let expected = TypeError::TypeMismatch {
+        expected: union.type_name(),
+        got: "String".to_string(),
+    };
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        assert_eq!(err, expected, "{path} changed scalar-union fallback");
+    }
+}
+
+#[test]
+fn tied_scalar_union_keeps_detailed_declaration_order_error() {
+    fn reject_first(_: &Value) -> Result<(), String> {
+        Err("first scalar alternative failed".to_string())
+    }
+    fn reject_second(_: &Value) -> Result<(), String> {
+        Err("second scalar alternative failed".to_string())
+    }
+    let union = AttributeType::union(vec![
+        AttributeType::refined_string_with_validator(
+            Some(TypeIdentity::bare("FirstScalar")),
+            None,
+            None,
+            legacy_validator(reject_first),
+            None,
+        ),
+        AttributeType::refined_string_with_validator(
+            Some(TypeIdentity::bare("SecondScalar")),
+            None,
+            None,
+            legacy_validator(reject_second),
+            None,
+        ),
+    ]);
+    let value = Value::Concrete(ConcreteValue::String("value".to_string()));
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        assert_eq!(
+            err,
+            TypeError::ValidationFailed {
+                message: "first scalar alternative failed".to_string()
+            },
+            "{path} must keep a useful scalar member error"
+        );
+    }
+}
+
+#[test]
+fn union_unique_enum_match_preserves_structured_variant_payload() {
+    let union = AttributeType::union(vec![
+        AttributeType::int(),
+        AttributeType::enum_(
+            TypeIdentity::bare("Mode"),
+            Some(vec!["fast".to_string(), "slow".to_string()]),
+            vec![],
+            None,
+            None,
+        ),
+    ]);
+    let value = Value::Concrete(ConcreteValue::enum_identifier("zzz".to_string()));
+
+    for (path, err) in union_errors_from_public_paths(&union, &value) {
+        let TypeError::InvalidEnumVariant {
+            value,
+            type_name,
+            expected,
+            ..
+        } = err
+        else {
+            panic!("{path} discarded InvalidEnumVariant payload")
+        };
+        assert_eq!(value, "zzz");
+        assert_eq!(type_name.as_deref(), Some("Mode"));
+        assert_eq!(
+            expected.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec!["fast", "slow"],
+            "{path} changed the enum candidates consumed by the LSP quick-fix"
+        );
+    }
+}
+
+#[test]
+fn canonicalize_union_preserves_pre_3754_declaration_order_for_structs() {
+    let string_or_list = AttributeType::union(vec![
+        AttributeType::string(),
+        AttributeType::list(AttributeType::string()),
+    ]);
+    let union = AttributeType::union(vec![
+        AttributeType::struct_(
+            "Narrow".to_string(),
+            vec![StructField::new("a", string_or_list).required()],
+        ),
+        AttributeType::struct_(
+            "Wide".to_string(),
+            vec![
+                StructField::new("a", AttributeType::string()).required(),
+                StructField::new("b", AttributeType::int()).required(),
+            ],
+        ),
+    ]);
+    let value = union_map(vec![
+        ("a", Value::Concrete(ConcreteValue::String("s".to_string()))),
+        ("b", Value::Concrete(ConcreteValue::Int(1))),
+    ]);
+
+    let canonicalized = Schema::flat(union).canonicalize(value);
+    assert_eq!(
+        canonicalized,
+        union_map(vec![
+            (
+                "a",
+                Value::Concrete(ConcreteValue::StringList(vec!["s".to_string()])),
+            ),
+            ("b", Value::Concrete(ConcreteValue::Int(1))),
+        ]),
+        "an error-diagnostic change must not move canonicalization from Narrow to Wide"
+    );
+}
 
 #[test]
 fn union_string_vs_enum_picks_enum_error_for_string_input() {
@@ -6070,13 +6869,13 @@ fn dsl_map_is_empty_means_no_aliases_and_no_transform() {
     );
 }
 
-// carina#3080 type-safety guard: `select_union_member` must pick the
-// same member `validate_union` would, so the canonicalizer and the
-// validator never disagree on which member a value is. These tests
-// pin the property that makes the `None` (identity) arm unreachable
-// for the carina#3080 schema, so a future scorer/schema change that
-// breaks selection fails loudly here instead of silently skipping the
-// canonicalization fold and re-introducing the phantom diff.
+// carina#3080 type-safety guard: `select_union_member` and Union validation
+// must use the same structural judgement. For the shape-disjoint carina#3080
+// schema that means both identify the same unique member. These tests pin the
+// property that makes the `None` (identity) arm unreachable, so a future
+// judgement/schema change that breaks selection fails loudly instead of
+// silently skipping the canonicalization fold and re-introducing the phantom
+// diff.
 
 fn principal_union_schema() -> Vec<AttributeType> {
     vec![

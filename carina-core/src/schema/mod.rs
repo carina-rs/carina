@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 
 use crate::resource::{
     ConcreteValue, ConcreteValueRef, DeferredValue, EnumValueResolver, RawEnumIdentifier, Resource,
@@ -1227,34 +1227,12 @@ impl Schema {
                 }
             }
             AttrTypeKind::Union(members) => {
-                // Mirror `validate_union`'s best-scoring selection so
-                // the Enum-rich diagnostic (variant list, alias
-                // hints) survives when the user-supplied value shape
-                // most closely matches a Enum member — the LSP
-                // quick-fix depends on the structured payload (#2309).
                 let Some(concrete) = value.as_concrete() else {
                     return Ok(());
                 };
-                let mut best: Option<(u32, TypeError)> = None;
-                for member in members {
-                    match self.validate_attr(member, value) {
-                        Ok(()) => return Ok(()),
-                        Err(e) => {
-                            let score = union_member_score(member, concrete);
-                            if score > 0
-                                && best
-                                    .as_ref()
-                                    .is_none_or(|(prev_score, _)| score > *prev_score)
-                            {
-                                best = Some((score, e));
-                            }
-                        }
-                    }
-                }
-                Err(best.map(|(_, e)| e).unwrap_or(TypeError::TypeMismatch {
-                    expected: attr.type_name(),
-                    got: concrete.type_name().to_string(),
-                }))
+                validate_union_members(members, concrete, attr.type_name(), |member| {
+                    self.validate_attr(member, value)
+                })
             }
             // For non-recursive variants, delegate to the standalone
             // validator. Any `Ref` they could reach has already been
@@ -2539,38 +2517,20 @@ impl AttributeType {
     ///
     /// On failure, return the structurally-closest member's error rather
     /// than a generic `TypeMismatch`. "Closest" is measured by
-    /// [`union_member_score`]: members whose outer constructor matches
+    /// [`union_member_judgement`]: members whose outer constructor matches
     /// the input's (Map↔Struct, List↔List, String↔Enum, scalar↔
-    /// scalar) outscore unrelated members. The first member at the
-    /// maximum score wins — declaration order is preserved by the
-    /// strict `>` comparison below, so the prior Map↔Struct preference
-    /// still holds when multiple Struct members tie. When no member
-    /// shares any structural similarity, fall through to `TypeMismatch`.
-    /// See #2219.
+    /// scalar) outscore unrelated members. A unique maximum preserves
+    /// that member's error verbatim; tied closed-Struct failures are
+    /// combined into a Union-level alternatives diagnostic. When no
+    /// member shares any structural similarity, fall through to
+    /// `TypeMismatch`. See #2219 and #3754.
     fn validate_union(&self, value: ConcreteValueRef<'_>) -> Result<(), TypeError> {
         let AttrTypeKind::Union(types) = &self.kind else {
             unreachable!("validate_union called on non-Union");
         };
-        let mut best: Option<(u32, TypeError)> = None;
-        for member in types {
-            match member.validate_concrete(value) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    let score = union_member_score(member, value);
-                    if score > 0
-                        && best
-                            .as_ref()
-                            .is_none_or(|(prev_score, _)| score > *prev_score)
-                    {
-                        best = Some((score, e));
-                    }
-                }
-            }
-        }
-        Err(best.map(|(_, e)| e).unwrap_or(TypeError::TypeMismatch {
-            expected: self.type_name(),
-            got: value.type_name().to_string(),
-        }))
+        validate_union_members(types, value, self.type_name(), |member| {
+            member.validate_concrete(value)
+        })
     }
 
     pub fn type_name(&self) -> String {
@@ -2919,28 +2879,124 @@ fn validate_float_range(
     Ok(())
 }
 
-/// Rank a Union member against a runtime value by structural distance:
-/// how close the member's outer constructor is to the input's. Higher
-/// is closer; 0 means no shared structure. Used by `validate_union`
-/// to pick which member's error message to surface on failure (#2219).
+/// Total ordering axis for choosing one Union member to canonicalize through.
 ///
-/// Map↔Struct stays the highest (preserves the prior heuristic). The
-/// other constructor pairs — Map↔Map, List↔List, String↔String /
-/// Enum, scalar↔scalar — get the next tier. `Custom` defers to
-/// its declared `base`, so a Union of `Int | positive_int()`
-/// validating an `Int` input still surfaces the predicate's message.
-/// `Union` members recurse and take the best inner score so nested
-/// unions still produce a meaningful error.
+/// This newtype is deliberately distinct from [`UnionDiagnosticIdentity`]:
+/// ranking two members and deciding whether their field matches are diagnostic
+/// alternatives are different operations, and interchanging them must not
+/// type-check (carina#3080, carina#3754).
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct UnionCanonicalRank(u32);
+
+impl UnionCanonicalRank {
+    const NO_MATCH: Self = Self(0);
+    const SAME_CONSTRUCTOR: Self = Self(80);
+    const MAP_TO_STRUCT: Self = Self(100);
+
+    fn is_match(self) -> bool {
+        self != Self::NO_MATCH
+    }
+
+    fn list_with_inner(inner: Self) -> Self {
+        Self(Self::SAME_CONSTRUCTOR.0 + inner.0 / 2)
+    }
+}
+
+/// Exact supplied keys recognized by one closed-Struct Union arm.
 ///
-/// On a tie, the first member at the maximum wins — `validate_union`
-/// uses strict `>` so declaration order is preserved.
-pub(crate) fn union_member_score(member: &AttributeType, value: ConcreteValueRef<'_>) -> u32 {
+/// The set is intentionally opaque: diagnostic selection reasons about field
+/// identity and emptiness, never cardinality. It therefore cannot be compared
+/// with [`UnionCanonicalRank`] or accidentally used as its numeric bonus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecognizedStructFields(IndexSet<String>);
+
+impl RecognizedStructFields {
+    fn new(fields: &[StructField], map: &IndexMap<String, Value>) -> Self {
+        let accepted = build_accepted_field_map(fields);
+        Self(
+            map.keys()
+                .filter(|field| accepted.contains_key(field.as_str()))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    fn union<'a>(sets: impl Iterator<Item = &'a Self>) -> Self {
+        let mut union = IndexSet::new();
+        for set in sets {
+            union.extend(set.0.iter().cloned());
+        }
+        Self(union)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn contains(&self, field: &str) -> bool {
+        self.0.contains(field)
+    }
+}
+
+/// Diagnostic equivalence axis carried by the shared structural judgement.
+///
+/// Unlike [`UnionCanonicalRank`], this type has no ordering. A Struct match
+/// retains the actual recognized-field set so validation can distinguish one
+/// uniquely relevant arm from multiple co-equal alternatives without reducing
+/// those sets to counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UnionDiagnosticIdentity {
+    ClosedStruct(RecognizedStructFields),
+    OtherShape,
+}
+
+/// One shared judgement about a member and runtime value.
+///
+/// Canonicalization consumes only `canonical_rank`; failed validation consumes
+/// both the same structural rank and the separately typed diagnostic identity.
+/// Neither consumer re-derives shape or field recognition independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnionMemberJudgement {
+    canonical_rank: UnionCanonicalRank,
+    diagnostic_identity: UnionDiagnosticIdentity,
+}
+
+impl UnionMemberJudgement {
+    fn no_match() -> Self {
+        Self::other_shape(UnionCanonicalRank::NO_MATCH)
+    }
+
+    fn other_shape(canonical_rank: UnionCanonicalRank) -> Self {
+        Self {
+            canonical_rank,
+            diagnostic_identity: UnionDiagnosticIdentity::OtherShape,
+        }
+    }
+}
+
+/// Judge a Union member against a runtime value once, preserving both facts
+/// its consumers need: the pre-#3754 structural rank and, for a closed Struct,
+/// the exact supplied keys that arm recognizes.
+///
+/// The canonical rank keeps #2219's tiers unchanged: Map↔Struct is 100,
+/// same-constructor matches are 80, List peeks at its first element, nested
+/// Union takes its best inner rank, and unrelated shapes are zero. Refined
+/// primitives retain their declared primitive constructor. Declaration order
+/// remains the strict-max tie-break used before #3754.
+fn union_member_judgement(
+    member: &AttributeType,
+    value: ConcreteValueRef<'_>,
+) -> UnionMemberJudgement {
     use AttrTypeKind as AT;
     match (&member.kind, value) {
-        // Map↔Struct: the original heuristic. Highest score so a
-        // Struct member's "Unknown field 'x'" wins over a sibling's
-        // generic `TypeMismatch`.
-        (AT::Struct { .. }, ConcreteValueRef::Map(_)) => 100,
+        // Map↔Struct: preserve the original flat rank. Field recognition is
+        // diagnostic identity, not a numeric ordering bonus.
+        (AT::Struct { fields, .. }, ConcreteValueRef::Map(map)) => UnionMemberJudgement {
+            canonical_rank: UnionCanonicalRank::MAP_TO_STRUCT,
+            diagnostic_identity: UnionDiagnosticIdentity::ClosedStruct(
+                RecognizedStructFields::new(fields, map),
+            ),
+        },
         // Same-constructor match — second tier.
         //
         // `Enum` matches both `String` (quoted literal form) and
@@ -2955,13 +3011,19 @@ pub(crate) fn union_member_score(member: &AttributeType, value: ConcreteValueRef
         | (AT::Float { .. }, ConcreteValueRef::Float(_))
         | (AT::Bool, ConcreteValueRef::Bool(_))
         | (AT::Enum { .. }, ConcreteValueRef::String(_))
-        | (AT::Enum { .. }, ConcreteValueRef::EnumIdentifier(_)) => 80,
+        | (AT::Enum { .. }, ConcreteValueRef::EnumIdentifier(_)) => {
+            UnionMemberJudgement::other_shape(UnionCanonicalRank::SAME_CONSTRUCTOR)
+        }
         // List↔List: peek at the first element's structural match
         // against the member's inner type so `List<Struct>` outranks
-        // `List<String>` for an input like `[{...}]`. The inner
-        // contribution is halved so arbitrarily deep nesting can't
-        // exceed the Map↔Struct tier (100). Empty lists fall back to
-        // the bare same-constructor score. Inner peek requires
+        // `List<String>` for an input like `[{...}]`. Numeric tiers can
+        // cross under nesting: `List<Struct>` ranks 130, above the direct
+        // Map↔Struct rank 100. This is safe because an outer List value gives
+        // a direct Struct arm rank zero; only List arms compete at that outer
+        // shape. Halving bounds arbitrarily deep List recursion below 160
+        // while preserving the pre-#3754 ordering. Empty lists fall back to
+        // the bare same-constructor rank.
+        // Inner peek requires
         // re-projecting the first element through `as_concrete()` —
         // a deferred element contributes no bonus (the projection
         // returns `None`).
@@ -2972,66 +3034,280 @@ pub(crate) fn union_member_score(member: &AttributeType, value: ConcreteValueRef
             },
             ConcreteValueRef::List(items),
         ) => {
-            let inner_bonus = items
+            let inner_rank = items
                 .first()
                 .and_then(|first| first.as_concrete())
-                .map(|first| union_member_score(inner, first) / 2)
-                .unwrap_or(0);
-            80 + inner_bonus
+                .map(|first| union_member_judgement(inner, first).canonical_rank)
+                .unwrap_or(UnionCanonicalRank::NO_MATCH);
+            UnionMemberJudgement::other_shape(UnionCanonicalRank::list_with_inner(inner_rank))
         }
-        // Nested Union: recurse and take the best inner match.
+        // Nested Union: recurse and retain the first best inner judgement.
         (AT::Union(inner), v) => inner
             .iter()
-            .map(|m| union_member_score(m, v))
-            .max()
-            .unwrap_or(0),
-        _ => 0,
+            .map(|member| union_member_judgement(member, v))
+            .reduce(|best, candidate| {
+                if candidate.canonical_rank > best.canonical_rank {
+                    candidate
+                } else {
+                    best
+                }
+            })
+            .unwrap_or_else(UnionMemberJudgement::no_match),
+        _ => UnionMemberJudgement::no_match(),
     }
 }
 
+struct UnionMemberFailure {
+    error: TypeError,
+    diagnostic_identity: UnionDiagnosticIdentity,
+}
+
+/// A non-empty set of failures in the best canonical structural tier.
+///
+/// This type never escapes the shared selector: callers receive either
+/// `Ok(())` or the fully resolved `TypeError`, so neither validator can
+/// accidentally recover the pre-#3754 behavior by taking only the first
+/// candidate.
+struct BestUnionMemberFailures {
+    canonical_rank: UnionCanonicalRank,
+    first: UnionMemberFailure,
+    tied: Vec<UnionMemberFailure>,
+}
+
+impl BestUnionMemberFailures {
+    fn new(canonical_rank: UnionCanonicalRank, first: UnionMemberFailure) -> Self {
+        Self {
+            canonical_rank,
+            first,
+            tied: Vec::new(),
+        }
+    }
+
+    fn into_error(self, value: ConcreteValueRef<'_>, members: &[AttributeType]) -> TypeError {
+        let BestUnionMemberFailures {
+            first,
+            tied,
+            canonical_rank: _,
+        } = self;
+        if tied.is_empty() {
+            return first.error;
+        }
+
+        let ConcreteValueRef::Map(map) = value else {
+            // #3754 changes the tied closed-Struct case only. Preserve
+            // declaration-order attribution for other tied shapes.
+            return first.error;
+        };
+        let Some(alternatives) = describe_struct_union_members(members) else {
+            // A diagnostic listing only the Struct subset would falsely
+            // narrow a mixed-shape Union. Preserve the best member error.
+            return first.error;
+        };
+
+        let mut failures = Vec::with_capacity(tied.len() + 1);
+        failures.push(first);
+        failures.extend(tied);
+        if failures.iter().any(|failure| {
+            !matches!(
+                &failure.diagnostic_identity,
+                UnionDiagnosticIdentity::ClosedStruct(_)
+            )
+        }) {
+            return failures.remove(0).error;
+        }
+
+        // One non-empty recognized-field identity is a unique relevant arm,
+        // even though every Struct shares the same canonical rank. Preserve
+        // that member's detailed error verbatim (`{ days = "x" }`). Empty
+        // identities are background alternatives, not competitors. Zero or
+        // multiple non-empty identities require a Union-level diagnostic.
+        let mut sole_non_empty = None;
+        let mut non_empty_count = 0;
+        for (index, failure) in failures.iter().enumerate() {
+            let UnionDiagnosticIdentity::ClosedStruct(fields) = &failure.diagnostic_identity else {
+                unreachable!("non-Struct identity rejected above")
+            };
+            if !fields.is_empty() {
+                non_empty_count += 1;
+                sole_non_empty = Some(index);
+            }
+        }
+        if non_empty_count == 1 {
+            return failures
+                .swap_remove(sole_non_empty.expect("one non-empty identity has an index"))
+                .error;
+        }
+
+        let recognizable_fields = RecognizedStructFields::union(failures.iter().map(|failure| {
+            let UnionDiagnosticIdentity::ClosedStruct(fields) = &failure.diagnostic_identity else {
+                unreachable!("non-Struct identity rejected above")
+            };
+            fields
+        }));
+        let one_alternative_accepts_all_recognizable_fields = failures.iter().any(|failure| {
+            let UnionDiagnosticIdentity::ClosedStruct(fields) = &failure.diagnostic_identity else {
+                unreachable!("non-Struct identity rejected above")
+            };
+            fields == &recognizable_fields
+        });
+        let reason = if !recognizable_fields.is_empty()
+            && !one_alternative_accepts_all_recognizable_fields
+        {
+            UnionStructMismatchReason::ConflictingAlternatives
+        } else {
+            let unrecognized_fields = map
+                .keys()
+                .filter(|supplied| !recognizable_fields.contains(supplied))
+                .cloned()
+                .collect();
+            UnionStructMismatchReason::NoAlternativeSatisfied {
+                unrecognized_fields,
+            }
+        };
+
+        TypeError::UnionStructMismatch {
+            reason,
+            supplied_fields: map.keys().cloned().collect(),
+            alternatives,
+        }
+    }
+}
+
+fn describe_struct_union_members(members: &[AttributeType]) -> Option<Vec<UnionStructAlternative>> {
+    members
+        .iter()
+        .map(|member| {
+            let AttrTypeKind::Struct { name, fields } = &member.kind else {
+                return None;
+            };
+            let mut accepted_fields = Vec::with_capacity(fields.len() * 2);
+            for field in fields {
+                accepted_fields.push(field.name.clone());
+                if let Some(block_name) = &field.block_name
+                    && !accepted_fields.contains(block_name)
+                {
+                    accepted_fields.push(block_name.clone());
+                }
+            }
+            let required_fields = fields
+                .iter()
+                .filter(|field| field.required)
+                .map(|field| field.name.clone())
+                .collect();
+            Some(UnionStructAlternative {
+                name: name.clone(),
+                accepted_fields,
+                required_fields,
+            })
+        })
+        .collect()
+}
+
+/// Validate Union members and resolve their failures in one place for both
+/// the standalone and schema-aware validators.
+///
+/// A successful member short-circuits. Judgements with no structural match are
+/// ignored; every failure in the best canonical rank is retained. For closed
+/// Structs, exact recognized-field identities then select either one detailed
+/// member error or the structured alternatives diagnostic. This routine owns
+/// that policy for both validators so their real entry points cannot drift.
+fn validate_union_members<'a, F>(
+    members: &'a [AttributeType],
+    value: ConcreteValueRef<'_>,
+    expected: String,
+    mut validate_member: F,
+) -> Result<(), TypeError>
+where
+    F: FnMut(&'a AttributeType) -> Result<(), TypeError>,
+{
+    let mut best: Option<BestUnionMemberFailures> = None;
+    for member in members {
+        match validate_member(member) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let judgement = union_member_judgement(member, value);
+                if !judgement.canonical_rank.is_match() {
+                    continue;
+                }
+                let failure = UnionMemberFailure {
+                    error,
+                    diagnostic_identity: judgement.diagnostic_identity,
+                };
+                match &mut best {
+                    Some(current) if judgement.canonical_rank > current.canonical_rank => {
+                        *current = BestUnionMemberFailures::new(judgement.canonical_rank, failure);
+                    }
+                    Some(current) if judgement.canonical_rank == current.canonical_rank => {
+                        current.tied.push(failure);
+                    }
+                    Some(_) => {}
+                    None => {
+                        best = Some(BestUnionMemberFailures::new(
+                            judgement.canonical_rank,
+                            failure,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Err(best
+        .map(|best| best.into_error(value, members))
+        .unwrap_or(TypeError::TypeMismatch {
+            expected,
+            got: value.type_name().to_string(),
+        }))
+}
+
 /// Pick the Union member a concrete value structurally "is", using the
-/// **same scoring function** [`validate_union`] uses for error
-/// attribution ([`union_member_score`], #2219). Reusing the one scorer
-/// — rather than authoring a second parallel shape predicate — is
+/// **same structural judgement** [`validate_union`] uses for error
+/// attribution ([`union_member_judgement`], #2219). Reusing the one judgement
+/// builder — rather than authoring a second parallel shape predicate — is
 /// deliberate (carina#3080 design): the canonicalizer
 /// ([`crate::value::canonicalize_with_type`]'s `Union` arm) and the
 /// validator must not drift apart in how they judge a value's member.
-/// There is one ranking function here, not two kept in sync by review.
+/// The judgement deliberately exposes distinct types for canonical ordering
+/// and diagnostic field identity, rather than coupling both questions to one
+/// integer.
 ///
 /// Selection rules:
 /// - Project the value to its concrete shape (deferred values have no
 ///   shape → `None`, identity fallthrough at the call site).
-/// - Score **every** member; the **strict-max** member wins, so on a
-///   tie the earliest-declared member is kept (strict `>`, the same
-///   declaration-order preference `validate_union` applies, e.g.
-///   `string_or_principal_struct`'s deliberate Struct-before-String).
-/// - All members score `0` (no shared structure) → `None`. The caller
+/// - Judge **every** member; the strict maximum canonical rank wins, so on a
+///   tie the earliest-declared member is kept. In particular, all Struct arms
+///   retain the pre-#3754 flat rank and declaration-order canonicalization.
+/// - All members have no structural match → `None`. The caller
 ///   treats `None` as identity (never guess-coerce); a `Map` value can
 ///   never select a `String` member because `(String, Map)` scores `0`.
 ///
 /// Note the deliberate scope difference from `validate_union`: that
-/// function scores only members whose `validate_concrete` *failed*
+/// function judges only members whose `validate_concrete` *failed*
 /// (the first member that validates `Ok` short-circuits — its job is
-/// to attribute an *error* message). This function scores *all*
+/// to attribute an *error* message). This function judges *all*
 /// members because its job is the opposite: pick the structurally
 /// best-matching member to canonicalize *into*, whether or not it
 /// would also validate. For the IAM-union shapes this fix targets
 /// (`Union[Struct, String]`, `Union[String, List<String>]`) the
-/// members are shape-disjoint — exactly one scores `> 0` for a given
+/// members are shape-disjoint — exactly one matches for a given
 /// value — so the two functions select the same member regardless;
 /// the broader scoring only matters for hypothetical overlapping
 /// unions, where "best structural match" is the correct rule for a
-/// canonicalizer (and a no-op for `None`-on-tie safety).
+/// canonicalizer and declaration order is its deterministic tie-break.
 pub(crate) fn select_union_member<'a>(
     members: &'a [AttributeType],
     value: &Value,
 ) -> Option<&'a AttributeType> {
     let projected = value.as_concrete()?;
-    let mut best: Option<(u32, &AttributeType)> = None;
+    let mut best: Option<(UnionCanonicalRank, &AttributeType)> = None;
     for member in members {
-        let score = union_member_score(member, projected);
-        if score > 0 && best.as_ref().is_none_or(|(prev, _)| score > *prev) {
-            best = Some((score, member));
+        let judgement = union_member_judgement(member, projected);
+        if judgement.canonical_rank.is_match()
+            && best
+                .as_ref()
+                .is_none_or(|(previous, _)| judgement.canonical_rank > *previous)
+        {
+            best = Some((judgement.canonical_rank, member));
         }
     }
     best.map(|(_, m)| m)
@@ -3501,6 +3777,274 @@ impl fmt::Display for ExpectedEnumVariant {
     }
 }
 
+/// Why a map failed every closed-Struct arm of a Union [`AttributeType`] when
+/// either no arm recognized a supplied field or more than one arm did. A sole
+/// non-empty recognized-field identity keeps that member's detailed error, so
+/// this variant primarily represents empty maps, wholly unknown maps, and maps
+/// containing fields from multiple alternatives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnionStructMismatchReason {
+    /// No one alternative accepts all recognizable supplied fields.
+    ConflictingAlternatives,
+    /// No alternative was satisfied without fields spanning alternatives.
+    /// `unrecognized_fields` names keys accepted by no declared arm and is
+    /// empty whenever every supplied field is accepted by at least one retained
+    /// Struct arm.
+    NoAlternativeSatisfied { unrecognized_fields: Vec<String> },
+}
+
+/// Display metadata for one declared closed-Struct arm carried by
+/// [`TypeError::UnionStructMismatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnionStructAlternative {
+    /// Declared Struct name.
+    pub name: String,
+    /// Canonical field names and accepted `block_name` aliases.
+    pub accepted_fields: Vec<String>,
+    /// Canonical names of fields required by this alternative.
+    pub required_fields: Vec<String>,
+}
+
+/// CLI/LSP union diagnostics stay within one readable line. The formatter
+/// elides whole alternatives or falls back to quoted form names; it never
+/// slices a field or type name to meet this limit.
+const UNION_STRUCT_DIAGNOSTIC_MAX_CHARS: usize = 160;
+
+struct UnionAlternativeLabel {
+    full: String,
+    compact: String,
+}
+
+fn same_union_field_set(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len() && left.iter().all(|field| right.contains(field))
+}
+
+fn format_union_list(items: &[String], conjunction: &str) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} {conjunction} {second}"),
+        [head @ .., last] => {
+            format!("{}, {conjunction} {last}", head.join(", "))
+        }
+    }
+}
+
+fn format_union_field_set(fields: &[String]) -> String {
+    let quoted = fields
+        .iter()
+        .map(|field| format!("'{field}'"))
+        .collect::<Vec<_>>();
+    match quoted.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        _ => format!("({})", format_union_list(&quoted, "and")),
+    }
+}
+
+fn union_alternative_labels(alternatives: &[UnionStructAlternative]) -> Vec<UnionAlternativeLabel> {
+    alternatives
+        .iter()
+        .map(|alternative| {
+            let ambiguous = !alternative.required_fields.is_empty()
+                && alternatives
+                    .iter()
+                    .filter(|other| {
+                        same_union_field_set(&alternative.required_fields, &other.required_fields)
+                    })
+                    .count()
+                    > 1;
+            let fields = format_union_field_set(&alternative.required_fields);
+            let full = if fields.is_empty() {
+                format!("empty `{}` form", alternative.name)
+            } else if ambiguous {
+                format!("{fields} (`{}`)", alternative.name)
+            } else {
+                fields
+            };
+            UnionAlternativeLabel {
+                full,
+                compact: format!("`{}`", alternative.name),
+            }
+        })
+        .collect()
+}
+
+fn union_struct_alternatives_are_disjoint(alternatives: &[UnionStructAlternative]) -> bool {
+    alternatives.len() > 1
+        && alternatives
+            .iter()
+            .all(|alternative| !alternative.required_fields.is_empty())
+        && alternatives.iter().enumerate().all(|(index, alternative)| {
+            alternatives.iter().skip(index + 1).all(|other| {
+                alternative
+                    .required_fields
+                    .iter()
+                    .all(|required| !other.accepted_fields.contains(required))
+                    && other
+                        .required_fields
+                        .iter()
+                        .all(|required| !alternative.accepted_fields.contains(required))
+            })
+        })
+}
+
+fn union_diagnostic_fits(message: &str) -> bool {
+    message.chars().count() <= UNION_STRUCT_DIAGNOSTIC_MAX_CHARS
+}
+
+fn format_union_choice_message(prefix: &str, choices: &[String], suffix: &str) -> String {
+    format!("{prefix}{}{suffix}", format_union_list(choices, "or"))
+}
+
+fn omitted_union_choices(count: usize, noun: &str) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} more {noun}{plural}")
+}
+
+fn format_bounded_union_choices(
+    prefix: &str,
+    labels: &[UnionAlternativeLabel],
+    suffix: &str,
+    omitted_noun: &str,
+) -> String {
+    let full = labels
+        .iter()
+        .map(|label| label.full.clone())
+        .collect::<Vec<_>>();
+    let message = format_union_choice_message(prefix, &full, suffix);
+    if union_diagnostic_fits(&message) {
+        return message;
+    }
+
+    for shown in (1..labels.len()).rev() {
+        let mut choices = full[..shown].to_vec();
+        choices.push(omitted_union_choices(labels.len() - shown, omitted_noun));
+        let message = format_union_choice_message(prefix, &choices, suffix);
+        if union_diagnostic_fits(&message) {
+            return message;
+        }
+    }
+
+    let compact = labels
+        .iter()
+        .map(|label| label.compact.clone())
+        .collect::<Vec<_>>();
+    let message = format_union_choice_message(prefix, &compact, suffix);
+    if union_diagnostic_fits(&message) {
+        return message;
+    }
+
+    for shown in (1..labels.len()).rev() {
+        let mut choices = compact[..shown].to_vec();
+        choices.push(omitted_union_choices(labels.len() - shown, omitted_noun));
+        let message = format_union_choice_message(prefix, &choices, suffix);
+        if union_diagnostic_fits(&message) {
+            return message;
+        }
+    }
+
+    let generic = format!("{prefix}the declared union forms{suffix}");
+    if union_diagnostic_fits(&generic) {
+        generic
+    } else {
+        "Value does not match any declared union form".to_string()
+    }
+}
+
+fn format_union_unknown_prefix(
+    unrecognized_fields: &[String],
+    alternatives: &[UnionStructAlternative],
+    disjoint: bool,
+) -> String {
+    let expectation = if disjoint {
+        "exactly one of "
+    } else {
+        "one of these forms: "
+    };
+    if let [field] = unrecognized_fields {
+        let mut known_fields = Vec::new();
+        for alternative in alternatives {
+            for accepted in &alternative.accepted_fields {
+                if !known_fields.contains(&accepted.as_str()) {
+                    known_fields.push(accepted.as_str());
+                }
+            }
+        }
+        if let Some(suggestion) = suggest_similar_name(field, &known_fields) {
+            return format!(
+                "Unknown field '{field}', did you mean '{suggestion}'? Expected {expectation}"
+            );
+        }
+        return format!("Unknown field '{field}': expected {expectation}");
+    }
+
+    let fields = unrecognized_fields
+        .iter()
+        .map(|field| format!("'{field}'"))
+        .collect::<Vec<_>>();
+    format!(
+        "Unknown fields {}: expected {expectation}",
+        format_union_list(&fields, "and")
+    )
+}
+
+fn format_union_struct_mismatch(
+    reason: &UnionStructMismatchReason,
+    supplied_fields: &[String],
+    alternatives: &[UnionStructAlternative],
+) -> String {
+    let labels = union_alternative_labels(alternatives);
+    let disjoint = union_struct_alternatives_are_disjoint(alternatives);
+    if let UnionStructMismatchReason::NoAlternativeSatisfied {
+        unrecognized_fields,
+    } = reason
+        && !unrecognized_fields.is_empty()
+    {
+        return format_bounded_union_choices(
+            &format_union_unknown_prefix(unrecognized_fields, alternatives, disjoint),
+            &labels,
+            "",
+            if disjoint { "alternative" } else { "form" },
+        );
+    }
+
+    if !disjoint {
+        return format_bounded_union_choices("Expected one of these forms: ", &labels, "", "form");
+    }
+
+    match reason {
+        UnionStructMismatchReason::ConflictingAlternatives => format_bounded_union_choices(
+            "Expected exactly one of ",
+            &labels,
+            if alternatives.len() == 2 {
+                ", but both were supplied"
+            } else {
+                ", but more than one was supplied"
+            },
+            "alternative",
+        ),
+        UnionStructMismatchReason::NoAlternativeSatisfied { .. } => {
+            let no_required_field_was_supplied = alternatives.iter().all(|alternative| {
+                alternative
+                    .required_fields
+                    .iter()
+                    .all(|required| !supplied_fields.iter().any(|supplied| supplied == required))
+            });
+            format_bounded_union_choices(
+                "Expected exactly one of ",
+                &labels,
+                if no_required_field_was_supplied {
+                    ", but none were supplied"
+                } else {
+                    ", but no alternative was satisfied"
+                },
+                "alternative",
+            )
+        }
+    }
+}
+
 /// Type error
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
@@ -3613,6 +4157,19 @@ pub enum TypeError {
         struct_name: String,
         field: String,
         suggestion: Option<String>,
+    },
+
+    #[error(
+        "{}",
+        format_union_struct_mismatch(reason, supplied_fields, alternatives)
+    )]
+    UnionStructMismatch {
+        /// Classification consumed by the concise renderer.
+        reason: UnionStructMismatchReason,
+        /// Map keys in user-supplied order.
+        supplied_fields: Vec<String>,
+        /// Display metadata for every declared closed-Struct arm.
+        alternatives: Vec<UnionStructAlternative>,
     },
 
     #[error("List item at index {index}: {inner}")]
