@@ -4,7 +4,7 @@
 
 use crate::parser::ParseContext;
 use crate::parser::Rule;
-use crate::parser::ast::{StateBlock, StateBlockAddress};
+use crate::parser::ast::{MovedAddresses, StateBlock, StateBlockAddress};
 use crate::parser::context::first_inner;
 use crate::parser::error::ParseError;
 use crate::parser::expressions::string_literal::parse_string_value;
@@ -110,5 +110,20 @@ pub(in crate::parser) fn parse_moved_block(
         message: "moved block requires 'to' attribute".to_string(),
     })?;
 
-    Ok(StateBlock::Moved { from, to })
+    if from.provider != to.provider || from.resource_type != to.resource_type {
+        return Err(ParseError::InvalidExpression {
+            line: 0,
+            message: format!(
+                "moved block requires 'from' and 'to' to use the same provider and resource type (got '{}' and '{}'); a provider or resource type change is not a move. Remove the moved block and let the plan delete and create the resource, or use 'removed' and 'import' to preserve the existing cloud resource",
+                from.display_type(),
+                to.display_type(),
+            ),
+        });
+    }
+
+    let from_name = from.name_str().to_string();
+    let to_name = to.name_str().to_string();
+    Ok(StateBlock::Moved {
+        addresses: MovedAddresses::new(from.provider, from.resource_type, from_name, to_name),
+    })
 }

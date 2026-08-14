@@ -19,10 +19,10 @@ mod util;
 pub use ast::{
     ArgumentParameter, AttributeParameter, BackendConfig, BindingName, DeferredForExpression,
     ExportParamLike, ExportParameter, File, FnParam, InferredExportParam, InferredFile, ModuleCall,
-    ParsedExportParam, ParsedFile, ProviderConfig, RequireBlock, ResourceContext, ResourceRef,
-    ResourceTypePath, ShapeMismatch, StateBlock, StateBlockAddress, TypeExpr, UntilPredicateAst,
-    UpstreamState, UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock,
-    WaitBinding, expand_deferred_children,
+    MovedAddresses, ParsedExportParam, ParsedFile, ProviderConfig, RequireBlock, ResourceContext,
+    ResourceRef, ResourceTypePath, ShapeMismatch, StateBlock, StateBlockAddress, TypeExpr,
+    UntilPredicateAst, UpstreamState, UseStatement, UserFunction, UserFunctionBody, ValidateExpr,
+    ValidationBlock, WaitBinding, expand_deferred_children,
 };
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
 pub(crate) use entry::{
