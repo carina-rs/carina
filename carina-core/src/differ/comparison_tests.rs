@@ -1255,6 +1255,32 @@ fn string_or_list_of_strings_type() -> AttributeType {
 }
 
 #[test]
+fn type_aware_equal_self_cyclic_union_ref_uses_concrete_member() {
+    let root = AttributeType::ref_("A");
+    let defs = std::collections::BTreeMap::from([(
+        "A".to_string(),
+        AttributeType::union(vec![AttributeType::ref_("A"), AttributeType::string()]),
+    )]);
+    let x = Value::Concrete(ConcreteValue::String("x".to_string()));
+    let y = Value::Concrete(ConcreteValue::String("y".to_string()));
+
+    assert!(type_aware_equal(&x, &x, Some(&root), &defs, None));
+    assert!(!type_aware_equal(&x, &y, Some(&root), &defs, None));
+}
+
+#[test]
+fn type_aware_equal_skips_cyclic_union_member_and_reaches_sibling() {
+    let root = AttributeType::union(vec![AttributeType::ref_("A"), AttributeType::string()]);
+    let defs = std::collections::BTreeMap::from([(
+        "A".to_string(),
+        AttributeType::union(vec![AttributeType::ref_("A"), AttributeType::int()]),
+    )]);
+    let value = Value::Concrete(ConcreteValue::String("x".to_string()));
+
+    assert!(type_aware_equal(&value, &value, Some(&root), &defs, None));
+}
+
+#[test]
 fn union_string_or_list_canonical_string_list_equal_to_self() {
     // Two `Value::Concrete(ConcreteValue::StringList)` values with identical contents must be
     // equal under the differ for the `Union[String, list(String)]`

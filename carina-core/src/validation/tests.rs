@@ -2799,6 +2799,51 @@ fn type_compat_exact_match() {
     ));
 }
 
+fn mutually_recursive_string_union_fixture() -> (
+    AttributeType,
+    std::collections::BTreeMap<String, AttributeType>,
+) {
+    (
+        AttributeType::ref_("A"),
+        std::collections::BTreeMap::from([
+            (
+                "A".to_string(),
+                AttributeType::union(vec![AttributeType::ref_("B"), AttributeType::string()]),
+            ),
+            (
+                "B".to_string(),
+                AttributeType::union(vec![AttributeType::ref_("A"), AttributeType::string()]),
+            ),
+        ]),
+    )
+}
+
+#[test]
+fn string_compatible_predicate_uses_concrete_member_through_mutual_ref_cycle() {
+    let (root, defs) = mutually_recursive_string_union_fixture();
+
+    assert!(is_string_compatible_type(&root, &defs));
+    assert!(is_type_expr_compatible_with_schema(
+        &TypeExpr::String,
+        &root,
+        &defs,
+    ));
+}
+
+#[test]
+fn plain_string_union_predicate_uses_concrete_member_through_mutual_ref_cycle() {
+    let (root, defs) = mutually_recursive_string_union_fixture();
+
+    assert!(is_plain_string_or_string_union(&root, &defs));
+}
+
+#[test]
+fn specific_custom_predicate_skips_mutual_ref_cycle_without_custom_member() {
+    let (root, defs) = mutually_recursive_string_union_fixture();
+
+    assert!(!attr_type_demands_specific_custom(&root, &defs));
+}
+
 #[test]
 fn type_compat_simple_rejected_by_mixed_string_int_union_receiver() {
     // The subtyping branch only fires when *every* member of a

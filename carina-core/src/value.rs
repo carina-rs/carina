@@ -1451,10 +1451,13 @@ pub fn needs_trailing_separator(value: &Value) -> bool {
 
 /// Returns true when `attr_type` is exactly the IAM-style
 /// `string_or_list_of_strings` shape — `Union(vec![String, list(String)])`
-/// in either order — peeling through `Custom` wrappers.
-fn is_string_or_list_of_strings(attr_type: &AttributeType) -> bool {
+/// in either order — peeling top-level Union-member Refs through `defs`.
+fn is_string_or_list_of_strings(
+    attr_type: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> bool {
     let unwrapped = peel_custom(attr_type);
-    let AttrTypeKind::Union(members) = &unwrapped.kind else {
+    let Some(members) = crate::schema::union_members_with_defs(unwrapped, defs) else {
         return false;
     };
     if members.len() != 2 {
@@ -1462,8 +1465,11 @@ fn is_string_or_list_of_strings(attr_type: &AttributeType) -> bool {
     }
     let mut has_string = false;
     let mut has_list_of_string = false;
-    for m in members {
-        match &peel_custom(m).kind {
+    for member in members.iter() {
+        let Some(member) = member else {
+            return false;
+        };
+        match &peel_custom(member.as_attr()).kind {
             AttrTypeKind::String { .. } => has_string = true,
             AttrTypeKind::List {
                 element_type: inner,
@@ -1505,8 +1511,10 @@ fn peel_custom(t: &AttributeType) -> &AttributeType {
 ///
 /// `defs` carries the enclosing [`crate::schema::ResourceSchema::defs`]
 /// map so cyclic CFN definitions (`AttributeType::Ref`) are followed
-/// during the walk (carina#3340). The `Ref` arm resolves and recurses;
-/// primitives / unions terminate as before. Pass
+/// during the walk (carina#3340). A top-level Ref keeps the schema-invariant
+/// panic semantics of [`AttributeType::resolve_refs_with_defs`]; after Union
+/// selection, missing or cyclic member Refs are graceful no-match outcomes.
+/// Pass
 /// [`crate::schema::empty_defs_for_schema_walks()`] when the caller is confident no
 /// `Ref` is reachable.
 ///
@@ -1538,125 +1546,138 @@ fn canonicalize_with_type_for_enum_phase(
     defs: &std::collections::BTreeMap<String, AttributeType>,
     enum_identifier_phase: EnumIdentifierPhase,
 ) -> Value {
-    let unwrapped = peel_custom(attr_type);
-    if is_string_or_list_of_strings(unwrapped) {
-        return canonicalize_to_string_list(value);
-    }
-    // Dispatch via `Shape` so the `Ref` arm cannot fall into a tuple
-    // wildcard. `shape(defs)` peels any top-level `Ref` chain before
-    // returning, so the match below sees the resolved shape directly.
-    // Without this, the historical wildcard `(v, _) => v` silently
-    // passed Ref-typed values through without canonicalization —
-    // exactly the carina#3340 / carina#3349 bug class.
-    match (value, unwrapped.shape_with_defs(defs)) {
-        (
-            Value::Concrete(ConcreteValue::List(items)),
-            crate::schema::Shape::List {
-                element_type: inner,
-                ..
-            },
-        ) => {
-            let canonicalized = items
-                .into_iter()
-                .map(|v| {
-                    canonicalize_with_type_for_enum_phase(v, inner, defs, enum_identifier_phase)
-                })
-                .collect();
-            Value::Concrete(ConcreteValue::List(canonicalized))
+    let mut visited_refs = Vec::new();
+    let mut unwrapped = peel_custom(
+        attr_type
+            .resolve_refs_with_defs_on_path(defs, &mut visited_refs)
+            .as_attr(),
+    );
+    let value = match value {
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            return Value::Deferred(DeferredValue::Secret(Box::new(
+                canonicalize_with_type_for_enum_phase(
+                    *inner,
+                    attr_type,
+                    defs,
+                    enum_identifier_phase,
+                ),
+            )));
         }
-        (Value::Concrete(ConcreteValue::Map(map)), crate::schema::Shape::Map { value: vt, .. }) => {
-            let canonicalized = map
-                .into_iter()
-                .map(|(k, v)| {
-                    (
-                        k,
-                        canonicalize_with_type_for_enum_phase(v, vt, defs, enum_identifier_phase),
-                    )
-                })
-                .collect();
-            Value::Concrete(ConcreteValue::Map(canonicalized))
+        value => value,
+    };
+
+    loop {
+        if is_string_or_list_of_strings(unwrapped, defs) {
+            return canonicalize_to_string_list(value);
         }
-        (Value::Concrete(ConcreteValue::Map(map)), crate::schema::Shape::Struct { .. }) => {
-            let fields = crate::schema::struct_fields_with_defs(unwrapped, defs)
-                .expect("Shape::Struct must expose struct fields internally");
-            let canonicalized = map
-                .into_iter()
-                .map(|(k, v)| {
-                    let field_type = fields
-                        .iter()
-                        .find(|f| f.name == k || f.provider_name.as_deref() == Some(k.as_str()))
-                        .map(|f| &f.field_type);
-                    let canon = match field_type {
-                        Some(ft) => canonicalize_with_type_for_enum_phase(
-                            v,
-                            ft,
-                            defs,
-                            enum_identifier_phase,
-                        ),
-                        None => v,
-                    };
-                    (k, canon)
-                })
-                .collect();
-            Value::Concrete(ConcreteValue::Map(canonicalized))
+        let shape = unwrapped
+            .shape_ref_free()
+            .expect("canonicalization dispatch must hold a Ref-peeled type");
+
+        // Union selection is a non-value-consuming walk. Keep the chosen
+        // Ref path across iterations so an alias that resolves back to an
+        // already visited Union is excluded, while sibling judgements retain
+        // their existing truncate-on-return discipline. Concrete container
+        // members below start a fresh path for every child value.
+        if matches!(shape, crate::schema::Shape::Union) {
+            let Some(members) = crate::schema::union_members_with_defs(unwrapped, defs) else {
+                return value;
+            };
+            let Some(member) = members.select_on_path(&value, &mut visited_refs) else {
+                return value;
+            };
+            unwrapped = peel_custom(member.as_attr());
+            continue;
         }
-        (Value::Deferred(DeferredValue::Secret(inner)), _) => Value::Deferred(
-            DeferredValue::Secret(Box::new(canonicalize_with_type_for_enum_phase(
-                *inner,
-                attr_type,
-                defs,
-                enum_identifier_phase,
-            ))),
-        ),
-        // Enum must not fall through to the `(v, _) => v` wildcard.
-        // That is the same failure mode as carina#3080's Union gap:
-        // the ranker/canonicalizer path looked correct for other
-        // branches while this leaf silently skipped normalization.
-        (val, crate::schema::Shape::Enum { .. }) => {
-            let resolver = crate::resource::EnumValueResolver::with_defs(unwrapped, defs);
-            match val {
-                Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
-                    let resolved = match enum_identifier_phase {
-                        EnumIdentifierPhase::RawDsl => resolver.resolve_raw(&raw),
-                        EnumIdentifierPhase::StateText => resolver.resolve_state_text(raw.as_str()),
-                    };
-                    resolved
+
+        return match (value, shape) {
+            (
+                Value::Concrete(ConcreteValue::List(items)),
+                crate::schema::Shape::List {
+                    element_type: inner,
+                    ..
+                },
+            ) => {
+                let canonicalized = items
+                    .into_iter()
+                    .map(|v| {
+                        canonicalize_with_type_for_enum_phase(v, inner, defs, enum_identifier_phase)
+                    })
+                    .collect();
+                Value::Concrete(ConcreteValue::List(canonicalized))
+            }
+            (
+                Value::Concrete(ConcreteValue::Map(map)),
+                crate::schema::Shape::Map { value: vt, .. },
+            ) => {
+                let canonicalized = map
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (
+                            k,
+                            canonicalize_with_type_for_enum_phase(
+                                v,
+                                vt,
+                                defs,
+                                enum_identifier_phase,
+                            ),
+                        )
+                    })
+                    .collect();
+                Value::Concrete(ConcreteValue::Map(canonicalized))
+            }
+            (Value::Concrete(ConcreteValue::Map(map)), crate::schema::Shape::Struct { .. }) => {
+                let fields = crate::schema::struct_fields_with_defs(unwrapped, defs)
+                    .expect("Shape::Struct must expose struct fields internally");
+                let canonicalized = map
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let field_type = fields
+                            .iter()
+                            .find(|f| f.name == k || f.provider_name.as_deref() == Some(k.as_str()))
+                            .map(|f| &f.field_type);
+                        let canon = match field_type {
+                            Some(ft) => canonicalize_with_type_for_enum_phase(
+                                v,
+                                ft,
+                                defs,
+                                enum_identifier_phase,
+                            ),
+                            None => v,
+                        };
+                        (k, canon)
+                    })
+                    .collect();
+                Value::Concrete(ConcreteValue::Map(canonicalized))
+            }
+            // Enum must not fall through to the `(v, _) => v` wildcard.
+            // That is the same failure mode as carina#3080's Union gap:
+            // the ranker/canonicalizer path looked correct for other
+            // branches while this leaf silently skipped normalization.
+            (val, crate::schema::Shape::Enum { .. }) => {
+                let resolver = crate::resource::EnumValueResolver::with_defs(unwrapped, defs);
+                match val {
+                    Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
+                        let resolved = match enum_identifier_phase {
+                            EnumIdentifierPhase::RawDsl => resolver.resolve_raw(&raw),
+                            EnumIdentifierPhase::StateText => {
+                                resolver.resolve_state_text(raw.as_str())
+                            }
+                        };
+                        resolved
+                            .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
+                            .unwrap_or_else(|_| Value::Concrete(ConcreteValue::EnumIdentifier(raw)))
+                    }
+                    Value::Concrete(ConcreteValue::String(s)) => resolver
+                        .resolve_state_text(&s)
                         .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
-                        .unwrap_or_else(|_| Value::Concrete(ConcreteValue::EnumIdentifier(raw)))
+                        .unwrap_or_else(|_| Value::Concrete(ConcreteValue::String(s))),
+                    Value::Concrete(ConcreteValue::CanonicalEnum(_)) => val,
+                    other => other,
                 }
-                Value::Concrete(ConcreteValue::String(s)) => resolver
-                    .resolve_state_text(&s)
-                    .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
-                    .unwrap_or_else(|_| Value::Concrete(ConcreteValue::String(s))),
-                Value::Concrete(ConcreteValue::CanonicalEnum(_)) => val,
-                other => other,
             }
-        }
-        // Union: the missing nesting kind (List/Map/Struct/Secret
-        // already recurse; Union was the lone gap — carina#3080).
-        // `principal` is `Union[Struct{ service: Union[String,
-        // List<String>] }, String]`, so without descending into the
-        // matching member the nested `string_or_list_of_strings`
-        // `service` never folds to `StringList`, and a bare scalar
-        // (desired) vs singleton list (aws-read) reaches the differ as
-        // a never-converging phantom. Pick the member from the SAME
-        // structural judgement `validate_union` uses
-        // (`select_union_member` consumes its typed canonical rank) —
-        // one shape judgement, not a second parallel predicate that
-        // could drift from the validator's — then re-dispatch so the
-        // existing arms canonicalize it. `None` (no member shares the
-        // value's shape) is identity — never guess-coerce.
-        (val, crate::schema::Shape::Union) => {
-            let members = crate::schema::union_members_with_defs(unwrapped, defs)
-                .expect("Shape::Union must expose union members internally");
-            match crate::schema::select_union_member(members, &val) {
-                Some(member) => {
-                    canonicalize_with_type_for_enum_phase(val, member, defs, enum_identifier_phase)
-                }
-                None => val,
-            }
-        }
-        (v, _) => v,
+            (v, _) => v,
+        };
     }
 }
 
@@ -4383,6 +4404,249 @@ mod tests {
                 );
             }
             _ => panic!("expected Map"),
+        }
+    }
+
+    #[test]
+    fn canonicalize_recurses_through_union_ref_into_struct() {
+        let t = AttributeType::union(vec![
+            AttributeType::ref_("PrincipalStruct"),
+            AttributeType::string(),
+        ]);
+        let defs = std::collections::BTreeMap::from([(
+            "PrincipalStruct".to_string(),
+            AttributeType::struct_(
+                "PrincipalStruct".to_string(),
+                vec![crate::schema::StructField::new(
+                    "service",
+                    string_or_list_of_strings(),
+                )],
+            ),
+        )]);
+        let mut map = IndexMap::new();
+        map.insert(
+            "service".to_string(),
+            Value::Concrete(ConcreteValue::String(
+                "cloudfront.amazonaws.com".to_string(),
+            )),
+        );
+
+        let canon = canonicalize_with_type(Value::Concrete(ConcreteValue::Map(map)), &t, &defs);
+        let Value::Concrete(ConcreteValue::Map(map)) = canon else {
+            panic!("expected Map");
+        };
+        assert_eq!(
+            map.get("service"),
+            Some(&Value::Concrete(ConcreteValue::StringList(vec![
+                "cloudfront.amazonaws.com".to_string()
+            ])))
+        );
+    }
+
+    #[test]
+    fn canonicalize_union_ref_cycle_terminates_and_selects_non_recursive_struct() {
+        let recursive = AttributeType::union(vec![
+            AttributeType::struct_(
+                "PrincipalStruct".to_string(),
+                vec![crate::schema::StructField::new(
+                    "service",
+                    string_or_list_of_strings(),
+                )],
+            ),
+            AttributeType::ref_("A"),
+        ]);
+        let schema = crate::schema::Schema {
+            root: AttributeType::union(vec![AttributeType::ref_("A"), AttributeType::bool()]),
+            defs: std::collections::BTreeMap::from([("A".to_string(), recursive)]),
+        };
+        let mut map = IndexMap::new();
+        map.insert(
+            "service".to_string(),
+            Value::Concrete(ConcreteValue::String(
+                "cloudfront.amazonaws.com".to_string(),
+            )),
+        );
+        let value = Value::Concrete(ConcreteValue::Map(map));
+
+        assert!(schema.validate(&value).is_ok());
+        let canon = schema.canonicalize(value);
+        let Value::Concrete(ConcreteValue::Map(map)) = canon else {
+            panic!("expected Map");
+        };
+        assert_eq!(
+            map.get("service"),
+            Some(&Value::Concrete(ConcreteValue::StringList(vec![
+                "cloudfront.amazonaws.com".to_string()
+            ])))
+        );
+    }
+
+    #[test]
+    fn canonicalize_self_alias_union_ref_selects_string_list_sibling() {
+        let schema = crate::schema::Schema {
+            root: AttributeType::ref_("A"),
+            defs: std::collections::BTreeMap::from([(
+                "A".to_string(),
+                AttributeType::union(vec![AttributeType::ref_("A"), string_or_list_of_strings()]),
+            )]),
+        };
+        let value = Value::Concrete(ConcreteValue::String("x".to_string()));
+
+        assert!(schema.validate(&value).is_ok());
+        let canon = schema.canonicalize(value);
+        assert_eq!(
+            canon,
+            Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()]))
+        );
+    }
+
+    #[test]
+    fn canonicalize_mutual_union_ref_cycle_terminates() {
+        let schema = crate::schema::Schema {
+            root: AttributeType::ref_("A"),
+            defs: std::collections::BTreeMap::from([
+                (
+                    "A".to_string(),
+                    AttributeType::union(vec![AttributeType::ref_("B"), AttributeType::string()]),
+                ),
+                (
+                    "B".to_string(),
+                    AttributeType::union(vec![AttributeType::ref_("A"), AttributeType::int()]),
+                ),
+            ]),
+        };
+        let value = Value::Concrete(ConcreteValue::String("x".to_string()));
+
+        assert_eq!(schema.canonicalize(value.clone()), value);
+    }
+
+    #[test]
+    fn union_selection_resets_ref_path_for_list_element_probe() {
+        let schema = crate::schema::Schema {
+            root: AttributeType::ref_("A"),
+            defs: std::collections::BTreeMap::from([(
+                "A".to_string(),
+                AttributeType::union(vec![
+                    AttributeType::list(AttributeType::int()),
+                    AttributeType::list(AttributeType::ref_("A")),
+                    AttributeType::string(),
+                ]),
+            )]),
+        };
+        let value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::List(vec![Value::Concrete(ConcreteValue::String(
+                "x".to_string(),
+            ))]),
+        )]));
+
+        assert!(schema.validate(&value).is_ok());
+        let union = schema.resolve("A").expect("A must be defined");
+        let members = crate::schema::union_members_with_defs(union, &schema.defs)
+            .expect("A must resolve to a Union");
+        let mut visited_refs = vec!["A"];
+        let selected = members
+            .select_on_path(&value, &mut visited_refs)
+            .expect("the recursive List member must match");
+        let AttrTypeKind::List {
+            element_type: inner,
+            ..
+        } = &selected.as_attr().kind
+        else {
+            panic!("the selected member must be a List")
+        };
+        assert!(matches!(&inner.kind, AttrTypeKind::Ref(name) if name == "A"));
+    }
+
+    #[test]
+    fn canonicalize_recursive_list_union_agrees_with_validation() {
+        let schema = crate::schema::Schema {
+            root: AttributeType::ref_("A"),
+            defs: std::collections::BTreeMap::from([(
+                "A".to_string(),
+                AttributeType::union(vec![
+                    AttributeType::list(AttributeType::int()),
+                    AttributeType::list(AttributeType::ref_("A")),
+                    string_or_list_of_strings(),
+                ]),
+            )]),
+        };
+        let value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::List(vec![Value::Concrete(ConcreteValue::String(
+                "x".to_string(),
+            ))]),
+        )]));
+
+        assert!(schema.validate(&value).is_ok());
+        assert_eq!(
+            schema.canonicalize(value),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::List(vec![Value::Concrete(ConcreteValue::StringList(vec![
+                    "x".to_string(),
+                ]))]),
+            )]))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "schema invariant violated")]
+    fn canonicalize_top_level_missing_ref_preserves_schema_invariant_panic() {
+        let schema = crate::schema::Schema {
+            root: AttributeType::ref_("Missing"),
+            defs: std::collections::BTreeMap::new(),
+        };
+
+        let _ = schema.canonicalize(Value::Concrete(ConcreteValue::String("x".to_string())));
+    }
+
+    #[test]
+    #[should_panic(expected = "cyclic AttributeType::Ref(\"A\") in schema defs")]
+    fn canonicalize_top_level_ref_alias_cycle_preserves_schema_invariant_panic() {
+        let schema = crate::schema::Schema {
+            root: AttributeType::ref_("A"),
+            defs: std::collections::BTreeMap::from([("A".to_string(), AttributeType::ref_("A"))]),
+        };
+
+        let _ = schema.canonicalize(Value::Concrete(ConcreteValue::String("x".to_string())));
+    }
+
+    #[test]
+    fn canonicalize_ref_membered_string_or_list_union_in_both_enum_phases() {
+        let attr_type =
+            AttributeType::union(vec![AttributeType::ref_("S"), AttributeType::ref_("L")]);
+        let defs = std::collections::BTreeMap::from([
+            ("S".to_string(), AttributeType::string()),
+            (
+                "L".to_string(),
+                AttributeType::list(AttributeType::string()),
+            ),
+        ]);
+        let expected = Value::Concrete(ConcreteValue::StringList(vec![
+            "cloudfront.amazonaws.com".to_string(),
+        ]));
+
+        for phase in [EnumIdentifierPhase::RawDsl, EnumIdentifierPhase::StateText] {
+            let desired = Value::Concrete(ConcreteValue::String(
+                "cloudfront.amazonaws.com".to_string(),
+            ));
+            assert_eq!(
+                canonicalize_with_type_for_enum_phase(desired, &attr_type, &defs, phase),
+                expected
+            );
+
+            let provider_read = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::String("cloudfront.amazonaws.com".to_string()),
+            )]));
+            assert_eq!(
+                canonicalize_with_type_for_enum_phase(provider_read, &attr_type, &defs, phase),
+                expected
+            );
+
+            let secret_hash = format!("{SECRET_PREFIX}deadbeef");
+            let sentinel = Value::Concrete(ConcreteValue::String(secret_hash));
+            assert_eq!(
+                canonicalize_with_type_for_enum_phase(sentinel.clone(), &attr_type, &defs, phase),
+                sentinel
+            );
         }
     }
 

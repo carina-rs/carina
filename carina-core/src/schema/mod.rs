@@ -4,7 +4,7 @@
 //! enabling type validation at parse time.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -18,10 +18,13 @@ use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
 use crate::value::format_value_with_key;
 
 mod resolved_attr_type;
+mod resolved_union_members;
 mod type_identity;
 
 pub use carina_provider_protocol::types::DslTransform;
 pub use resolved_attr_type::ResolvedAttrType;
+use resolved_union_members::UnionMemberTypes;
+pub use resolved_union_members::{ResolvedUnionMember, UnionMembers};
 pub use type_identity::TypeIdentity;
 
 /// Error returned when a bare projection reaches a schema-bound
@@ -165,6 +168,27 @@ fn walk_custom_lookup(
     defs: &std::collections::BTreeMap<String, AttributeType>,
     errors: &mut Vec<TypeError>,
 ) {
+    let mut visited_refs = Vec::new();
+    walk_custom_lookup_on_path(
+        attr_type,
+        value,
+        attr_name,
+        lookup,
+        defs,
+        errors,
+        &mut visited_refs,
+    );
+}
+
+fn walk_custom_lookup_on_path<'a>(
+    attr_type: &'a AttributeType,
+    value: &Value,
+    attr_name: &str,
+    lookup: CustomTypeLookup<'_>,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    errors: &mut Vec<TypeError>,
+    visited_refs: &mut Vec<&'a str>,
+) {
     // Skip deferred-resolution values — same convention as
     // `AttrTypeKind::validate`, plus `ResourceRef` / `Interpolation`
     // which only resolve to a concrete string at apply time.
@@ -202,6 +226,8 @@ fn walk_custom_lookup(
         } => {
             if let Value::Concrete(ConcreteValue::List(items)) = value {
                 for item in items {
+                    // Descending to an item consumes one value level, so a
+                    // recursive schema may legitimately revisit the same Ref.
                     walk_custom_lookup(inner, item, attr_name, lookup, defs, errors);
                 }
             }
@@ -237,9 +263,22 @@ fn walk_custom_lookup(
             // smallest error set so the user-facing diagnostic stays
             // pointed at the closest near-match.
             let mut best: Option<Vec<TypeError>> = None;
-            for member in members {
+            for member in members.as_raw_slice() {
+                let Ok(resolution) = resolve_refs_on_path(member, defs, visited_refs) else {
+                    // A missing or cyclic Ref is not a viable Union member.
+                    continue;
+                };
                 let mut local = Vec::new();
-                walk_custom_lookup(member, value, attr_name, lookup, defs, &mut local);
+                walk_custom_lookup_on_path(
+                    resolution.attr,
+                    value,
+                    attr_name,
+                    lookup,
+                    defs,
+                    &mut local,
+                    visited_refs,
+                );
+                visited_refs.truncate(resolution.restore_len);
                 if local.is_empty() {
                     return;
                 }
@@ -259,13 +298,23 @@ fn walk_custom_lookup(
         // as `ValidationFailed`; here we just skip the custom-lookup
         // walk so a user-facing dangling-Ref does not abort the
         // process (carina#3345).
-        AttrTypeKind::Ref(name) => match defs.get(name) {
-            Some(resolved) => {
-                walk_custom_lookup(resolved, value, attr_name, lookup, defs, errors);
+        AttrTypeKind::Ref(_) => match resolve_refs_on_path(attr_type, defs, visited_refs) {
+            Ok(resolution) => {
+                walk_custom_lookup_on_path(
+                    resolution.attr,
+                    value,
+                    attr_name,
+                    lookup,
+                    defs,
+                    errors,
+                    visited_refs,
+                );
+                visited_refs.truncate(resolution.restore_len);
             }
-            None => {
+            Err(_) => {
                 // Skip — the `validate_attr` pass already emitted
-                // the dangling-Ref diagnostic for this attribute.
+                // the dangling-Ref or cyclic-path diagnostic for this
+                // attribute/member.
             }
         },
     }
@@ -531,7 +580,7 @@ pub(crate) enum AttrTypeKind {
         fields: Vec<StructField>,
     },
     /// Union of multiple types (value is valid if it matches any member)
-    Union(Vec<AttributeType>),
+    Union(UnionMemberTypes),
     /// Named reference into the enclosing [`Schema`]'s definition map.
     ///
     /// Used to express cyclic struct definitions
@@ -892,6 +941,113 @@ pub struct Schema {
     pub defs: std::collections::BTreeMap<String, AttributeType>,
 }
 
+/// Maximum number of non-consuming `Ref` hops retained on one traversal path.
+const MAX_REF_PATH_HOPS: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefResolutionFailureKind {
+    Missing,
+    Cycle,
+    HopLimit,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RefResolutionFailure<'a> {
+    kind: RefResolutionFailureKind,
+    name: &'a str,
+}
+
+impl RefResolutionFailure<'_> {
+    fn into_validation_error(self) -> TypeError {
+        let message = match self.kind {
+            RefResolutionFailureKind::Missing => format!(
+                "schema reference `{}` is not defined in the enclosing schema",
+                self.name
+            ),
+            RefResolutionFailureKind::Cycle => {
+                format!("cyclic schema reference `{}`", self.name)
+            }
+            RefResolutionFailureKind::HopLimit => format!(
+                "schema reference chain exceeded {MAX_REF_PATH_HOPS} hops at `{}`",
+                self.name
+            ),
+        };
+        TypeError::ValidationFailed { message }
+    }
+}
+
+struct RefPathResolution<'a> {
+    attr: &'a AttributeType,
+    restore_len: usize,
+}
+
+/// Resolve a top-level `Ref` chain while retaining the names reached on the
+/// current non-consuming path.
+///
+/// All Ref walkers share this primitive. Callers deliberately map its three
+/// failures differently: schema validation returns a typed error, invariant
+/// walkers panic, and Union-member judgement treats them as no-match.
+fn resolve_refs_on_path<'a>(
+    attr: &'a AttributeType,
+    defs: &'a BTreeMap<String, AttributeType>,
+    visited_refs: &mut Vec<&'a str>,
+) -> Result<RefPathResolution<'a>, RefResolutionFailure<'a>> {
+    let restore_len = visited_refs.len();
+    let mut current = attr;
+    let mut chain_hops = 0;
+
+    loop {
+        let AttrTypeKind::Ref(name) = &current.kind else {
+            return Ok(RefPathResolution {
+                attr: current,
+                restore_len,
+            });
+        };
+        let name = name.as_str();
+        let failure_kind = if visited_refs.contains(&name) {
+            Some(RefResolutionFailureKind::Cycle)
+        } else if chain_hops >= MAX_REF_PATH_HOPS {
+            Some(RefResolutionFailureKind::HopLimit)
+        } else {
+            None
+        };
+        if let Some(kind) = failure_kind {
+            visited_refs.truncate(restore_len);
+            return Err(RefResolutionFailure { kind, name });
+        }
+        let Some(next) = defs.get(name) else {
+            visited_refs.truncate(restore_len);
+            return Err(RefResolutionFailure {
+                kind: RefResolutionFailureKind::Missing,
+                name,
+            });
+        };
+        visited_refs.push(name);
+        chain_hops += 1;
+        current = next;
+    }
+}
+
+fn panic_for_ref_resolution_failure(failure: RefResolutionFailure<'_>) -> ! {
+    match failure.kind {
+        RefResolutionFailureKind::Missing => panic!(
+            "AttributeType::Ref(\"{}\") not found in schema defs; \
+             schema invariant violated (producer must populate \
+             ResourceSchema.defs for every Ref it emits)",
+            failure.name
+        ),
+        RefResolutionFailureKind::Cycle => panic!(
+            "cyclic AttributeType::Ref(\"{}\") in schema defs; \
+             schema invariant violated",
+            failure.name
+        ),
+        RefResolutionFailureKind::HopLimit => panic!(
+            "AttributeType::Ref chain exceeded {MAX_REF_PATH_HOPS} hops; \
+             pathological self-cycle in defs"
+        ),
+    }
+}
+
 impl Schema {
     /// Construct a `Schema` from `root` with an empty `defs` map. A
     /// `Ref` reached during walking surfaces as a clean
@@ -989,21 +1145,27 @@ impl Schema {
         value: &Value,
         out: &mut Vec<(FieldPath, TypeError)>,
     ) {
+        let mut visited_refs = Vec::new();
+        self.collect_attr_into_on_path(attr, path, value, out, &mut visited_refs);
+    }
+
+    fn collect_attr_into_on_path<'a>(
+        &'a self,
+        attr: &'a AttributeType,
+        path: &FieldPath,
+        value: &Value,
+        out: &mut Vec<(FieldPath, TypeError)>,
+        visited_refs: &mut Vec<&'a str>,
+    ) {
         // Peel Ref so the downstream arms never have to think about it.
-        if let AttrTypeKind::Ref(name) = &attr.kind {
-            match self.resolve(name) {
-                Some(resolved) => {
-                    self.collect_attr_into(resolved, path, value, out);
+        if matches!(&attr.kind, AttrTypeKind::Ref(_)) {
+            match resolve_refs_on_path(attr, &self.defs, visited_refs) {
+                Ok(resolution) => {
+                    self.collect_attr_into_on_path(resolution.attr, path, value, out, visited_refs);
+                    visited_refs.truncate(resolution.restore_len);
                 }
-                None => {
-                    out.push((
-                        path.clone(),
-                        TypeError::ValidationFailed {
-                            message: format!(
-                                "schema reference `{name}` is not defined in the enclosing schema"
-                            ),
-                        },
-                    ));
+                Err(failure) => {
+                    out.push((path.clone(), failure.into_validation_error()));
                 }
             }
             return;
@@ -1105,7 +1267,7 @@ impl Schema {
             // collecting a failed Struct member would improve LSP path
             // precision but would not change validation acceptance.
             AttrTypeKind::Union(_) => {
-                if let Err(e) = self.validate_attr(attr, value) {
+                if let Err(e) = self.validate_attr_on_path(attr, value, visited_refs) {
                     out.push((path.clone(), e));
                 }
             }
@@ -1126,15 +1288,24 @@ impl Schema {
     /// resource's attribute type plus the resource's struct-definition
     /// map) can validate without re-rooting the schema.
     pub fn validate_attr(&self, attr: &AttributeType, value: &Value) -> Result<(), TypeError> {
+        let mut visited_refs = Vec::new();
+        self.validate_attr_on_path(attr, value, &mut visited_refs)
+    }
+
+    fn validate_attr_on_path<'a>(
+        &'a self,
+        attr: &'a AttributeType,
+        value: &Value,
+        visited_refs: &mut Vec<&'a str>,
+    ) -> Result<(), TypeError> {
         match &attr.kind {
-            AttrTypeKind::Ref(name) => match self.resolve(name) {
-                Some(resolved) => self.validate_attr(resolved, value),
-                None => Err(TypeError::ValidationFailed {
-                    message: format!(
-                        "schema reference `{name}` is not defined in the enclosing schema"
-                    ),
-                }),
-            },
+            AttrTypeKind::Ref(_) => {
+                let resolution = resolve_refs_on_path(attr, &self.defs, visited_refs)
+                    .map_err(RefResolutionFailure::into_validation_error)?;
+                let result = self.validate_attr_on_path(resolution.attr, value, visited_refs);
+                visited_refs.truncate(resolution.restore_len);
+                result
+            }
             AttrTypeKind::List {
                 element_type: inner,
                 ordered,
@@ -1230,9 +1401,14 @@ impl Schema {
                 let Some(concrete) = value.as_concrete() else {
                     return Ok(());
                 };
-                validate_union_members(members, concrete, attr.type_name(), |member| {
-                    self.validate_attr(member, value)
-                })
+                validate_union_members(
+                    members.as_raw_slice(),
+                    concrete,
+                    attr.type_name(),
+                    &self.defs,
+                    visited_refs,
+                    |member, visited_refs| self.validate_attr_on_path(member, value, visited_refs),
+                )
             }
             // For non-recursive variants, delegate to the standalone
             // validator. Any `Ref` they could reach has already been
@@ -1474,23 +1650,39 @@ impl AttributeType {
         &'a self,
         defs: &'a std::collections::BTreeMap<String, AttributeType>,
     ) -> ResolvedAttrType<'a> {
-        let mut cur = self;
-        // A small upper bound to catch pathological cycles
-        // (`Ref("X") -> Ref("X")`) without hanging the walker.
-        for _ in 0..256 {
-            match &cur.kind {
-                AttrTypeKind::Ref(name) => match defs.get(name) {
-                    Some(next) => cur = next,
-                    None => panic!(
-                        "AttributeType::Ref(\"{name}\") not found in schema defs; \
-                         schema invariant violated (producer must populate \
-                         ResourceSchema.defs for every Ref it emits)"
-                    ),
-                },
-                _ => return ResolvedAttrType::new_after_peel(cur),
-            }
+        let mut visited_refs = Vec::new();
+        self.resolve_refs_with_defs_on_path(defs, &mut visited_refs)
+    }
+
+    /// Resolve a top-level Ref chain under invariant-panic semantics while
+    /// retaining its names for a subsequent non-consuming Union selection.
+    pub(crate) fn resolve_refs_with_defs_on_path<'a>(
+        &'a self,
+        defs: &'a std::collections::BTreeMap<String, AttributeType>,
+        visited_refs: &mut Vec<&'a str>,
+    ) -> ResolvedAttrType<'a> {
+        match resolve_refs_on_path(self, defs, visited_refs) {
+            Ok(resolution) => ResolvedAttrType::new_after_peel(resolution.attr),
+            Err(failure) => panic_for_ref_resolution_failure(failure),
         }
-        panic!("AttributeType::Ref chain exceeded 256 hops; pathological self-cycle in defs")
+    }
+
+    /// Peel a Ref chain for a non-consuming Union walk. Revisiting a Ref on the
+    /// current path returns `None` so the walker can stop at the cyclic branch;
+    /// missing definitions and overlong chains retain invariant-panic semantics.
+    pub(crate) fn resolve_refs_for_union_walk_on_path<'a>(
+        &'a self,
+        defs: &'a std::collections::BTreeMap<String, AttributeType>,
+        visited_refs: &mut Vec<&'a str>,
+    ) -> Option<ResolvedAttrType<'a>> {
+        match resolve_refs_on_path(self, defs, visited_refs) {
+            Ok(resolution) => Some(ResolvedAttrType::new_after_peel(resolution.attr)),
+            Err(RefResolutionFailure {
+                kind: RefResolutionFailureKind::Cycle,
+                ..
+            }) => None,
+            Err(failure) => panic_for_ref_resolution_failure(failure),
+        }
     }
 
     /// Project this type onto a [`Shape`] view with every top-level
@@ -1546,17 +1738,20 @@ impl AttributeType {
     pub fn union_members_ref_free_with_budget(
         &self,
         budget: &mut ShapeWalkBudget,
-    ) -> Result<Option<&[AttributeType]>, RefEncountered> {
+    ) -> Result<Option<UnionMembers<'_>>, RefEncountered> {
         if !budget.take() {
             return Ok(None);
         }
         if let AttrTypeKind::Ref(name) = &self.kind {
             return Err(RefEncountered { name: name.clone() });
         }
-        Ok(match &self.kind {
-            AttrTypeKind::Union(members) => Some(members.as_slice()),
-            _ => None,
-        })
+        let AttrTypeKind::Union(members) = &self.kind else {
+            return Ok(None);
+        };
+        Ok(Some(UnionMembers::new_after_union(
+            members.as_raw_slice(),
+            empty_defs_for_schema_walks(),
+        )))
     }
 
     fn shape_from_resolved(resolved: &AttributeType) -> Shape<'_> {
@@ -1720,7 +1915,7 @@ impl AttributeType {
                 name: name.as_str(),
                 fields: fields.as_slice(),
             },
-            AttrTypeKind::Union(members) => RawShape::Union(members.as_slice()),
+            AttrTypeKind::Union(members) => RawShape::Union(members.as_raw_slice()),
             AttrTypeKind::Ref(name) => RawShape::Ref(name.as_str()),
         }
     }
@@ -1964,7 +2159,7 @@ impl AttributeType {
     /// Create a `Union` type from member types.
     pub fn union(members: Vec<AttributeType>) -> Self {
         AttributeType {
-            kind: AttrTypeKind::Union(members),
+            kind: AttrTypeKind::Union(UnionMemberTypes::new(members)),
         }
     }
 
@@ -2517,7 +2712,7 @@ impl AttributeType {
     ///
     /// On failure, return the structurally-closest member's error rather
     /// than a generic `TypeMismatch`. "Closest" is measured by
-    /// [`union_member_judgement`]: members whose outer constructor matches
+    /// [`union_member_judgement_on_path`]: members whose outer constructor matches
     /// the input's (Map↔Struct, List↔List, String↔Enum, scalar↔
     /// scalar) outscore unrelated members. A unique maximum preserves
     /// that member's error verbatim; tied closed-Struct failures are
@@ -2528,9 +2723,15 @@ impl AttributeType {
         let AttrTypeKind::Union(types) = &self.kind else {
             unreachable!("validate_union called on non-Union");
         };
-        validate_union_members(types, value, self.type_name(), |member| {
-            member.validate_concrete(value)
-        })
+        let mut visited_refs = Vec::new();
+        validate_union_members(
+            types.as_raw_slice(),
+            value,
+            self.type_name(),
+            empty_defs_for_schema_walks(),
+            &mut visited_refs,
+            |member, _| member.validate_concrete(value),
+        )
     }
 
     pub fn type_name(&self) -> String {
@@ -2559,7 +2760,8 @@ impl AttributeType {
             AttrTypeKind::Map { value: inner, .. } => format!("Map<{}>", inner.type_name()),
             AttrTypeKind::Struct { name, .. } => format!("Struct({})", name),
             AttrTypeKind::Union(types) => {
-                let names: Vec<String> = types.iter().map(|t| t.type_name()).collect();
+                let names: Vec<String> =
+                    types.as_raw_slice().iter().map(|t| t.type_name()).collect();
                 names.join(" | ")
             }
             AttrTypeKind::Ref(name) => format!("Ref({name})"),
@@ -2571,7 +2773,10 @@ impl AttributeType {
     /// For other types, returns true if self.type_name() == name.
     pub fn accepts_type_name(&self, name: &str) -> bool {
         match &self.kind {
-            AttrTypeKind::Union(types) => types.iter().any(|t| t.accepts_type_name(name)),
+            AttrTypeKind::Union(types) => types
+                .as_raw_slice()
+                .iter()
+                .any(|t| t.accepts_type_name(name)),
             _ => self.type_name() == name,
         }
     }
@@ -2647,10 +2852,16 @@ impl AttributeType {
     pub fn is_assignable_to(&self, sink: &AttributeType) -> bool {
         use AttrTypeKind::*;
         if let Union(members) = &sink.kind {
-            return members.iter().any(|m| self.is_assignable_to(m));
+            return members
+                .as_raw_slice()
+                .iter()
+                .any(|m| self.is_assignable_to(m));
         }
         if let Union(members) = &self.kind {
-            return members.iter().all(|m| m.is_assignable_to(sink));
+            return members
+                .as_raw_slice()
+                .iter()
+                .all(|m| m.is_assignable_to(sink));
         }
         match (&self.kind, &sink.kind) {
             (
@@ -2983,12 +3194,18 @@ impl UnionMemberJudgement {
 /// Union takes its best inner rank, and unrelated shapes are zero. Refined
 /// primitives retain their declared primitive constructor. Declaration order
 /// remains the strict-max tie-break used before #3754.
-fn union_member_judgement(
-    member: &AttributeType,
+fn union_member_judgement_on_path<'a>(
+    member: &'a AttributeType,
     value: ConcreteValueRef<'_>,
+    defs: &'a BTreeMap<String, AttributeType>,
+    visited_refs: &mut Vec<&'a str>,
 ) -> UnionMemberJudgement {
     use AttrTypeKind as AT;
-    match (&member.kind, value) {
+    let Ok(resolution) = resolve_refs_on_path(member, defs, visited_refs) else {
+        return UnionMemberJudgement::no_match();
+    };
+    let member = resolution.attr;
+    let judgement = match (&member.kind, value) {
         // Map↔Struct: preserve the original flat rank. Field recognition is
         // diagnostic identity, not a numeric ordering bonus.
         (AT::Struct { fields, .. }, ConcreteValueRef::Map(map)) => UnionMemberJudgement {
@@ -3026,7 +3243,9 @@ fn union_member_judgement(
         // Inner peek requires
         // re-projecting the first element through `as_concrete()` —
         // a deferred element contributes no bonus (the projection
-        // returns `None`).
+        // returns `None`). List descent consumes one value level, matching
+        // `Schema::validate_attr`'s fresh-path element recursion; retaining an
+        // outer Union alias here would make selection disagree with validation.
         (
             AT::List {
                 element_type: inner,
@@ -3037,14 +3256,19 @@ fn union_member_judgement(
             let inner_rank = items
                 .first()
                 .and_then(|first| first.as_concrete())
-                .map(|first| union_member_judgement(inner, first).canonical_rank)
+                .map(|first| {
+                    let mut element_path = Vec::new();
+                    union_member_judgement_on_path(inner, first, defs, &mut element_path)
+                        .canonical_rank
+                })
                 .unwrap_or(UnionCanonicalRank::NO_MATCH);
             UnionMemberJudgement::other_shape(UnionCanonicalRank::list_with_inner(inner_rank))
         }
         // Nested Union: recurse and retain the first best inner judgement.
         (AT::Union(inner), v) => inner
+            .as_raw_slice()
             .iter()
-            .map(|member| union_member_judgement(member, v))
+            .map(|member| union_member_judgement_on_path(member, v, defs, visited_refs))
             .reduce(|best, candidate| {
                 if candidate.canonical_rank > best.canonical_rank {
                     candidate
@@ -3054,7 +3278,9 @@ fn union_member_judgement(
             })
             .unwrap_or_else(UnionMemberJudgement::no_match),
         _ => UnionMemberJudgement::no_match(),
-    }
+    };
+    visited_refs.truncate(resolution.restore_len);
+    judgement
 }
 
 struct UnionMemberFailure {
@@ -3083,7 +3309,7 @@ impl BestUnionMemberFailures {
         }
     }
 
-    fn into_error(self, value: ConcreteValueRef<'_>, members: &[AttributeType]) -> TypeError {
+    fn into_error(self, value: ConcreteValueRef<'_>, members: UnionMembers<'_>) -> TypeError {
         let BestUnionMemberFailures {
             first,
             tied,
@@ -3173,10 +3399,11 @@ impl BestUnionMemberFailures {
     }
 }
 
-fn describe_struct_union_members(members: &[AttributeType]) -> Option<Vec<UnionStructAlternative>> {
+fn describe_struct_union_members(members: UnionMembers<'_>) -> Option<Vec<UnionStructAlternative>> {
     members
         .iter()
         .map(|member| {
+            let member = member?.as_attr();
             let AttrTypeKind::Struct { name, fields } = &member.kind else {
                 return None;
             };
@@ -3215,17 +3442,21 @@ fn validate_union_members<'a, F>(
     members: &'a [AttributeType],
     value: ConcreteValueRef<'_>,
     expected: String,
+    defs: &'a BTreeMap<String, AttributeType>,
+    visited_refs: &mut Vec<&'a str>,
     mut validate_member: F,
 ) -> Result<(), TypeError>
 where
-    F: FnMut(&'a AttributeType) -> Result<(), TypeError>,
+    F: FnMut(&'a AttributeType, &mut Vec<&'a str>) -> Result<(), TypeError>,
 {
+    let resolved_members =
+        UnionMembers::new_after_union_on_path(members, defs, visited_refs.clone());
     let mut best: Option<BestUnionMemberFailures> = None;
     for member in members {
-        match validate_member(member) {
+        match validate_member(member, visited_refs) {
             Ok(()) => return Ok(()),
             Err(error) => {
-                let judgement = union_member_judgement(member, value);
+                let judgement = union_member_judgement_on_path(member, value, defs, visited_refs);
                 if !judgement.canonical_rank.is_match() {
                     continue;
                 }
@@ -3253,64 +3484,11 @@ where
     }
 
     Err(best
-        .map(|best| best.into_error(value, members))
+        .map(|best| best.into_error(value, resolved_members))
         .unwrap_or(TypeError::TypeMismatch {
             expected,
             got: value.type_name().to_string(),
         }))
-}
-
-/// Pick the Union member a concrete value structurally "is", using the
-/// **same structural judgement** [`validate_union`] uses for error
-/// attribution ([`union_member_judgement`], #2219). Reusing the one judgement
-/// builder — rather than authoring a second parallel shape predicate — is
-/// deliberate (carina#3080 design): the canonicalizer
-/// ([`crate::value::canonicalize_with_type`]'s `Union` arm) and the
-/// validator must not drift apart in how they judge a value's member.
-/// The judgement deliberately exposes distinct types for canonical ordering
-/// and diagnostic field identity, rather than coupling both questions to one
-/// integer.
-///
-/// Selection rules:
-/// - Project the value to its concrete shape (deferred values have no
-///   shape → `None`, identity fallthrough at the call site).
-/// - Judge **every** member; the strict maximum canonical rank wins, so on a
-///   tie the earliest-declared member is kept. In particular, all Struct arms
-///   retain the pre-#3754 flat rank and declaration-order canonicalization.
-/// - All members have no structural match → `None`. The caller
-///   treats `None` as identity (never guess-coerce); a `Map` value can
-///   never select a `String` member because `(String, Map)` scores `0`.
-///
-/// Note the deliberate scope difference from `validate_union`: that
-/// function judges only members whose `validate_concrete` *failed*
-/// (the first member that validates `Ok` short-circuits — its job is
-/// to attribute an *error* message). This function judges *all*
-/// members because its job is the opposite: pick the structurally
-/// best-matching member to canonicalize *into*, whether or not it
-/// would also validate. For the IAM-union shapes this fix targets
-/// (`Union[Struct, String]`, `Union[String, List<String>]`) the
-/// members are shape-disjoint — exactly one matches for a given
-/// value — so the two functions select the same member regardless;
-/// the broader scoring only matters for hypothetical overlapping
-/// unions, where "best structural match" is the correct rule for a
-/// canonicalizer and declaration order is its deterministic tie-break.
-pub(crate) fn select_union_member<'a>(
-    members: &'a [AttributeType],
-    value: &Value,
-) -> Option<&'a AttributeType> {
-    let projected = value.as_concrete()?;
-    let mut best: Option<(UnionCanonicalRank, &AttributeType)> = None;
-    for member in members {
-        let judgement = union_member_judgement(member, projected);
-        if judgement.canonical_rank.is_match()
-            && best
-                .as_ref()
-                .is_none_or(|(previous, _)| judgement.canonical_rank > *previous)
-        {
-            best = Some((judgement.canonical_rank, member));
-        }
-    }
-    best.map(|(_, m)| m)
 }
 
 /// Map every accepted field name to its canonical [`StructField`].
@@ -4585,9 +4763,18 @@ pub(crate) fn struct_fields_with_defs<'a>(
 pub(crate) fn union_members_with_defs<'a>(
     attr_type: &'a AttributeType,
     defs: &'a std::collections::BTreeMap<String, AttributeType>,
-) -> Option<&'a [AttributeType]> {
-    match attr_type.resolve_refs_with_defs(defs).as_attr().kind() {
-        AttrTypeKind::Union(members) => Some(members.as_slice()),
+) -> Option<UnionMembers<'a>> {
+    let mut visited_refs = Vec::new();
+    match attr_type
+        .resolve_refs_with_defs_on_path(defs, &mut visited_refs)
+        .as_attr()
+        .kind()
+    {
+        AttrTypeKind::Union(members) => Some(UnionMembers::new_after_union_on_path(
+            members.as_raw_slice(),
+            defs,
+            visited_refs,
+        )),
         _ => None,
     }
 }
@@ -4746,7 +4933,7 @@ impl ResourceSchema {
         &'a self,
         ty: &'a AttributeType,
         budget: &mut ShapeWalkBudget,
-    ) -> Option<&'a [AttributeType]> {
+    ) -> Option<UnionMembers<'a>> {
         if !budget.take() {
             return None;
         }
@@ -4801,8 +4988,12 @@ impl ResourceSchema {
             }
             Shape::Union => {
                 if let Some(members) = self.union_members_of(attr_type) {
-                    for member in members {
-                        self.append_enum_values_from_top_level_attr_type(member, input, out);
+                    for member in members.iter().flatten() {
+                        self.append_enum_values_from_top_level_attr_type(
+                            member.as_attr(),
+                            input,
+                            out,
+                        );
                     }
                 }
             }
@@ -4818,7 +5009,7 @@ impl ResourceSchema {
     pub(crate) fn union_members_of<'a>(
         &'a self,
         ty: &'a AttributeType,
-    ) -> Option<&'a [AttributeType]> {
+    ) -> Option<UnionMembers<'a>> {
         union_members_with_defs(ty, &self.defs)
     }
 
@@ -5167,7 +5358,7 @@ fn collect_block_names_from_type(attr_type: &AttributeType, result: &mut HashMap
             collect_block_names_from_type(inner, result);
         }
         AttrTypeKind::Union(types) => {
-            for t in types {
+            for t in types.as_raw_slice() {
                 collect_block_names_from_type(t, result);
             }
         }

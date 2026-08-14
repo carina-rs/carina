@@ -64,6 +64,17 @@ pub(crate) fn type_aware_equal(
     defs: &BTreeMap<String, AttributeType>,
     secret_ctx: Option<&SecretHashContext>,
 ) -> bool {
+    type_aware_equal_on_path(a, b, attr_type, defs, secret_ctx, &[])
+}
+
+fn type_aware_equal_on_path<'a>(
+    a: &Value,
+    b: &Value,
+    attr_type: Option<&'a AttributeType>,
+    defs: &'a BTreeMap<String, AttributeType>,
+    secret_ctx: Option<&SecretHashContext>,
+    visited_refs: &[&'a str],
+) -> bool {
     // Secret comparison: compare the hash of the desired secret with the state hash string.
     // State stores secrets as "_secret:argon2:<hex>", desired has Value::Deferred(DeferredValue::Secret(inner)).
     if let Value::Deferred(DeferredValue::Secret(inner)) = a {
@@ -73,12 +84,23 @@ pub(crate) fn type_aware_equal(
         return secret_matches_state(inner, a, secret_ctx);
     }
 
-    // Dispatch through `Shape` so the wildcard `_ => …` arm cannot be
-    // reached by a `Ref`-typed attr_type. Shape has no `Ref` variant,
-    // so the carina#3340 / carina#3349 invariant is moved from a
-    // hand-written `resolve_refs` + `Ref(_) => unreachable!()` guard
-    // into the type system.
-    let shape = attr_type.map(|t| t.shape_with_defs(defs));
+    // Retain top-level Ref names across non-consuming Union recursion. Each
+    // recursive branch receives its own copy, so sibling probes cannot pollute
+    // one another.
+    let mut current_path = visited_refs.to_vec();
+    let resolved_attr_type = attr_type.map(|attr_type| {
+        attr_type
+            .resolve_refs_with_defs_on_path(defs, &mut current_path)
+            .as_attr()
+    });
+    // Dispatch through `Shape` so the wildcard `_ => …` arm cannot be reached
+    // by a Ref-typed attr_type. The resolver above proves this projection is
+    // Ref-free without starting another path.
+    let shape = resolved_attr_type.map(|attr_type| {
+        attr_type
+            .shape_ref_free()
+            .expect("resolve_refs_with_defs_on_path must peel every top-level Ref")
+    });
 
     match shape {
         None => {
@@ -150,7 +172,8 @@ pub(crate) fn type_aware_equal(
                 Value::Concrete(ConcreteValue::Map(mb)),
                 crate::schema::Shape::Struct { .. },
             ) => {
-                let attr_type = attr_type.expect("Some(shape) implies Some(attr_type)");
+                let attr_type =
+                    resolved_attr_type.expect("Some(shape) implies Some(resolved attr_type)");
                 let fields = crate::schema::struct_fields_with_defs(attr_type, defs)
                     .expect("Shape::Struct must expose struct fields internally");
                 type_aware_struct_equal(ma, mb, fields, defs, secret_ctx)
@@ -158,7 +181,8 @@ pub(crate) fn type_aware_equal(
 
             // Union: try each member type; if any says equal, they're equal
             (_, _, crate::schema::Shape::Union) => {
-                let attr_type = attr_type.expect("Some(shape) implies Some(attr_type)");
+                let attr_type =
+                    resolved_attr_type.expect("Some(shape) implies Some(resolved attr_type)");
                 let types = crate::schema::union_members_with_defs(attr_type, defs)
                     .expect("Shape::Union must expose union members internally");
                 // Also check Int/Float coercion for unions containing numeric types
@@ -170,9 +194,9 @@ pub(crate) fn type_aware_equal(
                     | (
                         Value::Concrete(ConcreteValue::Float(f)),
                         Value::Concrete(ConcreteValue::Int(i)),
-                    ) if types.iter().any(|t| {
+                    ) if types.any_on_path(&mut current_path, |member, _| {
                         matches!(
-                            &t.kind,
+                            &member.as_attr().kind,
                             crate::schema::AttrTypeKind::Float { .. }
                                 | crate::schema::AttrTypeKind::Int { .. }
                         )
@@ -180,9 +204,16 @@ pub(crate) fn type_aware_equal(
                     {
                         (*i as f64) == *f && (*i as f64) as i64 == *i
                     }
-                    _ => types
-                        .iter()
-                        .any(|t| type_aware_equal(a, b, Some(t), defs, secret_ctx)),
+                    _ => types.any_on_path(&mut current_path, |member, member_path| {
+                        type_aware_equal_on_path(
+                            a,
+                            b,
+                            Some(member.as_attr()),
+                            defs,
+                            secret_ctx,
+                            member_path,
+                        )
+                    }),
                 }
             }
 

@@ -715,9 +715,12 @@ impl CompletionProvider {
                 };
                 let mut completions = Vec::new();
                 let mut seen_labels = std::collections::HashSet::new();
-                for member in members {
-                    for item in self.completions_for_type_with_budget(member, resource_type, budget)
-                    {
+                for member in members.iter().flatten() {
+                    for item in self.completions_for_type_with_budget(
+                        member.as_attr(),
+                        resource_type,
+                        budget,
+                    ) {
                         if seen_labels.insert(item.label.clone()) {
                             completions.push(item);
                         }
@@ -2038,11 +2041,15 @@ fn return_type_fits(
         return false;
     };
     match shape {
-        Shape::Union => attr_type
-            .union_members_ref_free_with_budget(budget)
-            .ok()
-            .flatten()
-            .is_some_and(|members| members.iter().any(|m| return_type_fits(ret, m, budget))),
+        Shape::Union => {
+            let Ok(Some(members)) = attr_type.union_members_ref_free_with_budget(budget) else {
+                return false;
+            };
+            members
+                .iter()
+                .flatten()
+                .any(|member| return_type_fits(ret, member.as_attr(), budget))
+        }
         Shape::String {
             identity: None,
             pattern: None,
@@ -2259,4 +2266,24 @@ fn collect_named_provider_instance_bindings(
     bindings.sort();
     bindings.dedup();
     bindings
+}
+
+#[cfg(test)]
+mod return_type_fits_tests {
+    use super::*;
+
+    #[test]
+    fn ref_member_is_skipped_when_string_sibling_fits() {
+        let attr_type = AttributeType::union(vec![
+            AttributeType::ref_("ResolvedOnlyWithDefs"),
+            AttributeType::string(),
+        ]);
+        let mut budget = carina_core::schema::ShapeWalkBudget::new(8);
+
+        assert!(return_type_fits(
+            builtins::BuiltinReturnType::String,
+            &attr_type,
+            &mut budget,
+        ));
+    }
 }

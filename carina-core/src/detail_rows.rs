@@ -852,7 +852,9 @@ fn build_attribute_diff_rows(
                 }),
                 None => effectively_unchanged += 1,
             }
-        } else if let Some(diff) = compute_string_list_change(old_value, new_value, attr_type) {
+        } else if let Some(diff) =
+            compute_string_list_change(old_value, new_value, attr_type, ctx.defs)
+        {
             rows.push(string_list_diff_row(
                 key.to_string(),
                 diff.unchanged,
@@ -1289,7 +1291,7 @@ fn compute_map_diff_entries(
                         });
                     }
                 } else if let Some(diff) =
-                    compute_string_list_change(Some(&e.old_value), &e.new_value, entry_type)
+                    compute_string_list_change(Some(&e.old_value), &e.new_value, entry_type, defs)
                 {
                     // #3234: see MapDiffEntryIR::StringListChanged docs.
                     entries.push(MapDiffEntryIR::StringListChanged {
@@ -1527,7 +1529,7 @@ fn compute_list_of_maps_diff_parts(
                         entries: nested,
                     });
                 } else if let Some(diff) =
-                    compute_string_list_change(old_val, &new_map[k], field_type)
+                    compute_string_list_change(old_val, &new_map[k], field_type, defs)
                 {
                     fields.push(ListOfMapsDiffField::StringListChanged {
                         key: k.to_string(),
@@ -1666,6 +1668,7 @@ fn compute_string_list_change(
     old_value: Option<&Value>,
     new_value: &Value,
     attr_type: Option<&AttributeType>,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> Option<crate::diff_helpers::StringListDiff> {
     let mut new_list = crate::value::as_string_list(new_value)?;
     let mut old_list = match old_value {
@@ -1680,7 +1683,7 @@ fn compute_string_list_change(
     // the API spelling first, mirroring the differ's `Enum` arm
     // (`extract_enum_value_with_values` → `DslMap::api_for`).
     if let Some((_, Some(values), _, _, dsl_map)) = attr_type
-        .and_then(string_list_inner_type)
+        .and_then(|attr_type| string_list_inner_type(attr_type, defs))
         .and_then(|t| t.enum_parts())
     {
         let valid: Vec<&str> = values.iter().map(String::as_str).collect();
@@ -1695,33 +1698,46 @@ fn compute_string_list_change(
     Some(diff)
 }
 
-/// Return a `List`'s element type, descending recursively through
-/// `Union` members to find the first `List` arm. Returns `None` when
-/// `attr_type` resolves to nothing list-shaped.
-fn string_list_inner_type(attr_type: &AttributeType) -> Option<&AttributeType> {
-    use crate::schema::AttrTypeKind;
-    match &attr_type.kind {
-        AttrTypeKind::List {
-            element_type: inner,
-            ..
-        } => Some(inner),
-        AttrTypeKind::Union(members) => members.iter().find_map(string_list_inner_type),
-        // `AttributeType::Ref` (carina#3340): in CFN-derived schemas
-        // the resolved target is a `Struct`, never a `List<String>`.
-        // Returning `None` is the safe answer and keeps the helper
-        // free of a `defs` dependency. A future schema that uses
-        // `Ref` for list shapes would need to thread `&defs` and
-        // resolve here.
-        AttrTypeKind::Ref(_) => None,
-        AttrTypeKind::String { .. }
-        | AttrTypeKind::Int { .. }
-        | AttrTypeKind::Float { .. }
-        | AttrTypeKind::Bool
-        | AttrTypeKind::Duration
-        | AttrTypeKind::Enum { .. }
-        | AttrTypeKind::Map { .. }
-        | AttrTypeKind::Struct { .. } => None,
+/// Return a `List`'s element type, descending recursively through the lazy,
+/// definition-aware Union-member view. A visited-node set terminates cyclic
+/// Union aliases without hiding a reachable sibling List arm.
+fn string_list_inner_type<'a>(
+    attr_type: &'a AttributeType,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+) -> Option<&'a AttributeType> {
+    fn on_path<'a>(
+        attr_type: &'a AttributeType,
+        defs: &'a std::collections::BTreeMap<String, AttributeType>,
+        visited: &mut std::collections::HashSet<*const AttributeType>,
+    ) -> Option<&'a AttributeType> {
+        let resolved = attr_type.resolve_refs_with_defs(defs).as_attr();
+        let identity = std::ptr::from_ref(resolved);
+        if !visited.insert(identity) {
+            return None;
+        }
+        let result = match resolved.shape_ref_free().ok()? {
+            crate::schema::Shape::List {
+                element_type: inner,
+                ..
+            } => Some(inner),
+            crate::schema::Shape::Union => crate::schema::union_members_with_defs(resolved, defs)?
+                .iter()
+                .flatten()
+                .find_map(|member| on_path(member.as_attr(), defs, visited)),
+            crate::schema::Shape::String { .. }
+            | crate::schema::Shape::Int { .. }
+            | crate::schema::Shape::Float { .. }
+            | crate::schema::Shape::Bool
+            | crate::schema::Shape::Duration
+            | crate::schema::Shape::Enum { .. }
+            | crate::schema::Shape::Map { .. }
+            | crate::schema::Shape::Struct { .. } => None,
+        };
+        visited.remove(&identity);
+        result
     }
+
+    on_path(attr_type, defs, &mut std::collections::HashSet::new())
 }
 
 #[cfg(test)]
@@ -3412,6 +3428,79 @@ mod tests {
                 .map(|s| Value::Concrete(ConcreteValue::enum_identifier(s.to_string())))
                 .collect(),
         ))
+    }
+
+    #[test]
+    fn map_string_list_change_resolves_ref_union_member_enum() {
+        let mode = AttributeType::enum_(
+            crate::schema::TypeIdentity::bare("Mode"),
+            Some(vec!["Allow".to_string(), "Deny".to_string()]),
+            vec![
+                ("Allow".to_string(), "allow".to_string()),
+                ("Deny".to_string(), "deny".to_string()),
+            ],
+            None,
+            None,
+        );
+        let settings = AttributeType::struct_(
+            "Settings",
+            vec![crate::schema::StructField::new(
+                "modes",
+                AttributeType::union(vec![AttributeType::ref_("L")]),
+            )],
+        );
+        let defs = std::collections::BTreeMap::from([("L".to_string(), AttributeType::list(mode))]);
+        let old_value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "modes".to_string(),
+            enum_list(&["allow"]),
+        )])));
+        let new_value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "modes".to_string(),
+            enum_list(&["Allow", "Deny"]),
+        )])));
+
+        let entries = compute_map_diff_entries(
+            Some(&old_value),
+            &new_value,
+            Some(&settings),
+            &defs,
+            DetailLevel::Explicit,
+        );
+
+        assert_eq!(entries.len(), 1, "expected one nested row: {entries:?}");
+        let MapDiffEntryIR::StringListChanged {
+            key,
+            unchanged,
+            added,
+            removed,
+        } = &entries[0]
+        else {
+            panic!("expected StringListChanged, got: {entries:?}");
+        };
+        assert_eq!(key, "modes");
+        assert_eq!(unchanged, &["Allow"]);
+        assert_eq!(added, &["Deny"]);
+        assert!(removed.is_empty(), "no alias-only removal: {removed:?}");
+    }
+
+    #[test]
+    fn string_list_inner_type_finds_list_through_cyclic_ref_union() {
+        let attr_type = AttributeType::union(vec![AttributeType::ref_("L")]);
+        let defs = std::collections::BTreeMap::from([(
+            "L".to_string(),
+            AttributeType::union(vec![
+                AttributeType::ref_("L"),
+                AttributeType::list(AttributeType::string()),
+            ]),
+        )]);
+
+        let inner = string_list_inner_type(&attr_type, &defs)
+            .expect("the concrete List sibling must remain reachable");
+
+        assert!(matches!(
+            inner.shape_ref_free(),
+            Ok(crate::schema::Shape::String { .. })
+        ));
     }
 
     /// carina#3075: a `List<Enum>` attribute whose state holds the
