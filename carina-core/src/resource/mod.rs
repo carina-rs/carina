@@ -2346,8 +2346,8 @@ fn append_schema_pairing_hashes(
         Shape::Union => {
             let members = crate::schema::union_members_with_defs(attr_type, defs)
                 .expect("Shape::Union must expose union members internally");
-            for member in members {
-                append_schema_pairing_hashes(value, member, defs, hashes, depth + 1);
+            for member in members.iter().flatten() {
+                append_schema_pairing_hashes(value, member.as_attr(), defs, hashes, depth + 1);
             }
         }
     }

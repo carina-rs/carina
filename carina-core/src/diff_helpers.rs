@@ -55,8 +55,14 @@ pub(crate) fn map_entry_subtype<'a>(
     defs: &'a BTreeMap<String, AttributeType>,
 ) -> Option<&'a AttributeType> {
     let mut t = attr_type?;
+    let mut visited_refs = Vec::new();
     loop {
-        match t.shape_with_defs(defs) {
+        let resolved = t.resolve_refs_for_union_walk_on_path(defs, &mut visited_refs)?;
+        t = resolved.as_attr();
+        match t
+            .shape_ref_free()
+            .expect("resolve_refs_for_union_walk_on_path must peel every top-level Ref")
+        {
             crate::schema::Shape::List {
                 element_type: inner,
                 ..
@@ -70,7 +76,7 @@ pub(crate) fn map_entry_subtype<'a>(
                     .map(|field| &field.field_type);
             }
             crate::schema::Shape::Union => {
-                t = union_member_for_walk(t, defs, UnionWalkTarget::MapEntry)?;
+                t = union_member_for_walk(t, defs, UnionWalkTarget::MapEntry, &mut visited_refs)?;
             }
             _ => return None,
         }
@@ -96,31 +102,45 @@ fn union_member_for_walk<'a>(
     attr_type: &'a AttributeType,
     defs: &'a BTreeMap<String, AttributeType>,
     target: UnionWalkTarget,
+    visited_refs: &mut Vec<&'a str>,
 ) -> Option<&'a AttributeType> {
     let members = crate::schema::union_members_with_defs(attr_type, defs)
         .expect("Shape::Union must expose union members internally");
     match target {
-        UnionWalkTarget::ListElement => members.iter().find(|member| {
-            matches!(
-                member.shape_with_defs(defs),
-                crate::schema::Shape::List { .. }
-            )
-        }),
-        UnionWalkTarget::MapEntry => members
-            .iter()
-            .find(|member| {
+        UnionWalkTarget::ListElement => members
+            .find_on_path(visited_refs, |member, _| {
                 matches!(
-                    member.shape_with_defs(defs),
+                    member
+                        .as_attr()
+                        .shape_ref_free()
+                        .expect("UnionMembers must peel member Refs"),
+                    crate::schema::Shape::List { .. }
+                )
+            })
+            .map(|member| member.as_attr()),
+        UnionWalkTarget::MapEntry => members
+            .find_on_path(visited_refs, |member, _| {
+                matches!(
+                    member
+                        .as_attr()
+                        .shape_ref_free()
+                        .expect("UnionMembers must peel member Refs"),
                     crate::schema::Shape::Struct { .. } | crate::schema::Shape::Map { .. }
                 )
             })
+            .map(|member| member.as_attr())
             .or_else(|| {
-                members.iter().find(|member| {
-                    matches!(
-                        member.shape_with_defs(defs),
-                        crate::schema::Shape::List { .. }
-                    )
-                })
+                members
+                    .find_on_path(visited_refs, |member, _| {
+                        matches!(
+                            member
+                                .as_attr()
+                                .shape_ref_free()
+                                .expect("UnionMembers must peel member Refs"),
+                            crate::schema::Shape::List { .. }
+                        )
+                    })
+                    .map(|member| member.as_attr())
             }),
     }
 }
@@ -138,13 +158,24 @@ pub(crate) fn list_element_type<'a>(
     defs: &'a BTreeMap<String, AttributeType>,
 ) -> Option<&'a AttributeType> {
     let mut current = attr_type?;
+    let mut visited_refs = Vec::new();
     loop {
-        match current.shape_with_defs(defs) {
+        let resolved = current.resolve_refs_for_union_walk_on_path(defs, &mut visited_refs)?;
+        current = resolved.as_attr();
+        match current
+            .shape_ref_free()
+            .expect("resolve_refs_for_union_walk_on_path must peel every top-level Ref")
+        {
             crate::schema::Shape::List { element_type, .. } => return Some(element_type),
             crate::schema::Shape::Union => {
-                current = union_member_for_walk(current, defs, UnionWalkTarget::ListElement)?;
+                current = union_member_for_walk(
+                    current,
+                    defs,
+                    UnionWalkTarget::ListElement,
+                    &mut visited_refs,
+                )?;
             }
-            _ => return Some(current.resolve_refs_with_defs(defs).as_attr()),
+            _ => return Some(current),
         }
     }
 }
@@ -388,6 +419,17 @@ mod tests {
                 field_type.shape_with_defs(defs)
             );
         }
+    }
+
+    #[test]
+    fn map_entry_subtype_terminates_on_recursive_list_union_without_map_entry() {
+        let root = AttributeType::ref_("A");
+        let defs = BTreeMap::from([(
+            "A".to_string(),
+            AttributeType::union(vec![AttributeType::list(AttributeType::ref_("A"))]),
+        )]);
+
+        assert!(map_entry_subtype(Some(&root), "missing", &defs).is_none());
     }
 
     #[test]

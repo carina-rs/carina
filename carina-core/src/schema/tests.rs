@@ -2916,6 +2916,51 @@ fn shape_ref_free_projects_non_ref_shape() {
 }
 
 #[test]
+fn union_members_ref_free_skips_ref_member_and_keeps_sibling() {
+    let attr_type = AttributeType::union(vec![
+        AttributeType::ref_("ResolvedOnlyWithDefs"),
+        AttributeType::string(),
+    ]);
+    let mut budget = ShapeWalkBudget::new(8);
+
+    let members = attr_type
+        .union_members_ref_free_with_budget(&mut budget)
+        .expect("the Union itself is Ref-free")
+        .expect("the accessor must expose Union members");
+    let resolved = members.iter().collect::<Vec<_>>();
+    assert_eq!(resolved.len(), 2);
+    assert!(
+        resolved[0].is_none(),
+        "the unresolved Ref member is skipped"
+    );
+    assert!(matches!(
+        resolved[1]
+            .expect("String sibling must remain visible")
+            .as_attr()
+            .kind(),
+        AttrTypeKind::String { .. }
+    ));
+}
+
+#[test]
+fn ref_hop_limit_counts_only_the_current_resolution_chain() {
+    let prior_names = (0..MAX_REF_PATH_HOPS)
+        .map(|index| format!("Prior{index}"))
+        .collect::<Vec<_>>();
+    let mut visited_refs = prior_names.iter().map(String::as_str).collect::<Vec<_>>();
+    let attr_type = AttributeType::ref_("Leaf");
+    let defs = std::collections::BTreeMap::from([("Leaf".to_string(), AttributeType::string())]);
+
+    let resolution = resolve_refs_on_path(&attr_type, &defs, &mut visited_refs)
+        .expect("an accumulated path must not consume the current chain's hop budget");
+    assert!(matches!(
+        resolution.attr.kind(),
+        AttrTypeKind::String { .. }
+    ));
+    assert_eq!(visited_refs.len(), MAX_REF_PATH_HOPS + 1);
+}
+
+#[test]
 fn schema_shape_of_resolves_ref_against_defs() {
     let mut defs = std::collections::BTreeMap::new();
     defs.insert("Alias".to_string(), AttributeType::bool());
@@ -4754,6 +4799,25 @@ fn retention_union() -> AttributeType {
     ])
 }
 
+fn retention_ref_schema() -> Schema {
+    Schema {
+        root: AttributeType::union(vec![
+            AttributeType::ref_("RetentionDays"),
+            AttributeType::ref_("RetentionYears"),
+        ]),
+        defs: std::collections::BTreeMap::from([
+            (
+                "RetentionDays".to_string(),
+                required_int_struct("RetentionDays", &["days"]),
+            ),
+            (
+                "RetentionYears".to_string(),
+                required_int_struct("RetentionYears", &["years"]),
+            ),
+        ]),
+    }
+}
+
 fn required_int_struct(name: &str, fields: &[&str]) -> AttributeType {
     AttributeType::struct_(
         name.to_string(),
@@ -4799,6 +4863,45 @@ fn union_errors_from_public_paths(
         ("Schema::validate_attr", schema_attr),
         ("Schema::validate_collect", collected[0].1.clone()),
     ]
+}
+
+fn union_ref_errors_from_schema_paths(
+    schema: &Schema,
+    value: &Value,
+) -> Vec<(&'static str, TypeError)> {
+    let schema_root = schema
+        .validate(value)
+        .expect_err("Schema::validate must reject the value");
+    let schema_attr = schema
+        .validate_attr(&schema.root, value)
+        .expect_err("Schema::validate_attr must reject the value");
+    let collected = schema.validate_collect(value);
+    assert_eq!(
+        collected.len(),
+        1,
+        "Schema::validate_collect must produce one union-level error, got {collected:?}"
+    );
+
+    vec![
+        ("Schema::validate", schema_root),
+        ("Schema::validate_attr", schema_attr),
+        ("Schema::validate_collect", collected[0].1.clone()),
+    ]
+}
+
+fn assert_union_ref_valid_through_schema_paths(schema: &Schema, value: &Value) {
+    assert!(
+        schema.validate(value).is_ok(),
+        "Schema::validate rejected {value:?}"
+    );
+    assert!(
+        schema.validate_attr(&schema.root, value).is_ok(),
+        "Schema::validate_attr rejected {value:?}"
+    );
+    assert!(
+        schema.validate_collect(value).is_empty(),
+        "Schema::validate_collect rejected {value:?}"
+    );
 }
 
 fn assert_union_valid_through_public_paths(union: &AttributeType, value: &Value) {
@@ -5393,6 +5496,234 @@ fn union_struct_unique_field_match_preserves_detailed_member_error_verbatim() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// #3757 — Ref-based Union members use the shared structural judgement
+// ---------------------------------------------------------------------------
+
+#[test]
+fn schema_union_ref_struct_tie_reports_fields_from_multiple_alternatives() {
+    let schema = retention_ref_schema();
+    let value = union_map(vec![
+        ("days", Value::Concrete(ConcreteValue::Int(30))),
+        ("years", Value::Concrete(ConcreteValue::Int(1))),
+    ]);
+
+    for (path, err) in union_ref_errors_from_schema_paths(&schema, &value) {
+        let TypeError::UnionStructMismatch {
+            reason,
+            supplied_fields,
+            alternatives,
+        } = &err
+        else {
+            panic!("{path} must return structured UnionStructMismatch, got {err:?}")
+        };
+        assert_eq!(reason, &UnionStructMismatchReason::ConflictingAlternatives);
+        assert_eq!(supplied_fields, &["days", "years"]);
+        assert_retention_alternative_metadata(path, alternatives);
+        assert_eq!(
+            err.to_string(),
+            "Expected exactly one of 'days' or 'years', but both were supplied",
+            "{path} must match the inline-Struct diagnostic"
+        );
+    }
+}
+
+#[test]
+fn schema_union_ref_struct_tie_reports_no_alternative_for_empty_map() {
+    let schema = retention_ref_schema();
+    let value = union_map(vec![]);
+
+    for (path, err) in union_ref_errors_from_schema_paths(&schema, &value) {
+        let TypeError::UnionStructMismatch {
+            reason,
+            supplied_fields,
+            alternatives,
+        } = &err
+        else {
+            panic!("{path} must return structured UnionStructMismatch, got {err:?}")
+        };
+        assert_eq!(
+            reason,
+            &UnionStructMismatchReason::NoAlternativeSatisfied {
+                unrecognized_fields: vec![]
+            }
+        );
+        assert!(supplied_fields.is_empty());
+        assert_retention_alternative_metadata(path, alternatives);
+        assert_eq!(
+            err.to_string(),
+            "Expected exactly one of 'days' or 'years', but none were supplied",
+            "{path} must match the inline-Struct diagnostic"
+        );
+    }
+}
+
+#[test]
+fn schema_union_ref_struct_unique_field_match_preserves_detailed_member_error_verbatim() {
+    let schema = retention_ref_schema();
+    let value = union_map(vec![(
+        "days",
+        Value::Concrete(ConcreteValue::String("x".to_string())),
+    )]);
+
+    for (path, err) in union_ref_errors_from_schema_paths(&schema, &value) {
+        assert_eq!(
+            err.to_string(),
+            "Struct field 'days': Type mismatch: expected Int, got String",
+            "{path} must preserve the unique RetentionDays member error"
+        );
+    }
+}
+
+#[test]
+fn schema_union_ref_struct_unknown_field_restores_similar_name_suggestion() {
+    let schema = retention_ref_schema();
+    let value = union_map(vec![("dayz", Value::Concrete(ConcreteValue::Int(30)))]);
+
+    for (path, err) in union_ref_errors_from_schema_paths(&schema, &value) {
+        assert_eq!(
+            err.to_string(),
+            "Unknown field 'dayz', did you mean 'days'? Expected exactly one of 'days' or 'years'",
+            "{path} must match the inline-Struct typo diagnostic"
+        );
+    }
+
+    let corrected = union_map(vec![("days", Value::Concrete(ConcreteValue::Int(30)))]);
+    assert_union_ref_valid_through_schema_paths(&schema, &corrected);
+}
+
+#[test]
+fn schema_union_ref_member_missing_from_defs_keeps_generic_type_mismatch() {
+    let schema = Schema::flat(AttributeType::union(vec![
+        AttributeType::ref_("MissingDays"),
+        AttributeType::ref_("MissingYears"),
+    ]));
+    let value = union_map(vec![("days", Value::Concrete(ConcreteValue::Int(30)))]);
+    let expected = TypeError::TypeMismatch {
+        expected: schema.root.type_name(),
+        got: "Map".to_string(),
+    };
+
+    for (path, err) in union_ref_errors_from_schema_paths(&schema, &value) {
+        assert_eq!(err, expected, "{path} changed the missing-Ref fallback");
+        assert!(
+            !err.to_string().contains("internal:"),
+            "{path} leaked an implementation detail"
+        );
+    }
+}
+
+#[test]
+fn standalone_union_ref_members_keep_generic_type_mismatch_without_internal_error() {
+    let union = AttributeType::union(vec![
+        AttributeType::ref_("RetentionDays"),
+        AttributeType::ref_("RetentionYears"),
+    ]);
+    let value = union_map(vec![("days", Value::Concrete(ConcreteValue::Int(30)))]);
+
+    let err = union
+        .validate(&value)
+        .expect_err("standalone Ref members cannot resolve without defs");
+    assert_eq!(
+        err,
+        TypeError::TypeMismatch {
+            expected: union.type_name(),
+            got: "Map".to_string(),
+        }
+    );
+    assert!(!err.to_string().contains("internal:"));
+}
+
+#[test]
+fn schema_validate_self_cyclic_union_ref_failing_value_terminates() {
+    let schema = Schema {
+        root: AttributeType::ref_("A"),
+        defs: std::collections::BTreeMap::from([(
+            "A".to_string(),
+            AttributeType::union(vec![AttributeType::ref_("A"), AttributeType::string()]),
+        )]),
+    };
+    let value = Value::Concrete(ConcreteValue::Int(1));
+
+    let err = schema
+        .validate(&value)
+        .expect_err("the cyclic union has no member accepting Int");
+    assert_eq!(
+        err,
+        TypeError::TypeMismatch {
+            expected: "Ref(A) | String".to_string(),
+            got: "Int".to_string(),
+        }
+    );
+}
+
+#[test]
+fn schema_validate_ref_alias_cycle_terminates_for_validate_and_collect() {
+    let schema = Schema {
+        root: AttributeType::ref_("A"),
+        defs: std::collections::BTreeMap::from([
+            ("A".to_string(), AttributeType::ref_("B")),
+            ("B".to_string(), AttributeType::ref_("A")),
+        ]),
+    };
+    let value = Value::Concrete(ConcreteValue::Int(1));
+    let expected = TypeError::ValidationFailed {
+        message: "cyclic schema reference `A`".to_string(),
+    };
+
+    assert_eq!(schema.validate(&value), Err(expected.clone()));
+    let collected = schema.validate_collect(&value);
+    assert_eq!(collected.len(), 1);
+    assert_eq!(collected[0].1, expected);
+}
+
+#[test]
+fn schema_validation_ref_cycle_guard_resets_for_struct_field_values() {
+    let schema = Schema {
+        root: AttributeType::ref_("Node"),
+        defs: std::collections::BTreeMap::from([(
+            "Node".to_string(),
+            AttributeType::struct_(
+                "Node",
+                vec![StructField::new("child", AttributeType::ref_("Node"))],
+            ),
+        )]),
+    };
+    let value = union_map(vec![("child", union_map(vec![]))]);
+
+    assert!(schema.validate(&value).is_ok());
+    assert!(schema.validate_collect(&value).is_empty());
+}
+
+#[test]
+fn schema_union_judgement_resets_ref_path_for_list_failure_attribution() {
+    let schema = Schema {
+        root: AttributeType::ref_("A"),
+        defs: std::collections::BTreeMap::from([(
+            "A".to_string(),
+            AttributeType::union(vec![
+                AttributeType::list(AttributeType::int()),
+                AttributeType::list(AttributeType::ref_("A")),
+                AttributeType::string(),
+            ]),
+        )]),
+    };
+    let value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::List(vec![Value::Concrete(ConcreteValue::Bool(true))]),
+    )]));
+
+    let TypeError::ListItemError { index: 0, inner } = schema
+        .validate(&value)
+        .expect_err("the recursive list value must fail validation")
+    else {
+        panic!("the recursive List member must own failure attribution")
+    };
+    assert!(
+        matches!(*inner, TypeError::ListItemError { index: 0, .. }),
+        "the recursive List member must preserve the nested item error, got {inner:?}"
+    );
+}
+
 #[test]
 fn nested_union_preserves_inner_struct_alternative_diagnostic() {
     let union = AttributeType::union(vec![retention_union(), AttributeType::bool()]);
@@ -5530,6 +5861,56 @@ fn canonicalize_union_preserves_pre_3754_declaration_order_for_structs() {
             ("b", Value::Concrete(ConcreteValue::Int(1))),
         ]),
         "an error-diagnostic change must not move canonicalization from Narrow to Wide"
+    );
+}
+
+#[test]
+fn canonicalize_union_ref_preserves_pre_3754_declaration_order_for_structs() {
+    let string_or_list = AttributeType::union(vec![
+        AttributeType::string(),
+        AttributeType::list(AttributeType::string()),
+    ]);
+    let schema = Schema {
+        root: AttributeType::union(vec![
+            AttributeType::ref_("Narrow"),
+            AttributeType::ref_("Wide"),
+        ]),
+        defs: std::collections::BTreeMap::from([
+            (
+                "Narrow".to_string(),
+                AttributeType::struct_(
+                    "Narrow".to_string(),
+                    vec![StructField::new("a", string_or_list).required()],
+                ),
+            ),
+            (
+                "Wide".to_string(),
+                AttributeType::struct_(
+                    "Wide".to_string(),
+                    vec![
+                        StructField::new("a", AttributeType::string()).required(),
+                        StructField::new("b", AttributeType::int()).required(),
+                    ],
+                ),
+            ),
+        ]),
+    };
+    let value = union_map(vec![
+        ("a", Value::Concrete(ConcreteValue::String("s".to_string()))),
+        ("b", Value::Concrete(ConcreteValue::Int(1))),
+    ]);
+
+    let canonicalized = schema.canonicalize(value);
+    assert_eq!(
+        canonicalized,
+        union_map(vec![
+            (
+                "a",
+                Value::Concrete(ConcreteValue::StringList(vec!["s".to_string()])),
+            ),
+            ("b", Value::Concrete(ConcreteValue::Int(1))),
+        ]),
+        "tied Ref-to-Struct arms must keep declaration-order canonicalization"
     );
 }
 
@@ -5959,6 +6340,95 @@ fn walk_custom_lookup_skips_value_unknown() {
     assert!(
         errors.is_empty(),
         "Value::Deferred(DeferredValue::Unknown) must not invoke the custom validator, got: {errors:?}"
+    );
+}
+
+fn resource_schema_with_self_cyclic_string_union() -> ResourceSchema {
+    ResourceSchema::new("test.SelfCyclicUnion")
+        .attribute(AttributeSchema::new("value", AttributeType::ref_("A")))
+        .with_def(
+            "A",
+            AttributeType::union(vec![AttributeType::ref_("A"), AttributeType::string()]),
+        )
+}
+
+#[test]
+fn resource_schema_validate_self_cyclic_union_with_valid_value_terminates() {
+    let schema = resource_schema_with_self_cyclic_string_union();
+    let attributes = HashMap::from([(
+        "value".to_string(),
+        Value::Concrete(ConcreteValue::String("x".to_string())),
+    )]);
+
+    assert_eq!(schema.validate(&attributes), Ok(()));
+}
+
+#[test]
+fn resource_schema_validate_self_cyclic_union_with_invalid_value_terminates() {
+    let schema = resource_schema_with_self_cyclic_string_union();
+    let attributes = HashMap::from([("value".to_string(), Value::Concrete(ConcreteValue::Int(1)))]);
+
+    let errors = schema
+        .validate(&attributes)
+        .expect_err("Int must not satisfy the self-cyclic String union");
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, TypeError::TypeMismatch { .. })),
+        "the failing value must produce a defined type error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn resource_schema_custom_lookup_resets_ref_path_after_list_descent() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let custom_string = AttributeType::refined_string_with_validator(
+        Some(TypeIdentity::bare("cyclic_leaf")),
+        None,
+        None,
+        validator(|_| Ok(())),
+        None,
+    );
+    let schema = ResourceSchema::new("test.CyclicCustomLookup")
+        .attribute(AttributeSchema::new("value", AttributeType::ref_("A")))
+        .with_def(
+            "A",
+            AttributeType::union(vec![
+                AttributeType::ref_("A"),
+                custom_string,
+                AttributeType::list(AttributeType::ref_("A")),
+            ]),
+        );
+    let attributes = HashMap::from([(
+        "value".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("x".to_string()),
+        )])),
+    )]);
+    let calls = AtomicUsize::new(0);
+    let lookup = |identity: &TypeIdentity, value: &Value| {
+        if identity.kind != "cyclic_leaf" {
+            return Ok(());
+        }
+        if matches!(value, Value::Concrete(ConcreteValue::String(_))) {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        } else {
+            Err(TypeError::ValidationFailed {
+                message: "cyclic_leaf expects a String".to_string(),
+            })
+        }
+    };
+
+    assert_eq!(
+        schema.validate_with_origins_and_lookup(&attributes, &|_| false, &lookup),
+        Ok(())
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "list-element descent must start a fresh Ref path and reach the custom leaf"
     );
 }
 
@@ -6869,7 +7339,7 @@ fn dsl_map_is_empty_means_no_aliases_and_no_transform() {
     );
 }
 
-// carina#3080 type-safety guard: `select_union_member` and Union validation
+// carina#3080 type-safety guard: Union selection and Union validation
 // must use the same structural judgement. For the shape-disjoint carina#3080
 // schema that means both identify the same unique member. These tests pin the
 // property that makes the `None` (identity) arm unreachable, so a future
@@ -6877,8 +7347,8 @@ fn dsl_map_is_empty_means_no_aliases_and_no_transform() {
 // silently skipping the canonicalization fold and re-introducing the phantom
 // diff.
 
-fn principal_union_schema() -> Vec<AttributeType> {
-    vec![
+fn principal_union_schema() -> AttributeType {
+    AttributeType::union(vec![
         AttributeType::struct_(
             "PrincipalStruct".to_string(),
             vec![StructField::new(
@@ -6890,12 +7360,46 @@ fn principal_union_schema() -> Vec<AttributeType> {
             )],
         ),
         AttributeType::string(),
-    ]
+    ])
+}
+
+fn select_union_member_for_test<'a>(
+    union: &'a AttributeType,
+    value: &Value,
+) -> Option<ResolvedUnionMember<'a>> {
+    let members = union_members_with_defs(union, empty_defs_for_schema_walks())
+        .expect("test fixture must be a Union");
+    let mut visited_refs = Vec::new();
+    members.select_on_path(value, &mut visited_refs)
+}
+
+#[test]
+fn select_union_member_retains_only_the_chosen_member_ref_chain() {
+    let root = AttributeType::ref_("Outer");
+    let defs = std::collections::BTreeMap::from([
+        (
+            "Outer".to_string(),
+            AttributeType::union(vec![AttributeType::ref_("Chosen"), AttributeType::int()]),
+        ),
+        ("Chosen".to_string(), AttributeType::string()),
+    ]);
+    let members = union_members_with_defs(&root, &defs).expect("Outer must resolve to a Union");
+    let value = Value::Concrete(ConcreteValue::String("x".to_string()));
+    let mut visited_refs = vec!["Caller"];
+
+    let selected = members
+        .select_on_path(&value, &mut visited_refs)
+        .expect("String value must select Chosen");
+    assert!(matches!(
+        selected.as_attr().kind(),
+        AttrTypeKind::String { .. }
+    ));
+    assert_eq!(visited_refs, vec!["Caller", "Chosen"]);
 }
 
 #[test]
 fn select_union_member_picks_struct_for_map_value() {
-    let members = principal_union_schema();
+    let union = principal_union_schema();
     let mut map = IndexMap::new();
     map.insert(
         "service".to_string(),
@@ -6904,9 +7408,9 @@ fn select_union_member_picks_struct_for_map_value() {
         )),
     );
     let v = Value::Concrete(ConcreteValue::Map(map));
-    let chosen = select_union_member(&members, &v).expect("a Map must select a member");
+    let chosen = select_union_member_for_test(&union, &v).expect("a Map must select a member");
     assert!(
-        matches!(chosen.kind(), AttrTypeKind::Struct { .. }),
+        matches!(chosen.as_attr().kind(), AttrTypeKind::Struct { .. }),
         "a Map value must select the Struct member, got {chosen:?}"
     );
 }
@@ -6926,21 +7430,21 @@ fn select_union_member_map_never_picks_string_member() {
     // Struct-before-String (the real `string_or_principal_struct` order).
     let a = principal_union_schema();
     assert!(matches!(
-        select_union_member(&a, &v).map(|m| m.kind()),
+        select_union_member_for_test(&a, &v).map(|m| m.as_attr().kind()),
         Some(AttrTypeKind::Struct { .. })
     ));
 
     // String-before-Struct: still must not pick String for a Map.
-    let b = vec![
+    let b = AttributeType::union(vec![
         AttributeType::string(),
         AttributeType::struct_(
             "PrincipalStruct".to_string(),
             vec![StructField::new("service", AttributeType::string())],
         ),
-    ];
+    ]);
     assert!(
         matches!(
-            select_union_member(&b, &v).map(|m| m.kind()),
+            select_union_member_for_test(&b, &v).map(|m| m.as_attr().kind()),
             Some(AttrTypeKind::Struct { .. })
         ),
         "a Map must select Struct even when String is declared first"
@@ -6951,22 +7455,22 @@ fn select_union_member_map_never_picks_string_member() {
 /// (so the nested fold is reachable, never the `None` identity arm).
 #[test]
 fn select_union_member_scalar_selects_string_or_list() {
-    let members = vec![
+    let union = AttributeType::union(vec![
         AttributeType::string(),
         AttributeType::list(AttributeType::string()),
-    ];
+    ]);
     let v = Value::Concrete(ConcreteValue::String(
         "cloudfront.amazonaws.com".to_string(),
     ));
     assert!(
-        select_union_member(&members, &v).is_some(),
+        select_union_member_for_test(&union, &v).is_some(),
         "a scalar must select the String member, not fall to None"
     );
     let list = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
         ConcreteValue::String("cloudfront.amazonaws.com".to_string()),
     )]));
     assert!(
-        select_union_member(&members, &list).is_some(),
+        select_union_member_for_test(&union, &list).is_some(),
         "a singleton list must select the List member, not fall to None"
     );
 }
@@ -6974,20 +7478,20 @@ fn select_union_member_scalar_selects_string_or_list() {
 /// No member shares the value's shape → `None` (identity at call site).
 #[test]
 fn select_union_member_no_match_is_none() {
-    let members = vec![AttributeType::int(), AttributeType::bool()];
+    let union = AttributeType::union(vec![AttributeType::int(), AttributeType::bool()]);
     let v = Value::Concrete(ConcreteValue::String("not-an-int".to_string()));
-    assert!(select_union_member(&members, &v).is_none());
+    assert!(select_union_member_for_test(&union, &v).is_none());
 }
 
 /// Deferred values have no concrete shape → `None` (the canonicalizer
 /// leaves them for a later post-resolution pass).
 #[test]
 fn select_union_member_deferred_value_is_none() {
-    let members = principal_union_schema();
+    let union = principal_union_schema();
     let v = Value::Deferred(DeferredValue::BindingRef {
         binding: "some_ref".to_string(),
     });
-    assert!(select_union_member(&members, &v).is_none());
+    assert!(select_union_member_for_test(&union, &v).is_none());
 }
 
 // ---------------------------------------------------------------------------

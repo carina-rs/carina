@@ -1406,20 +1406,20 @@ fn collect_validators_from_type(
     attr_type: &crate::schema::AttributeType,
     validators: &mut HashMap<TypeIdentity, crate::parser::ValidatorFn>,
 ) {
-    use crate::schema::AttrTypeKind;
+    use crate::schema::RawShape;
 
-    match &attr_type.kind {
-        AttrTypeKind::String {
+    match attr_type.raw_shape() {
+        RawShape::String {
             identity: Some(id),
             validate,
             ..
         }
-        | AttrTypeKind::Int {
+        | RawShape::Int {
             identity: Some(id),
             validate,
             ..
         }
-        | AttrTypeKind::Float {
+        | RawShape::Float {
             identity: Some(id),
             validate,
             ..
@@ -1434,25 +1434,25 @@ fn collect_validators_from_type(
                 })
             });
         }
-        AttrTypeKind::String { identity: None, .. }
-        | AttrTypeKind::Int { identity: None, .. }
-        | AttrTypeKind::Float { identity: None, .. } => {}
-        AttrTypeKind::List {
+        RawShape::String { identity: None, .. }
+        | RawShape::Int { identity: None, .. }
+        | RawShape::Float { identity: None, .. } => {}
+        RawShape::List {
             element_type: inner,
             ..
         } => {
             collect_validators_from_type(inner, validators);
         }
-        AttrTypeKind::Map { key, value: inner } => {
+        RawShape::Map { key, value: inner } => {
             collect_validators_from_type(key, validators);
             collect_validators_from_type(inner, validators);
         }
-        AttrTypeKind::Struct { fields, .. } => {
+        RawShape::Struct { fields, .. } => {
             for field in fields {
                 collect_validators_from_type(&field.field_type, validators);
             }
         }
-        AttrTypeKind::Union(types) => {
+        RawShape::Union(types) => {
             for t in types {
                 collect_validators_from_type(t, validators);
             }
@@ -1464,9 +1464,9 @@ fn collect_validators_from_type(
         // `collect_custom_type_names`) walk every entry of
         // `schema.defs` directly in a separate loop, which terminates
         // because each def is visited exactly once. (carina#3340.)
-        AttrTypeKind::Ref(_) => {}
+        RawShape::Ref(_) => {}
         // Primitives carry no nested Custom types and no Ref.
-        AttrTypeKind::Bool | AttrTypeKind::Duration | AttrTypeKind::Enum { .. } => {}
+        RawShape::Bool | RawShape::Duration | RawShape::Enum { .. } => {}
     }
 }
 
@@ -1476,39 +1476,39 @@ fn collect_type_names_from_type(
     attr_type: &crate::schema::AttributeType,
     names: &mut std::collections::HashSet<TypeIdentity>,
 ) {
-    use crate::schema::AttrTypeKind;
+    use crate::schema::RawShape;
 
-    match &attr_type.kind {
-        AttrTypeKind::String {
+    match attr_type.raw_shape() {
+        RawShape::String {
             identity: Some(id), ..
         }
-        | AttrTypeKind::Int {
+        | RawShape::Int {
             identity: Some(id), ..
         }
-        | AttrTypeKind::Float {
+        | RawShape::Float {
             identity: Some(id), ..
         } => {
             names.insert(id.clone());
         }
-        AttrTypeKind::String { identity: None, .. }
-        | AttrTypeKind::Int { identity: None, .. }
-        | AttrTypeKind::Float { identity: None, .. } => {}
-        AttrTypeKind::List {
+        RawShape::String { identity: None, .. }
+        | RawShape::Int { identity: None, .. }
+        | RawShape::Float { identity: None, .. } => {}
+        RawShape::List {
             element_type: inner,
             ..
         } => {
             collect_type_names_from_type(inner, names);
         }
-        AttrTypeKind::Map { key, value: inner } => {
+        RawShape::Map { key, value: inner } => {
             collect_type_names_from_type(key, names);
             collect_type_names_from_type(inner, names);
         }
-        AttrTypeKind::Struct { fields, .. } => {
+        RawShape::Struct { fields, .. } => {
             for field in fields {
                 collect_type_names_from_type(&field.field_type, names);
             }
         }
-        AttrTypeKind::Union(types) => {
+        RawShape::Union(types) => {
             for t in types {
                 collect_type_names_from_type(t, names);
             }
@@ -1516,8 +1516,8 @@ fn collect_type_names_from_type(
         // See `collect_validators_from_type` for the rationale: the
         // caller walks `schema.defs` separately to avoid infinite
         // recursion on cyclic schemas (carina#3340).
-        AttrTypeKind::Ref(_) => {}
-        AttrTypeKind::Bool | AttrTypeKind::Duration | AttrTypeKind::Enum { .. } => {}
+        RawShape::Ref(_) => {}
+        RawShape::Bool | RawShape::Duration | RawShape::Enum { .. } => {}
     }
 }
 

@@ -909,13 +909,17 @@ pub fn is_type_expr_compatible_with_schema(
                     .expect("Shape::Union must expose union members internally");
                 let has_plain_string = members
                     .iter()
-                    .any(|m| is_plain_string_or_string_union(m, defs));
-                let others_shape_disjoint = members.iter().all(|m| {
-                    is_plain_string_or_string_union(m, defs)
-                        || matches!(
-                            m.shape_with_defs(defs),
-                            Shape::List { .. } | Shape::Map { .. } | Shape::Struct { .. }
-                        )
+                    .flatten()
+                    .any(|m| is_plain_string_or_string_union(m.as_attr(), defs));
+                let others_shape_disjoint = members.iter().all(|member| {
+                    member.is_some_and(|member| {
+                        let member = member.as_attr();
+                        is_plain_string_or_string_union(member, defs)
+                            || matches!(
+                                member.shape_with_defs(defs),
+                                Shape::List { .. } | Shape::Map { .. } | Shape::Struct { .. }
+                            )
+                    })
                 });
                 if has_plain_string && others_shape_disjoint {
                     return true;
@@ -994,12 +998,46 @@ pub fn is_string_compatible_type(
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> bool {
-    match attr_type.shape_with_defs(defs) {
+    is_string_compatible_type_on_path(attr_type, defs, &[])
+}
+
+fn all_resolved_union_members_on_path<'a>(
+    members: &crate::schema::UnionMembers<'a>,
+    visited_refs: &mut Vec<&'a str>,
+    mut predicate: impl FnMut(crate::schema::ResolvedUnionMember<'a>, &[&'a str]) -> bool,
+) -> bool {
+    let mut saw_member = false;
+    let found_incompatible = members.any_on_path(visited_refs, |member, member_path| {
+        saw_member = true;
+        !predicate(member, member_path)
+    });
+    saw_member && !found_incompatible
+}
+
+fn is_string_compatible_type_on_path<'a>(
+    attr_type: &'a AttributeType,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    visited_refs: &[&'a str],
+) -> bool {
+    let mut current_path = visited_refs.to_vec();
+    let resolved = attr_type.resolve_refs_with_defs_on_path(defs, &mut current_path);
+    let resolved_attr = resolved.as_attr();
+    match resolved_attr
+        .shape_ref_free()
+        .expect("resolve_refs_with_defs_on_path must peel every top-level Ref")
+    {
         Shape::String { .. } | Shape::Enum { .. } => true,
-        Shape::Union => crate::schema::union_members_with_defs(attr_type, defs)
-            .expect("Shape::Union must expose union members internally")
-            .iter()
-            .all(|t| is_string_compatible_type(t, defs)),
+        Shape::Union => {
+            let members = crate::schema::union_members_with_defs(resolved_attr, defs)
+                .expect("Shape::Union must expose union members internally");
+            all_resolved_union_members_on_path(
+                &members,
+                &mut current_path,
+                |member, member_path| {
+                    is_string_compatible_type_on_path(member.as_attr(), defs, member_path)
+                },
+            )
+        }
         Shape::Int { .. }
         | Shape::Float { .. }
         | Shape::Bool
@@ -1019,7 +1057,21 @@ fn is_plain_string_or_string_union(
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> bool {
-    match attr_type.shape_with_defs(defs) {
+    is_plain_string_or_string_union_on_path(attr_type, defs, &[])
+}
+
+fn is_plain_string_or_string_union_on_path<'a>(
+    attr_type: &'a AttributeType,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    visited_refs: &[&'a str],
+) -> bool {
+    let mut current_path = visited_refs.to_vec();
+    let resolved = attr_type.resolve_refs_with_defs_on_path(defs, &mut current_path);
+    let resolved_attr = resolved.as_attr();
+    match resolved_attr
+        .shape_ref_free()
+        .expect("resolve_refs_with_defs_on_path must peel every top-level Ref")
+    {
         Shape::String {
             identity: None,
             pattern: None,
@@ -1027,10 +1079,17 @@ fn is_plain_string_or_string_union(
             ..
         } => true,
         Shape::String { .. } => false,
-        Shape::Union => crate::schema::union_members_with_defs(attr_type, defs)
-            .expect("Shape::Union must expose union members internally")
-            .iter()
-            .all(|t| is_plain_string_or_string_union(t, defs)),
+        Shape::Union => {
+            let members = crate::schema::union_members_with_defs(resolved_attr, defs)
+                .expect("Shape::Union must expose union members internally");
+            all_resolved_union_members_on_path(
+                &members,
+                &mut current_path,
+                |member, member_path| {
+                    is_plain_string_or_string_union_on_path(member.as_attr(), defs, member_path)
+                },
+            )
+        }
         Shape::Int { .. }
         | Shape::Float { .. }
         | Shape::Bool
@@ -1066,15 +1125,32 @@ fn attr_type_demands_specific_custom(
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,
 ) -> bool {
-    match attr_type.shape_with_defs(defs) {
+    attr_type_demands_specific_custom_on_path(attr_type, defs, &[])
+}
+
+fn attr_type_demands_specific_custom_on_path<'a>(
+    attr_type: &'a AttributeType,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    visited_refs: &[&'a str],
+) -> bool {
+    let mut current_path = visited_refs.to_vec();
+    let resolved = attr_type.resolve_refs_with_defs_on_path(defs, &mut current_path);
+    let resolved_attr = resolved.as_attr();
+    match resolved_attr
+        .shape_ref_free()
+        .expect("resolve_refs_with_defs_on_path must peel every top-level Ref")
+    {
         Shape::String {
             identity: Some(_), ..
         } => true,
         Shape::String { identity: None, .. } => false,
-        Shape::Union => crate::schema::union_members_with_defs(attr_type, defs)
-            .expect("Shape::Union must expose union members internally")
-            .iter()
-            .any(|t| attr_type_demands_specific_custom(t, defs)),
+        Shape::Union => {
+            let members = crate::schema::union_members_with_defs(resolved_attr, defs)
+                .expect("Shape::Union must expose union members internally");
+            members.any_on_path(&mut current_path, |member, member_path| {
+                attr_type_demands_specific_custom_on_path(member.as_attr(), defs, member_path)
+            })
+        }
         Shape::Int { .. }
         | Shape::Float { .. }
         | Shape::Bool

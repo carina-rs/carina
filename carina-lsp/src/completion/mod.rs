@@ -681,7 +681,10 @@ impl CompletionProvider {
             Shape::Union => schema
                 .union_members_with_budget(attr_type, budget)?
                 .iter()
-                .find_map(|m| self.extract_struct_fields_with_budget(schema, m, budget)),
+                .flatten()
+                .find_map(|member| {
+                    self.extract_struct_fields_with_budget(schema, member.as_attr(), budget)
+                }),
             _ => None,
         }
     }
