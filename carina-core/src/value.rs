@@ -1492,6 +1492,8 @@ fn peel_custom(t: &AttributeType) -> &AttributeType {
 ///
 /// Conversion rules for `string_or_list_of_strings`:
 /// - `Value::Concrete(ConcreteValue::String(s))` → `Value::Concrete(ConcreteValue::StringList(vec![s]))`
+///   unless `s` starts with [`SECRET_PREFIX`]; a secret hash is an opaque
+///   scalar sentinel on every operand
 /// - `Value::Concrete(ConcreteValue::List([Value::String(_), ...]))` (every element a String) →
 ///   `Value::Concrete(ConcreteValue::StringList(vec![..]))`
 /// - `Value::Concrete(ConcreteValue::StringList(_))` is returned unchanged
@@ -1508,6 +1510,10 @@ fn peel_custom(t: &AttributeType) -> &AttributeType {
 /// [`crate::schema::empty_defs_for_schema_walks()`] when the caller is confident no
 /// `Ref` is reachable.
 ///
+/// This convenience wrapper interprets `EnumIdentifier` as authored DSL.
+/// State-side container adapters call the phase-aware worker through
+/// [`canonicalize_attribute_map_with_schema`] instead.
+///
 /// See #2481, #2510.
 pub(crate) fn canonicalize_with_type(
     value: Value,
@@ -1517,9 +1523,12 @@ pub(crate) fn canonicalize_with_type(
     canonicalize_with_type_for_enum_phase(value, attr_type, defs, EnumIdentifierPhase::RawDsl)
 }
 
+/// How an `EnumIdentifier` entered the canonicalization walk.
 #[derive(Clone, Copy)]
-enum EnumIdentifierPhase {
+pub(crate) enum EnumIdentifierPhase {
+    /// Parser-produced, authored enum syntax whose DSL aliases take precedence.
     RawDsl,
+    /// Provider or persisted state text whose API spelling takes precedence.
     StateText,
 }
 
@@ -1658,6 +1667,12 @@ fn canonicalize_to_string_list(value: Value) -> Value {
         Value::Concrete(ConcreteValue::StringList(items)) => {
             Value::Concrete(ConcreteValue::StringList(items))
         }
+        // carina#3740: secret hashes are opaque scalar sentinels on every
+        // operand. Promoting one changes both secret comparison semantics and
+        // its on-disk JSON shape from a string to an array.
+        Value::Concrete(ConcreteValue::String(s)) if s.starts_with(SECRET_PREFIX) => {
+            Value::Concrete(ConcreteValue::String(s))
+        }
         Value::Concrete(ConcreteValue::String(s)) => {
             Value::Concrete(ConcreteValue::StringList(vec![s]))
         }
@@ -1695,6 +1710,39 @@ impl<'a> CanonicalizedResources<'a> {
     }
 }
 
+/// Canonicalize every schema-known value in one resource attribute map.
+///
+/// carina#3740: desired resources, current states, and persisted saved
+/// attributes must share this exact per-attribute walk. Keeping the container
+/// adapters thin prevents one differ operand from receiving fewer structural
+/// rewrites than the others. `enum_identifier_phase` records the operand's
+/// provenance so the same recursive walk cannot accidentally reinterpret
+/// state text as raw DSL.
+pub(crate) fn canonicalize_attribute_map_with_schema<Attributes>(
+    attributes: &mut Attributes,
+    schema: &crate::schema::ResourceSchema,
+    enum_identifier_phase: EnumIdentifierPhase,
+) where
+    Attributes:
+        Default + IntoIterator<Item = (String, Value)> + std::iter::FromIterator<(String, Value)>,
+{
+    *attributes = std::mem::take(attributes)
+        .into_iter()
+        .map(|(key, value)| {
+            let canonical = match schema.attributes.get(&key) {
+                Some(attr_schema) => canonicalize_with_type_for_enum_phase(
+                    value,
+                    &attr_schema.attr_type,
+                    &schema.defs,
+                    enum_identifier_phase,
+                ),
+                None => value,
+            };
+            (key, canonical)
+        })
+        .collect();
+}
+
 /// Walk every resource's attributes, canonicalizing values whose
 /// declared schema type is `Union[String, list(String)]` into
 /// `Value::Concrete(ConcreteValue::StringList)`. Resources whose schema is not in the registry
@@ -1712,17 +1760,11 @@ pub fn canonicalize_resources_with_schemas<'a>(
         let Some(schema) = registry.get_for(resource) else {
             continue;
         };
-        let mut new_attrs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-        for (key, value) in std::mem::take(&mut resource.attributes) {
-            let canon = match schema.attributes.get(&key) {
-                Some(attr_schema) => {
-                    canonicalize_with_type(value, &attr_schema.attr_type, &schema.defs)
-                }
-                None => value,
-            };
-            new_attrs.insert(key, canon);
-        }
-        resource.attributes = new_attrs;
+        canonicalize_attribute_map_with_schema(
+            &mut resource.attributes,
+            schema,
+            EnumIdentifierPhase::RawDsl,
+        );
     }
 
     CanonicalizedResources { resources }
@@ -1781,7 +1823,9 @@ pub fn canonicalize_provider_configs_with_attribute_types(
 /// [`DataSource`](crate::resource::DataSource) counterpart of
 /// [`canonicalize_resources_with_schemas`]. Schema lookup routes through
 /// the data-source registry (`get_for_data_source`); data sources whose
-/// schema is not registered are skipped (carina#3181).
+/// schema is not registered are skipped. A data source's attributes are
+/// authored `read` inputs, so `EnumIdentifier` uses RawDsl semantics
+/// (carina#3181, carina#3740).
 pub fn canonicalize_data_sources_with_schemas(
     data_sources: &mut [crate::resource::DataSource],
     registry: &crate::schema::SchemaRegistry,
@@ -1790,17 +1834,11 @@ pub fn canonicalize_data_sources_with_schemas(
         let Some(schema) = registry.get_for_data_source(data_source) else {
             continue;
         };
-        let mut new_attrs: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-        for (key, value) in std::mem::take(&mut data_source.attributes) {
-            let canon = match schema.attributes.get(&key) {
-                Some(attr_schema) => {
-                    canonicalize_with_type(value, &attr_schema.attr_type, &schema.defs)
-                }
-                None => value,
-            };
-            new_attrs.insert(key, canon);
-        }
-        data_source.attributes = new_attrs;
+        canonicalize_attribute_map_with_schema(
+            &mut data_source.attributes,
+            schema,
+            EnumIdentifierPhase::RawDsl,
+        );
     }
 }
 
@@ -1832,17 +1870,11 @@ pub fn canonicalize_states_with_schemas(
         let Some(schema) = kind else {
             continue;
         };
-        let mut new_attrs = std::collections::HashMap::with_capacity(state.attributes.len());
-        for (key, value) in std::mem::take(&mut state.attributes) {
-            let canon = match schema.attributes.get(&key) {
-                Some(attr_schema) => {
-                    canonicalize_with_type(value, &attr_schema.attr_type, &schema.defs)
-                }
-                None => value,
-            };
-            new_attrs.insert(key, canon);
-        }
-        state.attributes = new_attrs;
+        canonicalize_attribute_map_with_schema(
+            &mut state.attributes,
+            schema,
+            EnumIdentifierPhase::StateText,
+        );
     }
 }
 
@@ -4690,6 +4722,58 @@ mod tests {
         assert_eq!(a[0].attributes, b[0].attributes);
     }
 
+    // ---- canonicalize_data_sources_with_schemas tests (carina#3181, #3740) ----
+
+    #[test]
+    fn canonicalize_data_sources_with_schemas_rewrites_authored_inputs() {
+        use crate::resource::DataSource;
+        use crate::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, enum_identity,
+        };
+
+        let mode = AttributeType::enum_(
+            enum_identity("Mode", Some("awscc.example.Widget")),
+            Some(vec!["API_A".to_string(), "FOO".to_string()]),
+            vec![("API_A".to_string(), "foo".to_string())],
+            None,
+            None,
+        );
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "awscc",
+            ResourceSchema::new("example.Widget")
+                .as_data_source()
+                .attribute(AttributeSchema::new("subject", string_or_list_of_strings()))
+                .attribute(AttributeSchema::new("mode", mode)),
+        );
+        let mut data_source = DataSource::with_provider("awscc", "example.Widget", "widget", None);
+        data_source.set_attr(
+            "subject",
+            Value::Concrete(ConcreteValue::String("repo:foo:*".to_string())),
+        );
+        data_source.set_attr(
+            "mode",
+            Value::Concrete(ConcreteValue::enum_identifier("foo")),
+        );
+        let mut data_sources = vec![data_source];
+
+        canonicalize_data_sources_with_schemas(&mut data_sources, &registry);
+
+        assert_eq!(
+            data_sources[0].attributes["subject"],
+            Value::Concrete(ConcreteValue::StringList(vec!["repo:foo:*".to_string()])),
+            "carina#3740: data-source attributes must use the shared structural walk"
+        );
+        assert!(
+            matches!(
+                &data_sources[0].attributes["mode"],
+                Value::Concrete(ConcreteValue::CanonicalEnum(value))
+                    if value.api_value() == "API_A"
+            ),
+            "carina#3740: authored data-source EnumIdentifier values use RawDsl alias semantics"
+        );
+    }
+
     // ---- canonicalize_states_with_schemas tests (#2481, #2513) ----
 
     fn make_state(attrs: Vec<(&str, Value)>) -> crate::resource::State {
@@ -4751,6 +4835,27 @@ mod tests {
             Some(&Value::Concrete(ConcreteValue::StringList(vec![
                 "repo:foo:*".to_string()
             ])))
+        );
+    }
+
+    #[test]
+    fn canonicalize_states_with_schemas_preserves_secret_hash_scalar() {
+        let registry = build_test_registry();
+        let secret_hash = format!("{SECRET_PREFIX}deadbeef");
+        let mut states = std::collections::HashMap::new();
+        let state = make_state(vec![(
+            "subject",
+            Value::Concrete(ConcreteValue::String(secret_hash.clone())),
+        )]);
+        states.insert(state.id.clone(), state);
+
+        canonicalize_states_with_schemas(&mut states, &registry);
+
+        let state = states.values().next().unwrap();
+        assert_eq!(
+            state.attributes["subject"],
+            Value::Concrete(ConcreteValue::String(secret_hash)),
+            "carina#3740: a current-state secret hash is an opaque scalar sentinel, never a list"
         );
     }
 

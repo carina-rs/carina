@@ -39,7 +39,9 @@ use crate::value::{
 /// canonicalization happens upstream in
 /// `value::canonicalize_resources_with_schemas` (#2511) for the
 /// desired side and `value::canonicalize_states_with_schemas` (#2513)
-/// for the actual side, both run before the differ.
+/// for the actual side, both run before the differ. Persisted values that
+/// `merge_with_saved` adds to the effective desired side are canonicalized by
+/// `provider::RawSavedAttrs::lift` at the raw-to-lifted seam (carina#3740).
 ///
 /// **Do not add a special-case equality here that treats `"x"` and
 /// `["x"]` as equal for this Union type.** Doing so would mask the
