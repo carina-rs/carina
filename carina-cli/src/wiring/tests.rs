@@ -5129,7 +5129,98 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
     assert!(
         load_errors
             .values()
-            .any(|error| error.contains("locked at version 1.0.0"))
+            .any(|error| error.to_string().contains("locked at version 1.0.0"))
+    );
+}
+
+#[test]
+fn unversioned_lock_error_reaches_cli_with_source_and_init_remediation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path();
+    std::fs::write(
+        base.join("carina-providers.lock"),
+        r#"[[provider]]
+name = "awscc"
+source = "github.com/carina-rs/carina-provider-awscc"
+mode = "revision"
+revision = "main"
+resolved_sha = "967e645a7153522ca60ef942183d3fc338fc7c27"
+sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
+"#,
+    )
+    .unwrap();
+    let config = ProviderConfig {
+        name: "awscc".into(),
+        source: Some("github.com/carina-rs/carina-provider-awscc".into()),
+        version: None,
+        revision: Some("main".into()),
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+        is_default: true,
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+    };
+
+    let runtime_error = match build_factories_from_providers(std::slice::from_ref(&config), base) {
+        Err(error) => error,
+        Ok(_) => panic!("unversioned provider lock must be returned as an error"),
+    };
+    let rendered = runtime_error.to_string();
+    assert!(
+        rendered.contains("predates lock format versioning"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Delete it, then regenerate it with `carina init`"),
+        "{rendered}"
+    );
+
+    let mut source = std::error::Error::source(&runtime_error);
+    let mut found_lock_file_error = false;
+    while let Some(error) = source {
+        if error
+            .downcast_ref::<carina_provider_resolver::LockFileError>()
+            .is_some()
+        {
+            found_lock_file_error = true;
+            break;
+        }
+        source = error.source();
+    }
+    assert!(
+        found_lock_file_error,
+        "the CLI error chain must retain the typed lock-file error"
+    );
+
+    let (factories, load_errors) = build_factories_from_providers_for_formatting(&[config], base);
+    assert!(factories.is_empty());
+    let formatting_error = load_errors
+        .get("carina-providers.lock")
+        .expect("formatting diagnostics must name the lock file");
+    let formatting_rendered = formatting_error.to_string();
+    assert!(
+        formatting_rendered.contains("predates lock format versioning"),
+        "{formatting_rendered}"
+    );
+    assert!(
+        formatting_rendered.contains("Delete it, then regenerate it with `carina init`"),
+        "{formatting_rendered}"
+    );
+    let mut source = std::error::Error::source(formatting_error);
+    let mut found_lock_file_error = false;
+    while let Some(error) = source {
+        if error
+            .downcast_ref::<carina_provider_resolver::LockFileError>()
+            .is_some()
+        {
+            found_lock_file_error = true;
+            break;
+        }
+        source = error.source();
+    }
+    assert!(
+        found_lock_file_error,
+        "the formatting diagnostic must retain the typed lock-file error"
     );
 }
 
