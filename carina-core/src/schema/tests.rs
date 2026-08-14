@@ -2062,34 +2062,6 @@ fn union_type_name() {
 }
 
 #[test]
-fn union_accepts_type_name() {
-    let type_a = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("TypeA")),
-        None,
-        None,
-        crate::schema::legacy_validator(|_| Ok(())),
-        None,
-    );
-    let type_b = AttributeType::refined_string_with_validator(
-        Some(TypeIdentity::bare("TypeB")),
-        None,
-        None,
-        crate::schema::legacy_validator(|_| Ok(())),
-        None,
-    );
-
-    let union_type = AttributeType::union(vec![type_a, type_b]);
-    assert!(union_type.accepts_type_name("TypeA"));
-    assert!(union_type.accepts_type_name("TypeB"));
-    assert!(!union_type.accepts_type_name("TypeC"));
-
-    // Non-union types
-    let simple = AttributeType::string();
-    assert!(simple.accepts_type_name("String"));
-    assert!(!simple.accepts_type_name("Int"));
-}
-
-#[test]
 fn with_block_name_builder() {
     let attr = AttributeSchema::new("operating_regions", AttributeType::string())
         .with_block_name("operating_region");
@@ -3158,27 +3130,508 @@ fn make_custom_anon_len(min: u64, max: u64) -> AttributeType {
     )
 }
 
+fn assignable_with_defs(
+    source: &AttributeType,
+    source_defs: &std::collections::BTreeMap<String, AttributeType>,
+    sink: &AttributeType,
+    sink_defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> bool {
+    source
+        .in_schema(source_defs)
+        .is_assignable_to(sink.in_schema(sink_defs))
+}
+
+fn assignable(source: &AttributeType, sink: &AttributeType) -> bool {
+    TypeInSchema::schemaless(source).is_assignable_to(TypeInSchema::schemaless(sink))
+}
+
+#[test]
+fn assignable_sink_ref_union_matches_inline_union() {
+    let source = AttributeType::string();
+    let inline = AttributeType::union(vec![
+        AttributeType::string(),
+        AttributeType::list(AttributeType::string()),
+    ]);
+    let referenced = AttributeType::union(vec![
+        AttributeType::ref_("S".to_string()),
+        AttributeType::ref_("L".to_string()),
+    ]);
+    let sink_defs = std::collections::BTreeMap::from([
+        ("S".to_string(), AttributeType::string()),
+        (
+            "L".to_string(),
+            AttributeType::list(AttributeType::string()),
+        ),
+    ]);
+    let empty_defs = std::collections::BTreeMap::new();
+
+    assert!(assignable(&source, &inline));
+    assert!(assignable_with_defs(
+        &source,
+        &empty_defs,
+        &referenced,
+        &sink_defs,
+    ));
+}
+
+#[test]
+fn assignable_source_ref_resolves_against_source_defs() {
+    let source = AttributeType::ref_("X".to_string());
+    let source_defs =
+        std::collections::BTreeMap::from([("X".to_string(), AttributeType::string())]);
+    let sink = AttributeType::string();
+    let sink_defs = std::collections::BTreeMap::new();
+
+    assert!(assignable_with_defs(
+        &source,
+        &source_defs,
+        &sink,
+        &sink_defs,
+    ));
+}
+
+#[test]
+fn assignable_ref_chains_resolve_on_both_sides() {
+    let source = AttributeType::ref_("SourceX".to_string());
+    let source_defs = std::collections::BTreeMap::from([
+        (
+            "SourceX".to_string(),
+            AttributeType::ref_("SourceY".to_string()),
+        ),
+        ("SourceY".to_string(), AttributeType::string()),
+    ]);
+    let sink = AttributeType::ref_("SinkX".to_string());
+    let sink_defs = std::collections::BTreeMap::from([
+        (
+            "SinkX".to_string(),
+            AttributeType::ref_("SinkY".to_string()),
+        ),
+        ("SinkY".to_string(), AttributeType::string()),
+    ]);
+
+    assert!(assignable_with_defs(
+        &source,
+        &source_defs,
+        &sink,
+        &sink_defs,
+    ));
+}
+
+#[test]
+fn assignable_missing_ref_defs_reject_without_panicking() {
+    let source = AttributeType::ref_("Value".to_string());
+    let sink = AttributeType::ref_("Value".to_string());
+    let empty_defs = std::collections::BTreeMap::new();
+    let string_defs =
+        std::collections::BTreeMap::from([("Value".to_string(), AttributeType::string())]);
+
+    assert!(!assignable_with_defs(
+        &source,
+        &empty_defs,
+        &sink,
+        &string_defs,
+    ));
+    assert!(!assignable_with_defs(
+        &source,
+        &string_defs,
+        &sink,
+        &empty_defs,
+    ));
+}
+
+#[test]
+fn assignable_source_mutual_ref_cycle_fails_conservatively() {
+    let source = AttributeType::ref_("A".to_string());
+    let source_defs = std::collections::BTreeMap::from([
+        (
+            "A".to_string(),
+            AttributeType::union(vec![
+                AttributeType::ref_("B".to_string()),
+                AttributeType::string(),
+            ]),
+        ),
+        (
+            "B".to_string(),
+            AttributeType::union(vec![
+                AttributeType::ref_("A".to_string()),
+                AttributeType::int(),
+            ]),
+        ),
+    ]);
+    let sink = AttributeType::union(vec![AttributeType::string(), AttributeType::int()]);
+    let sink_defs = std::collections::BTreeMap::new();
+
+    // A cyclic source member fails conservatively. Because source-Union
+    // assignability requires every member to succeed, the whole source fails.
+    assert!(!assignable_with_defs(
+        &source,
+        &source_defs,
+        &sink,
+        &sink_defs,
+    ));
+}
+
+#[test]
+fn assignable_identity_direction_survives_refs() {
+    let generic = AttributeType::refined_string_with_validator(
+        Some(TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn")),
+        None,
+        None,
+        crate::schema::legacy_validator(|_| Ok(())),
+        None,
+    );
+    let role = AttributeType::refined_string_with_validator(
+        Some(TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn")),
+        None,
+        None,
+        crate::schema::legacy_validator(|_| Ok(())),
+        None,
+    );
+    let certificate = AttributeType::refined_string_with_validator(
+        Some(TypeIdentity::new(
+            Some("aws"),
+            ["acm", "Certificate"],
+            "Arn",
+        )),
+        None,
+        None,
+        crate::schema::legacy_validator(|_| Ok(())),
+        None,
+    );
+    let source = AttributeType::ref_("Value".to_string());
+    let sink = AttributeType::ref_("Value".to_string());
+    let generic_defs = std::collections::BTreeMap::from([("Value".to_string(), generic)]);
+    let role_defs = std::collections::BTreeMap::from([("Value".to_string(), role)]);
+    let certificate_defs = std::collections::BTreeMap::from([("Value".to_string(), certificate)]);
+
+    assert!(assignable_with_defs(
+        &source,
+        &role_defs,
+        &sink,
+        &generic_defs,
+    ));
+    assert!(!assignable_with_defs(
+        &source,
+        &generic_defs,
+        &sink,
+        &role_defs,
+    ));
+    assert!(!assignable_with_defs(
+        &source,
+        &role_defs,
+        &sink,
+        &certificate_defs,
+    ));
+}
+
+#[test]
+fn assignable_list_ref_name_collision_uses_each_schema_defs() {
+    let source = AttributeType::list(AttributeType::ref_("Tag".to_string()));
+    let source_defs = std::collections::BTreeMap::from([(
+        "Tag".to_string(),
+        AttributeType::struct_(
+            "Tag".to_string(),
+            vec![StructField::new("key", AttributeType::string())],
+        ),
+    )]);
+    let sink = AttributeType::list(AttributeType::ref_("Tag".to_string()));
+    let sink_defs =
+        std::collections::BTreeMap::from([("Tag".to_string(), AttributeType::string())]);
+
+    assert!(!assignable_with_defs(
+        &source,
+        &source_defs,
+        &sink,
+        &sink_defs,
+    ));
+}
+
+#[test]
+fn assignable_list_nested_ref_matches_inline_element() {
+    let source = AttributeType::list(AttributeType::ref_("S".to_string()));
+    let source_defs =
+        std::collections::BTreeMap::from([("S".to_string(), AttributeType::string())]);
+    let sink = AttributeType::list(AttributeType::string());
+    let sink_defs = std::collections::BTreeMap::new();
+
+    assert!(assignable_with_defs(
+        &source,
+        &source_defs,
+        &sink,
+        &sink_defs,
+    ));
+}
+
+#[test]
+fn assignable_inline_lists_remain_assignable() {
+    assert!(assignable(
+        &AttributeType::list(AttributeType::string()),
+        &AttributeType::list(AttributeType::string()),
+    ));
+}
+
+#[test]
+fn assignable_list_ignores_order_and_length_metadata() {
+    let source = AttributeType::refined_list(
+        AttributeType::string(),
+        false,
+        Some((Some(1), Some(2))),
+        crate::schema::legacy_validator(|_| Ok(())),
+    );
+    let sink = AttributeType::refined_list(
+        AttributeType::string(),
+        true,
+        Some((Some(10), Some(20))),
+        crate::schema::legacy_validator(|_| Ok(())),
+    );
+
+    assert!(assignable(&source, &sink));
+}
+
+#[test]
+fn assignable_cyclic_list_ref_terminates_conservatively() {
+    let source = AttributeType::ref_("A".to_string());
+    let source_defs = std::collections::BTreeMap::from([(
+        "A".to_string(),
+        AttributeType::list(AttributeType::ref_("A".to_string())),
+    )]);
+    let sink = AttributeType::list(AttributeType::string());
+    let sink_defs = std::collections::BTreeMap::new();
+
+    assert!(!assignable_with_defs(
+        &source,
+        &source_defs,
+        &sink,
+        &sink_defs,
+    ));
+}
+
+#[test]
+fn assignable_map_nested_ref_matches_inline_value() {
+    let source = AttributeType::map(AttributeType::ref_("S".to_string()));
+    let source_defs =
+        std::collections::BTreeMap::from([("S".to_string(), AttributeType::string())]);
+    let sink = AttributeType::map(AttributeType::string());
+    let sink_defs = std::collections::BTreeMap::new();
+
+    assert!(assignable_with_defs(
+        &source,
+        &source_defs,
+        &sink,
+        &sink_defs,
+    ));
+}
+
+#[test]
+fn assignable_map_ref_name_collision_rejects_incompatible_value() {
+    let source = AttributeType::map(AttributeType::ref_("Tag".to_string()));
+    let source_defs = std::collections::BTreeMap::from([(
+        "Tag".to_string(),
+        AttributeType::struct_(
+            "Tag".to_string(),
+            vec![StructField::new("key", AttributeType::string())],
+        ),
+    )]);
+    let sink = AttributeType::map(AttributeType::ref_("Tag".to_string()));
+    let sink_defs =
+        std::collections::BTreeMap::from([("Tag".to_string(), AttributeType::string())]);
+
+    assert!(!assignable_with_defs(
+        &source,
+        &source_defs,
+        &sink,
+        &sink_defs,
+    ));
+}
+
+#[test]
+fn assignable_map_key_refs_use_each_schema_defs() {
+    let source = AttributeType::map_with_key(
+        AttributeType::ref_("Key".to_string()),
+        AttributeType::string(),
+    );
+    let source_defs = std::collections::BTreeMap::from([("Key".to_string(), AttributeType::int())]);
+    let sink = AttributeType::map_with_key(
+        AttributeType::ref_("Key".to_string()),
+        AttributeType::string(),
+    );
+    let sink_defs =
+        std::collections::BTreeMap::from([("Key".to_string(), AttributeType::string())]);
+
+    assert!(!assignable_with_defs(
+        &source,
+        &source_defs,
+        &sink,
+        &sink_defs,
+    ));
+}
+
+#[test]
+fn assignable_identical_inline_unions_are_assignable() {
+    let source = AttributeType::union(vec![AttributeType::string(), AttributeType::int()]);
+    let sink = AttributeType::union(vec![AttributeType::string(), AttributeType::int()]);
+
+    assert!(assignable(&source, &sink));
+}
+
+#[test]
+fn assignable_identical_ref_membered_unions_are_assignable() {
+    let source = AttributeType::union(vec![
+        AttributeType::ref_("S".to_string()),
+        AttributeType::ref_("L".to_string()),
+    ]);
+    let source_defs = std::collections::BTreeMap::from([
+        ("S".to_string(), AttributeType::string()),
+        (
+            "L".to_string(),
+            AttributeType::list(AttributeType::string()),
+        ),
+    ]);
+    let sink = AttributeType::union(vec![
+        AttributeType::ref_("S".to_string()),
+        AttributeType::ref_("L".to_string()),
+    ]);
+    let sink_defs = source_defs.clone();
+
+    assert!(assignable_with_defs(
+        &source,
+        &source_defs,
+        &sink,
+        &sink_defs,
+    ));
+}
+
+#[test]
+fn assignable_union_non_subset_is_rejected() {
+    let source = AttributeType::union(vec![AttributeType::string(), AttributeType::bool()]);
+    let sink = AttributeType::union(vec![AttributeType::string(), AttributeType::int()]);
+
+    assert!(!assignable(&source, &sink));
+}
+
+#[test]
+fn assignable_single_union_side_semantics_are_unchanged() {
+    let string_or_int = AttributeType::union(vec![AttributeType::string(), AttributeType::int()]);
+    assert!(assignable(&AttributeType::string(), &string_or_int));
+
+    let strings = AttributeType::union(vec![AttributeType::string(), AttributeType::string()]);
+    assert!(assignable(&strings, &AttributeType::string()));
+    assert!(!assignable(&string_or_int, &AttributeType::string()));
+}
+
+#[test]
+fn assignable_empty_source_union_is_vacuously_assignable() {
+    let bottom = AttributeType::union(vec![]);
+
+    // An empty union has no possible values, so it is the bottom type and is
+    // assignable to every sink under the source-subset rule.
+    assert!(assignable(&bottom, &AttributeType::bool()));
+}
+
+#[test]
+fn assignable_list_identified_string_flows_to_anonymous_string() {
+    let source = AttributeType::list(make_custom("VpcId", AttributeType::string()));
+    let sink = AttributeType::list(AttributeType::string());
+
+    // Structural List comparison intentionally changes the old name-only
+    // rejection: element assignability now mirrors VpcId -> String scalars.
+    assert!(assignable(&source, &sink));
+}
+
+#[test]
+fn assignable_list_int_range_rejects_wider_source() {
+    let source = AttributeType::list(AttributeType::refined_int_with_validator(
+        None,
+        Some((Some(0), Some(100))),
+        crate::schema::legacy_validator(|_| Ok(())),
+    ));
+    let sink = AttributeType::list(AttributeType::refined_int_with_validator(
+        None,
+        Some((Some(0), Some(10))),
+        crate::schema::legacy_validator(|_| Ok(())),
+    ));
+
+    // Structural List comparison intentionally closes the old name-only
+    // false acceptance: the source element range is not contained by sink.
+    assert!(!assignable(&source, &sink));
+}
+
+#[test]
+fn resource_schema_type_in_schema_uses_its_own_defs() {
+    let schema = ResourceSchema::new("test.Item")
+        .attribute(AttributeSchema::new(
+            "value",
+            AttributeType::ref_("Value".to_string()),
+        ))
+        .with_def("Value", AttributeType::string());
+    let attr = &schema.attributes["value"].attr_type;
+
+    assert_eq!(schema.type_in_schema(attr).resolved_type_name(), "String");
+}
+
+#[test]
+fn type_in_schema_display_name_falls_back_for_missing_ref() {
+    let attr = AttributeType::ref_("Missing".to_string());
+
+    assert_eq!(
+        attr.in_schema(crate::schema::empty_defs_for_schema_walks())
+            .resolved_type_name(),
+        "Ref(Missing)",
+    );
+}
+
+#[test]
+fn type_in_schema_display_name_resolves_refs_in_composite_types() {
+    let attr = AttributeType::union(vec![
+        AttributeType::list(AttributeType::ref_("S".to_string())),
+        AttributeType::map(AttributeType::ref_("I".to_string())),
+    ]);
+    let defs = std::collections::BTreeMap::from([
+        ("S".to_string(), AttributeType::string()),
+        ("I".to_string(), AttributeType::int()),
+    ]);
+
+    assert_eq!(
+        attr.in_schema(&defs).resolved_type_name(),
+        "List<String> | Map<Int>",
+    );
+}
+
+#[test]
+fn type_in_schema_display_name_falls_back_at_cyclic_node() {
+    let attr = AttributeType::ref_("A".to_string());
+    let defs = std::collections::BTreeMap::from([(
+        "A".to_string(),
+        AttributeType::list(AttributeType::ref_("A".to_string())),
+    )]);
+
+    assert_eq!(attr.in_schema(&defs).resolved_type_name(), "List<Ref(A)>",);
+}
+
 #[test]
 fn assignable_allows_same_primitives() {
-    assert!(AttributeType::string().is_assignable_to(&AttributeType::string()));
-    assert!(AttributeType::int().is_assignable_to(&AttributeType::int()));
-    assert!(!AttributeType::int().is_assignable_to(&AttributeType::string()));
-    assert!(!AttributeType::bool().is_assignable_to(&AttributeType::int()));
+    assert!(assignable(
+        &AttributeType::string(),
+        &AttributeType::string()
+    ));
+    assert!(assignable(&AttributeType::int(), &AttributeType::int()));
+    assert!(!assignable(&AttributeType::int(), &AttributeType::string()));
+    assert!(!assignable(&AttributeType::bool(), &AttributeType::int()));
 }
 
 #[test]
 fn assignable_rejects_distinct_semantic_names() {
     let vpc = make_custom("VpcId", AttributeType::string());
     let subnet = make_custom("SubnetId", AttributeType::string());
-    assert!(!vpc.is_assignable_to(&subnet));
-    assert!(!subnet.is_assignable_to(&vpc));
+    assert!(!assignable(&vpc, &subnet));
+    assert!(!assignable(&subnet, &vpc));
 }
 
 #[test]
 fn assignable_allows_same_semantic_name() {
     let a = make_custom("VpcId", AttributeType::string());
     let b = make_custom("VpcId", AttributeType::string());
-    assert!(a.is_assignable_to(&b));
+    assert!(assignable(&a, &b));
 }
 
 /// carina#2807: two providers exposing a same-named custom type
@@ -3203,8 +3656,8 @@ fn assignable_rejects_same_kind_across_providers() {
     };
     let aws_region = provider_custom("aws");
     let gcp_region = provider_custom("gcp");
-    assert!(!aws_region.is_assignable_to(&gcp_region));
-    assert!(!gcp_region.is_assignable_to(&aws_region));
+    assert!(!assignable(&aws_region, &gcp_region));
+    assert!(!assignable(&gcp_region, &aws_region));
 }
 
 #[test]
@@ -3220,8 +3673,8 @@ fn assignable_rejects_same_enum_kind_across_namespaces() {
     };
     let aws_enum = provider_enum("aws.foo");
     let bar_enum = provider_enum("aws.bar");
-    assert!(!aws_enum.is_assignable_to(&bar_enum));
-    assert!(!bar_enum.is_assignable_to(&aws_enum));
+    assert!(!assignable(&aws_enum, &bar_enum));
+    assert!(!assignable(&bar_enum, &aws_enum));
 }
 
 /// carina#3413: same `TypeIdentity` for an Enum constructed independently
@@ -3240,8 +3693,8 @@ fn assignable_accepts_same_enum_typeidentity_from_distinct_constructions() {
     };
     let a = mk();
     let b = mk();
-    assert!(a.is_assignable_to(&b));
-    assert!(b.is_assignable_to(&a));
+    assert!(assignable(&a, &b));
+    assert!(assignable(&b, &a));
 }
 
 /// The generic provider-scoped `aws.Arn` (no service/resource segments)
@@ -3264,16 +3717,16 @@ fn assignable_specific_arn_flows_into_generic_arn() {
     let role_arn = mk(&["iam", "Role"], None);
 
     // Specific → generic: narrower source satisfies wider sink.
-    assert!(role_arn.is_assignable_to(&generic));
+    assert!(assignable(&role_arn, &generic));
 
     // Generic → specific: the empty-segments source carries no
     // evidence of being an IAM Role ARN. Must be rejected.
-    assert!(!generic.is_assignable_to(&role_arn));
+    assert!(!assignable(&generic, &role_arn));
 
     // …and two specific ARNs with different service/resource differ.
     let cert_arn = mk(&["acm", "Certificate"], None);
-    assert!(!role_arn.is_assignable_to(&cert_arn));
-    assert!(!cert_arn.is_assignable_to(&role_arn));
+    assert!(!assignable(&role_arn, &cert_arn));
+    assert!(!assignable(&cert_arn, &role_arn));
 
     // Matching patterns do not make different same-depth identities compatible.
     let s3_bucket_arn = mk(
@@ -3284,8 +3737,8 @@ fn assignable_specific_arn_flows_into_generic_arn() {
         &["s3", "Object"],
         Some("^arn:(aws|aws-cn|aws-us-gov):s3:::.+$"),
     );
-    assert!(!s3_bucket_arn.is_assignable_to(&s3_object_arn));
-    assert!(!s3_object_arn.is_assignable_to(&s3_bucket_arn));
+    assert!(!assignable(&s3_bucket_arn, &s3_object_arn));
+    assert!(!assignable(&s3_object_arn, &s3_bucket_arn));
 }
 
 #[test]
@@ -3303,8 +3756,8 @@ fn assignable_specific_arn_with_pattern_flows_into_generic_arn_with_pattern() {
     let generic = mk(&[], "^arn:(aws|aws-cn|aws-us-gov):[^:]+:.+$");
     let bucket_arn = mk(&["s3", "Bucket"], "^arn:(aws|aws-cn|aws-us-gov):s3:::.+$");
 
-    assert!(bucket_arn.is_assignable_to(&generic));
-    assert!(!generic.is_assignable_to(&bucket_arn));
+    assert!(assignable(&bucket_arn, &generic));
+    assert!(!assignable(&generic, &bucket_arn));
 }
 
 #[test]
@@ -3322,7 +3775,7 @@ fn assignable_specific_arn_without_pattern_flows_into_generic_arn_with_pattern()
     let generic = mk(&[], Some("^arn:(aws|aws-cn|aws-us-gov):[^:]+:.+$"));
     let role_arn = mk(&["iam", "Role"], None);
 
-    assert!(role_arn.is_assignable_to(&generic));
+    assert!(assignable(&role_arn, &generic));
 }
 
 #[test]
@@ -3339,11 +3792,11 @@ fn assignable_identified_custom_length_must_be_contained() {
 
     let narrow = mk(Some((Some(1), Some(32))));
     let wide = mk(Some((Some(1), Some(64))));
-    assert!(narrow.is_assignable_to(&wide));
-    assert!(!wide.is_assignable_to(&narrow));
+    assert!(assignable(&narrow, &wide));
+    assert!(!assignable(&wide, &narrow));
 
     let unproven = mk(None);
-    assert!(!unproven.is_assignable_to(&wide));
+    assert!(!assignable(&unproven, &wide));
 }
 
 /// carina#3413: two callers that independently construct the SAME
@@ -3367,8 +3820,8 @@ fn assignable_accepts_same_typeidentity_from_distinct_constructions_vpc_id() {
     };
     let a = mk();
     let b = mk();
-    assert!(a.is_assignable_to(&b));
-    assert!(b.is_assignable_to(&a));
+    assert!(assignable(&a, &b));
+    assert!(assignable(&b, &a));
 }
 
 /// carina#3413: same as above but for the `aws.AccountId` form which
@@ -3391,8 +3844,8 @@ fn assignable_accepts_same_typeidentity_from_distinct_constructions_account_id()
     };
     let a = mk();
     let b = mk();
-    assert!(a.is_assignable_to(&b));
-    assert!(b.is_assignable_to(&a));
+    assert!(assignable(&a, &b));
+    assert!(assignable(&b, &a));
 }
 
 /// carina#3413: deeper segments path (`aws.iam.Role.Arn`). One of the
@@ -3410,8 +3863,8 @@ fn assignable_accepts_same_typeidentity_from_distinct_constructions_iam_role_arn
     };
     let a = mk();
     let b = mk();
-    assert!(a.is_assignable_to(&b));
-    assert!(b.is_assignable_to(&a));
+    assert!(assignable(&a, &b));
+    assert!(assignable(&b, &a));
 }
 
 /// carina#3413 guard: canonicalizing AWS identities to `aws.*` must
@@ -3437,8 +3890,8 @@ fn assignable_rejects_account_id_across_genuinely_different_providers() {
     };
     let aws_account = mk("aws");
     let gcp_account = mk("gcp");
-    assert!(!aws_account.is_assignable_to(&gcp_account));
-    assert!(!gcp_account.is_assignable_to(&aws_account));
+    assert!(!assignable(&aws_account, &gcp_account));
+    assert!(!assignable(&gcp_account, &aws_account));
 }
 
 /// Directional per-axis subsumption: source missing a populated sink
@@ -3459,15 +3912,15 @@ fn assignable_identity_axis_directionality() {
     // provider: None source → Some sink rejected
     let bare = mk(None, &[]);
     let scoped = mk(Some("aws"), &[]);
-    assert!(!bare.is_assignable_to(&scoped));
+    assert!(!assignable(&bare, &scoped));
     // The reverse (sink None) is the widening case and is accepted.
-    assert!(scoped.is_assignable_to(&bare));
+    assert!(assignable(&scoped, &bare));
 
     // segments: [] source → ["iam", "Role"] sink rejected
     let generic = mk(Some("aws"), &[]);
     let role = mk(Some("aws"), &["iam", "Role"]);
-    assert!(!generic.is_assignable_to(&role));
-    assert!(role.is_assignable_to(&generic));
+    assert!(!assignable(&generic, &role));
+    assert!(assignable(&role, &generic));
 }
 
 #[test]
@@ -3481,7 +3934,7 @@ fn assignable_narrow_to_anonymous_unconstrained_sink() {
         crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
-    assert!(account.is_assignable_to(&anon));
+    assert!(assignable(&account, &anon));
 }
 
 #[test]
@@ -3489,28 +3942,28 @@ fn assignable_source_without_pattern_rejected_by_patterned_sink() {
     let account = make_custom("AwsAccountId", AttributeType::string());
     let anon = make_custom_anon_pattern("^\\d{12}$");
     // Source has no pattern; sink demands one → NG.
-    assert!(!account.is_assignable_to(&anon));
+    assert!(!assignable(&account, &anon));
 }
 
 #[test]
 fn assignable_anon_to_anon_length_containment() {
     let narrow = make_custom_anon_len(1, 36);
     let wide = make_custom_anon_len(1, 64);
-    assert!(narrow.is_assignable_to(&wide));
-    assert!(!wide.is_assignable_to(&narrow));
+    assert!(assignable(&narrow, &wide));
+    assert!(!assignable(&wide, &narrow));
 }
 
 #[test]
 fn assignable_rejects_non_custom_to_custom() {
     let vpc = make_custom("VpcId", AttributeType::string());
-    assert!(!AttributeType::string().is_assignable_to(&vpc));
+    assert!(!assignable(&AttributeType::string(), &vpc));
 }
 
 #[test]
 fn assignable_custom_to_non_custom_recurses_on_base() {
     // AwsAccountId (base: String) assigns to a plain String sink.
     let account = make_custom("AwsAccountId", AttributeType::string());
-    assert!(account.is_assignable_to(&AttributeType::string()));
+    assert!(assignable(&account, &AttributeType::string()));
 }
 
 #[test]
@@ -3518,7 +3971,7 @@ fn assignable_union_sink_accepts_assignable_member() {
     let vpc = make_custom("VpcId", AttributeType::string());
     let other_vpc = make_custom("VpcId", AttributeType::string());
     let union = AttributeType::union(vec![vpc, AttributeType::string()]);
-    assert!(other_vpc.is_assignable_to(&union));
+    assert!(assignable(&other_vpc, &union));
 }
 
 #[test]
@@ -3533,15 +3986,15 @@ fn assignable_union_source_requires_all_members_assignable() {
         None,
     );
     let both_ok = AttributeType::union(vec![vpc.clone(), vpc.clone()]);
-    assert!(both_ok.is_assignable_to(&vpc));
+    assert!(assignable(&both_ok, &vpc));
 
     let subnet = make_custom("SubnetId", AttributeType::string());
     let mixed = AttributeType::union(vec![vpc.clone(), subnet]);
     // One member (SubnetId) not assignable to VpcId sink → whole union NG.
-    assert!(!mixed.is_assignable_to(&vpc));
+    assert!(!assignable(&mixed, &vpc));
 
     // But is assignable to an anonymous unconstrained sink.
-    assert!(mixed.is_assignable_to(&anon_any));
+    assert!(assignable(&mixed, &anon_any));
 }
 
 #[test]
@@ -3556,16 +4009,16 @@ fn semantic_custom_assigns_to_anonymous_unconstrained_sink() {
         crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
-    assert!(vpc.is_assignable_to(&anon));
+    assert!(assignable(&vpc, &anon));
     // Reverse: anon has no proof it's a VpcId → NG.
-    assert!(!anon.is_assignable_to(&vpc));
+    assert!(!assignable(&anon, &vpc));
 }
 
 #[test]
 fn assignable_int_custom_rejects_string_custom() {
     let int_custom = make_custom("Port", AttributeType::int());
     let string_custom = make_custom("VpcId", AttributeType::string());
-    assert!(!int_custom.is_assignable_to(&string_custom));
+    assert!(!assignable(&int_custom, &string_custom));
 }
 
 // -- Custom-pattern and Custom-length assignability matrix (#2218) --
@@ -3600,7 +4053,7 @@ fn make_custom_anon_pattern_and_len(
 fn assignable_anon_pattern_equal_strings_compatible() {
     let a = make_custom_anon_pattern_and_len(Some("^a+$"), None);
     let b = make_custom_anon_pattern_and_len(Some("^a+$"), None);
-    assert!(a.is_assignable_to(&b));
+    assert!(assignable(&a, &b));
 }
 
 #[test]
@@ -3610,8 +4063,8 @@ fn assignable_anon_pattern_differing_strings_incompatible() {
     // strings are conservatively rejected.
     let a = make_custom_anon_pattern_and_len(Some("^a+$"), None);
     let b = make_custom_anon_pattern_and_len(Some("^a*$"), None);
-    assert!(!a.is_assignable_to(&b));
-    assert!(!b.is_assignable_to(&a));
+    assert!(!assignable(&a, &b));
+    assert!(!assignable(&b, &a));
 }
 
 #[test]
@@ -3620,7 +4073,7 @@ fn assignable_anon_pattern_source_none_sink_some_rejected() {
     // its values match the sink's pattern.
     let source = make_custom_anon_pattern_and_len(None, None);
     let sink = make_custom_anon_pattern_and_len(Some("^x+$"), None);
-    assert!(!source.is_assignable_to(&sink));
+    assert!(!assignable(&source, &sink));
 }
 
 #[test]
@@ -3628,7 +4081,7 @@ fn assignable_anon_pattern_source_some_sink_none_compatible() {
     // Sink has no pattern constraint — any source pattern is fine.
     let source = make_custom_anon_pattern_and_len(Some("^x+$"), None);
     let sink = make_custom_anon_pattern_and_len(None, None);
-    assert!(source.is_assignable_to(&sink));
+    assert!(assignable(&source, &sink));
 }
 
 #[test]
@@ -3636,7 +4089,7 @@ fn assignable_anon_length_source_narrower_compatible() {
     // Source length range ⊂ sink range → compatible.
     let source = make_custom_anon_pattern_and_len(None, Some((Some(20), Some(30))));
     let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
-    assert!(source.is_assignable_to(&sink));
+    assert!(assignable(&source, &sink));
 }
 
 #[test]
@@ -3644,7 +4097,7 @@ fn assignable_anon_length_source_wider_min_rejected() {
     // Source min < sink min → values shorter than sink allows could leak through.
     let source = make_custom_anon_pattern_and_len(None, Some((Some(5), Some(40))));
     let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
-    assert!(!source.is_assignable_to(&sink));
+    assert!(!assignable(&source, &sink));
 }
 
 #[test]
@@ -3652,7 +4105,7 @@ fn assignable_anon_length_source_wider_max_rejected() {
     // Source max > sink max → values longer than sink allows could leak through.
     let source = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(50))));
     let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
-    assert!(!source.is_assignable_to(&sink));
+    assert!(!assignable(&source, &sink));
 }
 
 #[test]
@@ -3660,7 +4113,7 @@ fn assignable_anon_length_source_unbounded_max_against_bounded_sink_rejected() {
     // Source has no upper bound; sink does → source could exceed sink max.
     let source = make_custom_anon_pattern_and_len(None, Some((Some(10), None)));
     let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
-    assert!(!source.is_assignable_to(&sink));
+    assert!(!assignable(&source, &sink));
 }
 
 #[test]
@@ -3668,7 +4121,7 @@ fn assignable_anon_length_source_unbounded_min_against_bounded_sink_rejected() {
     // Source has no lower bound; sink does → source could fall below sink min.
     let source = make_custom_anon_pattern_and_len(None, Some((None, Some(40))));
     let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
-    assert!(!source.is_assignable_to(&sink));
+    assert!(!assignable(&source, &sink));
 }
 
 #[test]
@@ -3676,7 +4129,7 @@ fn assignable_anon_length_source_none_sink_some_rejected() {
     // Source has no length constraint at all; sink does → no proof.
     let source = make_custom_anon_pattern_and_len(None, None);
     let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
-    assert!(!source.is_assignable_to(&sink));
+    assert!(!assignable(&source, &sink));
 }
 
 #[test]
@@ -3684,14 +4137,14 @@ fn assignable_anon_length_source_some_sink_none_compatible() {
     // Sink has no length constraint — any source length is fine.
     let source = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
     let sink = make_custom_anon_pattern_and_len(None, None);
-    assert!(source.is_assignable_to(&sink));
+    assert!(assignable(&source, &sink));
 }
 
 #[test]
 fn assignable_anon_length_both_none_compatible() {
     let source = make_custom_anon_pattern_and_len(None, None);
     let sink = make_custom_anon_pattern_and_len(None, None);
-    assert!(source.is_assignable_to(&sink));
+    assert!(assignable(&source, &sink));
 }
 
 #[test]

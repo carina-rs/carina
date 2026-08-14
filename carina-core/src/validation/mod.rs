@@ -371,13 +371,15 @@ pub fn validate_resource_ref_types<E>(
                     }
                     Err(NarrowError::ShapeMismatch) => continue,
                 };
-                let ref_type_name = narrowed.type_name();
-                let expected_type_name = attr_schema.attr_type.type_name();
+                let source_type = ref_schema.type_in_schema(narrowed);
+                let sink_type = schema.type_in_schema(&attr_schema.attr_type);
+                let ref_type_name = source_type.resolved_type_name();
+                let expected_type_name = sink_type.resolved_type_name();
 
                 // Directional check: source (the referenced attribute, post
                 // path narrowing) must be assignable to the sink (the
                 // current resource's attribute).
-                if narrowed.is_assignable_to(&attr_schema.attr_type) {
+                if source_type.is_assignable_to(sink_type) {
                     continue;
                 }
 
@@ -538,7 +540,9 @@ fn check_attribute_param_ref_type(
         return;
     };
 
-    let ref_type_name = ref_attr_type.type_name();
+    let ref_type_name = ref_schema
+        .type_in_schema(ref_attr_type)
+        .resolved_type_name();
     let ref_type_snake = crate::parser::pascal_to_snake(&ref_type_name);
 
     if ref_type_snake == expected_type {
@@ -784,7 +788,7 @@ fn collect_ref_type_errors(
                 Err(NarrowError::ShapeMismatch) => return,
             };
             if !is_type_expr_compatible_with_schema(type_expr, ref_type, &ref_schema.defs) {
-                let ref_type_name = ref_type.type_name();
+                let ref_type_name = ref_schema.type_in_schema(ref_type).resolved_type_name();
                 errors.push(format!(
                     "export '{}': type mismatch for '{}.{}': expected {}, got {}",
                     param_name, ref_binding, ref_attr, type_expr, ref_type_name,

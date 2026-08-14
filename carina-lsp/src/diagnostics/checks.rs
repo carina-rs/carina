@@ -1299,7 +1299,7 @@ impl DiagnosticEngine {
         Some(format!(
             "type mismatch: expected {}, got {} (from {}.{})",
             type_expr,
-            ref_type.type_name(),
+            schema.type_in_schema(ref_type).resolved_type_name(),
             binding,
             attr
         ))

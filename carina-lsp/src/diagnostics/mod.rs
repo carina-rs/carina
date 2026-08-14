@@ -15,7 +15,7 @@ use crate::position;
 use carina_core::parser::{ParseError, ParsedFile, ResourceRef, WarningKind};
 use carina_core::provider::ProviderFactory;
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
-use carina_core::schema::{ResourceSchema, SchemaRegistry};
+use carina_core::schema::{ResourceSchema, SchemaRegistry, TypeInSchema};
 
 /// Create a `Diagnostic` on a single line with the standard "carina" source.
 pub(crate) fn carina_diagnostic(
@@ -675,7 +675,7 @@ impl DiagnosticEngine {
                                     Value::Deferred(DeferredValue::ResourceRef { path }),
                                 ) => check_resource_ref_type_mismatch(
                                     &binding_schema_map,
-                                    &attr_schema.attr_type,
+                                    schema.type_in_schema(&attr_schema.attr_type),
                                     path.binding(),
                                     path.attribute(),
                                 ),
@@ -1500,21 +1500,22 @@ fn build_enum_diagnostic(
 /// cannot be resolved (unknown bindings are not flagged here).
 fn check_resource_ref_type_mismatch(
     binding_schema_map: &HashMap<&str, &ResourceSchema>,
-    expected_type: &carina_core::schema::AttributeType,
+    expected: TypeInSchema<'_>,
     ref_binding: &str,
     ref_attr: &str,
 ) -> Option<String> {
     let ref_schema = binding_schema_map.get(ref_binding)?;
     let ref_attr_schema = ref_schema.attributes.get(ref_attr)?;
+    let source = ref_schema.type_in_schema(&ref_attr_schema.attr_type);
 
     // Directional: the ref (source) must be assignable to the expected (sink).
-    if ref_attr_schema.attr_type.is_assignable_to(expected_type) {
+    if source.is_assignable_to(expected) {
         None
     } else {
         Some(format!(
             "Type mismatch: expected {}, got {} (from {}.{})",
-            expected_type.type_name(),
-            ref_attr_schema.attr_type.type_name(),
+            expected.resolved_type_name(),
+            source.resolved_type_name(),
             ref_binding,
             ref_attr
         ))

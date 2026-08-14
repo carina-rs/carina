@@ -868,6 +868,127 @@ fn known_attribute_reference_through_wait_binding_is_accepted() {
 }
 
 #[test]
+fn resource_ref_string_is_assignable_to_ref_membered_sink_union() {
+    let source_schema = make_schema("r.source", vec![("value", AttributeType::string())]);
+    let sink_schema = make_schema(
+        "r.sink",
+        vec![(
+            "target",
+            AttributeType::union(vec![
+                AttributeType::ref_("S".to_string()),
+                AttributeType::ref_("L".to_string()),
+            ]),
+        )],
+    )
+    .with_def("S", AttributeType::string())
+    .with_def("L", AttributeType::list(AttributeType::string()));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", source_schema);
+    schemas.insert("test", sink_schema);
+
+    // Directory-shaped input: two resources and a let-binding reference,
+    // matching the validation walk used for merged sibling files.
+    let parsed = crate::parser::parse(
+        r#"
+let source = test.r.source {}
+
+let sink = test.r.sink {
+    target = source.value
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .unwrap();
+
+    let result = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new());
+    assert!(
+        result.is_ok(),
+        "String should flow into Union<Ref(S), Ref(L)> without a spurious error: {result:?}",
+    );
+}
+
+#[test]
+fn resource_ref_mismatch_displays_resolved_ref_type_names() {
+    let source_schema = make_schema(
+        "r.source",
+        vec![("value", AttributeType::ref_("Source".to_string()))],
+    )
+    .with_def("Source", AttributeType::string());
+    let sink_schema = make_schema(
+        "r.sink",
+        vec![("target", AttributeType::ref_("Target".to_string()))],
+    )
+    .with_def("Target", AttributeType::bool());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", source_schema);
+    schemas.insert("test", sink_schema);
+    let parsed = crate::parser::parse(
+        r#"
+let source = test.r.source {}
+
+let sink = test.r.sink {
+    target = source.value
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .unwrap();
+
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new())
+        .expect_err("String must not be assignable to Bool");
+    assert!(
+        error.contains("expected Bool, got String"),
+        "resolved source and sink names should be displayed: {error}",
+    );
+    assert!(
+        !error.contains("Ref("),
+        "schema-internal Ref names must not leak into the error: {error}",
+    );
+}
+
+#[test]
+fn resource_ref_mismatch_displays_resolved_union_member_names() {
+    let source_schema = make_schema("r.source", vec![("value", AttributeType::bool())]);
+    let sink_schema = make_schema(
+        "r.sink",
+        vec![(
+            "target",
+            AttributeType::union(vec![
+                AttributeType::ref_("S".to_string()),
+                AttributeType::ref_("L".to_string()),
+            ]),
+        )],
+    )
+    .with_def("S", AttributeType::string())
+    .with_def("L", AttributeType::list(AttributeType::string()));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", source_schema);
+    schemas.insert("test", sink_schema);
+    let parsed = crate::parser::parse(
+        r#"
+let source = test.r.source {}
+
+let sink = test.r.sink {
+    target = source.value
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .unwrap();
+
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas, &HashSet::new())
+        .expect_err("Bool must not be assignable to String | List<String>");
+    assert!(
+        error.contains("expected String | List<String>, got Bool"),
+        "nested Ref members should be resolved for display: {error}",
+    );
+    assert!(
+        !error.contains("Ref("),
+        "schema-internal Ref names must not leak into the error: {error}",
+    );
+}
+
+#[test]
 fn unknown_attribute_reference_through_wait_binding_inside_nested_struct_reports_error() {
     use crate::schema::StructField;
 
@@ -2172,6 +2293,45 @@ fn attribute_param_ref_type_mismatch_detected() {
 }
 
 #[test]
+fn attribute_param_ref_type_resolves_terminal_schema_ref() {
+    use crate::parser::AttributeParameter;
+    use crate::schema::{AttributeSchema, ResourceSchema};
+
+    let source = Resource::with_provider("test", "source.Item", "source", None)
+        .with_binding("source")
+        .with_attribute(
+            "value",
+            Value::Concrete(ConcreteValue::String("text".to_string())),
+        );
+    let source_schema = ResourceSchema::new("source.Item")
+        .attribute(AttributeSchema::new(
+            "value",
+            AttributeType::ref_("X".to_string()),
+        ))
+        .with_def("X", AttributeType::string());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", source_schema);
+    let mut parsed = empty_parsed();
+    parsed.resources.push(source); // allow: direct — fixture test inspection
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let params = vec![AttributeParameter {
+        name: "value".to_string(),
+        type_expr: Some(TypeExpr::Simple("string".to_string())),
+        value: Some(Value::resource_ref(
+            "source".to_string(),
+            "value".to_string(),
+            vec![],
+        )),
+    }];
+
+    let result = validate_attribute_param_ref_types_with_bindings(&params, &bindings);
+    assert!(
+        result.is_ok(),
+        "terminal Ref(X) should resolve to String for module-param compatibility: {result:?}",
+    );
+}
+
+#[test]
 fn attribute_param_ref_existence_checks_composition_attribute_membership_only() {
     use crate::parser::AttributeParameter;
 
@@ -3094,6 +3254,47 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
     assert!(
         err.contains("accounts") && err.contains("type mismatch"),
         "error should mention the export name and type mismatch, got: {err}"
+    );
+}
+
+#[test]
+fn export_param_ref_type_mismatch_displays_resolved_nested_ref_names() {
+    use crate::parser::InferredExportParam;
+    use crate::schema::{AttributeSchema, ResourceSchema};
+
+    let source_schema = ResourceSchema::new("source.Item")
+        .attribute(AttributeSchema::new(
+            "values",
+            AttributeType::list(AttributeType::ref_("S".to_string())),
+        ))
+        .with_def("S", AttributeType::string());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", source_schema);
+    let source = Resource::with_provider("test", "source.Item", "source", None)
+        .with_binding("source")
+        .with_attribute("values", Value::Concrete(ConcreteValue::List(Vec::new())));
+    let exports = vec![InferredExportParam {
+        name: "values".to_string(),
+        type_expr: TypeExpr::Bool,
+        value: Some(Value::resource_ref(
+            "source".to_string(),
+            "values".to_string(),
+            vec![],
+        )),
+    }];
+    let mut parsed = empty_parsed();
+    parsed.resources.push(source); // allow: direct — fixture test inspection
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+
+    let error = validate_export_param_ref_types_with_bindings(&exports, &bindings, &HashSet::new())
+        .expect_err("List<String> must not satisfy Bool");
+    assert!(
+        error.contains("expected Bool, got List<String>"),
+        "nested Ref names should be resolved in export errors: {error}",
+    );
+    assert!(
+        !error.contains("Ref("),
+        "schema-internal Ref names must not leak into the export error: {error}",
     );
 }
 
