@@ -798,30 +798,20 @@ async fn run_destroy_locked(
                             ))
                             .ok();
 
-                        let nested_cleanup_wait = match cleanup_loop.step() {
-                            LoopStep::Continue(wait) => wait,
-                            LoopStep::Abandon => {
-                                cancelled = true;
-                                break 'destroy;
-                            }
-                        };
-                        let wait_result = match nested_cleanup_wait
-                            .until_cleanup_priority(wait_for_deletion(
-                                &provider,
-                                &dep_id,
-                                &dep_identifier,
-                                180,
-                                std::time::Duration::from_secs(10),
-                            ))
-                            .await
-                        {
-                            CleanupInterrupted::Completed(result) => result,
-                            CleanupInterrupted::Abandoned => {
-                                cancelled = true;
-                                break 'destroy;
-                            }
-                        };
+                        let wait_result = wait_for_deletion(
+                            &cleanup_loop,
+                            &provider,
+                            &dep_id,
+                            &dep_identifier,
+                            180,
+                            std::time::Duration::from_secs(10),
+                        )
+                        .await;
                         match wait_result {
+                            WaitResult::Abandoned => {
+                                cancelled = true;
+                                break 'destroy;
+                            }
                             WaitResult::Deleted => {
                                 multi
                                     .println(format!(
@@ -1150,23 +1140,18 @@ async fn run_destroy_locked(
                 dep_id
             );
 
-            let outcome = cleanup_wait.until_cleanup_priority(wait_for_deletion(
+            let outcome = wait_for_deletion(
+                &cleanup_loop,
                 &provider,
                 dep_id,
                 dep_identifier,
                 180,
                 std::time::Duration::from_secs(10),
-            ));
+            );
             tokio::pin!(outcome);
             let outcome = tokio::select! {
                 biased;
-                outcome = &mut outcome => match outcome {
-                    CleanupInterrupted::Completed(outcome) => outcome,
-                    CleanupInterrupted::Abandoned => {
-                        cancelled = true;
-                        break;
-                    }
-                },
+                outcome = &mut outcome => outcome,
                 _ = cancel.cancelled() => {
                     cancelled = true;
                     break;
@@ -1174,6 +1159,10 @@ async fn run_destroy_locked(
             };
 
             match outcome {
+                WaitResult::Abandoned => {
+                    cancelled = true;
+                    break;
+                }
                 WaitResult::Deleted => {
                     eprintln!(
                         "  {} Delete {} (completed after extended wait)",
@@ -2520,12 +2509,127 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_deletion_abandons_when_cleanup_is_prioritized() {
+        let id = ResourceId::with_identity("s3.Bucket", "test");
+        let existing_state = State::existing(id.clone(), HashMap::new());
+        let provider = SequenceProvider::new(vec![Ok(existing_state)]);
+        let (trigger, shutdown) = carina_core::shutdown::testing::shutdown_channel();
+        let cleanup_loop = shutdown.cleanup_aware_loop();
+        let poll_interval = std::time::Duration::from_secs(30);
+
+        let wait = wait_for_deletion(
+            &cleanup_loop,
+            &provider,
+            &id,
+            "some-identifier",
+            100,
+            poll_interval,
+        );
+        tokio::pin!(wait);
+
+        // Poll once to enter the first cleanup-aware wait and register its
+        // sleep without allowing paused time to advance.
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(wait.as_mut(), cx).is_pending(),
+                "wait_for_deletion returned before its first poll was in flight"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            provider.call_count.load(Ordering::SeqCst),
+            0,
+            "the first provider read must still be waiting on poll_interval"
+        );
+
+        let cleanup_requested_at = tokio::time::Instant::now();
+        trigger.prioritize_cleanup();
+        let result = wait.await;
+        let cleanup_elapsed = cleanup_requested_at.elapsed();
+
+        assert_eq!(result, WaitResult::Abandoned);
+        assert!(
+            cleanup_elapsed < poll_interval,
+            "cleanup priority waited for the full poll interval: {cleanup_elapsed:?}"
+        );
+        assert_eq!(
+            provider.call_count.load(Ordering::SeqCst),
+            0,
+            "cleanup priority must abandon the in-flight sleep before provider.read"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_deletion_abandons_before_polling_when_cleanup_is_already_prioritized() {
+        let id = ResourceId::with_identity("s3.Bucket", "test");
+        let provider = SequenceProvider::new(Vec::new());
+        let (trigger, shutdown) = carina_core::shutdown::testing::shutdown_channel();
+        let cleanup_loop = shutdown.cleanup_aware_loop();
+        trigger.prioritize_cleanup();
+
+        let started_at = tokio::time::Instant::now();
+        let result = wait_for_deletion(
+            &cleanup_loop,
+            &provider,
+            &id,
+            "some-identifier",
+            180,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            WaitResult::Abandoned,
+            "already-active cleanup must abandon before entering the poll loop"
+        );
+        assert_eq!(
+            started_at.elapsed(),
+            std::time::Duration::ZERO,
+            "an already-abandoned wait must return without advancing poll time"
+        );
+        assert_eq!(
+            provider.call_count.load(Ordering::SeqCst),
+            0,
+            "an already-abandoned wait must not call provider.read"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_deletion_running_token_polls_to_completion() {
+        // Resource exists on first poll, then disappears on second.
+        let id = ResourceId::with_identity("s3.Bucket", "test");
+        let existing_state = State::existing(id.clone(), HashMap::new());
+        let provider =
+            SequenceProvider::new(vec![Ok(existing_state), Ok(State::not_found(id.clone()))]);
+        let shutdown = ShutdownToken::running();
+        let cleanup_loop = shutdown.cleanup_aware_loop();
+
+        let result = wait_for_deletion(
+            &cleanup_loop,
+            &provider,
+            &id,
+            "some-identifier",
+            3,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(result, WaitResult::Deleted);
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn wait_for_deletion_succeeds_when_resource_disappears() {
         let id = ResourceId::with_identity("s3.Bucket", "test");
         let provider = SequenceProvider::new(vec![Ok(State::not_found(id.clone()))]);
+        let shutdown = ShutdownToken::running();
+        let cleanup_loop = shutdown.cleanup_aware_loop();
 
         let result = wait_for_deletion(
+            &cleanup_loop,
             &provider,
             &id,
             "some-identifier",
@@ -2541,8 +2645,11 @@ mod tests {
     async fn wait_for_deletion_returns_read_error_on_provider_error() {
         let id = ResourceId::with_identity("s3.Bucket", "test");
         let provider = SequenceProvider::new(vec![Err(ProviderError::api_error("auth expired"))]);
+        let shutdown = ShutdownToken::running();
+        let cleanup_loop = shutdown.cleanup_aware_loop();
 
         let result = wait_for_deletion(
+            &cleanup_loop,
             &provider,
             &id,
             "some-identifier",
@@ -2569,8 +2676,11 @@ mod tests {
         // was told it was destroyed.
         let id = ResourceId::with_identity("s3.Bucket", "test");
         let provider = SequenceProvider::new(vec![Err(ProviderError::timeout("network timeout"))]);
+        let shutdown = ShutdownToken::running();
+        let cleanup_loop = shutdown.cleanup_aware_loop();
 
         let result = wait_for_deletion(
+            &cleanup_loop,
             &provider,
             &id,
             "some-identifier",
@@ -2580,7 +2690,10 @@ mod tests {
         .await;
 
         // Must NOT be Deleted -- that was the old (buggy) behavior
-        assert_ne!(result, WaitResult::Deleted);
+        assert!(
+            matches!(&result, WaitResult::ReadError(_)),
+            "Expected ReadError, got: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -2592,8 +2705,11 @@ mod tests {
             Ok(existing_state.clone()),
             Ok(existing_state),
         ]);
+        let shutdown = ShutdownToken::running();
+        let cleanup_loop = shutdown.cleanup_aware_loop();
 
         let result = wait_for_deletion(
+            &cleanup_loop,
             &provider,
             &id,
             "some-identifier",
@@ -2603,25 +2719,5 @@ mod tests {
         .await;
 
         assert_eq!(result, WaitResult::TimedOut);
-    }
-
-    #[tokio::test]
-    async fn wait_for_deletion_succeeds_after_transient_exists() {
-        // Resource exists on first poll, then disappears on second.
-        let id = ResourceId::with_identity("s3.Bucket", "test");
-        let existing_state = State::existing(id.clone(), HashMap::new());
-        let provider =
-            SequenceProvider::new(vec![Ok(existing_state), Ok(State::not_found(id.clone()))]);
-
-        let result = wait_for_deletion(
-            &provider,
-            &id,
-            "some-identifier",
-            3,
-            std::time::Duration::from_millis(1),
-        )
-        .await;
-
-        assert_eq!(result, WaitResult::Deleted);
     }
 }

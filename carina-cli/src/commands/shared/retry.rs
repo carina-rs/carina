@@ -2,6 +2,7 @@
 
 use carina_core::provider::{Provider, ReadRequest};
 use carina_core::resource::ResourceId;
+use carina_core::shutdown::{CleanupAwareLoop, CleanupInterrupted, LoopStep};
 
 /// Check if a delete error is retryable due to implicit dependency ordering.
 ///
@@ -33,18 +34,22 @@ pub(crate) fn is_retryable_delete_error(e: &carina_core::provider::ProviderError
 pub(crate) enum WaitResult {
     /// Resource confirmed deleted (`state.exists == false`).
     Deleted,
+    /// Cleanup priority interrupted the deletion wait.
+    Abandoned,
     /// A `provider.read()` call returned an error.
     ReadError(String),
     /// The resource still existed after all retry attempts.
     TimedOut,
 }
 
-/// Poll `provider.read()` in a loop until the resource disappears or an error /
-/// timeout occurs.
+/// Poll `provider.read()` until the resource disappears, a read fails, cleanup
+/// priority abandons the wait, or the poll budget is exhausted.
 ///
+/// * `cleanup_loop` – shutdown state sampled immediately before every poll.
 /// * `max_attempts` – how many times to poll (each preceded by `poll_interval`).
 /// * `poll_interval` – sleep duration between polls.
 pub(crate) async fn wait_for_deletion(
+    cleanup_loop: &CleanupAwareLoop<'_>,
     provider: &dyn Provider,
     id: &ResourceId,
     identifier: &str,
@@ -52,8 +57,21 @@ pub(crate) async fn wait_for_deletion(
     poll_interval: std::time::Duration,
 ) -> WaitResult {
     for _ in 0..max_attempts {
-        tokio::time::sleep(poll_interval).await;
-        match provider.read(id, Some(identifier), ReadRequest).await {
+        let cleanup_wait = match cleanup_loop.step() {
+            LoopStep::Continue(wait) => wait,
+            LoopStep::Abandon => return WaitResult::Abandoned,
+        };
+        let read_result = cleanup_wait
+            .until_cleanup_priority(async {
+                tokio::time::sleep(poll_interval).await;
+                provider.read(id, Some(identifier), ReadRequest).await
+            })
+            .await;
+        let read_result = match read_result {
+            CleanupInterrupted::Completed(result) => result,
+            CleanupInterrupted::Abandoned => return WaitResult::Abandoned,
+        };
+        match read_result {
             Ok(state) if !state.exists => return WaitResult::Deleted,
             Ok(_) => {
                 // Still exists, keep waiting
