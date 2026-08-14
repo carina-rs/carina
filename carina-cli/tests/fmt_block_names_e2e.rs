@@ -501,6 +501,48 @@ broken.test.resource {
 }
 
 #[test]
+fn check_surfaces_unversioned_lock_remediation() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("main.crn"),
+        r#"provider awscc {
+  source = 'github.com/carina-rs/carina-provider-awscc'
+  revision = 'main'
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("carina-providers.lock"),
+        r#"[[provider]]
+name = "awscc"
+source = "github.com/carina-rs/carina-provider-awscc"
+mode = "revision"
+revision = "main"
+resolved_sha = "967e645a7153522ca60ef942183d3fc338fc7c27"
+sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
+"#,
+    )
+    .unwrap();
+
+    let format = run_fmt(project.path(), false);
+    assert_success(&format);
+    let output = run_fmt_with_args(project.path(), false, &[".", "--check"]);
+
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(PROVIDER_WARNING), "{stderr}");
+    assert!(
+        stderr.contains("predates lock format versioning"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Delete it, then regenerate it with `carina init`"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn check_does_not_warn_for_sourceless_provider() {
     let project = tempfile::tempdir().unwrap();
     let main = project.path().join("main.crn");

@@ -1,5 +1,6 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -117,6 +118,41 @@ pub struct WiringContext {
 /// Provider factories paired with provider-specific load diagnostics.
 pub type ProviderFactoryLoad = (Vec<Box<dyn ProviderFactory>>, HashMap<String, String>);
 
+#[derive(Debug)]
+pub(crate) enum ProviderFactoryDiagnostic {
+    LockConstraint(carina_provider_resolver::LockConstraintError),
+    Message(String),
+}
+
+impl fmt::Display for ProviderFactoryDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LockConstraint(error) => error.fmt(f),
+            Self::Message(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ProviderFactoryDiagnostic {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LockConstraint(error) => Some(error),
+            Self::Message(_) => None,
+        }
+    }
+}
+
+impl From<String> for ProviderFactoryDiagnostic {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+pub(crate) type FormattingFactoryLoad = (
+    Vec<Box<dyn ProviderFactory>>,
+    HashMap<String, ProviderFactoryDiagnostic>,
+);
+
 impl WiringContext {
     pub fn new(factories: Vec<Box<dyn ProviderFactory>>) -> Self {
         let mut schemas = provider_mod::collect_schemas(&factories);
@@ -183,8 +219,7 @@ pub fn build_factories_from_providers(
     providers: &[ProviderConfig],
     base_dir: &Path,
 ) -> Result<ProviderFactoryLoad, AppError> {
-    carina_provider_resolver::validate_lock_constraints(base_dir, providers)
-        .map_err(AppError::Config)?;
+    carina_provider_resolver::validate_lock_constraints(base_dir, providers)?;
 
     Ok(build_factories_from_providers_impl(
         providers, base_dir, true,
@@ -201,15 +236,25 @@ pub fn build_factories_from_providers(
 pub(crate) fn build_factories_from_providers_for_formatting(
     providers: &[ProviderConfig],
     base_dir: &Path,
-) -> (Vec<Box<dyn ProviderFactory>>, HashMap<String, String>) {
+) -> FormattingFactoryLoad {
     if let Err(error) = carina_provider_resolver::validate_lock_constraints(base_dir, providers) {
         return (
             Vec::new(),
-            HashMap::from([("carina-providers.lock".to_string(), error)]),
+            HashMap::from([(
+                "carina-providers.lock".to_string(),
+                ProviderFactoryDiagnostic::LockConstraint(error),
+            )]),
         );
     }
 
-    build_factories_from_providers_impl(providers, base_dir, false)
+    let (factories, load_errors) = build_factories_from_providers_impl(providers, base_dir, false);
+    (
+        factories,
+        load_errors
+            .into_iter()
+            .map(|(provider, message)| (provider, ProviderFactoryDiagnostic::Message(message)))
+            .collect(),
+    )
 }
 
 fn build_factories_from_providers_impl(

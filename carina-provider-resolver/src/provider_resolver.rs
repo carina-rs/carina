@@ -76,18 +76,33 @@ pub struct LockEntry {
 
 /// Registry-only pinning metadata. Kept outside [`LockEntryKind`] so the
 /// version/revision/file shape remains a closed tagged enum.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(try_from = "RegistryLockSerde", into = "RegistryLockSerde")]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(into = "RegistryLockSerde")]
 pub struct RegistryLock {
     pub resolved_hostname: String,
     pub api_base_url: String,
     pub discovery_sha256: String,
-    pub sequence_present: bool,
-    pub sequence: Option<u64>,
+    pub sequence: RegistrySequence,
     pub valid_until_present: bool,
-    pub signature_present: bool,
-    pub pin: Option<IdentityPin>,
+    pub signature: RegistrySignatureProtection,
     pub transparency_log_present: bool,
+}
+
+/// Whether registry freshness has ever carried a monotonic sequence, including
+/// the last value when it has. The contradictory `present = true, value = None`
+/// state cannot be constructed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrySequence {
+    Absent,
+    Present(u64),
+}
+
+/// Signature protection recorded for a registry provider. Signed entries
+/// always carry their identity pin; a signed-but-unpinned lock cannot exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrySignatureProtection {
+    Absent,
+    Present(IdentityPin),
 }
 
 /// A signing-identity pin whose identity and issuer are always present together.
@@ -98,52 +113,53 @@ pub struct IdentityPin {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RegistryLockSerde {
     resolved_hostname: String,
     api_base_url: String,
     discovery_sha256: String,
-    #[serde(default)]
     sequence_present: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sequence: Option<u64>,
-    #[serde(default)]
     valid_until_present: bool,
-    #[serde(default)]
     signature_present: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     certificate_identity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     certificate_oidc_issuer: Option<String>,
-    #[serde(default)]
     transparency_log_present: bool,
 }
 
 impl TryFrom<RegistryLockSerde> for RegistryLock {
-    type Error = String;
+    type Error = RegistryLockError;
 
     fn try_from(value: RegistryLockSerde) -> Result<Self, Self::Error> {
-        let pin = match (value.certificate_identity, value.certificate_oidc_issuer) {
-            (Some(certificate_identity), Some(certificate_oidc_issuer)) => Some(IdentityPin {
-                certificate_identity,
-                certificate_oidc_issuer,
-            }),
-            (None, None) => None,
-            _ => {
-                return Err(
-                    "registry lock is inconsistent: certificate_identity and certificate_oidc_issuer must either both be set or both be absent"
-                        .to_string(),
-                );
+        let sequence = match (value.sequence_present, value.sequence) {
+            (false, None) => RegistrySequence::Absent,
+            (true, Some(sequence)) => RegistrySequence::Present(sequence),
+            _ => return Err(RegistryLockError::InconsistentSequence),
+        };
+        let signature = match (
+            value.signature_present,
+            value.certificate_identity,
+            value.certificate_oidc_issuer,
+        ) {
+            (false, None, None) => RegistrySignatureProtection::Absent,
+            (true, Some(certificate_identity), Some(certificate_oidc_issuer)) => {
+                RegistrySignatureProtection::Present(IdentityPin {
+                    certificate_identity,
+                    certificate_oidc_issuer,
+                })
             }
+            _ => return Err(RegistryLockError::InconsistentSignature),
         };
         Ok(Self {
             resolved_hostname: value.resolved_hostname,
             api_base_url: value.api_base_url,
             discovery_sha256: value.discovery_sha256,
-            sequence_present: value.sequence_present,
-            sequence: value.sequence,
+            sequence,
             valid_until_present: value.valid_until_present,
-            signature_present: value.signature_present,
-            pin,
+            signature,
             transparency_log_present: value.transparency_log_present,
         })
     }
@@ -151,21 +167,27 @@ impl TryFrom<RegistryLockSerde> for RegistryLock {
 
 impl From<RegistryLock> for RegistryLockSerde {
     fn from(value: RegistryLock) -> Self {
-        let (certificate_identity, certificate_oidc_issuer) =
-            value.pin.map_or((None, None), |pin| {
-                (
+        let (sequence_present, sequence) = match value.sequence {
+            RegistrySequence::Absent => (false, None),
+            RegistrySequence::Present(sequence) => (true, Some(sequence)),
+        };
+        let (signature_present, certificate_identity, certificate_oidc_issuer) =
+            match value.signature {
+                RegistrySignatureProtection::Absent => (false, None, None),
+                RegistrySignatureProtection::Present(pin) => (
+                    true,
                     Some(pin.certificate_identity),
                     Some(pin.certificate_oidc_issuer),
-                )
-            });
+                ),
+            };
         Self {
             resolved_hostname: value.resolved_hostname,
             api_base_url: value.api_base_url,
             discovery_sha256: value.discovery_sha256,
-            sequence_present: value.sequence_present,
-            sequence: value.sequence,
+            sequence_present,
+            sequence,
             valid_until_present: value.valid_until_present,
-            signature_present: value.signature_present,
+            signature_present,
             certificate_identity,
             certificate_oidc_issuer,
             transparency_log_present: value.transparency_log_present,
@@ -173,25 +195,204 @@ impl From<RegistryLock> for RegistryLockSerde {
     }
 }
 
-impl RegistryLock {
+#[derive(Debug)]
+enum RegistryLockError {
+    InconsistentSequence,
+    InconsistentSignature,
+}
+
+impl fmt::Display for RegistryLockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InconsistentSequence => write!(
+                f,
+                "registry lock is inconsistent: sequence_present and sequence must either encode an absent sequence or a present value"
+            ),
+            Self::InconsistentSignature => write!(
+                f,
+                "registry lock is inconsistent: signature_present, certificate_identity, and certificate_oidc_issuer must either all describe a signature pin or all be absent"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RegistryLockError {}
+
+impl<'de> Deserialize<'de> for RegistryLock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        RegistryLockSerde::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl RegistrySignatureProtection {
     fn expected_identity(&self) -> Option<ExpectedIdentity> {
-        self.pin.as_ref().map(|pin| {
-            ExpectedIdentity::pinned(
+        match self {
+            Self::Absent => None,
+            Self::Present(pin) => Some(ExpectedIdentity::pinned(
                 pin.certificate_identity.clone(),
                 pin.certificate_oidc_issuer.clone(),
-            )
-        })
+            )),
+        }
+    }
+}
+
+impl RegistrySequence {
+    fn value(&self) -> Option<u64> {
+        match self {
+            Self::Absent => None,
+            Self::Present(sequence) => Some(*sequence),
+        }
+    }
+
+    fn is_present(&self) -> bool {
+        matches!(self, Self::Present(_))
+    }
+}
+
+impl RegistryLock {
+    fn expected_identity(&self) -> Option<ExpectedIdentity> {
+        self.signature.expected_identity()
     }
 }
 
 /// The full carina-providers.lock file.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `LockFile` deliberately implements only `Serialize`. All deserialization is
+/// routed through [`Self::load`], which checks the format version before the
+/// current schema can consume or rewrite the file.
+#[derive(Debug, Clone, Serialize)]
 pub struct LockFile {
-    #[serde(default)]
+    version: u32,
     pub provider: Vec<LockEntry>,
 }
 
+#[derive(Deserialize)]
+struct LockFileVersion {
+    version: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UncheckedLockFile {
+    version: u32,
+    #[serde(default)]
+    provider: Vec<LockEntry>,
+}
+
+#[derive(Debug)]
+pub enum LockFileError {
+    Read {
+        path: PathBuf,
+        source: io::Error,
+    },
+    MissingVersion {
+        path: PathBuf,
+    },
+    VersionTooNew {
+        found: u32,
+        supported: u32,
+    },
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+}
+
+impl fmt::Display for LockFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read { path, source } => {
+                write!(f, "Failed to read {}: {source}", path.display())
+            }
+            Self::MissingVersion { path } => write!(
+                f,
+                "Lock file {} has no format version and predates lock format versioning. It cannot be distinguished from a lock whose protection fields were stripped by an older Carina binary. Delete it, then regenerate it with `carina init`.",
+                path.display()
+            ),
+            Self::VersionTooNew { found, supported } => write!(
+                f,
+                "Lock file version {found} is newer than supported version {supported}. Please upgrade Carina."
+            ),
+            Self::Parse { path, source } => write!(
+                f,
+                "Failed to parse {}: {source}\nhint: delete {} and re-run `carina init`.",
+                path.display(),
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LockFileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read { source, .. } => Some(source),
+            Self::Parse { source, .. } => Some(source),
+            Self::MissingVersion { .. } | Self::VersionTooNew { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum LockConstraintError {
+    LockFile(LockFileError),
+    ConstraintMismatch {
+        provider: String,
+        locked_version: String,
+        constraint: String,
+    },
+}
+
+impl fmt::Display for LockConstraintError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LockFile(error) => error.fmt(f),
+            Self::ConstraintMismatch {
+                provider,
+                locked_version,
+                constraint,
+            } => write!(
+                f,
+                "Provider '{provider}' locked at version {locked_version}, but constraint '{constraint}' requires a different version.\nRun `carina init --upgrade` to resolve."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LockConstraintError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LockFile(error) => Some(error),
+            Self::ConstraintMismatch { .. } => None,
+        }
+    }
+}
+
+impl From<LockFileError> for LockConstraintError {
+    fn from(error: LockFileError) -> Self {
+        Self::LockFile(error)
+    }
+}
+
+impl Default for LockFile {
+    fn default() -> Self {
+        Self {
+            version: Self::CURRENT_VERSION,
+            provider: Vec::new(),
+        }
+    }
+}
+
 impl LockFile {
+    /// v1: Registry protection-presence fields are mandatory, and signed
+    /// registry entries always carry a signing-identity pin.
+    pub const CURRENT_VERSION: u32 = 1;
+
     fn sources_match(existing: &str, requested: &str) -> bool {
         existing == requested || canonical_lock_source(existing) == canonical_lock_source(requested)
     }
@@ -199,23 +400,54 @@ impl LockFile {
     /// Load `carina-providers.lock`.
     ///
     /// Returns `Ok(None)` when the file is absent (normal first-run case).
-    /// Parse errors — including an entry that can't be discriminated into one
-    /// of the three [`LockEntryKind`] variants — surface as `Err` rather than
-    /// being silently collapsed into a default-empty lock.
-    pub fn load(path: &Path) -> Result<Option<Self>, String> {
+    /// Parse errors — including an entry that can't be discriminated into a
+    /// [`LockEntryKind`] variant — surface as `Err` rather than being silently
+    /// collapsed into a default-empty lock.
+    pub fn load(path: &Path) -> Result<Option<Self>, LockFileError> {
         let content = match fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("Failed to read {}: {e}", path.display())),
+            Err(source) => {
+                return Err(LockFileError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
         };
-        let lock = toml::from_str(&content).map_err(|e| {
-            format!(
-                "Failed to parse {}: {e}\nhint: delete {} and re-run `carina init`.",
-                path.display(),
-                path.display()
-            )
-        })?;
-        Ok(Some(lock))
+        Self::from_toml_str(&content, path).map(Some)
+    }
+
+    /// Validated parse seam shared by filesystem loading and unit tests. It is
+    /// private so callers cannot deserialize a `LockFile` around the version
+    /// gate.
+    fn from_toml_str(content: &str, path: &Path) -> Result<Self, LockFileError> {
+        let version: LockFileVersion =
+            toml::from_str(content).map_err(|source| LockFileError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let version = version
+            .version
+            .ok_or_else(|| LockFileError::MissingVersion {
+                path: path.to_path_buf(),
+            })?;
+        if version > Self::CURRENT_VERSION {
+            return Err(LockFileError::VersionTooNew {
+                found: version,
+                supported: Self::CURRENT_VERSION,
+            });
+        }
+        let unchecked: UncheckedLockFile =
+            toml::from_str(content).map_err(|source| LockFileError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let lock = Self {
+            version: Self::CURRENT_VERSION,
+            provider: unchecked.provider,
+        };
+        debug_assert_eq!(unchecked.version, version);
+        Ok(lock)
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
@@ -801,7 +1033,8 @@ fn enforce_registry_freshness(
     let locked = lock_file
         .find_by_source(&source.source_key())
         .and_then(|entry| entry.registry.as_ref());
-    if locked.is_some_and(|registry| registry.sequence_present) && versions.sequence.is_none() {
+    if locked.is_some_and(|registry| registry.sequence.is_present()) && versions.sequence.is_none()
+    {
         return Err(format!(
             "registry sequence field disappeared for {}/{}",
             source.namespace, source.name
@@ -815,7 +1048,7 @@ fn enforce_registry_freshness(
         ));
     }
     if let (Some(registry), Some(sequence)) = (locked, versions.sequence)
-        && let Some(previous) = registry.sequence
+        && let Some(previous) = registry.sequence.value()
     {
         if sequence < previous {
             return Err(format!(
@@ -1181,12 +1414,12 @@ fn verify_registry_lock_pin(
             "registry discovery document pin mismatch for {source_key}"
         ));
     }
-    if locked_registry.signature_present && signature.is_none() {
+    let expected_identity = locked_registry.expected_identity();
+    if expected_identity.is_some() && signature.is_none() {
         return Err(format!(
-            "the resolved version of {source_key} has no registry signature, but carina-providers.lock records this provider as signed; downgrades from signed to unsigned versions are refused and have no override. {IDENTITY_REPIN_REMEDIATION}"
+            "the resolved version of {source_key} has no registry signature, but carina-providers.lock records this provider as signed and identity-pinned; downgrades from signed to unsigned versions are refused and have no override. {IDENTITY_REPIN_REMEDIATION}"
         ));
     }
-    let expected_identity = locked_registry.expected_identity();
     if let (Some(expected_identity), Some(signature)) = (&expected_identity, signature) {
         let (certificate_identity, certificate_oidc_issuer) = expected_identity.values();
         if signature.certificate_identity != certificate_identity
@@ -1196,11 +1429,6 @@ fn verify_registry_lock_pin(
                 "registry signature identity for {source_key} differs from the carina-providers.lock pin; signature verification has no override. {IDENTITY_REPIN_REMEDIATION}"
             ));
         }
-    }
-    if expected_identity.is_some() && signature.is_none() {
-        return Err(format!(
-            "registry signature is missing for identity-pinned provider {source_key}; signature verification has no override. {IDENTITY_REPIN_REMEDIATION}"
-        ));
     }
     if locked_registry.transparency_log_present && !transparency_log_present {
         return Err(format!(
@@ -1270,7 +1498,6 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
         ));
     }
     let download = fetch_registry_download(&registry, source, version, http)?;
-    let signature_present = download.signature.is_some();
     if let Some(signature) = &download.signature {
         signing::ensure_supported_signature_type(&signature.r#type)?;
     }
@@ -1327,18 +1554,21 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
         }
         None => None,
     };
-    let pin = verified_identity.map(|(identity, expected_identity)| {
-        let (certificate_identity, certificate_oidc_issuer) = identity.into_parts();
-        if expected_identity.is_first_use() {
-            eprintln!(
-                "carina: pinned signing identity for {source_key}: {certificate_identity} (issuer {certificate_oidc_issuer})"
-            );
+    let signature = match verified_identity {
+        Some((identity, expected_identity)) => {
+            let (certificate_identity, certificate_oidc_issuer) = identity.into_parts();
+            if expected_identity.is_first_use() {
+                eprintln!(
+                    "carina: pinned signing identity for {source_key}: {certificate_identity} (issuer {certificate_oidc_issuer})"
+                );
+            }
+            RegistrySignatureProtection::Present(IdentityPin {
+                certificate_identity,
+                certificate_oidc_issuer,
+            })
         }
-        IdentityPin {
-            certificate_identity,
-            certificate_oidc_issuer,
-        }
-    });
+        None => RegistrySignatureProtection::Absent,
+    };
 
     lock_file.upsert(LockEntry {
         name: name.to_string(),
@@ -1352,11 +1582,11 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
             resolved_hostname: registry.hostname,
             api_base_url: registry.api_base_url,
             discovery_sha256: registry.discovery_sha256,
-            sequence_present: versions.sequence.is_some(),
-            sequence: versions.sequence,
+            sequence: versions
+                .sequence
+                .map_or(RegistrySequence::Absent, RegistrySequence::Present),
             valid_until_present: versions.valid_until.is_some(),
-            signature_present,
-            pin,
+            signature,
             transparency_log_present,
         }),
     });
@@ -1572,7 +1802,9 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
     let source = canonical_provider_source(source)?;
 
     let lock_path = base_dir.join("carina-providers.lock");
-    let mut lock_file = LockFile::load(&lock_path)?.unwrap_or_default();
+    let mut lock_file = LockFile::load(&lock_path)
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
 
     let binary_path = if registry_revision(&source, config)?.is_some() {
         let version = resolve_version(&source, config, &mut lock_file, false, http)?;
@@ -1692,7 +1924,9 @@ pub fn find_installed_provider(
     let source = canonical_provider_source(source)?;
 
     let lock_path = base_dir.join("carina-providers.lock");
-    let lock_file = LockFile::load(&lock_path)?.unwrap_or_default();
+    let lock_file = LockFile::load(&lock_path)
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
 
     // Only the project-local `.carina/` counts. The global plugin cache is an
     // install-time optimization consulted by `carina init`; treating it as a
@@ -2174,7 +2408,9 @@ fn resolve_all_with_http<H: RegistryHttp>(
     http: &H,
 ) -> Result<HashMap<String, PathBuf>, String> {
     let lock_path = base_dir.join("carina-providers.lock");
-    let mut lock_file = LockFile::load(&lock_path)?.unwrap_or_default();
+    let mut lock_file = LockFile::load(&lock_path)
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
 
     // Fail before touching the filesystem if the lock disagrees with .crn.
     // Rewriting the lock requires `--upgrade`; `--locked` tightens this to
@@ -2299,7 +2535,7 @@ fn resolve_all_with_http<H: RegistryHttp>(
 pub fn validate_lock_constraints(
     base_dir: &Path,
     providers: &[ProviderConfig],
-) -> Result<(), String> {
+) -> Result<(), LockConstraintError> {
     let lock_path = base_dir.join("carina-providers.lock");
     let lock_file = match LockFile::load(&lock_path)? {
         Some(lf) => lf,
@@ -2326,10 +2562,11 @@ pub fn validate_lock_constraints(
             && let LockEntryKind::Version { version, .. } = &lock_entry.kind
             && !constraint.matches(version).unwrap_or(false)
         {
-            return Err(format!(
-                "Provider '{}' locked at version {}, but constraint '{}' requires a different version.\nRun `carina init --upgrade` to resolve.",
-                config.name, version, constraint.raw
-            ));
+            return Err(LockConstraintError::ConstraintMismatch {
+                provider: config.name.clone(),
+                locked_version: version.clone(),
+                constraint: constraint.raw.clone(),
+            });
         }
     }
 
@@ -2349,6 +2586,103 @@ mod tests {
     const SIGNED_FIXTURE_IDENTITY: &str = "https://github.com/sigstore-conformance/extremely-dangerous-public-oidc-beacon/.github/workflows/extremely-dangerous-oidc-beacon.yml@refs/heads/main";
     const SIGNED_FIXTURE_ISSUER: &str = "https://token.actions.githubusercontent.com";
     const SIGNED_FIXTURE_BUNDLE_URL: &str = "https://downloads.example.test/aws.sigstore.json";
+
+    fn signature_pin(identity: &str, issuer: &str) -> RegistrySignatureProtection {
+        RegistrySignatureProtection::Present(IdentityPin {
+            certificate_identity: identity.into(),
+            certificate_oidc_issuer: issuer.into(),
+        })
+    }
+
+    fn signed_fixture_pin() -> RegistrySignatureProtection {
+        signature_pin(SIGNED_FIXTURE_IDENTITY, SIGNED_FIXTURE_ISSUER)
+    }
+
+    /// The lock-file shape from commit cd228086. In particular, this predates
+    /// signing-identity pins and the top-level lock format version.
+    #[derive(Serialize, Deserialize)]
+    struct Cd228086LockFile {
+        #[serde(default)]
+        provider: Vec<Cd228086LockEntry>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Cd228086LockEntry {
+        name: String,
+        source: String,
+        #[serde(flatten)]
+        kind: Cd228086LockEntryKind,
+        sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        registry: Option<Cd228086RegistryLock>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "mode", rename_all = "lowercase")]
+    enum Cd228086LockEntryKind {
+        Version {
+            version: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            constraint: Option<String>,
+        },
+        Revision {
+            revision: String,
+            resolved_sha: String,
+        },
+        File,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Cd228086RegistryLock {
+        resolved_hostname: String,
+        api_base_url: String,
+        discovery_sha256: String,
+        #[serde(default)]
+        sequence_present: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
+        #[serde(default)]
+        valid_until_present: bool,
+        #[serde(default)]
+        signature_present: bool,
+        #[serde(default)]
+        transparency_log_present: bool,
+    }
+
+    fn fully_protected_lock_toml() -> String {
+        let mut lock = LockFile::default();
+        lock.upsert(LockEntry {
+            name: "aws".into(),
+            source: "carina-rs/aws".into(),
+            kind: LockEntryKind::Version {
+                version: "0.5.0".into(),
+                constraint: None,
+            },
+            sha256: "abc".into(),
+            registry: Some(RegistryLock {
+                resolved_hostname: "registry.carina-rs.dev".into(),
+                api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
+                discovery_sha256: "def".into(),
+                sequence: RegistrySequence::Present(7),
+                valid_until_present: true,
+                signature: signed_fixture_pin(),
+                transparency_log_present: true,
+            }),
+        });
+        toml::to_string_pretty(&lock).unwrap()
+    }
+
+    fn lock_toml_error(content: &str) -> LockFileError {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        fs::write(&lock_path, content).unwrap();
+        LockFile::load(&lock_path).expect_err("invalid protection metadata must be rejected")
+    }
+
+    fn assert_lock_toml_is_rejected(content: &str) {
+        let error = lock_toml_error(content);
+        assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
+    }
 
     fn version_entry(source: &str, version: &str) -> LockEntry {
         LockEntry {
@@ -2597,6 +2931,7 @@ mod tests {
     fn version_mode_toml_roundtrip() {
         let source = "github.com/carina-rs/carina-provider-aws";
         let lock = LockFile {
+            version: LockFile::CURRENT_VERSION,
             provider: vec![LockEntry {
                 name: "aws".into(),
                 source: source.into(),
@@ -2614,7 +2949,8 @@ mod tests {
             "serialized form should tag the variant: {toml_str}"
         );
 
-        let loaded: LockFile = toml::from_str(&toml_str).unwrap();
+        let loaded =
+            LockFile::from_toml_str(&toml_str, Path::new("carina-providers.lock")).unwrap();
         assert_eq!(loaded.provider[0].kind, lock.provider[0].kind);
     }
 
@@ -2623,6 +2959,7 @@ mod tests {
     #[test]
     fn registry_revision_mode_toml_roundtrip() {
         let lock = LockFile {
+            version: LockFile::CURRENT_VERSION,
             provider: vec![LockEntry {
                 name: "aws".into(),
                 source: "carina-rs/aws".into(),
@@ -2645,7 +2982,8 @@ mod tests {
             "{toml_str}"
         );
 
-        let loaded: LockFile = toml::from_str(&toml_str).unwrap();
+        let loaded =
+            LockFile::from_toml_str(&toml_str, Path::new("carina-providers.lock")).unwrap();
         assert_eq!(loaded.provider[0].kind, lock.provider[0].kind);
     }
 
@@ -2653,6 +2991,7 @@ mod tests {
     #[test]
     fn revision_mode_toml_roundtrip() {
         let lock = LockFile {
+            version: LockFile::CURRENT_VERSION,
             provider: vec![revision_entry(
                 "github.com/carina-rs/carina-provider-awscc",
                 "main",
@@ -2665,17 +3004,19 @@ mod tests {
             "serialized form should tag the variant: {toml_str}"
         );
         assert!(
-            !toml_str.contains("version ="),
+            !toml_str.contains("version = \""),
             "revision-mode entry must not serialize a version field: {toml_str}"
         );
 
-        let loaded: LockFile = toml::from_str(&toml_str).unwrap();
+        let loaded =
+            LockFile::from_toml_str(&toml_str, Path::new("carina-providers.lock")).unwrap();
         assert_eq!(loaded.provider[0].kind, lock.provider[0].kind);
     }
 
     #[test]
     fn file_mode_toml_roundtrip() {
         let lock = LockFile {
+            version: LockFile::CURRENT_VERSION,
             provider: vec![LockEntry {
                 name: "test".into(),
                 source: "file:///tmp/my-provider.wasm".into(),
@@ -2687,7 +3028,8 @@ mod tests {
         let toml_str = toml::to_string_pretty(&lock).unwrap();
         assert!(toml_str.contains("mode = \"file\""), "{toml_str}");
 
-        let loaded: LockFile = toml::from_str(&toml_str).unwrap();
+        let loaded =
+            LockFile::from_toml_str(&toml_str, Path::new("carina-providers.lock")).unwrap();
         assert_eq!(loaded.provider[0].kind, LockEntryKind::File);
     }
 
@@ -2701,7 +3043,8 @@ mod tests {
         let lock_path = dir.path().join("carina-providers.lock");
         fs::write(
             &lock_path,
-            r#"
+            r#"version = 1
+
 [[provider]]
 name = "awscc"
 source = "github.com/carina-rs/carina-provider-awscc"
@@ -2713,10 +3056,11 @@ sha256 = "abc"
 
         let err = LockFile::load(&lock_path)
             .expect_err("entry without a mode tag must not parse as any variant");
+        let rendered = err.to_string();
         assert!(
-            err.to_lowercase().contains("parse")
-                || err.contains("carina init")
-                || err.contains("mode"),
+            rendered.to_lowercase().contains("parse")
+                || rendered.contains("carina init")
+                || rendered.contains("mode"),
             "error should explain the parse failure: {err}"
         );
     }
@@ -2739,8 +3083,129 @@ sha256 = "abc"
     }
 
     #[test]
+    fn lock_file_roundtripped_through_cd228086_is_rejected() {
+        let old_lock: Cd228086LockFile = toml::from_str(&fully_protected_lock_toml()).unwrap();
+        let stripped = toml::to_string_pretty(&old_lock).unwrap();
+
+        assert!(!stripped.contains("version = 1"), "{stripped}");
+        assert!(!stripped.contains("certificate_identity"), "{stripped}");
+        assert!(!stripped.contains("certificate_oidc_issuer"), "{stripped}");
+        let error = lock_toml_error(&stripped);
+        assert!(
+            matches!(error, LockFileError::MissingVersion { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn lock_load_rejects_newer_format_with_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        let found = LockFile::CURRENT_VERSION + 1;
+        fs::write(
+            &lock_path,
+            format!(
+                "version = {found}\n\n[[provider]]\nmode = \"a-future-mode-current-carina-cannot-parse\"\n"
+            ),
+        )
+        .unwrap();
+
+        let error = LockFile::load(&lock_path).unwrap_err();
+        assert!(matches!(
+            error,
+            LockFileError::VersionTooNew {
+                found: actual,
+                supported: LockFile::CURRENT_VERSION,
+            } if actual == found
+        ));
+    }
+
+    #[test]
+    fn lock_load_rejects_unversioned_infra_lock_with_typed_remediation() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        fs::write(
+            &lock_path,
+            r#"[[provider]]
+name = "awscc"
+source = "github.com/carina-rs/carina-provider-awscc"
+mode = "revision"
+revision = "main"
+resolved_sha = "967e645a7153522ca60ef942183d3fc338fc7c27"
+sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
+"#,
+        )
+        .unwrap();
+
+        let error = LockFile::load(&lock_path).unwrap_err();
+        assert!(matches!(
+            &error,
+            LockFileError::MissingVersion { path } if path == &lock_path
+        ));
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("predates lock format versioning"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("protection fields were stripped"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Delete it, then regenerate it with `carina init`"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn lock_load_keeps_malformed_toml_as_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        fs::write(&lock_path, "version = [\n").unwrap();
+
+        let error = LockFile::load(&lock_path).unwrap_err();
+        assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
+    }
+
+    #[test]
+    fn lock_load_rejects_stripped_registry_identity_pin() {
+        let stripped = fully_protected_lock_toml()
+            .lines()
+            .filter(|line| {
+                !line.starts_with("certificate_identity")
+                    && !line.starts_with("certificate_oidc_issuer")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_lock_toml_is_rejected(&stripped);
+    }
+
+    #[test]
+    fn lock_load_rejects_stripped_signature_presence() {
+        let stripped = fully_protected_lock_toml().replace("signature_present = true\n", "");
+        assert_lock_toml_is_rejected(&stripped);
+    }
+
+    #[test]
+    fn lock_load_rejects_stripped_sequence_protection() {
+        for stripped in [
+            fully_protected_lock_toml().replace("sequence = 7\n", ""),
+            fully_protected_lock_toml().replace("sequence_present = true\n", ""),
+        ] {
+            assert_lock_toml_is_rejected(&stripped);
+        }
+    }
+
+    #[test]
+    fn lock_load_rejects_stripped_transparency_log_presence() {
+        let stripped = fully_protected_lock_toml().replace("transparency_log_present = true\n", "");
+        assert_lock_toml_is_rejected(&stripped);
+    }
+
+    #[test]
     fn registry_identity_pin_toml_roundtrip_preserves_flat_bytes() {
         let lock = LockFile {
+            version: LockFile::CURRENT_VERSION,
             provider: vec![LockEntry {
                 name: "aws".into(),
                 source: "carina-rs/aws".into(),
@@ -2753,11 +3218,9 @@ sha256 = "abc"
                     resolved_hostname: "registry.carina-rs.dev".into(),
                     api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
                     discovery_sha256: "def".into(),
-                    sequence_present: true,
-                    sequence: Some(7),
+                    sequence: RegistrySequence::Present(7),
                     valid_until_present: true,
-                    signature_present: true,
-                    pin: Some(IdentityPin {
+                    signature: RegistrySignatureProtection::Present(IdentityPin {
                         certificate_identity: SIGNED_FIXTURE_IDENTITY.into(),
                         certificate_oidc_issuer: SIGNED_FIXTURE_ISSUER.into(),
                     }),
@@ -2766,7 +3229,9 @@ sha256 = "abc"
             }],
         };
         let expected = format!(
-            r#"[[provider]]
+            r#"version = 1
+
+[[provider]]
 name = "aws"
 source = "carina-rs/aws"
 mode = "version"
@@ -2789,7 +3254,8 @@ transparency_log_present = false
 
         let serialized = toml::to_string_pretty(&lock).unwrap();
         assert_eq!(serialized, expected);
-        let reparsed: LockFile = toml::from_str(&serialized).unwrap();
+        let reparsed =
+            LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock")).unwrap();
         assert_eq!(toml::to_string_pretty(&reparsed).unwrap(), expected);
     }
 
@@ -3166,8 +3632,9 @@ transparency_log_present = false
             .registry
             .as_ref()
             .unwrap();
-        assert!(registry.signature_present);
-        let pin = registry.pin.as_ref().unwrap();
+        let RegistrySignatureProtection::Present(pin) = &registry.signature else {
+            panic!("verified signature must carry its identity pin");
+        };
         assert_eq!(pin.certificate_identity, SIGNED_FIXTURE_IDENTITY);
         assert_eq!(pin.certificate_oidc_issuer, SIGNED_FIXTURE_ISSUER);
 
@@ -3323,16 +3790,6 @@ transparency_log_present = false
             &initial_http,
         )
         .unwrap();
-        lock_file
-            .provider
-            .iter_mut()
-            .find(|entry| entry.source == "carina-rs/aws")
-            .unwrap()
-            .registry
-            .as_mut()
-            .unwrap()
-            .signature_present = false;
-
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let unsigned_http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
             "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
@@ -3353,14 +3810,14 @@ transparency_log_present = false
 
         assert!(error.contains("signature"), "{error}");
         assert!(error.contains("no override"), "{error}");
-        assert!(error.contains("identity-pinned provider"), "{error}");
+        assert!(error.contains("identity-pinned"), "{error}");
         assert!(error.contains("verifying out-of-band"), "{error}");
         assert!(error.contains("re-run carina init to re-pin"), "{error}");
         assert!(!unsigned_http.was_requested("https://downloads.example.test/aws.wasm"));
     }
 
     #[test]
-    fn registry_source_upgrades_presence_only_signature_lock_with_identity_pin() {
+    fn registry_source_reuses_existing_signature_identity_pin() {
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let mut lock_file = LockFile::default();
@@ -3376,11 +3833,9 @@ transparency_log_present = false
                 resolved_hostname: "registry.carina-rs.dev".into(),
                 api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
                 discovery_sha256: sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
-                sequence_present: true,
-                sequence: Some(7),
+                sequence: RegistrySequence::Present(7),
                 valid_until_present: true,
-                signature_present: true,
-                pin: None,
+                signature: signed_fixture_pin(),
                 transparency_log_present: false,
             }),
         });
@@ -3402,7 +3857,9 @@ transparency_log_present = false
             .registry
             .as_ref()
             .unwrap();
-        let pin = registry.pin.as_ref().unwrap();
+        let RegistrySignatureProtection::Present(pin) = &registry.signature else {
+            panic!("signed registry lock must retain its identity pin");
+        };
         assert_eq!(pin.certificate_identity, SIGNED_FIXTURE_IDENTITY);
         assert_eq!(pin.certificate_oidc_issuer, SIGNED_FIXTURE_ISSUER);
     }
@@ -3467,7 +3924,9 @@ transparency_log_present = false
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("carina-providers.lock");
         let one_sided_pin = format!(
-            r#"[[provider]]
+            r#"version = 1
+
+[[provider]]
 name = "aws"
 source = "carina-rs/aws"
 mode = "version"
@@ -3487,7 +3946,9 @@ transparency_log_present = false
 "#
         );
 
-        let direct_error = toml::from_str::<LockFile>(&one_sided_pin).unwrap_err();
+        let direct_error =
+            LockFile::from_toml_str(&one_sided_pin, Path::new("carina-providers.lock"))
+                .unwrap_err();
         assert!(
             direct_error.to_string().contains("inconsistent"),
             "{direct_error}"
@@ -3495,8 +3956,9 @@ transparency_log_present = false
         fs::write(&lock_path, one_sided_pin).unwrap();
 
         let error = LockFile::load(&lock_path).unwrap_err();
-        assert!(error.contains("inconsistent"), "{error}");
-        assert!(error.contains("certificate_identity"), "{error}");
+        let rendered = error.to_string();
+        assert!(rendered.contains("inconsistent"), "{error}");
+        assert!(rendered.contains("certificate_identity"), "{error}");
     }
 
     #[test]
@@ -3750,9 +4212,8 @@ transparency_log_present = false
             registry.api_base_url,
             "https://registry.carina-rs.dev/v1/providers/"
         );
-        assert!(registry.sequence_present);
-        assert_eq!(registry.sequence, Some(7));
-        assert!(!registry.signature_present);
+        assert_eq!(registry.sequence, RegistrySequence::Present(7));
+        assert_eq!(registry.signature, RegistrySignatureProtection::Absent);
     }
 
     #[test]
@@ -3838,11 +4299,9 @@ transparency_log_present = false
                 resolved_hostname: "registry.carina-rs.dev".into(),
                 api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
                 discovery_sha256: sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
-                sequence_present: true,
-                sequence: Some(7),
+                sequence: RegistrySequence::Present(7),
                 valid_until_present: true,
-                signature_present: false,
-                pin: None,
+                signature: RegistrySignatureProtection::Absent,
                 transparency_log_present: false,
             }),
         });
@@ -3913,11 +4372,9 @@ transparency_log_present = false
                 resolved_hostname: "registry.carina-rs.dev".into(),
                 api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
                 discovery_sha256: sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
-                sequence_present: true,
-                sequence: Some(7),
+                sequence: RegistrySequence::Present(7),
                 valid_until_present: true,
-                signature_present: false,
-                pin: None,
+                signature: RegistrySignatureProtection::Absent,
                 transparency_log_present: false,
             }),
         });
@@ -4081,11 +4538,9 @@ transparency_log_present = false
                 resolved_hostname: "registry.carina-rs.dev".into(),
                 api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
                 discovery_sha256: "old".into(),
-                sequence_present: true,
-                sequence: Some(7),
+                sequence: RegistrySequence::Present(7),
                 valid_until_present: true,
-                signature_present: false,
-                pin: None,
+                signature: RegistrySignatureProtection::Absent,
                 transparency_log_present: false,
             }),
         });
@@ -4124,11 +4579,9 @@ transparency_log_present = false
                 resolved_hostname: "registry.carina-rs.dev".into(),
                 api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
                 discovery_sha256: "old".into(),
-                sequence_present: true,
-                sequence: Some(7),
+                sequence: RegistrySequence::Present(7),
                 valid_until_present: false,
-                signature_present: false,
-                pin: None,
+                signature: RegistrySignatureProtection::Absent,
                 transparency_log_present: false,
             }),
         });
@@ -4167,11 +4620,9 @@ transparency_log_present = false
                 resolved_hostname: "registry.carina-rs.dev".into(),
                 api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
                 discovery_sha256: "old".into(),
-                sequence_present: true,
-                sequence: Some(7),
+                sequence: RegistrySequence::Present(7),
                 valid_until_present: true,
-                signature_present: false,
-                pin: None,
+                signature: RegistrySignatureProtection::Absent,
                 transparency_log_present: false,
             }),
         });
@@ -4210,11 +4661,9 @@ transparency_log_present = false
                 resolved_hostname: "registry.carina-rs.dev".into(),
                 api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
                 discovery_sha256: "old".into(),
-                sequence_present: true,
-                sequence: Some(7),
+                sequence: RegistrySequence::Present(7),
                 valid_until_present: true,
-                signature_present: false,
-                pin: None,
+                signature: RegistrySignatureProtection::Absent,
                 transparency_log_present: false,
             }),
         });
@@ -4255,11 +4704,9 @@ transparency_log_present = false
                 resolved_hostname: "registry.carina-rs.dev".into(),
                 api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
                 discovery_sha256: sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
-                sequence_present: true,
-                sequence: Some(7),
+                sequence: RegistrySequence::Present(7),
                 valid_until_present: true,
-                signature_present: true,
-                pin: None,
+                signature: signed_fixture_pin(),
                 transparency_log_present: false,
             }),
         });
@@ -4327,11 +4774,9 @@ transparency_log_present = false
                 resolved_hostname: "registry.carina-rs.dev".into(),
                 api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
                 discovery_sha256: sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
-                sequence_present: true,
-                sequence: Some(7),
+                sequence: RegistrySequence::Present(7),
                 valid_until_present: true,
-                signature_present: true,
-                pin: None,
+                signature: signed_fixture_pin(),
                 transparency_log_present: false,
             }),
         });
@@ -4384,11 +4829,9 @@ transparency_log_present = false
                 resolved_hostname: "registry.carina-rs.dev".into(),
                 api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
                 discovery_sha256: sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
-                sequence_present: true,
-                sequence: Some(7),
+                sequence: RegistrySequence::Present(7),
                 valid_until_present: true,
-                signature_present: true,
-                pin: None,
+                signature: signed_fixture_pin(),
                 transparency_log_present: false,
             }),
         });
@@ -4595,11 +5038,9 @@ transparency_log_present = false
                 resolved_hostname: "registry.carina-rs.dev".into(),
                 api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
                 discovery_sha256: sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
-                sequence_present: true,
-                sequence: Some(7),
+                sequence: RegistrySequence::Present(7),
                 valid_until_present: true,
-                signature_present: true,
-                pin: None,
+                signature: signature_pin("identity", "issuer"),
                 transparency_log_present: true,
             }),
         });

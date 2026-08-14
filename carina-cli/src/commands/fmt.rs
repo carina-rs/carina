@@ -11,18 +11,17 @@ use carina_core::config_loader::{
 };
 use carina_core::formatter::{self, FormatConfig};
 use carina_core::parser::{ProviderConfig, UseStatement};
-use carina_core::provider::ProviderFactory;
 use carina_core::schema::collect_all_block_names;
 
 use crate::error::AppError;
-use crate::wiring::{WiringContext, build_factories_from_providers_for_formatting};
-
-type FormattingFactoryLoadResult = (Vec<Box<dyn ProviderFactory>>, HashMap<String, String>);
+use crate::wiring::{
+    FormattingFactoryLoad, WiringContext, build_factories_from_providers_for_formatting,
+};
 
 #[derive(Default)]
 struct DirectoryBlockNames {
     block_names: HashMap<String, String>,
-    provider_load_failed: bool,
+    provider_load_diagnostics: HashMap<String, crate::wiring::ProviderFactoryDiagnostic>,
 }
 
 #[derive(Default)]
@@ -47,7 +46,7 @@ fn block_names_from_config<F>(
     build_factories: &mut F,
 ) -> DirectoryBlockNames
 where
-    F: FnMut(&[ProviderConfig], &Path) -> FormattingFactoryLoadResult,
+    F: FnMut(&[ProviderConfig], &Path) -> FormattingFactoryLoad,
 {
     if config.providers.is_empty() {
         return DirectoryBlockNames::default();
@@ -61,14 +60,14 @@ where
     let ctx = WiringContext::new(factories);
     DirectoryBlockNames {
         block_names: collect_all_block_names(ctx.schemas()),
-        provider_load_failed: !load_errors.is_empty(),
+        provider_load_diagnostics: load_errors,
     }
 }
 
 #[cfg(test)]
 fn block_names_for_dir<F>(directory: &Path, mut build_factories: F) -> DirectoryBlockNames
 where
-    F: FnMut(&[ProviderConfig], &Path) -> FormattingFactoryLoadResult,
+    F: FnMut(&[ProviderConfig], &Path) -> FormattingFactoryLoad,
 {
     let config = load_formatting_directory_config(directory);
     block_names_from_config(directory, &config, &mut build_factories)
@@ -167,7 +166,7 @@ fn resolve_directory_block_names<F>(
     build_factories: &mut F,
 ) -> Arc<DirectoryBlockNames>
 where
-    F: FnMut(&[ProviderConfig], &Path) -> FormattingFactoryLoadResult,
+    F: FnMut(&[ProviderConfig], &Path) -> FormattingFactoryLoad,
 {
     let directory = canonical_directory(directory);
     if let Some(block_names) = cache.get(&directory) {
@@ -227,7 +226,7 @@ fn run_fmt_with_factory_builder<F>(
     mut build_factories: F,
 ) -> Result<(), AppError>
 where
-    F: FnMut(&[ProviderConfig], &Path) -> FormattingFactoryLoadResult,
+    F: FnMut(&[ProviderConfig], &Path) -> FormattingFactoryLoad,
 {
     if path.is_file() {
         return Err(AppError::Config(format!(
@@ -253,7 +252,7 @@ where
     let directory_configs = invocation_directory_configs(path, &files, recursive);
     let import_map = invocation_import_map(&directory_configs);
     let mut block_names_by_dir: HashMap<PathBuf, Arc<DirectoryBlockNames>> = HashMap::new();
-    let mut provider_load_failed = false;
+    let mut provider_load_diagnostics = BTreeSet::new();
 
     for file in &files {
         let content = fs::read_to_string(file)
@@ -265,7 +264,12 @@ where
             &mut block_names_by_dir,
             &mut build_factories,
         );
-        provider_load_failed |= block_names.provider_load_failed;
+        provider_load_diagnostics.extend(
+            block_names
+                .provider_load_diagnostics
+                .iter()
+                .map(|(name, diagnostic)| format!("{name}: {diagnostic}")),
+        );
 
         match formatter::format_with_block_names(&content, &config, &block_names.block_names) {
             Ok(formatted) => {
@@ -289,11 +293,14 @@ where
         }
     }
 
-    if check && provider_load_failed {
+    if check && !provider_load_diagnostics.is_empty() {
         eprintln!(
             "{}",
             "Warning: provider(s) unavailable; block-syntax conversion skipped".yellow()
         );
+        for diagnostic in provider_load_diagnostics {
+            eprintln!("  {diagnostic}");
+        }
     }
 
     // Print summary
@@ -429,7 +436,7 @@ mod tests {
             directory.block_names.get("entries").map(String::as_str),
             Some("entry_from_factory")
         );
-        assert!(!directory.provider_load_failed);
+        assert!(directory.provider_load_diagnostics.is_empty());
     }
 
     #[test]
@@ -467,12 +474,12 @@ mod tests {
         let failed = block_names_for_dir(tmp.path(), |_, _| {
             (
                 Vec::<Box<dyn ProviderFactory>>::new(),
-                HashMap::from([("example".to_string(), "load failed".to_string())]),
+                HashMap::from([("example".to_string(), "load failed".to_string().into())]),
             )
         });
 
-        assert!(!skipped.provider_load_failed);
-        assert!(failed.provider_load_failed);
+        assert!(skipped.provider_load_diagnostics.is_empty());
+        assert!(!failed.provider_load_diagnostics.is_empty());
     }
 
     fn write_provider_caller(directory: &Path, provider: &str, module_path: &str) {

@@ -125,6 +125,10 @@ pub enum AppError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
 
+    /// Provider lock-file loading or constraint errors.
+    #[error(transparent)]
+    LockConstraint(#[from] carina_provider_resolver::LockConstraintError),
+
     /// Validation errors (schema mismatch, invalid config, etc.)
     #[error("{0}")]
     Validation(String),
