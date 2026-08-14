@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::{
 
 use carina_core::builtins;
 use carina_core::parser::snake_to_pascal;
-use carina_core::schema::{AttributeType, Shape, TypeIdentity, legacy_validator};
+use carina_core::schema::{AttributeType, Shape, TypeIdentity, TypeInSchema, legacy_validator};
 
 use super::{CompletionProvider, DslSource};
 
@@ -1327,7 +1327,16 @@ impl CompletionProvider {
         };
 
         let mut items = Self::builtin_function_completions_for_type(&effective);
-        items.extend(self.resource_ref_completions_for_type(&effective, text, base_path));
+        // `parse_exports_type_text` currently constructs only inline types and
+        // cannot produce `AttributeType::Ref`, so a schema-less context is
+        // sound here. Any future schema-derived annotation branch must carry
+        // its owning defs with it; silently yielding zero completions would
+        // regress the carina#2120 class.
+        items.extend(self.resource_ref_completions_for_type(
+            TypeInSchema::schemaless(&effective),
+            text,
+            base_path,
+        ));
         items
     }
 
@@ -1362,7 +1371,11 @@ impl CompletionProvider {
     ) -> Vec<CompletionItem> {
         let mut items = self.completions_for_type(attr_type, None);
         items.extend(Self::builtin_function_completions_for_type(attr_type));
-        items.extend(self.resource_ref_completions_for_type(attr_type, text, base_path));
+        items.extend(self.resource_ref_completions_for_type(
+            attr_type.in_schema(attr_defs),
+            text,
+            base_path,
+        ));
         items.extend(
             self.module_call_binding_ref_completions_for_type(
                 attr_type, attr_defs, text, base_path,
@@ -1441,7 +1454,7 @@ impl CompletionProvider {
     /// (see #2043 follow-up).
     fn resource_ref_completions_for_type(
         &self,
-        target: &AttributeType,
+        target: TypeInSchema<'_>,
         text: &str,
         base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
@@ -1456,7 +1469,8 @@ impl CompletionProvider {
                 continue;
             };
             for attr in schema.attributes.values() {
-                if !attr.attr_type.is_assignable_to(target) {
+                let source_type = schema.type_in_schema(&attr.attr_type);
+                if !source_type.is_assignable_to(target) {
                     continue;
                 }
                 let full_ref = format!("{}.{}", binding_name, attr.name);
@@ -1467,7 +1481,7 @@ impl CompletionProvider {
                         "Reference to {}'s {} ({})",
                         binding_name,
                         attr.name,
-                        attr.attr_type.type_name()
+                        source_type.resolved_type_name()
                     )),
                     insert_text: Some(full_ref),
                     ..Default::default()

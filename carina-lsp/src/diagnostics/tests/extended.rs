@@ -2041,6 +2041,153 @@ fn resource_ref_type_mismatch_resolves_binding_from_sibling_file() {
 }
 
 #[test]
+fn resource_ref_string_matches_ref_membered_sink_union() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let source_schema = ResourceSchema::new("source.Item")
+        .attribute(AttributeSchema::new("value", AttributeType::string()));
+    let sink_schema = ResourceSchema::new("sink.Item")
+        .attribute(AttributeSchema::new(
+            "target",
+            AttributeType::union(vec![
+                AttributeType::ref_("S".to_string()),
+                AttributeType::ref_("L".to_string()),
+            ]),
+        ))
+        .with_def("S", AttributeType::string())
+        .with_def("L", AttributeType::list(AttributeType::string()));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", source_schema);
+    schemas.insert("test", sink_schema);
+    let engine = custom_engine(schemas);
+    let doc = create_document(
+        r#"let source = test.source.Item {}
+
+let sink = test.sink.Item {
+    target = source.value
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("Type mismatch")),
+        "Ref-membered sink union should accept the String source: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn resource_ref_mismatch_displays_resolved_ref_type_names() {
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, legacy_validator,
+    };
+
+    let refined = |name: &str| {
+        AttributeType::refined_string_with_validator(
+            Some(TypeIdentity::bare(name)),
+            None,
+            None,
+            legacy_validator(|_| Ok(())),
+            None,
+        )
+    };
+    let source_schema = ResourceSchema::new("source.Item")
+        .attribute(AttributeSchema::new(
+            "value",
+            AttributeType::ref_("Source".to_string()),
+        ))
+        .with_def("Source", refined("SourceId"));
+    let sink_schema = ResourceSchema::new("sink.Item")
+        .attribute(AttributeSchema::new(
+            "target",
+            AttributeType::ref_("Target".to_string()),
+        ))
+        .with_def("Target", refined("TargetId"));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", source_schema);
+    schemas.insert("test", sink_schema);
+    let engine = custom_engine(schemas);
+    let doc = create_document(
+        r#"let source = test.source.Item {}
+
+let sink = test.sink.Item {
+    target = source.value
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let mismatch = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("Type mismatch"))
+        .expect("distinct resolved identities should produce a mismatch");
+    assert!(
+        mismatch.message.contains("expected TargetId, got SourceId"),
+        "resolved source and sink names should be displayed: {}",
+        mismatch.message,
+    );
+    assert!(
+        !mismatch.message.contains("Ref("),
+        "schema-internal Ref names must not leak into the diagnostic: {}",
+        mismatch.message,
+    );
+}
+
+#[test]
+fn resource_ref_mismatch_displays_resolved_union_member_names() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let source_schema = ResourceSchema::new("source.Item")
+        .attribute(AttributeSchema::new("value", AttributeType::bool()));
+    let sink_schema = ResourceSchema::new("sink.Item")
+        .attribute(AttributeSchema::new(
+            "target",
+            AttributeType::union(vec![
+                AttributeType::ref_("S".to_string()),
+                AttributeType::ref_("L".to_string()),
+            ]),
+        ))
+        .with_def("S", AttributeType::string())
+        .with_def("L", AttributeType::list(AttributeType::string()));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", source_schema);
+    schemas.insert("test", sink_schema);
+    let engine = custom_engine(schemas);
+    let doc = create_document(
+        r#"let source = test.source.Item {}
+
+let sink = test.sink.Item {
+    target = source.value
+}
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let mismatch = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("Type mismatch"))
+        .expect("Bool should be rejected by String | List<String>");
+    assert!(
+        mismatch
+            .message
+            .contains("expected String | List<String>, got Bool"),
+        "nested Ref members should be resolved for display: {}",
+        mismatch.message,
+    );
+    assert!(
+        !mismatch.message.contains("Ref("),
+        "schema-internal Ref names must not leak into the diagnostic: {}",
+        mismatch.message,
+    );
+}
+
+#[test]
 fn exports_cross_file_ref_no_false_positive() {
     // Regression: when exports.crn references a binding from a sibling file,
     // the parser produces a ResourceRef for `binding.attr`.
@@ -3856,6 +4003,47 @@ fn exports_type_check_resolves_resource_binding_from_sibling_file() {
             .any(|d| { d.message.contains("type mismatch") || d.message.contains("expected") }),
         "type-mismatch warning should fire for map(Bool) vs String. Got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn exports_ref_type_mismatch_displays_resolved_schema_name() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let schema = ResourceSchema::new("source.Item")
+        .attribute(AttributeSchema::new(
+            "value",
+            AttributeType::ref_("S".to_string()),
+        ))
+        .with_def("S", AttributeType::string());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+    let engine = custom_engine(schemas);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("downstream");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("main.crn"), "let source = test.source.Item {}\n").unwrap();
+    let exports = "exports {\n  value: Bool = source.value\n}\n";
+    std::fs::write(base.join("exports.crn"), exports).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "exports.crn", exports);
+    let mismatch_messages: Vec<&str> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .filter(|message| message.contains("type mismatch") && message.contains("source.value"))
+        .collect();
+    assert!(
+        mismatch_messages
+            .iter()
+            .any(|message| message.contains("expected Bool, got String")),
+        "resolved String mismatch should be reported: {mismatch_messages:?}",
+    );
+    assert!(
+        mismatch_messages
+            .iter()
+            .all(|message| !message.contains("Ref(")),
+        "all LSP mismatch surfaces should hide schema-internal Refs: {mismatch_messages:?}",
     );
 }
 

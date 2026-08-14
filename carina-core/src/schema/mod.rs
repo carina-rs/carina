@@ -503,6 +503,18 @@ pub struct AttributeType {
     pub(crate) kind: AttrTypeKind,
 }
 
+/// An [`AttributeType`] paired with the named definitions that give its
+/// [`AttrTypeKind::Ref`] nodes meaning.
+///
+/// Assignability compares types from two independently-owned resource schemas.
+/// Carrying each definition map inside this wrapper prevents the source and
+/// sink maps from being exchanged as indistinguishable positional arguments.
+#[derive(Clone, Copy)]
+pub struct TypeInSchema<'a> {
+    attr: &'a AttributeType,
+    defs: &'a BTreeMap<String, AttributeType>,
+}
+
 /// Internal variant enum carried by [`AttributeType`]. `pub(crate)` so
 /// it is visible to every file inside `carina-core` (validation, value
 /// canonicalization, differ, detail rows, etc.) but hidden from
@@ -1628,6 +1640,18 @@ pub(crate) fn empty_defs_for_schema_walks()
 }
 
 impl AttributeType {
+    /// Pair this type with the named definitions from its owning schema.
+    ///
+    /// Use the resulting [`TypeInSchema`] for cross-schema assignability so
+    /// source and sink references are resolved against their respective maps.
+    /// Prefer [`ResourceSchema::type_in_schema`] when the owning resource
+    /// schema is available; this lower-level constructor is for separately
+    /// derived contexts that carry a defs map explicitly. For schema-less,
+    /// structurally Ref-free types, use [`TypeInSchema::schemaless`].
+    pub fn in_schema<'a>(&'a self, defs: &'a BTreeMap<String, AttributeType>) -> TypeInSchema<'a> {
+        TypeInSchema { attr: self, defs }
+    }
+
     /// Walk through any [`AttrTypeKind::Ref`] chain at the top of this
     /// type, returning the first non-`Ref` target wrapped in
     /// [`ResolvedAttrType`].
@@ -2768,19 +2792,6 @@ impl AttributeType {
         }
     }
 
-    /// Check if a type name is accepted by this type.
-    /// For Union types, returns true if any member accepts the name.
-    /// For other types, returns true if self.type_name() == name.
-    pub fn accepts_type_name(&self, name: &str) -> bool {
-        match &self.kind {
-            AttrTypeKind::Union(types) => types
-                .as_raw_slice()
-                .iter()
-                .any(|t| t.accepts_type_name(name)),
-            _ => self.type_name() == name,
-        }
-    }
-
     /// Check if this type is a String-based Custom type.
     /// Used for cross-schema type compatibility: all String-based Custom types
     /// are considered compatible with each other.
@@ -2799,34 +2810,43 @@ impl AttributeType {
             }
         )
     }
+}
 
-    /// Check if a value of `self`'s type can be assigned to a sink of
-    /// `sink`'s type. Directional: narrowing source → wider sink is OK,
-    /// but widening source → narrower sink is NG.
+impl TypeInSchema<'_> {
+    /// Check if a value of this source type can be assigned to `sink`.
+    /// Directional: narrowing source → wider sink is OK, but widening source →
+    /// narrower sink is NG. Each side resolves references against the
+    /// definition map carried by its own [`TypeInSchema`].
     ///
     /// Rules (first match wins):
-    /// 1. Union sink: OK if source is assignable to any member.
-    /// 2. Union source: OK iff source is assignable to sink for every member.
-    /// 3. Custom→Custom with both `identity: Some`: the source's identity
-    ///    must be [`TypeIdentity::assignable_to`] the sink's, any length
-    ///    range must be contained by the sink's range, and the base types
-    ///    must also be assignable. This is the final verdict for identified
-    ///    custom types: pattern checks are subsumed by identity subsumption
-    ///    and are not consulted in this arm, while length containment remains
-    ///    a structural safety check. Directional per-axis subsumption — an
+    /// 1. Peel top-level Ref chains on both sides. A missing definition,
+    ///    cycle, or hop-limit failure rejects that comparison.
+    /// 2. Union source: OK iff every source member is assignable to the sink.
+    /// 3. Union sink: OK if source is assignable to any member.
+    /// 4. List→List: recurse on the element types. Ordering and length metadata
+    ///    remain intentionally ignored, matching the old `type_name` behavior.
+    /// 5. Map→Map: recurse on both key and value types.
+    /// 6. Custom→Custom with both `identity: Some`: the source's identity
+    ///    must be [`TypeIdentity::assignable_to`] the sink's and any length
+    ///    range must be contained by the sink's range. Enum→Enum additionally
+    ///    recurses on the two base types. This is the final verdict for
+    ///    identified custom types: pattern checks are subsumed by identity
+    ///    subsumption and are not consulted in this arm, while length
+    ///    containment remains a structural safety check. Directional
+    ///    per-axis subsumption — an
     ///    empty axis on the **sink** widens (any source matches), but an empty
     ///    axis on the **source** against a populated sink is rejected (no
     ///    evidence). So `aws.iam.Role.Arn` flows into `aws.Arn` (sink is
     ///    wider) but `aws.Arn` does not flow into `aws.iam.Role.Arn` (source
     ///    has no Role-specific evidence). `aws.Region` and `gcp.Region` are
     ///    rejected both ways (populated providers differ). Closes carina#3218.
-    /// 4. Custom→Custom where at least one side has `identity: None`: check
+    /// 7. Custom→Custom where at least one side has `identity: None`: check
     ///    pattern (literal equality) and length containment (source ⊆ sink),
-    ///    then recurse on base. For both-identified pairs, see rule 3.
-    /// 5. Custom source → non-Custom sink: recurse on `source.base`.
-    /// 6. non-Custom source → Custom sink: NG (source has no proof of
+    ///    then recurse on base. For both-identified pairs, see rule 6.
+    /// 8. Custom source → non-Custom sink: recurse on `source.base`.
+    /// 9. non-Custom source → Custom sink: NG (source has no proof of
     ///    satisfying the sink's identity/pattern/length).
-    /// 7. Otherwise: same primitive type names.
+    /// 10. Otherwise: same primitive type names.
     ///
     /// # Conservative pattern/length policy
     ///
@@ -2849,21 +2869,166 @@ impl AttributeType {
     /// **Do not loosen these checks** without a concrete plan to track
     /// regex-containment proofs through the type system. Loosening here
     /// re-introduces the silent-false-positive class that #2218 closed.
-    pub fn is_assignable_to(&self, sink: &AttributeType) -> bool {
+    pub fn is_assignable_to(self, sink: TypeInSchema<'_>) -> bool {
+        let mut source_visited_refs = Vec::new();
+        let mut sink_visited_refs = Vec::new();
+        self.is_assignable_to_on_paths(sink, &mut source_visited_refs, &mut sink_visited_refs)
+    }
+}
+
+impl<'source> TypeInSchema<'source> {
+    /// Pair a structurally Ref-free type with an empty definition context.
+    ///
+    /// Use this only when the type cannot contain [`AttrTypeKind::Ref`] at any
+    /// depth, such as a type parsed from an exports annotation. A type derived
+    /// from a resource schema must instead travel with that schema's defs via
+    /// [`ResourceSchema::type_in_schema`] or [`AttributeType::in_schema`].
+    pub fn schemaless(attr: &'source AttributeType) -> Self {
+        attr.in_schema(empty_defs_for_schema_walks())
+    }
+
+    /// Return a defs-aware display name, resolving Refs recursively through
+    /// Union members and List/Map element types.
+    ///
+    /// Missing definitions, cycles, and hop-limit failures fall back to the
+    /// raw declared name at the failing node so diagnostics remain total and
+    /// never panic.
+    pub fn resolved_type_name(&self) -> String {
+        let mut visited_refs = Vec::new();
+        self.resolved_type_name_on_path(&mut visited_refs)
+    }
+
+    fn resolved_type_name_on_path(&self, visited_refs: &mut Vec<&'source str>) -> String {
+        let Ok(resolution) = resolve_refs_on_path(self.attr, self.defs, visited_refs) else {
+            return self.attr.type_name();
+        };
+        let resolved = resolution.attr;
+        let name = match &resolved.kind {
+            AttrTypeKind::List {
+                element_type: inner,
+                ..
+            } => format!(
+                "List<{}>",
+                inner
+                    .in_schema(self.defs)
+                    .resolved_type_name_on_path(visited_refs)
+            ),
+            // `type_name` intentionally renders only a Map's value type; keep
+            // that public spelling while resolving the displayed node.
+            AttrTypeKind::Map { value: inner, .. } => format!(
+                "Map<{}>",
+                inner
+                    .in_schema(self.defs)
+                    .resolved_type_name_on_path(visited_refs)
+            ),
+            AttrTypeKind::Union(members) => members
+                .as_raw_slice()
+                .iter()
+                .map(|member| {
+                    member
+                        .in_schema(self.defs)
+                        .resolved_type_name_on_path(visited_refs)
+                })
+                .collect::<Vec<_>>()
+                .join(" | "),
+            _ => resolved.type_name(),
+        };
+        visited_refs.truncate(resolution.restore_len);
+        name
+    }
+
+    fn is_assignable_to_on_paths<'sink>(
+        self,
+        sink: TypeInSchema<'sink>,
+        source_visited_refs: &mut Vec<&'source str>,
+        sink_visited_refs: &mut Vec<&'sink str>,
+    ) -> bool {
+        let Ok(source_resolution) = resolve_refs_on_path(self.attr, self.defs, source_visited_refs)
+        else {
+            return false;
+        };
+        let Ok(sink_resolution) = resolve_refs_on_path(sink.attr, sink.defs, sink_visited_refs)
+        else {
+            source_visited_refs.truncate(source_resolution.restore_len);
+            return false;
+        };
+
+        let source = TypeInSchema {
+            attr: source_resolution.attr,
+            defs: self.defs,
+        };
+        let sink = TypeInSchema {
+            attr: sink_resolution.attr,
+            defs: sink.defs,
+        };
+        let result = source.is_assignable_to_resolved(sink, source_visited_refs, sink_visited_refs);
+        source_visited_refs.truncate(source_resolution.restore_len);
+        sink_visited_refs.truncate(sink_resolution.restore_len);
+        result
+    }
+
+    fn is_assignable_to_resolved<'sink>(
+        self,
+        sink: TypeInSchema<'sink>,
+        source_visited_refs: &mut Vec<&'source str>,
+        sink_visited_refs: &mut Vec<&'sink str>,
+    ) -> bool {
         use AttrTypeKind::*;
-        if let Union(members) = &sink.kind {
-            return members
-                .as_raw_slice()
-                .iter()
-                .any(|m| self.is_assignable_to(m));
+        if let Union(members) = &self.attr.kind {
+            return members.as_raw_slice().iter().all(|member| {
+                member.in_schema(self.defs).is_assignable_to_on_paths(
+                    sink,
+                    source_visited_refs,
+                    sink_visited_refs,
+                )
+            });
         }
-        if let Union(members) = &self.kind {
-            return members
-                .as_raw_slice()
-                .iter()
-                .all(|m| m.is_assignable_to(sink));
+        if let Union(members) = &sink.attr.kind {
+            return members.as_raw_slice().iter().any(|member| {
+                self.is_assignable_to_on_paths(
+                    member.in_schema(sink.defs),
+                    source_visited_refs,
+                    sink_visited_refs,
+                )
+            });
         }
-        match (&self.kind, &sink.kind) {
+        match (&self.attr.kind, &sink.attr.kind) {
+            (
+                List {
+                    element_type: source_element,
+                    ..
+                },
+                List {
+                    element_type: sink_element,
+                    ..
+                },
+            ) => source_element
+                .in_schema(self.defs)
+                .is_assignable_to_on_paths(
+                    sink_element.in_schema(sink.defs),
+                    source_visited_refs,
+                    sink_visited_refs,
+                ),
+            (
+                Map {
+                    key: source_key,
+                    value: source_value,
+                },
+                Map {
+                    key: sink_key,
+                    value: sink_value,
+                },
+            ) => {
+                source_key.in_schema(self.defs).is_assignable_to_on_paths(
+                    sink_key.in_schema(sink.defs),
+                    source_visited_refs,
+                    sink_visited_refs,
+                ) && source_value.in_schema(self.defs).is_assignable_to_on_paths(
+                    sink_value.in_schema(sink.defs),
+                    source_visited_refs,
+                    sink_visited_refs,
+                )
+            }
             (
                 String {
                     identity: Some(s_id),
@@ -2892,7 +3057,14 @@ impl AttributeType {
                     base: k_base,
                     ..
                 },
-            ) => s_id.assignable_to(k_id) && s_base.is_assignable_to(k_base),
+            ) => {
+                s_id.assignable_to(k_id)
+                    && s_base.in_schema(self.defs).is_assignable_to_on_paths(
+                        k_base.in_schema(sink.defs),
+                        source_visited_refs,
+                        sink_visited_refs,
+                    )
+            }
             // Anonymous source → identified sink has no proof of identity.
             (
                 String { identity: None, .. }
@@ -2959,11 +3131,11 @@ impl AttributeType {
                 f64_range_contains(s_range.as_ref(), k_range.as_ref())
             }
             (String { .. }, _) | (Int { .. }, _) | (Float { .. }, _)
-                if self.type_name() != sink.type_name() =>
+                if self.attr.type_name() != sink.attr.type_name() =>
             {
                 false
             }
-            (_a, _b) => self.type_name() == sink.type_name(),
+            (_a, _b) => self.attr.type_name() == sink.attr.type_name(),
         }
     }
 }
@@ -4905,6 +5077,15 @@ impl ResourceSchema {
     pub fn attribute(mut self, schema: AttributeSchema) -> Self {
         self.attributes.insert(schema.name.clone(), schema);
         self
+    }
+
+    /// Pair an attribute or derived subtype with this resource's definitions.
+    ///
+    /// Prefer this over [`AttributeType::in_schema`] whenever the owning
+    /// resource schema is in hand so the attribute cannot accidentally be
+    /// paired with another resource's same-shaped defs map.
+    pub fn type_in_schema<'a>(&'a self, attr: &'a AttributeType) -> TypeInSchema<'a> {
+        attr.in_schema(&self.defs)
     }
 
     /// Resolve `ty` against this resource schema's definition map.

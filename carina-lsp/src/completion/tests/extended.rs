@@ -509,6 +509,44 @@ awscc.ec2.Subnet {
 }
 
 #[test]
+fn type_based_completion_resolves_ref_typed_source_attribute() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let source_schema = ResourceSchema::new("source.Item")
+        .attribute(AttributeSchema::new(
+            "value",
+            AttributeType::ref_("Text".to_string()),
+        ))
+        .with_def("Text", AttributeType::string());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", source_schema);
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
+    let target = AttributeType::string();
+    let target_defs = std::collections::BTreeMap::new();
+    let completions = provider.value_completions_for_attribute_type(
+        &target,
+        &target_defs,
+        "let source = test.source.Item {}\n",
+        None,
+    );
+    let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+    assert!(
+        labels.contains(&"source.value"),
+        "Ref(Text) source should be offered for a String target. Got: {labels:?}",
+    );
+    let source_value = completions
+        .iter()
+        .find(|item| item.label == "source.value")
+        .expect("matching Ref-typed source completion should be present");
+    assert_eq!(
+        source_value.detail.as_deref(),
+        Some("Reference to source's value (String)"),
+        "completion detail should display the resolved schema type",
+    );
+}
+
+#[test]
 #[ignore = "requires provider schemas"]
 fn type_based_completion_does_not_suggest_region_or_boolean() {
     // For reference attributes like route_table_id (Custom("RouteTableId")),

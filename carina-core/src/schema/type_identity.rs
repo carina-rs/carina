@@ -157,7 +157,8 @@ impl TypeIdentity {
     /// The two rules are deliberately separate (see carina#3218): the
     /// symmetric equivalence is correct for display and schema-registry
     /// lookup, but the assignment check inside
-    /// [`AttributeType::is_assignable_to`] needs the directional shape.
+    /// [`TypeInSchema::is_assignable_to`](super::TypeInSchema::is_assignable_to)
+    /// needs the directional shape.
     ///
     /// Rules, per-axis:
     ///
