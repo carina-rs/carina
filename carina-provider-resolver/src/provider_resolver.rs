@@ -712,6 +712,9 @@ pub fn download_url_wasm(source: &str, version: &str) -> Result<String, String> 
 }
 
 const DEFAULT_REGISTRY_HOST: &str = "registry.carina-rs.dev";
+// Registry sequence advances only when the canonical version-set digest changes;
+// timestamp-only re-issues reuse it. A million content changes for one provider
+// is unreachable in practice, so the ceiling leaves ample room for real updates.
 const MAX_SEQUENCE_FAST_FORWARD: u64 = 1_000_000;
 const MAX_SIGNATURE_BUNDLE_BYTES: usize = 1024 * 1024;
 const IDENTITY_REPIN_REMEDIATION: &str = "After verifying out-of-band that this is intended (a legitimate signing-identity change or a deliberate downgrade to a pre-signing version), remove that provider's entry from carina-providers.lock and re-run carina init to re-pin.";
@@ -1056,8 +1059,11 @@ fn enforce_registry_freshness(
                 source.namespace, source.name, previous, sequence
             ));
         }
-        // TODO(#12): replace this local ceiling with a transparency-log bound
-        // once the checksum log is available as the higher-integrity source.
+        // This ceiling already satisfies the protocol's bounded re-bootstrap branch:
+        // following IDENTITY_REPIN_REMEDIATION removes the lock entry, so the next
+        // resolve accepts the current sequence as a fresh baseline.
+        // TODO(carina-rs/registry#13): upgrade to the higher-integrity branch by
+        // deriving the ceiling from the checksum transparency log once it exists.
         if sequence.saturating_sub(previous) > MAX_SEQUENCE_FAST_FORWARD {
             return Err(format!(
                 "registry sequence fast-forward for {}/{} is too large: previous {}, got {}",
