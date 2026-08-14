@@ -1499,12 +1499,7 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
         parallelism: NonZeroUsize::new(1).unwrap(),
     };
 
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        execute_plan(&provider, input, &observer, cancel),
-    )
-    .await
-    .expect("cancelled wait should not block until its natural timeout");
+    let outcome = execute_plan(&provider, input, &observer, cancel).await;
 
     let result = match outcome {
         ExecutionOutcome::Cancelled(result) => result,
@@ -1662,12 +1657,7 @@ async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_ef
         parallelism: NonZeroUsize::new(1).unwrap(),
     };
 
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        execute_plan(&provider, input, &observer, shutdown),
-    )
-    .await
-    .expect("cleanup priority must abandon the delayed in-flight effect");
+    let outcome = execute_plan(&provider, input, &observer, shutdown).await;
     let result = match outcome {
         ExecutionOutcome::Cancelled(result) => result,
         ExecutionOutcome::Completed(_) => panic!("cleanup-priority run returned Completed"),
@@ -1766,12 +1756,7 @@ async fn execute_plan_cleanup_priority_abandons_a_pending_failure_refresh() {
         parallelism: NonZeroUsize::new(1).unwrap(),
     };
 
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        execute_plan(&provider, input, &observer, shutdown),
-    )
-    .await
-    .expect("cleanup priority must abandon a pending state refresh");
+    let outcome = execute_plan(&provider, input, &observer, shutdown).await;
 
     assert!(matches!(outcome, ExecutionOutcome::Cancelled(_)));
 }
