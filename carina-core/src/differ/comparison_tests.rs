@@ -1525,6 +1525,177 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
     );
 }
 
+/// carina#3740: persisted values merged into an authored container must pass
+/// through the same structural canonicalization as desired and current state.
+#[test]
+fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
+    use crate::provider::RawSavedAttrs;
+    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+    use crate::value::{canonicalize_resources_with_schemas, canonicalize_states_with_schemas};
+
+    let statement = AttributeType::struct_(
+        "Statement".to_string(),
+        vec![
+            StructField::new("effect", AttributeType::string()),
+            StructField::new(
+                "action",
+                AttributeType::union(vec![
+                    AttributeType::string(),
+                    AttributeType::list(AttributeType::string()),
+                ]),
+            ),
+        ],
+    );
+    let mut schema = ResourceSchema::new("iam.policy");
+    schema.attributes.insert(
+        "statement".to_string(),
+        AttributeSchema::new("statement", statement),
+    );
+    let mut registry = SchemaRegistry::new();
+    registry.insert("aws", schema.clone());
+
+    let mut desired_statement = IndexMap::new();
+    desired_statement.insert(
+        "effect".to_string(),
+        Value::Concrete(ConcreteValue::String("Allow".to_string())),
+    );
+    let mut resources = vec![Resource::new("iam.policy", "p1").with_attribute(
+        "statement",
+        Value::Concrete(ConcreteValue::Map(desired_statement)),
+    )];
+    resources[0].id.provider = "aws".to_string();
+    canonicalize_resources_with_schemas(&mut resources, &registry);
+
+    let persisted_statement = || {
+        IndexMap::from([
+            (
+                "effect".to_string(),
+                Value::Concrete(ConcreteValue::String("Allow".to_string())),
+            ),
+            (
+                "action".to_string(),
+                Value::Concrete(ConcreteValue::String("s3:GetObject".to_string())),
+            ),
+        ])
+    };
+    let id = resources[0].id.clone();
+    let mut states = HashMap::from([(
+        id.clone(),
+        State::existing(
+            id.clone(),
+            HashMap::from([(
+                "statement".to_string(),
+                Value::Concrete(ConcreteValue::Map(persisted_statement())),
+            )]),
+        ),
+    )]);
+    canonicalize_states_with_schemas(&mut states, &registry);
+
+    let saved_attrs = RawSavedAttrs::from_persisted(HashMap::from([(
+        id.clone(),
+        HashMap::from([(
+            "statement".to_string(),
+            Value::Concrete(ConcreteValue::Map(persisted_statement())),
+        )]),
+    )]))
+    .lift(&registry);
+
+    let result = diff(
+        &resources[0],
+        states.get(&id).unwrap(),
+        saved_attrs.get(&id),
+        None,
+        Some(&schema),
+    );
+    assert!(
+        matches!(result, Diff::NoChange(_)),
+        "carina#3740: a saved scalar nested under an authored Struct must canonicalize before \
+         merge_with_saved compares it with current state — got {result:?}"
+    );
+}
+
+/// carina#3740: a persisted secret hash is an opaque scalar sentinel. Saved
+/// reconciliation must not turn it into a list before `merge_with_saved`
+/// carries the unauthored nested field into the effective desired value.
+#[test]
+fn carina3740_saved_nested_secret_hash_union_scalar_is_no_change() {
+    use crate::provider::RawSavedAttrs;
+    use crate::schema::{AttributeSchema, ResourceSchema, StructField};
+    use crate::value::SECRET_PREFIX;
+
+    let config = AttributeType::struct_(
+        "Config".to_string(),
+        vec![
+            StructField::new("enabled", AttributeType::bool()),
+            StructField::new(
+                "password",
+                AttributeType::union(vec![
+                    AttributeType::string(),
+                    AttributeType::list(AttributeType::string()),
+                ]),
+            ),
+        ],
+    );
+    let mut schema = ResourceSchema::new("service.Widget");
+    schema
+        .attributes
+        .insert("config".to_string(), AttributeSchema::new("config", config));
+    let mut registry = SchemaRegistry::new();
+    registry.insert("test", schema.clone());
+
+    let desired_config = IndexMap::from([(
+        "enabled".to_string(),
+        Value::Concrete(ConcreteValue::Bool(true)),
+    )]);
+    let mut desired = Resource::new("service.Widget", "widget").with_attribute(
+        "config",
+        Value::Concrete(ConcreteValue::Map(desired_config)),
+    );
+    desired.id.provider = "test".to_string();
+
+    let secret_hash = format!("{SECRET_PREFIX}deadbeef");
+    let persisted_config = || {
+        IndexMap::from([
+            (
+                "enabled".to_string(),
+                Value::Concrete(ConcreteValue::Bool(true)),
+            ),
+            (
+                "password".to_string(),
+                Value::Concrete(ConcreteValue::String(secret_hash.clone())),
+            ),
+        ])
+    };
+    let current = State::existing(
+        desired.id.clone(),
+        HashMap::from([(
+            "config".to_string(),
+            Value::Concrete(ConcreteValue::Map(persisted_config())),
+        )]),
+    );
+    let saved_attrs = RawSavedAttrs::from_persisted(HashMap::from([(
+        desired.id.clone(),
+        HashMap::from([(
+            "config".to_string(),
+            Value::Concrete(ConcreteValue::Map(persisted_config())),
+        )]),
+    )]))
+    .lift(&registry);
+
+    let result = diff(
+        &desired,
+        &current,
+        saved_attrs.get(&desired.id),
+        None,
+        Some(&schema),
+    );
+    assert!(
+        matches!(result, Diff::NoChange(_)),
+        "carina#3740: matching current and saved secret hashes nested under an authored Struct \
+         must converge — got {result:?}"
+    );
+}
+
 /// carina#3122 SHAPE A: a steady-state no-op plan on awscc CloudFront
 /// `Distribution` must NOT report a change for `allowed_methods` /
 /// `cached_methods`. Those are nested two Struct levels deep

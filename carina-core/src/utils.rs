@@ -823,10 +823,13 @@ pub fn lift_state_enum_leaves(
     }
 }
 
-/// Internal enum-lift worker for [`RawSavedAttrs::lift`](crate::provider::RawSavedAttrs::lift).
+/// Internal saved-state reconciliation worker for
+/// [`RawSavedAttrs::lift`](crate::provider::RawSavedAttrs::lift).
 ///
-/// The lift is map-driven: every persisted entry is resolved from its own
-/// resource ID. Entries whose schema is not in `registry` are skipped.
+/// Reconciliation is map-driven: every persisted entry resolves its schema
+/// once from its own resource ID, then receives both the enum lift and
+/// structural canonicalization. Entries whose schema is not in `registry` are
+/// skipped.
 pub(crate) fn lift_saved_state_enum_leaves(
     saved_attrs: &mut std::collections::HashMap<
         crate::resource::ResourceId,
@@ -834,9 +837,9 @@ pub(crate) fn lift_saved_state_enum_leaves(
     >,
     registry: &crate::schema::SchemaRegistry,
 ) {
-    // carina#3739: hydration is map-driven, so lifting must cover the same map.
-    // This includes materialized for-loop children before an expanded resource
-    // slice is available.
+    // carina#3739: hydration is map-driven, so reconciliation must cover the
+    // same map. This includes materialized for-loop children before an expanded
+    // resource slice is available.
     for (id, attrs) in saved_attrs.iter_mut() {
         if let Some(schema) = registry.get(
             &id.provider,
@@ -844,6 +847,11 @@ pub(crate) fn lift_saved_state_enum_leaves(
             crate::schema::SchemaKind::Resource,
         ) {
             lift_state_enum_leaves(attrs, schema);
+            crate::value::canonicalize_attribute_map_with_schema(
+                attrs,
+                schema,
+                crate::value::EnumIdentifierPhase::StateText,
+            );
         }
     }
 }

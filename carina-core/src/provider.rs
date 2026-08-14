@@ -498,7 +498,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type SavedAttrs = HashMap<ResourceId, HashMap<String, Value>>;
 
 /// Saved attributes decoded from persisted state but not yet reconciled
-/// with the current provider schemas.
+/// with the current provider schemas for enum or structural value shapes.
 ///
 /// This type cannot be passed to planning or refresh hydration. Consume it
 /// with [`RawSavedAttrs::lift`] to obtain [`LiftedSavedAttrs`].
@@ -511,7 +511,11 @@ impl RawSavedAttrs {
         Self(saved_attrs)
     }
 
-    /// Lift every persisted entry using the schema selected by its resource ID.
+    /// Lift enum leaves and structurally canonicalize every persisted entry
+    /// using the schema selected by its resource ID.
+    ///
+    /// carina#3740: both rewrites live at this single raw-to-lifted seam so a
+    /// saved map cannot reach hydration or the differ with only one applied.
     pub fn lift(mut self, registry: &SchemaRegistry) -> LiftedSavedAttrs {
         crate::utils::lift_saved_state_enum_leaves(&mut self.0, registry);
         LiftedSavedAttrs(self.0)
@@ -523,8 +527,9 @@ impl RawSavedAttrs {
     }
 }
 
-/// Saved attributes whose enum leaves have been lifted against the current
-/// schemas and are safe for hydration and planning.
+/// Saved attributes whose enum leaves and structural value shapes have been
+/// canonicalized against the current schemas and are safe for hydration and
+/// planning.
 ///
 /// carina#3739: the private field deliberately prevents construction from a
 /// plain map. The only public conversion from persisted data is
@@ -1638,6 +1643,253 @@ mod tests {
         lifted.remap_resource_id(&from, to.clone());
         assert!(lifted.get(&from).is_none());
         assert!(lifted.get(&to).is_some());
+    }
+
+    #[test]
+    fn raw_saved_attrs_lift_structurally_canonicalizes_nested_values() {
+        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+        let statement = AttributeType::struct_(
+            "Statement".to_string(),
+            vec![StructField::new(
+                "action",
+                AttributeType::union(vec![
+                    AttributeType::string(),
+                    AttributeType::list(AttributeType::string()),
+                ]),
+            )],
+        );
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "aws",
+            ResourceSchema::new("iam.policy")
+                .attribute(AttributeSchema::new("statement", statement)),
+        );
+
+        let id = ResourceId::with_provider_identity("aws", "iam.policy", "p1", None);
+        let raw = RawSavedAttrs::from_persisted(HashMap::from([(
+            id.clone(),
+            HashMap::from([(
+                "statement".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "action".to_string(),
+                    Value::Concrete(ConcreteValue::String("s3:GetObject".to_string())),
+                )]))),
+            )]),
+        )]));
+
+        let lifted = raw.lift(&registry);
+        let Value::Concrete(ConcreteValue::Map(statement)) = &lifted.get(&id).unwrap()["statement"]
+        else {
+            panic!("statement must remain a map");
+        };
+        assert_eq!(
+            statement["action"],
+            Value::Concrete(ConcreteValue::StringList(vec!["s3:GetObject".to_string()])),
+            "carina#3740: RawSavedAttrs::lift must apply the shared structural canonicalizer"
+        );
+    }
+
+    #[test]
+    fn raw_saved_attrs_lift_preserves_attribute_absent_from_schema() {
+        let id = ResourceId::with_provider_identity("aws", "service.Widget", "widget", None);
+        let original = Value::Concrete(ConcreteValue::String("opaque".to_string()));
+        let raw = RawSavedAttrs::from_persisted(HashMap::from([(
+            id.clone(),
+            HashMap::from([("provider_extension".to_string(), original.clone())]),
+        )]));
+
+        let lifted = raw.lift(&widget_status_registry());
+
+        assert_eq!(
+            lifted.get(&id).unwrap()["provider_extension"],
+            original,
+            "carina#3740: a saved attribute absent from a known resource schema must pass through"
+        );
+    }
+
+    #[test]
+    fn raw_saved_attrs_lift_skips_resource_type_absent_from_registry() {
+        let id = ResourceId::with_provider_identity("aws", "service.Unknown", "unknown", None);
+        let original = Value::Concrete(ConcreteValue::String("Enabled".to_string()));
+        let raw = RawSavedAttrs::from_persisted(HashMap::from([(
+            id.clone(),
+            HashMap::from([("status".to_string(), original.clone())]),
+        )]));
+
+        let lifted = raw.lift(&widget_status_registry());
+
+        assert_eq!(
+            lifted.get(&id).unwrap()["status"],
+            original,
+            "carina#3740: a saved entry whose resource type is absent from the registry must be skipped"
+        );
+    }
+
+    #[test]
+    fn raw_saved_attrs_lift_is_idempotent() {
+        use crate::schema::{AttributeSchema, ResourceSchema};
+
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "aws",
+            ResourceSchema::new("service.Widget")
+                .attribute(AttributeSchema::new(
+                    "status",
+                    crate::schema::AttributeType::enum_(
+                        crate::schema::enum_identity("Status", Some("aws.service.Widget")),
+                        Some(vec!["Enabled".to_string()]),
+                        vec![("Enabled".to_string(), "enabled".to_string())],
+                        None,
+                        None,
+                    ),
+                ))
+                .attribute(AttributeSchema::new(
+                    "subjects",
+                    crate::schema::AttributeType::union(vec![
+                        crate::schema::AttributeType::string(),
+                        crate::schema::AttributeType::list(crate::schema::AttributeType::string()),
+                    ]),
+                )),
+        );
+        let id = ResourceId::with_provider_identity("aws", "service.Widget", "widget", None);
+        let raw = RawSavedAttrs::from_persisted(HashMap::from([(
+            id.clone(),
+            HashMap::from([
+                (
+                    "status".to_string(),
+                    Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+                ),
+                (
+                    "subjects".to_string(),
+                    Value::Concrete(ConcreteValue::String("repo:foo:*".to_string())),
+                ),
+            ]),
+        )]));
+
+        let once = raw.lift(&registry);
+        let twice = RawSavedAttrs::from_persisted(once.0.clone()).lift(&registry);
+        let sorted_pairs = |attrs: &HashMap<String, Value>| {
+            let mut pairs: Vec<_> = attrs
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            pairs.sort_by(|(left, _), (right, _)| left.cmp(right));
+            pairs
+        };
+
+        assert_eq!(
+            sorted_pairs(once.get(&id).unwrap()),
+            sorted_pairs(twice.get(&id).unwrap()),
+            "carina#3740: applying RawSavedAttrs::lift twice must reach the same fixpoint"
+        );
+    }
+
+    #[test]
+    fn raw_saved_attrs_lift_preserves_secret_hash_scalar_in_string_or_list_union() {
+        use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+        use crate::value::SECRET_PREFIX;
+
+        let config = AttributeType::struct_(
+            "Config".to_string(),
+            vec![StructField::new(
+                "password",
+                AttributeType::union(vec![
+                    AttributeType::string(),
+                    AttributeType::list(AttributeType::string()),
+                ]),
+            )],
+        );
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "test",
+            ResourceSchema::new("service.Widget").attribute(AttributeSchema::new("config", config)),
+        );
+
+        let id = ResourceId::with_provider_identity("test", "service.Widget", "widget", None);
+        let secret_hash = format!("{SECRET_PREFIX}deadbeef");
+        let raw = RawSavedAttrs::from_persisted(HashMap::from([(
+            id.clone(),
+            HashMap::from([(
+                "config".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "password".to_string(),
+                    Value::Concrete(ConcreteValue::String(secret_hash.clone())),
+                )]))),
+            )]),
+        )]));
+
+        let lifted = raw.lift(&registry);
+        let Value::Concrete(ConcreteValue::Map(config)) = &lifted.get(&id).unwrap()["config"]
+        else {
+            panic!("config must remain a map");
+        };
+        assert_eq!(
+            config["password"],
+            Value::Concrete(ConcreteValue::String(secret_hash)),
+            "carina#3740: a persisted secret hash is an opaque scalar sentinel, never a list"
+        );
+    }
+
+    #[test]
+    fn raw_saved_attrs_lift_uses_state_text_for_union_wrapped_enum_identifier() {
+        use crate::schema::{
+            AttributeSchema, AttributeType, ResourceSchema, StructField, enum_identity,
+        };
+
+        // Persisted JSON strings currently decode as ConcreteValue::String, so
+        // EnumIdentifier is a seam-only phase probe rather than a reachable
+        // state-file shape. StateText case-matches `foo` to API member `FOO`;
+        // RawDsl would treat it as the alias for the different member `API_A`.
+        // The Union wrapper ensures the separate enum-lift walker does not
+        // perform the conversion first.
+        let mode = AttributeType::enum_(
+            enum_identity("Mode", Some("awscc.example.Widget")),
+            Some(vec!["API_A".to_string(), "FOO".to_string()]),
+            vec![("API_A".to_string(), "foo".to_string())],
+            None,
+            None,
+        );
+        let settings = AttributeType::struct_(
+            "Settings".to_string(),
+            vec![StructField::new(
+                "mode",
+                AttributeType::union(vec![mode.clone(), AttributeType::list(mode)]),
+            )],
+        );
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "awscc",
+            ResourceSchema::new("example.Widget")
+                .attribute(AttributeSchema::new("settings", settings)),
+        );
+
+        let id = ResourceId::with_provider_identity("awscc", "example.Widget", "widget", None);
+        let raw = RawSavedAttrs::from_persisted(HashMap::from([(
+            id.clone(),
+            HashMap::from([(
+                "settings".to_string(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "mode".to_string(),
+                    Value::Concrete(ConcreteValue::enum_identifier("foo")),
+                )]))),
+            )]),
+        )]));
+
+        let lifted = raw.lift(&registry);
+        let Value::Concrete(ConcreteValue::Map(settings)) = &lifted.get(&id).unwrap()["settings"]
+        else {
+            panic!("settings must remain a map");
+        };
+        let Value::Concrete(ConcreteValue::CanonicalEnum(value)) = &settings["mode"] else {
+            panic!("enum state text must be lifted to CanonicalEnum");
+        };
+        assert_eq!(
+            value.api_value(),
+            "FOO",
+            "carina#3740: saved-side structural canonicalization must use StateText semantics \
+             when an EnumIdentifier reaches an Enum through a Union"
+        );
     }
 
     fn resolved_for_test(resource: Resource) -> ResolvedResource {
