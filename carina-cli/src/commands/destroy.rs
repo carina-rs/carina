@@ -22,7 +22,9 @@ use carina_core::provider::Provider;
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 #[cfg(test)]
 use carina_core::shutdown::testing::TestShutdownTrigger;
-use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
+use carina_core::shutdown::{
+    CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
+};
 use carina_state::{LockInfo, StateBackend, StateFile};
 
 use carina_core::parser::ProviderContext;
@@ -235,7 +237,20 @@ async fn run_destroy_locked(
         let mut refresh_cancelled = false;
         let mut resource_iter = resources.into_iter();
         let mut refresh_in_flight = FuturesUnordered::new();
+        let cleanup_loop = cancel.cleanup_aware_loop();
         loop {
+            let cleanup_wait = match cleanup_loop.step() {
+                LoopStep::Continue(wait) => wait,
+                LoopStep::Abandon => {
+                    refresh_cancelled = true;
+                    break;
+                }
+            };
+            match cleanup_wait.phase() {
+                LoopShutdownPhase::Running => {}
+                LoopShutdownPhase::Graceful => refresh_cancelled = true,
+            }
+
             while !refresh_cancelled && refresh_in_flight.len() < 5 {
                 let Some(resource) = resource_iter.next() else {
                     break;
@@ -257,26 +272,41 @@ async fn run_destroy_locked(
                 break;
             }
 
-            let result: Result<(ResourceId, State), AppError> = if refresh_cancelled {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cleanup_priority_requested() => break,
-                    result = refresh_in_flight.next() => result.unwrap(),
+            let draining = refresh_cancelled;
+            #[cfg(test)]
+            let next_in_flight = async {
+                if draining {
+                    crate::commands::shared::cancellation_test_support::observe_refresh_drain_wait(
+                        &cancel,
+                    )
+                    .await;
                 }
+                refresh_in_flight.next().await
+            };
+            #[cfg(not(test))]
+            let next_in_flight = refresh_in_flight.next();
+            // A ready provider result is harvested before cleanup priority. If
+            // refresh is already cancelled, the short-circuit below discards it.
+            let next = cleanup_wait.until_cleanup_priority(next_in_flight);
+            tokio::pin!(next);
+            let next = if draining {
+                next.await
             } else {
                 tokio::select! {
                     biased;
-                    _ = cancel.cleanup_priority_requested() => {
-                        refresh_cancelled = true;
-                        break;
-                    }
+                    next = &mut next => next,
                     _ = cancel.cancelled() => {
                         refresh_cancelled = true;
                         continue;
                     }
-                    result = refresh_in_flight.next() => {
-                        result.unwrap()
-                    }
+                }
+            };
+            let result: Result<(ResourceId, State), AppError> = match next {
+                CleanupInterrupted::Completed(Some(result)) => result,
+                CleanupInterrupted::Completed(None) => break,
+                CleanupInterrupted::Abandoned => {
+                    refresh_cancelled = true;
+                    break;
                 }
             };
 
@@ -302,7 +332,20 @@ async fn run_destroy_locked(
             let mut refresh_cancelled = false;
             let mut orphan_iter = orphan_states.into_iter();
             let mut orphan_in_flight = FuturesUnordered::new();
+            let cleanup_loop = cancel.cleanup_aware_loop();
             loop {
+                let cleanup_wait = match cleanup_loop.step() {
+                    LoopStep::Continue(wait) => wait,
+                    LoopStep::Abandon => {
+                        refresh_cancelled = true;
+                        break;
+                    }
+                };
+                match cleanup_wait.phase() {
+                    LoopShutdownPhase::Running => {}
+                    LoopShutdownPhase::Graceful => refresh_cancelled = true,
+                }
+
                 while !refresh_cancelled && orphan_in_flight.len() < 5 {
                     let Some((id, state)) = orphan_iter.next() else {
                         break;
@@ -322,26 +365,41 @@ async fn run_destroy_locked(
                     break;
                 }
 
-                let result: Result<(ResourceId, State), AppError> = if refresh_cancelled {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cleanup_priority_requested() => break,
-                        result = orphan_in_flight.next() => result.unwrap(),
+                let draining = refresh_cancelled;
+                #[cfg(test)]
+                let next_in_flight = async {
+                    if draining {
+                        crate::commands::shared::cancellation_test_support::observe_refresh_drain_wait(
+                            &cancel,
+                        )
+                        .await;
                     }
+                    orphan_in_flight.next().await
+                };
+                #[cfg(not(test))]
+                let next_in_flight = orphan_in_flight.next();
+                // A ready provider result is harvested before cleanup priority. If
+                // refresh is already cancelled, the short-circuit below discards it.
+                let next = cleanup_wait.until_cleanup_priority(next_in_flight);
+                tokio::pin!(next);
+                let next = if draining {
+                    next.await
                 } else {
                     tokio::select! {
                         biased;
-                        _ = cancel.cleanup_priority_requested() => {
-                            refresh_cancelled = true;
-                            break;
-                        }
+                        next = &mut next => next,
                         _ = cancel.cancelled() => {
                             refresh_cancelled = true;
                             continue;
                         }
-                        result = orphan_in_flight.next() => {
-                            result.unwrap()
-                        }
+                    }
+                };
+                let result: Result<(ResourceId, State), AppError> = match next {
+                    CleanupInterrupted::Completed(Some(result)) => result,
+                    CleanupInterrupted::Completed(None) => break,
+                    CleanupInterrupted::Abandoned => {
+                        refresh_cancelled = true;
+                        break;
                     }
                 };
 
@@ -638,23 +696,27 @@ async fn run_destroy_locked(
     let mut retry_pending: HashSet<usize> = HashSet::new();
 
     let mut in_flight = FuturesUnordered::new();
+    let cleanup_loop = cancel.cleanup_aware_loop();
 
     'destroy: loop {
         let undispatched_at_loop_start = all_indices
             .iter()
             .filter(|&&idx| !dispatched.contains(&idx))
             .count();
-        match cancel.phase() {
-            ShutdownPhase::CleanupPriority => {
+        let cleanup_wait = match cleanup_loop.step() {
+            LoopStep::Continue(wait) => wait,
+            LoopStep::Abandon => {
                 cancelled = true;
                 break 'destroy;
             }
-            ShutdownPhase::Graceful
+        };
+        match cleanup_wait.phase() {
+            LoopShutdownPhase::Graceful
                 if !cancelled && (undispatched_at_loop_start > 0 || !in_flight.is_empty()) =>
             {
                 cancelled = true;
             }
-            ShutdownPhase::Running | ShutdownPhase::Graceful => {}
+            LoopShutdownPhase::Running | LoopShutdownPhase::Graceful => {}
         }
 
         if !cancelled {
@@ -674,9 +736,12 @@ async fn run_destroy_locked(
 
             // Process newly ready resources
             for idx in newly_ready {
-                if shutdown_requested(&cancel) {
-                    cancelled = true;
-                    break;
+                match cancel.phase() {
+                    ShutdownPhase::Running => {}
+                    ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
+                        cancelled = true;
+                        break;
+                    }
                 }
 
                 dispatched.insert(idx);
@@ -733,19 +798,28 @@ async fn run_destroy_locked(
                             ))
                             .ok();
 
-                        let wait_result = tokio::select! {
-                            biased;
-                            _ = cancel.cleanup_priority_requested() => {
+                        let nested_cleanup_wait = match cleanup_loop.step() {
+                            LoopStep::Continue(wait) => wait,
+                            LoopStep::Abandon => {
                                 cancelled = true;
                                 break 'destroy;
                             }
-                            result = wait_for_deletion(
+                        };
+                        let wait_result = match nested_cleanup_wait
+                            .until_cleanup_priority(wait_for_deletion(
                                 &provider,
                                 &dep_id,
                                 &dep_identifier,
                                 180,
                                 std::time::Duration::from_secs(10),
-                            ) => result,
+                            ))
+                            .await
+                        {
+                            CleanupInterrupted::Completed(result) => result,
+                            CleanupInterrupted::Abandoned => {
+                                cancelled = true;
+                                break 'destroy;
+                            }
                         };
                         match wait_result {
                             WaitResult::Deleted => {
@@ -841,6 +915,7 @@ async fn run_destroy_locked(
                 let directives = directives.clone();
 
                 let provider_ref = &provider;
+                let result_shutdown = &cancel;
                 in_flight.push(async move {
                     let started = Instant::now();
                     let delete_result = provider_ref
@@ -852,7 +927,7 @@ async fn run_destroy_locked(
                             },
                         )
                         .await;
-                    observe_destroy_result_ready_for_tests().await;
+                    observe_destroy_result_ready_for_tests(result_shutdown).await;
                     (
                         idx,
                         resource_id,
@@ -925,30 +1000,34 @@ async fn run_destroy_locked(
             break;
         }
 
-        // Wait for the next deletion to complete
-        let (finished_idx, resource_id, identifier, generation, started, delete_result) =
+        // Wait for the next deletion to complete. A ready provider result is
+        // harvested before cleanup priority, matching the scheduler contract.
+        let next = {
+            let next = cleanup_wait.until_cleanup_priority(in_flight.next());
+            tokio::pin!(next);
             if cancelled {
-                tokio::select! {
-                    biased;
-                    finished = in_flight.next() => finished.unwrap(),
-                    _ = cancel.cleanup_priority_requested() => break 'destroy,
-                }
+                Some(next.await)
             } else {
                 tokio::select! {
                     biased;
-                    finished = in_flight.next() => {
-                        finished.unwrap()
-                    }
-                    _ = cancel.cleanup_priority_requested() => {
-                        cancelled = true;
-                        break 'destroy;
-                    }
-                    _ = cancel.cancelled() => {
-                        cancelled = true;
-                        continue;
-                    }
+                    next = &mut next => Some(next),
+                    _ = cancel.cancelled() => None,
                 }
-            };
+            }
+        };
+        let Some(next) = next else {
+            cancelled = true;
+            continue;
+        };
+        let (finished_idx, resource_id, identifier, generation, started, delete_result) = match next
+        {
+            CleanupInterrupted::Completed(Some(finished)) => finished,
+            CleanupInterrupted::Completed(None) => break 'destroy,
+            CleanupInterrupted::Abandoned => {
+                cancelled = true;
+                break 'destroy;
+            }
+        };
         completed_indices.insert(finished_idx);
 
         // An effect completed — release all retry-pending indices so they
@@ -1050,9 +1129,19 @@ async fn run_destroy_locked(
     // Handle any remaining timed-out resources that no parent waited on.
     if !cancelled {
         for (dep_idx, (dep_id, dep_identifier, dep_generation)) in &timed_out_resources {
-            if shutdown_requested(&cancel) {
-                cancelled = true;
-                break;
+            let cleanup_wait = match cleanup_loop.step() {
+                LoopStep::Continue(wait) => wait,
+                LoopStep::Abandon => {
+                    cancelled = true;
+                    break;
+                }
+            };
+            match cleanup_wait.phase() {
+                LoopShutdownPhase::Running => {}
+                LoopShutdownPhase::Graceful => {
+                    cancelled = true;
+                    break;
+                }
             }
 
             eprintln!(
@@ -1061,23 +1150,27 @@ async fn run_destroy_locked(
                 dep_id
             );
 
+            let outcome = cleanup_wait.until_cleanup_priority(wait_for_deletion(
+                &provider,
+                dep_id,
+                dep_identifier,
+                180,
+                std::time::Duration::from_secs(10),
+            ));
+            tokio::pin!(outcome);
             let outcome = tokio::select! {
                 biased;
-                _ = cancel.cleanup_priority_requested() => {
-                    cancelled = true;
-                    break;
-                }
+                outcome = &mut outcome => match outcome {
+                    CleanupInterrupted::Completed(outcome) => outcome,
+                    CleanupInterrupted::Abandoned => {
+                        cancelled = true;
+                        break;
+                    }
+                },
                 _ = cancel.cancelled() => {
                     cancelled = true;
                     break;
                 }
-                result = wait_for_deletion(
-                    &provider,
-                    dep_id,
-                    dep_identifier,
-                    180,
-                    std::time::Duration::from_secs(10),
-                ) => result,
             };
 
             match outcome {
@@ -1171,14 +1264,16 @@ static DESTROY_READY_RESULT_BARRIER: std::sync::Mutex<Option<DestroyReadyResultB
 pub(crate) struct DestroyReadyResultBarrier {
     reached: std::sync::Arc<tokio::sync::Notify>,
     release: std::sync::Arc<tokio::sync::Notify>,
+    shutdown: ShutdownToken,
 }
 
 #[cfg(test)]
 impl DestroyReadyResultBarrier {
-    fn new() -> Self {
+    fn new(shutdown: ShutdownToken) -> Self {
         Self {
             reached: std::sync::Arc::new(tokio::sync::Notify::new()),
             release: std::sync::Arc::new(tokio::sync::Notify::new()),
+            shutdown,
         }
     }
 
@@ -1195,14 +1290,22 @@ impl DestroyReadyResultBarrier {
 struct DestroySuccessCancelHook {
     threshold: usize,
     trigger: TestShutdownTrigger,
+    shutdown: ShutdownToken,
 }
 
 #[cfg(test)]
-pub(crate) fn set_destroy_success_cancel_after(threshold: usize, trigger: TestShutdownTrigger) {
+pub(crate) fn set_destroy_success_cancel_after(
+    threshold: usize,
+    trigger: TestShutdownTrigger,
+    shutdown: ShutdownToken,
+) {
     *DESTROY_SUCCESS_CANCEL_AFTER
         .lock()
-        .expect("destroy success cancel hook lock") =
-        Some(DestroySuccessCancelHook { threshold, trigger });
+        .expect("destroy success cancel hook lock") = Some(DestroySuccessCancelHook {
+        threshold,
+        trigger,
+        shutdown,
+    });
 }
 
 #[cfg(test)]
@@ -1213,8 +1316,10 @@ pub(crate) fn clear_destroy_success_cancel_after() {
 }
 
 #[cfg(test)]
-pub(crate) fn install_destroy_ready_result_barrier() -> DestroyReadyResultBarrier {
-    let barrier = DestroyReadyResultBarrier::new();
+pub(crate) fn install_destroy_ready_result_barrier(
+    shutdown: ShutdownToken,
+) -> DestroyReadyResultBarrier {
+    let barrier = DestroyReadyResultBarrier::new(shutdown);
     *DESTROY_READY_RESULT_BARRIER
         .lock()
         .expect("destroy ready result barrier lock") = Some(barrier.clone());
@@ -1229,11 +1334,19 @@ pub(crate) fn clear_destroy_ready_result_barrier() {
 }
 
 #[cfg(test)]
-async fn observe_destroy_result_ready_for_tests() {
-    let barrier = DESTROY_READY_RESULT_BARRIER
-        .lock()
-        .expect("destroy ready result barrier lock")
-        .take();
+async fn observe_destroy_result_ready_for_tests(shutdown: &ShutdownToken) {
+    let barrier = {
+        let mut barrier = DESTROY_READY_RESULT_BARRIER
+            .lock()
+            .expect("destroy ready result barrier lock");
+        if barrier.as_ref().is_some_and(|barrier| {
+            carina_core::shutdown::testing::same_shutdown_channel(&barrier.shutdown, shutdown)
+        }) {
+            barrier.take()
+        } else {
+            None
+        }
+    };
     if let Some(barrier) = barrier {
         barrier.reached.notify_one();
         barrier.release.notified().await;
@@ -1241,28 +1354,22 @@ async fn observe_destroy_result_ready_for_tests() {
 }
 
 #[cfg(not(test))]
-async fn observe_destroy_result_ready_for_tests() {}
+async fn observe_destroy_result_ready_for_tests(_shutdown: &ShutdownToken) {}
 
 #[cfg(test)]
 fn observe_destroy_success_for_tests(
     success_count: usize,
     _resource_id: &ResourceId,
-    _cancel: &ShutdownToken,
+    cancel: &ShutdownToken,
 ) {
     if let Some(hook) = DESTROY_SUCCESS_CANCEL_AFTER
         .lock()
         .expect("destroy success cancel hook lock")
         .as_ref()
+        && carina_core::shutdown::testing::same_shutdown_channel(&hook.shutdown, cancel)
         && success_count == hook.threshold
     {
         hook.trigger.request_graceful_shutdown();
-    }
-}
-
-fn shutdown_requested(shutdown: &ShutdownToken) -> bool {
-    match shutdown.phase() {
-        ShutdownPhase::Running => false,
-        ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => true,
     }
 }
 
@@ -1773,6 +1880,124 @@ mod tests {
             state.exports.is_empty(),
             "exports must be cleared on partial destroy"
         );
+    }
+
+    #[tokio::test]
+    async fn destroy_managed_refresh_cleanup_priority_abandons_in_flight_read_and_releases_lock() {
+        let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
+            .lock()
+            .await;
+        let fixture = DestroyCancellationFixture::new()
+            .with_existing_resources(["managed"])
+            .with_blocked_read("managed")
+            .with_refresh_drain_barrier();
+        let shutdown = fixture.cancel_token();
+
+        let destroy = run_destroy(
+            fixture.config_path(),
+            true,
+            true,
+            true,
+            false,
+            NonZeroUsize::new(1).unwrap(),
+            fixture.provider_context(),
+            shutdown,
+        );
+        tokio::pin!(destroy);
+        tokio::select! {
+            () = fixture.wait_for_blocked_read() => {}
+            result = &mut destroy => {
+                panic!("destroy returned before the managed refresh read blocked: {result:?}");
+            }
+        }
+        assert!(fixture.lock_path().exists(), "fixture must hold the lock");
+        fixture.request_graceful_shutdown();
+        tokio::select! {
+            () = fixture.wait_for_refresh_drain() => {}
+            result = &mut destroy => {
+                panic!("destroy returned before the managed refresh entered its drain wait: {result:?}");
+            }
+        }
+        fixture.prioritize_cleanup_and_release_refresh_drain();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), destroy)
+            .await
+            .expect("destroy did not abandon the in-flight managed refresh after cleanup priority")
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Interrupted));
+        assert_eq!(
+            fixture.read_outcome(),
+            "abandoned\n",
+            "the in-flight managed refresh read must be dropped before producing a result"
+        );
+        let state = fixture.read_state().await;
+        assert_eq!(state.serial, 0, "abandoned refresh must not save");
+        assert!(
+            state
+                .find_resource("mock", "test.resource", "managed")
+                .is_some(),
+            "an abandoned refresh must preserve the persisted resource"
+        );
+        assert!(!fixture.lock_path().exists(), "lock must be released");
+    }
+
+    #[tokio::test]
+    async fn destroy_orphan_refresh_cleanup_priority_abandons_in_flight_read_and_releases_lock() {
+        let _env_guard = crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK
+            .lock()
+            .await;
+        let fixture = DestroyCancellationFixture::new()
+            .with_orphaned_resources(["orphan"])
+            .with_blocked_read("orphan")
+            .with_refresh_drain_barrier();
+        let shutdown = fixture.cancel_token();
+
+        let destroy = run_destroy(
+            fixture.config_path(),
+            true,
+            true,
+            true,
+            false,
+            NonZeroUsize::new(1).unwrap(),
+            fixture.provider_context(),
+            shutdown,
+        );
+        tokio::pin!(destroy);
+        tokio::select! {
+            () = fixture.wait_for_blocked_read() => {}
+            result = &mut destroy => {
+                panic!("destroy returned before the orphan refresh read blocked: {result:?}");
+            }
+        }
+        assert!(fixture.lock_path().exists(), "fixture must hold the lock");
+        fixture.request_graceful_shutdown();
+        tokio::select! {
+            () = fixture.wait_for_refresh_drain() => {}
+            result = &mut destroy => {
+                panic!("destroy returned before the orphan refresh entered its drain wait: {result:?}");
+            }
+        }
+        fixture.prioritize_cleanup_and_release_refresh_drain();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), destroy)
+            .await
+            .expect("destroy did not abandon the in-flight orphan refresh after cleanup priority")
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Interrupted));
+        assert_eq!(
+            fixture.read_outcome(),
+            "abandoned\n",
+            "the in-flight orphan refresh read must be dropped before producing a result"
+        );
+        let state = fixture.read_state().await;
+        assert_eq!(state.serial, 0, "abandoned refresh must not save");
+        assert!(
+            state
+                .find_resource("mock", "test.resource", "orphan")
+                .is_some(),
+            "an abandoned refresh must preserve the persisted orphan"
+        );
+        assert!(!fixture.lock_path().exists(), "lock must be released");
     }
 
     #[tokio::test]

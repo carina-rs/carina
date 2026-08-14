@@ -2,12 +2,66 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use carina_core::shutdown::ShutdownToken;
-use carina_core::shutdown::testing::{TestShutdownTrigger, shutdown_channel};
+use carina_core::shutdown::testing::{
+    TestShutdownTrigger, same_shutdown_channel, shutdown_channel,
+};
 use carina_state::{LocalBackend, StateBackend, StateFile};
 use tempfile::TempDir;
 
 pub(crate) static MOCK_PROVIDER_ENV_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
+
+static REFRESH_DRAIN_BARRIER: std::sync::Mutex<Option<RefreshDrainBarrier>> =
+    std::sync::Mutex::new(None);
+
+#[derive(Clone)]
+pub(crate) struct RefreshDrainBarrier {
+    reached: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+    shutdown: ShutdownToken,
+}
+
+impl RefreshDrainBarrier {
+    pub(crate) async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+pub(crate) fn install_refresh_drain_barrier(shutdown: ShutdownToken) -> RefreshDrainBarrier {
+    let barrier = RefreshDrainBarrier {
+        reached: std::sync::Arc::new(tokio::sync::Notify::new()),
+        release: std::sync::Arc::new(tokio::sync::Notify::new()),
+        shutdown,
+    };
+    *REFRESH_DRAIN_BARRIER
+        .lock()
+        .expect("refresh drain barrier lock") = Some(barrier.clone());
+    barrier
+}
+
+pub(crate) async fn observe_refresh_drain_wait(shutdown: &ShutdownToken) {
+    let barrier = {
+        let mut barrier = REFRESH_DRAIN_BARRIER
+            .lock()
+            .expect("refresh drain barrier lock");
+        if barrier
+            .as_ref()
+            .is_some_and(|barrier| same_shutdown_channel(&barrier.shutdown, shutdown))
+        {
+            barrier.take()
+        } else {
+            None
+        }
+    };
+    if let Some(barrier) = barrier {
+        barrier.reached.notify_one();
+        barrier.release.notified().await;
+    }
+}
 
 pub(crate) struct ScopedEnv {
     name: &'static str,

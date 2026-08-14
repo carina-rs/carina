@@ -4,7 +4,7 @@ use carina_core::effect::{Effect, resolve_import_identifier};
 use carina_core::executor::ExecutionResult;
 use carina_core::plan::Plan;
 use carina_core::provider::{Provider, ReadRequest};
-use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
+use carina_core::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 use colored::Colorize;
 
 /// Execute import effects by reading the resource from the provider.
@@ -18,10 +18,16 @@ pub(crate) async fn execute_import_effects(
     result: &mut ExecutionResult,
     shutdown: &ShutdownToken,
 ) {
+    let cleanup_loop = shutdown.cleanup_aware_loop();
     for effect in plan.effects() {
         if let Effect::Import { id, identifier } = effect {
-            if shutdown_requested(shutdown) {
-                return;
+            let cleanup_wait = match cleanup_loop.step() {
+                LoopStep::Continue(wait) => wait,
+                LoopStep::Abandon => return,
+            };
+            match cleanup_wait.phase() {
+                LoopShutdownPhase::Running => {}
+                LoopShutdownPhase::Graceful => return,
             }
 
             // carina#3329: the identifier is a `Value` so an
@@ -47,11 +53,9 @@ pub(crate) async fn execute_import_effects(
                 identifier_str
             );
             let read = provider.read(id, Some(identifier_str.as_str()), ReadRequest);
-            tokio::pin!(read);
-            let read_result = tokio::select! {
-                biased;
-                _ = shutdown.cleanup_priority_requested() => return,
-                result = &mut read => result,
+            let read_result = match cleanup_wait.until_cleanup_priority(read).await {
+                CleanupInterrupted::Completed(result) => result,
+                CleanupInterrupted::Abandoned => return,
             };
             match read_result {
                 Ok(state) => {
@@ -75,13 +79,6 @@ pub(crate) async fn execute_import_effects(
                 }
             }
         }
-    }
-}
-
-fn shutdown_requested(shutdown: &ShutdownToken) -> bool {
-    match shutdown.phase() {
-        ShutdownPhase::Running => false,
-        ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => true,
     }
 }
 

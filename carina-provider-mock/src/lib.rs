@@ -33,6 +33,37 @@ struct ActiveUpdateGuard {
     resource: String,
 }
 
+struct ReadOutcomeGuard {
+    path: Option<PathBuf>,
+    completed: bool,
+}
+
+impl ReadOutcomeGuard {
+    fn from_env() -> Self {
+        Self {
+            path: env::var_os("CARINA_MOCK_READ_OUTCOME_PATH").map(PathBuf::from),
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+        if let Some(path) = &self.path {
+            let _ = fs::write(path, "completed\n");
+        }
+    }
+}
+
+impl Drop for ReadOutcomeGuard {
+    fn drop(&mut self) {
+        if !self.completed
+            && let Some(path) = &self.path
+        {
+            let _ = fs::write(path, "abandoned\n");
+        }
+    }
+}
+
 impl ActiveUpdateGuard {
     fn enter(id: &ResourceId) -> Self {
         let active = ACTIVE_UPDATES.fetch_add(1, Ordering::SeqCst) + 1;
@@ -249,6 +280,18 @@ impl MockProvider {
             .map(Duration::from_millis)
     }
 
+    fn read_delay_for(id: &ResourceId) -> Option<Duration> {
+        let target = env::var("CARINA_MOCK_READ_DELAY_MS_FOR").ok()?;
+        if target != Self::resource_key(id) {
+            return None;
+        }
+        env::var("CARINA_MOCK_READ_DELAY_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|millis| *millis > 0)
+            .map(Duration::from_millis)
+    }
+
     fn create_delay_for(id: &ResourceId) -> Option<Duration> {
         let target = env::var("CARINA_MOCK_CREATE_DELAY_MS_FOR").ok()?;
         if target != Self::resource_key(id) {
@@ -436,18 +479,29 @@ impl Provider for MockProvider {
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = id.clone();
         Box::pin(async move {
+            let mut read_outcome = None;
+            if let Some(delay) = Self::read_delay_for(&id) {
+                read_outcome = Some(ReadOutcomeGuard::from_env());
+                Self::signal_ready("CARINA_MOCK_READ_READY_PATH")?;
+                tokio::time::sleep(delay).await;
+            }
+
             let states = self.load_states();
             let key = Self::resource_key(&id);
 
-            if let Some(attrs) = states.get(&key) {
+            let state = if let Some(attrs) = states.get(&key) {
                 let attributes: HashMap<String, Value> = attrs
                     .iter()
                     .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
                     .collect();
-                Ok(State::existing(id, attributes).with_identifier("mock-id"))
+                State::existing(id, attributes).with_identifier("mock-id")
             } else {
-                Ok(State::not_found(id))
+                State::not_found(id)
+            };
+            if let Some(read_outcome) = &mut read_outcome {
+                read_outcome.complete();
             }
+            Ok(state)
         })
     }
 
