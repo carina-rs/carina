@@ -823,34 +823,26 @@ pub fn lift_state_enum_leaves(
     }
 }
 
-/// Apply [`lift_state_enum_leaves`] to every resource's
-/// loaded prior-state attributes, resolving each resource's schema from
-/// `registry`.
+/// Internal enum-lift worker for [`RawSavedAttrs::lift`](crate::provider::RawSavedAttrs::lift).
 ///
-/// This is the single entry point every persisted-state load seam must
-/// call before the state reaches the differ or the validator. There are
-/// three such seams in the CLI — `carina plan`, `carina apply`, and
-/// `carina state` — each builds its own `saved_attrs` map from
-/// `StateFile::build_saved_attrs`. Wiring this helper at all three keeps
-/// the migration uniform: fixing only the plan seam (awscc#251's first
-/// cut) left `apply` carrying un-lifted `String` state, which the
-/// already-lifted desired side then diffed against as a spurious
-/// `String` vs `EnumIdentifier` change on every apply.
-///
-/// Resources whose schema is not in `registry` (or that have no saved
-/// attributes) are skipped.
-pub fn lift_saved_state_enum_leaves(
+/// The lift is map-driven: every persisted entry is resolved from its own
+/// resource ID. Entries whose schema is not in `registry` are skipped.
+pub(crate) fn lift_saved_state_enum_leaves(
     saved_attrs: &mut std::collections::HashMap<
         crate::resource::ResourceId,
         std::collections::HashMap<String, Value>,
     >,
-    resources: &[crate::resource::Resource],
     registry: &crate::schema::SchemaRegistry,
 ) {
-    for resource in resources {
-        if let Some(schema) = registry.get_for(resource)
-            && let Some(attrs) = saved_attrs.get_mut(&resource.id)
-        {
+    // carina#3739: hydration is map-driven, so lifting must cover the same map.
+    // This includes materialized for-loop children before an expanded resource
+    // slice is available.
+    for (id, attrs) in saved_attrs.iter_mut() {
+        if let Some(schema) = registry.get(
+            &id.provider,
+            &id.resource_type,
+            crate::schema::SchemaKind::Resource,
+        ) {
             lift_state_enum_leaves(attrs, schema);
         }
     }
@@ -2596,7 +2588,7 @@ mod tests {
         saved.insert(known.id.clone(), known_attrs);
         saved.insert(unknown.id.clone(), unknown_attrs);
 
-        lift_saved_state_enum_leaves(&mut saved, &[known.clone(), unknown.clone()], &registry);
+        lift_saved_state_enum_leaves(&mut saved, &registry);
 
         let Value::Concrete(ConcreteValue::Map(pd)) = &saved[&known.id]["policy_document"] else {
             panic!("policy_document map");

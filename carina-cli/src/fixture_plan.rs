@@ -186,20 +186,15 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         .map(|sf| sf.build_directives())
         .unwrap_or_default();
 
-    let mut saved_attrs = state_file
-        .as_ref()
-        .map(|sf| sf.build_saved_attrs())
-        .unwrap_or_default();
-
     // Keep fixture plans aligned with the real CLI plan/apply wiring:
     // state-file attributes are lifted before the differ sees them, so
     // fixture coverage exercises the enum-state lift seam instead of
     // relying on differ cross-shape tolerance.
-    carina_core::utils::lift_saved_state_enum_leaves(
-        &mut saved_attrs,
-        &sorted_resources,
-        wiring.schemas(),
-    );
+    let mut saved_attrs = state_file
+        .as_ref()
+        .map(|sf| sf.build_saved_attrs())
+        .unwrap_or_default()
+        .lift(wiring.schemas());
 
     let mut prev_explicit = state_file
         .as_ref()
@@ -332,9 +327,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             state.id = to.clone();
             current_states.insert(to.clone(), state);
         }
-        if let Some(attrs) = saved_attrs.remove(from) {
-            saved_attrs.insert(to.clone(), attrs);
-        }
+        saved_attrs.remap_resource_id(from, to.clone());
         if let Some(explicit) = prev_explicit.remove(from) {
             prev_explicit.insert(to.clone(), explicit);
         }

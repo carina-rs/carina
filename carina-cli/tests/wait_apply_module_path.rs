@@ -508,6 +508,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         )
         .await;
 
+    let saved_attrs = carina_core::provider::RawSavedAttrs::default().lift(ctx.schemas());
     let plan = create_plan(
         &resources_for_plan,
         &parsed.data_sources,
@@ -519,7 +520,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         ),
         &HashMap::new(),
         ctx.schemas(),
-        &HashMap::new(),
+        &saved_attrs,
         &HashMap::new(),
         &HashMap::new(),
         &wait_bindings,

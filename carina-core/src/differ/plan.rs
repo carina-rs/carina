@@ -13,7 +13,7 @@ use crate::plan::{
     PreventDestroyAction, ReplacementCannotCoexistError, ReplacementDelete, ReplacementGroup,
     SchemaNotRegisteredError,
 };
-use crate::provider::Provider;
+use crate::provider::{LiftedSavedAttrs, Provider};
 use crate::resource::{
     ConcreteValue, DataSource, Directives, PlanInputState, ResolvedDataSource, ResolvedResource,
     ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
@@ -221,17 +221,20 @@ pub fn generate_temporary_name(
 /// ```compile_fail
 /// use std::collections::{BTreeSet, HashMap};
 /// use carina_core::differ::create_plan;
+/// use carina_core::provider::RawSavedAttrs;
 /// use carina_core::resource::Composition;
 /// use carina_core::schema::SchemaRegistry;
 /// let compositions: Vec<Composition> = vec![];
+/// let registry = SchemaRegistry::default();
+/// let saved_attrs = RawSavedAttrs::default().lift(&registry);
 /// let _ = create_plan(
 ///     &compositions,
 ///     &[],
 ///     &carina_core::provider::ProviderRouter::new(),
 ///     &HashMap::new(),
 ///     &HashMap::new(),
-///     &SchemaRegistry::default(),
-///     &HashMap::new(),
+///     &registry,
+///     &saved_attrs,
 ///     &HashMap::new(),
 ///     &HashMap::new(),
 ///     &[],
@@ -246,20 +249,49 @@ pub fn generate_temporary_name(
 /// ```compile_fail
 /// use std::collections::HashMap;
 /// use carina_core::differ::create_plan;
-/// use carina_core::provider::ProviderRouter;
+/// use carina_core::provider::{ProviderRouter, RawSavedAttrs};
 /// use carina_core::resource::{Resource, ResourceId, State};
 /// use carina_core::schema::SchemaRegistry;
 ///
 /// let resources: Vec<Resource> = vec![];
 /// let states: HashMap<ResourceId, State> = HashMap::new();
+/// let registry = SchemaRegistry::default();
+/// let saved_attrs = RawSavedAttrs::default().lift(&registry);
 /// let _ = create_plan(
 ///     &resources,
 ///     &[],
 ///     &ProviderRouter::new(),
 ///     &states,
 ///     &HashMap::new(),
-///     &SchemaRegistry::default(),
+///     &registry,
+///     &saved_attrs,
 ///     &HashMap::new(),
+///     &HashMap::new(),
+///     &[],
+/// );
+/// ```
+///
+/// Persisted [`RawSavedAttrs`](crate::provider::RawSavedAttrs) cannot reach
+/// the differ before schema lifting.
+///
+/// ```compile_fail
+/// use std::collections::HashMap;
+/// use carina_core::differ::create_plan;
+/// use carina_core::provider::{ProviderRouter, RawSavedAttrs};
+/// use carina_core::resource::Resource;
+/// use carina_core::schema::SchemaRegistry;
+///
+/// let resources: Vec<Resource> = vec![];
+/// let registry = SchemaRegistry::default();
+/// let raw_saved_attrs = RawSavedAttrs::default();
+/// let _ = create_plan(
+///     &resources,
+///     &[],
+///     &ProviderRouter::new(),
+///     &HashMap::new(),
+///     &HashMap::new(),
+///     &registry,
+///     &raw_saved_attrs,
 ///     &HashMap::new(),
 ///     &HashMap::new(),
 ///     &[],
@@ -273,7 +305,7 @@ pub fn create_plan(
     current_states: &HashMap<ResourceId, PlanInputState>,
     directives_map: &HashMap<ResourceId, Directives>,
     registry: &SchemaRegistry,
-    saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
+    saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
     wait_bindings: &[WaitBinding],
@@ -303,7 +335,7 @@ pub fn create_plan_with_cascades(
     current_states: &HashMap<ResourceId, PlanInputState>,
     directives_map: &HashMap<ResourceId, Directives>,
     registry: &SchemaRegistry,
-    saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
+    saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
     wait_bindings: &[WaitBinding],
@@ -347,7 +379,7 @@ fn create_plan_parts(
     current_states: &HashMap<ResourceId, PlanInputState>,
     directives_map: &HashMap<ResourceId, Directives>,
     registry: &SchemaRegistry,
-    saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
+    saved_attrs: &LiftedSavedAttrs,
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
     wait_bindings: &[WaitBinding],

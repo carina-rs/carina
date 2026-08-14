@@ -516,7 +516,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
     let resources_without = vec![resource.clone()];
     let directives_map: HashMap<ResourceId, Directives> = HashMap::new();
     let schemas = SchemaRegistry::new();
-    let saved_attrs = HashMap::new();
+    let saved_attrs = crate::empty_lifted_saved_attrs();
     let prev_explicit = HashMap::new();
     let orphan_deps = HashMap::new();
     let plan_without = create_plan(
@@ -638,7 +638,7 @@ fn test_merge_default_tags_prevents_false_diff() {
     // The differ sees this as attribute removal → false Update diff.
     let resources_without = vec![resource.clone()];
     let directives_map: HashMap<ResourceId, Directives> = HashMap::new();
-    let saved_attrs = HashMap::new();
+    let saved_attrs = crate::empty_lifted_saved_attrs();
     let orphan_deps = HashMap::new();
     let plan_without = create_plan(
         &resources_without,
@@ -766,7 +766,7 @@ fn moved_block_resolves_routed_instance_on_from_and_to() {
     current_states.insert(routed_from.clone(), State::not_found(routed_from.clone()));
 
     let mut prev_explicit = HashMap::new();
-    let mut saved_attrs = HashMap::new();
+    let mut saved_attrs = crate::empty_lifted_saved_attrs();
 
     // `moved` block addresses are routing-agnostic by construction
     // (the type makes routing unrepresentable here).
@@ -1128,7 +1128,7 @@ fn test_materialize_moved_states_warns_on_missing_from() {
     let moved_pairs = materialize_moved_states_with_warning_sink(
         &mut HashMap::new(),
         &mut HashMap::new(),
-        &mut HashMap::new(),
+        &mut crate::empty_lifted_saved_attrs(),
         &state_blocks,
         &Some(StateFile::new()),
         &mut |warning| warnings.push(warning),
@@ -1150,7 +1150,7 @@ fn test_materialize_moved_states_warns_on_missing_from() {
     let moved_pairs = materialize_moved_states_with_warning_sink(
         &mut HashMap::new(),
         &mut HashMap::new(),
-        &mut HashMap::new(),
+        &mut crate::empty_lifted_saved_attrs(),
         &state_blocks,
         &Some(state_file),
         &mut |warning| warnings.push(warning),
@@ -1426,7 +1426,7 @@ fn test_plan_allows_from_absent_to_present_idempotent_noop() {
     let moved_pairs = materialize_moved_states_with_warning_sink(
         &mut HashMap::new(),
         &mut HashMap::new(),
-        &mut HashMap::new(),
+        &mut crate::empty_lifted_saved_attrs(),
         &state_blocks,
         &state_file,
         &mut |warning| warnings.push(warning),
@@ -1867,7 +1867,7 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
     let moved_pairs = materialize_moved_states(
         &mut current_states,
         &mut HashMap::new(),
-        &mut HashMap::new(),
+        &mut crate::empty_lifted_saved_attrs(),
         &state_blocks,
         &Some(state_file),
     );
@@ -2943,7 +2943,7 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
         .expect("test state setup must be valid");
     let mut current_states = HashMap::new();
     let mut prev_explicit = HashMap::new();
-    let mut saved_attrs = HashMap::new();
+    let mut saved_attrs = crate::empty_lifted_saved_attrs();
 
     let renames = apply_anonymous_to_named_renames(
         &ctx,
@@ -4895,7 +4895,7 @@ mod wait_until_enum_alias {
             ),
             &HashMap::new(),
             ctx.schemas(),
-            &HashMap::new(),
+            &crate::empty_lifted_saved_attrs(),
             &HashMap::new(),
             &HashMap::new(),
             &raw_waits,
@@ -4921,7 +4921,7 @@ mod wait_until_enum_alias {
             ),
             &HashMap::new(),
             ctx.schemas(),
-            &HashMap::new(),
+            &crate::empty_lifted_saved_attrs(),
             &HashMap::new(),
             &HashMap::new(),
             &waits,

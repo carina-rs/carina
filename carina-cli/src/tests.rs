@@ -1392,7 +1392,7 @@ fn orphaned_state_resource_produces_delete_effect() {
     }
 
     let directives_map = state_file.build_directives();
-    let saved_attrs = state_file.build_saved_attrs();
+    let saved_attrs = state_file.build_saved_attrs().lift(&SchemaRegistry::new());
     let prev_explicit = state_file.build_explicit();
 
     let plan = create_plan(
@@ -2097,7 +2097,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
     }
 
     let directives_map = state_file.build_directives();
-    let saved_attrs = state_file.build_saved_attrs();
+    let saved_attrs = state_file.build_saved_attrs().lift(&SchemaRegistry::new());
     let prev_explicit = state_file.build_explicit();
 
     let plan = create_plan(
@@ -2190,7 +2190,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
     );
 
     let directives_map = state_file.build_directives();
-    let saved_attrs = state_file.build_saved_attrs();
+    let saved_attrs = state_file.build_saved_attrs().lift(&SchemaRegistry::new());
     let prev_explicit = state_file.build_explicit();
 
     let plan = create_plan(
@@ -2245,7 +2245,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
     }
 
     let directives_map = state_file.build_directives();
-    let saved_attrs = state_file.build_saved_attrs();
+    let saved_attrs = state_file.build_saved_attrs().lift(&SchemaRegistry::new());
     let prev_explicit = state_file.build_explicit();
 
     let plan = create_plan(
@@ -2310,7 +2310,7 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
         ),
         &HashMap::new(),
         &SchemaRegistry::new(),
-        &HashMap::new(),
+        &crate::empty_lifted_saved_attrs(),
         &HashMap::new(),
         &HashMap::new(),
         &[],
@@ -2567,7 +2567,7 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
         ),
         &HashMap::new(),
         &schemas,
-        &HashMap::new(),
+        &crate::empty_lifted_saved_attrs(),
         &HashMap::new(),
         &HashMap::new(),
         &[],

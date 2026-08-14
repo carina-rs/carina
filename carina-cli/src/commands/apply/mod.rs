@@ -1191,19 +1191,16 @@ async fn run_apply_locked(
 
     // Build state-file-derived maps up front so anonymous → let-bound
     // rename transfer (#1685) can run between refresh phases 1 and 2.
-    let mut saved_attrs = state_file
-        .as_ref()
-        .map(|sf| sf.build_saved_attrs())
-        .unwrap_or_default();
+
     // awscc#251: lift pre-Enum-migration state (`ConcreteValue::
     // String` at a now-`Enum` position) before the differ /
     // `hydrate_read_state` consume it, so apply does not diff lifted
     // desired against un-lifted saved state. Same seam as the plan path.
-    carina_core::utils::lift_saved_state_enum_leaves(
-        &mut saved_attrs,
-        &sorted_resources,
-        ctx.schemas(),
-    );
+    let mut saved_attrs = state_file
+        .as_ref()
+        .map(|sf| sf.build_saved_attrs())
+        .unwrap_or_default()
+        .lift(ctx.schemas());
     let mut prev_explicit = state_file
         .as_ref()
         .map(|sf| sf.build_explicit())
@@ -1322,7 +1319,7 @@ async fn run_apply_locked(
     // Hydrate, transfer state for moved blocks and anonymous → let-bound
     // renames (#1685), then run phase 2 against the consolidated state.
     provider
-        .hydrate_read_state(&mut current_states, &saved_attrs)
+        .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
         .await;
     if let Some(sf) = state_file.as_ref() {
         sf.restore_partial_read_markers(&mut current_states);
