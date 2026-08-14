@@ -4300,7 +4300,7 @@ mod saved_plan_version_tests {
             &plan_input_states,
             &std::collections::HashMap::new(),
             &schemas,
-            &std::collections::HashMap::new(),
+            &crate::empty_lifted_saved_attrs(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &[],

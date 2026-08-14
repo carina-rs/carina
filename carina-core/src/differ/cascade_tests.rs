@@ -115,7 +115,7 @@ fn plan_for(
         ),
         &HashMap::new(),
         schemas,
-        &HashMap::new(),
+        &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &HashMap::new(),
         &[],

@@ -4,6 +4,7 @@ use carina_core::deps::get_resource_dependencies;
 use carina_core::explicit::{self, ExplicitFields};
 pub use carina_core::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use carina_core::override_aware::NameOverrideSource;
+use carina_core::provider::RawSavedAttrs;
 pub use carina_core::resource::DeposedKey;
 use carina_core::resource::{
     ConcreteValue, DeferredValue, Directives, PartialReadMarker, Resource, ResourceId, State, Value,
@@ -366,7 +367,7 @@ impl StateFile {
     }
 
     /// Build a map of saved attributes, converting JSON values to DSL values.
-    pub fn build_saved_attrs(&self) -> HashMap<ResourceId, HashMap<String, Value>> {
+    pub fn build_saved_attrs(&self) -> RawSavedAttrs {
         let mut result = HashMap::new();
         for rs in &self.resources {
             let id = Self::id_for_resource_state(rs);
@@ -377,7 +378,7 @@ impl StateFile {
                 .collect();
             result.insert(id, attrs);
         }
-        result
+        RawSavedAttrs::from_persisted(result)
     }
 
     /// Restore partial-read markers from the state file onto refreshed states.

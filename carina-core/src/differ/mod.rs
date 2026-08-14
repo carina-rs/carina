@@ -25,6 +25,11 @@ use crate::schema::{AttributeType, SchemaRegistry};
 #[cfg(test)]
 use comparison::find_changed_attributes;
 
+#[cfg(test)]
+fn empty_lifted_saved_attrs() -> crate::provider::LiftedSavedAttrs {
+    crate::provider::RawSavedAttrs::default().lift(&SchemaRegistry::new())
+}
+
 // Re-export comparison primitives for consumers that must agree with
 // `find_changed_attributes`: detail rows render with the same equality,
 // and executor patch construction uses the same key/value gate.

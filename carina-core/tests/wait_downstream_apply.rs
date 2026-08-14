@@ -44,6 +44,10 @@ use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
 use carina_core::schema::SchemaRegistry;
 
+fn empty_lifted_saved_attrs() -> carina_core::provider::LiftedSavedAttrs {
+    carina_core::provider::RawSavedAttrs::default().lift(&SchemaRegistry::new())
+}
+
 fn completed_result(outcome: ExecutionOutcome) -> ExecutionResult {
     match outcome {
         ExecutionOutcome::Completed(result) => result,
@@ -275,7 +279,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         ),
         &HashMap::new(),
         &registry,
-        &HashMap::new(),
+        &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &HashMap::new(),
         &parsed.wait_bindings,
@@ -441,7 +445,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         ),
         &HashMap::new(),
         &registry,
-        &HashMap::new(),
+        &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &HashMap::new(),
         &parsed.wait_bindings,
@@ -615,7 +619,7 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         ),
         &HashMap::new(),
         &registry,
-        &HashMap::new(),
+        &empty_lifted_saved_attrs(),
         &HashMap::new(),
         &HashMap::new(),
         &parsed.wait_bindings,

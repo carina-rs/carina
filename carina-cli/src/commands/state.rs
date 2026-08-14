@@ -12,7 +12,7 @@ use carina_core::effect::Effect;
 use carina_core::executor::UnresolvedDataSourceInput;
 use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
-use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
+use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, RawSavedAttrs};
 use carina_core::resource::{
     ConcreteValue, DataSource, ResolvedDataSource, Resource, ResourceId, State, Value,
 };
@@ -1123,10 +1123,14 @@ pub(crate) async fn run_state_refresh_locked(
     // carina#3278: route the expand → child-refresh → hydrate(2nd) →
     // lift quartet through the shared constructor so this path and
     // `run_apply_locked` cannot drift on the sequence again.
+    // carina#3739: `build_saved_attrs` returns raw persisted values; consuming
+    // them through `lift` is required before the typed expansion input accepts
+    // the map for Phase 2.5 hydration.
     let saved_attrs_for_expansion = state_file
         .as_ref()
         .map(|sf| sf.build_saved_attrs())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .lift(ctx.schemas());
     let saved_dep_bindings: HashMap<ResourceId, BTreeSet<String>> = state_file
         .as_ref()
         .map(|sf| {
@@ -1261,24 +1265,11 @@ pub(crate) async fn run_state_refresh_locked(
         }
     }
 
-    // Restore unreturned attributes from state file (CloudControl doesn't always return them)
-    let mut saved_attrs = state_file
-        .as_ref()
-        .map(|sf| sf.build_saved_attrs())
-        .unwrap_or_default();
-    // awscc#251: lift pre-Enum-migration state before
-    // `hydrate_read_state` carries it forward into read state.
-    // carina#3272: use the post-expansion `sorted_resources` (not
-    // `parsed.resources`) so for-loop-materialised children's saved
-    // state is lifted too — otherwise their enum-typed attrs stay
-    // as plain `String` and the differ surfaces a phantom case diff.
-    carina_core::utils::lift_saved_state_enum_leaves(
-        &mut saved_attrs,
-        &sorted_resources,
-        ctx.schemas(),
-    );
+    // Restore unreturned attributes from the same lifted map used by the
+    // expansion hydration above (CloudControl doesn't always return them).
+    let saved_attrs = saved_attrs_for_expansion;
     provider
-        .hydrate_read_state(&mut current_states, &saved_attrs)
+        .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
         .await;
     // awscc#251: also lift the provider-read `current_states` (not just
     // `saved_attrs`) — the values read at the refresh loop above arrive
@@ -1724,11 +1715,11 @@ async fn normalize_deposed_read_state<P>(
     P: ProviderNormalizer + ?Sized,
 {
     let mut states = HashMap::from([(target.id.clone(), fresh_state.clone())]);
-    let mut saved_attrs = HashMap::from([(target.id.clone(), deposed_saved_attrs(target))]);
     let resources = std::slice::from_ref(resource);
-
-    carina_core::utils::lift_saved_state_enum_leaves(&mut saved_attrs, resources, schemas);
-    provider.hydrate_read_state(&mut states, &saved_attrs).await;
+    let saved_attrs = deposed_saved_attrs(target).lift(schemas);
+    provider
+        .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
+        .await;
     carina_core::utils::lift_current_state_enum_leaves(&mut states, resources, schemas);
 
     if let Some(normalized) = states.remove(&target.id) {
@@ -1736,12 +1727,13 @@ async fn normalize_deposed_read_state<P>(
     }
 }
 
-fn deposed_saved_attrs(target: &DeposedRefreshTarget) -> HashMap<String, Value> {
-    target
+fn deposed_saved_attrs(target: &DeposedRefreshTarget) -> RawSavedAttrs {
+    let attrs = target
         .attributes
         .iter()
         .filter_map(|(key, value)| json_to_dsl_value(value).map(|dsl| (key.clone(), dsl)))
-        .collect()
+        .collect();
+    RawSavedAttrs::from_persisted(HashMap::from([(target.id.clone(), attrs)]))
 }
 
 /// Compare old state with fresh provider state for a single resource,
@@ -1913,6 +1905,7 @@ fn diff_display_update_resource(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::parser::parse;
     use carina_core::provider::{
         BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
         UpdateRequest,
@@ -1923,11 +1916,13 @@ mod tests {
     use carina_state::{DeposedInstance, DeposedKey};
     use serde_json::json;
     use std::path::PathBuf;
+    use std::sync::Mutex;
 
     #[derive(Default)]
     struct DeposedRefreshTestProvider {
         read_results: HashMap<(String, String), Result<State, String>>,
         hydrate_saved_attrs: bool,
+        hydrated_saved_values: Mutex<Vec<Value>>,
     }
 
     impl DeposedRefreshTestProvider {
@@ -2046,6 +2041,10 @@ mod tests {
                             .attributes
                             .entry(key.clone())
                             .or_insert_with(|| value.clone());
+                        self.hydrated_saved_values
+                            .lock()
+                            .expect("hydration probe lock")
+                            .push(value.clone());
                     }
                 }
             })
@@ -2082,6 +2081,138 @@ mod tests {
 
     fn string_value(raw: &str) -> Value {
         Value::Concrete(ConcreteValue::String(raw.to_string()))
+    }
+
+    #[tokio::test]
+    async fn state_refresh_expansion_hydrates_lifted_saved_enum_attrs() {
+        let parsed = parse(
+            r#"
+                let source = aws.service.Source {
+                    name = "source"
+                }
+
+                for (_, item) in source.items {
+                    aws.service.Widget {
+                        name = item
+                    }
+                }
+            "#,
+            &ProviderContext::default(),
+        )
+        .expect("test config should parse");
+        assert_eq!(parsed.deferred_for_expressions.len(), 1);
+
+        let sorted_resources = sort_resources_by_dependencies(&parsed.resources).unwrap();
+        let source = parsed
+            .resources
+            .iter()
+            .find(|resource| resource.binding.as_deref() == Some("source"))
+            .expect("source resource");
+        let mut current_states = HashMap::from([(
+            source.id.clone(),
+            State::existing(
+                source.id.clone(),
+                HashMap::from([(
+                    "items".to_string(),
+                    Value::Concrete(ConcreteValue::List(vec![string_value("widget-1")])),
+                )]),
+            ),
+        )]);
+
+        let preview = crate::wiring::expand_same_config_deferred_for(
+            &parsed,
+            &sorted_resources,
+            &current_states,
+            &SchemaRegistry::new(),
+            &HashMap::new(),
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .expect("loop should expand");
+        let child = preview
+            .sorted_resources
+            .iter()
+            .find(|resource| resource.id.resource_type == "service.Widget")
+            .expect("materialized child")
+            .clone();
+        assert_eq!(preview.new_child_ids, HashSet::from([child.id.clone()]));
+
+        let mut state_file = StateFile::new();
+        let mut child_state = ResourceState::new(
+            &child.id.resource_type,
+            child.id.identity_or_empty(),
+            &child.id.provider,
+        )
+        .with_identifier("widget-1")
+        .with_attribute("status", json!("Enabled"));
+        child_state.directives.provider_instance = child.id.provider_instance.clone();
+        state_file
+            .upsert_resource(child_state)
+            .expect("test state setup must be valid");
+
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "aws",
+            ResourceSchema::new("service.Widget").attribute(AttributeSchema::new(
+                "status",
+                AttributeType::enum_(
+                    carina_core::schema::enum_identity("Status", Some("aws.service.Widget")),
+                    Some(vec!["Enabled".to_string()]),
+                    vec![("Enabled".to_string(), "enabled".to_string())],
+                    None,
+                    None,
+                ),
+            )),
+        );
+
+        // This is the saved-attribute construction used by
+        // `run_state_refresh_locked` before the shared expansion path.
+        let saved_attrs_for_expansion = state_file.build_saved_attrs().lift(&schemas);
+        let state_file = Some(state_file);
+        let provider = DeposedRefreshTestProvider::default()
+            .with_saved_attr_hydration()
+            .with_read_state(
+                &child.id,
+                "widget-1",
+                State::existing(child.id.clone(), HashMap::new()).with_identifier("widget-1"),
+            );
+        let multi =
+            indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
+
+        let expanded = crate::wiring::expand_refresh_and_lift_states(
+            crate::wiring::ExpandRefreshAndLiftInputs {
+                parsed: &parsed,
+                provider: &provider,
+                sorted_resources: &sorted_resources,
+                current_states: &mut current_states,
+                remote_bindings: &HashMap::new(),
+                wait_aliases: &[],
+                moved_targets: &HashSet::new(),
+                already_refreshed: &HashSet::new(),
+                state_file: &state_file,
+                saved_dep_bindings: &HashMap::new(),
+                saved_attrs: &saved_attrs_for_expansion,
+                multi: &multi,
+                schemas: &schemas,
+            },
+        )
+        .await
+        .expect("refresh expansion should succeed");
+        assert_eq!(expanded.new_child_ids, HashSet::from([child.id.clone()]));
+
+        let hydrated = provider
+            .hydrated_saved_values
+            .lock()
+            .expect("hydration probe lock");
+        assert!(
+            matches!(
+                hydrated.as_slice(),
+                [Value::Concrete(ConcreteValue::CanonicalEnum(value))]
+                    if value.api_value() == "Enabled"
+            ),
+            "saved enum must be lifted before hydration, got {hydrated:?}"
+        );
     }
 
     fn deposed_format_state() -> StateFile {

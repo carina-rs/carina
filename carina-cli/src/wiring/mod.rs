@@ -32,8 +32,8 @@ use carina_core::override_aware::OverrideAwareResources;
 use carina_core::parser::{ProviderConfig, StateBlock, StateBlockAddress, WarningKind};
 use carina_core::plan::Plan;
 use carina_core::provider::{
-    self as provider_mod, Provider, ProviderError, ProviderFactory, ProviderNormalizer,
-    ProviderRouter,
+    self as provider_mod, LiftedSavedAttrs, Provider, ProviderError, ProviderFactory,
+    ProviderNormalizer, ProviderRouter,
 };
 use carina_core::resource::{
     ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, State, Value,
@@ -612,7 +612,7 @@ pub fn apply_anonymous_to_named_renames(
     providers: &[ProviderConfig],
     current_states: &mut HashMap<ResourceId, State>,
     prev_explicit: &mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
-    saved_attrs: &mut HashMap<ResourceId, HashMap<String, Value>>,
+    saved_attrs: &mut LiftedSavedAttrs,
     state_file: &Option<StateFile>,
     claims: &StateBlockClaims,
 ) -> Vec<(ResourceId, ResourceId)> {
@@ -673,9 +673,7 @@ pub fn apply_anonymous_to_named_renames(
         if let Some(keys) = prev_explicit.remove(from) {
             prev_explicit.insert(to.clone(), keys);
         }
-        if let Some(attrs) = saved_attrs.remove(from) {
-            saved_attrs.insert(to.clone(), attrs);
-        }
+        saved_attrs.remap_resource_id(from, to.clone());
     }
 
     renames
@@ -870,7 +868,7 @@ pub(crate) struct LateAnonymousIdentityInputs<'a> {
     pub state_file: Option<&'a StateFile>,
     pub state_block_claims: &'a StateBlockClaims,
     pub current_states: &'a mut HashMap<ResourceId, State>,
-    pub saved_attrs: &'a mut HashMap<ResourceId, HashMap<String, Value>>,
+    pub saved_attrs: &'a mut LiftedSavedAttrs,
     pub prev_explicit: &'a mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     pub providers: &'a [ProviderConfig],
 }
@@ -908,9 +906,7 @@ pub(crate) fn reconcile_late_anonymous_identities(
             state.id = to.clone();
             inputs.current_states.insert(to.clone(), state);
         }
-        if let Some(attrs) = inputs.saved_attrs.remove(from) {
-            inputs.saved_attrs.insert(to.clone(), attrs);
-        }
+        inputs.saved_attrs.remap_resource_id(from, to.clone());
         if let Some(explicit) = inputs.prev_explicit.remove(from) {
             inputs.prev_explicit.insert(to.clone(), explicit);
         }
@@ -2005,10 +2001,10 @@ pub struct ExpandRefreshAndLiftInputs<'a, E: Clone, P: Provider + ProviderNormal
     pub saved_dep_bindings: &'a HashMap<ResourceId, BTreeSet<String>>,
     /// Saved attribute values to carry forward to materialised children
     /// via `provider.hydrate_read_state` after their initial read. Pass
-    /// the same `SavedAttrs` the caller built once at the head of its
-    /// pipeline — `hydrate_read_state` is idempotent, so passing it
-    /// here and re-hydrating downstream of this function is safe.
-    pub saved_attrs: &'a carina_core::provider::SavedAttrs,
+    /// the same lifted saved attributes the caller built once at the head of
+    /// its pipeline — `hydrate_read_state` is idempotent, so passing it here
+    /// and re-hydrating downstream of this function is safe.
+    pub saved_attrs: &'a LiftedSavedAttrs,
     pub multi: &'a indicatif::MultiProgress,
     pub schemas: &'a carina_core::schema::SchemaRegistry,
 }
@@ -2061,7 +2057,10 @@ pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNorm
         .await?;
         inputs
             .provider
-            .hydrate_read_state(inputs.current_states, inputs.saved_attrs)
+            .hydrate_read_state(
+                inputs.current_states,
+                inputs.saved_attrs.as_provider_saved_attrs(),
+            )
             .await;
     }
 
@@ -2173,10 +2172,6 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // Build state-file-derived maps up front so anonymous → let-bound
     // rename transfer (#1685) can run between refresh phases 1 and 2.
     // These maps only depend on `state_file`, not on refresh output.
-    let mut saved_attrs = state_file
-        .as_ref()
-        .map(|sf| sf.build_saved_attrs())
-        .unwrap_or_default();
     // awscc#251: state files written before a provider promoted an
     // attribute from `Custom` to `Enum` (e.g. awscc#250 for IAM
     // policy `version`/`effect`) store enum values as plain JSON
@@ -2187,11 +2182,11 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // `ConcreteValue::EnumIdentifier` against each resource's current
     // schema before any diff/validation consumes the loaded state.
     // carina-state stays schema-free; the registry only exists here.
-    carina_core::utils::lift_saved_state_enum_leaves(
-        &mut saved_attrs,
-        &sorted_resources,
-        ctx.schemas(),
-    );
+    let mut saved_attrs = state_file
+        .as_ref()
+        .map(|sf| sf.build_saved_attrs())
+        .unwrap_or_default()
+        .lift(ctx.schemas());
     let mut prev_explicit = state_file
         .as_ref()
         .map(|sf| sf.build_explicit())
@@ -2317,7 +2312,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         // any attributes the provider's read() didn't return are
         // available when building the binding map (#1685).
         provider
-            .hydrate_read_state(&mut current_states, &saved_attrs)
+            .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
             .await;
         if let Some(sf) = state_file.as_ref() {
             sf.restore_partial_read_markers(&mut current_states);
@@ -2418,7 +2413,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             // call (and data-source-input resolution) sees entries
             // under their current binding names (#1685).
             provider
-                .hydrate_read_state(&mut current_states, &saved_attrs)
+                .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
                 .await;
             if let Some(sf) = state_file.as_ref() {
                 sf.restore_partial_read_markers(&mut current_states);
@@ -2518,7 +2513,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             )
             .await?;
             provider
-                .hydrate_read_state(&mut current_states, &saved_attrs)
+                .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
                 .await;
             if let Some(sf) = state_file.as_ref() {
                 sf.restore_partial_read_markers(&mut current_states);
@@ -2533,7 +2528,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 current_states.insert(resource.id.clone(), state);
             }
             provider
-                .hydrate_read_state(&mut current_states, &saved_attrs)
+                .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
                 .await;
         } else {
             for resource in children() {
@@ -2735,7 +2730,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
 pub fn materialize_moved_states(
     current_states: &mut HashMap<ResourceId, State>,
     prev_explicit: &mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
-    saved_attrs: &mut HashMap<ResourceId, HashMap<String, Value>>,
+    saved_attrs: &mut LiftedSavedAttrs,
     state_blocks: &[StateBlock],
     state_file: &Option<StateFile>,
 ) -> Vec<(ResourceId, ResourceId)> {
@@ -2752,7 +2747,7 @@ pub fn materialize_moved_states(
 fn materialize_moved_states_with_warning_sink(
     current_states: &mut HashMap<ResourceId, State>,
     prev_explicit: &mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
-    saved_attrs: &mut HashMap<ResourceId, HashMap<String, Value>>,
+    saved_attrs: &mut LiftedSavedAttrs,
     state_blocks: &[StateBlock],
     state_file: &Option<StateFile>,
     warn_missing: &mut dyn FnMut(String),
@@ -2812,9 +2807,9 @@ fn materialize_moved_states_with_warning_sink(
             // the resolution is independent of map-population
             // ordering — a routed entry in any of the three is the
             // right routing for the destination.
-            let resolved_to = find_desired_id(to, current_states)
-                .or_else(|| find_desired_id(to, prev_explicit))
-                .or_else(|| find_desired_id(to, saved_attrs))
+            let resolved_to = find_desired_id(to, current_states.keys())
+                .or_else(|| find_desired_id(to, prev_explicit.keys()))
+                .or_else(|| find_desired_id(to, saved_attrs.resource_ids()))
                 .unwrap_or_else(|| to.to_unrouted_resource_id());
 
             // Transfer state from the old name to the new name so the
@@ -2832,9 +2827,7 @@ fn materialize_moved_states_with_warning_sink(
 
             // Transfer saved_attrs so create_plan can look up saved
             // attributes under the new resource name.
-            if let Some(attrs) = saved_attrs.remove(&resolved_from) {
-                saved_attrs.insert(resolved_to.clone(), attrs);
-            }
+            saved_attrs.remap_resource_id(&resolved_from, resolved_to.clone());
 
             moved_pairs.push((resolved_from, resolved_to));
         }
@@ -3032,12 +3025,11 @@ pub fn validate_plan_time_state_block_collisions(
 /// destination of a `moved { ... }` block can be derived. Returns
 /// `None` when no matching key exists, so callers can chain across
 /// multiple maps with `.or_else(...)` (carina#3324).
-fn find_desired_id<V>(
+fn find_desired_id<'a>(
     to: &StateBlockAddress,
-    desired: &HashMap<ResourceId, V>,
+    mut desired: impl Iterator<Item = &'a ResourceId>,
 ) -> Option<ResourceId> {
     desired
-        .keys()
         .find(|k| {
             k.provider == to.provider
                 && k.resource_type == to.resource_type

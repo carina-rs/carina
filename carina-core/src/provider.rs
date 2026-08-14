@@ -491,8 +491,78 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Saved attribute values keyed by resource ID.
 ///
 /// Used by `ProviderNormalizer::hydrate_read_state` to carry forward
-/// attributes that APIs don't return in read responses.
+/// attributes that APIs don't return in read responses. This structural alias
+/// remains the provider/plugin ABI representation; schema-aware callers use
+/// [`RawSavedAttrs`] and [`LiftedSavedAttrs`] to track whether persisted enum
+/// leaves are safe to expose at this boundary.
 pub type SavedAttrs = HashMap<ResourceId, HashMap<String, Value>>;
+
+/// Saved attributes decoded from persisted state but not yet reconciled
+/// with the current provider schemas.
+///
+/// This type cannot be passed to planning or refresh hydration. Consume it
+/// with [`RawSavedAttrs::lift`] to obtain [`LiftedSavedAttrs`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RawSavedAttrs(SavedAttrs);
+
+impl RawSavedAttrs {
+    /// Mark a structurally raw map as originating from persisted state.
+    pub fn from_persisted(saved_attrs: SavedAttrs) -> Self {
+        Self(saved_attrs)
+    }
+
+    /// Lift every persisted entry using the schema selected by its resource ID.
+    pub fn lift(mut self, registry: &SchemaRegistry) -> LiftedSavedAttrs {
+        crate::utils::lift_saved_state_enum_leaves(&mut self.0, registry);
+        LiftedSavedAttrs(self.0)
+    }
+
+    /// Read a raw resource entry without changing its typestate.
+    pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, Value>> {
+        self.0.get(id)
+    }
+}
+
+/// Saved attributes whose enum leaves have been lifted against the current
+/// schemas and are safe for hydration and planning.
+///
+/// carina#3739: the private field deliberately prevents construction from a
+/// plain map. The only public conversion from persisted data is
+/// [`RawSavedAttrs::lift`].
+///
+/// ```compile_fail
+/// use carina_core::provider::{LiftedSavedAttrs, RawSavedAttrs};
+///
+/// fn requires_lifted(_: &LiftedSavedAttrs) {}
+/// let raw = RawSavedAttrs::default();
+/// requires_lifted(&raw);
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiftedSavedAttrs(SavedAttrs);
+
+impl LiftedSavedAttrs {
+    /// Borrow the plugin-ABI representation at a provider hydration boundary.
+    pub fn as_provider_saved_attrs(&self) -> &SavedAttrs {
+        &self.0
+    }
+
+    /// Read saved attributes for one resource.
+    pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, Value>> {
+        self.0.get(id)
+    }
+
+    /// Iterate resource IDs without exposing mutable map access.
+    pub fn resource_ids(&self) -> impl Iterator<Item = &ResourceId> {
+        self.0.keys()
+    }
+
+    /// Transfer a resource's saved attributes to a new ID.
+    pub fn remap_resource_id(&mut self, from: &ResourceId, to: ResourceId) {
+        if let Some(attrs) = self.0.remove(from) {
+            self.0.insert(to, attrs);
+        }
+    }
+}
 
 /// Result of a provider create operation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1504,6 +1574,71 @@ impl Provider for Box<dyn Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn widget_status_registry() -> SchemaRegistry {
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "aws",
+            crate::schema::ResourceSchema::new("service.Widget").attribute(
+                crate::schema::AttributeSchema::new(
+                    "status",
+                    crate::schema::AttributeType::enum_(
+                        crate::schema::enum_identity("Status", Some("aws.service.Widget")),
+                        Some(vec!["Enabled".to_string()]),
+                        vec![("Enabled".to_string(), "enabled".to_string())],
+                        None,
+                        None,
+                    ),
+                ),
+            ),
+        );
+        registry
+    }
+
+    #[test]
+    fn lift_covers_orphan_entries_absent_from_any_resource_slice() {
+        let orphan = ResourceId::with_provider_identity("aws", "service.Widget", "orphan", None);
+        let raw = RawSavedAttrs::from_persisted(HashMap::from([(
+            orphan.clone(),
+            HashMap::from([(
+                "status".to_string(),
+                Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+            )]),
+        )]));
+
+        let lifted = raw.lift(&widget_status_registry());
+
+        assert!(matches!(
+            &lifted.get(&orphan).unwrap()["status"],
+            Value::Concrete(ConcreteValue::CanonicalEnum(value))
+                if value.api_value() == "Enabled"
+        ));
+    }
+
+    #[test]
+    fn raw_saved_attrs_lift_is_map_driven_and_remappable() {
+        let from = ResourceId::with_provider_identity("aws", "service.Widget", "old", None);
+        let to = ResourceId::with_provider_identity("aws", "service.Widget", "new", None);
+        let raw = RawSavedAttrs::from_persisted(HashMap::from([(
+            from.clone(),
+            HashMap::from([(
+                "status".to_string(),
+                Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+            )]),
+        )]));
+        let registry = widget_status_registry();
+
+        let mut lifted = raw.lift(&registry);
+        assert!(matches!(
+            &lifted.get(&from).unwrap()["status"],
+            Value::Concrete(ConcreteValue::CanonicalEnum(value))
+                if value.api_value() == "Enabled"
+        ));
+
+        lifted.remap_resource_id(&from, to.clone());
+        assert!(lifted.get(&from).is_none());
+        assert!(lifted.get(&to).is_some());
+    }
 
     fn resolved_for_test(resource: Resource) -> ResolvedResource {
         let normalized =
