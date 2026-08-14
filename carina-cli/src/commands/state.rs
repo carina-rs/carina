@@ -16,7 +16,9 @@ use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, 
 use carina_core::resource::{
     ConcreteValue, DataSource, ResolvedDataSource, Resource, ResourceId, State, Value,
 };
-use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
+use carina_core::shutdown::{
+    CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
+};
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, DeposedInstance, DeposedKey, LockInfo,
@@ -33,13 +35,6 @@ use crate::wiring::{
     get_provider_with_ctx, read_data_source_with_retry, reconcile_anonymous_identifiers_with_ctx,
     reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
 };
-
-fn shutdown_requested(shutdown: &ShutdownToken) -> bool {
-    match shutdown.phase() {
-        ShutdownPhase::Running => false,
-        ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => true,
-    }
-}
 
 /// Convert a lock acquisition error into an `AppError`.
 ///
@@ -1098,8 +1093,11 @@ pub(crate) async fn run_state_refresh_locked(
         .collect();
     let (mut current_states, already_refreshed) =
         refresh_existing_resources_until_cancelled(&provider, managed_reads, &cancel).await?;
-    if shutdown_requested(&cancel) {
-        return Err(AppError::Interrupted);
+    match cancel.phase() {
+        ShutdownPhase::Running => {}
+        ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
+            return Err(AppError::Interrupted);
+        }
     }
 
     // carina#3272: expand `for _, _ in <iter> { ... }` loops the same
@@ -1176,8 +1174,11 @@ pub(crate) async fn run_state_refresh_locked(
     })
     .await?;
     sorted_resources = resorted;
-    if shutdown_requested(&cancel) {
-        return Err(AppError::Interrupted);
+    match cancel.phase() {
+        ShutdownPhase::Running => {}
+        ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
+            return Err(AppError::Interrupted);
+        }
     }
 
     // Also read states for orphaned resources (in state but removed from config)
@@ -1252,14 +1253,20 @@ pub(crate) async fn run_state_refresh_locked(
                     continue;
                 }
             };
-            if shutdown_requested(&cancel) {
-                return Err(AppError::Interrupted);
+            match cancel.phase() {
+                ShutdownPhase::Running => {}
+                ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
+                    return Err(AppError::Interrupted);
+                }
             }
             let fresh_state = read_data_source_with_retry(&provider, &resource)
                 .await
                 .map_err(AppError::Provider)?;
-            if shutdown_requested(&cancel) {
-                return Err(AppError::Interrupted);
+            match cancel.phase() {
+                ShutdownPhase::Running => {}
+                ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
+                    return Err(AppError::Interrupted);
+                }
             }
             current_states.insert(resource.id.clone(), fresh_state);
         }
@@ -1329,8 +1336,11 @@ pub(crate) async fn run_state_refresh_locked(
         &cancel,
     )
     .await?;
-    if shutdown_requested(&cancel) {
-        return Err(AppError::Interrupted);
+    match cancel.phase() {
+        ShutdownPhase::Running => {}
+        ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
+            return Err(AppError::Interrupted);
+        }
     }
 
     // Re-resolve exports using refreshed state
@@ -1431,9 +1441,22 @@ async fn refresh_existing_resources_until_cancelled(
     let mut refreshed = HashSet::new();
     let mut read_iter = reads.into_iter();
     let mut in_flight = FuturesUnordered::new();
-    let mut refresh_cancelled = shutdown_requested(cancel);
+    let mut refresh_cancelled = false;
+    let cleanup_loop = cancel.cleanup_aware_loop();
 
     loop {
+        let cleanup_wait = match cleanup_loop.step() {
+            LoopStep::Continue(wait) => wait,
+            LoopStep::Abandon => {
+                refresh_cancelled = true;
+                break;
+            }
+        };
+        match cleanup_wait.phase() {
+            LoopShutdownPhase::Running => {}
+            LoopShutdownPhase::Graceful => refresh_cancelled = true,
+        }
+
         while !refresh_cancelled && in_flight.len() < 5 {
             let Some((id, identifier)) = read_iter.next() else {
                 break;
@@ -1455,26 +1478,41 @@ async fn refresh_existing_resources_until_cancelled(
             break;
         }
 
-        let result: Result<(ResourceId, State), AppError> = if refresh_cancelled {
-            tokio::select! {
-                biased;
-                _ = cancel.cleanup_priority_requested() => break,
-                result = in_flight.next() => result.unwrap(),
+        let draining = refresh_cancelled;
+        #[cfg(test)]
+        let next_in_flight = async {
+            if draining {
+                crate::commands::shared::cancellation_test_support::observe_refresh_drain_wait(
+                    cancel,
+                )
+                .await;
             }
+            in_flight.next().await
+        };
+        #[cfg(not(test))]
+        let next_in_flight = in_flight.next();
+        // A ready provider result is harvested before cleanup priority. If
+        // refresh is already cancelled, the short-circuit below discards it.
+        let next = cleanup_wait.until_cleanup_priority(next_in_flight);
+        tokio::pin!(next);
+        let next = if draining {
+            next.await
         } else {
             tokio::select! {
                 biased;
-                _ = cancel.cleanup_priority_requested() => {
-                    refresh_cancelled = true;
-                    break;
-                }
+                next = &mut next => next,
                 _ = cancel.cancelled() => {
                     refresh_cancelled = true;
                     continue;
                 }
-                result = in_flight.next() => {
-                    result.unwrap()
-                }
+            }
+        };
+        let result: Result<(ResourceId, State), AppError> = match next {
+            CleanupInterrupted::Completed(Some(result)) => result,
+            CleanupInterrupted::Completed(None) => break,
+            CleanupInterrupted::Abandoned => {
+                refresh_cancelled = true;
+                break;
             }
         };
 
@@ -1536,23 +1574,34 @@ where
         updated_generations: 0,
         failed_generations: 0,
     };
+    let cleanup_loop = cancel.cleanup_aware_loop();
 
     for target in targets {
-        if shutdown_requested(cancel) {
-            return Err(AppError::Interrupted);
+        let cleanup_wait = match cleanup_loop.step() {
+            LoopStep::Continue(wait) => wait,
+            LoopStep::Abandon => return Err(AppError::Interrupted),
+        };
+        match cleanup_wait.phase() {
+            LoopShutdownPhase::Running => {}
+            LoopShutdownPhase::Graceful => return Err(AppError::Interrupted),
         }
 
-        let read_result = tokio::select! {
-            biased;
-            _ = cancel.cleanup_priority_requested() => return Err(AppError::Interrupted),
-            result = provider.read(
+        let read_result = match cleanup_wait
+            .until_cleanup_priority(provider.read(
                 &target.id,
                 Some(target.identifier.as_str()),
                 carina_core::provider::ReadRequest,
-            ) => result,
+            ))
+            .await
+        {
+            CleanupInterrupted::Completed(result) => result,
+            CleanupInterrupted::Abandoned => return Err(AppError::Interrupted),
         };
-        if shutdown_requested(cancel) {
-            return Err(AppError::Interrupted);
+        match cancel.phase() {
+            ShutdownPhase::Running => {}
+            ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
+                return Err(AppError::Interrupted);
+            }
         }
 
         let fresh_state = match read_result {
@@ -1606,8 +1655,11 @@ where
             schemas,
         )
         .await;
-        if shutdown_requested(cancel) {
-            return Err(AppError::Interrupted);
+        match cancel.phase() {
+            ShutdownPhase::Running => {}
+            ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
+                return Err(AppError::Interrupted);
+            }
         }
         let schema = schemas.get_for(&masking_resource);
         let attributes = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
@@ -1905,6 +1957,9 @@ fn diff_display_update_resource(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::shared::cancellation_test_support::{
+        CancellationFixtureBase, MOCK_PROVIDER_ENV_LOCK, ScopedEnv, install_refresh_drain_barrier,
+    };
     use carina_core::parser::parse;
     use carina_core::provider::{
         BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
@@ -2081,6 +2136,110 @@ mod tests {
 
     fn string_value(raw: &str) -> Value {
         Value::Concrete(ConcreteValue::String(raw.to_string()))
+    }
+
+    #[tokio::test]
+    async fn state_refresh_cleanup_priority_abandons_in_flight_read_and_releases_lock() {
+        let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
+        let fixture = CancellationFixtureBase::new();
+        let state_path = fixture.state_path().display();
+        fixture.write_crn(format!(
+            "backend local {{ path = \"{state_path}\" }}\n\
+             provider mock {{}}\n\
+             let managed = mock.test.resource {{ name = \"managed\" }}\n"
+        ));
+        fixture.write_backend_lock();
+
+        let mut initial_state = StateFile::new();
+        let mut managed =
+            ResourceState::new("test.resource", "managed", "mock").with_identifier("mock-id");
+        managed.binding = Some("managed".to_string());
+        managed
+            .attributes
+            .insert("name".to_string(), serde_json::json!("managed"));
+        initial_state
+            .upsert_resource(managed)
+            .expect("test state setup must be valid");
+        let initial_serial = initial_state.serial;
+        fixture.write_state(&initial_state);
+
+        let provider_state_path = fixture.readiness_path("mock-provider-state.json");
+        let provider_state = std::collections::HashMap::from([(
+            "test.resource.managed".to_string(),
+            serde_json::json!({ "name": "managed" }),
+        )]);
+        std::fs::write(
+            &provider_state_path,
+            carina_core::utils::pretty_with_newline(&provider_state)
+                .expect("serialize mock provider state"),
+        )
+        .expect("write mock provider state");
+        let read_ready_path = fixture.readiness_path("mock-read-ready");
+        let read_outcome_path = fixture.readiness_path("mock-read-outcome");
+        let _provider_env = [
+            ScopedEnv::set("CARINA_MOCK_STATE_FILE", &provider_state_path),
+            ScopedEnv::set("CARINA_MOCK_READ_DELAY_MS_FOR", "test.resource.managed"),
+            ScopedEnv::set("CARINA_MOCK_READ_DELAY_MS", "60000"),
+            ScopedEnv::set("CARINA_MOCK_READ_READY_PATH", &read_ready_path),
+            ScopedEnv::set("CARINA_MOCK_READ_OUTCOME_PATH", &read_outcome_path),
+        ];
+        let drain_barrier = install_refresh_drain_barrier(fixture.shutdown_token());
+
+        let provider_context = ProviderContext::default();
+        let refresh = run_state_refresh(
+            fixture.config_path(),
+            true,
+            &provider_context,
+            fixture.shutdown_token(),
+        );
+        tokio::pin!(refresh);
+        tokio::select! {
+            ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !read_ready_path.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }) => ready.expect("mock provider did not signal that the blocked read started"),
+            result = &mut refresh => {
+                panic!("state refresh returned before the managed read blocked: {result:?}");
+            }
+        }
+        assert!(fixture.lock_path().exists(), "fixture must hold the lock");
+        fixture.shutdown_trigger().request_graceful_shutdown();
+        tokio::select! {
+            reached = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                drain_barrier.reached(),
+            ) => reached.expect("state refresh did not enter its in-flight drain wait"),
+            result = &mut refresh => {
+                panic!("state refresh returned before entering its in-flight drain wait: {result:?}");
+            }
+        }
+        fixture.shutdown_trigger().prioritize_cleanup();
+        drain_barrier.release();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), refresh)
+            .await
+            .expect("state refresh did not abandon the in-flight read after cleanup priority")
+            .unwrap_err();
+
+        assert!(matches!(err, AppError::Interrupted));
+        assert_eq!(
+            std::fs::read_to_string(&read_outcome_path)
+                .expect("mock provider must record the in-flight read outcome"),
+            "abandoned\n",
+            "the in-flight state refresh read must be dropped before producing a result"
+        );
+        let state = fixture.read_state().await;
+        assert_eq!(
+            state.serial, initial_serial,
+            "abandoned refresh must not save"
+        );
+        assert!(
+            state
+                .find_resource("mock", "test.resource", "managed")
+                .is_some(),
+            "an abandoned refresh must preserve the persisted resource"
+        );
+        assert!(!fixture.lock_path().exists(), "lock must be released");
     }
 
     #[tokio::test]

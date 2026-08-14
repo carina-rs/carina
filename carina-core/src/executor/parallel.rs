@@ -9,7 +9,7 @@ use crate::effect::deps::UnresolvedResource;
 use crate::effect::{DeletedInstanceKey, Effect};
 use crate::provider::Provider;
 use crate::resource::{Resource, ResourceId, Value};
-use crate::shutdown::{ShutdownPhase, ShutdownToken};
+use crate::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
 use super::basic::{
     BasicEffectCtx, ExecutionState, RenormalizePipeline, count_actionable_effects,
@@ -275,24 +275,28 @@ pub(super) async fn execute_effects_sequential(
 
     let mut in_flight: WaitAwareInFlight<'_, SingleEffectResult> = WaitAwareInFlight::new();
     let mut cancelled = false;
+    let cleanup_loop = shutdown.cleanup_aware_loop();
 
     'execution: loop {
         let undispatched_at_loop_start = actionable_indices
             .iter()
             .filter(|&&idx| !dispatched.contains(&idx))
             .count();
-        match shutdown.phase() {
-            ShutdownPhase::CleanupPriority => {
+        let cleanup_wait = match cleanup_loop.step() {
+            LoopStep::Continue(wait) => wait,
+            LoopStep::Abandon => {
                 cancelled = true;
                 break 'execution;
             }
-            ShutdownPhase::Graceful
+        };
+        match cleanup_wait.phase() {
+            LoopShutdownPhase::Graceful
                 if !cancelled && (undispatched_at_loop_start > 0 || !in_flight.is_empty()) =>
             {
                 cancelled = true;
                 in_flight.signal_in_flight_waits();
             }
-            ShutdownPhase::Running | ShutdownPhase::Graceful => {}
+            LoopShutdownPhase::Running | LoopShutdownPhase::Graceful => {}
         }
 
         // Find newly ready effects: all deps completed and not yet dispatched
@@ -619,44 +623,36 @@ pub(super) async fn execute_effects_sequential(
             break;
         }
 
-        // Wait for the next effect to complete
-        let (finished_idx, result) = if cancelled {
-            tokio::select! {
-                biased;
-                finished = in_flight
-                    .check_terminal(count_undispatched(&dispatched, &failed_indices))
-                    .cancel_if_terminal()
-                    .next_completed() => {
-                    let Some(finished) = finished else {
-                        break;
-                    };
-                    finished
-                }
-                _ = shutdown.cleanup_priority_requested() => {
-                    break 'execution;
+        // Wait for the next effect to complete. The completion branch stays
+        // ahead of shutdown so a result that is already ready is harvested.
+        let completion = {
+            let next_completed = in_flight
+                .check_terminal(count_undispatched(&dispatched, &failed_indices))
+                .cancel_if_terminal()
+                .next_completed();
+            let completion = cleanup_wait.until_cleanup_priority(next_completed);
+            tokio::pin!(completion);
+            if cancelled {
+                Some(completion.await)
+            } else {
+                tokio::select! {
+                    biased;
+                    completion = &mut completion => Some(completion),
+                    _ = shutdown.cancelled() => None,
                 }
             }
-        } else {
-            tokio::select! {
-                biased;
-                finished = in_flight
-                    .check_terminal(count_undispatched(&dispatched, &failed_indices))
-                    .cancel_if_terminal()
-                    .next_completed() => {
-                    let Some(finished) = finished else {
-                        break;
-                    };
-                    finished
-                }
-                _ = shutdown.cleanup_priority_requested() => {
-                    cancelled = true;
-                    break 'execution;
-                }
-                _ = shutdown.cancelled() => {
-                    cancelled = true;
-                    in_flight.signal_in_flight_waits();
-                    continue;
-                }
+        };
+        let Some(completion) = completion else {
+            cancelled = true;
+            in_flight.signal_in_flight_waits();
+            continue;
+        };
+        let (finished_idx, result) = match completion {
+            CleanupInterrupted::Completed(Some(finished)) => finished,
+            CleanupInterrupted::Completed(None) => break 'execution,
+            CleanupInterrupted::Abandoned => {
+                cancelled = true;
+                break 'execution;
             }
         };
         completed_indices.insert(finished_idx);
@@ -792,20 +788,18 @@ pub(super) async fn execute_effects_sequential(
     // Cleanup-priority mode deliberately drops unresolved provider futures so
     // the caller can persist the results already folded into `applied_states`.
     drop(in_flight);
-    let (failed_refreshes, refresh_cancelled) = match shutdown.phase() {
-        ShutdownPhase::CleanupPriority => (HashSet::new(), true),
-        ShutdownPhase::Running | ShutdownPhase::Graceful => {
+    let (failed_refreshes, refresh_cancelled) = match cleanup_loop.step() {
+        LoopStep::Abandon => (HashSet::new(), true),
+        LoopStep::Continue(cleanup_wait) => {
             let refresh = refresh_pending_states(
                 provider,
                 &mut input.current_states,
                 &pending_refreshes,
                 observer,
             );
-            tokio::pin!(refresh);
-            tokio::select! {
-                biased;
-                _ = shutdown.cleanup_priority_requested() => (HashSet::new(), true),
-                failed = &mut refresh => (failed, false),
+            match cleanup_wait.until_cleanup_priority(refresh).await {
+                CleanupInterrupted::Completed(failed) => (failed, false),
+                CleanupInterrupted::Abandoned => (HashSet::new(), true),
             }
         }
     };

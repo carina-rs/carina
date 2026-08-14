@@ -9,6 +9,28 @@ pub(crate) enum StatePersistence {
     CancellationCleanup,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanupStageMode {
+    Normal,
+    CancellationCleanup,
+}
+
+impl CleanupStageMode {
+    fn at_start(already_cancelled: bool, phase: ShutdownPhase) -> Self {
+        match phase {
+            ShutdownPhase::Running => {
+                if already_cancelled {
+                    Self::CancellationCleanup
+                } else {
+                    Self::Normal
+                }
+            }
+            ShutdownPhase::Graceful => Self::CancellationCleanup,
+            ShutdownPhase::CleanupPriority => Self::CancellationCleanup,
+        }
+    }
+}
+
 pub(crate) async fn release_lock_after_execute(
     backend: &dyn StateBackend,
     lock: &LockInfo,
@@ -51,10 +73,11 @@ where
     MakeFinalize: FnOnce(StatePersistence) -> F,
     F: Future<Output = Result<T, AppError>>,
 {
-    let persistence = if execution_cancelled || shutdown_requested(shutdown) {
-        StatePersistence::CancellationCleanup
-    } else {
-        StatePersistence::Normal
+    let persistence = match shutdown.phase() {
+        ShutdownPhase::Running if !execution_cancelled => StatePersistence::Normal,
+        ShutdownPhase::Running | ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
+            StatePersistence::CancellationCleanup
+        }
     };
     let finalize = make_finalize(persistence);
     let Some(finalize_result) = await_state_flush_stage(
@@ -72,13 +95,12 @@ where
         );
         return Err(AppError::Interrupted);
     };
-    let cancelled = execution_cancelled || shutdown_requested(shutdown);
-
-    if cancelled {
-        return Err(AppError::Interrupted);
+    match shutdown.phase() {
+        ShutdownPhase::Running if !execution_cancelled => finalize_result,
+        ShutdownPhase::Running | ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
+            Err(AppError::Interrupted)
+        }
     }
-
-    finalize_result
 }
 
 async fn await_cleanup_stage<T, E, F>(
@@ -94,28 +116,30 @@ where
     E: std::fmt::Display,
 {
     tokio::pin!(future);
-    let logged_start = already_cancelled || shutdown_requested(shutdown);
-    if logged_start {
-        eprintln!("Cancellation cleanup: {started}");
-    }
-
-    let result = if logged_start {
-        future.await
-    } else {
-        tokio::select! {
-            result = &mut future => result,
-            _ = shutdown.cancelled() => {
-                eprintln!("Cancellation cleanup: {started}");
-                future.await
+    let result = match CleanupStageMode::at_start(already_cancelled, shutdown.phase()) {
+        CleanupStageMode::Normal => {
+            tokio::select! {
+                result = &mut future => result,
+                _ = shutdown.cancelled() => {
+                    eprintln!("Cancellation cleanup: {started}");
+                    future.await
+                }
             }
+        }
+        CleanupStageMode::CancellationCleanup => {
+            eprintln!("Cancellation cleanup: {started}");
+            future.await
         }
     };
 
-    if already_cancelled || shutdown_requested(shutdown) {
-        eprintln!(
-            "{}",
-            cleanup_stage_terminal_message(&result, completed, failed)
-        );
+    match shutdown.phase() {
+        ShutdownPhase::Running if !already_cancelled => {}
+        ShutdownPhase::Running | ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
+            eprintln!(
+                "{}",
+                cleanup_stage_terminal_message(&result, completed, failed)
+            );
+        }
     }
     result
 }
@@ -133,9 +157,12 @@ where
     E: std::fmt::Display,
 {
     tokio::pin!(future);
-    let mut logged_start = already_cancelled || shutdown_requested(shutdown);
-    if logged_start {
-        eprintln!("Cancellation cleanup: {started}");
+    let mut mode = CleanupStageMode::at_start(already_cancelled, shutdown.phase());
+    match mode {
+        CleanupStageMode::Normal => {}
+        CleanupStageMode::CancellationCleanup => {
+            eprintln!("Cancellation cleanup: {started}");
+        }
     }
 
     let result = loop {
@@ -143,29 +170,25 @@ where
             biased;
             result = &mut future => break Some(result),
             _ = shutdown.state_flush_budget_expired() => break None,
-            _ = shutdown.cancelled(), if !logged_start => {
-                logged_start = true;
+            _ = shutdown.cancelled(), if matches!(mode, CleanupStageMode::Normal) => {
+                mode = CleanupStageMode::CancellationCleanup;
                 eprintln!("Cancellation cleanup: {started}");
             }
         }
     };
 
-    if shutdown_requested(shutdown)
-        && let Some(stage_result) = result.as_ref()
-    {
-        eprintln!(
-            "{}",
-            cleanup_stage_terminal_message(stage_result, completed, failed)
-        );
+    match shutdown.phase() {
+        ShutdownPhase::Running => {}
+        ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
+            if let Some(stage_result) = result.as_ref() {
+                eprintln!(
+                    "{}",
+                    cleanup_stage_terminal_message(stage_result, completed, failed)
+                );
+            }
+        }
     }
     result
-}
-
-fn shutdown_requested(shutdown: &ShutdownToken) -> bool {
-    match shutdown.phase() {
-        ShutdownPhase::Running => false,
-        ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => true,
-    }
 }
 
 fn cleanup_stage_terminal_message<T, E: std::fmt::Display>(

@@ -1756,7 +1756,12 @@ async fn execute_plan_cleanup_priority_abandons_a_pending_failure_refresh() {
         parallelism: NonZeroUsize::new(1).unwrap(),
     };
 
-    let outcome = execute_plan(&provider, input, &observer, shutdown).await;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        execute_plan(&provider, input, &observer, shutdown),
+    )
+    .await
+    .expect("cleanup priority did not abandon the pending failure refresh");
 
     assert!(matches!(outcome, ExecutionOutcome::Cancelled(_)));
 }

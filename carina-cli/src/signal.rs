@@ -121,7 +121,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::shutdown::testing::shutdown_channel;
+    use carina_core::shutdown::testing::{cleanup_priority_requested, shutdown_channel};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::Notify;
@@ -194,7 +194,7 @@ mod tests {
 
         let task = tokio::spawn(supervise_shutdown_events(
             |shutdown| async move {
-                shutdown.cleanup_priority_requested().await;
+                cleanup_priority_requested(&shutdown).await;
             },
             SignalEvents::from_receiver(rx),
             exit,
@@ -224,7 +224,7 @@ mod tests {
         let supervisor = tokio::spawn(supervise_shutdown_events(
             move |shutdown| async move {
                 shutdown.cancelled().await;
-                shutdown.cleanup_priority_requested().await;
+                cleanup_priority_requested(&shutdown).await;
                 tokio::time::sleep(Duration::from_millis(25)).await;
                 cleanup_state_flushed.store(true, Ordering::SeqCst);
                 cleanup_lock_released.store(true, Ordering::SeqCst);
@@ -261,7 +261,7 @@ mod tests {
         let command_lock_released = Arc::clone(&lock_released);
         let supervisor = tokio::spawn(supervise_shutdown_events(
             move |shutdown| async move {
-                shutdown.cleanup_priority_requested().await;
+                cleanup_priority_requested(&shutdown).await;
                 command_state_flushed.store(true, Ordering::SeqCst);
                 command_lock_released.store(true, Ordering::SeqCst);
             },
@@ -312,7 +312,7 @@ mod tests {
         let command_cleanup_started = Arc::clone(&cleanup_started);
         let supervisor = tokio::spawn(supervise_shutdown_events(
             move |shutdown| async move {
-                shutdown.cleanup_priority_requested().await;
+                cleanup_priority_requested(&shutdown).await;
                 let result = crate::commands::shared::finalize::finalize_after_execute(
                     |_| async move {
                         command_cleanup_started.notify_one();
@@ -356,7 +356,7 @@ mod tests {
 
         let supervisor = tokio::spawn(supervise_shutdown_events(
             |shutdown| async move {
-                shutdown.cleanup_priority_requested().await;
+                cleanup_priority_requested(&shutdown).await;
                 std::future::pending::<()>().await;
             },
             SignalEvents::from_receiver(rx),
@@ -422,7 +422,7 @@ mod tests {
         };
         let supervisor = tokio::spawn(supervise_shutdown_events(
             move |shutdown| async move {
-                shutdown.cleanup_priority_requested().await;
+                cleanup_priority_requested(&shutdown).await;
                 command_observed.store(true, Ordering::SeqCst);
                 std::future::pending::<()>().await;
             },

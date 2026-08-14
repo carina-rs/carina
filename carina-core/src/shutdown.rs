@@ -8,6 +8,8 @@
 //! ```
 
 use std::future::Future;
+#[cfg(any(test, feature = "test-shutdown"))]
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -32,6 +34,44 @@ pub enum ShutdownPhase {
     Running,
     Graceful,
     CleanupPriority,
+}
+
+/// Outcome of a wait that cleanup priority is allowed to abandon.
+#[derive(Debug)]
+pub enum CleanupInterrupted<T> {
+    /// The awaited work finished before cleanup priority was requested.
+    Completed(T),
+    /// Cleanup priority fired; the work was abandoned mid-flight.
+    Abandoned,
+}
+
+/// A non-cleanup shutdown phase captured when a cleanup-aware wait is issued.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoopShutdownPhase {
+    Running,
+    Graceful,
+}
+
+/// Couples each cleanup-aware blocking wait to the phase observation that issued it.
+#[derive(Debug)]
+pub struct CleanupAwareLoop<'a> {
+    shutdown: &'a ShutdownToken,
+}
+
+/// Whether the latest phase observation permits a cleanup-aware blocking wait.
+#[derive(Debug)]
+pub enum LoopStep<'a> {
+    /// Continue with the only handle that can perform a cleanup-aware wait.
+    Continue(CleanupWait<'a>),
+    /// Cleanup priority is active, so the loop must be abandoned.
+    Abandon,
+}
+
+/// A handle issued after observing the shutdown phase for a cleanup-aware wait.
+#[derive(Debug)]
+pub struct CleanupWait<'a> {
+    shutdown: &'a ShutdownToken,
+    phase: LoopShutdownPhase,
 }
 
 /// A shutdown event understood by the command supervisor.
@@ -75,6 +115,8 @@ pub struct ShutdownToken {
     graceful: CancellationToken,
     cleanup_priority: CancellationToken,
     state_flush_budget_expired: CancellationToken,
+    #[cfg(any(test, feature = "test-shutdown"))]
+    test_channel_identity: Arc<()>,
 }
 
 /// Private write capability owned only by [`supervise_shutdown_events`].
@@ -99,6 +141,8 @@ fn shutdown_channel() -> (ShutdownTrigger, ShutdownToken) {
             graceful,
             cleanup_priority,
             state_flush_budget_expired,
+            #[cfg(any(test, feature = "test-shutdown"))]
+            test_channel_identity: Arc::new(()),
         },
     )
 }
@@ -140,19 +184,59 @@ impl ShutdownToken {
         }
     }
 
+    /// Create a handle that observes shutdown before issuing cleanup-aware waits.
+    pub fn cleanup_aware_loop(&self) -> CleanupAwareLoop<'_> {
+        CleanupAwareLoop { shutdown: self }
+    }
+
     /// Wait for graceful shutdown (or a later phase) to be requested.
     pub async fn cancelled(&self) {
         self.graceful.cancelled().await;
     }
 
-    /// Wait for cleanup-priority mode to be requested.
-    pub async fn cleanup_priority_requested(&self) {
-        self.cleanup_priority.cancelled().await;
-    }
-
     /// Wait until state flushing must yield the remaining budget to lock release.
     pub async fn state_flush_budget_expired(&self) {
         self.state_flush_budget_expired.cancelled().await;
+    }
+}
+
+impl<'a> CleanupAwareLoop<'a> {
+    /// Re-sample shutdown and issue one cleanup-aware wait handle when permitted.
+    ///
+    /// This may be called anywhere the loop handle is in scope, including before
+    /// a long nested wait.
+    pub fn step(&self) -> LoopStep<'a> {
+        match self.shutdown.phase() {
+            ShutdownPhase::Running => LoopStep::Continue(CleanupWait {
+                shutdown: self.shutdown,
+                phase: LoopShutdownPhase::Running,
+            }),
+            ShutdownPhase::Graceful => LoopStep::Continue(CleanupWait {
+                shutdown: self.shutdown,
+                phase: LoopShutdownPhase::Graceful,
+            }),
+            ShutdownPhase::CleanupPriority => LoopStep::Abandon,
+        }
+    }
+}
+
+impl CleanupWait<'_> {
+    /// Return the non-cleanup phase observed when this wait handle was issued.
+    pub fn phase(&self) -> LoopShutdownPhase {
+        self.phase
+    }
+
+    /// Await `future`, abandoning it if cleanup priority is requested.
+    pub async fn until_cleanup_priority<F: Future>(
+        self,
+        future: F,
+    ) -> CleanupInterrupted<F::Output> {
+        tokio::pin!(future);
+        tokio::select! {
+            biased;
+            output = &mut future => CleanupInterrupted::Completed(output),
+            _ = self.shutdown.cleanup_priority.cancelled() => CleanupInterrupted::Abandoned,
+        }
     }
 }
 
@@ -303,6 +387,16 @@ pub mod testing {
         (TestShutdownTrigger(trigger), token)
     }
 
+    /// Wait for cleanup-priority mode to be requested in shutdown tests.
+    pub async fn cleanup_priority_requested(token: &ShutdownToken) {
+        token.cleanup_priority.cancelled().await;
+    }
+
+    /// Return whether two test tokens observe the same shutdown channel.
+    pub fn same_shutdown_channel(left: &ShutdownToken, right: &ShutdownToken) -> bool {
+        std::sync::Arc::ptr_eq(&left.test_channel_identity, &right.test_channel_identity)
+    }
+
     impl TestShutdownTrigger {
         pub fn request_graceful_shutdown(&self) {
             self.0.request_graceful_shutdown();
@@ -320,6 +414,7 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
+    use super::testing::cleanup_priority_requested;
     use super::*;
 
     #[test]
@@ -345,6 +440,49 @@ mod tests {
 
         assert_eq!(token.phase(), ShutdownPhase::CleanupPriority);
         token.cancelled().await;
-        token.cleanup_priority_requested().await;
+        cleanup_priority_requested(&token).await;
+    }
+
+    #[test]
+    fn cleanup_aware_loop_step_exposes_only_non_cleanup_phases() {
+        let (trigger, token) = shutdown_channel();
+        let cleanup_loop = token.cleanup_aware_loop();
+
+        let LoopStep::Continue(wait) = cleanup_loop.step() else {
+            panic!("running loop must continue");
+        };
+        assert_eq!(wait.phase(), LoopShutdownPhase::Running);
+
+        trigger.request_graceful_shutdown();
+        let LoopStep::Continue(wait) = cleanup_loop.step() else {
+            panic!("graceful loop must continue draining in-flight work");
+        };
+        assert_eq!(wait.phase(), LoopShutdownPhase::Graceful);
+
+        trigger.prioritize_cleanup();
+        assert!(matches!(cleanup_loop.step(), LoopStep::Abandon));
+    }
+
+    #[tokio::test]
+    async fn cleanup_wait_has_named_completed_and_abandoned_outcomes() {
+        let (trigger, token) = shutdown_channel();
+        let cleanup_loop = token.cleanup_aware_loop();
+        let LoopStep::Continue(wait) = cleanup_loop.step() else {
+            panic!("running loop must continue");
+        };
+        assert!(matches!(
+            wait.until_cleanup_priority(async { 42 }).await,
+            CleanupInterrupted::Completed(42)
+        ));
+
+        let LoopStep::Continue(wait) = cleanup_loop.step() else {
+            panic!("running loop must continue");
+        };
+        trigger.prioritize_cleanup();
+        assert!(matches!(
+            wait.until_cleanup_priority(std::future::pending::<()>())
+                .await,
+            CleanupInterrupted::Abandoned
+        ));
     }
 }
