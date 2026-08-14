@@ -4174,6 +4174,173 @@ fn validate_http_response_status_code_type() {
 }
 
 #[cfg(test)]
+mod schema_validate_attr_struct_tests {
+    use super::*;
+    use indexmap::IndexMap;
+
+    fn struct_type(name: &str, fields: Vec<StructField>) -> AttributeType {
+        AttributeType::struct_(name.to_string(), fields)
+    }
+
+    fn map_value(entries: Vec<(&str, Value)>) -> Value {
+        let mut map = IndexMap::new();
+        for (key, value) in entries {
+            map.insert(key.to_string(), value);
+        }
+        Value::Concrete(ConcreteValue::Map(map))
+    }
+
+    #[test]
+    fn validate_attr_rejects_unknown_nested_struct_field_with_suggestion() {
+        let retention = struct_type(
+            "Retention",
+            vec![StructField::new("days", AttributeType::int())],
+        );
+        let policy = struct_type(
+            "Policy",
+            vec![StructField::new("retention", retention).required()],
+        );
+        let value = map_value(vec![(
+            "retention",
+            map_value(vec![("dayz", Value::Concrete(ConcreteValue::Int(30)))]),
+        )]);
+
+        let err = Schema::flat(AttributeType::string())
+            .validate_attr(&policy, &value)
+            .expect_err("Schema::validate_attr must reject unknown nested struct fields");
+
+        match err {
+            TypeError::StructFieldError { field, inner } => {
+                assert_eq!(field, "retention");
+                assert_eq!(
+                    *inner,
+                    TypeError::UnknownStructField {
+                        struct_name: "Retention".to_string(),
+                        field: "dayz".to_string(),
+                        suggestion: Some("days".to_string()),
+                    }
+                );
+            }
+            other => panic!("expected nested UnknownStructField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_collect_discriminates_union_of_single_field_structs() {
+        let retention = AttributeType::union(vec![
+            struct_type(
+                "RetentionDays",
+                vec![StructField::new("days", AttributeType::int()).required()],
+            ),
+            struct_type(
+                "RetentionYears",
+                vec![StructField::new("years", AttributeType::int()).required()],
+            ),
+        ]);
+        let schema = Schema::flat(retention);
+        let days = map_value(vec![("days", Value::Concrete(ConcreteValue::Int(30)))]);
+        let years = map_value(vec![("years", Value::Concrete(ConcreteValue::Int(1)))]);
+        let mixed = map_value(vec![
+            ("days", Value::Concrete(ConcreteValue::Int(30))),
+            ("years", Value::Concrete(ConcreteValue::Int(1))),
+        ]);
+
+        assert!(
+            schema.validate_collect(&days).is_empty(),
+            "the RetentionDays member must accept its declared field"
+        );
+        assert!(
+            schema.validate_collect(&years).is_empty(),
+            "the RetentionYears member must accept its declared field"
+        );
+
+        let errors = schema.validate_collect(&mixed);
+        assert_eq!(errors.len(), 1, "mixed union value must be rejected");
+        assert!(matches!(
+            &errors[0].1,
+            TypeError::UnknownStructField {
+                struct_name,
+                field,
+                ..
+            } if (struct_name == "RetentionDays" && field == "years")
+                || (struct_name == "RetentionYears" && field == "days")
+        ));
+    }
+
+    #[test]
+    fn validate_attr_accepts_and_type_checks_block_name_alias() {
+        let lifecycle = struct_type(
+            "Lifecycle",
+            vec![
+                StructField::new("transitions", AttributeType::int()).with_block_name("transition"),
+            ],
+        );
+        let schema = Schema::flat(AttributeType::string());
+        let valid = map_value(vec![(
+            "transition",
+            Value::Concrete(ConcreteValue::Int(30)),
+        )]);
+
+        assert!(schema.validate_attr(&lifecycle, &valid).is_ok());
+
+        let invalid = map_value(vec![(
+            "transition",
+            Value::Concrete(ConcreteValue::String("thirty".to_string())),
+        )]);
+        let err = schema
+            .validate_attr(&lifecycle, &invalid)
+            .expect_err("the accepted alias must resolve to its field type");
+        assert!(matches!(
+            err,
+            TypeError::StructFieldError { field, inner }
+                if field == "transition" && matches!(*inner, TypeError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_attr_preserves_required_and_nested_type_errors() {
+        let inner = struct_type(
+            "Inner",
+            vec![StructField::new("count", AttributeType::int()).required()],
+        );
+        let outer = struct_type("Outer", vec![StructField::new("nested", inner).required()]);
+        let schema = Schema::flat(AttributeType::string());
+
+        let missing = schema
+            .validate_attr(&outer, &map_value(vec![]))
+            .expect_err("the required outer field must remain required");
+        assert_eq!(
+            missing,
+            TypeError::MissingRequired {
+                name: "nested".to_string()
+            }
+        );
+
+        let wrong_type = map_value(vec![(
+            "nested",
+            map_value(vec![(
+                "count",
+                Value::Concrete(ConcreteValue::String("one".to_string())),
+            )]),
+        )]);
+        let err = schema
+            .validate_attr(&outer, &wrong_type)
+            .expect_err("nested field type errors must remain recursive");
+        match err {
+            TypeError::StructFieldError { field, inner } => {
+                assert_eq!(field, "nested");
+                assert!(matches!(
+                    *inner,
+                    TypeError::StructFieldError { field, inner }
+                        if field == "count" && matches!(*inner, TypeError::TypeMismatch { .. })
+                ));
+            }
+            other => panic!("expected nested StructFieldError, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod validate_collect_tests {
     use super::*;
     use indexmap::IndexMap;

@@ -1099,13 +1099,11 @@ impl Schema {
                     self.collect_attr_into(inner, &next_path, item, out);
                 }
             }
-            // Union of leaves is the only Union shape in the current
-            // schema vocabulary (e.g. `string_or_list_of_strings`).
-            // Delegate to `validate_attr` which runs the best-scoring
-            // member selection and returns a single error anchored at
-            // the current path. If a Union-of-structs shape is ever
-            // introduced, this arm should recurse via collect_attr_into
-            // on the selected member to preserve per-field paths.
+            // Keep Union membership and best-scoring failure selection
+            // single-sourced in `validate_attr`. This returns one error
+            // anchored at the current path; choosing and recursively
+            // collecting a failed Struct member would improve LSP path
+            // precision but would not change validation acceptance.
             AttrTypeKind::Union(_) => {
                 if let Err(e) = self.validate_attr(attr, value) {
                     out.push((path.clone(), e));
@@ -1202,28 +1200,22 @@ impl Schema {
             }
             AttrTypeKind::Struct { name, fields } => {
                 if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
-                    for field in fields {
-                        match map.get(&field.name) {
-                            Some(field_val) => {
-                                if let Err(inner_err) =
-                                    self.validate_attr(&field.field_type, field_val)
-                                {
-                                    return Err(TypeError::StructFieldError {
-                                        field: field.name.clone(),
-                                        inner: Box::new(inner_err),
-                                    });
-                                }
-                            }
-                            None if field.required => {
-                                return Err(TypeError::MissingRequired {
-                                    name: field.name.clone(),
-                                });
-                            }
-                            None => {}
-                        }
-                    }
-                    let _ = name;
-                    Ok(())
+                    validate_struct_fields(
+                        name,
+                        fields,
+                        map,
+                        |field| TypeError::MissingRequired {
+                            name: field.name.clone(),
+                        },
+                        |input_name, field, field_value| {
+                            self.validate_attr(&field.field_type, field_value).map_err(
+                                |inner_err| TypeError::StructFieldError {
+                                    field: input_name.to_string(),
+                                    inner: Box::new(inner_err),
+                                },
+                            )
+                        },
+                    )
                 } else {
                     AttributeType {
                         kind: AttrTypeKind::Struct {
@@ -2522,42 +2514,25 @@ impl AttributeType {
             });
         };
 
-        // Check required fields
-        for field in fields {
-            if field.required && !map.contains_key(&field.name) {
-                return Err(TypeError::StructFieldError {
-                    field: field.name.clone(),
-                    inner: Box::new(TypeError::MissingRequired {
-                        name: field.name.clone(),
-                    }),
-                });
-            }
-        }
-        // Type-check each field value. Use the same accepted-name map
-        // (canonical + block_name alias) the path-tagged validator
-        // builds; before #2214 this branch only knew canonical names
-        // and silently rejected aliases that the LSP happily accepted.
-        let accepted = build_accepted_field_map(fields);
-        let canonical_names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
-        for (k, v) in map {
-            if let Some(field) = accepted.get(k.as_str()) {
-                field
-                    .field_type
-                    .validate(v)
-                    .map_err(|e| TypeError::StructFieldError {
-                        field: k.clone(),
-                        inner: Box::new(e),
-                    })?;
-            } else {
-                let suggestion = suggest_similar_name(k, &canonical_names);
-                return Err(TypeError::UnknownStructField {
-                    struct_name: name.clone(),
-                    field: k.clone(),
-                    suggestion,
-                });
-            }
-        }
-        Ok(())
+        validate_struct_fields(
+            name,
+            fields,
+            map,
+            |field| TypeError::StructFieldError {
+                field: field.name.clone(),
+                inner: Box::new(TypeError::MissingRequired {
+                    name: field.name.clone(),
+                }),
+            },
+            |input_name, field, field_value| {
+                field.field_type.validate(field_value).map_err(|inner_err| {
+                    TypeError::StructFieldError {
+                        field: input_name.to_string(),
+                        inner: Box::new(inner_err),
+                    }
+                })
+            },
+        )
     }
 
     /// Validate a `Union` variant: succeed if any member accepts the value.
@@ -3079,6 +3054,45 @@ pub(crate) fn build_accepted_field_map(fields: &[StructField]) -> HashMap<&str, 
         }
     }
     accepted
+}
+
+/// Validate the shared structural contract for a struct map, then route each
+/// accepted value through the caller's recursive validator.
+///
+/// Keeping required-field checks, canonical/`block_name` lookup, unknown-key
+/// rejection, and suggestions behind one function prevents the standalone and
+/// schema-aware validators from acquiring different notions of a valid struct.
+fn validate_struct_fields<M, V>(
+    struct_name: &str,
+    fields: &[StructField],
+    map: &IndexMap<String, Value>,
+    missing_required: M,
+    mut validate_value: V,
+) -> Result<(), TypeError>
+where
+    M: Fn(&StructField) -> TypeError,
+    V: FnMut(&str, &StructField, &Value) -> Result<(), TypeError>,
+{
+    for field in fields {
+        if field.required && !map.contains_key(&field.name) {
+            return Err(missing_required(field));
+        }
+    }
+
+    let accepted = build_accepted_field_map(fields);
+    let canonical_names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+    for (input_name, value) in map {
+        let Some(field) = accepted.get(input_name.as_str()).copied() else {
+            return Err(TypeError::UnknownStructField {
+                struct_name: struct_name.to_string(),
+                field: input_name.clone(),
+                suggestion: suggest_similar_name(input_name, &canonical_names),
+            });
+        };
+        validate_value(input_name, field, value)?;
+    }
+
+    Ok(())
 }
 
 /// Source length is contained in sink length (narrow ⊆ wide).
