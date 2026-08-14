@@ -397,6 +397,61 @@ mode = "invalid_mode"
 }
 
 #[test]
+fn union_of_structs_reports_alternatives_at_the_attribute() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let retention = AttributeType::union(vec![
+        AttributeType::struct_(
+            "RetentionDays".to_string(),
+            vec![StructField::new("days", AttributeType::int()).required()],
+        ),
+        AttributeType::struct_(
+            "RetentionYears".to_string(),
+            vec![StructField::new("years", AttributeType::int()).required()],
+        ),
+    ]);
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
+        .attribute(AttributeSchema::new("retention", retention));
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+    let engine = custom_engine(schemas);
+    let doc = create_document(
+        r#"provider test {
+region = "ap-northeast-1"
+}
+
+test.test.resource {
+name = "my-resource"
+retention = {
+days = 30
+years = 1
+}
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let matching = diagnostics
+        .iter()
+        .filter(|d| {
+            d.message == "Expected exactly one of 'days' or 'years', but both were supplied"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "LSP must surface exactly one union-level diagnostic. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let diagnostic = matching[0];
+    assert_eq!(
+        diagnostic.range.start.line, 6,
+        "the union diagnostic must be anchored at the retention attribute"
+    );
+}
+
+#[test]
 fn union_valid_static_value_no_warning() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 

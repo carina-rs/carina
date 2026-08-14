@@ -899,6 +899,7 @@ impl DiagnosticEngine {
                                     | carina_core::schema::TypeError::InvalidEnumVariant { .. }
                                     | carina_core::schema::TypeError::ValidationFailed { .. }
                                     | carina_core::schema::TypeError::UnknownStructField { .. }
+                                    | carina_core::schema::TypeError::UnionStructMismatch { .. }
                                     | carina_core::schema::TypeError::StructFieldError { .. }
                                     | carina_core::schema::TypeError::ListItemError { .. }
                                     | carina_core::schema::TypeError::MapValueError { .. }

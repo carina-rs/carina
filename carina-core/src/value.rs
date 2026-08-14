@@ -1639,13 +1639,13 @@ fn canonicalize_with_type_for_enum_phase(
         // matching member the nested `string_or_list_of_strings`
         // `service` never folds to `StringList`, and a bare scalar
         // (desired) vs singleton list (aws-read) reaches the differ as
-        // a never-converging phantom. Pick the member with the SAME
-        // scorer `validate_union` uses (`select_union_member` wraps
-        // `union_member_score`) — one ranking function, not a second
-        // parallel shape predicate that could drift from the
-        // validator's — then re-dispatch so the existing arms
-        // canonicalize it. `None` (no member shares the value's shape)
-        // is identity — never guess-coerce.
+        // a never-converging phantom. Pick the member from the SAME
+        // structural judgement `validate_union` uses
+        // (`select_union_member` consumes its typed canonical rank) —
+        // one shape judgement, not a second parallel predicate that
+        // could drift from the validator's — then re-dispatch so the
+        // existing arms canonicalize it. `None` (no member shares the
+        // value's shape) is identity — never guess-coerce.
         (val, crate::schema::Shape::Union) => {
             let members = crate::schema::union_members_with_defs(unwrapped, defs)
                 .expect("Shape::Union must expose union members internally");
