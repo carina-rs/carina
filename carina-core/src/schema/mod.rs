@@ -436,6 +436,9 @@ pub struct StructField {
     pub provider_name: Option<String>,
     /// Alternative block name for repeated block syntax (e.g., "transition" for "transitions")
     pub block_name: Option<String>,
+    /// Whether this nested field is populated by the provider and cannot be
+    /// assigned by the user.
+    pub read_only: bool,
     /// Whether the value of this nested field is populated by the
     /// provider asynchronously *after* the Create call returns.
     /// Reached when a chained access traverses a `Struct` (e.g.
@@ -455,6 +458,7 @@ impl StructField {
             description: None,
             provider_name: None,
             block_name: None,
+            read_only: false,
             deferred_populate: false,
         }
     }
@@ -476,6 +480,13 @@ impl StructField {
 
     pub fn with_block_name(mut self, name: impl Into<String>) -> Self {
         self.block_name = Some(name.into());
+        self
+    }
+
+    /// Mark this nested field as provider-populated and therefore not
+    /// assignable by users.
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
         self
     }
 
@@ -1235,6 +1246,10 @@ impl Schema {
                     match accepted.get(k.as_str()) {
                         Some(field) => {
                             let next_path = path.push_field(k.clone());
+                            if let Some(error) = validate_struct_field_assignment(field, k) {
+                                out.push((next_path, error));
+                                continue;
+                            }
                             self.collect_attr_into(&field.field_type, &next_path, v, out);
                         }
                         None => {
@@ -3682,6 +3697,17 @@ pub(crate) fn build_accepted_field_map(fields: &[StructField]) -> HashMap<&str, 
     accepted
 }
 
+/// Reject an assignment that targets provider-populated struct data.
+///
+/// Both the single-error validator and the path-collecting LSP validator call
+/// this gate before type-checking the field value, keeping writability policy
+/// and diagnostic precedence identical across the two walkers.
+fn validate_struct_field_assignment(field: &StructField, input_name: &str) -> Option<TypeError> {
+    field.read_only.then(|| TypeError::ReadOnlyAttribute {
+        name: input_name.to_string(),
+    })
+}
+
 /// Validate the shared structural contract for a struct map, then route each
 /// accepted value through the caller's recursive validator.
 ///
@@ -3715,6 +3741,12 @@ where
                 suggestion: suggest_similar_name(input_name, &canonical_names),
             });
         };
+        if let Some(inner) = validate_struct_field_assignment(field, input_name) {
+            return Err(TypeError::StructFieldError {
+                field: input_name.clone(),
+                inner: Box::new(inner),
+            });
+        }
         validate_value(input_name, field, value)?;
     }
 

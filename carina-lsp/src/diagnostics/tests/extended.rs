@@ -112,6 +112,39 @@ outer {
 }
 
 #[test]
+fn read_only_nested_struct_field_diagnostic_is_anchored_on_offending_line() {
+    let engine = test_engine_with_nested_structs();
+    let doc = create_document(
+        r#"let r = test.nested.resource {
+outer {
+    inner {
+        provider_leaf = "cannot-set-this"
+    }
+}
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let read_only = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message
+                == "Attribute 'provider_leaf' is populated by the provider and cannot be set"
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        read_only.len(),
+        1,
+        "expected one nested read-only diagnostic: {diagnostics:#?}"
+    );
+    assert_eq!(read_only[0].range.start.line, 3);
+    assert_eq!(read_only[0].range.start.character, 8);
+    assert_eq!(read_only[0].range.end.line, 3);
+    assert_eq!(read_only[0].range.end.character, 21);
+}
+
+#[test]
 #[ignore = "requires provider schemas"]
 fn enum_invalid_value_top_level() {
     let engine = test_engine();

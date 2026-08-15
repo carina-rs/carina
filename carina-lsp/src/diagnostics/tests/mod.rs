@@ -35,6 +35,7 @@ pub(super) fn test_engine_with_nested_structs() -> DiagnosticEngine {
         vec![
             StructField::new("leaf_field", AttributeType::string()),
             StructField::new("leaf_int", AttributeType::int()),
+            StructField::new("provider_leaf", AttributeType::string()).read_only(),
         ],
     ));
 

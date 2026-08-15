@@ -46,6 +46,12 @@ impl SchemaDecodeError {
         }
     }
 
+    fn schema_default_value_encode(err: serde_json::Error) -> Self {
+        Self {
+            detail: format!("schema default value conversion error: {err}"),
+        }
+    }
+
     fn unsupported_custom_base(enclosing_custom_name: &str, base: &proto::AttributeType) -> Self {
         Self {
             detail: format!(
@@ -862,24 +868,48 @@ fn validate_tags_key_value(
 fn proto_attr_schema_to_core(
     a: &proto::AttributeSchema,
 ) -> Result<CoreAttributeSchema, SchemaDecodeError> {
+    // Exhaustive source destructuring is a compile-time forcing function: a
+    // new protocol field cannot be silently omitted from this conversion.
+    let proto::AttributeSchema {
+        name,
+        attr_type,
+        required,
+        default,
+        description,
+        create_only,
+        read_only,
+        write_only,
+        block_name,
+        provider_name,
+        removable,
+        identity,
+        deferred_populate,
+    } = a;
+
     Ok(CoreAttributeSchema {
-        name: a.name.clone(),
-        attr_type: proto_attr_type_to_core(&a.attr_type)?,
-        required: a.required,
-        default: None,
-        description: a.description.clone(),
+        name: name.clone(),
+        attr_type: proto_attr_type_to_core(attr_type)?,
+        required: *required,
+        default: default
+            .as_ref()
+            .map(|value| {
+                serde_json::to_value(value)
+                    .map(|json| json_to_core_value(&json))
+                    .map_err(SchemaDecodeError::schema_default_value_encode)
+            })
+            .transpose()?,
+        description: description.clone(),
+        // Provider configuration completions cross through the separate
+        // `provider-config-completions` WIT export, not schema JSON.
         completions: None,
-        provider_name: a.provider_name.clone(),
-        create_only: a.create_only,
-        read_only: a.read_only,
-        removable: a.removable,
-        block_name: a.block_name.clone(),
-        write_only: a.write_only,
-        identity: a.identity,
-        // The WIT contract does not transmit `deferred_populate` —
-        // the annotation lives entirely in the host-side schema; see
-        // `proto_struct_field_to_core` for the rationale.
-        deferred_populate: false,
+        provider_name: provider_name.clone(),
+        create_only: *create_only,
+        read_only: *read_only,
+        removable: *removable,
+        block_name: block_name.clone(),
+        write_only: *write_only,
+        identity: *identity,
+        deferred_populate: *deferred_populate,
     })
 }
 
@@ -1074,20 +1104,28 @@ fn proto_legacy_custom_to_core(
 fn proto_struct_field_to_core(
     f: &proto::StructField,
 ) -> Result<CoreStructField, SchemaDecodeError> {
+    // Exhaustive source destructuring is a compile-time forcing function: a
+    // new protocol field cannot be silently omitted from this conversion.
+    let proto::StructField {
+        name,
+        field_type,
+        required,
+        description,
+        block_name,
+        provider_name,
+        read_only,
+        deferred_populate,
+    } = f;
+
     Ok(CoreStructField {
-        name: f.name.clone(),
-        field_type: proto_attr_type_to_core(&f.field_type)?,
-        required: f.required,
-        description: f.description.clone(),
-        provider_name: f.provider_name.clone(),
-        block_name: f.block_name.clone(),
-        // The WIT contract does not transmit `deferred_populate` —
-        // the annotation lives entirely in the host-side schema (set
-        // by the provider's codegen output in
-        // `carina-provider-{aws,awscc}/.../schemas/generated/`),
-        // which is loaded directly via the SchemaRegistry rather
-        // than crossing the WASM boundary. carina#3034.
-        deferred_populate: false,
+        name: name.clone(),
+        field_type: proto_attr_type_to_core(field_type)?,
+        required: *required,
+        description: description.clone(),
+        provider_name: provider_name.clone(),
+        block_name: block_name.clone(),
+        read_only: *read_only,
+        deferred_populate: *deferred_populate,
     })
 }
 
@@ -1119,6 +1157,189 @@ mod tests {
             validate: None,
             to_dsl: None,
         }
+    }
+
+    fn core_string_to_proto_for_schema_round_trip(
+        attr_type: &CoreAttributeType,
+    ) -> proto::AttributeType {
+        assert!(matches!(
+            attr_type
+                .shape_ref_free()
+                .expect("round-trip fixture must be Ref-free"),
+            carina_core::schema::Shape::String { .. }
+        ));
+        proto_string()
+    }
+
+    fn core_struct_field_to_proto_for_schema_round_trip(
+        field: &CoreStructField,
+    ) -> proto::StructField {
+        let CoreStructField {
+            name,
+            field_type,
+            required,
+            description,
+            provider_name,
+            block_name,
+            read_only,
+            deferred_populate,
+        } = field;
+
+        proto::StructField {
+            name: name.clone(),
+            field_type: core_string_to_proto_for_schema_round_trip(field_type),
+            required: *required,
+            description: description.clone(),
+            block_name: block_name.clone(),
+            provider_name: provider_name.clone(),
+            read_only: *read_only,
+            deferred_populate: *deferred_populate,
+        }
+    }
+
+    fn core_attr_schema_to_proto_for_schema_round_trip(
+        attr: &CoreAttributeSchema,
+    ) -> proto::AttributeSchema {
+        let CoreAttributeSchema {
+            name,
+            attr_type,
+            required,
+            default,
+            description,
+            completions,
+            provider_name,
+            create_only,
+            read_only,
+            removable,
+            block_name,
+            write_only,
+            identity,
+            deferred_populate,
+        } = attr;
+
+        assert!(
+            completions.is_none(),
+            "provider configuration completions use a separate WIT export"
+        );
+        proto::AttributeSchema {
+            name: name.clone(),
+            attr_type: core_string_to_proto_for_schema_round_trip(attr_type),
+            required: *required,
+            default: default.as_ref().map(|value| {
+                let json = core_value_to_json(value)
+                    .expect("round-trip fixture default must cross the WASM boundary");
+                serde_json::from_value(json)
+                    .expect("round-trip fixture default must decode as a protocol value")
+            }),
+            description: description.clone(),
+            create_only: *create_only,
+            read_only: *read_only,
+            write_only: *write_only,
+            block_name: block_name.clone(),
+            provider_name: provider_name.clone(),
+            removable: *removable,
+            identity: *identity,
+            deferred_populate: *deferred_populate,
+        }
+    }
+
+    #[test]
+    fn schema_transport_round_trip_is_exhaustive_for_touched_types() {
+        let core_field = CoreStructField::new("provider_id", CoreAttributeType::string())
+            .required()
+            .with_description("Provider-assigned identifier")
+            .with_provider_name("ProviderId")
+            .with_block_name("provider_id_block")
+            .read_only()
+            .deferred_populate();
+        let field_json = serde_json::to_string(&core_struct_field_to_proto_for_schema_round_trip(
+            &core_field,
+        ))
+        .unwrap();
+        let proto_field: proto::StructField = serde_json::from_str(&field_json).unwrap();
+        let round_tripped_field = proto_struct_field_to_core(&proto_field).unwrap();
+        let CoreStructField {
+            name,
+            field_type,
+            required,
+            description,
+            provider_name,
+            block_name,
+            read_only,
+            deferred_populate,
+        } = &round_tripped_field;
+        assert_eq!(name, "provider_id");
+        assert!(matches!(
+            field_type
+                .shape_ref_free()
+                .expect("round-tripped field type must be Ref-free"),
+            carina_core::schema::Shape::String { .. }
+        ));
+        assert!(*required);
+        assert_eq!(description.as_deref(), Some("Provider-assigned identifier"));
+        assert_eq!(provider_name.as_deref(), Some("ProviderId"));
+        assert_eq!(block_name.as_deref(), Some("provider_id_block"));
+        assert!(*read_only);
+        assert!(*deferred_populate);
+
+        let core_attr = CoreAttributeSchema::new("status", CoreAttributeType::string())
+            .required()
+            .with_default(CoreValue::Concrete(ConcreteValue::String(
+                "provider-default".to_string(),
+            )))
+            .with_description("Eventually populated status")
+            .with_provider_name("Status")
+            .create_only()
+            .read_only()
+            .non_removable()
+            .with_block_name("status_block")
+            .write_only()
+            .identity()
+            .deferred_populate();
+        let attr_json =
+            serde_json::to_string(&core_attr_schema_to_proto_for_schema_round_trip(&core_attr))
+                .unwrap();
+        let proto_attr: proto::AttributeSchema = serde_json::from_str(&attr_json).unwrap();
+        let round_tripped_attr = proto_attr_schema_to_core(&proto_attr).unwrap();
+        let CoreAttributeSchema {
+            name,
+            attr_type,
+            required,
+            default,
+            description,
+            completions,
+            provider_name,
+            create_only,
+            read_only,
+            removable,
+            block_name,
+            write_only,
+            identity,
+            deferred_populate,
+        } = &round_tripped_attr;
+        assert_eq!(name, "status");
+        assert!(matches!(
+            attr_type
+                .shape_ref_free()
+                .expect("round-tripped attribute type must be Ref-free"),
+            carina_core::schema::Shape::String { .. }
+        ));
+        assert!(*required);
+        assert!(matches!(
+            default,
+            Some(CoreValue::Concrete(ConcreteValue::String(value)))
+                if value == "provider-default"
+        ));
+        assert_eq!(description.as_deref(), Some("Eventually populated status"));
+        assert!(completions.is_none());
+        assert_eq!(provider_name.as_deref(), Some("Status"));
+        assert!(*create_only);
+        assert!(*read_only);
+        assert_eq!(*removable, Some(false));
+        assert_eq!(block_name.as_deref(), Some("status_block"));
+        assert!(*write_only);
+        assert!(*identity);
+        assert!(*deferred_populate);
     }
 
     #[test]
