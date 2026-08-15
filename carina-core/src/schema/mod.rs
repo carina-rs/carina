@@ -444,6 +444,18 @@ impl InputMode {
     pub const fn is_provider_populated(self) -> bool {
         matches!(self, Self::ProviderPopulated)
     }
+
+    fn transition_to(&mut self, requested: Self) {
+        let conflicts = matches!(
+            (*self, requested),
+            (Self::Required, Self::ProviderPopulated) | (Self::ProviderPopulated, Self::Required)
+        );
+        assert!(
+            !conflicts,
+            "schema input mode cannot be both required and provider-populated"
+        );
+        *self = requested;
+    }
 }
 
 /// A field within a Struct type
@@ -485,7 +497,7 @@ impl StructField {
     }
 
     pub fn required(mut self) -> Self {
-        self.input_mode = InputMode::Required;
+        self.input_mode.transition_to(InputMode::Required);
         self
     }
 
@@ -511,7 +523,7 @@ impl StructField {
     /// Mark this nested field as provider-populated and therefore not
     /// assignable by users.
     pub fn read_only(mut self) -> Self {
-        self.input_mode = InputMode::ProviderPopulated;
+        self.input_mode.transition_to(InputMode::ProviderPopulated);
         self
     }
 
@@ -4890,7 +4902,7 @@ impl AttributeSchema {
     }
 
     pub fn required(mut self) -> Self {
-        self.input_mode = InputMode::Required;
+        self.input_mode.transition_to(InputMode::Required);
         self
     }
 
@@ -4904,7 +4916,7 @@ impl AttributeSchema {
     }
 
     pub fn read_only(mut self) -> Self {
-        self.input_mode = InputMode::ProviderPopulated;
+        self.input_mode.transition_to(InputMode::ProviderPopulated);
         self
     }
 

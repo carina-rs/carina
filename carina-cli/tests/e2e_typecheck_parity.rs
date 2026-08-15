@@ -698,6 +698,66 @@ test.r.bucket {
     );
 }
 
+#[test]
+fn nested_read_only_assignment_in_multi_file_directory_fails_validate() {
+    let config = AttributeType::struct_(
+        "Config".to_string(),
+        vec![StructField::new("arn", AttributeType::string()).read_only()],
+    );
+    let schemas = single_schema_map(
+        ResourceSchema::new("r.bucket")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("config", config)),
+    );
+    let fixture = write_fixture(&[
+        (
+            "main.crn",
+            r#"
+test.r.bucket {
+    name = "configured"
+}
+"#,
+        ),
+        (
+            "sibling.crn",
+            r#"
+test.r.bucket {
+    name = "sibling"
+    config = {
+        arn = "provider-arn"
+    }
+}
+"#,
+        ),
+    ]);
+
+    let expected = "Attribute 'arn' is populated by the provider and cannot be set";
+    let cli_diags = cli_diagnostics(factories_for(&schemas), &fixture);
+    assert!(
+        cli_messages_contain(&cli_diags, expected),
+        "carina validate must reject nested read-only assignment in a merged directory, got {cli_diags:?}"
+    );
+
+    let lsp_diags = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "sibling.crn");
+    let diagnostic = lsp_diags
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains(expected))
+        .unwrap_or_else(|| {
+            panic!(
+                "LSP must report the same nested read-only assignment, got {:?}",
+                lsp_diags
+                    .iter()
+                    .map(|diagnostic| &diagnostic.message)
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+        "LSP parity includes hard-error severity for nested writability"
+    );
+}
+
 // ============================================================================
 // Scenario 6: Unknown attribute with `suggestion`
 // ============================================================================

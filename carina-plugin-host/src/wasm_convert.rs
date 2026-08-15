@@ -669,6 +669,8 @@ pub fn core_to_wit_delete_request(request: &CoreDeleteRequest) -> wit::DeleteReq
 
 /// Convert a [`Directives`] to a [`wit::Directives`].
 pub fn core_to_wit_directives(directives: &Directives) -> wit::Directives {
+    // `depends_on` and `provider_instance` are host-only orchestration metadata;
+    // the WIT Directives record intentionally carries only these three flags.
     wit::Directives {
         force_delete: directives.force_delete,
         create_before_destroy: directives.create_before_destroy,
@@ -809,33 +811,41 @@ pub fn json_to_attribute_types(
 fn proto_schema_to_core(
     s: &proto::ResourceSchema,
 ) -> Result<CoreResourceSchema, SchemaDecodeError> {
+    // Exhaustive source destructuring is a compile-time forcing function: a
+    // new protocol field cannot be silently omitted from this conversion.
+    let proto::ResourceSchema {
+        resource_type,
+        attributes,
+        description,
+        kind,
+        unique_name,
+        operation_config,
+        validators,
+        exclusive_required,
+        defs,
+    } = s;
+
     Ok(CoreResourceSchema {
-        resource_type: s.resource_type.clone(),
-        attributes: s
-            .attributes
+        resource_type: resource_type.clone(),
+        attributes: attributes
             .iter()
             .map(|(name, a)| {
                 proto_attr_schema_to_core(a)
                     .map(|schema| (name.clone(), schema))
-                    .map_err(|error| error.with_resource_type(&s.resource_type))
+                    .map_err(|error| error.with_resource_type(resource_type))
             })
             .collect::<Result<_, _>>()?,
-        description: s.description.clone(),
-        validator: build_validator_from_types(&s.validators),
-        kind: match s.kind {
+        description: description.clone(),
+        validator: build_validator_from_types(validators),
+        kind: match kind {
             proto::SchemaKind::Managed => carina_core::schema::SchemaKind::Resource,
             proto::SchemaKind::DataSource => carina_core::schema::SchemaKind::DataSource,
         },
-        unique_name: proto_unique_name_to_core(&s.unique_name),
-        operation_config: s.operation_config.as_ref().map(|c| {
-            carina_core::schema::OperationConfig {
-                delete_timeout_secs: c.delete_timeout_secs,
-                delete_max_retries: c.delete_max_retries,
-                create_timeout_secs: c.create_timeout_secs,
-                create_max_retries: c.create_max_retries,
-            }
-        }),
-        exclusive_required: s.exclusive_required.clone(),
+        unique_name: proto_unique_name_to_core(unique_name),
+        operation_config: operation_config
+            .as_ref()
+            .map(proto_operation_config_to_core),
+        exclusive_required: exclusive_required.clone(),
         // Wait defaults are not (yet) carried across the WASM plugin
         // boundary — providers fall back to the carina-core constants
         // (`WAIT_DEFAULT_TIMEOUT` / `WAIT_DEFAULT_INTERVAL`) until the
@@ -846,20 +856,35 @@ fn proto_schema_to_core(
         // `AttributeType::Ref`. Mirrors the wire `defs` map onto the
         // core schema so walk-sites that traverse a `Ref` can resolve
         // it against the resource's own def table (carina#3340).
-        defs: s
-            .defs
+        defs: defs
             .iter()
             .map(|(k, v)| {
                 proto_attr_type_to_core(v)
                     .map(|attr_type| (k.clone(), attr_type))
-                    .map_err(|error| {
-                        error
-                            .prepend_attribute(k)
-                            .with_resource_type(&s.resource_type)
-                    })
+                    .map_err(|error| error.prepend_attribute(k).with_resource_type(resource_type))
             })
             .collect::<Result<_, _>>()?,
     })
+}
+
+fn proto_operation_config_to_core(
+    config: &proto::OperationConfig,
+) -> carina_core::schema::OperationConfig {
+    // Keep the protocol record exhaustive for the same reason as its parent
+    // ResourceSchema conversion.
+    let proto::OperationConfig {
+        delete_timeout_secs,
+        delete_max_retries,
+        create_timeout_secs,
+        create_max_retries,
+    } = config;
+
+    carina_core::schema::OperationConfig {
+        delete_timeout_secs: *delete_timeout_secs,
+        delete_max_retries: *delete_max_retries,
+        create_timeout_secs: *create_timeout_secs,
+        create_max_retries: *create_max_retries,
+    }
 }
 
 fn proto_unique_name_to_core(spec: &proto::UniqueNameSpec) -> CoreUniqueNameSpec {
@@ -967,13 +992,16 @@ fn proto_attr_schema_to_core(
 fn proto_attr_type_to_core(
     t: &proto::AttributeType,
 ) -> Result<CoreAttributeType, SchemaDecodeError> {
+    // Legacy opaque per-type `validate` payloads have no host-side decoder;
+    // serializable resource validators travel through ResourceSchema.validators.
+    // Bind those fields explicitly so any new wire field still breaks this match.
     Ok(match t {
         proto::AttributeType::String {
             pattern,
             length,
+            validate: _,
             to_dsl,
             identity,
-            ..
         } => CoreAttributeType::refined_string(
             identity
                 .as_deref()
@@ -1025,7 +1053,7 @@ fn proto_attr_type_to_core(
             element_type,
             ordered,
             length,
-            ..
+            validate: _,
         } => CoreAttributeType::refined_list(
             proto_attr_type_to_core(element_type)?,
             *ordered,
@@ -1054,8 +1082,8 @@ fn proto_attr_type_to_core(
             base,
             pattern,
             length,
+            validate: _,
             to_dsl,
-            ..
         } => proto_legacy_custom_to_core(name, base, pattern.clone(), *length, to_dsl.clone())?,
         proto::AttributeType::CustomEnum {
             name,
@@ -1092,11 +1120,12 @@ fn proto_legacy_custom_to_core(
     to_dsl: Option<proto::DslTransform>,
 ) -> Result<CoreAttributeType, SchemaDecodeError> {
     if let proto::AttributeType::Custom {
+        name: _,
         base,
         pattern: inner_pattern,
         length: inner_length,
+        validate: _,
         to_dsl: inner_to_dsl,
-        ..
     } = base
     {
         // carina#3459: pre-namespace-adoption providers can encode resource
@@ -1121,24 +1150,38 @@ fn proto_legacy_custom_to_core(
     };
     let validate = legacy_validator(|_| Ok(())); // Validation is handled via ProviderContext.validators
 
+    // A legacy Custom's outer record owns its identity and refinements; its
+    // base is a shape discriminator (plus List element type/order). Name every
+    // unused base field so extending a variant cannot silently change that rule.
     match base {
-        proto::AttributeType::String { .. } => {
-            Ok(CoreAttributeType::refined_string_with_validator(
-                identity, pattern, length, validate, to_dsl,
-            ))
-        }
-        proto::AttributeType::Int { .. } => Ok(CoreAttributeType::refined_int_with_validator(
+        proto::AttributeType::String {
+            pattern: _,
+            length: _,
+            validate: _,
+            to_dsl: _,
+            identity: _,
+        } => Ok(CoreAttributeType::refined_string_with_validator(
+            identity, pattern, length, validate, to_dsl,
+        )),
+        proto::AttributeType::Int {
+            range: _,
+            identity: _,
+        } => Ok(CoreAttributeType::refined_int_with_validator(
             identity,
             length.map(|(min, max)| (min.map(|v| v as i64), max.map(|v| v as i64))),
             validate,
         )),
-        proto::AttributeType::Float { .. } => Ok(CoreAttributeType::refined_float_with_validator(
+        proto::AttributeType::Float {
+            range: _,
+            identity: _,
+        } => Ok(CoreAttributeType::refined_float_with_validator(
             identity, None, validate,
         )),
         proto::AttributeType::List {
             element_type,
             ordered,
-            ..
+            length: _,
+            validate: _,
         } => Ok(CoreAttributeType::refined_list(
             proto_attr_type_to_core(element_type)?,
             *ordered,
