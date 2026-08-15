@@ -587,6 +587,13 @@ impl DiagnosticEngine {
 
                         // Type validation
                         if let Some(attr_schema) = schema.attributes.get(canonical_name) {
+                            // The shared resource-level validator below owns read-only
+                            // assignments. Skip type and authoring guidance here so it
+                            // emits the single writability diagnostic, matching core.
+                            if attr_schema.read_only {
+                                continue;
+                            }
+
                             // Check for block syntax on bare Struct attributes:
                             // Block syntax produces Value::Concrete(ConcreteValue::List), but bare Struct requires
                             // map assignment syntax: attr = { ... }.
@@ -919,16 +926,16 @@ impl DiagnosticEngine {
                                 continue;
                             }
                             // Try attribute-level position first, fall back to resource position
-                            let position =
-                                if let carina_core::schema::TypeError::ResourceValidationFailed {
+                            let position = match &error {
+                                carina_core::schema::TypeError::ResourceValidationFailed {
                                     attribute: Some(attr),
                                     ..
-                                } = &error
-                                {
-                                    self.find_attribute_position(doc, attr, scope)
-                                } else {
-                                    None
-                                };
+                                }
+                                | carina_core::schema::TypeError::ReadOnlyAttribute {
+                                    name: attr,
+                                } => self.find_attribute_position(doc, attr, scope),
+                                _ => None,
+                            };
                             let position = position.or_else(|| {
                                 self.find_resource_type_position(
                                     doc,

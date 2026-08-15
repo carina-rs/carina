@@ -4496,6 +4496,9 @@ pub enum TypeError {
     #[error("Required attribute '{name}' is missing")]
     MissingRequired { name: String },
 
+    #[error("Attribute '{name}' is populated by the provider and cannot be set")]
+    ReadOnlyAttribute { name: String },
+
     #[error("Unknown attribute '{name}'{}", suggestion.as_ref().map(|s| format!(", did you mean '{}'?", s)).unwrap_or_default())]
     UnknownAttribute {
         name: String,
@@ -5442,6 +5445,14 @@ impl ResourceSchema {
             let canonical = bn_map.get(name).map(|s| s.as_str()).unwrap_or(name);
 
             if let Some(schema) = self.attributes.get(canonical) {
+                // `read_only` attributes are provider-populated, so accepting a user
+                // value would silently drop it. Reject before type checking so the
+                // diagnostic reports writability instead of a confusing type error.
+                if schema.read_only {
+                    errors.push(TypeError::ReadOnlyAttribute { name: name.clone() });
+                    continue;
+                }
+
                 if let Err(e) = schema_view.validate_attr(&schema.attr_type, value) {
                     // Tag the error with the attribute name the user actually
                     // wrote (which may be a block-name alias), so diagnostics
