@@ -18,7 +18,9 @@ use carina_core::parser::ProviderContext;
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
 use crate::wiring::{
-    WiringContext, build_factories_from_providers, validate_no_provider_in_modules,
+    WiringContext, build_factories_from_providers, validate_no_backend_in_modules,
+    validate_no_exports_in_modules, validate_no_provider_in_modules,
+    validate_no_state_blocks_in_modules, validate_no_upstream_states_in_modules,
 };
 
 /// A lint warning with file, line, and message info.
@@ -59,18 +61,23 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
 
     let base_dir = get_base_dir(path);
     let module_walk = ModuleWalk::load(&parsed, base_dir);
-    let provider_in_module_findings = validate_no_provider_in_modules(&module_walk);
+    let mut module_boundary_findings = validate_no_provider_in_modules(&module_walk);
+    module_boundary_findings.extend(validate_no_state_blocks_in_modules(&module_walk));
+    module_boundary_findings.extend(validate_no_backend_in_modules(&module_walk));
+    module_boundary_findings.extend(validate_no_upstream_states_in_modules(&module_walk));
+    module_boundary_findings.extend(validate_no_exports_in_modules(&module_walk));
 
-    // Report provider-in-module through lint's collected, path-prefixed output.
-    // The resolver enforces the same invariant as an expansion backstop, so
-    // do not expand after this gate fails or lint would abort before rendering
-    // the findings below. This deliberately degrades schema-dependent checks:
-    // `iter_top_level_resources` then sees only root-declared resources, so
-    // List<Struct> block-syntax suggestions can disappear even from root files.
-    // The configuration is already blocked; retaining this finding and the
-    // schema-independent text scans is more useful than aborting lint entirely.
-    // Full schema-backed suggestions return once the provider finding is fixed.
-    if provider_in_module_findings.is_empty() {
+    // Report invalid root-owned module blocks through lint's collected,
+    // path-prefixed output. The resolver enforces the same invariants as
+    // expansion backstops, so do not expand after this gate fails or lint
+    // would abort before rendering the findings below. This deliberately
+    // degrades schema-dependent checks: `iter_top_level_resources` then sees
+    // only root-declared resources, so List<Struct> block-syntax suggestions
+    // can disappear even from root files. The configuration is already
+    // blocked; retaining these findings and the schema-independent text scans
+    // is more useful than aborting lint entirely. Full schema-backed
+    // suggestions return once the blocking finding is fixed.
+    if module_boundary_findings.is_empty() {
         module_resolver::resolve_modules_with_config(&mut parsed, base_dir, provider_context)
             .map_err(|e| format!("Module resolution error: {}", e))?;
     }
@@ -118,10 +125,10 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
     }
 
     // Scan each source file for list literal usage of List<Struct> attributes
-    let mut warnings: Vec<LintWarning> = provider_in_module_findings
+    let mut warnings: Vec<LintWarning> = module_boundary_findings
         .into_iter()
         .map(|finding| LintWarning {
-            // The merged module parse does not retain a provider declaration
+            // The merged module parse does not retain an offending declaration
             // span. Keep lint's file:line convention at the caller boundary;
             // the finding itself retains the recursive module-path prefix.
             file: path.to_path_buf(),

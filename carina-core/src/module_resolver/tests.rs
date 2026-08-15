@@ -2359,6 +2359,161 @@ fn test_load_module_parse_error_cleans_resolving_set() {
 }
 
 #[test]
+fn test_load_module_rejects_state_blocks() {
+    let cases = [
+        (
+            "moved",
+            r#"moved {
+  from = mock.test.Resource 'old'
+  to = mock.test.Resource 'new'
+}
+"#,
+        ),
+        (
+            "removed",
+            r#"removed {
+  from = mock.test.Resource 'old'
+}
+"#,
+        ),
+        (
+            "import",
+            r#"import {
+  to = mock.test.Resource 'existing'
+  id = 'resource-123'
+}
+"#,
+        ),
+    ];
+
+    for (kind, state_block) in cases {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let module_dir = tmp.path().join("module");
+        fs::create_dir(&module_dir).expect("module directory");
+        fs::write(
+            module_dir.join("arguments.crn"),
+            "arguments {\n  name: String = 'test'\n}\n",
+        )
+        .expect("module arguments");
+        fs::write(module_dir.join("state.crn"), state_block).expect("module state block");
+
+        let mut resolver = ModuleResolver::new(tmp.path());
+        let err = resolver
+            .load_module("module")
+            .expect_err("state block inside a module must be rejected");
+
+        assert!(
+            matches!(&err, ModuleError::StateBlockInModule),
+            "expected StateBlockInModule for {kind}, got {err:?}",
+        );
+        assert_eq!(
+            err.to_string(),
+            "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+            "unexpected resolver error for {kind}",
+        );
+    }
+}
+
+#[test]
+fn test_load_module_rejects_backend_and_cleans_resolving_set() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("module");
+    fs::create_dir(&module_dir).expect("module directory");
+    fs::write(
+        module_dir.join("arguments.crn"),
+        "arguments {\n  name: String = 'test'\n}\n",
+    )
+    .expect("module arguments");
+    fs::write(
+        module_dir.join("backend.crn"),
+        "backend local {\n  path = 'module.state.json'\n}\n",
+    )
+    .expect("module backend");
+
+    let mut resolver = ModuleResolver::new(tmp.path());
+    for attempt in 1..=2 {
+        let err = resolver
+            .load_module("module")
+            .expect_err("backend inside a module must be rejected");
+        assert!(
+            matches!(&err, ModuleError::BackendInModule),
+            "expected BackendInModule on attempt {attempt}, got {err:?}",
+        );
+        assert_eq!(
+            err.to_string(),
+            "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",
+            "unexpected resolver error on attempt {attempt}",
+        );
+    }
+}
+
+#[test]
+fn test_load_module_rejects_upstream_state_and_cleans_resolving_set() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("module");
+    fs::create_dir(&module_dir).expect("module directory");
+    fs::write(
+        module_dir.join("arguments.crn"),
+        "arguments {\n  name: String = 'test'\n}\n",
+    )
+    .expect("module arguments");
+    fs::write(
+        module_dir.join("upstream.crn"),
+        "let up = upstream_state { source = '../other' }\n",
+    )
+    .expect("module upstream_state");
+
+    let mut resolver = ModuleResolver::new(tmp.path());
+    for attempt in 1..=2 {
+        let err = resolver
+            .load_module("module")
+            .expect_err("upstream_state inside a module must be rejected");
+        assert!(
+            matches!(&err, ModuleError::UpstreamStateInModule),
+            "expected UpstreamStateInModule on attempt {attempt}, got {err:?}",
+        );
+        assert_eq!(
+            err.to_string(),
+            "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
+            "unexpected resolver error on attempt {attempt}",
+        );
+    }
+}
+
+#[test]
+fn test_load_module_rejects_exports_and_cleans_resolving_set() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let module_dir = tmp.path().join("module");
+    fs::create_dir(&module_dir).expect("module directory");
+    fs::write(
+        module_dir.join("arguments.crn"),
+        "arguments {\n  name: String = 'test'\n}\n",
+    )
+    .expect("module arguments");
+    fs::write(
+        module_dir.join("exports.crn"),
+        "exports {\n  module_value = 'module'\n}\n",
+    )
+    .expect("module exports");
+
+    let mut resolver = ModuleResolver::new(tmp.path());
+    for attempt in 1..=2 {
+        let err = resolver
+            .load_module("module")
+            .expect_err("exports inside a module must be rejected");
+        assert!(
+            matches!(&err, ModuleError::ExportsInModule),
+            "expected ExportsInModule on attempt {attempt}, got {err:?}",
+        );
+        assert_eq!(
+            err.to_string(),
+            "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+            "unexpected resolver error on attempt {attempt}",
+        );
+    }
+}
+
+#[test]
 fn test_load_module_rejects_file_path() {
     // Issue #1997: Modules must be directories. A single `.crn` file as a
     // module target should be rejected with NotADirectory instead of being

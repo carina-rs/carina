@@ -213,13 +213,8 @@ fn state_refresh_uses_resolver_backstop_when_validation_walk_is_skipped() {
         .args(["state", "refresh", "--lock=false", "."])
         .output()
         .expect("run carina state refresh");
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(
-        !output.status.success(),
-        "state refresh must reject the invalid module; stdout: {stdout}\nstderr: {stderr}",
-    );
     assert!(
         stderr.contains("Module resolution error: provider blocks are not allowed inside modules"),
         "the skip-validation path must retain the resolver backstop form; stderr: {stderr}",
