@@ -20,6 +20,7 @@ use crate::executor::scheduler::FailureView;
 use crate::executor::{ExecutionEvent, ExecutionObserver};
 use crate::provider::{Provider, ProviderError, ReadRequest};
 use crate::resource::{ResourceId, State, Value};
+use crate::shutdown::{CleanupAwareLoop, CleanupInterrupted, LoopStep};
 use crate::value::format_value_user_facing;
 use crate::wait::WaitObservation;
 use crate::wait::predicate::WaitPredicate;
@@ -82,6 +83,7 @@ impl AppliedStates {
 /// Outcome of polling a Wait effect. The variants distinguish:
 /// - `Satisfied`: the wait condition was met; carries the resource state.
 /// - `Cancelled`: external cancel observed mid-poll; abort early without failure.
+/// - `Abandoned`: cleanup priority interrupted the wait; abort without failure.
 /// - `Unsatisfiable`: the wait can never be satisfied, such as when no
 ///   remaining mutator can change the target.
 /// - `Timeout`: wait window elapsed without satisfying the condition.
@@ -93,6 +95,7 @@ pub enum WaitOutcome {
         state: State,
     },
     Cancelled,
+    Abandoned,
     Unsatisfiable(UnsatisfiableReason),
     Timeout {
         last_attrs: HashMap<String, Value>,
@@ -161,9 +164,12 @@ pub(super) fn wait_failure_message(outcome: &WaitOutcome, target_id: &ResourceId
             )
         }
         WaitOutcome::NotFound(err) | WaitOutcome::ReadFailed(err) => err.to_string(),
-        WaitOutcome::Satisfied { .. } | WaitOutcome::Cancelled | WaitOutcome::Unsatisfiable(_) => {
-            unreachable!("satisfied, cancelled, and unsatisfiable waits are not failures")
-        }
+        WaitOutcome::Satisfied { .. }
+        | WaitOutcome::Cancelled
+        | WaitOutcome::Abandoned
+        | WaitOutcome::Unsatisfiable(_) => unreachable!(
+            "satisfied, cancelled, abandoned, and unsatisfiable waits are not failures"
+        ),
     }
 }
 
@@ -347,21 +353,22 @@ impl<'a, 'fut, R> NextReady<'a, 'fut, R> {
     pub(super) fn drop_without_awaiting(self) {}
 }
 
-/// Run the wait polling loop:
+/// Poll `provider.read()` until `until` is satisfied, the wait fails or times
+/// out, cancellation makes it unsatisfiable, or cleanup priority abandons it.
 ///
-/// 1. `read()` the target's current state.
-/// 2. If the read returns `not_found`, fail immediately with
-///    [`ProviderError::NotFound`] — mid-poll target deletion is a
-///    real divergence the user should see right away.
-/// 3. Evaluate `until` against the returned attribute map.
-/// 4. If true, return the captured state.
-/// 5. Otherwise, if the elapsed time has passed `timeout`, return
-///    [`ProviderError::Timeout`] whose message includes the unmet
-///    predicate, the last observed attribute snapshot, and the
-///    elapsed time.
-/// 6. Otherwise, sleep for `interval` and repeat.
+/// * `cleanup_loop` – shutdown state sampled immediately before every poll. If
+///   cleanup priority is already active, the function returns
+///   [`WaitOutcome::Abandoned`] before resolving the target identifier or
+///   calling `provider.read()`. Cleanup priority can also interrupt either an
+///   in-flight provider read or the following interval sleep.
+/// * `timeout` – maximum elapsed time before returning [`WaitOutcome::Timeout`].
+/// * `interval` – sleep duration between provider reads.
+///
+/// A missing target or provider read error returns immediately rather than
+/// waiting for another interval.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_wait_effect(
+    cleanup_loop: &CleanupAwareLoop<'_>,
     provider: &dyn Provider,
     target_id: &ResourceId,
     identifier_resolver: &WaitIdentifierResolver<'_>,
@@ -372,6 +379,7 @@ pub async fn execute_wait_effect(
     observer: &dyn ExecutionObserver,
 ) -> WaitOutcome {
     execute_wait_effect_with_heartbeat_cadence(
+        cleanup_loop,
         provider,
         target_id.identity_or_empty(),
         target_id,
@@ -388,6 +396,7 @@ pub async fn execute_wait_effect(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_wait_effect_with_heartbeat_cadence(
+    cleanup_loop: &CleanupAwareLoop<'_>,
     provider: &dyn Provider,
     binding: &str,
     target_id: &ResourceId,
@@ -402,70 +411,86 @@ pub(crate) async fn execute_wait_effect_with_heartbeat_cadence(
     let start = Instant::now();
     let mut last_heartbeat_at: Option<Instant> = None;
     loop {
-        let target_identifier = identifier_resolver(target_id);
-        let state = match provider
-            .read(target_id, target_identifier.as_deref(), ReadRequest)
-            .await
-        {
-            Ok(state) => state,
-            Err(err @ ProviderError::NotFound(_)) => return WaitOutcome::NotFound(err),
-            Err(err) => return WaitOutcome::ReadFailed(err),
+        let cleanup_wait = match cleanup_loop.step() {
+            LoopStep::Continue(wait) => wait,
+            LoopStep::Abandon => return WaitOutcome::Abandoned,
         };
-        if !state.exists {
-            return WaitOutcome::NotFound(
-                ProviderError::not_found(format!(
-                    "wait target {} not found (deleted out-of-band?)",
-                    target_id
-                ))
-                .for_resource(target_id.clone()),
-            );
-        }
-
-        // Sample `now` before the sleep deliberately: it timestamps this poll,
-        // not the following wakeup. With `>=`, the cadence is a floor, not a
-        // target: emits are never early but can be late when the interval does
-        // not divide 30s or provider/scheduler work delays a poll.
-        // Observer-side timestamps can drift further through event construction
-        // and callback delay.
-        let now = Instant::now();
-        let should_emit_heartbeat = last_heartbeat_at
-            .map(|last| now.duration_since(last) >= heartbeat_cadence)
-            .unwrap_or(true);
-        if should_emit_heartbeat {
-            let observation = WaitObservation::new(binding, target_id, until, &state.attributes);
-            observer.on_event(&ExecutionEvent::WaitPolling {
-                observation,
-                elapsed: start.elapsed(),
-            });
-            last_heartbeat_at = Some(now);
-        }
-
-        if until.evaluate(&state.attributes) {
-            return WaitOutcome::Satisfied { state };
-        }
-        let elapsed = start.elapsed();
-        if elapsed >= timeout {
-            return WaitOutcome::Timeout {
-                last_attrs: state.attributes,
-                elapsed,
+        let iteration = async {
+            let target_identifier = identifier_resolver(target_id);
+            let state = match provider
+                .read(target_id, target_identifier.as_deref(), ReadRequest)
+                .await
+            {
+                Ok(state) => state,
+                Err(err @ ProviderError::NotFound(_)) => {
+                    return Some(WaitOutcome::NotFound(err));
+                }
+                Err(err) => return Some(WaitOutcome::ReadFailed(err)),
             };
-        }
-        tokio::select! {
-            biased;
-            changed = cancel.changed() => {
-                if changed.is_ok() {
-                    match *cancel.borrow() {
-                        WaitSignal::Cancelled => return WaitOutcome::Cancelled,
-                        WaitSignal::NoMutatorRemaining => {
-                            return WaitOutcome::Unsatisfiable(
-                                UnsatisfiableReason::NoMutatorRemaining
-                            );
+            if !state.exists {
+                return Some(WaitOutcome::NotFound(
+                    ProviderError::not_found(format!(
+                        "wait target {} not found (deleted out-of-band?)",
+                        target_id
+                    ))
+                    .for_resource(target_id.clone()),
+                ));
+            }
+
+            // Sample `now` before the sleep deliberately: it timestamps this poll,
+            // not the following wakeup. With `>=`, the cadence is a floor, not a
+            // target: emits are never early but can be late when the interval does
+            // not divide 30s or provider/scheduler work delays a poll.
+            // Observer-side timestamps can drift further through event construction
+            // and callback delay.
+            let now = Instant::now();
+            let should_emit_heartbeat = last_heartbeat_at
+                .map(|last| now.duration_since(last) >= heartbeat_cadence)
+                .unwrap_or(true);
+            if should_emit_heartbeat {
+                let observation =
+                    WaitObservation::new(binding, target_id, until, &state.attributes);
+                observer.on_event(&ExecutionEvent::WaitPolling {
+                    observation,
+                    elapsed: start.elapsed(),
+                });
+                last_heartbeat_at = Some(now);
+            }
+
+            if until.evaluate(&state.attributes) {
+                return Some(WaitOutcome::Satisfied { state });
+            }
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                return Some(WaitOutcome::Timeout {
+                    last_attrs: state.attributes,
+                    elapsed,
+                });
+            }
+            tokio::select! {
+                biased;
+                changed = cancel.changed() => {
+                    if changed.is_ok() {
+                        match *cancel.borrow() {
+                            WaitSignal::Cancelled => Some(WaitOutcome::Cancelled),
+                            WaitSignal::NoMutatorRemaining => {
+                                Some(WaitOutcome::Unsatisfiable(
+                                    UnsatisfiableReason::NoMutatorRemaining
+                                ))
+                            }
+                            WaitSignal::Continue => None,
                         }
-                        WaitSignal::Continue => {}
+                    } else {
+                        None
                     }
                 }
+                () = tokio::time::sleep(interval) => None,
             }
-            () = tokio::time::sleep(interval) => {}
+        };
+        match cleanup_wait.until_cleanup_priority(iteration).await {
+            CleanupInterrupted::Completed(Some(outcome)) => return outcome,
+            CleanupInterrupted::Completed(None) => {}
+            CleanupInterrupted::Abandoned => return WaitOutcome::Abandoned,
         }
     }
 }
@@ -480,9 +505,11 @@ mod tests {
     use crate::resource::{ConcreteValue, DataSource, DeferredValue, UnknownReason, Value};
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::collections::HashMap;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::watch;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::{oneshot, watch};
+
+    const CLEANUP_TEST_BOUND: Duration = Duration::from_secs(1);
 
     fn no_identifier(_: &ResourceId) -> Option<String> {
         None
@@ -494,6 +521,7 @@ mod tests {
     struct ReadSequenceProvider {
         responses: Mutex<Vec<State>>,
         reads: Mutex<usize>,
+        pending: bool,
     }
 
     impl ReadSequenceProvider {
@@ -501,6 +529,15 @@ mod tests {
             Self {
                 responses: Mutex::new(responses),
                 reads: Mutex::new(0),
+                pending: false,
+            }
+        }
+
+        fn pending() -> Self {
+            Self {
+                responses: Mutex::new(Vec::new()),
+                reads: Mutex::new(0),
+                pending: true,
             }
         }
 
@@ -521,8 +558,13 @@ mod tests {
             _request: ReadRequest,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             Box::pin(async move {
-                let mut reads = self.reads.lock().unwrap();
-                *reads += 1;
+                {
+                    let mut reads = self.reads.lock().unwrap();
+                    *reads += 1;
+                }
+                if self.pending {
+                    return std::future::pending().await;
+                }
                 let mut responses = self.responses.lock().unwrap();
                 if responses.len() > 1 {
                     Ok(responses.remove(0))
@@ -648,13 +690,230 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_abandons_in_flight_provider_read_when_cleanup_is_prioritized() {
+        tokio::time::timeout(CLEANUP_TEST_BOUND, async {
+            let provider = ReadSequenceProvider::pending();
+            let pred = equals_status("ISSUED");
+            let target = ResourceId::with_identity("acm.Certificate", "cert");
+            let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
+            let observer = NoopWaitObserver;
+            let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
+            let cleanup_loop = shutdown.cleanup_aware_loop();
+
+            let wait = execute_wait_effect(
+                &cleanup_loop,
+                &provider,
+                &target,
+                &no_identifier,
+                &pred,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                cancel_rx,
+                &observer,
+            );
+            tokio::pin!(wait);
+
+            std::future::poll_fn(|cx| {
+                assert!(
+                    wait.as_mut().poll(cx).is_pending(),
+                    "wait returned before provider.read was in flight"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(
+                provider.read_count(),
+                1,
+                "the test must park inside the first provider.read"
+            );
+
+            trigger.prioritize_cleanup();
+            let result = std::future::poll_fn(|cx| match wait.as_mut().poll(cx) {
+                std::task::Poll::Ready(outcome) => std::task::Poll::Ready(outcome),
+                std::task::Poll::Pending => {
+                    panic!("cleanup priority did not abandon the in-flight provider.read")
+                }
+            })
+            .await;
+            assert!(
+                matches!(result, WaitOutcome::Abandoned),
+                "cleanup priority returned the wrong outcome: {result:?}"
+            );
+        })
+        .await
+        .expect("in-flight cleanup regression test exceeded its one-second bound");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_abandons_while_parked_in_sleep_interval() {
+        tokio::time::timeout(CLEANUP_TEST_BOUND, async {
+            let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING")]);
+            let pred = equals_status("ISSUED");
+            let target = ResourceId::with_identity("acm.Certificate", "cert");
+            let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
+            let observer = NoopWaitObserver;
+            let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
+            let cleanup_loop = shutdown.cleanup_aware_loop();
+
+            let wait = execute_wait_effect(
+                &cleanup_loop,
+                &provider,
+                &target,
+                &no_identifier,
+                &pred,
+                Duration::from_secs(600),
+                Duration::from_secs(30),
+                cancel_rx,
+                &observer,
+            );
+            tokio::pin!(wait);
+
+            std::future::poll_fn(|cx| {
+                assert!(
+                    wait.as_mut().poll(cx).is_pending(),
+                    "wait returned before parking in the polling interval"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(
+                provider.read_count(),
+                1,
+                "the first provider.read must complete before the wait parks in sleep"
+            );
+
+            trigger.prioritize_cleanup();
+            let result = std::future::poll_fn(|cx| match wait.as_mut().poll(cx) {
+                std::task::Poll::Ready(outcome) => std::task::Poll::Ready(outcome),
+                std::task::Poll::Pending => {
+                    panic!("cleanup priority did not abandon the wait parked in sleep")
+                }
+            })
+            .await;
+            assert!(
+                matches!(result, WaitOutcome::Abandoned),
+                "cleanup priority returned the wrong sleep-parked outcome: {result:?}"
+            );
+        })
+        .await
+        .expect("sleep-parked cleanup regression test exceeded its one-second bound");
+    }
+
+    #[tokio::test]
+    async fn wait_abandons_before_read_when_cleanup_is_already_prioritized() {
+        let provider = Arc::new(ReadSequenceProvider::new(vec![state_with_status("ISSUED")]));
+        let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
+        trigger.prioritize_cleanup();
+        assert_eq!(
+            shutdown.phase(),
+            crate::shutdown::ShutdownPhase::CleanupPriority,
+            "the test trigger and shutdown token must share cleanup-priority state"
+        );
+
+        let worker_provider = Arc::clone(&provider);
+        let (result_tx, result_rx) = oneshot::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("failed to build wait-test runtime");
+            let result = runtime.block_on(async move {
+                let pred = equals_status("ISSUED");
+                let target = ResourceId::with_identity("acm.Certificate", "cert");
+                let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
+                let observer = NoopWaitObserver;
+                let cleanup_loop = shutdown.cleanup_aware_loop();
+
+                execute_wait_effect(
+                    &cleanup_loop,
+                    worker_provider.as_ref(),
+                    &target,
+                    &no_identifier,
+                    &pred,
+                    Duration::from_secs(60),
+                    Duration::from_secs(60),
+                    cancel_rx,
+                    &observer,
+                )
+                .await
+            });
+            let _ = result_tx.send(result);
+        });
+
+        let result = tokio::time::timeout(CLEANUP_TEST_BOUND, result_rx)
+            .await
+            .expect("already-active cleanup wait did not return within one second")
+            .expect("already-active cleanup wait worker exited without an outcome");
+        worker
+            .join()
+            .expect("already-active cleanup wait worker panicked");
+
+        assert!(
+            matches!(result, WaitOutcome::Abandoned),
+            "already-active cleanup priority returned the wrong outcome: {result:?}"
+        );
+        assert_eq!(
+            provider.read_count(),
+            0,
+            "already-active cleanup priority must abandon before provider.read; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_reaches_satisfied_during_graceful_shutdown() {
+        tokio::time::timeout(CLEANUP_TEST_BOUND, async {
+            let provider = ReadSequenceProvider::new(vec![state_with_status("ISSUED")]);
+            let pred = equals_status("ISSUED");
+            let target = ResourceId::with_identity("acm.Certificate", "cert");
+            let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
+            let observer = NoopWaitObserver;
+            let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
+            trigger.request_graceful_shutdown();
+            assert_eq!(
+                shutdown.phase(),
+                crate::shutdown::ShutdownPhase::Graceful,
+                "the wait must start while graceful shutdown is active"
+            );
+            let cleanup_loop = shutdown.cleanup_aware_loop();
+
+            let result = execute_wait_effect(
+                &cleanup_loop,
+                &provider,
+                &target,
+                &no_identifier,
+                &pred,
+                Duration::from_secs(60),
+                Duration::from_secs(30),
+                cancel_rx,
+                &observer,
+            )
+            .await;
+
+            assert!(
+                matches!(result, WaitOutcome::Satisfied { .. }),
+                "graceful shutdown abandoned a satisfiable wait: {result:?}"
+            );
+            assert_eq!(
+                provider.read_count(),
+                1,
+                "graceful shutdown must allow the provider read to complete"
+            );
+        })
+        .await
+        .expect("graceful-shutdown wait test exceeded its one-second bound");
+    }
+
+    #[tokio::test]
     async fn wait_returns_immediately_when_until_already_true() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("ISSUED")]);
         let pred = equals_status("ISSUED");
         let target = ResourceId::with_identity("acm.Certificate", "cert");
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
+        let shutdown = crate::shutdown::ShutdownToken::running();
+        let cleanup_loop = shutdown.cleanup_aware_loop();
         let result = execute_wait_effect(
+            &cleanup_loop,
             &provider,
             &target,
             &no_identifier,
@@ -688,7 +947,10 @@ mod tests {
         let target = ResourceId::with_identity("acm.Certificate", "cert");
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
+        let shutdown = crate::shutdown::ShutdownToken::running();
+        let cleanup_loop = shutdown.cleanup_aware_loop();
         let result = execute_wait_effect(
+            &cleanup_loop,
             &provider,
             &target,
             &no_identifier,
@@ -713,7 +975,10 @@ mod tests {
         let target = ResourceId::with_identity("acm.Certificate", "cert");
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
+        let shutdown = crate::shutdown::ShutdownToken::running();
+        let cleanup_loop = shutdown.cleanup_aware_loop();
         let result = execute_wait_effect(
+            &cleanup_loop,
             &provider,
             &target,
             &no_identifier,
@@ -824,7 +1089,10 @@ mod tests {
         let target = ResourceId::with_identity("acm.Certificate", "cert");
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
+        let shutdown = crate::shutdown::ShutdownToken::running();
+        let cleanup_loop = shutdown.cleanup_aware_loop();
         let result = execute_wait_effect(
+            &cleanup_loop,
             &provider,
             &target,
             &no_identifier,
@@ -849,6 +1117,8 @@ mod tests {
         let (cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let reads_seen = AtomicUsize::new(0);
+        let shutdown = crate::shutdown::ShutdownToken::running();
+        let cleanup_loop = shutdown.cleanup_aware_loop();
 
         let result = tokio::join!(
             async {
@@ -862,6 +1132,7 @@ mod tests {
                 }
             },
             execute_wait_effect(
+                &cleanup_loop,
                 &provider,
                 &target,
                 &no_identifier,
@@ -894,8 +1165,11 @@ mod tests {
         let target = ResourceId::with_identity("acm.Certificate", "cert");
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = HeartbeatObserver::new();
+        let shutdown = crate::shutdown::ShutdownToken::running();
+        let cleanup_loop = shutdown.cleanup_aware_loop();
 
         let result = execute_wait_effect_with_heartbeat_cadence(
+            &cleanup_loop,
             &provider,
             "cert_issued",
             &target,

@@ -546,7 +546,9 @@ pub(super) async fn execute_effects_sequential(
                             let identifier_resolver = |target_id: &ResourceId| {
                                 resolve_wait_identifier(&wait_identifiers, target_id)
                             };
+                            let cleanup_loop = shutdown.cleanup_aware_loop();
                             let outcome = super::wait::execute_wait_effect(
+                                &cleanup_loop,
                                 provider,
                                 target_id,
                                 &identifier_resolver,
@@ -756,7 +758,7 @@ pub(super) async fn execute_effects_sequential(
                     skip_count += 1;
                     failed_indices.insert(finished_idx);
                 }
-                WaitOutcome::Cancelled => {
+                WaitOutcome::Cancelled | WaitOutcome::Abandoned => {
                     observer.on_event(&ExecutionEvent::EffectSkipped {
                         effect: &effects[finished_idx],
                         reason: SKIP_REASON_CANCELLED,
