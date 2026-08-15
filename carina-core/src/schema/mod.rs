@@ -421,12 +421,12 @@ impl<'a> DslMap<'a> {
     }
 }
 
-/// Whether a nested struct field may or must be supplied by the user.
+/// Whether a schema value may or must be supplied by the user.
 ///
 /// These states are mutually exclusive by construction: provider-populated
-/// fields cannot also be required user input.
+/// values cannot also be required user input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum StructFieldInputMode {
+pub enum InputMode {
     /// The user may omit this field.
     #[default]
     Optional,
@@ -434,6 +434,16 @@ pub enum StructFieldInputMode {
     Required,
     /// The provider supplies this field; user assignments are rejected.
     ProviderPopulated,
+}
+
+impl InputMode {
+    pub const fn is_required(self) -> bool {
+        matches!(self, Self::Required)
+    }
+
+    pub const fn is_provider_populated(self) -> bool {
+        matches!(self, Self::ProviderPopulated)
+    }
 }
 
 /// A field within a Struct type
@@ -444,7 +454,7 @@ pub struct StructField {
     /// Field type
     pub field_type: AttributeType,
     /// Whether user input for this field is optional, required, or forbidden.
-    pub input_mode: StructFieldInputMode,
+    pub input_mode: InputMode,
     /// Description of this field
     pub description: Option<String>,
     /// Provider-side property name (e.g., "IpProtocol")
@@ -466,7 +476,7 @@ impl StructField {
         Self {
             name: name.into(),
             field_type,
-            input_mode: StructFieldInputMode::Optional,
+            input_mode: InputMode::Optional,
             description: None,
             provider_name: None,
             block_name: None,
@@ -475,12 +485,12 @@ impl StructField {
     }
 
     pub fn required(mut self) -> Self {
-        self.input_mode = StructFieldInputMode::Required;
+        self.input_mode = InputMode::Required;
         self
     }
 
     pub fn is_required(&self) -> bool {
-        self.input_mode == StructFieldInputMode::Required
+        self.input_mode.is_required()
     }
 
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
@@ -501,12 +511,12 @@ impl StructField {
     /// Mark this nested field as provider-populated and therefore not
     /// assignable by users.
     pub fn read_only(mut self) -> Self {
-        self.input_mode = StructFieldInputMode::ProviderPopulated;
+        self.input_mode = InputMode::ProviderPopulated;
         self
     }
 
     pub fn is_read_only(&self) -> bool {
-        self.input_mode == StructFieldInputMode::ProviderPopulated
+        self.input_mode.is_provider_populated()
     }
 
     /// Mark this nested field as populated asynchronously by the
@@ -4796,12 +4806,26 @@ impl CompletionValue {
     }
 }
 
-/// Attribute schema
+/// Schema for one top-level resource attribute.
+///
+/// Required user input and provider-populated output are mutually exclusive.
+/// Constructing the former two-boolean state is intentionally a compile error:
+///
+/// ```compile_fail
+/// use carina_core::schema::{AttributeSchema, AttributeType};
+///
+/// let _ = AttributeSchema {
+///     required: true,
+///     read_only: true,
+///     ..AttributeSchema::new("arn", AttributeType::string())
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct AttributeSchema {
     pub name: String,
     pub attr_type: AttributeType,
-    pub required: bool,
+    /// Whether user input for this attribute is optional, required, or forbidden.
+    pub input_mode: InputMode,
     pub default: Option<Value>,
     pub description: Option<String>,
     /// Completion values for this attribute (used by LSP)
@@ -4810,10 +4834,8 @@ pub struct AttributeSchema {
     pub provider_name: Option<String>,
     /// Whether this attribute is create-only (immutable after creation)
     pub create_only: bool,
-    /// Whether this attribute is read-only (set by the provider, cannot be updated)
-    pub read_only: bool,
     /// Override for removability detection.
-    /// `None` = auto-detect: removable if `!required && !create_only`.
+    /// `None` = auto-detect: removable when optional, mutable, and writable.
     /// `Some(false)` = explicitly non-removable (e.g., region inherited from provider).
     /// Only removable attributes trigger removal detection in the differ.
     pub removable: Option<bool>,
@@ -4853,13 +4875,12 @@ impl AttributeSchema {
         Self {
             name: name.into(),
             attr_type,
-            required: false,
+            input_mode: InputMode::Optional,
             default: None,
             description: None,
             completions: None,
             provider_name: None,
             create_only: false,
-            read_only: false,
             removable: None,
             block_name: None,
             write_only: false,
@@ -4869,8 +4890,12 @@ impl AttributeSchema {
     }
 
     pub fn required(mut self) -> Self {
-        self.required = true;
+        self.input_mode = InputMode::Required;
         self
+    }
+
+    pub fn is_required(&self) -> bool {
+        self.input_mode.is_required()
     }
 
     pub fn create_only(mut self) -> Self {
@@ -4879,8 +4904,12 @@ impl AttributeSchema {
     }
 
     pub fn read_only(mut self) -> Self {
-        self.read_only = true;
+        self.input_mode = InputMode::ProviderPopulated;
         self
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.input_mode.is_provider_populated()
     }
 
     pub fn write_only(mut self) -> Self {
@@ -4916,7 +4945,7 @@ impl AttributeSchema {
     /// `.removable()` or `.non_removable()`.
     pub fn is_removable(&self) -> bool {
         self.removable
-            .unwrap_or(!self.required && !self.create_only && !self.read_only)
+            .unwrap_or(!self.is_required() && !self.create_only && !self.is_read_only())
     }
 
     pub fn with_default(mut self, value: Value) -> Self {
@@ -5319,7 +5348,7 @@ impl ResourceSchema {
     pub fn read_only_attributes(&self) -> Vec<&str> {
         self.attributes
             .iter()
-            .filter(|(_, schema)| schema.read_only)
+            .filter(|(_, schema)| schema.is_read_only())
             .map(|(name, _)| name.as_str())
             .collect()
     }
@@ -5329,7 +5358,7 @@ impl ResourceSchema {
     pub fn default_value_attributes(&self) -> Vec<(&str, &Value)> {
         self.attributes
             .iter()
-            .filter(|(_, schema)| schema.default.is_some() && !schema.read_only)
+            .filter(|(_, schema)| schema.default.is_some() && !schema.is_read_only())
             .map(|(name, schema)| (name.as_str(), schema.default.as_ref().unwrap()))
             .collect()
     }
@@ -5458,7 +5487,7 @@ impl ResourceSchema {
 
         // Check required attributes
         for (name, schema) in &self.attributes {
-            if schema.required && !attributes.contains_key(name) && schema.default.is_none() {
+            if schema.is_required() && !attributes.contains_key(name) && schema.default.is_none() {
                 errors.push(TypeError::MissingRequired { name: name.clone() });
             }
         }
@@ -5499,7 +5528,7 @@ impl ResourceSchema {
                 // `read_only` attributes are provider-populated, so accepting a user
                 // value would silently drop it. Reject before type checking so the
                 // diagnostic reports writability instead of a confusing type error.
-                if schema.read_only {
+                if schema.is_read_only() {
                     errors.push(TypeError::ReadOnlyAttribute { name: name.clone() });
                     continue;
                 }

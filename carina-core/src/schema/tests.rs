@@ -3076,6 +3076,78 @@ fn validate_rejects_read_only_attribute_assignment() {
 }
 
 #[test]
+fn validate_allows_required_attribute_to_be_omitted_when_it_has_a_default() {
+    let schema = ResourceSchema::new("test.Resource").attribute(
+        AttributeSchema::new("region", AttributeType::string())
+            .required()
+            .with_default(Value::Concrete(ConcreteValue::String(
+                "us-east-1".to_string(),
+            ))),
+    );
+
+    assert!(
+        schema.validate(&HashMap::new()).is_ok(),
+        "a default must satisfy a required top-level attribute"
+    );
+}
+
+#[test]
+fn attribute_schema_removability_preserves_input_mode_and_create_only_matrix() {
+    let cases = [
+        (
+            "optional mutable",
+            AttributeSchema::new("value", AttributeType::string()),
+            true,
+        ),
+        (
+            "required mutable",
+            AttributeSchema::new("value", AttributeType::string()).required(),
+            false,
+        ),
+        (
+            "provider-populated mutable",
+            AttributeSchema::new("value", AttributeType::string()).read_only(),
+            false,
+        ),
+        (
+            "optional create-only",
+            AttributeSchema::new("value", AttributeType::string()).create_only(),
+            false,
+        ),
+        (
+            "required create-only",
+            AttributeSchema::new("value", AttributeType::string())
+                .required()
+                .create_only(),
+            false,
+        ),
+        (
+            "provider-populated create-only",
+            AttributeSchema::new("value", AttributeType::string())
+                .read_only()
+                .create_only(),
+            false,
+        ),
+    ];
+
+    for (name, schema, expected_auto) in cases {
+        assert_eq!(
+            schema.is_removable(),
+            expected_auto,
+            "auto-detected removability changed for {name}"
+        );
+        assert!(
+            schema.clone().removable().is_removable(),
+            "explicit removable override must win for {name}"
+        );
+        assert!(
+            !schema.non_removable().is_removable(),
+            "explicit non-removable override must win for {name}"
+        );
+    }
+}
+
+#[test]
 fn validate_read_only_block_name_error_uses_user_written_alias() {
     let schema = ResourceSchema::new("test.Resource").attribute(
         AttributeSchema::new(

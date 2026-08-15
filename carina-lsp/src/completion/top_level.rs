@@ -243,7 +243,7 @@ impl CompletionProvider {
             let mut snippet = format!("{} {{\n", key);
             let mut tab_stop = 1;
             for attr in schema.attributes.values() {
-                if attr.required {
+                if attr.is_required() {
                     snippet.push_str(&format!("    {} = ${{{}}}\n", attr.name, tab_stop));
                     tab_stop += 1;
                 }
