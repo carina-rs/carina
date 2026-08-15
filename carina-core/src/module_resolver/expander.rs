@@ -51,8 +51,9 @@ impl ModuleResolver<'_> {
     /// through [`relabel_export_phase`](crate::config_loader) before
     /// the merge so it stays phase-agnostic (today every caller is
     /// `E = ParsedExportParam`, making that a same-phase no-op;
-    /// `export_params` is always empty so the relabel is total
-    /// regardless). The recursive parser-phase caller
+    /// module loading rejects `export_params` before expansion, so the
+    /// empty contribution and its relabel are enforced by the module
+    /// boundary). The recursive parser-phase caller
     /// (`resolve_nested_modules`) merges directly.
     pub fn expand_module_call(
         &self,
@@ -387,21 +388,28 @@ impl ModuleResolver<'_> {
             wait_bindings: expanded_wait_bindings,
             deferred_for_expressions: expanded_deferred_for_expressions,
 
-            // Consumed *inside* expansion, not propagated to the caller
-            // (a module instance does not re-export these as raw
-            // collections — they are inlined / surfaced via the
-            // composition attribute resource above):
-            //   - `providers`: modules inherit the caller's providers.
+            // Not propagated to the caller (a module instance does not
+            // re-export these as raw collections — they are either consumed
+            // during expansion, surfaced through the composition attribute
+            // resource above, or rejected at the module boundary):
+            //   - `providers`: rejected during module loading because modules
+            //     inherit the caller's providers.
             //   - `variables` / `user_functions`: module-local, already
             //     substituted into the expanded resources.
             //   - `uses` / `module_calls`: nested modules are resolved
             //     within `expand_module_call`, not re-emitted.
-            //   - `arguments` / `attribute_params` / `export_params`:
-            //     the call's args are bound here; outputs reach the
-            //     caller through the `_virtual` attribute resource.
+            //   - `arguments`: the call's args are bound here.
+            //   - `attribute_params`: outputs reach the caller through the
+            //     `_virtual` attribute resource.
+            //   - `export_params`: rejected during module loading because
+            //     exports publish root state, not module instance outputs.
             //   - `requires`: evaluated against this call's args here.
-            //   - `state_blocks` / `backend`: a module does not own
-            //     caller state/backend config.
+            //   - `state_blocks`: rejected during module loading because a
+            //     module does not own caller state config.
+            //   - `backend`: rejected during module loading because a module
+            //     does not own caller backend config.
+            //   - `upstream_states`: rejected during module loading because a
+            //     module does not own caller upstream state dependencies.
             //   - `structural_bindings`: scoped to the module's own
             //     parse, not merged upward.
             providers: Vec::new(),

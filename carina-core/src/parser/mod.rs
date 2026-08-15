@@ -28,7 +28,10 @@ pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
 pub(crate) use entry::{
     BindingSeed, parse_with_seeded_bindings, parse_with_seeded_bindings_without_literal_warnings,
 };
-pub use entry::{parse, parse_and_resolve};
+pub use entry::{
+    TopLevelBlockSourceSpan, parse, parse_and_resolve, top_level_backend_block_spans,
+    top_level_exports_block_spans, top_level_state_block_spans, top_level_upstream_state_spans,
+};
 pub(crate) use entry::{parse_expression, parse_expression_eval};
 pub use error::{
     ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,

@@ -48,6 +48,26 @@ pub enum ModuleError {
     ProviderInModule,
 
     #[error(
+        "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level."
+    )]
+    StateBlockInModule,
+
+    #[error(
+        "backend blocks are not allowed inside modules. Define the backend at the root configuration level."
+    )]
+    BackendInModule,
+
+    #[error(
+        "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level."
+    )]
+    UpstreamStateInModule,
+
+    #[error(
+        "exports blocks are not allowed inside modules. Define exports at the root configuration level."
+    )]
+    ExportsInModule,
+
+    #[error(
         "Validation failed for argument '{argument}' in module '{module}': {message} (got {actual})"
     )]
     ArgumentValidationFailed {

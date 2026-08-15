@@ -351,6 +351,18 @@ impl DiagnosticEngine {
             // Check provider in module
             diagnostics.extend(self.check_provider_in_module(doc, parsed, merged));
 
+            // Check state blocks in module
+            diagnostics.extend(self.check_state_blocks_in_module(doc, parsed, merged));
+
+            // Check backend in module
+            diagnostics.extend(self.check_backend_in_module(doc, parsed, merged));
+
+            // Check upstream state declarations in module
+            diagnostics.extend(self.check_upstream_states_in_module(doc, parsed, merged));
+
+            // Check exports blocks in module
+            diagnostics.extend(self.check_exports_in_module(doc, parsed, merged));
+
             // Check arguments in root. The "is this a root config?"
             // signal — a sibling `backend` block — can live in another
             // .crn file in the same directory, so the check needs the

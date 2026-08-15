@@ -1319,6 +1319,279 @@ fn module_without_provider_ok() {
     assert!(result.is_ok());
 }
 
+fn parse_state_blocks(source: &str) -> ParsedFile {
+    crate::parser::parse(source, &ProviderContext::default()).expect("valid state block fixture")
+}
+
+#[test]
+fn moved_in_module_with_arguments_errors() {
+    let mut parsed = parse_state_blocks(
+        r#"moved {
+  from = mock.test.Resource 'old'
+  to = mock.test.Resource 'new'
+}
+"#,
+    );
+    parsed.arguments.push(argument_param("name"));
+
+    let result = validate_no_state_blocks_in_module(&parsed);
+
+    assert_eq!(
+        result.unwrap_err(),
+        "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level."
+    );
+}
+
+#[test]
+fn removed_in_module_with_arguments_errors() {
+    let mut parsed = parse_state_blocks(
+        r#"removed {
+  from = mock.test.Resource 'legacy'
+}
+"#,
+    );
+    parsed.arguments.push(argument_param("name"));
+
+    let result = validate_no_state_blocks_in_module(&parsed);
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn import_in_module_with_arguments_errors() {
+    let mut parsed = parse_state_blocks(
+        r#"import {
+  to = mock.test.Resource 'existing'
+  id = 'resource-123'
+}
+"#,
+    );
+    parsed.arguments.push(argument_param("name"));
+
+    let result = validate_no_state_blocks_in_module(&parsed);
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn state_block_in_module_with_attributes_errors() {
+    let mut parsed = parse_state_blocks(
+        r#"moved {
+  from = mock.test.Resource 'old'
+  to = mock.test.Resource 'new'
+}
+"#,
+    );
+    parsed
+        .attribute_params
+        .push(crate::parser::AttributeParameter {
+            name: "resource_id".to_string(),
+            type_expr: Some(TypeExpr::String),
+            value: Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
+        });
+
+    let result = validate_no_state_blocks_in_module(&parsed);
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn state_blocks_without_module_markers_ok() {
+    let parsed = parse_state_blocks(
+        r#"moved {
+  from = mock.test.Resource 'old'
+  to = mock.test.Resource 'new'
+}
+
+removed {
+  from = mock.test.Resource 'legacy'
+}
+
+import {
+  to = mock.test.Resource 'existing'
+  id = 'resource-123'
+}
+"#,
+    );
+
+    let result = validate_no_state_blocks_in_module(&parsed);
+
+    assert!(result.is_ok());
+}
+
+#[test]
+fn module_without_state_blocks_ok() {
+    let mut parsed = empty_parsed();
+    parsed.arguments.push(argument_param("name"));
+
+    let result = validate_no_state_blocks_in_module(&parsed);
+
+    assert!(result.is_ok());
+}
+
+#[test]
+fn backend_in_module_with_arguments_errors() {
+    let mut parsed = empty_parsed();
+    parsed.arguments.push(argument_param("name"));
+    parsed.backend = Some(crate::parser::BackendConfig {
+        backend_type: "local".to_string(),
+        attributes: HashMap::new(),
+    });
+
+    let result = validate_no_backend_in_module(&parsed);
+
+    assert_eq!(
+        result.unwrap_err(),
+        "backend blocks are not allowed inside modules. Define the backend at the root configuration level."
+    );
+}
+
+#[test]
+fn backend_in_module_with_attributes_errors() {
+    let mut parsed = empty_parsed();
+    parsed
+        .attribute_params
+        .push(crate::parser::AttributeParameter {
+            name: "resource_id".to_string(),
+            type_expr: Some(TypeExpr::String),
+            value: Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
+        });
+    parsed.backend = Some(crate::parser::BackendConfig {
+        backend_type: "local".to_string(),
+        attributes: HashMap::new(),
+    });
+
+    let result = validate_no_backend_in_module(&parsed);
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn backend_without_module_markers_ok() {
+    let mut parsed = empty_parsed();
+    parsed.backend = Some(crate::parser::BackendConfig {
+        backend_type: "local".to_string(),
+        attributes: HashMap::new(),
+    });
+
+    let result = validate_no_backend_in_module(&parsed);
+
+    assert!(result.is_ok());
+}
+
+#[test]
+fn module_without_backend_ok() {
+    let mut parsed = empty_parsed();
+    parsed.arguments.push(argument_param("name"));
+
+    let result = validate_no_backend_in_module(&parsed);
+
+    assert!(result.is_ok());
+}
+
+fn parse_root_owned_declaration(source: &str) -> ParsedFile {
+    crate::parser::parse(source, &ProviderContext::default())
+        .expect("valid root-owned declaration fixture")
+}
+
+#[test]
+fn upstream_state_in_module_with_arguments_errors() {
+    let mut parsed =
+        parse_root_owned_declaration("let up = upstream_state { source = '../other' }\n");
+    parsed.arguments.push(argument_param("name"));
+
+    let result = validate_no_upstream_states_in_module(&parsed);
+
+    assert_eq!(
+        result.unwrap_err(),
+        "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level."
+    );
+}
+
+#[test]
+fn upstream_state_in_module_with_attributes_errors() {
+    let mut parsed =
+        parse_root_owned_declaration("let up = upstream_state { source = '../other' }\n");
+    parsed
+        .attribute_params
+        .push(crate::parser::AttributeParameter {
+            name: "resource_id".to_string(),
+            type_expr: Some(TypeExpr::String),
+            value: Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
+        });
+
+    let result = validate_no_upstream_states_in_module(&parsed);
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn upstream_state_without_module_markers_ok() {
+    let parsed = parse_root_owned_declaration("let up = upstream_state { source = '../other' }\n");
+
+    let result = validate_no_upstream_states_in_module(&parsed);
+
+    assert!(result.is_ok());
+}
+
+#[test]
+fn module_without_upstream_state_ok() {
+    let mut parsed = empty_parsed();
+    parsed.arguments.push(argument_param("name"));
+
+    let result = validate_no_upstream_states_in_module(&parsed);
+
+    assert!(result.is_ok());
+}
+
+#[test]
+fn exports_in_module_with_arguments_errors() {
+    let mut parsed = parse_root_owned_declaration("exports {\n  module_value = 'module'\n}\n");
+    parsed.arguments.push(argument_param("name"));
+
+    let result = validate_no_exports_in_module(&parsed);
+
+    assert_eq!(
+        result.unwrap_err(),
+        "exports blocks are not allowed inside modules. Define exports at the root configuration level."
+    );
+}
+
+#[test]
+fn exports_in_module_with_attributes_errors() {
+    let mut parsed = parse_root_owned_declaration("exports {\n  module_value = 'module'\n}\n");
+    parsed
+        .attribute_params
+        .push(crate::parser::AttributeParameter {
+            name: "resource_id".to_string(),
+            type_expr: Some(TypeExpr::String),
+            value: Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
+        });
+
+    let result = validate_no_exports_in_module(&parsed);
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn exports_without_module_markers_ok() {
+    let parsed = parse_root_owned_declaration("exports {\n  root_value = 'root'\n}\n");
+
+    let result = validate_no_exports_in_module(&parsed);
+
+    assert!(result.is_ok());
+}
+
+#[test]
+fn module_without_exports_ok() {
+    let mut parsed = empty_parsed();
+    parsed.arguments.push(argument_param("name"));
+
+    let result = validate_no_exports_in_module(&parsed);
+
+    assert!(result.is_ok());
+}
+
 // --- validate_no_arguments_in_root tests ---
 
 fn argument_param(name: &str) -> crate::parser::ArgumentParameter {

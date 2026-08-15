@@ -1336,6 +1336,79 @@ pub(crate) fn validate_no_provider_in_modules(module_walk: &ModuleWalk) -> Vec<A
     errors
 }
 
+/// Reject state blocks in every recursively loaded module and preserve each
+/// module's import path in the resulting user-facing diagnostic. The module
+/// directory unit deliberately includes imported-but-uncalled nested modules,
+/// matching the provider validation policy. The resolver retains its own
+/// expansion-phase backstop for callers that bypass this validation walk.
+pub(crate) fn validate_no_state_blocks_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
+    let mut errors = Vec::new();
+    for module in module_walk.iter() {
+        if let Err(message) =
+            validation::validate_no_state_blocks_in_module(&module.loaded().parsed)
+        {
+            errors.push(AppError::Validation(format!(
+                "{}: {message}",
+                module.diagnostic_path().display()
+            )));
+        }
+    }
+    errors
+}
+
+/// Reject backend blocks in every recursively loaded module and preserve each
+/// module's import path in the resulting user-facing diagnostic. The resolver
+/// retains its own expansion-phase backstop for callers that bypass this
+/// validation walk.
+pub(crate) fn validate_no_backend_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
+    let mut errors = Vec::new();
+    for module in module_walk.iter() {
+        if let Err(message) = validation::validate_no_backend_in_module(&module.loaded().parsed) {
+            errors.push(AppError::Validation(format!(
+                "{}: {message}",
+                module.diagnostic_path().display()
+            )));
+        }
+    }
+    errors
+}
+
+/// Reject upstream state declarations in every recursively loaded module and
+/// preserve each module's import path in the resulting user-facing diagnostic.
+/// The resolver retains its own expansion-phase backstop for callers that
+/// bypass this validation walk.
+pub(crate) fn validate_no_upstream_states_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
+    let mut errors = Vec::new();
+    for module in module_walk.iter() {
+        if let Err(message) =
+            validation::validate_no_upstream_states_in_module(&module.loaded().parsed)
+        {
+            errors.push(AppError::Validation(format!(
+                "{}: {message}",
+                module.diagnostic_path().display()
+            )));
+        }
+    }
+    errors
+}
+
+/// Reject exports blocks in every recursively loaded module and preserve each
+/// module's import path in the resulting user-facing diagnostic. The resolver
+/// retains its own expansion-phase backstop for callers that bypass this
+/// validation walk.
+pub(crate) fn validate_no_exports_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
+    let mut errors = Vec::new();
+    for module in module_walk.iter() {
+        if let Err(message) = validation::validate_no_exports_in_module(&module.loaded().parsed) {
+            errors.push(AppError::Validation(format!(
+                "{}: {message}",
+                module.diagnostic_path().display()
+            )));
+        }
+    }
+    errors
+}
+
 fn pre_expansion_module_call_attributes(
     module_parsed: &carina_core::parser::ParsedFile,
     module_path: &Path,

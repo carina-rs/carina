@@ -1421,6 +1421,67 @@ pub fn validate_no_provider_in_module<E>(parsed: &crate::parser::File<E>) -> Res
     Ok(())
 }
 
+/// Check that a module file does not contain state blocks.
+///
+/// State changes should only be defined at the root configuration level, not
+/// inside modules (files with `arguments` or `attributes` blocks).
+pub fn validate_no_state_blocks_in_module<E>(
+    parsed: &crate::parser::File<E>,
+) -> Result<(), String> {
+    let is_module = !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty();
+    if is_module && !parsed.state_blocks.is_empty() {
+        return Err(
+            "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Check that a module file does not contain a backend block.
+///
+/// Backend configuration should only be defined at the root configuration
+/// level, not inside modules (files with `arguments` or `attributes` blocks).
+pub fn validate_no_backend_in_module<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
+    let is_module = !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty();
+    if is_module && parsed.backend.is_some() {
+        return Err(
+            "backend blocks are not allowed inside modules. Define the backend at the root configuration level.".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Check that a module file does not contain upstream state declarations.
+///
+/// Upstream state dependencies should only be defined at the root
+/// configuration level, not inside modules (files with `arguments` or
+/// `attributes` blocks).
+pub fn validate_no_upstream_states_in_module<E>(
+    parsed: &crate::parser::File<E>,
+) -> Result<(), String> {
+    let is_module = !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty();
+    if is_module && !parsed.upstream_states.is_empty() {
+        return Err(
+            "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Check that a module file does not contain an exports block.
+///
+/// State exports should only be defined at the root configuration level, not
+/// inside modules (files with `arguments` or `attributes` blocks).
+pub fn validate_no_exports_in_module<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
+    let is_module = !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty();
+    if is_module && !parsed.export_params.is_empty() {
+        return Err(
+            "exports blocks are not allowed inside modules. Define exports at the root configuration level.".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Returns `true` if `value` contains any deferred sub-value that the
 /// WASM provider boundary would reject (ResourceRef, BindingRef,
 /// Interpolation, FunctionCall, Unknown). Used by

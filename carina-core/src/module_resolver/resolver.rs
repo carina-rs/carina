@@ -97,17 +97,33 @@ impl<'cfg> ModuleResolver<'cfg> {
             return Err(ModuleError::NotFound(path.to_string()));
         }
 
-        // Expansion-phase backstop for provider blocks inside modules. The
-        // CLI's `validate_no_provider_in_modules` walks are the user-facing
-        // gates: they collect module-path-prefixed diagnostics and stop before
-        // expansion, so validate/plan/apply and lint cannot emit both forms.
-        // The production paths that bypass those walks but still expand are
-        // destroy, state refresh, and apply's backend-bootstrap re-resolve
+        // Expansion-phase backstops for root-owned blocks inside modules. The
+        // CLI's validation walks are the user-facing gates: they collect
+        // module-path-prefixed diagnostics and stop before expansion, so
+        // validate/plan/apply and lint cannot emit both forms. The production
+        // paths that bypass those walks but still expand are destroy, state
+        // refresh, and apply's backend-bootstrap re-resolve
         // (`skip_resource_validation = true`). `fixture_plan` also depends on
-        // this backstop as test support.
+        // these backstops as test support.
         if !parsed.providers.is_empty() {
             self.resolving.remove(&canonical);
             return Err(ModuleError::ProviderInModule);
+        }
+        if !parsed.state_blocks.is_empty() {
+            self.resolving.remove(&canonical);
+            return Err(ModuleError::StateBlockInModule);
+        }
+        if parsed.backend.is_some() {
+            self.resolving.remove(&canonical);
+            return Err(ModuleError::BackendInModule);
+        }
+        if !parsed.upstream_states.is_empty() {
+            self.resolving.remove(&canonical);
+            return Err(ModuleError::UpstreamStateInModule);
+        }
+        if !parsed.export_params.is_empty() {
+            self.resolving.remove(&canonical);
+            return Err(ModuleError::ExportsInModule);
         }
 
         // Recursively resolve nested module imports within this module.

@@ -46,6 +46,17 @@ pub(crate) enum SeedKind<'a> {
     Structural,
 }
 
+/// Source span of a top-level declaration keyword.
+///
+/// Lines and columns are 1-indexed, matching pest's source positions and the
+/// parser's other source-span types. `end_column` is exclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopLevelBlockSourceSpan {
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_column: usize,
+}
+
 impl<'a> BindingSeed<'a> {
     pub(crate) fn value(name: &'a str, value: &'a Value) -> Self {
         Self {
@@ -88,6 +99,119 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
     let parsed = parse_with_seeded_bindings(input, config, &[])?;
     super::resolve::reject_cyclic_let_bindings(&parsed)?;
     Ok(parsed)
+}
+
+/// Return keyword spans for state blocks parsed as top-level statements.
+///
+/// This uses the main DSL grammar rather than a textual keyword scan, so a
+/// schema attribute written as a nested block named `moved`, `removed`, or
+/// `import` is not included.
+pub fn top_level_state_block_spans(
+    input: &str,
+) -> Result<Vec<TopLevelBlockSourceSpan>, ParseError> {
+    top_level_block_spans(input, |statement| match statement.as_rule() {
+        Rule::moved_block => Some("moved"),
+        Rule::removed_block => Some("removed"),
+        Rule::import_state_block => Some("import"),
+        _ => None,
+    })
+}
+
+/// Return keyword spans for backend blocks parsed as top-level statements.
+///
+/// A schema attribute may use `backend` as a nested block name. Parsing with
+/// the main DSL grammar keeps those nested blocks out of the result.
+pub fn top_level_backend_block_spans(
+    input: &str,
+) -> Result<Vec<TopLevelBlockSourceSpan>, ParseError> {
+    top_level_block_spans(input, |statement| match statement.as_rule() {
+        Rule::backend_block => Some("backend"),
+        _ => None,
+    })
+}
+
+/// Return keyword spans for exports blocks parsed as top-level statements.
+///
+/// A schema attribute may use `exports` as a nested block name. Parsing with
+/// the main DSL grammar keeps those nested blocks out of the result.
+pub fn top_level_exports_block_spans(
+    input: &str,
+) -> Result<Vec<TopLevelBlockSourceSpan>, ParseError> {
+    top_level_block_spans(input, |statement| match statement.as_rule() {
+        Rule::exports_block => Some("exports"),
+        _ => None,
+    })
+}
+
+/// Return keyword spans for top-level `let` declarations whose right-hand
+/// side is parsed as an `upstream_state` expression.
+///
+/// A resource schema may use `upstream_state` as a nested block name. Matching
+/// the grammar rule beneath a top-level `let_binding` excludes those blocks.
+pub fn top_level_upstream_state_spans(
+    input: &str,
+) -> Result<Vec<TopLevelBlockSourceSpan>, ParseError> {
+    top_level_block_spans(input, |statement| {
+        if statement.as_rule() != Rule::let_binding {
+            return None;
+        }
+        let binding = statement.clone().into_inner().next()?;
+        if binding.as_str() == "_" {
+            return None;
+        }
+        pair_contains_rule(statement, Rule::upstream_state_expr).then_some("let")
+    })
+}
+
+fn top_level_block_spans(
+    input: &str,
+    keyword_for_statement: fn(&pest::iterators::Pair<Rule>) -> Option<&'static str>,
+) -> Result<Vec<TopLevelBlockSourceSpan>, ParseError> {
+    let preprocess_result =
+        crate::heredoc::preprocess_heredocs(input).map_err(|e| ParseError::InvalidExpression {
+            line: 0,
+            message: e.to_string(),
+        })?;
+    let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)
+        .map_err(|e| map_pest_error_lines(e, &preprocess_result.line_map))?;
+    let mut spans = Vec::new();
+
+    for pair in pairs {
+        if pair.as_rule() != Rule::file {
+            continue;
+        }
+        for statement in pair
+            .into_inner()
+            .filter(|pair| pair.as_rule() == Rule::statement)
+        {
+            let block = statement
+                .into_inner()
+                .next()
+                .ok_or_else(|| ParseError::InternalError {
+                    expected: "top-level statement body".to_string(),
+                    context: "top-level block source span collection".to_string(),
+                })?;
+            let Some(keyword) = keyword_for_statement(&block) else {
+                continue;
+            };
+            let (preprocessed_line, start_column) = block.as_span().start_pos().line_col();
+            spans.push(TopLevelBlockSourceSpan {
+                start_line: original_line(preprocessed_line, &preprocess_result.line_map),
+                start_column,
+                end_column: start_column + keyword.len(),
+            });
+        }
+    }
+
+    Ok(spans)
+}
+
+fn pair_contains_rule(pair: &pest::iterators::Pair<Rule>, expected: Rule) -> bool {
+    pair.as_rule() == expected
+        || pair
+            .clone()
+            .into_inner()
+            .any(|inner| pair_contains_rule(&inner, expected))
 }
 
 /// Parse a .crn file with `seeds` pre-registered as lexical bindings.

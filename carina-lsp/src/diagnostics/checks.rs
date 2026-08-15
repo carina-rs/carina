@@ -257,6 +257,181 @@ impl DiagnosticEngine {
         diagnostics
     }
 
+    /// Check that state blocks are not defined inside modules.
+    ///
+    /// The marker that identifies the directory as a module can live in a
+    /// sibling `.crn` file, so the merged directory parse takes precedence
+    /// when available. Diagnostics remain anchored to state block declarations
+    /// in the current buffer.
+    pub(super) fn check_state_blocks_in_module(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+        merged: Option<&ParsedFile>,
+    ) -> Vec<Diagnostic> {
+        let validation_input = merged.unwrap_or(parsed);
+        let Err(message) =
+            carina_core::validation::validate_no_state_blocks_in_module(validation_input)
+        else {
+            return Vec::new();
+        };
+        if parsed.state_blocks.is_empty() {
+            return Vec::new();
+        }
+
+        let text = doc.text();
+        let Ok(spans) = carina_core::parser::top_level_state_block_spans(&text) else {
+            return Vec::new();
+        };
+        // Only anchor spans that correspond one-to-one with the state blocks
+        // in this buffer's parsed AST. A future grammar/AST mismatch must not
+        // fall back to guessing from keyword-shaped text.
+        if spans.len() != parsed.state_blocks.len() {
+            return Vec::new();
+        }
+
+        spans
+            .into_iter()
+            .map(|span| {
+                carina_diagnostic(
+                    span.start_line.saturating_sub(1) as u32,
+                    span.start_column.saturating_sub(1) as u32,
+                    span.end_column.saturating_sub(1) as u32,
+                    DiagnosticSeverity::ERROR,
+                    message.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Check that a backend block is not defined inside a module.
+    ///
+    /// Module classification uses the merged directory parse, while the
+    /// grammar-derived span keeps the diagnostic anchored to a top-level
+    /// backend declaration in the current buffer.
+    pub(super) fn check_backend_in_module(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+        merged: Option<&ParsedFile>,
+    ) -> Vec<Diagnostic> {
+        let validation_input = merged.unwrap_or(parsed);
+        let Err(message) = carina_core::validation::validate_no_backend_in_module(validation_input)
+        else {
+            return Vec::new();
+        };
+        if parsed.backend.is_none() {
+            return Vec::new();
+        }
+
+        let text = doc.text();
+        let Ok(spans) = carina_core::parser::top_level_backend_block_spans(&text) else {
+            return Vec::new();
+        };
+        // `ParsedFile` carries at most one backend. Do not guess an anchor if
+        // the grammar spans and the parsed AST stop corresponding one-to-one.
+        if spans.len() != 1 {
+            return Vec::new();
+        }
+
+        spans
+            .into_iter()
+            .map(|span| {
+                carina_diagnostic(
+                    span.start_line.saturating_sub(1) as u32,
+                    span.start_column.saturating_sub(1) as u32,
+                    span.end_column.saturating_sub(1) as u32,
+                    DiagnosticSeverity::ERROR,
+                    message.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Check that upstream state declarations are not defined inside modules.
+    ///
+    /// Module classification uses the merged directory parse. The current
+    /// buffer's declaration anchors come from top-level `let_binding` grammar
+    /// nodes that contain an `upstream_state_expr`.
+    pub(super) fn check_upstream_states_in_module(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+        merged: Option<&ParsedFile>,
+    ) -> Vec<Diagnostic> {
+        let validation_input = merged.unwrap_or(parsed);
+        let Err(message) =
+            carina_core::validation::validate_no_upstream_states_in_module(validation_input)
+        else {
+            return Vec::new();
+        };
+        if parsed.upstream_states.is_empty() {
+            return Vec::new();
+        }
+
+        let text = doc.text();
+        let Ok(spans) = carina_core::parser::top_level_upstream_state_spans(&text) else {
+            return Vec::new();
+        };
+        if spans.len() != parsed.upstream_states.len() {
+            return Vec::new();
+        }
+
+        spans
+            .into_iter()
+            .map(|span| {
+                carina_diagnostic(
+                    span.start_line.saturating_sub(1) as u32,
+                    span.start_column.saturating_sub(1) as u32,
+                    span.end_column.saturating_sub(1) as u32,
+                    DiagnosticSeverity::ERROR,
+                    message.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Check that exports blocks are not defined inside modules.
+    ///
+    /// Module classification uses the merged directory parse, while
+    /// grammar-derived spans keep diagnostics on top-level exports blocks in
+    /// the current buffer and exclude same-named nested schema blocks.
+    pub(super) fn check_exports_in_module(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+        merged: Option<&ParsedFile>,
+    ) -> Vec<Diagnostic> {
+        let validation_input = merged.unwrap_or(parsed);
+        let Err(message) = carina_core::validation::validate_no_exports_in_module(validation_input)
+        else {
+            return Vec::new();
+        };
+        if parsed.export_params.is_empty() {
+            return Vec::new();
+        }
+
+        let text = doc.text();
+        let Ok(spans) = carina_core::parser::top_level_exports_block_spans(&text) else {
+            return Vec::new();
+        };
+        // No span-count guard belongs here: `export_params` counts parameters,
+        // while `spans` counts top-level exports blocks.
+
+        spans
+            .into_iter()
+            .map(|span| {
+                carina_diagnostic(
+                    span.start_line.saturating_sub(1) as u32,
+                    span.start_column.saturating_sub(1) as u32,
+                    span.end_column.saturating_sub(1) as u32,
+                    DiagnosticSeverity::ERROR,
+                    message.clone(),
+                )
+            })
+            .collect()
+    }
+
     /// Check provider block attributes.
     ///
     /// Runs host-side type-level validation using

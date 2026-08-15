@@ -928,6 +928,205 @@ fn provider_in_root_shaped_directory_no_error() {
 }
 
 #[test]
+fn moved_block_in_module_emits_error() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"arguments {
+    name: String = "test"
+}
+
+moved {
+    from = mock.test.Resource 'old'
+    to = mock.test.Resource 'new'
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let state_block_diag = diagnostics.iter().find(|diagnostic| {
+        diagnostic
+            .message
+            .contains("state blocks (moved, removed, and import) are not allowed inside modules")
+    });
+    assert!(
+        state_block_diag.is_some(),
+        "Should error about a moved block in a module. Got diagnostics: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+    let diag = state_block_diag.unwrap();
+    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diag.range.start.line, 4);
+    assert_eq!(diag.range.start.character, 0);
+}
+
+#[test]
+fn state_blocks_in_module_with_sibling_arguments_emit_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    std::fs::write(
+        base.join("arguments.crn"),
+        r#"arguments {
+    name: String = "test"
+}
+"#,
+    )
+    .unwrap();
+    let state_blocks = r#"moved {
+    from = mock.test.Resource 'old'
+    to = mock.test.Resource 'new'
+}
+
+removed {
+    from = mock.test.Resource 'legacy'
+}
+
+import {
+    to = mock.test.Resource 'existing'
+    id = 'resource-123'
+}
+"#;
+    std::fs::write(base.join("state.crn"), state_blocks).unwrap();
+
+    let engine = test_engine();
+    let doc = create_document(state_blocks);
+    let diagnostics = engine.analyze_with_filename(&doc, Some("state.crn"), Some(&base));
+    let state_block_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains(
+                "state blocks (moved, removed, and import) are not allowed inside modules",
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        state_block_diagnostics.len(),
+        3,
+        "all three state block variants should be diagnosed. Got: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        state_block_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)),
+        "state block diagnostics must be errors: {state_block_diagnostics:?}",
+    );
+    assert_eq!(
+        state_block_diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.range.start.line)
+            .collect::<Vec<_>>(),
+        vec![0, 5, 9],
+    );
+}
+
+#[test]
+fn arguments_buffer_with_sibling_state_block_has_no_state_block_diagnostic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    let arguments = r#"arguments {
+    name: String = "test"
+}
+"#;
+    std::fs::write(base.join("arguments.crn"), arguments).unwrap();
+    std::fs::write(
+        base.join("state.crn"),
+        "removed {\n    from = mock.test.Resource 'legacy'\n}\n",
+    )
+    .unwrap();
+
+    let engine = test_engine();
+    let doc = create_document(arguments);
+    let diagnostics = engine.analyze_with_filename(&doc, Some("arguments.crn"), Some(&base));
+    let state_block_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains(
+                "state blocks (moved, removed, and import) are not allowed inside modules",
+            )
+        })
+        .collect();
+
+    assert!(
+        state_block_diagnostics.is_empty(),
+        "a state block diagnostic must only anchor in the buffer that declares it. Got: {state_block_diagnostics:?}",
+    );
+}
+
+#[test]
+fn state_blocks_in_root_shaped_directory_no_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    let state_blocks = r#"moved {
+    from = mock.test.Resource 'old'
+    to = mock.test.Resource 'new'
+}
+
+removed {
+    from = mock.test.Resource 'legacy'
+}
+
+import {
+    to = mock.test.Resource 'existing'
+    id = 'resource-123'
+}
+"#;
+    std::fs::write(base.join("state.crn"), state_blocks).unwrap();
+    std::fs::write(base.join("values.crn"), "let environment = \"test\"\n").unwrap();
+
+    let engine = test_engine();
+    let doc = create_document(state_blocks);
+    let diagnostics = engine.analyze_with_filename(&doc, Some("state.crn"), Some(&base));
+
+    assert!(
+        diagnostics.iter().all(|diagnostic| !diagnostic
+            .message
+            .contains("state blocks (moved, removed, and import) are not allowed inside modules")),
+        "Should not reject root state blocks when no module marker exists. Got: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn discarded_upstream_state_does_not_suppress_real_module_diagnostic() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"let _ = upstream_state { source = './a' }
+arguments {
+    n: String = "x"
+}
+let up = upstream_state { source = './b' }
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let upstream_state_lines: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("upstream_state declarations are not allowed inside modules")
+        })
+        .map(|diagnostic| diagnostic.range.start.line)
+        .collect();
+
+    assert_eq!(
+        upstream_state_lines,
+        vec![4],
+        "the discarded declaration must not hide or receive the real module violation: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn arguments_with_backend_emits_error() {
     // Issue #2198. `arguments` is a module-input declaration. A `backend`
     // block is root-only, so the combination is unambiguously a misplaced
