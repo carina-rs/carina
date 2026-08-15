@@ -1,6 +1,38 @@
 use super::*;
 
 #[test]
+#[should_panic(expected = "schema input mode cannot be both required and provider-populated")]
+fn struct_field_conflicting_input_mode_required_then_read_only_is_rejected() {
+    let _ = StructField::new("arn", AttributeType::string())
+        .required()
+        .read_only();
+}
+
+#[test]
+#[should_panic(expected = "schema input mode cannot be both required and provider-populated")]
+fn struct_field_conflicting_input_mode_read_only_then_required_is_rejected() {
+    let _ = StructField::new("arn", AttributeType::string())
+        .read_only()
+        .required();
+}
+
+#[test]
+#[should_panic(expected = "schema input mode cannot be both required and provider-populated")]
+fn attribute_schema_conflicting_input_mode_required_then_read_only_is_rejected() {
+    let _ = AttributeSchema::new("arn", AttributeType::string())
+        .required()
+        .read_only();
+}
+
+#[test]
+#[should_panic(expected = "schema input mode cannot be both required and provider-populated")]
+fn attribute_schema_conflicting_input_mode_read_only_then_required_is_rejected() {
+    let _ = AttributeSchema::new("arn", AttributeType::string())
+        .read_only()
+        .required();
+}
+
+#[test]
 fn attribute_schema_write_only_default_false() {
     let attr = AttributeSchema::new("ipv4_netmask_length", AttributeType::int());
     assert!(!attr.write_only);
@@ -3076,6 +3108,78 @@ fn validate_rejects_read_only_attribute_assignment() {
 }
 
 #[test]
+fn validate_allows_required_attribute_to_be_omitted_when_it_has_a_default() {
+    let schema = ResourceSchema::new("test.Resource").attribute(
+        AttributeSchema::new("region", AttributeType::string())
+            .required()
+            .with_default(Value::Concrete(ConcreteValue::String(
+                "us-east-1".to_string(),
+            ))),
+    );
+
+    assert!(
+        schema.validate(&HashMap::new()).is_ok(),
+        "a default must satisfy a required top-level attribute"
+    );
+}
+
+#[test]
+fn attribute_schema_removability_preserves_input_mode_and_create_only_matrix() {
+    let cases = [
+        (
+            "optional mutable",
+            AttributeSchema::new("value", AttributeType::string()),
+            true,
+        ),
+        (
+            "required mutable",
+            AttributeSchema::new("value", AttributeType::string()).required(),
+            false,
+        ),
+        (
+            "provider-populated mutable",
+            AttributeSchema::new("value", AttributeType::string()).read_only(),
+            false,
+        ),
+        (
+            "optional create-only",
+            AttributeSchema::new("value", AttributeType::string()).create_only(),
+            false,
+        ),
+        (
+            "required create-only",
+            AttributeSchema::new("value", AttributeType::string())
+                .required()
+                .create_only(),
+            false,
+        ),
+        (
+            "provider-populated create-only",
+            AttributeSchema::new("value", AttributeType::string())
+                .read_only()
+                .create_only(),
+            false,
+        ),
+    ];
+
+    for (name, schema, expected_auto) in cases {
+        assert_eq!(
+            schema.is_removable(),
+            expected_auto,
+            "auto-detected removability changed for {name}"
+        );
+        assert!(
+            schema.clone().removable().is_removable(),
+            "explicit removable override must win for {name}"
+        );
+        assert!(
+            !schema.non_removable().is_removable(),
+            "explicit non-removable override must win for {name}"
+        );
+    }
+}
+
+#[test]
 fn validate_read_only_block_name_error_uses_user_written_alias() {
     let schema = ResourceSchema::new("test.Resource").attribute(
         AttributeSchema::new(
@@ -3137,12 +3241,12 @@ fn validate_read_only_is_keyed_per_resource_type_not_by_attribute_name() {
 }
 
 #[test]
-fn validate_read_only_top_level_name_does_not_reject_writable_nested_struct_field() {
+fn validate_read_only_scope_distinguishes_top_level_and_nested_struct_fields() {
     let origin = AttributeType::struct_(
         "Origin".to_string(),
         vec![
             StructField::new("id", AttributeType::string()).required(),
-            StructField::new("domain_name", AttributeType::string()).required(),
+            StructField::new("domain_name", AttributeType::string()).read_only(),
         ],
     );
     let schema = ResourceSchema::new("cloudfront.Distribution")
@@ -3157,22 +3261,60 @@ fn validate_read_only_top_level_name_does_not_reject_writable_nested_struct_fiel
         "id".to_string(),
         Value::Concrete(ConcreteValue::String("primary-origin".to_string())),
     );
-    origin_value.insert(
-        "domain_name".to_string(),
-        Value::Concrete(ConcreteValue::String("origin.example.com".to_string())),
-    );
     let mut attrs = HashMap::from([(
         "origin".to_string(),
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::Map(origin_value),
+            ConcreteValue::Map(origin_value.clone()),
         )])),
     )]);
 
     assert!(
         schema.validate(&attrs).is_ok(),
-        "nested origin.id and origin.domain_name must remain writable"
+        "nested origin.id must remain writable when only the top-level id is read-only"
     );
 
+    origin_value.insert(
+        "domain_name".to_string(),
+        Value::Concrete(ConcreteValue::String("origin.example.com".to_string())),
+    );
+    attrs.insert(
+        "origin".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(origin_value),
+        )])),
+    );
+    let errors = schema
+        .validate(&attrs)
+        .expect_err("nested read-only origin.domain_name must be rejected");
+    assert!(
+        matches!(
+            &errors[..],
+            [TypeError::ListItemError { index: 0, inner }]
+                if matches!(
+                    inner.as_ref(),
+                    TypeError::StructFieldError { field, inner }
+                        if field == "domain_name"
+                            && matches!(
+                                inner.as_ref(),
+                                TypeError::ReadOnlyAttribute { name }
+                                    if name == "domain_name"
+                            )
+                )
+        ),
+        "the nested read-only field must fail at its own scope: {errors:?}"
+    );
+
+    let mut writable_origin = IndexMap::new();
+    writable_origin.insert(
+        "id".to_string(),
+        Value::Concrete(ConcreteValue::String("primary-origin".to_string())),
+    );
+    attrs.insert(
+        "origin".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(writable_origin),
+        )])),
+    );
     attrs.insert(
         "id".to_string(),
         Value::Concrete(ConcreteValue::String("provider-id".to_string())),
@@ -5001,6 +5143,102 @@ mod schema_validate_attr_struct_tests {
             other => panic!("expected nested StructFieldError, got {other:?}"),
         }
     }
+
+    #[test]
+    fn validate_rejects_read_only_nested_field_before_type_checking() {
+        let config = struct_type(
+            "Config",
+            vec![StructField::new("provider_id", AttributeType::string()).read_only()],
+        );
+        let value = map_value(vec![(
+            "provider_id",
+            Value::Concrete(ConcreteValue::Int(42)),
+        )]);
+
+        let err = Schema::flat(config)
+            .validate(&value)
+            .expect_err("assigning a read-only nested field must fail validation");
+
+        assert!(matches!(
+            &err,
+            TypeError::StructFieldError { field, inner }
+                if field == "provider_id"
+                    && matches!(
+                        inner.as_ref(),
+                        TypeError::ReadOnlyAttribute { name } if name == "provider_id"
+                    )
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_read_only_field_two_struct_levels_deep() {
+        let destination = struct_type(
+            "Destination",
+            vec![StructField::new("table_arn", AttributeType::string()).read_only()],
+        );
+        let metadata = struct_type(
+            "Metadata",
+            vec![StructField::new("destination", destination)],
+        );
+        let value = map_value(vec![(
+            "destination",
+            map_value(vec![(
+                "table_arn",
+                Value::Concrete(ConcreteValue::String("provider-arn".to_string())),
+            )]),
+        )]);
+
+        let err = Schema::flat(metadata)
+            .validate(&value)
+            .expect_err("a read-only field two structs deep must fail validation");
+
+        assert!(matches!(
+            &err,
+            TypeError::StructFieldError { field, inner }
+                if field == "destination"
+                    && matches!(
+                        inner.as_ref(),
+                        TypeError::StructFieldError { field, inner }
+                            if field == "table_arn"
+                                && matches!(
+                                    inner.as_ref(),
+                                    TypeError::ReadOnlyAttribute { name }
+                                        if name == "table_arn"
+                                )
+                    )
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_read_only_field_inside_list_of_struct() {
+        let item = struct_type(
+            "Item",
+            vec![StructField::new("table_namespace", AttributeType::string()).read_only()],
+        );
+        let value = Value::Concrete(ConcreteValue::List(vec![map_value(vec![(
+            "table_namespace",
+            Value::Concrete(ConcreteValue::String("provider-owned".to_string())),
+        )])]));
+
+        let err = Schema::flat(AttributeType::list(item))
+            .validate(&value)
+            .expect_err("a read-only field inside List<Struct> must fail validation");
+
+        assert!(matches!(
+            &err,
+            TypeError::ListItemError { index: 0, inner }
+                if matches!(
+                    inner.as_ref(),
+                    TypeError::StructFieldError { field, inner }
+                        if field == "table_namespace"
+                            && matches!(
+                                inner.as_ref(),
+                                TypeError::ReadOnlyAttribute { name }
+                                    if name == "table_namespace"
+                            )
+                )
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -5118,6 +5356,241 @@ mod validate_collect_tests {
         let path = &errors[0].0;
         let steps: Vec<String> = path.steps().iter().map(|s| s.to_string()).collect();
         assert_eq!(steps, vec!["[1]".to_string(), "name".to_string()]);
+    }
+
+    #[test]
+    fn collect_reports_read_only_struct_field_at_written_path() {
+        let ty = struct_type(
+            "Config",
+            vec![StructField::new("provider_id", AttributeType::string()).read_only()],
+        );
+        let value = map_value(vec![(
+            "provider_id",
+            Value::Concrete(ConcreteValue::Int(42)),
+        )]);
+
+        let errors = Schema::flat(ty).validate_collect(&value);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected one writability error: {errors:?}"
+        );
+        assert_eq!(errors[0].0.to_string(), "provider_id");
+        assert!(matches!(
+            &errors[0].1,
+            TypeError::ReadOnlyAttribute { name } if name == "provider_id"
+        ));
+    }
+
+    #[test]
+    fn collect_reports_deep_read_only_field_with_full_path() {
+        let destination = struct_type(
+            "Destination",
+            vec![StructField::new("table_arn", AttributeType::string()).read_only()],
+        );
+        let metadata = struct_type(
+            "Metadata",
+            vec![StructField::new("destination", destination)],
+        );
+        let value = map_value(vec![(
+            "destination",
+            map_value(vec![(
+                "table_arn",
+                Value::Concrete(ConcreteValue::String("provider-arn".to_string())),
+            )]),
+        )]);
+
+        let errors = Schema::flat(metadata).validate_collect(&value);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected one writability error: {errors:?}"
+        );
+        assert_eq!(errors[0].0.to_string(), "destination.table_arn");
+        assert!(matches!(
+            &errors[0].1,
+            TypeError::ReadOnlyAttribute { name } if name == "table_arn"
+        ));
+    }
+
+    #[test]
+    fn collect_reports_read_only_field_inside_list_element() {
+        let item = struct_type(
+            "Item",
+            vec![StructField::new("table_namespace", AttributeType::string()).read_only()],
+        );
+        let value = Value::Concrete(ConcreteValue::List(vec![map_value(vec![(
+            "table_namespace",
+            Value::Concrete(ConcreteValue::String("provider-owned".to_string())),
+        )])]));
+
+        let errors = Schema::flat(AttributeType::list(item)).validate_collect(&value);
+
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected one writability error: {errors:?}"
+        );
+        assert_eq!(errors[0].0.to_string(), "[0].table_namespace");
+        assert!(matches!(
+            &errors[0].1,
+            TypeError::ReadOnlyAttribute { name } if name == "table_namespace"
+        ));
+    }
+
+    #[test]
+    fn read_only_field_inside_map_struct_is_rejected_at_the_map_field_path() {
+        let entry = struct_type(
+            "Entry",
+            vec![StructField::new("arn", AttributeType::string()).read_only()],
+        );
+        let root = struct_type(
+            "Config",
+            vec![StructField::new("entries", AttributeType::map(entry))],
+        );
+        let value = map_value(vec![(
+            "entries",
+            map_value(vec![(
+                "primary",
+                map_value(vec![(
+                    "arn",
+                    Value::Concrete(ConcreteValue::String("provider-arn".to_string())),
+                )]),
+            )]),
+        )]);
+        let schema = Schema::flat(root);
+
+        let error = schema
+            .validate(&value)
+            .expect_err("Map<String, Struct> must reject a nested read-only field");
+        assert!(matches!(
+            &error,
+            TypeError::StructFieldError { field, inner }
+                if field == "entries"
+                    && matches!(
+                        inner.as_ref(),
+                        TypeError::MapValueError { key, inner }
+                            if key == "primary"
+                                && matches!(
+                                    inner.as_ref(),
+                                    TypeError::StructFieldError { field, inner }
+                                        if field == "arn"
+                                            && matches!(
+                                                inner.as_ref(),
+                                                TypeError::ReadOnlyAttribute { name }
+                                                    if name == "arn"
+                                            )
+                                )
+                    )
+        ));
+
+        let errors = schema.validate_collect(&value);
+        assert_eq!(errors.len(), 1, "expected one map writability error");
+        assert_eq!(
+            errors[0].0.to_string(),
+            "entries",
+            "the current collector anchors Map value failures at the map field"
+        );
+        assert!(matches!(
+            &errors[0].1,
+            TypeError::MapValueError { key, inner }
+                if key == "primary"
+                    && matches!(
+                        inner.as_ref(),
+                        TypeError::StructFieldError { field, inner }
+                            if field == "arn"
+                                && matches!(
+                                    inner.as_ref(),
+                                    TypeError::ReadOnlyAttribute { name } if name == "arn"
+                                )
+                    )
+        ));
+    }
+
+    #[test]
+    fn read_only_field_behind_ref_typed_struct_field_is_rejected() {
+        let root = struct_type(
+            "Config",
+            vec![StructField::new(
+                "destination",
+                AttributeType::ref_("Destination"),
+            )],
+        );
+        let destination = struct_type(
+            "Destination",
+            vec![StructField::new("arn", AttributeType::string()).read_only()],
+        );
+        let schema = Schema {
+            root,
+            defs: std::collections::BTreeMap::from([("Destination".to_string(), destination)]),
+        };
+        let value = map_value(vec![(
+            "destination",
+            map_value(vec![(
+                "arn",
+                Value::Concrete(ConcreteValue::String("provider-arn".to_string())),
+            )]),
+        )]);
+
+        assert!(matches!(
+            schema.validate(&value),
+            Err(TypeError::StructFieldError { field, inner })
+                if field == "destination"
+                    && matches!(
+                        inner.as_ref(),
+                        TypeError::StructFieldError { field, inner }
+                            if field == "arn"
+                                && matches!(
+                                    inner.as_ref(),
+                                    TypeError::ReadOnlyAttribute { name } if name == "arn"
+                                )
+                    )
+        ));
+
+        let errors = schema.validate_collect(&value);
+        assert_eq!(errors.len(), 1, "expected one Ref writability error");
+        assert_eq!(errors[0].0.to_string(), "destination.arn");
+        assert!(matches!(
+            &errors[0].1,
+            TypeError::ReadOnlyAttribute { name } if name == "arn"
+        ));
+    }
+
+    #[test]
+    fn read_only_nested_block_name_reports_the_alias_the_user_wrote() {
+        let root = struct_type(
+            "Config",
+            vec![
+                StructField::new("generated_rules", AttributeType::string())
+                    .with_block_name("generated_rule")
+                    .read_only(),
+            ],
+        );
+        let value = map_value(vec![(
+            "generated_rule",
+            Value::Concrete(ConcreteValue::String("provider-owned".to_string())),
+        )]);
+        let schema = Schema::flat(root);
+
+        assert!(matches!(
+            schema.validate(&value),
+            Err(TypeError::StructFieldError { field, inner })
+                if field == "generated_rule"
+                    && matches!(
+                        inner.as_ref(),
+                        TypeError::ReadOnlyAttribute { name } if name == "generated_rule"
+                    )
+        ));
+
+        let errors = schema.validate_collect(&value);
+        assert_eq!(errors.len(), 1, "expected one aliased writability error");
+        assert_eq!(errors[0].0.to_string(), "generated_rule");
+        assert!(matches!(
+            &errors[0].1,
+            TypeError::ReadOnlyAttribute { name } if name == "generated_rule"
+        ));
     }
 
     #[test]

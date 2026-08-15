@@ -519,18 +519,25 @@ impl HoverProvider {
         let mut arguments: Vec<&carina_core::schema::AttributeSchema> = schema
             .attributes
             .values()
-            .filter(|a| !a.read_only)
+            .filter(|a| !a.is_read_only())
             .collect();
         arguments.sort_by_key(|a| &a.name);
 
-        let mut read_only_attrs: Vec<&carina_core::schema::AttributeSchema> =
-            schema.attributes.values().filter(|a| a.read_only).collect();
+        let mut read_only_attrs: Vec<&carina_core::schema::AttributeSchema> = schema
+            .attributes
+            .values()
+            .filter(|a| a.is_read_only())
+            .collect();
         read_only_attrs.sort_by_key(|a| &a.name);
 
         if !arguments.is_empty() {
             content.push_str("\n### Arguments\n\n");
             for attr in &arguments {
-                let required = if attr.required { " **(required)**" } else { "" };
+                let required = if attr.is_required() {
+                    " **(required)**"
+                } else {
+                    ""
+                };
                 let create_only = if attr.create_only {
                     " _(create-only)_"
                 } else {
@@ -655,7 +662,7 @@ impl HoverProvider {
         let description = convert_markdown_links_to_plain_text(
             attr.description.as_deref().unwrap_or("No description"),
         );
-        let required = if attr.required {
+        let required = if attr.is_required() {
             "Required"
         } else {
             "Optional"

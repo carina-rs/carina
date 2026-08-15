@@ -80,6 +80,11 @@ outer {
         "Should warn about type mismatch in nested struct field. Got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
+    assert_eq!(
+        mismatch.unwrap().severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING),
+        "ordinary nested validation failures must retain warning severity"
+    );
 }
 
 #[test]
@@ -108,6 +113,145 @@ outer {
         struct_diags.is_empty(),
         "Valid nested struct should have no field diagnostics. Got: {:?}",
         struct_diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn read_only_nested_struct_field_diagnostic_is_anchored_on_offending_line() {
+    let engine = test_engine_with_nested_structs();
+    let doc = create_document(
+        r#"let r = test.nested.resource {
+outer {
+    inner {
+        provider_leaf = "cannot-set-this"
+    }
+}
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let read_only = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message
+                == "Attribute 'provider_leaf' is populated by the provider and cannot be set"
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        read_only.len(),
+        1,
+        "expected one nested read-only diagnostic: {diagnostics:#?}"
+    );
+    assert_eq!(read_only[0].range.start.line, 3);
+    assert_eq!(read_only[0].range.start.character, 8);
+    assert_eq!(read_only[0].range.end.line, 3);
+    assert_eq!(read_only[0].range.end.character, 21);
+    assert_eq!(
+        read_only[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+        "nested read-only assignments must have the same severity as top-level ones"
+    );
+}
+
+#[test]
+fn read_only_shadowed_arn_diagnostics_land_on_top_level_and_nested_lines() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let config = AttributeType::struct_(
+        "Config".to_string(),
+        vec![StructField::new("arn", AttributeType::string()).read_only()],
+    );
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("arn", AttributeType::string()).read_only())
+        .attribute(AttributeSchema::new("config", config));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", schema);
+    let engine = custom_engine(schemas);
+    let doc = create_document(
+        r#"mock.test.resource {
+  arn = "top-level-provider-arn"
+  config = {
+    arn = "nested-provider-arn"
+  }
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let mut read_only = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message == "Attribute 'arn' is populated by the provider and cannot be set"
+        })
+        .collect::<Vec<_>>();
+    read_only.sort_by_key(|diagnostic| diagnostic.range.start.line);
+
+    assert_eq!(
+        read_only.len(),
+        2,
+        "top-level and nested arn assignments need independent diagnostics: {diagnostics:#?}"
+    );
+    assert_eq!(
+        read_only
+            .iter()
+            .map(|diagnostic| diagnostic.range.start.line)
+            .collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+    assert!(
+        read_only.iter().all(|diagnostic| diagnostic.severity
+            == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)),
+        "both writability diagnostics must be errors: {read_only:#?}"
+    );
+}
+
+#[test]
+fn read_only_field_inside_map_struct_is_anchored_at_the_map_field() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let entry = AttributeType::struct_(
+        "Entry".to_string(),
+        vec![StructField::new("arn", AttributeType::string()).read_only()],
+    );
+    let config = AttributeType::struct_(
+        "Config".to_string(),
+        vec![StructField::new("entries", AttributeType::map(entry))],
+    );
+    let schema =
+        ResourceSchema::new("test.resource").attribute(AttributeSchema::new("config", config));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", schema);
+    let engine = custom_engine(schemas);
+    let doc = create_document(
+        r#"mock.test.resource {
+  config = {
+    entries = {
+      primary = {
+        arn = "provider-arn"
+      }
+    }
+  }
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Attribute 'arn' is populated by the provider and cannot be set")
+        })
+        .unwrap_or_else(|| panic!("expected map writability diagnostic: {diagnostics:#?}"));
+
+    assert_eq!(
+        diagnostic.range.start.line, 2,
+        "Map collection currently anchors nested errors at the map field"
+    );
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+        "a coarser Map anchor must not downgrade a writability failure"
     );
 }
 

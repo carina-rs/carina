@@ -590,7 +590,7 @@ impl DiagnosticEngine {
                             // The shared resource-level validator below owns read-only
                             // assignments. Skip type and authoring guidance here so it
                             // emits the single writability diagnostic, matching core.
-                            if attr_schema.read_only {
+                            if attr_schema.is_read_only() {
                                 continue;
                             }
 

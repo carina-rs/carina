@@ -113,6 +113,7 @@ pub(super) fn test_provider_with_nested_structs() -> CompletionProvider {
         vec![
             StructField::new("leaf_field", AttributeType::string()),
             StructField::new("leaf_bool", AttributeType::bool()),
+            StructField::new("provider_leaf", AttributeType::bool()).read_only(),
         ],
     );
 

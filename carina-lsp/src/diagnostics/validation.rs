@@ -12,7 +12,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 use crate::document::Document;
 use crate::position;
 use carina_core::resource::Value;
-use carina_core::schema::{FieldPath, FieldPathStep, ResourceSchema};
+use carina_core::schema::{FieldPath, FieldPathStep, ResourceSchema, TypeError};
 
 use super::{DiagnosticEngine, carina_diagnostic};
 
@@ -45,7 +45,7 @@ impl DiagnosticEngine {
                     line,
                     col,
                     end_col,
-                    DiagnosticSeverity::WARNING,
+                    severity_for_validation_error(&err),
                     err.to_string(),
                 ));
             }
@@ -188,7 +188,7 @@ impl DiagnosticEngine {
         for (attr_name, attr_schema) in &schema.attributes {
             // Resource-level validation reports read-only assignments; do not
             // offer authoring-style hints for attributes the user cannot set.
-            if attr_schema.read_only {
+            if attr_schema.is_read_only() {
                 continue;
             }
 
@@ -299,5 +299,16 @@ impl DiagnosticEngine {
         }
 
         positions
+    }
+}
+
+fn severity_for_validation_error(error: &TypeError) -> DiagnosticSeverity {
+    match error {
+        TypeError::ReadOnlyAttribute { .. } => DiagnosticSeverity::ERROR,
+        TypeError::ListItemError { inner, .. }
+        | TypeError::MapKeyError { inner, .. }
+        | TypeError::MapValueError { inner, .. }
+        | TypeError::StructFieldError { inner, .. } => severity_for_validation_error(inner),
+        _ => DiagnosticSeverity::WARNING,
     }
 }

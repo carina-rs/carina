@@ -514,6 +514,9 @@ pub struct AttributeSchema {
     /// Whether this attribute contributes to anonymous resource identity hashing.
     #[serde(default)]
     pub identity: bool,
+    /// Whether this attribute is populated asynchronously after Create returns.
+    #[serde(default)]
+    pub deferred_populate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -750,6 +753,12 @@ pub struct StructField {
     /// Provider-side property name (e.g., "IpProtocol" for AWS Cloud Control)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_name: Option<String>,
+    /// Whether this nested field is provider-populated and cannot be assigned.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Whether this nested field is populated asynchronously after Create returns.
+    #[serde(default)]
+    pub deferred_populate: bool,
 }
 
 #[cfg(test)]
@@ -824,12 +833,38 @@ mod tests {
                 description: None,
                 block_name: None,
                 provider_name: None,
+                read_only: false,
+                deferred_populate: false,
             }],
         };
 
         let json = serde_json::to_string(&attr).unwrap();
         let back: AttributeType = serde_json::from_str(&json).unwrap();
         assert_eq!(json, serde_json::to_string(&back).unwrap());
+    }
+
+    #[test]
+    fn schema_transport_flags_default_for_legacy_payloads() {
+        let field: StructField = serde_json::from_str(
+            r#"{
+                "name":"provider_id",
+                "field_type":{"type":"String"},
+                "required":false
+            }"#,
+        )
+        .unwrap();
+        assert!(!field.read_only);
+        assert!(!field.deferred_populate);
+
+        let attr: AttributeSchema = serde_json::from_str(
+            r#"{
+                "name":"status",
+                "attr_type":{"type":"String"},
+                "required":false
+            }"#,
+        )
+        .unwrap();
+        assert!(!attr.deferred_populate);
     }
 
     #[test]
@@ -1162,6 +1197,8 @@ mod tests {
                         description: None,
                         block_name: None,
                         provider_name: None,
+                        read_only: false,
+                        deferred_populate: false,
                     }],
                 },
             )]),
@@ -1256,6 +1293,8 @@ mod tests {
                         description: None,
                         block_name: None,
                         provider_name: None,
+                        read_only: false,
+                        deferred_populate: false,
                     }],
                 },
                 string_attr(),

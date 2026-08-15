@@ -491,8 +491,24 @@ A struct type represents a nested object with typed fields.
   Vec<StructField> }` variant (carina#3349 made this unrepresentable from
   outside `carina-core`).
 - Each `StructField` (`carina-core/src/schema/mod.rs`) has `name`,
-  `field_type` (recursive `AttributeType`), `required`, `description`, plus
-  `provider_name`, `block_name`, and `deferred_populate`.
+  `field_type` (recursive `AttributeType`), `input_mode: InputMode`,
+  `description`, `provider_name`, `block_name`, and `deferred_populate`.
+  `InputMode` is the shared optional/required/provider-populated axis used by
+  both `StructField` and `AttributeSchema`; required user input and
+  provider-populated output are mutually exclusive, and conflicting builder
+  calls panic instead of silently choosing the last one. Assigning a
+  provider-populated nested field is rejected the same as a top-level
+  read-only attribute (carina#3772).
+- **Schema field transport**: `StructField` and `AttributeSchema` cross the
+  WASM boundary as JSON via the `schemas: func() -> string` WIT export, decoded
+  by `carina-plugin-host/src/wasm_convert.rs`. The `ResourceSchema`,
+  `OperationConfig`, `AttributeSchema`, and `StructField` conversions
+  destructure protocol records exhaustively, and `AttributeType` conversion
+  patterns name every variant field. Adding a protocol field must break
+  compilation until it is consciously carried across or explicitly bound and
+  documented as unavailable on the destination side. Never use a catch-all
+  `_` or `..` at this seam; a silently dropped field is invisible in production
+  and cost carina#3034 its effect (carina#3772).
 - **LSP integration**: when adding Struct validation, update
   `carina-lsp/src/diagnostics/validation.rs` to validate nested fields;
   completion should work recursively for struct fields.

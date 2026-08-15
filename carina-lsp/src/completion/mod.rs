@@ -759,8 +759,13 @@ impl CompletionProvider {
             if let Some(fields) = self.resolve_struct_fields_for_path(schema, attr_path) {
                 return fields
                     .iter()
+                    .filter(|field| !field.is_read_only())
                     .map(|field| {
-                        let required_marker = if field.required { " (required)" } else { "" };
+                        let required_marker = if field.is_required() {
+                            " (required)"
+                        } else {
+                            ""
+                        };
                         CompletionItem {
                             label: field.name.clone(),
                             kind: Some(CompletionItemKind::FIELD),
@@ -769,7 +774,7 @@ impl CompletionProvider {
                                 .as_ref()
                                 .map(|d| format!("{}{}", d, required_marker))
                                 .or_else(|| {
-                                    if field.required {
+                                    if field.is_required() {
                                         Some("(required)".to_string())
                                     } else {
                                         None
@@ -852,6 +857,9 @@ impl CompletionProvider {
             && let Some(fields) = self.resolve_struct_fields_for_path(schema, attr_path)
             && let Some(field) = fields.iter().find(|f| f.name == field_name)
         {
+            if field.is_read_only() {
+                return vec![];
+            }
             completions.extend(self.completions_for_type(&field.field_type, Some(resource_type)));
         }
         completions.extend(self.in_scope_binding_completions(
