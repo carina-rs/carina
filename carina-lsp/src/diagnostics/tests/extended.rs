@@ -1858,6 +1858,129 @@ fn resource_validation_failed_with_attribute_points_to_attribute_line() {
     );
 }
 
+fn read_only_attribute_engine(attribute: carina_core::schema::AttributeSchema) -> DiagnosticEngine {
+    let schema = carina_core::schema::ResourceSchema::new("test.resource").attribute(attribute);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", schema);
+    custom_engine(schemas)
+}
+
+fn assert_only_read_only_diagnostic<'a>(
+    diagnostics: &'a [tower_lsp::lsp_types::Diagnostic],
+    attribute: &str,
+) -> &'a tower_lsp::lsp_types::Diagnostic {
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "'{attribute}' must produce exactly one diagnostic, got: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        diagnostic.message,
+        format!("Attribute '{attribute}' is populated by the provider and cannot be set")
+    );
+    diagnostic
+}
+
+#[test]
+fn read_only_wrong_typed_value_reports_only_writability() {
+    use carina_core::schema::{AttributeSchema, AttributeType};
+
+    let engine = read_only_attribute_engine(
+        AttributeSchema::new("enabled", AttributeType::bool()).read_only(),
+    );
+    let doc = create_document("mock.test.resource {\n  enabled = 'not-a-bool'\n}\n");
+
+    let diagnostics = engine.analyze(&doc, None);
+    assert_only_read_only_diagnostic(&diagnostics, "enabled");
+}
+
+#[test]
+fn read_only_invalid_enum_reports_no_enum_quick_fix() {
+    use carina_core::schema::{AttributeSchema, AttributeType};
+
+    let mode = AttributeType::enum_(
+        carina_core::schema::enum_identity("Mode", Some("mock.test.resource")),
+        Some(vec!["fast".to_string(), "slow".to_string()]),
+        vec![],
+        None,
+        None,
+    );
+    let engine = read_only_attribute_engine(AttributeSchema::new("mode", mode).read_only());
+    let doc = create_document("mock.test.resource {\n  mode = 'bogus'\n}\n");
+
+    let diagnostics = engine.analyze(&doc, None);
+    let diagnostic = assert_only_read_only_diagnostic(&diagnostics, "mode");
+    assert!(
+        diagnostic.data.is_none(),
+        "read-only enum diagnostics must not carry enum replacement data"
+    );
+    let uri = tower_lsp::lsp_types::Url::parse("file:///tmp/main.crn").unwrap();
+    assert!(
+        crate::code_action::code_actions_for_diagnostic(&uri, diagnostic).is_empty(),
+        "read-only enum assignments must not offer replacement quick-fixes"
+    );
+}
+
+#[test]
+fn read_only_list_struct_reports_no_shape_or_nested_diagnostics() {
+    use carina_core::schema::{AttributeSchema, AttributeType, StructField};
+
+    let setting = AttributeType::struct_(
+        "Setting".to_string(),
+        vec![StructField::new("enabled", AttributeType::bool()).required()],
+    );
+    let engine = read_only_attribute_engine(
+        AttributeSchema::new("settings", AttributeType::list(setting)).read_only(),
+    );
+    let doc = create_document(
+        "mock.test.resource {\n  settings = [{\n    enabled = 'not-a-bool'\n    unexpected = true\n  }]\n}\n",
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    assert_only_read_only_diagnostic(&diagnostics, "settings");
+}
+
+#[test]
+fn read_only_assignment_points_to_attribute_line() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("region", AttributeType::string()).read_only());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", schema);
+    let engine = custom_engine(schemas);
+
+    let doc = create_document("mock.test.resource {\n  name = 'test'\n  region = 'us-west-2'\n}\n");
+    let diagnostics = engine.analyze(&doc, None);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.message
+                == "Attribute 'region' is populated by the provider and cannot be set"
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a read-only assignment diagnostic, got: {:?}",
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| &diagnostic.message)
+                    .collect::<Vec<_>>()
+            )
+        });
+
+    assert_eq!(
+        diagnostic.range.start.line, 2,
+        "read-only diagnostic must point to the attribute, not the resource header"
+    );
+    assert_eq!(diagnostic.range.start.character, 2);
+}
+
 #[test]
 fn warning_when_provider_loaded_but_schema_missing() {
     // Provider is loaded but doesn't have a schema for this resource type.

@@ -653,6 +653,51 @@ let upstream = test.r.producer {
     );
 }
 
+#[test]
+fn read_only_assignment_in_multi_file_directory_fails_validate() {
+    let schemas = single_schema_map(
+        ResourceSchema::new("r.bucket")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("region", AttributeType::string()).read_only()),
+    );
+    let fixture = write_fixture(&[
+        (
+            "main.crn",
+            r#"
+test.r.bucket {
+    name = "configured"
+}
+"#,
+        ),
+        (
+            "sibling.crn",
+            r#"
+test.r.bucket {
+    name = "sibling"
+    region = "us-west-2"
+}
+"#,
+        ),
+    ]);
+
+    let expected = "Attribute 'region' is populated by the provider and cannot be set";
+    let cli_diags = cli_diagnostics(factories_for(&schemas), &fixture);
+    assert!(
+        cli_messages_contain(&cli_diags, expected),
+        "carina validate must reject read-only assignment in a merged directory, got {cli_diags:?}"
+    );
+
+    let lsp_diags = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "sibling.crn");
+    assert!(
+        lsp_messages_contain(&lsp_diags, expected),
+        "LSP must report the same read-only assignment, got {:?}",
+        lsp_diags
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+}
+
 // ============================================================================
 // Scenario 6: Unknown attribute with `suggestion`
 // ============================================================================

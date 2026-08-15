@@ -3030,6 +3030,163 @@ fn validate_allows_known_attributes_only() {
 }
 
 #[test]
+fn validate_rejects_read_only_attribute_assignment() {
+    let schema = ResourceSchema::new("s3.Bucket")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("region", AttributeType::string()).read_only());
+
+    assert!(
+        schema.validate(&HashMap::new()).is_ok(),
+        "omitting a read-only attribute should remain valid"
+    );
+
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+    );
+    assert!(
+        schema.validate(&attrs).is_ok(),
+        "normal writable attributes should remain valid"
+    );
+
+    // Deliberately use the wrong value type as well: writability takes
+    // precedence, so this assignment must produce one read-only error rather
+    // than a confusing type error (or both errors).
+    attrs.insert(
+        "region".to_string(),
+        Value::Concrete(ConcreteValue::Int(42)),
+    );
+    let errors = schema
+        .validate(&attrs)
+        .expect_err("assigning a read-only attribute must fail validation");
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected one writability error: {errors:?}"
+    );
+    assert!(
+        matches!(&errors[0], TypeError::ReadOnlyAttribute { name } if name == "region"),
+        "expected a structured read-only error naming 'region': {errors:?}"
+    );
+    assert_eq!(
+        errors[0].to_string(),
+        "Attribute 'region' is populated by the provider and cannot be set"
+    );
+}
+
+#[test]
+fn validate_read_only_block_name_error_uses_user_written_alias() {
+    let schema = ResourceSchema::new("test.Resource").attribute(
+        AttributeSchema::new(
+            "generated_rules",
+            AttributeType::list(AttributeType::string()),
+        )
+        .read_only()
+        .with_block_name("generated_rule"),
+    );
+
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "generated_rule".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("provider-owned".to_string()),
+        )])),
+    );
+
+    let errors = schema
+        .validate(&attrs)
+        .expect_err("assigning through a read-only block-name alias must fail validation");
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected one writability error: {errors:?}"
+    );
+    assert!(
+        matches!(&errors[0], TypeError::ReadOnlyAttribute { name } if name == "generated_rule"),
+        "expected a structured read-only error naming the written alias: {errors:?}"
+    );
+    assert_eq!(
+        errors[0].to_string(),
+        "Attribute 'generated_rule' is populated by the provider and cannot be set"
+    );
+}
+
+#[test]
+fn validate_read_only_is_keyed_per_resource_type_not_by_attribute_name() {
+    let route_schema = ResourceSchema::new("ec2.Route")
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).read_only());
+    let vpc_schema = ResourceSchema::new("ec2.Vpc")
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::string()));
+    let attrs = HashMap::from([(
+        "cidr_block".to_string(),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+    )]);
+
+    let route_errors = route_schema
+        .validate(&attrs)
+        .expect_err("Route.cidr_block must remain provider-populated");
+    assert!(
+        matches!(&route_errors[..], [TypeError::ReadOnlyAttribute { name }] if name == "cidr_block"),
+        "Route must reject its read-only cidr_block: {route_errors:?}"
+    );
+    assert!(
+        vpc_schema.validate(&attrs).is_ok(),
+        "Vpc must accept its independently writable cidr_block"
+    );
+}
+
+#[test]
+fn validate_read_only_top_level_name_does_not_reject_writable_nested_struct_field() {
+    let origin = AttributeType::struct_(
+        "Origin".to_string(),
+        vec![
+            StructField::new("id", AttributeType::string()).required(),
+            StructField::new("domain_name", AttributeType::string()).required(),
+        ],
+    );
+    let schema = ResourceSchema::new("cloudfront.Distribution")
+        .attribute(AttributeSchema::new("id", AttributeType::string()).read_only())
+        .attribute(AttributeSchema::new("domain_name", AttributeType::string()).read_only())
+        .attribute(
+            AttributeSchema::new("origins", AttributeType::list(origin)).with_block_name("origin"),
+        );
+
+    let mut origin_value = IndexMap::new();
+    origin_value.insert(
+        "id".to_string(),
+        Value::Concrete(ConcreteValue::String("primary-origin".to_string())),
+    );
+    origin_value.insert(
+        "domain_name".to_string(),
+        Value::Concrete(ConcreteValue::String("origin.example.com".to_string())),
+    );
+    let mut attrs = HashMap::from([(
+        "origin".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(origin_value),
+        )])),
+    )]);
+
+    assert!(
+        schema.validate(&attrs).is_ok(),
+        "nested origin.id and origin.domain_name must remain writable"
+    );
+
+    attrs.insert(
+        "id".to_string(),
+        Value::Concrete(ConcreteValue::String("provider-id".to_string())),
+    );
+    let errors = schema
+        .validate(&attrs)
+        .expect_err("top-level Distribution.id must remain provider-populated");
+    assert!(
+        matches!(&errors[..], [TypeError::ReadOnlyAttribute { name }] if name == "id"),
+        "only the top-level id assignment must be rejected: {errors:?}"
+    );
+}
+
+#[test]
 fn validate_unknown_attribute_with_suggestion() {
     let schema = ResourceSchema::new("s3.Bucket")
         .attribute(AttributeSchema::new("bucket_name", AttributeType::string()));

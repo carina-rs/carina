@@ -186,6 +186,12 @@ impl DiagnosticEngine {
         let mut diagnostics = Vec::new();
 
         for (attr_name, attr_schema) in &schema.attributes {
+            // Resource-level validation reports read-only assignments; do not
+            // offer authoring-style hints for attributes the user cannot set.
+            if attr_schema.read_only {
+                continue;
+            }
+
             // Only check List<Struct> attributes. Use `Shape` (Ref-peeled)
             // for both the attribute type and the list element type so
             // the hint also fires for cyclic-CFN shapes like
