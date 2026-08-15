@@ -514,6 +514,58 @@ security_group_ingress {
 }
 
 #[test]
+fn nested_struct_field_completion_excludes_read_only_fields() {
+    let provider = test_provider_with_nested_structs();
+    let doc = create_document(
+        r#"let r = test.nested.resource {
+outer {
+    inner {
+
+    }
+}
+}"#,
+    );
+    let position = Position {
+        line: 3,
+        character: 8,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels = completions
+        .iter()
+        .map(|completion| completion.label.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(labels, vec!["leaf_field", "leaf_bool"]);
+}
+
+#[test]
+fn nested_read_only_field_value_position_has_no_completions() {
+    let provider = test_provider_with_nested_structs();
+    let doc = create_document(
+        r#"let r = test.nested.resource {
+outer {
+    inner {
+        provider_leaf =
+    }
+}
+}"#,
+    );
+    let position = Position {
+        line: 3,
+        character: 23,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels = completions
+        .iter()
+        .map(|completion| completion.label.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(labels, Vec::<&str>::new());
+}
+
+#[test]
 #[ignore = "requires provider schemas"]
 fn struct_field_value_completion_for_bool() {
     // Requires the real `awscc.ec2.flow_log` schema so the destination_options

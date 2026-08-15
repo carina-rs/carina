@@ -18,7 +18,8 @@ use carina_core::resource::{
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
     ResourceSchema as CoreResourceSchema, StructField as CoreStructField,
-    UniqueNameSpec as CoreUniqueNameSpec, legacy_validator,
+    StructFieldInputMode as CoreStructFieldInputMode, UniqueNameSpec as CoreUniqueNameSpec,
+    legacy_validator,
 };
 use carina_core::value::{SerializationContext, SerializationError};
 use carina_core::wait::BindingPattern as CoreBindingPattern;
@@ -49,6 +50,12 @@ impl SchemaDecodeError {
     fn schema_default_value_encode(err: serde_json::Error) -> Self {
         Self {
             detail: format!("schema default value conversion error: {err}"),
+        }
+    }
+
+    fn conflicting_struct_field_input_mode(name: &str) -> Self {
+        Self {
+            detail: format!("struct field '{name}' cannot be both required and read-only"),
         }
     }
 
@@ -1117,14 +1124,22 @@ fn proto_struct_field_to_core(
         deferred_populate,
     } = f;
 
+    let input_mode = match (*required, *read_only) {
+        (false, false) => CoreStructFieldInputMode::Optional,
+        (true, false) => CoreStructFieldInputMode::Required,
+        (false, true) => CoreStructFieldInputMode::ProviderPopulated,
+        (true, true) => {
+            return Err(SchemaDecodeError::conflicting_struct_field_input_mode(name));
+        }
+    };
+
     Ok(CoreStructField {
         name: name.clone(),
         field_type: proto_attr_type_to_core(field_type)?,
-        required: *required,
+        input_mode,
         description: description.clone(),
         provider_name: provider_name.clone(),
         block_name: block_name.clone(),
-        read_only: *read_only,
         deferred_populate: *deferred_populate,
     })
 }
@@ -1177,22 +1192,27 @@ mod tests {
         let CoreStructField {
             name,
             field_type,
-            required,
+            input_mode,
             description,
             provider_name,
             block_name,
-            read_only,
             deferred_populate,
         } = field;
+
+        let (required, read_only) = match input_mode {
+            CoreStructFieldInputMode::Optional => (false, false),
+            CoreStructFieldInputMode::Required => (true, false),
+            CoreStructFieldInputMode::ProviderPopulated => (false, true),
+        };
 
         proto::StructField {
             name: name.clone(),
             field_type: core_string_to_proto_for_schema_round_trip(field_type),
-            required: *required,
+            required,
             description: description.clone(),
             block_name: block_name.clone(),
             provider_name: provider_name.clone(),
-            read_only: *read_only,
+            read_only,
             deferred_populate: *deferred_populate,
         }
     }
@@ -1244,9 +1264,30 @@ mod tests {
     }
 
     #[test]
+    fn required_read_only_struct_field_is_rejected_at_the_wire_boundary() {
+        let field = proto::StructField {
+            name: "provider_id".to_string(),
+            field_type: proto_string(),
+            required: true,
+            description: None,
+            block_name: None,
+            provider_name: None,
+            read_only: true,
+            deferred_populate: false,
+        };
+
+        let error = proto_struct_field_to_core(&field)
+            .expect_err("required and read-only must not form a core StructField");
+
+        assert_eq!(
+            error.to_string(),
+            "struct field 'provider_id' cannot be both required and read-only"
+        );
+    }
+
+    #[test]
     fn schema_transport_round_trip_is_exhaustive_for_touched_types() {
         let core_field = CoreStructField::new("provider_id", CoreAttributeType::string())
-            .required()
             .with_description("Provider-assigned identifier")
             .with_provider_name("ProviderId")
             .with_block_name("provider_id_block")
@@ -1261,11 +1302,10 @@ mod tests {
         let CoreStructField {
             name,
             field_type,
-            required,
+            input_mode,
             description,
             provider_name,
             block_name,
-            read_only,
             deferred_populate,
         } = &round_tripped_field;
         assert_eq!(name, "provider_id");
@@ -1275,12 +1315,21 @@ mod tests {
                 .expect("round-tripped field type must be Ref-free"),
             carina_core::schema::Shape::String { .. }
         ));
-        assert!(*required);
+        assert_eq!(*input_mode, CoreStructFieldInputMode::ProviderPopulated);
         assert_eq!(description.as_deref(), Some("Provider-assigned identifier"));
         assert_eq!(provider_name.as_deref(), Some("ProviderId"));
         assert_eq!(block_name.as_deref(), Some("provider_id_block"));
-        assert!(*read_only);
         assert!(*deferred_populate);
+
+        let required_field = CoreStructField::new("name", CoreAttributeType::string()).required();
+        let proto_required = core_struct_field_to_proto_for_schema_round_trip(&required_field);
+        assert!(proto_required.required);
+        assert!(!proto_required.read_only);
+        let round_tripped_required = proto_struct_field_to_core(&proto_required).unwrap();
+        assert_eq!(
+            round_tripped_required.input_mode,
+            CoreStructFieldInputMode::Required
+        );
 
         let core_attr = CoreAttributeSchema::new("status", CoreAttributeType::string())
             .required()
@@ -2275,7 +2324,7 @@ mod tests {
                                         .expect("test schema is Ref-free"),
                                     carina_core::schema::Shape::Int { .. }
                                 ));
-                                assert!(from_port.required);
+                                assert!(from_port.is_required());
                                 assert_eq!(
                                     from_port.description.as_deref(),
                                     Some("Start of port range")

@@ -421,6 +421,21 @@ impl<'a> DslMap<'a> {
     }
 }
 
+/// Whether a nested struct field may or must be supplied by the user.
+///
+/// These states are mutually exclusive by construction: provider-populated
+/// fields cannot also be required user input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StructFieldInputMode {
+    /// The user may omit this field.
+    #[default]
+    Optional,
+    /// The user must provide this field.
+    Required,
+    /// The provider supplies this field; user assignments are rejected.
+    ProviderPopulated,
+}
+
 /// A field within a Struct type
 #[derive(Debug, Clone)]
 pub struct StructField {
@@ -428,17 +443,14 @@ pub struct StructField {
     pub name: String,
     /// Field type
     pub field_type: AttributeType,
-    /// Whether this field is required
-    pub required: bool,
+    /// Whether user input for this field is optional, required, or forbidden.
+    pub input_mode: StructFieldInputMode,
     /// Description of this field
     pub description: Option<String>,
     /// Provider-side property name (e.g., "IpProtocol")
     pub provider_name: Option<String>,
     /// Alternative block name for repeated block syntax (e.g., "transition" for "transitions")
     pub block_name: Option<String>,
-    /// Whether this nested field is populated by the provider and cannot be
-    /// assigned by the user.
-    pub read_only: bool,
     /// Whether the value of this nested field is populated by the
     /// provider asynchronously *after* the Create call returns.
     /// Reached when a chained access traverses a `Struct` (e.g.
@@ -454,18 +466,21 @@ impl StructField {
         Self {
             name: name.into(),
             field_type,
-            required: false,
+            input_mode: StructFieldInputMode::Optional,
             description: None,
             provider_name: None,
             block_name: None,
-            read_only: false,
             deferred_populate: false,
         }
     }
 
     pub fn required(mut self) -> Self {
-        self.required = true;
+        self.input_mode = StructFieldInputMode::Required;
         self
+    }
+
+    pub fn is_required(&self) -> bool {
+        self.input_mode == StructFieldInputMode::Required
     }
 
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
@@ -486,8 +501,12 @@ impl StructField {
     /// Mark this nested field as provider-populated and therefore not
     /// assignable by users.
     pub fn read_only(mut self) -> Self {
-        self.read_only = true;
+        self.input_mode = StructFieldInputMode::ProviderPopulated;
         self
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.input_mode == StructFieldInputMode::ProviderPopulated
     }
 
     /// Mark this nested field as populated asynchronously by the
@@ -1231,7 +1250,7 @@ impl Schema {
 
                 // Required-field check.
                 for f in fields {
-                    if f.required && !map.contains_key(&f.name) {
+                    if f.is_required() && !map.contains_key(&f.name) {
                         let field_path = path.push_field(f.name.clone());
                         out.push((
                             field_path,
@@ -3605,7 +3624,7 @@ fn describe_struct_union_members(members: UnionMembers<'_>) -> Option<Vec<UnionS
             }
             let required_fields = fields
                 .iter()
-                .filter(|field| field.required)
+                .filter(|field| field.is_required())
                 .map(|field| field.name.clone())
                 .collect();
             Some(UnionStructAlternative {
@@ -3703,7 +3722,7 @@ pub(crate) fn build_accepted_field_map(fields: &[StructField]) -> HashMap<&str, 
 /// this gate before type-checking the field value, keeping writability policy
 /// and diagnostic precedence identical across the two walkers.
 fn validate_struct_field_assignment(field: &StructField, input_name: &str) -> Option<TypeError> {
-    field.read_only.then(|| TypeError::ReadOnlyAttribute {
+    field.is_read_only().then(|| TypeError::ReadOnlyAttribute {
         name: input_name.to_string(),
     })
 }
@@ -3726,7 +3745,7 @@ where
     V: FnMut(&str, &StructField, &Value) -> Result<(), TypeError>,
 {
     for field in fields {
-        if field.required && !map.contains_key(&field.name) {
+        if field.is_required() && !map.contains_key(&field.name) {
             return Err(missing_required(field));
         }
     }

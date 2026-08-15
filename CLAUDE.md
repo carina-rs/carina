@@ -492,7 +492,18 @@ A struct type represents a nested object with typed fields.
   outside `carina-core`).
 - Each `StructField` (`carina-core/src/schema/mod.rs`) has `name`,
   `field_type` (recursive `AttributeType`), `required`, `description`, plus
-  `provider_name`, `block_name`, and `deferred_populate`.
+  `provider_name`, `block_name`, `read_only`, and `deferred_populate`.
+  `read_only` marks a nested field as provider-populated: assigning to it is
+  rejected at validation time, the same as a top-level read-only attribute
+  (carina#3772).
+- **Schema field transport**: `StructField` and `AttributeSchema` cross the
+  WASM boundary as JSON via the `schemas: func() -> string` WIT export, decoded
+  by `carina-plugin-host/src/wasm_convert.rs`. Those conversions destructure
+  the protocol struct exhaustively on purpose — adding a field to
+  `carina-provider-protocol` must break compilation until it is consciously
+  carried across or documented as intentionally host-only. Never silence that
+  with `_` or `..`; a silently dropped field is invisible in production and
+  cost carina#3034 its effect (carina#3772).
 - **LSP integration**: when adding Struct validation, update
   `carina-lsp/src/diagnostics/validation.rs` to validate nested fields;
   completion should work recursively for struct fields.
