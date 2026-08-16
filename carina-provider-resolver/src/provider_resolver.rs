@@ -184,7 +184,7 @@ impl UnpinnedRegistryRatchets {
         self.0.get(source)
     }
 
-    fn insert(
+    fn merge(
         &mut self,
         source: String,
         ratchets: RegistryRatchets,
@@ -201,10 +201,6 @@ impl UnpinnedRegistryRatchets {
         Ok(())
     }
 
-    fn set(&mut self, source: String, ratchets: RegistryRatchets) {
-        self.0.insert(source, ratchets);
-    }
-
     fn remove(&mut self, source: &str) -> Option<RegistryRatchets> {
         self.0.remove(source)
     }
@@ -212,7 +208,7 @@ impl UnpinnedRegistryRatchets {
     fn into_canonical(self) -> Result<Self, RegistryIdentityPinConflict> {
         let mut canonical = Self::default();
         for (source, ratchets) in self.0 {
-            canonical.insert(canonical_lock_source(&source), ratchets)?;
+            canonical.merge(canonical_lock_source(&source), ratchets)?;
         }
         Ok(canonical)
     }
@@ -235,12 +231,14 @@ enum RegistrySequenceAnchor {
     Established(u64),
 }
 
-/// Signature protection recorded for a registry provider. Signed entries
-/// always carry their identity pin; a signed-but-unpinned lock cannot exist.
+/// Signature protection recorded for a registry provider. The signature
+/// requirement is a monotonic ratchet, while the identity pin can be cleared
+/// explicitly so the next signed artifact establishes a replacement pin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistrySignatureProtection {
-    Absent,
-    Present(IdentityPin),
+    NotRequired,
+    RequiredUnpinned,
+    RequiredPinned(IdentityPin),
 }
 
 /// A signing-identity pin whose identity and issuer are always present together.
@@ -271,6 +269,125 @@ impl fmt::Display for RegistryIdentityPinConflict {
 
 impl std::error::Error for RegistryIdentityPinConflict {}
 
+/// Freshness values discarded by an explicit registry re-bootstrap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistryFreshness {
+    pub sequence: Option<u64>,
+    pub sequence_anchor: Option<u64>,
+}
+
+enum RegistryRecoveryTarget<R> {
+    Pinned {
+        index: usize,
+        state: R,
+        sequence_anchor: RegistrySequenceAnchor,
+    },
+    Unpinned {
+        state: R,
+    },
+}
+
+impl<R> RegistryRecoveryTarget<R> {
+    fn state(&self) -> &R {
+        match self {
+            Self::Pinned { state, .. } | Self::Unpinned { state } => state,
+        }
+    }
+
+    fn sequence_anchor(&self) -> RegistrySequenceAnchor {
+        match self {
+            Self::Pinned {
+                sequence_anchor, ..
+            } => *sequence_anchor,
+            Self::Unpinned { .. } => RegistrySequenceAnchor::Unestablished,
+        }
+    }
+
+    fn map_state<S>(self, map: impl FnOnce(R) -> S) -> RegistryRecoveryTarget<S> {
+        match self {
+            Self::Pinned {
+                index,
+                state,
+                sequence_anchor,
+            } => RegistryRecoveryTarget::Pinned {
+                index,
+                state: map(state),
+                sequence_anchor,
+            },
+            Self::Unpinned { state } => RegistryRecoveryTarget::Unpinned { state: map(state) },
+        }
+    }
+
+    fn try_map_state<S, E>(
+        self,
+        map: impl FnOnce(R) -> Result<S, E>,
+    ) -> Result<RegistryRecoveryTarget<S>, E> {
+        match self {
+            Self::Pinned {
+                index,
+                state,
+                sequence_anchor,
+            } => Ok(RegistryRecoveryTarget::Pinned {
+                index,
+                state: map(state)?,
+                sequence_anchor,
+            }),
+            Self::Unpinned { state } => Ok(RegistryRecoveryTarget::Unpinned { state: map(state)? }),
+        }
+    }
+}
+
+/// Failure to inspect or mutate one registry provider's recovery state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryLockRecoveryError {
+    InvalidProvider { provider: String, reason: String },
+    NotRegistryProvider { provider: String },
+    ProviderStateNotFound { provider: String },
+    SignatureNotRequired { provider: String },
+    IdentityAlreadyUnpinned { provider: String },
+    IdentityPinConflict(RegistryIdentityPinConflict),
+}
+
+impl fmt::Display for RegistryLockRecoveryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidProvider { provider, reason } => {
+                write!(f, "Invalid registry provider {provider:?}: {reason}")
+            }
+            Self::NotRegistryProvider { provider } => write!(
+                f,
+                "Provider {provider:?} is not registry-hosted; provider recovery operations apply only to [hostname/]namespace/name sources"
+            ),
+            Self::ProviderStateNotFound { provider } => write!(
+                f,
+                "No registry security state for provider {provider:?} was found in carina-providers.lock"
+            ),
+            Self::SignatureNotRequired { provider } => write!(
+                f,
+                "Registry provider {provider:?} has no ratcheted signature requirement or identity pin to replace"
+            ),
+            Self::IdentityAlreadyUnpinned { provider } => write!(
+                f,
+                "Registry provider {provider:?} already requires a signature and is awaiting a new identity pin"
+            ),
+            Self::IdentityPinConflict(source) => source.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for RegistryLockRecoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IdentityPinConflict(source) => Some(source),
+            Self::InvalidProvider { .. }
+            | Self::NotRegistryProvider { .. }
+            | Self::ProviderStateNotFound { .. }
+            | Self::SignatureNotRequired { .. }
+            | Self::IdentityAlreadyUnpinned { .. } => None,
+        }
+    }
+}
+
 /// Durable security observations for one registry source. This is the shared
 /// representation used both by pinned provider entries and by observations
 /// that must survive before the provider itself can be pinned.
@@ -284,13 +401,42 @@ struct RegistryRatchets {
     transparency_log_present: bool,
 }
 
+struct ResolvedRegistryRecovery {
+    source_key: String,
+    target: RegistryRecoveryTarget<RegistryRatchets>,
+}
+
+struct RegistryIdentityRepinState {
+    pin: IdentityPin,
+    residual: RegistryIdentityRepinResidual,
+}
+
+struct RegistryIdentityRepinResidual {
+    sequence: RegistrySequence,
+    valid_until_present: bool,
+    yanked_versions: YankedRegistryVersions,
+    transparency_log_present: bool,
+}
+
+struct RegistryRebootstrapState {
+    sequence: RegistrySequence,
+    residual: RegistryRebootstrapResidual,
+}
+
+struct RegistryRebootstrapResidual {
+    valid_until_present: bool,
+    yanked_versions: YankedRegistryVersions,
+    signature: RegistrySignatureProtection,
+    transparency_log_present: bool,
+}
+
 impl Default for RegistryRatchets {
     fn default() -> Self {
         Self {
             sequence: RegistrySequence::Absent,
             valid_until_present: false,
             yanked_versions: YankedRegistryVersions::default(),
-            signature: RegistrySignatureProtection::Absent,
+            signature: RegistrySignatureProtection::NotRequired,
             transparency_log_present: false,
         }
     }
@@ -298,22 +444,25 @@ impl Default for RegistryRatchets {
 
 impl RegistryRatchets {
     fn merge(mut self, other: &Self) -> Result<Self, RegistryIdentityPinConflict> {
-        let signature = match (&self.signature, &other.signature) {
-            (RegistrySignatureProtection::Absent, signature)
-            | (signature, RegistrySignatureProtection::Absent) => signature.clone(),
-            (
-                RegistrySignatureProtection::Present(left),
-                RegistrySignatureProtection::Present(right),
-            ) if left == right => RegistrySignatureProtection::Present(left.clone()),
-            (
-                RegistrySignatureProtection::Present(left),
-                RegistrySignatureProtection::Present(right),
-            ) => {
+        let signature_required = self.signature.is_required() || other.signature.is_required();
+        let identity_pin = match (
+            self.signature.identity_pin(),
+            other.signature.identity_pin(),
+        ) {
+            (Some(left), Some(right)) if left == right => Some(left.clone()),
+            (Some(left), Some(right)) => {
                 return Err(RegistryIdentityPinConflict {
                     left: left.clone(),
                     right: right.clone(),
                 });
             }
+            (Some(pin), None) | (None, Some(pin)) => Some(pin.clone()),
+            (None, None) => None,
+        };
+        let signature = match (signature_required, identity_pin) {
+            (_, Some(pin)) => RegistrySignatureProtection::RequiredPinned(pin),
+            (true, None) => RegistrySignatureProtection::RequiredUnpinned,
+            (false, None) => RegistrySignatureProtection::NotRequired,
         };
         self.sequence = match (self.sequence.value(), other.sequence.value()) {
             (Some(left), Some(right)) => RegistrySequence::Present(left.max(right)),
@@ -328,12 +477,150 @@ impl RegistryRatchets {
         Ok(self)
     }
 
-    fn apply_to(self, registry: &mut RegistryLock) {
-        registry.sequence = self.sequence;
-        registry.valid_until_present = self.valid_until_present;
-        registry.yanked_versions = self.yanked_versions;
-        registry.signature = self.signature;
-        registry.transparency_log_present = self.transparency_log_present;
+    fn merge_into_registry(
+        self,
+        registry: &mut RegistryLock,
+    ) -> Result<(), RegistryIdentityPinConflict> {
+        let merged = RegistryRatchets::from(&*registry).merge(&self)?;
+        let Self {
+            sequence,
+            valid_until_present,
+            yanked_versions,
+            signature,
+            transparency_log_present,
+        } = merged;
+        registry.sequence = sequence;
+        registry.valid_until_present = valid_until_present;
+        registry.yanked_versions = yanked_versions;
+        registry.signature = signature;
+        registry.transparency_log_present = transparency_log_present;
+        Ok(())
+    }
+
+    fn into_identity_repin_state(
+        self,
+        provider: String,
+    ) -> Result<RegistryIdentityRepinState, RegistryLockRecoveryError> {
+        let Self {
+            sequence,
+            valid_until_present,
+            yanked_versions,
+            signature,
+            transparency_log_present,
+        } = self;
+        let pin = match signature {
+            RegistrySignatureProtection::RequiredPinned(pin) => pin,
+            RegistrySignatureProtection::RequiredUnpinned => {
+                return Err(RegistryLockRecoveryError::IdentityAlreadyUnpinned { provider });
+            }
+            RegistrySignatureProtection::NotRequired => {
+                return Err(RegistryLockRecoveryError::SignatureNotRequired { provider });
+            }
+        };
+        Ok(RegistryIdentityRepinState {
+            pin,
+            residual: RegistryIdentityRepinResidual {
+                sequence,
+                valid_until_present,
+                yanked_versions,
+                transparency_log_present,
+            },
+        })
+    }
+
+    fn into_rebootstrap_state(self) -> RegistryRebootstrapState {
+        let Self {
+            sequence,
+            valid_until_present,
+            yanked_versions,
+            signature,
+            transparency_log_present,
+        } = self;
+        RegistryRebootstrapState {
+            sequence,
+            residual: RegistryRebootstrapResidual {
+                valid_until_present,
+                yanked_versions,
+                signature,
+                transparency_log_present,
+            },
+        }
+    }
+}
+
+impl RegistryIdentityRepinResidual {
+    fn into_ratchets(self) -> RegistryRatchets {
+        RegistryRatchets {
+            sequence: self.sequence,
+            valid_until_present: self.valid_until_present,
+            yanked_versions: self.yanked_versions,
+            signature: RegistrySignatureProtection::RequiredUnpinned,
+            transparency_log_present: self.transparency_log_present,
+        }
+    }
+
+    fn apply_to_registry(self, registry: &mut RegistryLock) {
+        let RegistryRatchets {
+            sequence,
+            valid_until_present,
+            yanked_versions,
+            signature,
+            transparency_log_present,
+        } = self.into_ratchets();
+        registry.sequence = sequence;
+        registry.valid_until_present = valid_until_present;
+        registry.yanked_versions = yanked_versions;
+        registry.signature = signature;
+        registry.transparency_log_present = transparency_log_present;
+    }
+}
+
+impl RegistryRebootstrapResidual {
+    fn into_ratchets(self) -> RegistryRatchets {
+        RegistryRatchets {
+            sequence: RegistrySequence::Absent,
+            valid_until_present: self.valid_until_present,
+            yanked_versions: self.yanked_versions,
+            signature: self.signature,
+            transparency_log_present: self.transparency_log_present,
+        }
+    }
+
+    fn apply_to_registry(self, registry: &mut RegistryLock) {
+        let RegistryRatchets {
+            sequence,
+            valid_until_present,
+            yanked_versions,
+            signature,
+            transparency_log_present,
+        } = self.into_ratchets();
+        registry.sequence = sequence;
+        registry.valid_until_present = valid_until_present;
+        registry.yanked_versions = yanked_versions;
+        registry.signature = signature;
+        registry.transparency_log_present = transparency_log_present;
+    }
+}
+
+impl UnpinnedRegistryRatchets {
+    fn commit_identity_repin(
+        &mut self,
+        source: &str,
+        residual: RegistryIdentityRepinResidual,
+    ) -> bool {
+        let Some(ratchets) = self.0.get_mut(source) else {
+            return false;
+        };
+        *ratchets = residual.into_ratchets();
+        true
+    }
+
+    fn commit_rebootstrap(&mut self, source: &str, residual: RegistryRebootstrapResidual) -> bool {
+        let Some(ratchets) = self.0.get_mut(source) else {
+            return false;
+        };
+        *ratchets = residual.into_ratchets();
+        true
     }
 }
 
@@ -375,20 +662,11 @@ impl TryFrom<RegistryRatchetsSerde> for RegistryRatchets {
             (true, Some(sequence)) => RegistrySequence::Present(sequence),
             _ => return Err(RegistryLockError::InconsistentSequence),
         };
-        let signature = match (
+        let signature = RegistrySignatureProtection::from_serialized(
             value.signature_present,
             value.certificate_identity,
             value.certificate_oidc_issuer,
-        ) {
-            (false, None, None) => RegistrySignatureProtection::Absent,
-            (true, Some(certificate_identity), Some(certificate_oidc_issuer)) => {
-                RegistrySignatureProtection::Present(IdentityPin {
-                    certificate_identity,
-                    certificate_oidc_issuer,
-                })
-            }
-            _ => return Err(RegistryLockError::InconsistentSignature),
-        };
+        )?;
         Ok(Self {
             sequence,
             valid_until_present: value.valid_until_present,
@@ -406,14 +684,7 @@ impl From<RegistryRatchets> for RegistryRatchetsSerde {
             RegistrySequence::Present(sequence) => (true, Some(sequence)),
         };
         let (signature_present, certificate_identity, certificate_oidc_issuer) =
-            match value.signature {
-                RegistrySignatureProtection::Absent => (false, None, None),
-                RegistrySignatureProtection::Present(pin) => (
-                    true,
-                    Some(pin.certificate_identity),
-                    Some(pin.certificate_oidc_issuer),
-                ),
-            };
+            value.signature.into_serialized();
         Self {
             sequence_present,
             sequence,
@@ -486,20 +757,11 @@ impl TryFrom<RegistryLockSerde> for RegistryLock {
             }
             (RegistrySequence::Absent | RegistrySequence::Present(_), _) => {}
         }
-        let signature = match (
+        let signature = RegistrySignatureProtection::from_serialized(
             value.signature_present,
             value.certificate_identity,
             value.certificate_oidc_issuer,
-        ) {
-            (false, None, None) => RegistrySignatureProtection::Absent,
-            (true, Some(certificate_identity), Some(certificate_oidc_issuer)) => {
-                RegistrySignatureProtection::Present(IdentityPin {
-                    certificate_identity,
-                    certificate_oidc_issuer,
-                })
-            }
-            _ => return Err(RegistryLockError::InconsistentSignature),
-        };
+        )?;
         Ok(Self {
             resolved_hostname: value.resolved_hostname,
             api_base_url: value.api_base_url,
@@ -525,14 +787,7 @@ impl From<RegistryLock> for RegistryLockSerde {
             RegistrySequenceAnchor::Established(sequence) => (true, Some(sequence)),
         };
         let (signature_present, certificate_identity, certificate_oidc_issuer) =
-            match value.signature {
-                RegistrySignatureProtection::Absent => (false, None, None),
-                RegistrySignatureProtection::Present(pin) => (
-                    true,
-                    Some(pin.certificate_identity),
-                    Some(pin.certificate_oidc_issuer),
-                ),
-            };
+            value.signature.into_serialized();
         Self {
             resolved_hostname: value.resolved_hostname,
             api_base_url: value.api_base_url,
@@ -566,7 +821,7 @@ impl fmt::Display for RegistryLockError {
             ),
             Self::InconsistentSignature => write!(
                 f,
-                "registry lock is inconsistent: signature_present, certificate_identity, and certificate_oidc_issuer must either all describe a signature pin or all be absent"
+                "registry lock is inconsistent: certificate_identity and certificate_oidc_issuer must be present together and only when signature_present is true"
             ),
         }
     }
@@ -586,13 +841,58 @@ impl<'de> Deserialize<'de> for RegistryLock {
 }
 
 impl RegistrySignatureProtection {
+    fn from_serialized(
+        signature_required: bool,
+        certificate_identity: Option<String>,
+        certificate_oidc_issuer: Option<String>,
+    ) -> Result<Self, RegistryLockError> {
+        match (
+            signature_required,
+            certificate_identity,
+            certificate_oidc_issuer,
+        ) {
+            (false, None, None) => Ok(Self::NotRequired),
+            (true, None, None) => Ok(Self::RequiredUnpinned),
+            (true, Some(certificate_identity), Some(certificate_oidc_issuer)) => {
+                Ok(Self::RequiredPinned(IdentityPin {
+                    certificate_identity,
+                    certificate_oidc_issuer,
+                }))
+            }
+            _ => Err(RegistryLockError::InconsistentSignature),
+        }
+    }
+
+    fn into_serialized(self) -> (bool, Option<String>, Option<String>) {
+        match self {
+            Self::NotRequired => (false, None, None),
+            Self::RequiredUnpinned => (true, None, None),
+            Self::RequiredPinned(pin) => (
+                true,
+                Some(pin.certificate_identity),
+                Some(pin.certificate_oidc_issuer),
+            ),
+        }
+    }
+
+    fn is_required(&self) -> bool {
+        matches!(self, Self::RequiredUnpinned | Self::RequiredPinned(_))
+    }
+
+    fn identity_pin(&self) -> Option<&IdentityPin> {
+        match self {
+            Self::RequiredPinned(pin) => Some(pin),
+            Self::NotRequired | Self::RequiredUnpinned => None,
+        }
+    }
+
     fn expected_identity(&self) -> Option<ExpectedIdentity> {
         match self {
-            Self::Absent => None,
-            Self::Present(pin) => Some(ExpectedIdentity::pinned(
+            Self::RequiredPinned(pin) => Some(ExpectedIdentity::pinned(
                 pin.certificate_identity.clone(),
                 pin.certificate_oidc_issuer.clone(),
             )),
+            Self::NotRequired | Self::RequiredUnpinned => None,
         }
     }
 }
@@ -602,6 +902,15 @@ impl RegistrySequence {
         match self {
             Self::Absent => None,
             Self::Present(sequence) => Some(*sequence),
+        }
+    }
+}
+
+impl RegistrySequenceAnchor {
+    fn value(self) -> Option<u64> {
+        match self {
+            Self::Unestablished => None,
+            Self::Established(sequence) => Some(sequence),
         }
     }
 }
@@ -654,6 +963,24 @@ pub struct LockFile {
     pub provider: Vec<LockEntry<RegistryLock>>,
     #[serde(default, skip_serializing_if = "UnpinnedRegistryRatchets::is_empty")]
     unpinned_registry_ratchets: UnpinnedRegistryRatchets,
+}
+
+/// A validated identity re-pin that has not mutated its lock file yet.
+/// The exclusive borrow keeps the previewed state unchanged until this value
+/// is either consumed by [`Self::commit`] or dropped.
+pub struct PreparedRegistryIdentityRepin<'a> {
+    lock_file: &'a mut LockFile,
+    source_key: String,
+    target: RegistryRecoveryTarget<RegistryIdentityRepinState>,
+}
+
+/// A validated registry re-bootstrap that has not mutated its lock file yet.
+/// The exclusive borrow keeps the previewed state unchanged until this value
+/// is either consumed by [`Self::commit`] or dropped.
+pub struct PreparedRegistryRebootstrap<'a> {
+    lock_file: &'a mut LockFile,
+    source_key: String,
+    target: RegistryRecoveryTarget<RegistryRebootstrapState>,
 }
 
 #[derive(Deserialize)]
@@ -786,11 +1113,50 @@ impl Default for LockFile {
     }
 }
 
+impl<'a> PreparedRegistryIdentityRepin<'a> {
+    /// Return the identity pin that committing this recovery will discard.
+    pub fn identity_pin(&self) -> &IdentityPin {
+        &self.target.state().pin
+    }
+
+    /// Consume this prepared recovery and clear its previewed identity pin.
+    pub fn commit(self) -> Result<(), RegistryLockRecoveryError> {
+        let Self {
+            lock_file,
+            source_key,
+            target,
+        } = self;
+        lock_file.commit_prepared_registry_identity_repin(source_key, target)
+    }
+}
+
+impl PreparedRegistryRebootstrap<'_> {
+    /// Return the observation and anchor that committing this recovery will discard.
+    pub fn freshness(&self) -> RegistryFreshness {
+        RegistryFreshness {
+            sequence: self.target.state().sequence.value(),
+            sequence_anchor: self.target.sequence_anchor().value(),
+        }
+    }
+
+    /// Consume this prepared recovery and clear its previewed freshness pair.
+    pub fn commit(self) -> Result<(), RegistryLockRecoveryError> {
+        let Self {
+            lock_file,
+            source_key,
+            target,
+        } = self;
+        lock_file.commit_prepared_registry_rebootstrap(source_key, target)
+    }
+}
+
 impl LockFile {
-    /// v1: Registry protection-presence fields are mandatory, and signed
-    /// registry entries always carry a signing-identity pin. New protection
-    /// fields remain in v1 when their absence has a safe, explicit default;
-    /// older readers reject the unknown field instead of silently removing it.
+    /// v1: Registry protection-presence fields are mandatory.
+    /// `signature_present` records the ratcheted requirement; an explicitly
+    /// re-pinned entry may retain that requirement while awaiting a new
+    /// identity. New protection fields remain in v1 when their absence has a
+    /// safe, explicit default; older readers reject unknown or newly legal
+    /// combinations instead of silently removing protection.
     pub const CURRENT_VERSION: u32 = 1;
 
     fn sources_match(existing: &str, requested: &str) -> bool {
@@ -884,6 +1250,156 @@ impl LockFile {
             .find(|e| Self::sources_match(&e.source, source))
     }
 
+    fn resolve_registry_recovery(
+        &self,
+        provider: &str,
+    ) -> Result<ResolvedRegistryRecovery, RegistryLockRecoveryError> {
+        let source = parse_provider_source(provider).map_err(|reason| {
+            RegistryLockRecoveryError::InvalidProvider {
+                provider: provider.to_string(),
+                reason,
+            }
+        })?;
+        let source_key = match source {
+            ProviderSource::Registry(source) => source.source_key(),
+            ProviderSource::GithubDirect { .. } => {
+                return Err(RegistryLockRecoveryError::NotRegistryProvider {
+                    provider: provider.to_string(),
+                });
+            }
+        };
+        if let Some((index, registry)) =
+            self.provider.iter().enumerate().find_map(|(index, entry)| {
+                (Self::sources_match(&entry.source, &source_key))
+                    .then_some(entry.registry.as_ref())
+                    .flatten()
+                    .map(|registry| (index, registry))
+            })
+        {
+            let recorded = RegistryRatchets::from(registry);
+            let state = match self.unpinned_registry_ratchets.get(&source_key) {
+                Some(unpinned) => recorded
+                    .merge(unpinned)
+                    .map_err(RegistryLockRecoveryError::IdentityPinConflict)?,
+                None => recorded,
+            };
+            return Ok(ResolvedRegistryRecovery {
+                source_key,
+                target: RegistryRecoveryTarget::Pinned {
+                    index,
+                    state,
+                    sequence_anchor: registry.sequence_anchor,
+                },
+            });
+        }
+        let state = self
+            .unpinned_registry_ratchets
+            .get(&source_key)
+            .cloned()
+            .ok_or_else(|| RegistryLockRecoveryError::ProviderStateNotFound {
+                provider: source_key.clone(),
+            })?;
+        Ok(ResolvedRegistryRecovery {
+            source_key,
+            target: RegistryRecoveryTarget::Unpinned { state },
+        })
+    }
+
+    fn commit_prepared_registry_identity_repin(
+        &mut self,
+        source_key: String,
+        target: RegistryRecoveryTarget<RegistryIdentityRepinState>,
+    ) -> Result<(), RegistryLockRecoveryError> {
+        match target {
+            RegistryRecoveryTarget::Pinned { index, state, .. } => {
+                let registry = self
+                    .provider
+                    .get_mut(index)
+                    .and_then(|entry| entry.registry.as_mut())
+                    .ok_or_else(|| RegistryLockRecoveryError::ProviderStateNotFound {
+                        provider: source_key.clone(),
+                    })?;
+                state.residual.apply_to_registry(registry);
+                self.unpinned_registry_ratchets.remove(&source_key);
+            }
+            RegistryRecoveryTarget::Unpinned { state } => {
+                if !self
+                    .unpinned_registry_ratchets
+                    .commit_identity_repin(&source_key, state.residual)
+                {
+                    return Err(RegistryLockRecoveryError::ProviderStateNotFound {
+                        provider: source_key,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_prepared_registry_rebootstrap(
+        &mut self,
+        source_key: String,
+        target: RegistryRecoveryTarget<RegistryRebootstrapState>,
+    ) -> Result<(), RegistryLockRecoveryError> {
+        match target {
+            RegistryRecoveryTarget::Pinned { index, state, .. } => {
+                let registry = self
+                    .provider
+                    .get_mut(index)
+                    .and_then(|entry| entry.registry.as_mut())
+                    .ok_or_else(|| RegistryLockRecoveryError::ProviderStateNotFound {
+                        provider: source_key.clone(),
+                    })?;
+                state.residual.apply_to_registry(registry);
+                registry.sequence_anchor = RegistrySequenceAnchor::Unestablished;
+                self.unpinned_registry_ratchets.remove(&source_key);
+            }
+            RegistryRecoveryTarget::Unpinned { state } => {
+                if !self
+                    .unpinned_registry_ratchets
+                    .commit_rebootstrap(&source_key, state.residual)
+                {
+                    return Err(RegistryLockRecoveryError::ProviderStateNotFound {
+                        provider: source_key,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Prepare an explicit identity re-pin without mutating the lock file.
+    pub fn prepare_registry_identity_repin(
+        &mut self,
+        provider: &str,
+    ) -> Result<PreparedRegistryIdentityRepin<'_>, RegistryLockRecoveryError> {
+        let ResolvedRegistryRecovery { source_key, target } =
+            self.resolve_registry_recovery(provider)?;
+        let error_provider = source_key.clone();
+        let target =
+            target.try_map_state(|ratchets| ratchets.into_identity_repin_state(error_provider))?;
+        Ok(PreparedRegistryIdentityRepin {
+            lock_file: self,
+            source_key,
+            target,
+        })
+    }
+
+    /// Prepare an explicit registry re-bootstrap without mutating the lock file.
+    pub fn prepare_registry_rebootstrap(
+        &mut self,
+        provider: &str,
+    ) -> Result<PreparedRegistryRebootstrap<'_>, RegistryLockRecoveryError> {
+        let ResolvedRegistryRecovery { source_key, target } =
+            self.resolve_registry_recovery(provider)?;
+        let target = target.map_state(RegistryRatchets::into_rebootstrap_state);
+        Ok(PreparedRegistryRebootstrap {
+            lock_file: self,
+            source_key,
+            target,
+        })
+    }
+
     /// Find a revision-mode entry whose `resolved_sha` matches. Version and
     /// file entries can't have a resolved SHA, so they never match.
     pub fn find_by_source_and_sha(
@@ -930,15 +1446,17 @@ impl LockFile {
             };
             let source_key = canonical_lock_source(&entry.source);
             if let Some(unpinned) = self.unpinned_registry_ratchets.remove(&source_key) {
-                RegistryRatchets::from(&*registry)
-                    .merge(&unpinned)?
-                    .apply_to(registry);
+                unpinned.merge_into_registry(registry)?;
             }
         }
         Ok(())
     }
 
-    fn store_registry_ratchets(&mut self, source: &str, ratchets: RegistryRatchets) {
+    fn store_registry_ratchets(
+        &mut self,
+        source: &str,
+        ratchets: RegistryRatchets,
+    ) -> Result<(), RegistryIdentityPinConflict> {
         let source_key = canonical_lock_source(source);
         if let Some(registry) = self
             .provider
@@ -946,11 +1464,13 @@ impl LockFile {
             .find(|entry| Self::sources_match(&entry.source, &source_key))
             .and_then(|entry| entry.registry.as_mut())
         {
-            ratchets.apply_to(registry);
+            ratchets.merge_into_registry(registry)?;
             self.unpinned_registry_ratchets.remove(&source_key);
         } else {
-            self.unpinned_registry_ratchets.set(source_key, ratchets);
+            self.unpinned_registry_ratchets
+                .merge(source_key, ratchets)?;
         }
+        Ok(())
     }
 
     pub fn upsert(&mut self, entry: LockEntry<NoRegistryLock>) {
@@ -964,8 +1484,7 @@ impl LockFile {
     ) -> Result<(), RegistryIdentityPinConflict> {
         if let Some(registry) = entry.registry.as_mut() {
             let observed = self.known_registry_ratchets(&entry.source)?;
-            let merged = RegistryRatchets::from(&*registry).merge(&observed)?;
-            merged.apply_to(registry);
+            observed.merge_into_registry(registry)?;
         }
         self.upsert_entry(entry);
         Ok(())
@@ -1030,7 +1549,9 @@ impl<'a> PersistentLockFile<'a> {
             .known_registry_ratchets(&source_key)
             .map_err(|error| error.to_string())?;
         update(&mut ratchets)?;
-        persisted.store_registry_ratchets(&source_key, ratchets);
+        persisted
+            .store_registry_ratchets(&source_key, ratchets)
+            .map_err(|error| error.to_string())?;
         persisted.save(&self.path).map_err(|error| {
             format!(
                 "Failed to persist registry {observation} observation to {}: {error}",
@@ -1088,7 +1609,7 @@ impl<'a> PersistentLockFile<'a> {
         pin: IdentityPin,
     ) -> Result<(), String> {
         let verified = RegistryRatchets {
-            signature: RegistrySignatureProtection::Present(pin),
+            signature: RegistrySignatureProtection::RequiredPinned(pin),
             ..RegistryRatchets::default()
         };
         self.persist_registry_ratchets(source, "verified signature", |ratchets| {
@@ -1344,7 +1865,12 @@ const DEFAULT_REGISTRY_HOST: &str = "registry.carina-rs.dev";
 // observation cannot move that anchor, and true first contact has no numeric base.
 const MAX_SEQUENCE_FAST_FORWARD: u64 = 1_000_000;
 const MAX_SIGNATURE_BUNDLE_BYTES: usize = 1024 * 1024;
-const IDENTITY_REPIN_REMEDIATION: &str = "After verifying out-of-band that this is intended (a legitimate signing-identity change or a deliberate downgrade to a pre-signing version), remove that provider's entry from carina-providers.lock and re-run carina init to re-pin.";
+const IDENTITY_REPIN_REMEDIATION: &str = "After verifying out-of-band that the signing-identity change is intended, run `carina providers repin-identity <provider>` to clear only the identity pin, then re-run `carina init` to acquire and verify a new pin.";
+const SEQUENCE_REBOOTSTRAP_REMEDIATION: &str = "After verifying out-of-band that resetting registry freshness is intended, run `carina providers re-bootstrap <provider>` to clear only the persisted sequence observation and anchor, then re-run `carina init`.";
+
+fn recovery_remediation(template: &str, provider: &str) -> String {
+    template.replace("<provider>", provider)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProviderSource {
@@ -1516,15 +2042,23 @@ mod registry_listing_validation {
                         ));
                     };
                     if sequence < previous {
+                        let remediation = recovery_remediation(
+                            SEQUENCE_REBOOTSTRAP_REMEDIATION,
+                            &source.source_key(),
+                        );
                         return Err(format!(
-                            "registry sequence rollback for {}/{}: previous {}, got {}",
-                            source.namespace, source.name, previous, sequence
+                            "registry sequence rollback for {}/{}: previous {}, got {}. {}",
+                            source.namespace, source.name, previous, sequence, remediation
                         ));
                     }
                     if sequence.saturating_sub(previous) > MAX_SEQUENCE_FAST_FORWARD {
+                        let remediation = recovery_remediation(
+                            SEQUENCE_REBOOTSTRAP_REMEDIATION,
+                            &source.source_key(),
+                        );
                         return Err(format!(
-                            "registry sequence fast-forward for {}/{} is too large: established anchor {}, got {}",
-                            source.namespace, source.name, previous, sequence
+                            "registry sequence fast-forward for {}/{} is too large: established anchor {}, got {}. {}",
+                            source.namespace, source.name, previous, sequence, remediation
                         ));
                     }
                 }
@@ -1564,7 +2098,7 @@ mod registry_listing_validation {
                 sequence: sequence.clone(),
                 valid_until_present,
                 yanked_versions,
-                signature: RegistrySignatureProtection::Absent,
+                signature: RegistrySignatureProtection::NotRequired,
                 transparency_log_present: false,
             });
             Ok(Self {
@@ -2209,9 +2743,10 @@ fn verify_registry_lock_pin(
         .known_registry_ratchets(&source_key)
         .map_err(|error| error.to_string())?;
     let expected_identity = ratchets.signature.expected_identity();
-    if expected_identity.is_some() && signature.is_none() {
+    if ratchets.signature.is_required() && signature.is_none() {
+        let remediation = recovery_remediation(IDENTITY_REPIN_REMEDIATION, &source_key);
         return Err(format!(
-            "the resolved version of {source_key} has no registry signature, but carina-providers.lock records this provider as signed and identity-pinned; downgrades from signed to unsigned versions are refused and have no override. {IDENTITY_REPIN_REMEDIATION}"
+            "the resolved version of {source_key} has no registry signature, but carina-providers.lock records signatures as required for this provider; downgrades from signed to unsigned versions are refused and have no override. {remediation}"
         ));
     }
     if let (Some(expected_identity), Some(signature)) = (&expected_identity, signature) {
@@ -2219,8 +2754,9 @@ fn verify_registry_lock_pin(
         if signature.certificate_identity != certificate_identity
             || signature.certificate_oidc_issuer != certificate_oidc_issuer
         {
+            let remediation = recovery_remediation(IDENTITY_REPIN_REMEDIATION, &source_key);
             return Err(format!(
-                "registry signature identity for {source_key} differs from the carina-providers.lock pin; signature verification has no override. {IDENTITY_REPIN_REMEDIATION}"
+                "registry signature identity for {source_key} differs from the carina-providers.lock pin; signature verification has no override. {remediation}"
             ));
         }
     }
@@ -3416,7 +3952,7 @@ mod tests {
         "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download";
 
     fn signature_pin(identity: &str, issuer: &str) -> RegistrySignatureProtection {
-        RegistrySignatureProtection::Present(IdentityPin {
+        RegistrySignatureProtection::RequiredPinned(IdentityPin {
             certificate_identity: identity.into(),
             certificate_oidc_issuer: issuer.into(),
         })
@@ -3501,6 +4037,74 @@ mod tests {
         })
         .unwrap();
         toml::to_string_pretty(&lock).unwrap()
+    }
+
+    fn lock_with_registry_security_state(signature: RegistrySignatureProtection) -> LockFile {
+        LockFile {
+            version: LockFile::CURRENT_VERSION,
+            provider: vec![LockEntry {
+                name: "aws".into(),
+                source: "carina-rs/aws".into(),
+                kind: LockEntryKind::Version {
+                    version: "0.5.0".into(),
+                    constraint: Some("^0.5".into()),
+                },
+                sha256: "pinned-shasum".into(),
+                registry: Some(RegistryLock {
+                    resolved_hostname: "registry.carina-rs.dev".into(),
+                    api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
+                    discovery_sha256: "discovery-shasum".into(),
+                    sequence: RegistrySequence::Present(7),
+                    sequence_anchor: RegistrySequenceAnchor::Established(5),
+                    valid_until_present: true,
+                    yanked_versions: YankedRegistryVersions(BTreeSet::from(["0.4.0".into()])),
+                    signature,
+                    transparency_log_present: true,
+                }),
+            }],
+            unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
+        }
+    }
+
+    fn lock_with_duplicate_registry_source(signature: RegistrySignatureProtection) -> LockFile {
+        let mut lock = lock_with_registry_security_state(signature);
+        let protected = lock.provider.pop().unwrap();
+        lock.provider = vec![
+            version_entry::<RegistryLock>("carina-rs/aws", "0.4.0"),
+            protected,
+        ];
+        lock
+    }
+
+    fn assert_known_yank_is_still_refused(lock: &LockFile) {
+        let source = match parse_provider_source("carina-rs/aws").unwrap() {
+            ProviderSource::Registry(source) => source,
+            ProviderSource::GithubDirect { .. } => unreachable!(),
+        };
+        let known = lock.known_registry_ratchets("carina-rs/aws").unwrap();
+        assert!(
+            known.yanked_versions.contains("0.4.0"),
+            "the consumer-facing ratchets must retain the recorded yank"
+        );
+        let listing = RegistryVersions {
+            sequence: Some(7),
+            valid_until: Some("2999-01-01T00:00:00Z".into()),
+            versions: vec![RegistryVersion {
+                version: "0.4.0".into(),
+                yanked: false,
+            }],
+        };
+        let error = match ValidatedRegistryListing::validate(
+            &source,
+            &listing,
+            &known,
+            lock.registry_sequence_anchor("carina-rs/aws"),
+        ) {
+            Ok(_) => panic!("an explicitly recorded yank must not be reversible"),
+            Err(error) => error,
+        };
+        assert!(error.contains("yanked flag disappeared"), "{error}");
+        assert!(error.contains("0.4.0"), "{error}");
     }
 
     fn lock_toml_error(content: &str) -> LockFileError {
@@ -4143,7 +4747,7 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
     }
 
     #[test]
-    fn lock_load_rejects_stripped_registry_identity_pin() {
+    fn lock_load_accepts_signature_required_while_awaiting_identity_pin() {
         let stripped = fully_protected_lock_toml()
             .lines()
             .filter(|line| {
@@ -4152,7 +4756,31 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert_lock_toml_is_rejected(&stripped);
+        let lock = LockFile::from_toml_str(&stripped, Path::new("carina-providers.lock"))
+            .expect("required-but-unpinned signature state must be representable");
+        assert_eq!(
+            lock.known_registry_ratchets("carina-rs/aws")
+                .unwrap()
+                .signature,
+            RegistrySignatureProtection::RequiredUnpinned
+        );
+    }
+
+    #[test]
+    fn lock_load_rejects_identity_when_signature_is_not_required() {
+        let contradictory = fully_protected_lock_toml()
+            .replace("signature_present = true\n", "signature_present = false\n");
+        assert_lock_toml_is_rejected(&contradictory);
+    }
+
+    #[test]
+    fn lock_load_rejects_partial_signature_identity_pin() {
+        let contradictory = fully_protected_lock_toml()
+            .lines()
+            .filter(|line| !line.starts_with("certificate_oidc_issuer"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_lock_toml_is_rejected(&contradictory);
     }
 
     #[test]
@@ -4218,7 +4846,7 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
                     sequence_anchor: RegistrySequenceAnchor::Established(7),
                     valid_until_present: true,
                     yanked_versions: YankedRegistryVersions::default(),
-                    signature: RegistrySignatureProtection::Present(IdentityPin {
+                    signature: RegistrySignatureProtection::RequiredPinned(IdentityPin {
                         certificate_identity: SIGNED_FIXTURE_IDENTITY.into(),
                         certificate_oidc_issuer: SIGNED_FIXTURE_ISSUER.into(),
                     }),
@@ -4258,6 +4886,549 @@ transparency_log_present = false
         let reparsed =
             LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock")).unwrap();
         assert_eq!(toml::to_string_pretty(&reparsed).unwrap(), expected);
+    }
+
+    #[test]
+    fn registry_signature_states_roundtrip_through_lock_and_ratchet_serializers() {
+        let states = [
+            RegistrySignatureProtection::NotRequired,
+            RegistrySignatureProtection::RequiredUnpinned,
+            signature_pin("identity-a", "issuer-a"),
+        ];
+
+        for signature in states {
+            let lock = lock_with_registry_security_state(signature.clone());
+            let serialized_lock = toml::to_string_pretty(&lock).unwrap();
+            let reparsed_lock =
+                LockFile::from_toml_str(&serialized_lock, Path::new("carina-providers.lock"))
+                    .unwrap();
+            assert_eq!(
+                reparsed_lock
+                    .known_registry_ratchets("carina-rs/aws")
+                    .unwrap()
+                    .signature,
+                signature
+            );
+
+            let ratchets = RegistryRatchets {
+                signature: signature.clone(),
+                ..RegistryRatchets::default()
+            };
+            let serialized_ratchets = toml::to_string(&ratchets).unwrap();
+            let reparsed_ratchets: RegistryRatchets = toml::from_str(&serialized_ratchets).unwrap();
+            assert_eq!(reparsed_ratchets.signature, signature);
+        }
+    }
+
+    #[test]
+    fn registry_ratchet_serializer_rejects_contradictory_signature_encodings() {
+        for encoded in [
+            RegistryRatchetsSerde {
+                sequence_present: false,
+                sequence: None,
+                valid_until_present: false,
+                yanked_versions: BTreeSet::new(),
+                signature_present: false,
+                certificate_identity: Some("identity-a".into()),
+                certificate_oidc_issuer: Some("issuer-a".into()),
+                transparency_log_present: false,
+            },
+            RegistryRatchetsSerde {
+                sequence_present: false,
+                sequence: None,
+                valid_until_present: false,
+                yanked_versions: BTreeSet::new(),
+                signature_present: true,
+                certificate_identity: Some("identity-a".into()),
+                certificate_oidc_issuer: None,
+                transparency_log_present: false,
+            },
+        ] {
+            assert!(matches!(
+                RegistryRatchets::try_from(encoded),
+                Err(RegistryLockError::InconsistentSignature)
+            ));
+        }
+    }
+
+    #[test]
+    fn registry_signature_merge_retains_requirement_and_any_existing_pin() {
+        let awaiting = RegistryRatchets {
+            signature: RegistrySignatureProtection::RequiredUnpinned,
+            ..RegistryRatchets::default()
+        };
+        let pinned = RegistryRatchets {
+            signature: signature_pin("identity-a", "issuer-a"),
+            ..RegistryRatchets::default()
+        };
+
+        assert_eq!(
+            RegistryRatchets::default()
+                .merge(&awaiting)
+                .unwrap()
+                .signature,
+            RegistrySignatureProtection::RequiredUnpinned
+        );
+        assert_eq!(
+            awaiting.clone().merge(&pinned).unwrap().signature,
+            signature_pin("identity-a", "issuer-a")
+        );
+        assert_eq!(
+            pinned.merge(&awaiting).unwrap().signature,
+            signature_pin("identity-a", "issuer-a")
+        );
+    }
+
+    #[test]
+    fn normal_registry_ratchet_storage_cannot_lower_signature_requirement() {
+        let source = "carina-rs/aws";
+        let downgrade = RegistryRatchets::default();
+
+        let mut pinned =
+            lock_with_registry_security_state(RegistrySignatureProtection::RequiredUnpinned);
+        pinned
+            .store_registry_ratchets(source, downgrade.clone())
+            .unwrap();
+        assert!(
+            pinned.provider[0]
+                .registry
+                .as_ref()
+                .unwrap()
+                .signature
+                .is_required()
+        );
+
+        let mut unpinned = LockFile::default();
+        unpinned
+            .store_registry_ratchets(
+                source,
+                RegistryRatchets {
+                    signature: RegistrySignatureProtection::RequiredUnpinned,
+                    ..RegistryRatchets::default()
+                },
+            )
+            .unwrap();
+        unpinned.store_registry_ratchets(source, downgrade).unwrap();
+        assert!(
+            unpinned
+                .known_registry_ratchets(source)
+                .unwrap()
+                .signature
+                .is_required()
+        );
+    }
+
+    #[test]
+    fn rebootstrap_uses_one_duplicate_entry_for_preview_and_commit() {
+        let mut lock = lock_with_duplicate_registry_source(signature_pin("identity-a", "issuer-a"));
+        let before = lock.provider[1].registry.as_ref().unwrap().clone();
+
+        let recovery = lock.prepare_registry_rebootstrap("carina-rs/aws").unwrap();
+        let preview = recovery.freshness();
+        assert_eq!(preview.sequence, before.sequence.value());
+        assert_eq!(preview.sequence_anchor, before.sequence_anchor.value());
+        recovery.commit().unwrap();
+
+        assert!(lock.provider[0].registry.is_none());
+        let after = lock.provider[1].registry.as_ref().unwrap();
+        assert_eq!(after.sequence, RegistrySequence::Absent);
+        assert_eq!(after.sequence_anchor, RegistrySequenceAnchor::Unestablished);
+        assert_eq!(after.yanked_versions, before.yanked_versions);
+        assert_eq!(after.signature, before.signature);
+        assert_eq!(after.valid_until_present, before.valid_until_present);
+        assert_eq!(
+            after.transparency_log_present,
+            before.transparency_log_present
+        );
+    }
+
+    #[test]
+    fn repin_identity_uses_one_duplicate_entry_for_preview_and_commit() {
+        let mut lock = lock_with_duplicate_registry_source(signature_pin("identity-a", "issuer-a"));
+        let before = lock.provider[1].registry.as_ref().unwrap().clone();
+
+        let recovery = lock
+            .prepare_registry_identity_repin("carina-rs/aws")
+            .unwrap();
+        assert_eq!(
+            recovery.identity_pin(),
+            before.signature.identity_pin().unwrap()
+        );
+        recovery.commit().unwrap();
+
+        assert!(lock.provider[0].registry.is_none());
+        let after = lock.provider[1].registry.as_ref().unwrap();
+        assert_eq!(
+            after.signature,
+            RegistrySignatureProtection::RequiredUnpinned
+        );
+        assert_eq!(after.sequence, before.sequence);
+        assert_eq!(after.sequence_anchor, before.sequence_anchor);
+        assert_eq!(after.yanked_versions, before.yanked_versions);
+        assert_eq!(after.valid_until_present, before.valid_until_present);
+        assert_eq!(
+            after.transparency_log_present,
+            before.transparency_log_present
+        );
+    }
+
+    #[test]
+    fn repin_identity_preserves_yank_and_all_other_registry_ratchets() {
+        let mut lock = lock_with_registry_security_state(signature_pin("identity-a", "issuer-a"));
+        let before_entry = lock.find_by_source("carina-rs/aws").unwrap().clone();
+
+        let recovery = lock
+            .prepare_registry_identity_repin("registry.carina-rs.dev/carina-rs/aws")
+            .unwrap();
+        let preview = recovery.identity_pin().clone();
+        assert_eq!(preview.certificate_identity, "identity-a");
+        recovery.commit().unwrap();
+
+        let ratchets = lock.known_registry_ratchets("carina-rs/aws").unwrap();
+        assert_known_yank_is_still_refused(&lock);
+        assert_eq!(ratchets.sequence, RegistrySequence::Present(7));
+        assert!(ratchets.valid_until_present);
+        assert!(ratchets.transparency_log_present);
+        assert_eq!(
+            ratchets.signature,
+            RegistrySignatureProtection::RequiredUnpinned
+        );
+        assert_eq!(
+            lock.registry_sequence_anchor("carina-rs/aws"),
+            RegistrySequenceAnchor::Established(5)
+        );
+        let after_entry = lock.find_by_source("carina-rs/aws").unwrap();
+        assert_eq!(after_entry.sha256, before_entry.sha256);
+        assert_eq!(after_entry.kind, before_entry.kind);
+    }
+
+    #[test]
+    fn repin_identity_retains_signature_requirement_and_refuses_unsigned_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lock = lock_with_registry_security_state(signature_pin("identity-a", "issuer-a"));
+        lock.prepare_registry_identity_repin("carina-rs/aws")
+            .unwrap()
+            .commit()
+            .unwrap();
+        let source = match parse_provider_source("carina-rs/aws").unwrap() {
+            ProviderSource::Registry(source) => source,
+            ProviderSource::GithubDirect { .. } => unreachable!(),
+        };
+        let registry = ResolvedRegistry {
+            hostname: "registry.carina-rs.dev".into(),
+            api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
+            discovery_sha256: "discovery-shasum".into(),
+        };
+        let lock_path = dir.path().join("carina-providers.lock");
+        let mut persistent = PersistentLockFile::new(&mut lock, lock_path);
+
+        let error = match verify_registry_lock_pin(
+            &mut persistent,
+            &source,
+            "0.5.0",
+            "pinned-shasum",
+            &registry,
+            None,
+            true,
+        ) {
+            Ok(_) => panic!("repinning an identity must not permit an unsigned artifact"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("signed to unsigned"), "{error}");
+        assert!(error.contains("carina providers repin-identity"), "{error}");
+    }
+
+    #[test]
+    fn rebootstrap_clears_freshness_together_and_preserves_other_security_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        let mut lock = lock_with_registry_security_state(signature_pin("identity-a", "issuer-a"));
+        let before_entry = lock.find_by_source("carina-rs/aws").unwrap().clone();
+
+        let recovery = lock.prepare_registry_rebootstrap("carina-rs/aws").unwrap();
+        let preview = recovery.freshness();
+        assert_eq!(preview.sequence, Some(7));
+        assert_eq!(preview.sequence_anchor, Some(5));
+        recovery.commit().unwrap();
+
+        let ratchets = lock.known_registry_ratchets("carina-rs/aws").unwrap();
+        assert_eq!(ratchets.sequence, RegistrySequence::Absent);
+        assert_known_yank_is_still_refused(&lock);
+        assert_eq!(ratchets.signature, signature_pin("identity-a", "issuer-a"));
+        assert!(ratchets.valid_until_present);
+        assert!(ratchets.transparency_log_present);
+        assert_eq!(
+            lock.registry_sequence_anchor("carina-rs/aws"),
+            RegistrySequenceAnchor::Unestablished
+        );
+        let after_entry = lock.find_by_source("carina-rs/aws").unwrap();
+        assert_eq!(after_entry.sha256, before_entry.sha256);
+        assert_eq!(after_entry.kind, before_entry.kind);
+
+        lock.save(&lock_path).unwrap();
+        let reloaded = LockFile::load(&lock_path).unwrap().unwrap();
+        assert_eq!(
+            reloaded.known_registry_ratchets("carina-rs/aws").unwrap(),
+            ratchets
+        );
+        assert_eq!(
+            reloaded.registry_sequence_anchor("carina-rs/aws"),
+            RegistrySequenceAnchor::Unestablished
+        );
+    }
+
+    #[test]
+    fn rebootstrap_makes_missing_sequence_first_contact_instead_of_downgrade() {
+        let source = match parse_provider_source("carina-rs/aws").unwrap() {
+            ProviderSource::Registry(source) => source,
+            ProviderSource::GithubDirect { .. } => unreachable!(),
+        };
+        let listing_without_sequence = RegistryVersions {
+            sequence: None,
+            valid_until: Some("2999-01-01T00:00:00Z".into()),
+            versions: vec![RegistryVersion {
+                version: "0.4.0".into(),
+                yanked: true,
+            }],
+        };
+        let mut lock = lock_with_registry_security_state(signature_pin("identity-a", "issuer-a"));
+
+        let before = lock.known_registry_ratchets("carina-rs/aws").unwrap();
+        let error = match ValidatedRegistryListing::validate(
+            &source,
+            &listing_without_sequence,
+            &before,
+            lock.registry_sequence_anchor("carina-rs/aws"),
+        ) {
+            Ok(_) => panic!("an established sequence anchor must reject a missing sequence"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("registry sequence field disappeared"),
+            "{error}"
+        );
+
+        lock.prepare_registry_rebootstrap("carina-rs/aws")
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        let after = lock.known_registry_ratchets("carina-rs/aws").unwrap();
+        assert_eq!(after.sequence, RegistrySequence::Absent);
+        assert_eq!(
+            lock.registry_sequence_anchor("carina-rs/aws"),
+            RegistrySequenceAnchor::Unestablished
+        );
+        let validated = ValidatedRegistryListing::validate(
+            &source,
+            &listing_without_sequence,
+            &after,
+            lock.registry_sequence_anchor("carina-rs/aws"),
+        )
+        .expect("re-bootstrap must make a sequence-less listing first contact");
+        let (_, validated_sequence) = validated.into_parts();
+        assert_eq!(
+            validated_sequence.into_anchor(),
+            RegistrySequenceAnchor::Unestablished
+        );
+    }
+
+    #[test]
+    fn registry_recoveries_are_independent_and_order_independent() {
+        let original = lock_with_registry_security_state(signature_pin("identity-a", "issuer-a"));
+        let original_registry = original.provider[0].registry.as_ref().unwrap().clone();
+
+        let mut repin_only = original.clone();
+        repin_only
+            .prepare_registry_identity_repin("carina-rs/aws")
+            .unwrap()
+            .commit()
+            .unwrap();
+        let repinned_registry = repin_only.provider[0].registry.as_ref().unwrap();
+        assert_eq!(repinned_registry.sequence, original_registry.sequence);
+        assert_eq!(
+            repinned_registry.sequence_anchor,
+            original_registry.sequence_anchor
+        );
+
+        let mut rebootstrap_only = original.clone();
+        rebootstrap_only
+            .prepare_registry_rebootstrap("carina-rs/aws")
+            .unwrap()
+            .commit()
+            .unwrap();
+        let rebootstrap_registry = rebootstrap_only.provider[0].registry.as_ref().unwrap();
+        assert_eq!(rebootstrap_registry.signature, original_registry.signature);
+        assert!(rebootstrap_registry.signature.is_required());
+        assert_eq!(
+            rebootstrap_registry.signature.identity_pin(),
+            original_registry.signature.identity_pin()
+        );
+
+        let mut repin_then_rebootstrap = original.clone();
+        repin_then_rebootstrap
+            .prepare_registry_identity_repin("carina-rs/aws")
+            .unwrap()
+            .commit()
+            .unwrap();
+        repin_then_rebootstrap
+            .prepare_registry_rebootstrap("carina-rs/aws")
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        let mut rebootstrap_then_repin = original.clone();
+        rebootstrap_then_repin
+            .prepare_registry_rebootstrap("carina-rs/aws")
+            .unwrap()
+            .commit()
+            .unwrap();
+        rebootstrap_then_repin
+            .prepare_registry_identity_repin("carina-rs/aws")
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        assert_eq!(
+            toml::to_string_pretty(&repin_then_rebootstrap).unwrap(),
+            toml::to_string_pretty(&rebootstrap_then_repin).unwrap(),
+            "the two recovery operations must commute"
+        );
+
+        let mut expected = original;
+        let expected_registry = expected.provider[0].registry.as_mut().unwrap();
+        expected_registry.sequence = RegistrySequence::Absent;
+        expected_registry.sequence_anchor = RegistrySequenceAnchor::Unestablished;
+        expected_registry.signature = RegistrySignatureProtection::RequiredUnpinned;
+        assert_eq!(
+            toml::to_string_pretty(&repin_then_rebootstrap).unwrap(),
+            toml::to_string_pretty(&expected).unwrap(),
+            "running both recoveries must change exactly freshness and the identity pin"
+        );
+
+        let final_entry = &repin_then_rebootstrap.provider[0];
+        let final_registry = final_entry.registry.as_ref().unwrap();
+        assert_eq!(final_entry.sha256, "pinned-shasum");
+        assert!(final_registry.yanked_versions.contains("0.4.0"));
+        assert!(final_registry.valid_until_present);
+        assert!(final_registry.transparency_log_present);
+    }
+
+    #[test]
+    fn prepared_registry_rebootstrap_clears_pair_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        let mut lock = lock_with_registry_security_state(signature_pin("identity-a", "issuer-a"));
+
+        let recovery = lock.prepare_registry_rebootstrap("carina-rs/aws").unwrap();
+        let discarded = recovery.freshness();
+
+        assert_eq!(discarded.sequence, Some(7));
+        assert_eq!(discarded.sequence_anchor, Some(5));
+        recovery.commit().unwrap();
+        assert_eq!(
+            lock.known_registry_ratchets("carina-rs/aws")
+                .unwrap()
+                .sequence,
+            RegistrySequence::Absent
+        );
+        assert_eq!(
+            lock.registry_sequence_anchor("carina-rs/aws"),
+            RegistrySequenceAnchor::Unestablished
+        );
+
+        lock.save(&lock_path).unwrap();
+        let reloaded = LockFile::load(&lock_path).unwrap().unwrap();
+        assert_eq!(
+            reloaded
+                .known_registry_ratchets("carina-rs/aws")
+                .unwrap()
+                .sequence,
+            RegistrySequence::Absent
+        );
+        assert_eq!(
+            reloaded.registry_sequence_anchor("carina-rs/aws"),
+            RegistrySequenceAnchor::Unestablished
+        );
+    }
+
+    #[test]
+    fn prepared_unpinned_rebootstrap_uses_the_lock_anchor_value() {
+        let source = "carina-rs/aws";
+        let mut lock = LockFile::default();
+        lock.unpinned_registry_ratchets
+            .merge(
+                source.into(),
+                RegistryRatchets {
+                    sequence: RegistrySequence::Present(7),
+                    ..RegistryRatchets::default()
+                },
+            )
+            .unwrap();
+
+        let recovery = lock.prepare_registry_rebootstrap(source).unwrap();
+        assert_eq!(
+            recovery.freshness(),
+            RegistryFreshness {
+                sequence: Some(7),
+                sequence_anchor: None,
+            }
+        );
+        recovery.commit().unwrap();
+
+        assert_eq!(
+            lock.known_registry_ratchets(source).unwrap().sequence,
+            RegistrySequence::Absent
+        );
+        assert_eq!(
+            lock.registry_sequence_anchor(source),
+            RegistrySequenceAnchor::Unestablished
+        );
+    }
+
+    #[test]
+    fn dropping_prepared_recoveries_leaves_the_lock_unchanged() {
+        let mut lock = lock_with_registry_security_state(signature_pin("identity-a", "issuer-a"));
+        let before = lock.known_registry_ratchets("carina-rs/aws").unwrap();
+        let before_anchor = lock.registry_sequence_anchor("carina-rs/aws");
+
+        drop(
+            lock.prepare_registry_identity_repin("carina-rs/aws")
+                .unwrap(),
+        );
+        assert_eq!(
+            lock.known_registry_ratchets("carina-rs/aws").unwrap(),
+            before
+        );
+        assert_eq!(
+            lock.registry_sequence_anchor("carina-rs/aws"),
+            before_anchor
+        );
+
+        drop(lock.prepare_registry_rebootstrap("carina-rs/aws").unwrap());
+        assert_eq!(
+            lock.known_registry_ratchets("carina-rs/aws").unwrap(),
+            before
+        );
+        assert_eq!(
+            lock.registry_sequence_anchor("carina-rs/aws"),
+            before_anchor
+        );
+    }
+
+    #[test]
+    fn recovery_remediations_name_operations_without_lock_entry_deletion_advice() {
+        assert!(IDENTITY_REPIN_REMEDIATION.contains("carina providers repin-identity <provider>"));
+        assert!(
+            SEQUENCE_REBOOTSTRAP_REMEDIATION.contains("carina providers re-bootstrap <provider>")
+        );
+        for remediation in [IDENTITY_REPIN_REMEDIATION, SEQUENCE_REBOOTSTRAP_REMEDIATION] {
+            let remediation = remediation.to_ascii_lowercase();
+            assert!(!remediation.contains("delete"), "{remediation}");
+            assert!(!remediation.contains("remove"), "{remediation}");
+            assert!(!remediation.contains("lock entry"), "{remediation}");
+        }
     }
 
     #[test]
@@ -4328,7 +5499,7 @@ transparency_log_present = true
                 sequence_anchor: RegistrySequenceAnchor::Unestablished,
                 valid_until_present: false,
                 yanked_versions: YankedRegistryVersions::default(),
-                signature: RegistrySignatureProtection::Absent,
+                signature: RegistrySignatureProtection::NotRequired,
                 transparency_log_present: false,
             }),
         })
@@ -4339,9 +5510,10 @@ transparency_log_present = true
             ..RegistryRatchets::default()
         };
         lock.unpinned_registry_ratchets
-            .set(source.into(), observed.clone());
+            .merge(source.into(), observed.clone())
+            .unwrap();
 
-        lock.store_registry_ratchets(source, observed);
+        lock.store_registry_ratchets(source, observed).unwrap();
 
         assert!(lock.unpinned_registry_ratchets.get(source).is_none());
         let registry = lock.provider[0].registry.as_ref().unwrap();
@@ -4836,7 +6008,7 @@ transparency_log_present = true
     }
 
     #[test]
-    fn registry_ratchet_storage_identity_repin_remediation_clears_baseline() {
+    fn deleting_registry_entry_drops_the_security_baseline() {
         let dir = tempfile::tempdir().unwrap();
         let config = provider_config("carina-rs/aws", None);
         resolve_single_config_with_http(
@@ -4866,7 +6038,7 @@ transparency_log_present = true
             r#"{"sequence":10000000,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
         let path = resolve_single_config_with_http(dir.path(), &config, &unsigned_http)
-            .expect("removing the provider TOML block must establish a fresh baseline");
+            .expect("manual entry deletion demonstrates why recovery must preserve ratchets");
 
         assert_eq!(fs::read(path).unwrap(), SIGNED_FIXTURE_ARTIFACT);
         assert_eq!(
@@ -5553,7 +6725,7 @@ transparency_log_present = true
         .unwrap_err();
 
         assert!(error.contains("signature"), "{error}");
-        assert!(error.contains("identity-pinned"), "{error}");
+        assert!(error.contains("signatures as required"), "{error}");
     }
 
     #[test]
@@ -5908,7 +7080,7 @@ transparency_log_present = true
             .registry
             .as_ref()
             .unwrap();
-        let RegistrySignatureProtection::Present(pin) = &registry.signature else {
+        let RegistrySignatureProtection::RequiredPinned(pin) = &registry.signature else {
             panic!("verified signature must carry its identity pin");
         };
         assert_eq!(pin.certificate_identity, SIGNED_FIXTURE_IDENTITY);
@@ -6047,7 +7219,10 @@ transparency_log_present = true
         assert!(error.contains("identity"), "{error}");
         assert!(error.contains("no override"), "{error}");
         assert!(error.contains("verifying out-of-band"), "{error}");
-        assert!(error.contains("re-run carina init to re-pin"), "{error}");
+        assert!(
+            error.contains("carina providers repin-identity carina-rs/aws"),
+            "{error}"
+        );
         assert!(!mismatched_http.was_requested("https://downloads.example.test/aws.wasm"));
         assert!(!mismatched_http.was_requested(SIGNED_FIXTURE_BUNDLE_URL));
     }
@@ -6086,9 +7261,12 @@ transparency_log_present = true
 
         assert!(error.contains("signature"), "{error}");
         assert!(error.contains("no override"), "{error}");
-        assert!(error.contains("identity-pinned"), "{error}");
+        assert!(error.contains("signatures as required"), "{error}");
         assert!(error.contains("verifying out-of-band"), "{error}");
-        assert!(error.contains("re-run carina init to re-pin"), "{error}");
+        assert!(
+            error.contains("carina providers repin-identity carina-rs/aws"),
+            "{error}"
+        );
         assert!(!unsigned_http.was_requested("https://downloads.example.test/aws.wasm"));
     }
 
@@ -6139,7 +7317,7 @@ transparency_log_present = true
             .registry
             .as_ref()
             .unwrap();
-        let RegistrySignatureProtection::Present(pin) = &registry.signature else {
+        let RegistrySignatureProtection::RequiredPinned(pin) = &registry.signature else {
             panic!("signed registry lock must retain its identity pin");
         };
         assert_eq!(pin.certificate_identity, SIGNED_FIXTURE_IDENTITY);
@@ -6529,7 +7707,7 @@ transparency_log_present = false
             "https://registry.carina-rs.dev/v1/providers/"
         );
         assert_eq!(registry.sequence, RegistrySequence::Present(7));
-        assert_eq!(registry.signature, RegistrySignatureProtection::Absent);
+        assert_eq!(registry.signature, RegistrySignatureProtection::NotRequired);
     }
 
     #[test]
@@ -6619,7 +7797,7 @@ transparency_log_present = false
                 sequence_anchor: RegistrySequenceAnchor::Established(7),
                 valid_until_present: true,
                 yanked_versions: YankedRegistryVersions::default(),
-                signature: RegistrySignatureProtection::Absent,
+                signature: RegistrySignatureProtection::NotRequired,
                 transparency_log_present: false,
             }),
         })
@@ -6695,7 +7873,7 @@ transparency_log_present = false
                 sequence_anchor: RegistrySequenceAnchor::Established(7),
                 valid_until_present: true,
                 yanked_versions: YankedRegistryVersions::default(),
-                signature: RegistrySignatureProtection::Absent,
+                signature: RegistrySignatureProtection::NotRequired,
                 transparency_log_present: false,
             }),
         })
@@ -6865,7 +8043,7 @@ transparency_log_present = false
                     sequence_anchor: RegistrySequenceAnchor::Established(7),
                     valid_until_present: true,
                     yanked_versions: YankedRegistryVersions::default(),
-                    signature: RegistrySignatureProtection::Absent,
+                    signature: RegistrySignatureProtection::NotRequired,
                     transparency_log_present: false,
                 }),
             })
@@ -6881,6 +8059,10 @@ transparency_log_present = false
         )
         .unwrap_err();
         assert!(err.contains("sequence"), "{err}");
+        assert!(
+            err.contains("carina providers re-bootstrap carina-rs/aws"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -6910,7 +8092,7 @@ transparency_log_present = false
                     sequence_anchor: RegistrySequenceAnchor::Established(7),
                     valid_until_present: false,
                     yanked_versions: YankedRegistryVersions::default(),
-                    signature: RegistrySignatureProtection::Absent,
+                    signature: RegistrySignatureProtection::NotRequired,
                     transparency_log_present: false,
                 }),
             })
@@ -6955,7 +8137,7 @@ transparency_log_present = false
                     sequence_anchor: RegistrySequenceAnchor::Established(7),
                     valid_until_present: true,
                     yanked_versions: YankedRegistryVersions::default(),
-                    signature: RegistrySignatureProtection::Absent,
+                    signature: RegistrySignatureProtection::NotRequired,
                     transparency_log_present: false,
                 }),
             })
@@ -7000,7 +8182,7 @@ transparency_log_present = false
                     sequence_anchor: RegistrySequenceAnchor::Established(7),
                     valid_until_present: true,
                     yanked_versions: YankedRegistryVersions::default(),
-                    signature: RegistrySignatureProtection::Absent,
+                    signature: RegistrySignatureProtection::NotRequired,
                     transparency_log_present: false,
                 }),
             })
@@ -7016,6 +8198,10 @@ transparency_log_present = false
         )
         .unwrap_err();
         assert!(err.contains("sequence fast-forward"), "{err}");
+        assert!(
+            err.contains("carina providers re-bootstrap carina-rs/aws"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -7066,7 +8252,7 @@ transparency_log_present = false
         .unwrap_err();
         assert!(
             err.contains(
-                "the resolved version of carina-rs/aws has no registry signature, but carina-providers.lock records this provider as signed"
+                "the resolved version of carina-rs/aws has no registry signature, but carina-providers.lock records signatures as required for this provider"
             ),
             "{err}"
         );
@@ -7075,10 +8261,9 @@ transparency_log_present = false
             "{err}"
         );
         assert!(
-            err.contains("deliberate downgrade to a pre-signing version"),
+            err.contains("carina providers repin-identity carina-rs/aws"),
             "{err}"
         );
-        assert!(err.contains("re-run carina init to re-pin"), "{err}");
     }
 
     #[test]
