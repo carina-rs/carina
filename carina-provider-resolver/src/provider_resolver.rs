@@ -1044,17 +1044,29 @@ impl RegistryLock {
 
 /// The full carina-providers.lock file.
 ///
-/// `LockFile` deliberately implements only `Serialize`. All deserialization is
-/// routed through [`Self::load`], which checks the format version before the
-/// current schema can consume or rewrite the file.
-#[derive(Debug, Clone, Serialize)]
+/// `LockFile` deliberately implements neither `Serialize` nor `Deserialize`.
+/// Serialization stays behind the private seam used by [`Self::save`], while
+/// deserialization is routed through [`Self::load`], which checks the format
+/// version before the current schema can consume or rewrite the file.
+#[derive(Debug, Clone)]
 pub struct LockFile {
     version: u32,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     registry_host: BTreeMap<String, RegistryHostLock>,
     pub provider: Vec<LockEntry<RegistryLock>>,
-    #[serde(default, skip_serializing_if = "UnpinnedRegistryRatchets::is_empty")]
     unpinned_registry_ratchets: UnpinnedRegistryRatchets,
+}
+
+/// The crate-internal serialization view of [`LockFile`]. Field order and
+/// omission rules are part of the lock-file byte format and must stay aligned
+/// with the former direct `LockFile` serialization.
+#[derive(Serialize)]
+struct SerializableLockFile<'a> {
+    version: &'a u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    registry_host: &'a BTreeMap<String, RegistryHostLock>,
+    provider: &'a Vec<LockEntry<RegistryLock>>,
+    #[serde(default, skip_serializing_if = "UnpinnedRegistryRatchets::is_empty")]
+    unpinned_registry_ratchets: &'a UnpinnedRegistryRatchets,
 }
 
 mod registry_lock_with_host {
@@ -1546,6 +1558,15 @@ impl LockFile {
         Ok(lock)
     }
 
+    fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string_pretty(&SerializableLockFile {
+            version: &self.version,
+            registry_host: &self.registry_host,
+            provider: &self.provider,
+            unpinned_registry_ratchets: &self.unpinned_registry_ratchets,
+        })
+    }
+
     pub fn save(&self, path: &Path) -> io::Result<()> {
         // rename replaces a symlink itself, unlike fs::write. Resolve the
         // target first so every durability and replacement operation occurs
@@ -1555,7 +1576,8 @@ impl LockFile {
         // can leave that name untouched.
         let path = resolve_lock_file_save_path(path)?;
         let parent = resolve_parent(&path);
-        let content = toml::to_string_pretty(self)
+        let content = self
+            .to_toml_string()
             .map_err(|e| io::Error::other(format!("Failed to serialize lock file: {e}")))?;
 
         #[cfg(unix)]
@@ -4525,7 +4547,7 @@ mod tests {
             registry_host_lock("https://registry.carina-rs.dev/v1/providers/", "def"),
         )
         .unwrap();
-        toml::to_string_pretty(&lock).unwrap()
+        lock.to_toml_string().unwrap()
     }
 
     fn lock_with_registry_security_state(signature: RegistrySignatureProtection) -> LockFile {
@@ -4994,7 +5016,7 @@ mod tests {
             }],
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
-        let toml_str = toml::to_string_pretty(&lock).unwrap();
+        let toml_str = lock.to_toml_string().unwrap();
         assert!(
             toml_str.contains("mode = \"version\""),
             "serialized form should tag the variant: {toml_str}"
@@ -5024,7 +5046,7 @@ mod tests {
             }],
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
-        let toml_str = toml::to_string_pretty(&lock).unwrap();
+        let toml_str = lock.to_toml_string().unwrap();
         assert!(
             toml_str.contains("mode = \"registryrevision\""),
             "serialized form should tag the variant: {toml_str}"
@@ -5053,7 +5075,7 @@ mod tests {
             )],
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
-        let toml_str = toml::to_string_pretty(&lock).unwrap();
+        let toml_str = lock.to_toml_string().unwrap();
         assert!(
             toml_str.contains("mode = \"revision\""),
             "serialized form should tag the variant: {toml_str}"
@@ -5082,7 +5104,7 @@ mod tests {
             }],
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
-        let toml_str = toml::to_string_pretty(&lock).unwrap();
+        let toml_str = lock.to_toml_string().unwrap();
         assert!(toml_str.contains("mode = \"file\""), "{toml_str}");
 
         let loaded =
@@ -5246,7 +5268,7 @@ sha256 = "abc"
     fn lock_file_save_replaces_existing_contents_with_complete_document() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("carina-providers.lock");
-        let old_content = toml::to_string_pretty(&LockFile::default()).unwrap();
+        let old_content = LockFile::default().to_toml_string().unwrap();
         fs::write(&lock_path, old_content).unwrap();
 
         let mut new_lock = LockFile::default();
@@ -5254,7 +5276,7 @@ sha256 = "abc"
             "github.com/carina-rs/carina-provider-awscc",
             "0.2.0",
         ));
-        let expected = toml::to_string_pretty(&new_lock).unwrap();
+        let expected = new_lock.to_toml_string().unwrap();
 
         new_lock.save(&lock_path).unwrap();
 
@@ -5330,7 +5352,7 @@ sha256 = "abc"
             "github.com/carina-rs/carina-provider-awscc",
             "0.2.0",
         ));
-        let expected = toml::to_string_pretty(&replacement).unwrap();
+        let expected = replacement.to_toml_string().unwrap();
 
         replacement
             .save(&lock_path)
@@ -5368,7 +5390,7 @@ sha256 = "abc"
             "github.com/carina-rs/carina-provider-awscc",
             "0.2.0",
         ));
-        let expected = toml::to_string_pretty(&replacement).unwrap();
+        let expected = replacement.to_toml_string().unwrap();
         replacement.save(&link_path).unwrap();
 
         assert!(
@@ -5400,7 +5422,7 @@ sha256 = "abc"
             "github.com/carina-rs/carina-provider-awscc",
             "0.2.0",
         ));
-        let expected = toml::to_string_pretty(&lock).unwrap();
+        let expected = lock.to_toml_string().unwrap();
         lock.save(&link_path).unwrap();
 
         assert!(
@@ -5436,7 +5458,7 @@ sha256 = "abc"
             "github.com/carina-rs/carina-provider-awscc",
             "0.2.0",
         ));
-        let expected = toml::to_string_pretty(&lock).unwrap();
+        let expected = lock.to_toml_string().unwrap();
         lock.save(&top_path).unwrap();
 
         assert!(
@@ -5503,7 +5525,7 @@ sha256 = "abc"
             "github.com/carina-rs/carina-provider-awscc",
             "0.1.0",
         ));
-        let original_content = toml::to_string_pretty(&original).unwrap();
+        let original_content = original.to_toml_string().unwrap();
         fs::write(&lock_path, &original_content).unwrap();
 
         let mut replacement = LockFile::default();
@@ -5511,7 +5533,7 @@ sha256 = "abc"
             "github.com/carina-rs/carina-provider-awscc",
             "0.2.0",
         ));
-        let expected_temporary_content = toml::to_string_pretty(&replacement).unwrap();
+        let expected_temporary_content = replacement.to_toml_string().unwrap();
         let expected_target = lock_path.clone();
 
         let save_error = with_lock_file_rename_hook(
@@ -5561,7 +5583,7 @@ sha256 = "abc"
 
         let lock_path = Path::new("carina-providers.lock");
         let lock = LockFile::default();
-        let expected = toml::to_string_pretty(&lock).unwrap();
+        let expected = lock.to_toml_string().unwrap();
 
         if std::env::var_os(CHILD_ENV).is_some() {
             lock.save(lock_path).unwrap();
@@ -5591,7 +5613,7 @@ sha256 = "abc"
 
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("carina-providers.lock");
-        let old_content = toml::to_string_pretty(&LockFile::default()).unwrap();
+        let old_content = LockFile::default().to_toml_string().unwrap();
         fs::write(&lock_path, old_content).unwrap();
         let old_inode = fs::metadata(&lock_path).unwrap().ino();
 
@@ -5897,12 +5919,12 @@ transparency_log_present = false
                 discovery_sha256: "one-host-pin".into(),
             })
         );
-        let round_tripped = toml::to_string_pretty(&lock).unwrap();
+        let round_tripped = lock.to_toml_string().unwrap();
         assert_eq!(round_tripped.matches("api_base_url =").count(), 1);
         assert_eq!(round_tripped.matches("discovery_sha256 =").count(), 1);
         assert_eq!(
             LockFile::from_toml_str(&round_tripped, Path::new("carina-providers.lock"))
-                .map(|lock| toml::to_string_pretty(&lock).unwrap())
+                .map(|lock| lock.to_toml_string().unwrap())
                 .unwrap(),
             round_tripped,
             "the host table must serialize deterministically"
@@ -6246,9 +6268,7 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         let registry = lock.provider[0].registry.as_ref().unwrap();
         assert!(registry.yanked_versions().is_empty());
         assert!(
-            toml::to_string_pretty(&lock)
-                .unwrap()
-                .starts_with("version = 2\n"),
+            lock.to_toml_string().unwrap().starts_with("version = 2\n"),
             "the defaulted yank set must remain stable within lock format v2"
         );
     }
@@ -6314,11 +6334,17 @@ transparency_log_present = false
 "#
         );
 
-        let serialized = toml::to_string_pretty(&lock).unwrap();
+        let serialized = lock.to_toml_string().unwrap();
         assert_eq!(serialized, expected);
         let reparsed =
             LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock")).unwrap();
-        assert_eq!(toml::to_string_pretty(&reparsed).unwrap(), expected);
+        assert_eq!(reparsed.to_toml_string().unwrap(), expected);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carina-providers.lock");
+        reparsed.save(&path).unwrap();
+        let saved = fs::read(path).unwrap();
+        assert_eq!(saved.as_slice(), expected.as_bytes());
     }
 
     #[test]
@@ -6331,7 +6357,7 @@ transparency_log_present = false
 
         for signature in states {
             let lock = lock_with_registry_security_state(signature.clone());
-            let serialized_lock = toml::to_string_pretty(&lock).unwrap();
+            let serialized_lock = lock.to_toml_string().unwrap();
             let reparsed_lock =
                 LockFile::from_toml_str(&serialized_lock, Path::new("carina-providers.lock"))
                     .unwrap();
@@ -6883,8 +6909,8 @@ transparency_log_present = false
             .unwrap();
 
         assert_eq!(
-            toml::to_string_pretty(&repin_then_rebootstrap).unwrap(),
-            toml::to_string_pretty(&rebootstrap_then_repin).unwrap(),
+            repin_then_rebootstrap.to_toml_string().unwrap(),
+            rebootstrap_then_repin.to_toml_string().unwrap(),
             "the two recovery operations must commute"
         );
 
@@ -6894,8 +6920,8 @@ transparency_log_present = false
         expected_registry.sequence_anchor = RegistrySequenceAnchor::Unestablished;
         expected_registry.signature = RegistrySignatureProtection::RequiredUnpinned;
         assert_eq!(
-            toml::to_string_pretty(&repin_then_rebootstrap).unwrap(),
-            toml::to_string_pretty(&expected).unwrap(),
+            repin_then_rebootstrap.to_toml_string().unwrap(),
+            expected.to_toml_string().unwrap(),
             "running both recoveries must change exactly freshness and the identity pin"
         );
 
@@ -7072,7 +7098,8 @@ transparency_log_present = true
         assert!(registry.transparency_log_present);
         assert!(lock.unpinned_registry_ratchets.is_empty());
         assert!(
-            !toml::to_string_pretty(&lock)
+            !lock
+                .to_toml_string()
                 .unwrap()
                 .contains("[unpinned_registry_ratchets."),
             "load-time attachment must leave each source in one persisted location"
