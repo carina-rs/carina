@@ -13,6 +13,7 @@ use carina_cli::commands::fmt::run_fmt;
 use carina_cli::commands::lint::run_lint;
 use carina_cli::commands::module::{ModuleCommands, run_module_command};
 use carina_cli::commands::plan::run_plan;
+use carina_cli::commands::providers::{ProvidersCommands, run_providers_command};
 use carina_cli::commands::skills;
 use carina_cli::commands::state::{StateCommands, run_force_unlock, run_state_command};
 use carina_cli::commands::validate::run_validate;
@@ -186,6 +187,11 @@ enum Commands {
     State {
         #[command(subcommand)]
         command: StateCommands,
+    },
+    /// Registry provider lock recovery commands
+    Providers {
+        #[command(subcommand)]
+        command: ProvidersCommands,
     },
     /// Download and install provider binaries; migrate state on backend change
     Init {
@@ -441,6 +447,7 @@ async fn main() {
             Commands::State { command } => {
                 run_state_command(command, &provider_context, shutdown.clone()).await
             }
+            Commands::Providers { command } => run_providers_command(command),
             Commands::Init {
                 path,
                 upgrade,
@@ -749,5 +756,23 @@ mod error_format_tests {
     #[test]
     fn plan_check_iam_with_strict_iam_parses() {
         assert!(Cli::try_parse_from(["carina", "plan", "--check-iam", "--strict-iam"]).is_ok());
+    }
+
+    #[test]
+    fn provider_recovery_commands_parse_with_optional_path() {
+        assert!(
+            Cli::try_parse_from(["carina", "providers", "repin-identity", "carina-rs/aws",])
+                .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "carina",
+                "providers",
+                "re-bootstrap",
+                "registry.example.test/acme/widget",
+                "/tmp/project",
+            ])
+            .is_ok()
+        );
     }
 }

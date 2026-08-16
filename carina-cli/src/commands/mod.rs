@@ -9,6 +9,7 @@ pub mod lint;
 pub mod migrate_state;
 pub mod module;
 pub mod plan;
+pub mod providers;
 pub(crate) mod shared;
 pub mod skills;
 pub mod state;
