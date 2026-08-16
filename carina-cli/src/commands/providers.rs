@@ -9,6 +9,19 @@ const PROVIDER_LOCK_FILE: &str = "carina-providers.lock";
 
 #[derive(clap::Subcommand)]
 pub enum ProvidersCommands {
+    /// Replace a registry host's discovery pin on its next resolution
+    RepinDiscovery {
+        /// Resolved registry hostname
+        host: String,
+
+        /// Proceed without typing the registry host to confirm
+        #[arg(long)]
+        force: bool,
+
+        /// Path to the directory containing carina-providers.lock
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Replace a registry provider's signing-identity pin on its next resolution
     RepinIdentity {
         /// Registry provider source: [hostname/]namespace/name
@@ -40,6 +53,9 @@ pub enum ProvidersCommands {
 
 pub fn run_providers_command(command: ProvidersCommands) -> Result<(), AppError> {
     match command {
+        ProvidersCommands::RepinDiscovery { host, force, path } => {
+            run_repin_discovery(&host, force, &path)
+        }
         ProvidersCommands::RepinIdentity {
             provider,
             force,
@@ -81,14 +97,14 @@ fn save_lock(lock: &LockFile, lock_path: &Path) -> Result<(), AppError> {
     })
 }
 
-fn confirm_recovery(provider: &str, force: bool) -> Result<bool, AppError> {
+fn confirm_recovery(target: &str, target_label: &str, force: bool) -> Result<bool, AppError> {
     if force {
         return Ok(true);
     }
 
     println!();
-    println!("Type the provider source to confirm recovery:");
-    print!("  Enter provider source: ");
+    println!("Type the {target_label} to confirm recovery:");
+    print!("  Enter {target_label}: ");
     io::stdout()
         .flush()
         .map_err(|error| AppError::Config(format!("Failed to print recovery prompt: {error}")))?;
@@ -99,13 +115,40 @@ fn confirm_recovery(provider: &str, force: bool) -> Result<bool, AppError> {
     })?;
 
     // Protocol §2 requires a contemporaneous operator instruction naming the
-    // target; echoing the provider here makes that instruction explicit.
-    if input.trim() != provider {
+    // target; echoing it here makes that instruction explicit.
+    if input.trim() != target {
         println!();
         println!("Recovery cancelled.");
         return Ok(false);
     }
     Ok(true)
+}
+
+fn run_repin_discovery(host: &str, force: bool, base_dir: &Path) -> Result<(), AppError> {
+    let (lock_path, mut lock) = load_lock(base_dir)?;
+    let recovery = lock
+        .prepare_registry_discovery_repin(host)
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    let pin = recovery.discovery_pin();
+
+    eprintln!("Registry host: {host}");
+    eprintln!("Discarding API base URL: {}", pin.api_base_url);
+    eprintln!(
+        "Discarding discovery document SHA256: {}",
+        pin.discovery_sha256
+    );
+    eprintln!("All provider entries and provider security state will be retained.");
+    flush_preview()?;
+
+    if !confirm_recovery(host, "registry host", force)? {
+        return Ok(());
+    }
+    recovery.commit();
+    save_lock(&lock, &lock_path)?;
+    println!(
+        "Registry discovery pin cleared. Run `carina init` to verify discovery and acquire the new host pin."
+    );
+    Ok(())
 }
 
 fn run_repin_identity(provider: &str, force: bool, base_dir: &Path) -> Result<(), AppError> {
@@ -124,7 +167,7 @@ fn run_repin_identity(provider: &str, force: bool, base_dir: &Path) -> Result<()
     eprintln!("The ratcheted signature requirement and all other lock state will be retained.");
     flush_preview()?;
 
-    if !confirm_recovery(provider, force)? {
+    if !confirm_recovery(provider, "provider source", force)? {
         return Ok(());
     }
     recovery
@@ -162,7 +205,7 @@ fn run_rebootstrap(provider: &str, force: bool, base_dir: &Path) -> Result<(), A
     eprintln!("All other provider lock state will be retained.");
     flush_preview()?;
 
-    if !confirm_recovery(provider, force)? {
+    if !confirm_recovery(provider, "provider source", force)? {
         return Ok(());
     }
     recovery

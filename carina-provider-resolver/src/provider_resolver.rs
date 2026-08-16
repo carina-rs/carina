@@ -100,9 +100,7 @@ impl LockEntry<NoRegistryLock> {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(into = "RegistryLockSerde")]
 pub struct RegistryLock {
-    pub resolved_hostname: String,
-    pub api_base_url: String,
-    pub discovery_sha256: String,
+    resolved_hostname: String,
     /// The greatest fully validated sequence observed for this source. This is
     /// durable across downstream failures but is not a rollback floor.
     sequence: RegistrySequence,
@@ -111,6 +109,119 @@ pub struct RegistryLock {
     yanked_versions: YankedRegistryVersions,
     signature: RegistrySignatureProtection,
     transparency_log_present: bool,
+}
+
+/// The indivisible discovery values pinned for one registry host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryDiscoveryPin {
+    pub api_base_url: String,
+    pub discovery_sha256: String,
+}
+
+/// A host either has both discovery values pinned or is explicitly awaiting
+/// first contact after an operator-authorized re-pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RegistryDiscoveryPinState {
+    Pinned(RegistryDiscoveryPin),
+    Unpinned,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(into = "RegistryHostLockSerde")]
+struct RegistryHostLock {
+    discovery: RegistryDiscoveryPinState,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistryHostLockSerde {
+    discovery_pin_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    discovery_sha256: Option<String>,
+}
+
+#[derive(Debug)]
+struct RegistryHostLockError;
+
+impl fmt::Display for RegistryHostLockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "registry host lock is inconsistent: api_base_url and discovery_sha256 must be present together exactly when discovery_pin_present is true"
+        )
+    }
+}
+
+impl std::error::Error for RegistryHostLockError {}
+
+impl RegistryHostLock {
+    fn pinned(api_base_url: String, discovery_sha256: String) -> Self {
+        Self {
+            discovery: RegistryDiscoveryPinState::Pinned(RegistryDiscoveryPin {
+                api_base_url,
+                discovery_sha256,
+            }),
+        }
+    }
+
+    fn pin(&self) -> Option<&RegistryDiscoveryPin> {
+        match &self.discovery {
+            RegistryDiscoveryPinState::Pinned(pin) => Some(pin),
+            RegistryDiscoveryPinState::Unpinned => None,
+        }
+    }
+}
+
+impl TryFrom<RegistryHostLockSerde> for RegistryHostLock {
+    type Error = RegistryHostLockError;
+
+    fn try_from(value: RegistryHostLockSerde) -> Result<Self, Self::Error> {
+        let discovery = match (
+            value.discovery_pin_present,
+            value.api_base_url,
+            value.discovery_sha256,
+        ) {
+            (true, Some(api_base_url), Some(discovery_sha256)) => {
+                RegistryDiscoveryPinState::Pinned(RegistryDiscoveryPin {
+                    api_base_url,
+                    discovery_sha256,
+                })
+            }
+            (false, None, None) => RegistryDiscoveryPinState::Unpinned,
+            _ => return Err(RegistryHostLockError),
+        };
+        Ok(Self { discovery })
+    }
+}
+
+impl From<RegistryHostLock> for RegistryHostLockSerde {
+    fn from(value: RegistryHostLock) -> Self {
+        match value.discovery {
+            RegistryDiscoveryPinState::Pinned(pin) => Self {
+                discovery_pin_present: true,
+                api_base_url: Some(pin.api_base_url),
+                discovery_sha256: Some(pin.discovery_sha256),
+            },
+            RegistryDiscoveryPinState::Unpinned => Self {
+                discovery_pin_present: false,
+                api_base_url: None,
+                discovery_sha256: None,
+            },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RegistryHostLock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        RegistryHostLockSerde::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Versions that this lock has observed as yanked. The resolver can only add
@@ -337,12 +448,14 @@ impl<R> RegistryRecoveryTarget<R> {
     }
 }
 
-/// Failure to inspect or mutate one registry provider's recovery state.
+/// Failure to inspect or mutate registry provider or host recovery state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryLockRecoveryError {
     InvalidProvider { provider: String, reason: String },
     NotRegistryProvider { provider: String },
     ProviderStateNotFound { provider: String },
+    RegistryHostStateNotFound { host: String },
+    DiscoveryAlreadyUnpinned { host: String },
     SignatureNotRequired { provider: String },
     IdentityAlreadyUnpinned { provider: String },
     IdentityPinConflict(RegistryIdentityPinConflict),
@@ -361,6 +474,14 @@ impl fmt::Display for RegistryLockRecoveryError {
             Self::ProviderStateNotFound { provider } => write!(
                 f,
                 "No registry security state for provider {provider:?} was found in carina-providers.lock"
+            ),
+            Self::RegistryHostStateNotFound { host } => write!(
+                f,
+                "No registry discovery state for host {host:?} was found in carina-providers.lock"
+            ),
+            Self::DiscoveryAlreadyUnpinned { host } => write!(
+                f,
+                "Registry host {host:?} is already awaiting a new discovery pin"
             ),
             Self::SignatureNotRequired { provider } => write!(
                 f,
@@ -382,6 +503,8 @@ impl std::error::Error for RegistryLockRecoveryError {
             Self::InvalidProvider { .. }
             | Self::NotRegistryProvider { .. }
             | Self::ProviderStateNotFound { .. }
+            | Self::RegistryHostStateNotFound { .. }
+            | Self::DiscoveryAlreadyUnpinned { .. }
             | Self::SignatureNotRequired { .. }
             | Self::IdentityAlreadyUnpinned { .. } => None,
         }
@@ -713,8 +836,6 @@ impl<'de> Deserialize<'de> for RegistryRatchets {
 #[serde(deny_unknown_fields)]
 struct RegistryLockSerde {
     resolved_hostname: String,
-    api_base_url: String,
-    discovery_sha256: String,
     sequence_present: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sequence: Option<u64>,
@@ -764,8 +885,6 @@ impl TryFrom<RegistryLockSerde> for RegistryLock {
         )?;
         Ok(Self {
             resolved_hostname: value.resolved_hostname,
-            api_base_url: value.api_base_url,
-            discovery_sha256: value.discovery_sha256,
             sequence,
             sequence_anchor,
             valid_until_present: value.valid_until_present,
@@ -790,8 +909,6 @@ impl From<RegistryLock> for RegistryLockSerde {
             value.signature.into_serialized();
         Self {
             resolved_hostname: value.resolved_hostname,
-            api_base_url: value.api_base_url,
-            discovery_sha256: value.discovery_sha256,
             sequence_present,
             sequence,
             sequence_anchor_established,
@@ -916,35 +1033,8 @@ impl RegistrySequenceAnchor {
 }
 
 impl RegistryLock {
-    fn from_resolved_registry(
-        registry: ResolvedRegistry,
-        ratchets: RegistryRatchets,
-        validated_sequence: ValidatedRegistrySequence,
-    ) -> Self {
-        let ResolvedRegistry {
-            hostname,
-            api_base_url,
-            discovery_sha256,
-        } = registry;
-        let RegistryRatchets {
-            sequence,
-            valid_until_present,
-            yanked_versions,
-            signature,
-            transparency_log_present,
-        } = ratchets;
-        let sequence_anchor = validated_sequence.into_anchor();
-        Self {
-            resolved_hostname: hostname,
-            api_base_url,
-            discovery_sha256,
-            sequence,
-            sequence_anchor,
-            valid_until_present,
-            yanked_versions,
-            signature,
-            transparency_log_present,
-        }
+    pub fn resolved_hostname(&self) -> &str {
+        &self.resolved_hostname
     }
 
     pub fn yanked_versions(&self) -> &YankedRegistryVersions {
@@ -960,9 +1050,78 @@ impl RegistryLock {
 #[derive(Debug, Clone, Serialize)]
 pub struct LockFile {
     version: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    registry_host: BTreeMap<String, RegistryHostLock>,
     pub provider: Vec<LockEntry<RegistryLock>>,
     #[serde(default, skip_serializing_if = "UnpinnedRegistryRatchets::is_empty")]
     unpinned_registry_ratchets: UnpinnedRegistryRatchets,
+}
+
+mod registry_lock_with_host {
+    use super::*;
+
+    /// A provider registry record paired with the host pin it references. This
+    /// is the only result of converting verified discovery into persisted state.
+    pub(super) struct RegistryLockWithHost {
+        host: (String, RegistryHostLock),
+        registry: RegistryLock,
+    }
+
+    impl RegistryLock {
+        pub(super) fn from_resolved_registry(
+            registry: ResolvedRegistry,
+            ratchets: RegistryRatchets,
+            validated_sequence: ValidatedRegistrySequence,
+        ) -> RegistryLockWithHost {
+            let ResolvedRegistry {
+                hostname,
+                api_base_url,
+                discovery_sha256,
+            } = registry;
+            let RegistryRatchets {
+                sequence,
+                valid_until_present,
+                yanked_versions,
+                signature,
+                transparency_log_present,
+            } = ratchets;
+            let sequence_anchor = validated_sequence.into_anchor();
+            RegistryLockWithHost {
+                host: (
+                    hostname.clone(),
+                    RegistryHostLock::pinned(api_base_url, discovery_sha256),
+                ),
+                registry: Self {
+                    resolved_hostname: hostname,
+                    sequence,
+                    sequence_anchor,
+                    valid_until_present,
+                    yanked_versions,
+                    signature,
+                    transparency_log_present,
+                },
+            }
+        }
+    }
+
+    impl LockFile {
+        /// Insert a registry provider together with the host record it references.
+        pub(super) fn upsert_registry_with_host(
+            &mut self,
+            entry: LockEntry<NoRegistryLock>,
+            registry_with_host: RegistryLockWithHost,
+        ) {
+            let RegistryLockWithHost {
+                host: (hostname, host),
+                registry,
+            } = registry_with_host;
+            self.registry_host.insert(hostname, host);
+
+            let mut entry = entry.into_stored();
+            entry.registry = Some(registry);
+            self.upsert_entry(entry);
+        }
+    }
 }
 
 /// A validated identity re-pin that has not mutated its lock file yet.
@@ -983,6 +1142,13 @@ pub struct PreparedRegistryRebootstrap<'a> {
     target: RegistryRecoveryTarget<RegistryRebootstrapState>,
 }
 
+/// A validated host discovery re-pin that holds the one resolved host record
+/// used by commit together with its non-optional preview pair.
+pub struct PreparedRegistryDiscoveryRepin<'a> {
+    host: &'a mut RegistryHostLock,
+    discarded_pin: RegistryDiscoveryPin,
+}
+
 #[derive(Deserialize)]
 struct LockFileVersion {
     version: Option<u32>,
@@ -992,6 +1158,8 @@ struct LockFileVersion {
 #[serde(deny_unknown_fields)]
 struct UncheckedLockFile {
     version: u32,
+    #[serde(default)]
+    registry_host: BTreeMap<String, RegistryHostLock>,
     #[serde(default)]
     provider: Vec<LockEntry<RegistryLock>>,
     #[serde(default)]
@@ -1010,6 +1178,15 @@ pub enum LockFileError {
     VersionTooNew {
         found: u32,
         supported: u32,
+    },
+    VersionTooOld {
+        found: u32,
+        supported: u32,
+    },
+    MissingRegistryHostRecord {
+        path: PathBuf,
+        provider: String,
+        hostname: String,
     },
     Parse {
         path: PathBuf,
@@ -1036,6 +1213,19 @@ impl fmt::Display for LockFileError {
                 f,
                 "Lock file version {found} is newer than supported version {supported}. Please upgrade Carina."
             ),
+            Self::VersionTooOld { found, supported } => write!(
+                f,
+                "Lock file version {found} uses an older format that this Carina release cannot read; version {supported} is required. Delete the lock file, then run `carina init` to regenerate it. This re-establishes the pins by verifying registry discovery and the providers afresh; signing identity pins therefore return to first contact."
+            ),
+            Self::MissingRegistryHostRecord {
+                path,
+                provider,
+                hostname,
+            } => write!(
+                f,
+                "Lock file {} records registry provider {provider:?} as resolved through host {hostname:?}, but that host record is missing. The host record must be restored before a normal `carina init` can re-resolve against that host and re-establish the discovery pin.",
+                path.display()
+            ),
             Self::Parse { path, source } => write!(
                 f,
                 "Failed to parse {}: {source}\nhint: delete {} and re-run `carina init`.",
@@ -1057,7 +1247,10 @@ impl std::error::Error for LockFileError {
             Self::Read { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
             Self::RegistryIdentityPinConflict { source, .. } => Some(source),
-            Self::MissingVersion { .. } | Self::VersionTooNew { .. } => None,
+            Self::MissingVersion { .. }
+            | Self::VersionTooNew { .. }
+            | Self::VersionTooOld { .. }
+            | Self::MissingRegistryHostRecord { .. } => None,
         }
     }
 }
@@ -1107,6 +1300,7 @@ impl Default for LockFile {
     fn default() -> Self {
         Self {
             version: Self::CURRENT_VERSION,
+            registry_host: BTreeMap::new(),
             provider: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         }
@@ -1150,14 +1344,26 @@ impl PreparedRegistryRebootstrap<'_> {
     }
 }
 
+impl PreparedRegistryDiscoveryRepin<'_> {
+    /// Return the complete host discovery pair that commit will discard.
+    pub fn discovery_pin(&self) -> &RegistryDiscoveryPin {
+        &self.discarded_pin
+    }
+
+    /// Clear the previewed pair without touching provider-owned state.
+    pub fn commit(self) {
+        self.host.discovery = RegistryDiscoveryPinState::Unpinned;
+    }
+}
+
 impl LockFile {
-    /// v1: Registry protection-presence fields are mandatory.
-    /// `signature_present` records the ratcheted requirement; an explicitly
-    /// re-pinned entry may retain that requirement while awaiting a new
-    /// identity. New protection fields remain in v1 when their absence has a
-    /// safe, explicit default; older readers reject unknown or newly legal
-    /// combinations instead of silently removing protection.
-    pub const CURRENT_VERSION: u32 = 1;
+    /// v2: Registry discovery pins live once per resolved host. Provider
+    /// entries retain only their resolved-hostname reference.
+    ///
+    /// v1 introduced mandatory registry protection-presence fields, but kept
+    /// one discovery pin copy in every provider entry. It is rejected rather
+    /// than reinterpreted as this host-owned schema.
+    pub const CURRENT_VERSION: u32 = 2;
 
     fn sources_match(existing: &str, requested: &str) -> bool {
         existing == requested || canonical_lock_source(existing) == canonical_lock_source(requested)
@@ -1203,6 +1409,14 @@ impl LockFile {
                 supported: Self::CURRENT_VERSION,
             });
         }
+        if version < Self::CURRENT_VERSION {
+            // v1 kept a discovery pin copy in every provider entry. Copies for
+            // one host could diverge, so no value can be migrated safely.
+            return Err(LockFileError::VersionTooOld {
+                found: version,
+                supported: Self::CURRENT_VERSION,
+            });
+        }
         let unchecked: UncheckedLockFile =
             toml::from_str(content).map_err(|source| LockFileError::Parse {
                 path: path.to_path_buf(),
@@ -1215,8 +1429,24 @@ impl LockFile {
                 path: path.to_path_buf(),
                 source: Box::new(source),
             })?;
+        for entry in &unchecked.provider {
+            let Some(registry) = &entry.registry else {
+                continue;
+            };
+            if !unchecked
+                .registry_host
+                .contains_key(registry.resolved_hostname())
+            {
+                return Err(LockFileError::MissingRegistryHostRecord {
+                    path: path.to_path_buf(),
+                    provider: canonical_lock_source(&entry.source),
+                    hostname: registry.resolved_hostname().to_owned(),
+                });
+            }
+        }
         let mut lock = Self {
             version: Self::CURRENT_VERSION,
+            registry_host: unchecked.registry_host,
             provider: unchecked.provider,
             unpinned_registry_ratchets,
         };
@@ -1400,6 +1630,29 @@ impl LockFile {
         })
     }
 
+    /// Prepare an explicit host discovery re-pin without mutating the lock.
+    /// The returned exclusive borrow is the single lookup used for preview and
+    /// commit, so the displayed host state cannot diverge from the write.
+    pub fn prepare_registry_discovery_repin(
+        &mut self,
+        host: &str,
+    ) -> Result<PreparedRegistryDiscoveryRepin<'_>, RegistryLockRecoveryError> {
+        let host = host.to_ascii_lowercase();
+        let host_lock = self.registry_host.get_mut(&host).ok_or_else(|| {
+            RegistryLockRecoveryError::RegistryHostStateNotFound { host: host.clone() }
+        })?;
+        let discarded_pin = match &host_lock.discovery {
+            RegistryDiscoveryPinState::Pinned(pin) => pin.clone(),
+            RegistryDiscoveryPinState::Unpinned => {
+                return Err(RegistryLockRecoveryError::DiscoveryAlreadyUnpinned { host });
+            }
+        };
+        Ok(PreparedRegistryDiscoveryRepin {
+            host: host_lock,
+            discarded_pin,
+        })
+    }
+
     /// Find a revision-mode entry whose `resolved_sha` matches. Version and
     /// file entries can't have a resolved SHA, so they never match.
     pub fn find_by_source_and_sha(
@@ -1481,10 +1734,13 @@ impl LockFile {
     fn upsert_registry(
         &mut self,
         mut entry: LockEntry<RegistryLock>,
+        host: RegistryHostLock,
     ) -> Result<(), RegistryIdentityPinConflict> {
         if let Some(registry) = entry.registry.as_mut() {
             let observed = self.known_registry_ratchets(&entry.source)?;
             observed.merge_into_registry(registry)?;
+            self.registry_host
+                .insert(registry.resolved_hostname().to_owned(), host);
         }
         self.upsert_entry(entry);
         Ok(())
@@ -1622,22 +1878,30 @@ impl<'a> PersistentLockFile<'a> {
     }
 
     fn upsert_registry_provider(&mut self, entry: RegistryProviderLockEntry) -> Result<(), String> {
+        let RegistryProviderLockEntry {
+            name,
+            source,
+            kind,
+            sha256,
+            registry,
+            validated_sequence,
+        } = entry;
         let ratchets = self
             .lock_file
-            .known_registry_ratchets(&entry.source)
+            .known_registry_ratchets(&source)
             .map_err(|error| error.to_string())?;
-        let registry = RegistryLock::from_resolved_registry(
-            entry.registry,
-            ratchets,
-            entry.validated_sequence,
+        let registry_with_host =
+            RegistryLock::from_resolved_registry(registry, ratchets, validated_sequence);
+        self.lock_file.upsert_registry_with_host(
+            LockEntry {
+                name,
+                source,
+                kind,
+                sha256,
+                registry: None,
+            },
+            registry_with_host,
         );
-        self.lock_file.upsert_entry(LockEntry {
-            name: entry.name,
-            source: entry.source,
-            kind: entry.kind,
-            sha256: entry.sha256,
-            registry: Some(registry),
-        });
         Ok(())
     }
 }
@@ -1867,9 +2131,12 @@ const MAX_SEQUENCE_FAST_FORWARD: u64 = 1_000_000;
 const MAX_SIGNATURE_BUNDLE_BYTES: usize = 1024 * 1024;
 const IDENTITY_REPIN_REMEDIATION: &str = "After verifying out-of-band that the signing-identity change is intended, run `carina providers repin-identity <provider>` to clear only the identity pin, then re-run `carina init` to acquire and verify a new pin.";
 const SEQUENCE_REBOOTSTRAP_REMEDIATION: &str = "After verifying out-of-band that resetting registry freshness is intended, run `carina providers re-bootstrap <provider>` to clear only the persisted sequence observation and anchor, then re-run `carina init`.";
+const DISCOVERY_REPIN_REMEDIATION: &str = "After verifying out-of-band that the registry discovery change is intended, run `carina providers repin-discovery <host>` to clear only the host discovery pin, then re-run `carina init` to acquire and verify a new pin.";
 
-fn recovery_remediation(template: &str, provider: &str) -> String {
-    template.replace("<provider>", provider)
+fn recovery_remediation(template: &str, target: &str) -> String {
+    template
+        .replace("<provider>", target)
+        .replace("<host>", target)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2713,30 +2980,44 @@ fn verify_registry_lock_pin(
         LockEntryKind::Version { constraint, .. } => constraint.clone(),
         _ => None,
     });
-    if let Some(entry) = entry {
-        if matches!(&entry.kind, LockEntryKind::Version { version: locked, .. } if locked == version)
-            && entry.sha256 != expected_shasum
-        {
+    if let Some(entry) = entry
+        && matches!(&entry.kind, LockEntryKind::Version { version: locked, .. } if locked == version)
+        && entry.sha256 != expected_shasum
+    {
+        return Err(format!(
+            "registry shasum pin mismatch for {}@{}: lock has {}, registry returned {}",
+            source_key, version, entry.sha256, expected_shasum
+        ));
+    }
+    let locked_registry = entry.and_then(|entry| entry.registry.as_ref());
+    if let Some(locked_registry) = locked_registry
+        && locked_registry.resolved_hostname() != registry.hostname
+    {
+        return Err(format!(
+            "registry hostname pin mismatch for {}: lock has {}, resolved {}",
+            source_key,
+            locked_registry.resolved_hostname(),
+            registry.hostname
+        ));
+    }
+    let host = registry.hostname.as_str();
+    let locked_host_pin = current_lock
+        .registry_host
+        .get(host)
+        .and_then(RegistryHostLock::pin);
+    if let Some(locked_host_pin) = locked_host_pin {
+        let remediation = recovery_remediation(DISCOVERY_REPIN_REMEDIATION, host);
+        if locked_host_pin.api_base_url != registry.api_base_url {
             return Err(format!(
-                "registry shasum pin mismatch for {}@{}: lock has {}, registry returned {}",
-                source_key, version, entry.sha256, expected_shasum
+                "registry API base pin mismatch for host {host}: lock has {}, resolved {}. {remediation}",
+                locked_host_pin.api_base_url, registry.api_base_url
             ));
         }
-        if let Some(locked_registry) = &entry.registry {
-            if locked_registry.resolved_hostname != registry.hostname {
-                return Err(format!(
-                    "registry hostname pin mismatch for {}: lock has {}, resolved {}",
-                    source_key, locked_registry.resolved_hostname, registry.hostname
-                ));
-            }
-            if locked_registry.api_base_url != registry.api_base_url {
-                return Err(format!("registry API base pin mismatch for {source_key}"));
-            }
-            if locked_registry.discovery_sha256 != registry.discovery_sha256 {
-                return Err(format!(
-                    "registry discovery document pin mismatch for {source_key}"
-                ));
-            }
+        if locked_host_pin.discovery_sha256 != registry.discovery_sha256 {
+            return Err(format!(
+                "registry discovery document pin mismatch for host {host}: lock has {}, resolved {}. {remediation}",
+                locked_host_pin.discovery_sha256, registry.discovery_sha256
+            ));
         }
     }
     let ratchets = current_lock
@@ -3962,6 +4243,24 @@ mod tests {
         signature_pin(SIGNED_FIXTURE_IDENTITY, SIGNED_FIXTURE_ISSUER)
     }
 
+    fn registry_host_lock(
+        api_base_url: &str,
+        discovery_sha256: impl Into<String>,
+    ) -> RegistryHostLock {
+        RegistryHostLock::pinned(api_base_url.into(), discovery_sha256.into())
+    }
+
+    fn registry_host_table(
+        hostname: &str,
+        api_base_url: &str,
+        discovery_sha256: impl Into<String>,
+    ) -> BTreeMap<String, RegistryHostLock> {
+        BTreeMap::from([(
+            hostname.into(),
+            registry_host_lock(api_base_url, discovery_sha256),
+        )])
+    }
+
     /// The lock-file shape from commit cd228086. In particular, this predates
     /// signing-identity pins and the top-level lock format version.
     #[derive(Serialize, Deserialize)]
@@ -4015,33 +4314,43 @@ mod tests {
 
     fn fully_protected_lock_toml() -> String {
         let mut lock = LockFile::default();
-        lock.upsert_registry(LockEntry {
-            name: "aws".into(),
-            source: "carina-rs/aws".into(),
-            kind: LockEntryKind::Version {
-                version: "0.5.0".into(),
-                constraint: None,
+        lock.upsert_registry(
+            LockEntry {
+                name: "aws".into(),
+                source: "carina-rs/aws".into(),
+                kind: LockEntryKind::Version {
+                    version: "0.5.0".into(),
+                    constraint: None,
+                },
+                sha256: "abc".into(),
+                registry: Some(RegistryLock {
+                    resolved_hostname: "registry.carina-rs.dev".into(),
+                    sequence: RegistrySequence::Present(7),
+                    sequence_anchor: RegistrySequenceAnchor::Established(7),
+                    valid_until_present: true,
+                    yanked_versions: YankedRegistryVersions::default(),
+                    signature: signed_fixture_pin(),
+                    transparency_log_present: true,
+                }),
             },
-            sha256: "abc".into(),
-            registry: Some(RegistryLock {
-                resolved_hostname: "registry.carina-rs.dev".into(),
-                api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                discovery_sha256: "def".into(),
-                sequence: RegistrySequence::Present(7),
-                sequence_anchor: RegistrySequenceAnchor::Established(7),
-                valid_until_present: true,
-                yanked_versions: YankedRegistryVersions::default(),
-                signature: signed_fixture_pin(),
-                transparency_log_present: true,
-            }),
-        })
+            registry_host_lock("https://registry.carina-rs.dev/v1/providers/", "def"),
+        )
         .unwrap();
         toml::to_string_pretty(&lock).unwrap()
     }
 
     fn lock_with_registry_security_state(signature: RegistrySignatureProtection) -> LockFile {
+        lock_with_registry_security_state_for_host("registry.carina-rs.dev", signature)
+    }
+
+    fn lock_with_registry_security_state_for_host(
+        hostname: &str,
+        signature: RegistrySignatureProtection,
+    ) -> LockFile {
+        let api_base_url = format!("https://{hostname}/v1/providers/");
         LockFile {
             version: LockFile::CURRENT_VERSION,
+            registry_host: registry_host_table(hostname, &api_base_url, "discovery-shasum"),
             provider: vec![LockEntry {
                 name: "aws".into(),
                 source: "carina-rs/aws".into(),
@@ -4051,9 +4360,7 @@ mod tests {
                 },
                 sha256: "pinned-shasum".into(),
                 registry: Some(RegistryLock {
-                    resolved_hostname: "registry.carina-rs.dev".into(),
-                    api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                    discovery_sha256: "discovery-shasum".into(),
+                    resolved_hostname: hostname.into(),
                     sequence: RegistrySequence::Present(7),
                     sequence_anchor: RegistrySequenceAnchor::Established(5),
                     valid_until_present: true,
@@ -4485,6 +4792,7 @@ mod tests {
         let source = "github.com/carina-rs/carina-provider-aws";
         let lock = LockFile {
             version: LockFile::CURRENT_VERSION,
+            registry_host: BTreeMap::new(),
             provider: vec![LockEntry {
                 name: "aws".into(),
                 source: source.into(),
@@ -4514,6 +4822,7 @@ mod tests {
     fn registry_revision_mode_toml_roundtrip() {
         let lock = LockFile {
             version: LockFile::CURRENT_VERSION,
+            registry_host: BTreeMap::new(),
             provider: vec![LockEntry {
                 name: "aws".into(),
                 source: "carina-rs/aws".into(),
@@ -4547,6 +4856,7 @@ mod tests {
     fn revision_mode_toml_roundtrip() {
         let lock = LockFile {
             version: LockFile::CURRENT_VERSION,
+            registry_host: BTreeMap::new(),
             provider: vec![revision_entry(
                 "github.com/carina-rs/carina-provider-awscc",
                 "main",
@@ -4573,6 +4883,7 @@ mod tests {
     fn file_mode_toml_roundtrip() {
         let lock = LockFile {
             version: LockFile::CURRENT_VERSION,
+            registry_host: BTreeMap::new(),
             provider: vec![LockEntry {
                 name: "test".into(),
                 source: "file:///tmp/my-provider.wasm".into(),
@@ -4600,7 +4911,7 @@ mod tests {
         let lock_path = dir.path().join("carina-providers.lock");
         fs::write(
             &lock_path,
-            r#"version = 1
+            r#"version = 2
 
 [[provider]]
 name = "awscc"
@@ -4625,7 +4936,7 @@ sha256 = "abc"
     #[test]
     fn lock_load_rejects_set_shaped_unpinned_yanks() {
         let error = LockFile::from_toml_str(
-            r#"version = 1
+            r#"version = 2
 
 [unpinned_registry_yanks]
 "carina-rs/aws" = ["0.4.0"]
@@ -4662,18 +4973,13 @@ sha256 = "abc"
     }
 
     #[test]
-    fn lock_file_roundtripped_through_cd228086_is_rejected() {
-        let old_lock: Cd228086LockFile = toml::from_str(&fully_protected_lock_toml()).unwrap();
-        let stripped = toml::to_string_pretty(&old_lock).unwrap();
+    fn v2_host_pins_cannot_be_silently_read_by_cd228086() {
+        let error = match toml::from_str::<Cd228086LockFile>(&fully_protected_lock_toml()) {
+            Ok(_) => panic!("the old per-entry schema must not consume a v2 host-owned pin"),
+            Err(error) => error,
+        };
 
-        assert!(!stripped.contains("version = 1"), "{stripped}");
-        assert!(!stripped.contains("certificate_identity"), "{stripped}");
-        assert!(!stripped.contains("certificate_oidc_issuer"), "{stripped}");
-        let error = lock_toml_error(&stripped);
-        assert!(
-            matches!(error, LockFileError::MissingVersion { .. }),
-            "{error}"
-        );
+        assert!(error.to_string().contains("api_base_url"), "{error}");
     }
 
     #[test]
@@ -4697,6 +5003,470 @@ sha256 = "abc"
                 supported: LockFile::CURRENT_VERSION,
             } if actual == found
         ));
+    }
+
+    #[test]
+    fn lock_load_rejects_v1_before_parsing_it_as_the_v2_schema() {
+        let error = LockFile::from_toml_str(
+            r#"version = 1
+
+[[provider]]
+name = "aws"
+source = "carina-rs/aws"
+mode = "version"
+version = "0.5.0"
+sha256 = "abc"
+
+[provider.registry]
+resolved_hostname = "registry.carina-rs.dev"
+api_base_url = "https://registry.carina-rs.dev/v1/providers/"
+discovery_sha256 = "def"
+sequence_present = false
+sequence_anchor_established = false
+valid_until_present = false
+signature_present = false
+transparency_log_present = false
+"#,
+            Path::new("carina-providers.lock"),
+        )
+        .expect_err("v1 must be rejected before the v2 schema is parsed");
+
+        assert!(matches!(
+            &error,
+            LockFileError::VersionTooOld {
+                found: 1,
+                supported: 2
+            }
+        ));
+        let rendered = error.to_string();
+        assert!(rendered.contains("version 1"), "{rendered}");
+        assert!(rendered.contains("version 2"), "{rendered}");
+        assert!(rendered.contains("cannot read"), "{rendered}");
+        assert!(rendered.contains("regenerate"), "{rendered}");
+        assert!(rendered.contains("`carina init`"), "{rendered}");
+        assert!(
+            rendered.contains("verifying registry discovery"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("providers afresh"), "{rendered}");
+        assert!(rendered.contains("identity pins"), "{rendered}");
+        assert!(rendered.contains("first contact"), "{rendered}");
+        assert!(!rendered.contains("unknown field"), "{rendered}");
+    }
+
+    #[test]
+    fn lock_load_rejects_registry_entry_whose_host_record_is_absent() {
+        let error = LockFile::from_toml_str(
+            r#"version = 2
+
+[[provider]]
+name = "aws"
+source = "carina-rs/aws"
+mode = "version"
+version = "0.5.0"
+sha256 = "abc"
+
+[provider.registry]
+resolved_hostname = "registry.carina-rs.dev"
+sequence_present = false
+sequence_anchor_established = false
+valid_until_present = false
+signature_present = false
+transparency_log_present = false
+"#,
+            Path::new("carina-providers.lock"),
+        )
+        .expect_err("a registry entry must not outlive its host record");
+
+        assert!(matches!(
+            &error,
+            LockFileError::MissingRegistryHostRecord {
+                provider,
+                hostname,
+                ..
+            } if provider == "carina-rs/aws" && hostname == "registry.carina-rs.dev"
+        ));
+        let rendered = error.to_string();
+        assert!(rendered.contains("registry.carina-rs.dev"), "{rendered}");
+        assert!(rendered.contains("host record"), "{rendered}");
+        assert!(rendered.contains("must be restored"), "{rendered}");
+        assert!(rendered.contains("`carina init`"), "{rendered}");
+        assert!(
+            rendered.contains("re-resolve against that host"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("re-establish the discovery pin"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.to_ascii_lowercase().contains("delete"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn lock_load_rejects_legacy_per_entry_discovery_copies_in_v2() {
+        // V2 rejects these legacy fields structurally because the provider
+        // schema has no slot for a per-entry discovery pin; it does not compare
+        // the two copies. Their divergent values document the v1 bug that the
+        // host-owned v2 schema makes unrepresentable.
+        let error = LockFile::from_toml_str(
+            r#"version = 2
+
+[registry_host."registry.carina-rs.dev"]
+discovery_pin_present = true
+api_base_url = "https://registry.carina-rs.dev/v1/providers/"
+discovery_sha256 = "host-pin"
+
+[[provider]]
+name = "aws"
+source = "carina-rs/aws"
+mode = "version"
+version = "0.5.0"
+sha256 = "abc"
+
+[provider.registry]
+resolved_hostname = "registry.carina-rs.dev"
+api_base_url = "https://registry.carina-rs.dev/v1/providers/"
+discovery_sha256 = "provider-a-pin"
+sequence_present = false
+sequence_anchor_established = false
+valid_until_present = false
+signature_present = false
+transparency_log_present = false
+
+[[provider]]
+name = "random"
+source = "carina-rs/random"
+mode = "version"
+version = "1.0.0"
+sha256 = "xyz"
+
+[provider.registry]
+resolved_hostname = "registry.carina-rs.dev"
+api_base_url = "https://EVIL.example.com/v1/providers/"
+discovery_sha256 = "provider-b-pin"
+sequence_present = false
+sequence_anchor_established = false
+valid_until_present = false
+signature_present = false
+transparency_log_present = false
+"#,
+            Path::new("carina-providers.lock"),
+        )
+        .expect_err("v2 must have no per-provider location in which pins can disagree");
+
+        assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
+        let rendered = error.to_string();
+        assert!(rendered.contains("unknown field"), "{rendered}");
+        assert!(rendered.contains("api_base_url"), "{rendered}");
+
+        let single_entry_error = LockFile::from_toml_str(
+            r#"version = 2
+
+[registry_host."registry.carina-rs.dev"]
+discovery_pin_present = true
+api_base_url = "https://registry.carina-rs.dev/v1/providers/"
+discovery_sha256 = "host-pin"
+
+[[provider]]
+name = "aws"
+source = "carina-rs/aws"
+mode = "version"
+version = "0.5.0"
+sha256 = "abc"
+
+[provider.registry]
+resolved_hostname = "registry.carina-rs.dev"
+api_base_url = "https://registry.carina-rs.dev/v1/providers/"
+discovery_sha256 = "provider-a-pin"
+sequence_present = false
+sequence_anchor_established = false
+valid_until_present = false
+signature_present = false
+transparency_log_present = false
+"#,
+            Path::new("carina-providers.lock"),
+        )
+        .expect_err("even one legacy per-provider pin must be structurally rejected");
+
+        assert!(
+            matches!(single_entry_error, LockFileError::Parse { .. }),
+            "{single_entry_error}"
+        );
+        let single_entry_rendered = single_entry_error.to_string();
+        assert!(
+            single_entry_rendered.contains("unknown field"),
+            "{single_entry_rendered}"
+        );
+        assert!(
+            single_entry_rendered.contains("api_base_url"),
+            "{single_entry_rendered}"
+        );
+    }
+
+    #[test]
+    fn one_registry_host_pin_round_trips_for_multiple_provider_entries() {
+        let serialized = r#"version = 2
+
+[registry_host."registry.carina-rs.dev"]
+discovery_pin_present = true
+api_base_url = "https://registry.carina-rs.dev/v1/providers/"
+discovery_sha256 = "one-host-pin"
+
+[[provider]]
+name = "aws"
+source = "carina-rs/aws"
+mode = "version"
+version = "0.5.0"
+sha256 = "abc"
+
+[provider.registry]
+resolved_hostname = "registry.carina-rs.dev"
+sequence_present = false
+sequence_anchor_established = false
+valid_until_present = false
+signature_present = false
+transparency_log_present = false
+
+[[provider]]
+name = "random"
+source = "carina-rs/random"
+mode = "version"
+version = "1.0.0"
+sha256 = "xyz"
+
+[provider.registry]
+resolved_hostname = "registry.carina-rs.dev"
+sequence_present = false
+sequence_anchor_established = false
+valid_until_present = false
+signature_present = false
+transparency_log_present = false
+"#;
+
+        let lock = LockFile::from_toml_str(serialized, Path::new("carina-providers.lock"))
+            .expect("both entries should reference the one host-owned discovery pin");
+        assert_eq!(lock.provider.len(), 2);
+        assert_eq!(lock.registry_host.len(), 1);
+        assert_eq!(
+            lock.registry_host
+                .get("registry.carina-rs.dev")
+                .and_then(RegistryHostLock::pin),
+            Some(&RegistryDiscoveryPin {
+                api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
+                discovery_sha256: "one-host-pin".into(),
+            })
+        );
+        let round_tripped = toml::to_string_pretty(&lock).unwrap();
+        assert_eq!(round_tripped.matches("api_base_url =").count(), 1);
+        assert_eq!(round_tripped.matches("discovery_sha256 =").count(), 1);
+        assert_eq!(
+            LockFile::from_toml_str(&round_tripped, Path::new("carina-providers.lock"))
+                .map(|lock| toml::to_string_pretty(&lock).unwrap())
+                .unwrap(),
+            round_tripped,
+            "the host table must serialize deterministically"
+        );
+    }
+
+    #[test]
+    fn mutating_one_host_pin_is_observed_by_every_provider_for_that_host() {
+        let hostname = "registry.carina-rs.dev";
+        let mut lock = LockFile::default();
+        lock.registry_host.insert(
+            hostname.into(),
+            RegistryHostLock::pinned(
+                "https://registry.carina-rs.dev/v1/providers/".into(),
+                "original-discovery".into(),
+            ),
+        );
+        let providers = [
+            ("aws", "carina-rs/aws", "0.5.0", "aws-shasum"),
+            ("random", "carina-rs/random", "1.0.0", "random-shasum"),
+        ];
+        lock.provider = providers
+            .iter()
+            .copied()
+            .map(|(name, source, version, sha256)| LockEntry {
+                name: name.into(),
+                source: source.into(),
+                kind: LockEntryKind::Version {
+                    version: version.into(),
+                    constraint: None,
+                },
+                sha256: sha256.into(),
+                registry: Some(RegistryLock {
+                    resolved_hostname: hostname.into(),
+                    sequence: RegistrySequence::Absent,
+                    sequence_anchor: RegistrySequenceAnchor::Unestablished,
+                    valid_until_present: false,
+                    yanked_versions: YankedRegistryVersions::default(),
+                    signature: RegistrySignatureProtection::NotRequired,
+                    transparency_log_present: false,
+                }),
+            })
+            .collect();
+        let resolved = ResolvedRegistry {
+            hostname: hostname.into(),
+            api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
+            discovery_sha256: "original-discovery".into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(lock.registry_host.len(), 1);
+        for (_, source, version, shasum) in providers {
+            let source = match parse_provider_source(source).unwrap() {
+                ProviderSource::Registry(source) => source,
+                ProviderSource::GithubDirect { .. } => unreachable!(),
+            };
+            let mut persistent =
+                PersistentLockFile::new(&mut lock, dir.path().join("carina-providers.lock"));
+            verify_registry_lock_pin(
+                &mut persistent,
+                &source,
+                version,
+                shasum,
+                &resolved,
+                None,
+                true,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the original host pin must verify for {}: {error}",
+                    source.source_key()
+                )
+            });
+        }
+
+        let host_lock = lock
+            .registry_host
+            .get_mut(hostname)
+            .expect("the shared host pin must still exist");
+        let RegistryDiscoveryPinState::Pinned(pin) = &mut host_lock.discovery else {
+            panic!("the shared host pin must still be pinned");
+        };
+        pin.api_base_url = "https://EVIL.example.com/v1/providers/".into();
+
+        for (_, source, version, shasum) in providers {
+            let source = match parse_provider_source(source).unwrap() {
+                ProviderSource::Registry(source) => source,
+                ProviderSource::GithubDirect { .. } => unreachable!(),
+            };
+            let mut persistent =
+                PersistentLockFile::new(&mut lock, dir.path().join("carina-providers.lock"));
+            let error = match verify_registry_lock_pin(
+                &mut persistent,
+                &source,
+                version,
+                shasum,
+                &resolved,
+                None,
+                true,
+            ) {
+                Ok(_) => panic!("the one mutated host pin must reject every referencing provider"),
+                Err(error) => error,
+            };
+
+            assert!(
+                error.contains("registry API base pin mismatch for host registry.carina-rs.dev"),
+                "{error}"
+            );
+            assert!(
+                error.contains("carina providers repin-discovery registry.carina-rs.dev"),
+                "{error}"
+            );
+            assert!(!error.contains(&source.source_key()), "{error}");
+        }
+    }
+
+    #[test]
+    fn hostname_mismatch_does_not_report_the_discovery_repin_operation() {
+        let mut lock = lock_with_registry_security_state_for_host(
+            "old.registry.example",
+            RegistrySignatureProtection::NotRequired,
+        );
+        let source = match parse_provider_source("carina-rs/aws").unwrap() {
+            ProviderSource::Registry(source) => source,
+            ProviderSource::GithubDirect { .. } => unreachable!(),
+        };
+        let resolved = ResolvedRegistry {
+            hostname: "registry.carina-rs.dev".into(),
+            api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
+            discovery_sha256: "discovery-shasum".into(),
+        };
+        let mut persistent =
+            PersistentLockFile::new(&mut lock, PathBuf::from("carina-providers.lock"));
+        let error = match verify_registry_lock_pin(
+            &mut persistent,
+            &source,
+            "0.5.0",
+            "pinned-shasum",
+            &resolved,
+            None,
+            false,
+        ) {
+            Ok(_) => panic!("a provider hostname pin must reject a changed resolved hostname"),
+            Err(error) => error,
+        };
+        assert!(error.contains("registry hostname pin mismatch"), "{error}");
+        assert!(
+            error.contains("lock has old.registry.example, resolved registry.carina-rs.dev"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("carina providers repin-discovery"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn discovery_document_mismatch_reports_the_host_and_repin_operation() {
+        let mut lock = lock_with_registry_security_state(RegistrySignatureProtection::NotRequired);
+        lock.registry_host.insert(
+            "registry.carina-rs.dev".into(),
+            registry_host_lock(
+                "https://registry.carina-rs.dev/v1/providers/",
+                "old-discovery",
+            ),
+        );
+        let source = match parse_provider_source("carina-rs/aws").unwrap() {
+            ProviderSource::Registry(source) => source,
+            ProviderSource::GithubDirect { .. } => unreachable!(),
+        };
+        let resolved = ResolvedRegistry {
+            hostname: "registry.carina-rs.dev".into(),
+            api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
+            discovery_sha256: "new-discovery".into(),
+        };
+        let mut persistent =
+            PersistentLockFile::new(&mut lock, PathBuf::from("carina-providers.lock"));
+
+        let error = match verify_registry_lock_pin(
+            &mut persistent,
+            &source,
+            "0.5.0",
+            "pinned-shasum",
+            &resolved,
+            None,
+            true,
+        ) {
+            Ok(_) => panic!("a changed discovery document must trip the host pin"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains(
+                "registry discovery document pin mismatch for host registry.carina-rs.dev"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("carina providers repin-discovery registry.carina-rs.dev"),
+            "{error}"
+        );
+        assert!(!error.contains("carina-rs/aws"), "{error}");
     }
 
     #[test]
@@ -4809,9 +5579,28 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
     }
 
     #[test]
+    fn registry_host_discovery_pin_is_all_or_nothing_on_load() {
+        let pinned = fully_protected_lock_toml();
+        for inconsistent in [
+            pinned.replace(
+                "api_base_url = \"https://registry.carina-rs.dev/v1/providers/\"\n",
+                "",
+            ),
+            pinned.replace("discovery_sha256 = \"def\"\n", ""),
+            pinned.replace("discovery_pin_present = true\n", ""),
+            pinned.replace(
+                "discovery_pin_present = true\n",
+                "discovery_pin_present = false\n",
+            ),
+        ] {
+            assert_lock_toml_is_rejected(&inconsistent);
+        }
+    }
+
+    #[test]
     fn existing_registry_locks_default_sticky_yanked_set_to_empty() {
         let serialized = fully_protected_lock_toml();
-        assert!(serialized.starts_with("version = 1\n"), "{serialized}");
+        assert!(serialized.starts_with("version = 2\n"), "{serialized}");
         assert!(!serialized.contains("yanked_versions"), "{serialized}");
 
         let lock =
@@ -4821,8 +5610,8 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         assert!(
             toml::to_string_pretty(&lock)
                 .unwrap()
-                .starts_with("version = 1\n"),
-            "adding a defaulted yank set must not force a lock-format bump"
+                .starts_with("version = 2\n"),
+            "the defaulted yank set must remain stable within lock format v2"
         );
     }
 
@@ -4830,6 +5619,11 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
     fn registry_identity_pin_toml_roundtrip_preserves_flat_bytes() {
         let lock = LockFile {
             version: LockFile::CURRENT_VERSION,
+            registry_host: registry_host_table(
+                "registry.carina-rs.dev",
+                "https://registry.carina-rs.dev/v1/providers/",
+                "def",
+            ),
             provider: vec![LockEntry {
                 name: "aws".into(),
                 source: "carina-rs/aws".into(),
@@ -4840,8 +5634,6 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
                 sha256: "abc".into(),
                 registry: Some(RegistryLock {
                     resolved_hostname: "registry.carina-rs.dev".into(),
-                    api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                    discovery_sha256: "def".into(),
                     sequence: RegistrySequence::Present(7),
                     sequence_anchor: RegistrySequenceAnchor::Established(7),
                     valid_until_present: true,
@@ -4856,7 +5648,12 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
         let expected = format!(
-            r#"version = 1
+            r#"version = 2
+
+[registry_host."registry.carina-rs.dev"]
+discovery_pin_present = true
+api_base_url = "https://registry.carina-rs.dev/v1/providers/"
+discovery_sha256 = "def"
 
 [[provider]]
 name = "aws"
@@ -4867,8 +5664,6 @@ sha256 = "abc"
 
 [provider.registry]
 resolved_hostname = "registry.carina-rs.dev"
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "def"
 sequence_present = true
 sequence = 7
 sequence_anchor_established = true
@@ -5100,6 +5895,165 @@ transparency_log_present = false
         let after_entry = lock.find_by_source("carina-rs/aws").unwrap();
         assert_eq!(after_entry.sha256, before_entry.sha256);
         assert_eq!(after_entry.kind, before_entry.kind);
+    }
+
+    #[test]
+    fn prepared_discovery_repin_preview_is_total_by_construction() {
+        let mut lock = lock_with_registry_security_state(RegistrySignatureProtection::NotRequired);
+        let prepared = lock
+            .prepare_registry_discovery_repin("registry.carina-rs.dev")
+            .unwrap();
+
+        // This in-module assertion pins the structural guarantee directly:
+        // every prepared value carries a non-optional pin, and the public
+        // preview accessor is only a projection of that field.
+        assert!(std::ptr::eq(
+            prepared.discovery_pin(),
+            &prepared.discarded_pin
+        ));
+    }
+
+    #[test]
+    fn discovery_repin_normalizes_mixed_case_host_argument() {
+        let mut lock = lock_with_registry_security_state(RegistrySignatureProtection::NotRequired);
+
+        lock.prepare_registry_discovery_repin("Registry.Carina-RS.dev")
+            .unwrap()
+            .commit();
+
+        assert!(
+            lock.registry_host
+                .get("registry.carina-rs.dev")
+                .unwrap()
+                .pin()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn discovery_repin_clears_one_host_pair_and_preserves_every_provider_field() {
+        let hostname = "registry.carina-rs.dev";
+        let mut lock = lock_with_registry_security_state(signature_pin("identity-a", "issuer-a"));
+        lock.provider.push(LockEntry {
+            name: "random".into(),
+            source: "carina-rs/random".into(),
+            kind: LockEntryKind::Version {
+                version: "1.0.0".into(),
+                constraint: Some("^1".into()),
+            },
+            sha256: "random-shasum".into(),
+            registry: Some(RegistryLock {
+                resolved_hostname: hostname.into(),
+                sequence: RegistrySequence::Present(11),
+                sequence_anchor: RegistrySequenceAnchor::Established(9),
+                valid_until_present: true,
+                yanked_versions: YankedRegistryVersions(BTreeSet::from(["0.9.0".into()])),
+                signature: signature_pin("identity-b", "issuer-b"),
+                transparency_log_present: true,
+            }),
+        });
+        lock.registry_host.insert(
+            "registry.example.test".into(),
+            registry_host_lock(
+                "https://registry.example.test/providers/",
+                "other-discovery",
+            ),
+        );
+        let providers_before = serde_json::to_value(&lock.provider).unwrap();
+        let other_host_before = lock
+            .registry_host
+            .get("registry.example.test")
+            .unwrap()
+            .clone();
+
+        let recovery = lock.prepare_registry_discovery_repin(hostname).unwrap();
+        assert_eq!(
+            recovery.discovery_pin(),
+            &RegistryDiscoveryPin {
+                api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
+                discovery_sha256: "discovery-shasum".into(),
+            }
+        );
+        recovery.commit();
+
+        assert!(
+            lock.registry_host
+                .get(hostname)
+                .expect("the host record itself must survive")
+                .pin()
+                .is_none(),
+            "the next verified discovery fetch must see first contact"
+        );
+        assert_eq!(
+            lock.registry_host.get("registry.example.test"),
+            Some(&other_host_before),
+            "other hosts must not be changed"
+        );
+        assert_eq!(
+            serde_json::to_value(&lock.provider).unwrap(),
+            providers_before,
+            "discovery recovery must not rewrite any provider field"
+        );
+        assert!(
+            lock.provider[0]
+                .registry
+                .as_ref()
+                .unwrap()
+                .yanked_versions
+                .contains("0.4.0")
+        );
+        assert!(
+            lock.provider[1]
+                .registry
+                .as_ref()
+                .unwrap()
+                .yanked_versions
+                .contains("0.9.0")
+        );
+    }
+
+    #[test]
+    fn discovery_repin_supplies_no_replacement_and_round_trips_unpinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        let mut lock = lock_with_registry_security_state(signature_pin("identity-a", "issuer-a"));
+
+        let missing_error = match lock.prepare_registry_discovery_repin("missing.example.test") {
+            Ok(_) => panic!("an unknown host must not produce a prepared recovery"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            missing_error,
+            RegistryLockRecoveryError::RegistryHostStateNotFound {
+                host: "missing.example.test".into(),
+            }
+        );
+
+        lock.prepare_registry_discovery_repin("registry.carina-rs.dev")
+            .unwrap()
+            .commit();
+        lock.save(&lock_path).unwrap();
+        let mut reloaded = LockFile::load(&lock_path).unwrap().unwrap();
+
+        assert!(
+            reloaded
+                .registry_host
+                .get("registry.carina-rs.dev")
+                .unwrap()
+                .pin()
+                .is_none()
+        );
+        let error = match reloaded.prepare_registry_discovery_repin("registry.carina-rs.dev") {
+            Ok(_) => panic!("an already cleared host must not preview invented replacement values"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            RegistryLockRecoveryError::DiscoveryAlreadyUnpinned {
+                host: "registry.carina-rs.dev".into(),
+            }
+        );
+        assert!(error.to_string().contains("awaiting a new discovery pin"));
     }
 
     #[test]
@@ -5423,7 +6377,12 @@ transparency_log_present = false
         assert!(
             SEQUENCE_REBOOTSTRAP_REMEDIATION.contains("carina providers re-bootstrap <provider>")
         );
-        for remediation in [IDENTITY_REPIN_REMEDIATION, SEQUENCE_REBOOTSTRAP_REMEDIATION] {
+        assert!(DISCOVERY_REPIN_REMEDIATION.contains("carina providers repin-discovery <host>"));
+        for remediation in [
+            IDENTITY_REPIN_REMEDIATION,
+            SEQUENCE_REBOOTSTRAP_REMEDIATION,
+            DISCOVERY_REPIN_REMEDIATION,
+        ] {
             let remediation = remediation.to_ascii_lowercase();
             assert!(!remediation.contains("delete"), "{remediation}");
             assert!(!remediation.contains("remove"), "{remediation}");
@@ -5433,7 +6392,12 @@ transparency_log_present = false
 
     #[test]
     fn registry_ratchet_storage_load_attaches_unpinned_to_provider() {
-        let serialized = r#"version = 1
+        let serialized = r#"version = 2
+
+[registry_host."registry.carina-rs.dev"]
+discovery_pin_present = true
+api_base_url = "https://registry.carina-rs.dev/v1/providers/"
+discovery_sha256 = "def"
 
 [[provider]]
 name = "aws"
@@ -5444,8 +6408,6 @@ sha256 = "abc"
 
 [provider.registry]
 resolved_hostname = "registry.carina-rs.dev"
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "def"
 sequence_present = false
 sequence_anchor_established = false
 valid_until_present = false
@@ -5483,26 +6445,27 @@ transparency_log_present = true
     fn registry_ratchet_storage_store_clears_shadow_for_pinned_provider() {
         let source = "carina-rs/aws";
         let mut lock = LockFile::default();
-        lock.upsert_registry(LockEntry {
-            name: "aws".into(),
-            source: source.into(),
-            kind: LockEntryKind::Version {
-                version: "0.5.0".into(),
-                constraint: None,
+        lock.upsert_registry(
+            LockEntry {
+                name: "aws".into(),
+                source: source.into(),
+                kind: LockEntryKind::Version {
+                    version: "0.5.0".into(),
+                    constraint: None,
+                },
+                sha256: "abc".into(),
+                registry: Some(RegistryLock {
+                    resolved_hostname: "registry.carina-rs.dev".into(),
+                    sequence: RegistrySequence::Absent,
+                    sequence_anchor: RegistrySequenceAnchor::Unestablished,
+                    valid_until_present: false,
+                    yanked_versions: YankedRegistryVersions::default(),
+                    signature: RegistrySignatureProtection::NotRequired,
+                    transparency_log_present: false,
+                }),
             },
-            sha256: "abc".into(),
-            registry: Some(RegistryLock {
-                resolved_hostname: "registry.carina-rs.dev".into(),
-                api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                discovery_sha256: "def".into(),
-                sequence: RegistrySequence::Absent,
-                sequence_anchor: RegistrySequenceAnchor::Unestablished,
-                valid_until_present: false,
-                yanked_versions: YankedRegistryVersions::default(),
-                signature: RegistrySignatureProtection::NotRequired,
-                transparency_log_present: false,
-            }),
-        })
+            registry_host_lock("https://registry.carina-rs.dev/v1/providers/", "def"),
+        )
         .unwrap();
         let observed = RegistryRatchets {
             sequence: RegistrySequence::Present(7),
@@ -5522,6 +6485,73 @@ transparency_log_present = true
     }
 
     #[test]
+    fn registry_provider_writes_always_create_referenced_host_records() {
+        let mut lock = LockFile::default();
+
+        for (name, source, hostname) in [
+            ("aws", "carina-rs/aws", "registry.carina-rs.dev"),
+            (
+                "random",
+                "registry.example.test/acme/random",
+                "registry.example.test",
+            ),
+        ] {
+            let registry_source = match parse_provider_source(source).unwrap() {
+                ProviderSource::Registry(source) => source,
+                ProviderSource::GithubDirect { .. } => unreachable!(),
+            };
+            let validated = ValidatedRegistryListing::validate(
+                &registry_source,
+                &RegistryVersions {
+                    sequence: None,
+                    valid_until: None,
+                    versions: Vec::new(),
+                },
+                &RegistryRatchets::default(),
+                RegistrySequenceAnchor::Unestablished,
+            )
+            .unwrap();
+            let (_, validated_sequence) = validated.into_parts();
+            let mut persistent =
+                PersistentLockFile::new(&mut lock, PathBuf::from("carina-providers.lock"));
+
+            persistent
+                .upsert_registry_provider(RegistryProviderLockEntry {
+                    name: name.into(),
+                    source: source.into(),
+                    kind: LockEntryKind::Version {
+                        version: "1.0.0".into(),
+                        constraint: None,
+                    },
+                    sha256: format!("{name}-sha256"),
+                    registry: ResolvedRegistry {
+                        hostname: hostname.into(),
+                        api_base_url: format!("https://{hostname}/v1/providers/"),
+                        discovery_sha256: format!("{hostname}-discovery-sha256"),
+                    },
+                    validated_sequence,
+                })
+                .unwrap();
+
+            for entry in &lock.provider {
+                let Some(registry) = &entry.registry else {
+                    continue;
+                };
+                assert!(
+                    lock.registry_host
+                        .contains_key(registry.resolved_hostname()),
+                    "registry provider {:?} references missing host {:?}",
+                    entry.source,
+                    registry.resolved_hostname()
+                );
+            }
+        }
+
+        assert_eq!(lock.provider.len(), 2);
+        assert_eq!(lock.registry_host.len(), 2);
+    }
+
+    #[test]
     fn upsert_replaces_existing_entry_by_source() {
         let source = "github.com/carina-rs/carina-provider-awscc";
         let mut lock = LockFile::default();
@@ -5538,49 +6568,51 @@ transparency_log_present = true
     #[test]
     fn lock_upsert_rejects_conflicting_registry_identity_pin() {
         let mut lock = LockFile::default();
-        lock.upsert_registry(LockEntry {
-            name: "aws".into(),
-            source: "carina-rs/aws".into(),
-            kind: LockEntryKind::Version {
-                version: "0.5.0".into(),
-                constraint: None,
-            },
-            sha256: "recorded".into(),
-            registry: Some(RegistryLock {
-                resolved_hostname: "registry.carina-rs.dev".into(),
-                api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                discovery_sha256: "discovery".into(),
-                sequence: RegistrySequence::Present(100),
-                sequence_anchor: RegistrySequenceAnchor::Established(100),
-                valid_until_present: true,
-                yanked_versions: YankedRegistryVersions::default(),
-                signature: signature_pin("id-a", "issuer-a"),
-                transparency_log_present: true,
-            }),
-        })
-        .unwrap();
-
-        let hostile = lock
-            .upsert_registry(LockEntry {
+        lock.upsert_registry(
+            LockEntry {
                 name: "aws".into(),
                 source: "carina-rs/aws".into(),
                 kind: LockEntryKind::Version {
-                    version: "0.6.0".into(),
+                    version: "0.5.0".into(),
                     constraint: None,
                 },
-                sha256: "proposed".into(),
+                sha256: "recorded".into(),
                 registry: Some(RegistryLock {
                     resolved_hostname: "registry.carina-rs.dev".into(),
-                    api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                    discovery_sha256: "discovery".into(),
-                    sequence: RegistrySequence::Absent,
-                    sequence_anchor: RegistrySequenceAnchor::Unestablished,
-                    valid_until_present: false,
+                    sequence: RegistrySequence::Present(100),
+                    sequence_anchor: RegistrySequenceAnchor::Established(100),
+                    valid_until_present: true,
                     yanked_versions: YankedRegistryVersions::default(),
-                    signature: signature_pin("EVIL", "EVIL-issuer"),
-                    transparency_log_present: false,
+                    signature: signature_pin("id-a", "issuer-a"),
+                    transparency_log_present: true,
                 }),
-            })
+            },
+            registry_host_lock("https://registry.carina-rs.dev/v1/providers/", "discovery"),
+        )
+        .unwrap();
+
+        let hostile = lock
+            .upsert_registry(
+                LockEntry {
+                    name: "aws".into(),
+                    source: "carina-rs/aws".into(),
+                    kind: LockEntryKind::Version {
+                        version: "0.6.0".into(),
+                        constraint: None,
+                    },
+                    sha256: "proposed".into(),
+                    registry: Some(RegistryLock {
+                        resolved_hostname: "registry.carina-rs.dev".into(),
+                        sequence: RegistrySequence::Absent,
+                        sequence_anchor: RegistrySequenceAnchor::Unestablished,
+                        valid_until_present: false,
+                        yanked_versions: YankedRegistryVersions::default(),
+                        signature: signature_pin("EVIL", "EVIL-issuer"),
+                        transparency_log_present: false,
+                    }),
+                },
+                registry_host_lock("https://registry.carina-rs.dev/v1/providers/", "discovery"),
+            )
             .expect_err("a conflicting identity pin must be rejected");
         assert_eq!(
             hostile.left,
@@ -7276,28 +8308,30 @@ transparency_log_present = true
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let mut lock_file = LockFile::default();
         lock_file
-            .upsert_registry(LockEntry {
-                name: "aws".into(),
-                source: "carina-rs/aws".into(),
-                kind: LockEntryKind::Version {
-                    version: "0.5.0".into(),
-                    constraint: None,
+            .upsert_registry(
+                LockEntry {
+                    name: "aws".into(),
+                    source: "carina-rs/aws".into(),
+                    kind: LockEntryKind::Version {
+                        version: "0.5.0".into(),
+                        constraint: None,
+                    },
+                    sha256: shasum,
+                    registry: Some(RegistryLock {
+                        resolved_hostname: "registry.carina-rs.dev".into(),
+                        sequence: RegistrySequence::Present(7),
+                        sequence_anchor: RegistrySequenceAnchor::Established(7),
+                        valid_until_present: true,
+                        yanked_versions: YankedRegistryVersions::default(),
+                        signature: signed_fixture_pin(),
+                        transparency_log_present: false,
+                    }),
                 },
-                sha256: shasum,
-                registry: Some(RegistryLock {
-                    resolved_hostname: "registry.carina-rs.dev".into(),
-                    api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                    discovery_sha256: sha256_bytes(
-                        r#"{"providers.v1":"/v1/providers/"}"#.as_bytes(),
-                    ),
-                    sequence: RegistrySequence::Present(7),
-                    sequence_anchor: RegistrySequenceAnchor::Established(7),
-                    valid_until_present: true,
-                    yanked_versions: YankedRegistryVersions::default(),
-                    signature: signed_fixture_pin(),
-                    transparency_log_present: false,
-                }),
-            })
+                registry_host_lock(
+                    "https://registry.carina-rs.dev/v1/providers/",
+                    sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
+                ),
+            )
             .unwrap();
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200);
 
@@ -7384,7 +8418,12 @@ transparency_log_present = true
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("carina-providers.lock");
         let one_sided_pin = format!(
-            r#"version = 1
+            r#"version = 2
+
+[registry_host."registry.carina-rs.dev"]
+discovery_pin_present = true
+api_base_url = "https://registry.carina-rs.dev/v1/providers/"
+discovery_sha256 = "def"
 
 [[provider]]
 name = "aws"
@@ -7395,8 +8434,6 @@ sha256 = "abc"
 
 [provider.registry]
 resolved_hostname = "registry.carina-rs.dev"
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "def"
 sequence_present = true
 sequence = 7
 sequence_anchor_established = true
@@ -7701,9 +8738,14 @@ transparency_log_present = false
             .registry
             .as_ref()
             .expect("registry pin must be recorded");
-        assert_eq!(registry.resolved_hostname, "registry.carina-rs.dev");
+        assert_eq!(registry.resolved_hostname(), "registry.carina-rs.dev");
+        let host_pin = lock_file
+            .registry_host
+            .get(registry.resolved_hostname())
+            .and_then(RegistryHostLock::pin)
+            .expect("registry host pin must be recorded");
         assert_eq!(
-            registry.api_base_url,
+            host_pin.api_base_url,
             "https://registry.carina-rs.dev/v1/providers/"
         );
         assert_eq!(registry.sequence, RegistrySequence::Present(7));
@@ -7781,26 +8823,30 @@ transparency_log_present = false
         let new_body = b"new registry revision wasm bytes";
         let new_shasum = sha256_bytes(new_body);
         let mut lock = LockFile::default();
-        lock.upsert_registry(LockEntry {
-            name: "aws".into(),
-            source: "carina-rs/aws".into(),
-            kind: LockEntryKind::RegistryRevision {
-                revision: "main".into(),
-                version: "0.0.0-main.1.aaa".into(),
+        lock.upsert_registry(
+            LockEntry {
+                name: "aws".into(),
+                source: "carina-rs/aws".into(),
+                kind: LockEntryKind::RegistryRevision {
+                    revision: "main".into(),
+                    version: "0.0.0-main.1.aaa".into(),
+                },
+                sha256: old_shasum,
+                registry: Some(RegistryLock {
+                    resolved_hostname: "registry.carina-rs.dev".into(),
+                    sequence: RegistrySequence::Present(7),
+                    sequence_anchor: RegistrySequenceAnchor::Established(7),
+                    valid_until_present: true,
+                    yanked_versions: YankedRegistryVersions::default(),
+                    signature: RegistrySignatureProtection::NotRequired,
+                    transparency_log_present: false,
+                }),
             },
-            sha256: old_shasum,
-            registry: Some(RegistryLock {
-                resolved_hostname: "registry.carina-rs.dev".into(),
-                api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                discovery_sha256: sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
-                sequence: RegistrySequence::Present(7),
-                sequence_anchor: RegistrySequenceAnchor::Established(7),
-                valid_until_present: true,
-                yanked_versions: YankedRegistryVersions::default(),
-                signature: RegistrySignatureProtection::NotRequired,
-                transparency_log_present: false,
-            }),
-        })
+            registry_host_lock(
+                "https://registry.carina-rs.dev/v1/providers/",
+                sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
+            ),
+        )
         .unwrap();
         lock.save(&dir.path().join("carina-providers.lock"))
             .unwrap();
@@ -7857,26 +8903,30 @@ transparency_log_present = false
         let body = b"locked registry revision wasm bytes";
         let shasum = sha256_bytes(body);
         let mut lock = LockFile::default();
-        lock.upsert_registry(LockEntry {
-            name: "aws".into(),
-            source: "carina-rs/aws".into(),
-            kind: LockEntryKind::RegistryRevision {
-                revision: "main".into(),
-                version: "0.0.0-main.1.aaa".into(),
+        lock.upsert_registry(
+            LockEntry {
+                name: "aws".into(),
+                source: "carina-rs/aws".into(),
+                kind: LockEntryKind::RegistryRevision {
+                    revision: "main".into(),
+                    version: "0.0.0-main.1.aaa".into(),
+                },
+                sha256: shasum.clone(),
+                registry: Some(RegistryLock {
+                    resolved_hostname: "registry.carina-rs.dev".into(),
+                    sequence: RegistrySequence::Present(7),
+                    sequence_anchor: RegistrySequenceAnchor::Established(7),
+                    valid_until_present: true,
+                    yanked_versions: YankedRegistryVersions::default(),
+                    signature: RegistrySignatureProtection::NotRequired,
+                    transparency_log_present: false,
+                }),
             },
-            sha256: shasum.clone(),
-            registry: Some(RegistryLock {
-                resolved_hostname: "registry.carina-rs.dev".into(),
-                api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                discovery_sha256: sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
-                sequence: RegistrySequence::Present(7),
-                sequence_anchor: RegistrySequenceAnchor::Established(7),
-                valid_until_present: true,
-                yanked_versions: YankedRegistryVersions::default(),
-                signature: RegistrySignatureProtection::NotRequired,
-                transparency_log_present: false,
-            }),
-        })
+            registry_host_lock(
+                "https://registry.carina-rs.dev/v1/providers/",
+                sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
+            ),
+        )
         .unwrap();
         lock.save(&dir.path().join("carina-providers.lock"))
             .unwrap();
@@ -8027,26 +9077,27 @@ transparency_log_present = false
             .bytes("https://downloads.example.test/aws.wasm", body);
         let mut lock_file = LockFile::default();
         lock_file
-            .upsert_registry(LockEntry {
-                name: "aws".into(),
-                source: "carina-rs/aws".into(),
-                kind: LockEntryKind::Version {
-                    version: "0.5.0".into(),
-                    constraint: None,
+            .upsert_registry(
+                LockEntry {
+                    name: "aws".into(),
+                    source: "carina-rs/aws".into(),
+                    kind: LockEntryKind::Version {
+                        version: "0.5.0".into(),
+                        constraint: None,
+                    },
+                    sha256: shasum,
+                    registry: Some(RegistryLock {
+                        resolved_hostname: "registry.carina-rs.dev".into(),
+                        sequence: RegistrySequence::Present(7),
+                        sequence_anchor: RegistrySequenceAnchor::Established(7),
+                        valid_until_present: true,
+                        yanked_versions: YankedRegistryVersions::default(),
+                        signature: RegistrySignatureProtection::NotRequired,
+                        transparency_log_present: false,
+                    }),
                 },
-                sha256: shasum,
-                registry: Some(RegistryLock {
-                    resolved_hostname: "registry.carina-rs.dev".into(),
-                    api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                    discovery_sha256: "old".into(),
-                    sequence: RegistrySequence::Present(7),
-                    sequence_anchor: RegistrySequenceAnchor::Established(7),
-                    valid_until_present: true,
-                    yanked_versions: YankedRegistryVersions::default(),
-                    signature: RegistrySignatureProtection::NotRequired,
-                    transparency_log_present: false,
-                }),
-            })
+                registry_host_lock("https://registry.carina-rs.dev/v1/providers/", "old"),
+            )
             .unwrap();
 
         let err = resolve_provider_with_http(
@@ -8076,26 +9127,27 @@ transparency_log_present = false
         );
         let mut lock_file = LockFile::default();
         lock_file
-            .upsert_registry(LockEntry {
-                name: "aws".into(),
-                source: "carina-rs/aws".into(),
-                kind: LockEntryKind::Version {
-                    version: "0.5.0".into(),
-                    constraint: None,
+            .upsert_registry(
+                LockEntry {
+                    name: "aws".into(),
+                    source: "carina-rs/aws".into(),
+                    kind: LockEntryKind::Version {
+                        version: "0.5.0".into(),
+                        constraint: None,
+                    },
+                    sha256: shasum,
+                    registry: Some(RegistryLock {
+                        resolved_hostname: "registry.carina-rs.dev".into(),
+                        sequence: RegistrySequence::Present(7),
+                        sequence_anchor: RegistrySequenceAnchor::Established(7),
+                        valid_until_present: false,
+                        yanked_versions: YankedRegistryVersions::default(),
+                        signature: RegistrySignatureProtection::NotRequired,
+                        transparency_log_present: false,
+                    }),
                 },
-                sha256: shasum,
-                registry: Some(RegistryLock {
-                    resolved_hostname: "registry.carina-rs.dev".into(),
-                    api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                    discovery_sha256: "old".into(),
-                    sequence: RegistrySequence::Present(7),
-                    sequence_anchor: RegistrySequenceAnchor::Established(7),
-                    valid_until_present: false,
-                    yanked_versions: YankedRegistryVersions::default(),
-                    signature: RegistrySignatureProtection::NotRequired,
-                    transparency_log_present: false,
-                }),
-            })
+                registry_host_lock("https://registry.carina-rs.dev/v1/providers/", "old"),
+            )
             .unwrap();
 
         let err = resolve_provider_with_http(
@@ -8121,26 +9173,27 @@ transparency_log_present = false
         );
         let mut lock_file = LockFile::default();
         lock_file
-            .upsert_registry(LockEntry {
-                name: "aws".into(),
-                source: "carina-rs/aws".into(),
-                kind: LockEntryKind::Version {
-                    version: "0.5.0".into(),
-                    constraint: None,
+            .upsert_registry(
+                LockEntry {
+                    name: "aws".into(),
+                    source: "carina-rs/aws".into(),
+                    kind: LockEntryKind::Version {
+                        version: "0.5.0".into(),
+                        constraint: None,
+                    },
+                    sha256: shasum,
+                    registry: Some(RegistryLock {
+                        resolved_hostname: "registry.carina-rs.dev".into(),
+                        sequence: RegistrySequence::Present(7),
+                        sequence_anchor: RegistrySequenceAnchor::Established(7),
+                        valid_until_present: true,
+                        yanked_versions: YankedRegistryVersions::default(),
+                        signature: RegistrySignatureProtection::NotRequired,
+                        transparency_log_present: false,
+                    }),
                 },
-                sha256: shasum,
-                registry: Some(RegistryLock {
-                    resolved_hostname: "registry.carina-rs.dev".into(),
-                    api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                    discovery_sha256: "old".into(),
-                    sequence: RegistrySequence::Present(7),
-                    sequence_anchor: RegistrySequenceAnchor::Established(7),
-                    valid_until_present: true,
-                    yanked_versions: YankedRegistryVersions::default(),
-                    signature: RegistrySignatureProtection::NotRequired,
-                    transparency_log_present: false,
-                }),
-            })
+                registry_host_lock("https://registry.carina-rs.dev/v1/providers/", "old"),
+            )
             .unwrap();
 
         let err = resolve_provider_with_http(
@@ -8166,26 +9219,27 @@ transparency_log_present = false
         );
         let mut lock_file = LockFile::default();
         lock_file
-            .upsert_registry(LockEntry {
-                name: "aws".into(),
-                source: "carina-rs/aws".into(),
-                kind: LockEntryKind::Version {
-                    version: "0.5.0".into(),
-                    constraint: None,
+            .upsert_registry(
+                LockEntry {
+                    name: "aws".into(),
+                    source: "carina-rs/aws".into(),
+                    kind: LockEntryKind::Version {
+                        version: "0.5.0".into(),
+                        constraint: None,
+                    },
+                    sha256: shasum,
+                    registry: Some(RegistryLock {
+                        resolved_hostname: "registry.carina-rs.dev".into(),
+                        sequence: RegistrySequence::Present(7),
+                        sequence_anchor: RegistrySequenceAnchor::Established(7),
+                        valid_until_present: true,
+                        yanked_versions: YankedRegistryVersions::default(),
+                        signature: RegistrySignatureProtection::NotRequired,
+                        transparency_log_present: false,
+                    }),
                 },
-                sha256: shasum,
-                registry: Some(RegistryLock {
-                    resolved_hostname: "registry.carina-rs.dev".into(),
-                    api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                    discovery_sha256: "old".into(),
-                    sequence: RegistrySequence::Present(7),
-                    sequence_anchor: RegistrySequenceAnchor::Established(7),
-                    valid_until_present: true,
-                    yanked_versions: YankedRegistryVersions::default(),
-                    signature: RegistrySignatureProtection::NotRequired,
-                    transparency_log_present: false,
-                }),
-            })
+                registry_host_lock("https://registry.carina-rs.dev/v1/providers/", "old"),
+            )
             .unwrap();
 
         let err = resolve_provider_with_http(
@@ -8217,28 +9271,30 @@ transparency_log_present = false
         );
         let mut lock_file = LockFile::default();
         lock_file
-            .upsert_registry(LockEntry {
-                name: "aws".into(),
-                source: "carina-rs/aws".into(),
-                kind: LockEntryKind::Version {
-                    version: "0.5.0".into(),
-                    constraint: None,
+            .upsert_registry(
+                LockEntry {
+                    name: "aws".into(),
+                    source: "carina-rs/aws".into(),
+                    kind: LockEntryKind::Version {
+                        version: "0.5.0".into(),
+                        constraint: None,
+                    },
+                    sha256: shasum,
+                    registry: Some(RegistryLock {
+                        resolved_hostname: "registry.carina-rs.dev".into(),
+                        sequence: RegistrySequence::Present(7),
+                        sequence_anchor: RegistrySequenceAnchor::Established(7),
+                        valid_until_present: true,
+                        yanked_versions: YankedRegistryVersions::default(),
+                        signature: signed_fixture_pin(),
+                        transparency_log_present: false,
+                    }),
                 },
-                sha256: shasum,
-                registry: Some(RegistryLock {
-                    resolved_hostname: "registry.carina-rs.dev".into(),
-                    api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                    discovery_sha256: sha256_bytes(
-                        r#"{"providers.v1":"/v1/providers/"}"#.as_bytes(),
-                    ),
-                    sequence: RegistrySequence::Present(7),
-                    sequence_anchor: RegistrySequenceAnchor::Established(7),
-                    valid_until_present: true,
-                    yanked_versions: YankedRegistryVersions::default(),
-                    signature: signed_fixture_pin(),
-                    transparency_log_present: false,
-                }),
-            })
+                registry_host_lock(
+                    "https://registry.carina-rs.dev/v1/providers/",
+                    sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
+                ),
+            )
             .unwrap();
 
         let err = resolve_provider_with_http(
@@ -8292,28 +9348,30 @@ transparency_log_present = false
             .downloadable_bytes("https://downloads.example.test/aws-0.6.0.wasm", new_body);
         let mut lock_file = LockFile::default();
         lock_file
-            .upsert_registry(LockEntry {
-                name: "aws".into(),
-                source: "carina-rs/aws".into(),
-                kind: LockEntryKind::Version {
-                    version: "0.5.0".into(),
-                    constraint: None,
+            .upsert_registry(
+                LockEntry {
+                    name: "aws".into(),
+                    source: "carina-rs/aws".into(),
+                    kind: LockEntryKind::Version {
+                        version: "0.5.0".into(),
+                        constraint: None,
+                    },
+                    sha256: old_shasum,
+                    registry: Some(RegistryLock {
+                        resolved_hostname: "registry.carina-rs.dev".into(),
+                        sequence: RegistrySequence::Present(7),
+                        sequence_anchor: RegistrySequenceAnchor::Established(7),
+                        valid_until_present: true,
+                        yanked_versions: YankedRegistryVersions::default(),
+                        signature: signed_fixture_pin(),
+                        transparency_log_present: false,
+                    }),
                 },
-                sha256: old_shasum,
-                registry: Some(RegistryLock {
-                    resolved_hostname: "registry.carina-rs.dev".into(),
-                    api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                    discovery_sha256: sha256_bytes(
-                        r#"{"providers.v1":"/v1/providers/"}"#.as_bytes(),
-                    ),
-                    sequence: RegistrySequence::Present(7),
-                    sequence_anchor: RegistrySequenceAnchor::Established(7),
-                    valid_until_present: true,
-                    yanked_versions: YankedRegistryVersions::default(),
-                    signature: signed_fixture_pin(),
-                    transparency_log_present: false,
-                }),
-            })
+                registry_host_lock(
+                    "https://registry.carina-rs.dev/v1/providers/",
+                    sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
+                ),
+            )
             .unwrap();
 
         let err = resolve_provider_with_http(
@@ -8353,28 +9411,30 @@ transparency_log_present = false
             .downloadable_bytes("https://downloads.example.test/aws-0.6.0.wasm", new_body);
         let mut lock_file = LockFile::default();
         lock_file
-            .upsert_registry(LockEntry {
-                name: "aws".into(),
-                source: "carina-rs/aws".into(),
-                kind: LockEntryKind::Version {
-                    version: "0.5.0".into(),
-                    constraint: None,
+            .upsert_registry(
+                LockEntry {
+                    name: "aws".into(),
+                    source: "carina-rs/aws".into(),
+                    kind: LockEntryKind::Version {
+                        version: "0.5.0".into(),
+                        constraint: None,
+                    },
+                    sha256: old_shasum,
+                    registry: Some(RegistryLock {
+                        resolved_hostname: "registry.carina-rs.dev".into(),
+                        sequence: RegistrySequence::Present(7),
+                        sequence_anchor: RegistrySequenceAnchor::Established(7),
+                        valid_until_present: true,
+                        yanked_versions: YankedRegistryVersions::default(),
+                        signature: signed_fixture_pin(),
+                        transparency_log_present: false,
+                    }),
                 },
-                sha256: old_shasum,
-                registry: Some(RegistryLock {
-                    resolved_hostname: "registry.carina-rs.dev".into(),
-                    api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                    discovery_sha256: sha256_bytes(
-                        r#"{"providers.v1":"/v1/providers/"}"#.as_bytes(),
-                    ),
-                    sequence: RegistrySequence::Present(7),
-                    sequence_anchor: RegistrySequenceAnchor::Established(7),
-                    valid_until_present: true,
-                    yanked_versions: YankedRegistryVersions::default(),
-                    signature: signed_fixture_pin(),
-                    transparency_log_present: false,
-                }),
-            })
+                registry_host_lock(
+                    "https://registry.carina-rs.dev/v1/providers/",
+                    sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
+                ),
+            )
             .unwrap();
 
         let err = resolve_provider_with_http(
@@ -8568,28 +9628,30 @@ transparency_log_present = false
         );
         let mut lock_file = LockFile::default();
         lock_file
-            .upsert_registry(LockEntry {
-                name: "aws".into(),
-                source: "carina-rs/aws".into(),
-                kind: LockEntryKind::Version {
-                    version: "0.5.0".into(),
-                    constraint: None,
+            .upsert_registry(
+                LockEntry {
+                    name: "aws".into(),
+                    source: "carina-rs/aws".into(),
+                    kind: LockEntryKind::Version {
+                        version: "0.5.0".into(),
+                        constraint: None,
+                    },
+                    sha256: shasum,
+                    registry: Some(RegistryLock {
+                        resolved_hostname: "registry.carina-rs.dev".into(),
+                        sequence: RegistrySequence::Present(7),
+                        sequence_anchor: RegistrySequenceAnchor::Established(7),
+                        valid_until_present: true,
+                        yanked_versions: YankedRegistryVersions::default(),
+                        signature: signature_pin("identity", "issuer"),
+                        transparency_log_present: true,
+                    }),
                 },
-                sha256: shasum,
-                registry: Some(RegistryLock {
-                    resolved_hostname: "registry.carina-rs.dev".into(),
-                    api_base_url: "https://registry.carina-rs.dev/v1/providers/".into(),
-                    discovery_sha256: sha256_bytes(
-                        r#"{"providers.v1":"/v1/providers/"}"#.as_bytes(),
-                    ),
-                    sequence: RegistrySequence::Present(7),
-                    sequence_anchor: RegistrySequenceAnchor::Established(7),
-                    valid_until_present: true,
-                    yanked_versions: YankedRegistryVersions::default(),
-                    signature: signature_pin("identity", "issuer"),
-                    transparency_log_present: true,
-                }),
-            })
+                registry_host_lock(
+                    "https://registry.carina-rs.dev/v1/providers/",
+                    sha256_bytes(r#"{"providers.v1":"/v1/providers/"}"#.as_bytes()),
+                ),
+            )
             .unwrap();
 
         let err = resolve_provider_with_http(
