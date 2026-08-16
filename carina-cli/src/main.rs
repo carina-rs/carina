@@ -761,6 +761,25 @@ mod error_format_tests {
     #[test]
     fn provider_recovery_commands_parse_with_optional_path() {
         assert!(
+            Cli::try_parse_from([
+                "carina",
+                "providers",
+                "repin-discovery",
+                "Registry.Carina-RS.dev",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "carina",
+                "providers",
+                "repin-discovery",
+                "registry.example.test",
+                "/tmp/project",
+            ])
+            .is_ok()
+        );
+        assert!(
             Cli::try_parse_from(["carina", "providers", "repin-identity", "carina-rs/aws",])
                 .is_ok()
         );
