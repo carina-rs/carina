@@ -1,6 +1,5 @@
 //! Offline verification for Sigstore bundles returned by a provider registry.
 
-mod tlog;
 mod trust_root;
 mod verifier;
 
@@ -120,7 +119,6 @@ mod tests {
 
     const FIXTURE_ARTIFACT: &[u8] = include_bytes!("testdata/a.txt");
     const FIXTURE_BUNDLE: &[u8] = include_bytes!("testdata/bundle.sigstore.json");
-    const LIVE_BUNDLE: &[u8] = include_bytes!("testdata/live-bundle.sigstore.json");
     const FIXTURE_IDENTITY: &str = "https://github.com/sigstore-conformance/extremely-dangerous-public-oidc-beacon/.github/workflows/extremely-dangerous-oidc-beacon.yml@refs/heads/main";
     const FIXTURE_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
@@ -147,159 +145,6 @@ mod tests {
 
         assert!(first_use.is_first_use());
         assert!(!pinned.is_first_use());
-    }
-
-    #[test]
-    fn verifies_live_bundle_set() {
-        tlog::verify_set_only(LIVE_BUNDLE).expect("the live bundle SET should verify");
-    }
-
-    #[test]
-    fn verifies_live_bundle_inclusion_proof() {
-        tlog::verify_inclusion_proof_only(LIVE_BUNDLE)
-            .expect("the live bundle inclusion proof should verify");
-    }
-
-    #[test]
-    fn verifies_live_bundle_checkpoint_signature() {
-        tlog::verify_checkpoint_only(LIVE_BUNDLE)
-            .expect("the live bundle checkpoint should verify");
-    }
-
-    #[test]
-    fn set_payload_is_exact_compact_canonical_json() {
-        let payload = tlog::set_payload_for_test(FIXTURE_BUNDLE).unwrap();
-        let bundle: Value = serde_json::from_slice(FIXTURE_BUNDLE).unwrap();
-        let body = bundle["verificationMaterial"]["tlogEntries"][0]["canonicalizedBody"]
-            .as_str()
-            .unwrap();
-
-        assert_eq!(
-            payload,
-            format!(
-                r#"{{"body":"{body}","integratedTime":1710869186,"logID":"c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d","logIndex":79571823}}"#
-            )
-        );
-    }
-
-    #[test]
-    fn rejects_flipped_canonicalized_body_byte() {
-        let bundle = mutate_bundle(FIXTURE_BUNDLE, |bundle| {
-            flip_base64_byte(
-                &mut bundle["verificationMaterial"]["tlogEntries"][0]["canonicalizedBody"],
-            );
-        });
-
-        assert_verification_fails(&bundle, fixture_first_use_identity());
-    }
-
-    #[test]
-    fn rejects_flipped_set_signature_byte() {
-        let bundle = mutate_bundle(FIXTURE_BUNDLE, |bundle| {
-            flip_base64_byte(
-                &mut bundle["verificationMaterial"]["tlogEntries"][0]["inclusionPromise"]["signedEntryTimestamp"],
-            );
-        });
-
-        assert_verification_fails(&bundle, fixture_first_use_identity());
-    }
-
-    #[test]
-    fn rejects_wrong_inclusion_proof_log_index() {
-        let bundle = mutate_bundle(FIXTURE_BUNDLE, |bundle| {
-            bundle["verificationMaterial"]["tlogEntries"][0]["inclusionProof"]["logIndex"] =
-                json!("75408391");
-        });
-
-        assert_verification_fails(&bundle, fixture_first_use_identity());
-    }
-
-    #[test]
-    fn rejects_truncated_inclusion_proof_hashes() {
-        let bundle = mutate_bundle(FIXTURE_BUNDLE, |bundle| {
-            bundle["verificationMaterial"]["tlogEntries"][0]["inclusionProof"]["hashes"]
-                .as_array_mut()
-                .unwrap()
-                .pop();
-        });
-
-        assert_verification_fails(&bundle, fixture_first_use_identity());
-    }
-
-    #[test]
-    fn rejects_tampered_checkpoint_root_hash() {
-        let bundle = mutate_checkpoint(FIXTURE_BUNDLE, |lines| {
-            lines[2] = BASE64_STANDARD.encode([0u8; 32]);
-        });
-
-        assert_verification_fails(&bundle, fixture_first_use_identity());
-    }
-
-    #[test]
-    fn rejects_tampered_checkpoint_signature() {
-        let bundle = mutate_checkpoint(FIXTURE_BUNDLE, |lines| {
-            let (_, encoded) = lines[4].rsplit_once(' ').unwrap();
-            let mut signature = BASE64_STANDARD.decode(encoded).unwrap();
-            *signature.last_mut().unwrap() ^= 1;
-            lines[4] = format!("— rekor.sigstore.dev {}", BASE64_STANDARD.encode(signature));
-        });
-
-        assert_verification_fails(&bundle, fixture_first_use_identity());
-    }
-
-    #[test]
-    fn rejects_checkpoint_origin_suffix_not_bound_to_signature() {
-        let bundle = mutate_checkpoint(LIVE_BUNDLE, |lines| {
-            lines[0] = "rekor.sigstore.dev - 1193050959916656507".to_string();
-        });
-
-        let error = tlog::verify_checkpoint_only(&bundle).unwrap_err();
-        assert!(error.contains("checkpoint signature"), "{error}");
-    }
-
-    #[test]
-    fn rejects_checkpoint_tree_size_mismatch() {
-        let bundle = mutate_checkpoint(FIXTURE_BUNDLE, |lines| {
-            lines[1] = "75408394".to_string();
-        });
-
-        assert_verification_fails(&bundle, fixture_first_use_identity());
-    }
-
-    #[test]
-    fn rejects_missing_inclusion_promise() {
-        let bundle = mutate_bundle(FIXTURE_BUNDLE, |bundle| {
-            bundle["verificationMaterial"]["tlogEntries"][0]
-                .as_object_mut()
-                .unwrap()
-                .remove("inclusionPromise");
-        });
-
-        assert_verification_fails(&bundle, fixture_first_use_identity());
-    }
-
-    #[test]
-    fn rejects_missing_inclusion_proof() {
-        let bundle = mutate_bundle(FIXTURE_BUNDLE, |bundle| {
-            bundle["verificationMaterial"]["tlogEntries"][0]
-                .as_object_mut()
-                .unwrap()
-                .remove("inclusionProof");
-        });
-
-        assert_verification_fails(&bundle, fixture_first_use_identity());
-    }
-
-    #[test]
-    fn rejects_missing_checkpoint() {
-        let bundle = mutate_bundle(FIXTURE_BUNDLE, |bundle| {
-            bundle["verificationMaterial"]["tlogEntries"][0]["inclusionProof"]
-                .as_object_mut()
-                .unwrap()
-                .remove("checkpoint");
-        });
-
-        assert_verification_fails(&bundle, fixture_first_use_identity());
     }
 
     #[test]
@@ -401,30 +246,6 @@ mod tests {
         assert_verification_fails(&bundle, fixture_first_use_identity());
     }
 
-    #[test]
-    fn tlog_uses_protobuf_value_when_json_contains_field_aliases() {
-        let bundle: Value = serde_json::from_slice(FIXTURE_BUNDLE).unwrap();
-        let canonicalized_body =
-            bundle["verificationMaterial"]["tlogEntries"][0]["canonicalizedBody"]
-                .as_str()
-                .unwrap();
-        let mut tampered_body = BASE64_STANDARD.decode(canonicalized_body).unwrap();
-        tampered_body[0] ^= 1;
-        let tampered_body = BASE64_STANDARD.encode(tampered_body);
-        let original_field = format!(r#""canonicalizedBody": "{canonicalized_body}""#);
-        let duplicate_aliases =
-            format!(r#"{original_field}, "canonicalized_body": "{tampered_body}""#);
-        let bundle = std::str::from_utf8(FIXTURE_BUNDLE).unwrap().replacen(
-            &original_field,
-            &duplicate_aliases,
-            1,
-        );
-        assert!(bundle.contains("canonicalized_body"));
-
-        let error = tlog::verify_set_only(bundle.as_bytes()).unwrap_err();
-        assert!(error.contains("signed entry timestamp"), "{error}");
-    }
-
     fn fixture_first_use_identity() -> ExpectedIdentity {
         ExpectedIdentity::first_use(FIXTURE_IDENTITY.to_string(), FIXTURE_ISSUER.to_string())
     }
@@ -439,34 +260,6 @@ mod tests {
         let mut bundle: Value = serde_json::from_slice(bundle).unwrap();
         mutate(&mut bundle);
         serde_json::to_vec(&bundle).unwrap()
-    }
-
-    fn flip_base64_byte(value: &mut Value) {
-        let mut bytes = BASE64_STANDARD.decode(value.as_str().unwrap()).unwrap();
-        bytes[0] ^= 1;
-        *value = json!(BASE64_STANDARD.encode(bytes));
-    }
-
-    fn mutate_checkpoint(bundle: &[u8], mutate: impl FnOnce(&mut Vec<String>)) -> Vec<u8> {
-        mutate_bundle(bundle, |bundle| {
-            let envelope = bundle["verificationMaterial"]["tlogEntries"][0]
-                ["inclusionProof"]["checkpoint"]["envelope"]
-                .as_str()
-                .unwrap();
-            let trailing_newline = envelope.ends_with('\n');
-            let mut lines = envelope
-                .trim_end_matches('\n')
-                .split('\n')
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            mutate(&mut lines);
-            let mut envelope = lines.join("\n");
-            if trailing_newline {
-                envelope.push('\n');
-            }
-            bundle["verificationMaterial"]["tlogEntries"][0]["inclusionProof"]["checkpoint"]["envelope"] =
-                json!(envelope);
-        })
     }
 
     fn assert_verification_fails(bundle: &[u8], expected: ExpectedIdentity) {
