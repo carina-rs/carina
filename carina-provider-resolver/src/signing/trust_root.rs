@@ -120,18 +120,17 @@ impl TrustedRootDocument {
             if declared_key_id != entry_key_id {
                 continue;
             }
-            let der_spki = decode_base64("Rekor log public key", &log.public_key.raw_bytes)?;
-            if !valid_at(log.public_key.valid_for.as_ref(), integrated_time)? {
-                return Err(format!(
-                    "Rekor log key {} is not valid at integrated time {integrated_time}",
-                    lower_hex(entry_key_id)
-                ));
-            }
             if log.public_key.key_details != ECDSA_P256_KEY_DETAILS {
                 return Err(format!(
                     "Rekor log key {} uses unsupported key type {}",
                     lower_hex(entry_key_id),
                     log.public_key.key_details
+                ));
+            }
+            if !valid_at(log.public_key.valid_for.as_ref(), integrated_time)? {
+                return Err(format!(
+                    "Rekor log key {} is not valid at integrated time {integrated_time}",
+                    lower_hex(entry_key_id)
                 ));
             }
             let origin_name = https_origin_host(&log.base_url)?;
@@ -141,6 +140,7 @@ impl TrustedRootDocument {
                     key_id.len()
                 )
             })?;
+            let der_spki = decode_base64("Rekor log public key", &log.public_key.raw_bytes)?;
             return RekorKey::new(der_spki, key_id, origin_name).map_err(|_| {
                 format!(
                     "embedded Rekor log ID does not match the SHA-256 of its DER public key for {}",
@@ -318,6 +318,116 @@ mod tests {
             error.contains("upgrading carina may resolve this"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn unsupported_rekor_key_type_precedes_validity_window() {
+        let root = embedded_document().unwrap();
+        let unsupported_logs = root
+            .tlogs
+            .iter()
+            .filter(|log| log.public_key.key_details != ECDSA_P256_KEY_DETAILS)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unsupported_logs.len(),
+            1,
+            "embedded trust root must contain exactly one unsupported Rekor key type"
+        );
+        let unsupported_log = unsupported_logs[0];
+        let validity_start = unsupported_log
+            .public_key
+            .valid_for
+            .as_ref()
+            .and_then(|range| range.start.as_deref())
+            .expect("unsupported Rekor log key must have valid_for.start");
+        let validity_start = parse_timestamp(validity_start).unwrap();
+        let inside_validity_window = validity_start
+            .checked_add(1)
+            .expect("unsupported Rekor log validity-window start must permit a later timestamp");
+        let before_validity_window = validity_start
+            .checked_sub(1)
+            .expect("unsupported Rekor log validity-window start must permit an earlier timestamp");
+        assert!(
+            valid_at(
+                unsupported_log.public_key.valid_for.as_ref(),
+                inside_validity_window
+            )
+            .unwrap(),
+            "timestamp after unsupported Rekor log validity-window start must be inside the window"
+        );
+        assert!(
+            !valid_at(
+                unsupported_log.public_key.valid_for.as_ref(),
+                before_validity_window
+            )
+            .unwrap(),
+            "timestamp before unsupported Rekor log validity-window start must be outside the window"
+        );
+        let key_id = decode_base64("Rekor log key ID", &unsupported_log.log_id.key_id).unwrap();
+        let expected_error = format!(
+            "Rekor log key {} uses unsupported key type {}",
+            lower_hex(&key_id),
+            unsupported_log.public_key.key_details
+        );
+
+        for integrated_time in [inside_validity_window, before_validity_window] {
+            let error = match root.select_rekor_key(&key_id, integrated_time) {
+                Ok(_) => panic!("an unsupported Rekor key type must be rejected"),
+                Err(error) => error,
+            };
+
+            assert_eq!(error, expected_error);
+            assert!(!error.contains("not valid at integrated time"), "{error}");
+            assert!(!error.contains(TRUST_ROOT_STALENESS_HINT), "{error}");
+        }
+    }
+
+    #[test]
+    fn supported_rekor_key_outside_validity_window_reports_the_window() {
+        let root = embedded_document().unwrap();
+        let supported_logs = root
+            .tlogs
+            .iter()
+            .filter(|log| log.public_key.key_details == ECDSA_P256_KEY_DETAILS)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            supported_logs.len(),
+            1,
+            "embedded trust root must contain exactly one supported Rekor key type"
+        );
+        let supported_log = supported_logs[0];
+        let validity_start = supported_log
+            .public_key
+            .valid_for
+            .as_ref()
+            .and_then(|range| range.start.as_deref())
+            .expect("supported Rekor log key must have valid_for.start");
+        let validity_start = parse_timestamp(validity_start).unwrap();
+        let before_validity_window = validity_start
+            .checked_sub(1)
+            .expect("supported Rekor log validity-window start must permit an earlier timestamp");
+        assert!(
+            !valid_at(
+                supported_log.public_key.valid_for.as_ref(),
+                before_validity_window
+            )
+            .unwrap(),
+            "timestamp before supported Rekor log validity-window start must be outside the window"
+        );
+        let key_id = decode_base64("Rekor log key ID", &supported_log.log_id.key_id).unwrap();
+        let expected_error = format!(
+            "Rekor log key {} is not valid at integrated time {before_validity_window}",
+            lower_hex(&key_id)
+        );
+
+        let error = match root.select_rekor_key(&key_id, before_validity_window) {
+            Ok(_) => panic!("a supported Rekor key outside its validity window must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, expected_error);
+        assert!(!error.contains("uses unsupported key type"), "{error}");
+        assert!(!error.contains(TRUST_ROOT_STALENESS_HINT), "{error}");
     }
 
     #[test]
