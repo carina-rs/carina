@@ -5,7 +5,7 @@ use sigstore::bundle::verify::policy::Identity;
 use sigstore_protobuf_specs::dev::sigstore::bundle::v1::bundle::Content;
 
 use super::trust_root::embedded_document;
-use super::{ExpectedIdentity, TRUST_ROOT_STALENESS_HINT, error_chain, tlog, verification_failure};
+use super::{ExpectedIdentity, TRUST_ROOT_STALENESS_HINT, error_chain, verification_failure};
 
 const BUNDLE_V03_COMPAT_MEDIA_TYPE: &str = "application/vnd.dev.sigstore.bundle+json;version=0.3";
 const BUNDLE_V03_MEDIA_TYPE: &str = "application/vnd.dev.sigstore.bundle.v0.3+json";
@@ -40,7 +40,9 @@ fn verify_inner(
 
     let trust_root = embedded_document()?;
     trust_root.warn_if_rekor_keys_near_expiry();
-    let integrated_time = tlog::verify_all(&bundle, &trust_root)
+    let selection = carina_sigstore_tlog::selection_inputs(&bundle)?;
+    let rekor_key = trust_root.select_rekor_key(selection.log_key_id, selection.integrated_time)?;
+    let integrated_time = carina_sigstore_tlog::verify_all(&bundle, &rekor_key)
         .map_err(|error| format!("transparency-log verification failed: {error}"))?;
     let verifier_root = trust_root.verifier_root(integrated_time)?;
     let verifier = Verifier::new(Default::default(), verifier_root).map_err(|error| {

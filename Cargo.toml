@@ -8,6 +8,7 @@ members = [
     "carina-provider-mock",
     "carina-provider-resolver",
     "carina-provider-protocol",
+    "carina-sigstore-tlog",
     "carina-state",
     "carina-tui",
 ]

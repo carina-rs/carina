@@ -9,6 +9,7 @@ doctest = false
 
 [dependencies]
 carina-core = { path = "../carina-core" }
+carina-sigstore-tlog = { path = "../carina-sigstore-tlog" }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 toml = "0.8"
@@ -22,7 +23,6 @@ dirs = "6"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 sigstore = { version = "0.14", default-features = false, features = ["verify", "rustls-tls"] }
 sigstore_protobuf_specs = "0.5.1"
-p256 = "0.13"
 base64 = "0.22"
 tempfile = "3"
 

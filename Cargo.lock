@@ -1154,11 +1154,11 @@ version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "carina-core",
+ "carina-sigstore-tlog",
  "dirs",
  "flate2",
  "indexmap 2.13.0",
  "libc",
- "p256",
  "semver",
  "serde",
  "serde_json",
@@ -1171,6 +1171,18 @@ dependencies = [
  "toml 0.8.23",
  "ureq",
  "zip",
+]
+
+[[package]]
+name = "carina-sigstore-tlog"
+version = "0.4.0"
+dependencies = [
+ "base64 0.22.1",
+ "p256",
+ "serde_json",
+ "sha2 0.10.9",
+ "sigstore",
+ "sigstore_protobuf_specs",
 ]
 
 [[package]]

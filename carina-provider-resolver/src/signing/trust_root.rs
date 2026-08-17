@@ -4,8 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use carina_sigstore_tlog::RekorKey;
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 use sigstore::trust::ManualTrustRoot;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -74,12 +74,6 @@ struct RawCertificate {
     raw_bytes: String,
 }
 
-pub(super) struct SelectedLogKey {
-    pub(super) der_spki: Vec<u8>,
-    pub(super) key_id: [u8; 32],
-    pub(super) origin_name: String,
-}
-
 pub(super) fn embedded_document() -> Result<TrustedRootDocument, String> {
     serde_json::from_str(TRUSTED_ROOT_JSON)
         .map_err(|error| format!("cannot parse embedded trusted_root.json: {error}"))
@@ -120,20 +114,13 @@ impl TrustedRootDocument {
         &self,
         entry_key_id: &[u8],
         integrated_time: u64,
-    ) -> Result<SelectedLogKey, String> {
+    ) -> Result<RekorKey, String> {
         for log in &self.tlogs {
             let declared_key_id = decode_base64("Rekor log key ID", &log.log_id.key_id)?;
             if declared_key_id != entry_key_id {
                 continue;
             }
             let der_spki = decode_base64("Rekor log public key", &log.public_key.raw_bytes)?;
-            let computed_key_id: [u8; 32] = Sha256::digest(&der_spki).into();
-            if declared_key_id.as_slice() != computed_key_id {
-                return Err(format!(
-                    "embedded Rekor log ID does not match the SHA-256 of its DER public key for {}",
-                    log.base_url
-                ));
-            }
             if !valid_at(log.public_key.valid_for.as_ref(), integrated_time)? {
                 return Err(format!(
                     "Rekor log key {} is not valid at integrated time {integrated_time}",
@@ -148,10 +135,17 @@ impl TrustedRootDocument {
                 ));
             }
             let origin_name = https_origin_host(&log.base_url)?;
-            return Ok(SelectedLogKey {
-                der_spki,
-                key_id: computed_key_id,
-                origin_name,
+            let key_id = declared_key_id.try_into().map_err(|key_id: Vec<u8>| {
+                format!(
+                    "Rekor log key ID must decode to 32 bytes, got {}",
+                    key_id.len()
+                )
+            })?;
+            return RekorKey::new(der_spki, key_id, origin_name).map_err(|_| {
+                format!(
+                    "embedded Rekor log ID does not match the SHA-256 of its DER public key for {}",
+                    log.base_url
+                )
             });
         }
 
