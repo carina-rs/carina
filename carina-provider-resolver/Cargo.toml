@@ -24,7 +24,10 @@ sigstore = { version = "0.14", default-features = false, features = ["verify", "
 sigstore_protobuf_specs = "0.5.1"
 p256 = "0.13"
 base64 = "0.22"
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 indexmap = "2"
-tempfile = "3"

@@ -1044,17 +1044,29 @@ impl RegistryLock {
 
 /// The full carina-providers.lock file.
 ///
-/// `LockFile` deliberately implements only `Serialize`. All deserialization is
-/// routed through [`Self::load`], which checks the format version before the
-/// current schema can consume or rewrite the file.
-#[derive(Debug, Clone, Serialize)]
+/// `LockFile` deliberately implements neither `Serialize` nor `Deserialize`.
+/// Serialization stays behind the private seam used by [`Self::save`], while
+/// deserialization is routed through [`Self::load`], which checks the format
+/// version before the current schema can consume or rewrite the file.
+#[derive(Debug, Clone)]
 pub struct LockFile {
     version: u32,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     registry_host: BTreeMap<String, RegistryHostLock>,
     pub provider: Vec<LockEntry<RegistryLock>>,
-    #[serde(default, skip_serializing_if = "UnpinnedRegistryRatchets::is_empty")]
     unpinned_registry_ratchets: UnpinnedRegistryRatchets,
+}
+
+/// The crate-internal serialization view of [`LockFile`]. Field order and
+/// omission rules are part of the lock-file byte format and must stay aligned
+/// with the former direct `LockFile` serialization.
+#[derive(Serialize)]
+struct SerializableLockFile<'a> {
+    version: &'a u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    registry_host: &'a BTreeMap<String, RegistryHostLock>,
+    provider: &'a Vec<LockEntry<RegistryLock>>,
+    #[serde(default, skip_serializing_if = "UnpinnedRegistryRatchets::is_empty")]
+    unpinned_registry_ratchets: &'a UnpinnedRegistryRatchets,
 }
 
 mod registry_lock_with_host {
@@ -1356,6 +1368,92 @@ impl PreparedRegistryDiscoveryRepin<'_> {
     }
 }
 
+fn resolve_parent(path: &Path) -> &Path {
+    // Empty parents (bare relative filenames) and paths with no parent (such as
+    // roots) both fall back to the current directory. For bare filenames, this
+    // keeps the temporary file on the target's mount.
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+// Linux allows at most 40 symlink traversals during pathname resolution. Use
+// the same bound so dangling-chain fallback cannot loop forever on platforms
+// where canonicalize does not diagnose a cycle first.
+const MAX_LOCK_FILE_SYMLINK_HOPS: usize = 40;
+
+#[cfg(unix)]
+fn filesystem_loop_error() -> io::Error {
+    // ErrorKind::FilesystemLoop is not yet directly constructible on stable
+    // Rust, but std maps the platform's ELOOP code to that kind.
+    io::Error::from_raw_os_error(libc::ELOOP)
+}
+
+#[cfg(windows)]
+fn filesystem_loop_error() -> io::Error {
+    // WinError.h's ERROR_CANT_RESOLVE_FILENAME maps to FilesystemLoop in std.
+    const ERROR_CANT_RESOLVE_FILENAME: i32 = 1921;
+    io::Error::from_raw_os_error(ERROR_CANT_RESOLVE_FILENAME)
+}
+
+fn resolve_lock_file_save_path(path: &Path) -> io::Result<PathBuf> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(path.to_path_buf());
+        }
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(path.to_path_buf());
+    }
+
+    match fs::canonicalize(path) {
+        Ok(target) => Ok(target),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut link_path = path.to_path_buf();
+            for _ in 0..MAX_LOCK_FILE_SYMLINK_HOPS {
+                let target = fs::read_link(&link_path)?;
+                let target = if target.is_absolute() {
+                    target
+                } else {
+                    resolve_parent(&link_path).join(target)
+                };
+
+                match fs::symlink_metadata(&target) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        link_path = target;
+                    }
+                    Ok(_) => return Ok(target),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        return Ok(target);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(filesystem_loop_error())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+type LockFileRenameHook = Box<dyn FnOnce(&Path, &Path) -> io::Result<()>>;
+
+#[cfg(test)]
+std::thread_local! {
+    static LOCK_FILE_RENAME_HOOK: std::cell::RefCell<Option<LockFileRenameHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn rename_lock_file_for_test(from: &Path, to: &Path) -> io::Result<()> {
+    if let Some(rename) = LOCK_FILE_RENAME_HOOK.with(|hook| hook.borrow_mut().take()) {
+        return rename(from, to);
+    }
+    fs::rename(from, to)
+}
+
 impl LockFile {
     /// v2: Registry discovery pins live once per resolved host. Provider
     /// entries retain only their resolved-hostname reference.
@@ -1460,10 +1558,93 @@ impl LockFile {
         Ok(lock)
     }
 
+    fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string_pretty(&SerializableLockFile {
+            version: &self.version,
+            registry_host: &self.registry_host,
+            provider: &self.provider,
+            unpinned_registry_ratchets: &self.unpinned_registry_ratchets,
+        })
+    }
+
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        let content = toml::to_string_pretty(self)
+        // rename replaces a symlink itself, unlike fs::write. Resolve the
+        // target first so every durability and replacement operation occurs
+        // in the target directory while the caller's symlink remains intact.
+        // It requires delete/replace permission for the target name, so a
+        // deny-delete ACL intentionally makes save fail: no atomic replacement
+        // can leave that name untouched.
+        let path = resolve_lock_file_save_path(path)?;
+        let parent = resolve_parent(&path);
+        let content = self
+            .to_toml_string()
             .map_err(|e| io::Error::other(format!("Failed to serialize lock file: {e}")))?;
-        fs::write(path, content)
+
+        #[cfg(unix)]
+        let mut temp_file = {
+            use std::os::unix::fs::PermissionsExt;
+
+            let existing_permissions = match fs::metadata(&path) {
+                Ok(metadata) => Some(metadata.permissions()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+
+            // Builder::tempfile_in is the configurable counterpart of
+            // NamedTempFile::new_in: the file remains in the target directory,
+            // while 0o666 is filtered by umask at creation just like fs::write.
+            let mut builder = tempfile::Builder::new();
+            builder.permissions(fs::Permissions::from_mode(0o666));
+            let temp_file = builder.tempfile_in(parent)?;
+
+            // Creation applies umask, so restore an existing target's exact
+            // mode afterwards. The still-open file remains writable even when
+            // the preserved mode is read-only.
+            // Only mode is preserved; ownership, ACLs, and extended attributes
+            // from the existing target are not retained by temp-file replacement.
+            if let Some(permissions) = existing_permissions {
+                temp_file.as_file().set_permissions(permissions)?;
+            }
+            temp_file
+        };
+
+        #[cfg(not(unix))]
+        let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
+
+        if let Err(error) = io::Write::write_all(&mut temp_file, content.as_bytes()) {
+            let _ = temp_file.close();
+            return Err(error);
+        }
+        if let Err(error) = temp_file.as_file().sync_all() {
+            let _ = temp_file.close();
+            return Err(error);
+        }
+
+        // Disarm automatic cleanup before the external rename so dropping the
+        // tempfile cannot unlink a pathname concurrently reused after rename.
+        let (temp_handle, temp_path) = match temp_file.keep() {
+            Ok(parts) => parts,
+            Err(error) => {
+                let source = error.error;
+                let _ = error.file.close();
+                return Err(source);
+            }
+        };
+        drop(temp_handle);
+        #[cfg(test)]
+        let rename_result = rename_lock_file_for_test(&temp_path, &path);
+        #[cfg(not(test))]
+        let rename_result = fs::rename(&temp_path, &path);
+        if let Err(error) = rename_result {
+            let _ = fs::remove_file(temp_path);
+            return Err(error);
+        }
+
+        if let Ok(parent_dir) = fs::File::open(parent) {
+            let _ = parent_dir.sync_all();
+        }
+
+        Ok(())
     }
 
     /// Find an entry matching `(source, version)` for modes with a published
@@ -4232,6 +4413,36 @@ mod tests {
     const REGISTRY_DOWNLOAD_URL: &str =
         "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download";
 
+    struct LockFileRenameHookGuard;
+
+    impl Drop for LockFileRenameHookGuard {
+        fn drop(&mut self) {
+            LOCK_FILE_RENAME_HOOK.with(|hook| {
+                hook.borrow_mut().take();
+            });
+        }
+    }
+
+    fn with_lock_file_rename_hook<T>(
+        rename: impl FnOnce(&Path, &Path) -> io::Result<()> + 'static,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        LOCK_FILE_RENAME_HOOK.with(|hook| {
+            let mut hook = hook.borrow_mut();
+            assert!(hook.is_none(), "lock-file rename hook is already installed");
+            *hook = Some(Box::new(rename));
+        });
+        let _guard = LockFileRenameHookGuard;
+
+        let result = operation();
+        let hook_was_consumed = LOCK_FILE_RENAME_HOOK.with(|hook| hook.borrow().is_none());
+        assert!(
+            hook_was_consumed,
+            "lock-file save returned before reaching the rename hook"
+        );
+        result
+    }
+
     fn signature_pin(identity: &str, issuer: &str) -> RegistrySignatureProtection {
         RegistrySignatureProtection::RequiredPinned(IdentityPin {
             certificate_identity: identity.into(),
@@ -4336,7 +4547,7 @@ mod tests {
             registry_host_lock("https://registry.carina-rs.dev/v1/providers/", "def"),
         )
         .unwrap();
-        toml::to_string_pretty(&lock).unwrap()
+        lock.to_toml_string().unwrap()
     }
 
     fn lock_with_registry_security_state(signature: RegistrySignatureProtection) -> LockFile {
@@ -4805,7 +5016,7 @@ mod tests {
             }],
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
-        let toml_str = toml::to_string_pretty(&lock).unwrap();
+        let toml_str = lock.to_toml_string().unwrap();
         assert!(
             toml_str.contains("mode = \"version\""),
             "serialized form should tag the variant: {toml_str}"
@@ -4835,7 +5046,7 @@ mod tests {
             }],
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
-        let toml_str = toml::to_string_pretty(&lock).unwrap();
+        let toml_str = lock.to_toml_string().unwrap();
         assert!(
             toml_str.contains("mode = \"registryrevision\""),
             "serialized form should tag the variant: {toml_str}"
@@ -4864,7 +5075,7 @@ mod tests {
             )],
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
-        let toml_str = toml::to_string_pretty(&lock).unwrap();
+        let toml_str = lock.to_toml_string().unwrap();
         assert!(
             toml_str.contains("mode = \"revision\""),
             "serialized form should tag the variant: {toml_str}"
@@ -4893,7 +5104,7 @@ mod tests {
             }],
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
-        let toml_str = toml::to_string_pretty(&lock).unwrap();
+        let toml_str = lock.to_toml_string().unwrap();
         assert!(toml_str.contains("mode = \"file\""), "{toml_str}");
 
         let loaded =
@@ -4956,6 +5167,69 @@ sha256 = "abc"
     }
 
     #[test]
+    fn resolve_parent_normalizes_empty_parent_to_current_directory() {
+        assert_eq!(
+            resolve_parent(Path::new("carina-providers.lock")),
+            Path::new(".")
+        );
+        assert_eq!(
+            resolve_parent(Path::new("locks/carina-providers.lock")),
+            Path::new("locks")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_file_save_creates_temporary_file_in_target_directory() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        let expected_parent = fs::canonicalize(dir.path()).unwrap();
+        let hook_parent = expected_parent.clone();
+
+        with_lock_file_rename_hook(
+            move |temporary_path, target_path| {
+                let temporary_parent = temporary_path
+                    .parent()
+                    .ok_or_else(|| io::Error::other("temporary file has no parent"))?;
+                let temporary_parent = fs::canonicalize(temporary_parent)?;
+                let target_parent = target_path
+                    .parent()
+                    .ok_or_else(|| io::Error::other("lock file has no parent"))?;
+                let target_parent = fs::canonicalize(target_parent)?;
+
+                if temporary_parent != hook_parent || target_parent != hook_parent {
+                    return Err(io::Error::other(format!(
+                        "temporary file parent {} and target parent {} must both be {}",
+                        temporary_parent.display(),
+                        target_parent.display(),
+                        hook_parent.display()
+                    )));
+                }
+
+                let temporary_device = fs::metadata(temporary_path)?.dev();
+                let target_device = fs::metadata(&target_parent)?.dev();
+                if temporary_device != target_device {
+                    return Err(io::Error::other(format!(
+                        "temporary file device {temporary_device} differs from target directory device {target_device}"
+                    )));
+                }
+
+                fs::rename(temporary_path, target_path)
+            },
+            || LockFile::default().save(&lock_path),
+        )
+        .expect("save must stage its temporary file in the target directory");
+
+        LockFile::load(&lock_path).unwrap().unwrap();
+        assert_eq!(
+            fs::canonicalize(lock_path.parent().unwrap()).unwrap(),
+            expected_parent
+        );
+    }
+
+    #[test]
     fn lock_file_save_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("carina-providers.lock");
@@ -4970,6 +5244,392 @@ sha256 = "abc"
         let loaded = LockFile::load(&lock_path).unwrap().unwrap();
         assert_eq!(loaded.provider.len(), 1);
         assert_eq!(loaded.provider[0].name, "awscc");
+    }
+
+    #[test]
+    fn lock_file_save_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+
+        LockFile::default().save(&lock_path).unwrap();
+
+        let mut entries = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("carina-providers.lock")]
+        );
+    }
+
+    #[test]
+    fn lock_file_save_replaces_existing_contents_with_complete_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        let old_content = LockFile::default().to_toml_string().unwrap();
+        fs::write(&lock_path, old_content).unwrap();
+
+        let mut new_lock = LockFile::default();
+        new_lock.upsert(version_entry(
+            "github.com/carina-rs/carina-provider-awscc",
+            "0.2.0",
+        ));
+        let expected = new_lock.to_toml_string().unwrap();
+
+        new_lock.save(&lock_path).unwrap();
+
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), expected);
+        let loaded = LockFile::load(&lock_path).unwrap().unwrap();
+        assert_eq!(loaded.provider.len(), 1);
+        assert_eq!(loaded.provider[0].kind.resolved_version(), Some("0.2.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_file_save_new_file_uses_umask_adjusted_default_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let probe_path = dir.path().join("fs-write-mode-probe");
+        let lock_path = dir.path().join("carina-providers.lock");
+
+        // Observe the process umask through the same creation behavior as the
+        // pre-atomic fs::write implementation instead of assuming 0o022.
+        fs::write(&probe_path, b"").unwrap();
+        let expected_mode = fs::metadata(&probe_path).unwrap().permissions().mode() & 0o777;
+
+        LockFile::default().save(&lock_path).unwrap();
+
+        let actual_mode = fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            actual_mode, expected_mode,
+            "a newly created lock file must retain fs::write's umask-adjusted mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_file_save_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        fs::write(&lock_path, b"old contents").unwrap();
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        LockFile::default().save(&lock_path).unwrap();
+
+        let actual_mode = fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            actual_mode, 0o640,
+            "replacing a lock file must preserve its existing mode"
+        );
+    }
+
+    // Atomic rename can replace a read-only file because replacement permission
+    // belongs to its directory, unlike fs::write. This is inherent to atomic
+    // replacement, and the target mode must remain preserved.
+    #[cfg(unix)]
+    #[test]
+    fn lock_file_save_replaces_read_only_target_and_preserves_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+
+        let mut original = LockFile::default();
+        original.upsert(version_entry(
+            "github.com/carina-rs/carina-provider-awscc",
+            "0.1.0",
+        ));
+        original.save(&lock_path).unwrap();
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let mut replacement = LockFile::default();
+        replacement.upsert(version_entry(
+            "github.com/carina-rs/carina-provider-awscc",
+            "0.2.0",
+        ));
+        let expected = replacement.to_toml_string().unwrap();
+
+        replacement
+            .save(&lock_path)
+            .expect("atomic save must replace a read-only target");
+
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), expected);
+        let actual_mode = fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            actual_mode, 0o444,
+            "replacing a read-only lock file must preserve its mode"
+        );
+        let loaded = LockFile::load(&lock_path).unwrap().unwrap();
+        assert_eq!(loaded.provider.len(), 1);
+        assert_eq!(loaded.provider[0].kind.resolved_version(), Some("0.2.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_file_save_follows_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let link_dir = dir.path().join("links");
+        let target_dir = dir.path().join("targets");
+        fs::create_dir(&link_dir).unwrap();
+        fs::create_dir(&target_dir).unwrap();
+        let link_path = link_dir.join("carina-providers.lock");
+        let target_path = target_dir.join("carina-providers.lock");
+
+        LockFile::default().save(&target_path).unwrap();
+        symlink(&target_path, &link_path).unwrap();
+
+        let mut replacement = LockFile::default();
+        replacement.upsert(version_entry(
+            "github.com/carina-rs/carina-provider-awscc",
+            "0.2.0",
+        ));
+        let expected = replacement.to_toml_string().unwrap();
+        replacement.save(&link_path).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "save through a symlink must not replace the link itself"
+        );
+        assert_eq!(fs::read_to_string(&target_path).unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_file_save_follows_dangling_relative_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let link_dir = dir.path().join("links");
+        let target_dir = dir.path().join("targets");
+        fs::create_dir(&link_dir).unwrap();
+        fs::create_dir(&target_dir).unwrap();
+        let link_path = link_dir.join("carina-providers.lock");
+        let target_path = target_dir.join("carina-providers.lock");
+        symlink(Path::new("../targets/carina-providers.lock"), &link_path).unwrap();
+
+        let mut lock = LockFile::default();
+        lock.upsert(version_entry(
+            "github.com/carina-rs/carina-provider-awscc",
+            "0.2.0",
+        ));
+        let expected = lock.to_toml_string().unwrap();
+        lock.save(&link_path).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "save through a dangling symlink must not replace the link itself"
+        );
+        assert_eq!(fs::read_to_string(&target_path).unwrap(), expected);
+        LockFile::load(&target_path).unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_file_save_follows_dangling_multihop_relative_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let link_dir = dir.path().join("links");
+        let target_dir = dir.path().join("targets");
+        fs::create_dir(&link_dir).unwrap();
+        fs::create_dir(&target_dir).unwrap();
+        let top_path = dir.path().join("top.lock");
+        let middle_path = link_dir.join("mid.lock");
+        let missing_path = target_dir.join("missing.lock");
+        symlink(Path::new("links/mid.lock"), &top_path).unwrap();
+        symlink(Path::new("../targets/missing.lock"), &middle_path).unwrap();
+        assert!(!missing_path.exists());
+
+        let mut lock = LockFile::default();
+        lock.upsert(version_entry(
+            "github.com/carina-rs/carina-provider-awscc",
+            "0.2.0",
+        ));
+        let expected = lock.to_toml_string().unwrap();
+        lock.save(&top_path).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&top_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "save must preserve the top-level symlink"
+        );
+        assert!(
+            fs::symlink_metadata(&middle_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "save must preserve every intermediate symlink"
+        );
+        assert_eq!(fs::read_to_string(&missing_path).unwrap(), expected);
+        LockFile::load(&top_path).unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_file_save_rejects_dangling_symlink_cycle_without_temporary_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.lock");
+        let b_path = dir.path().join("b.lock");
+        symlink(Path::new("b.lock"), &a_path).unwrap();
+        symlink(Path::new("a.lock"), &b_path).unwrap();
+        let filesystem_loop_kind = fs::canonicalize(&a_path)
+            .expect_err("the operating system must reject a symlink cycle")
+            .kind();
+
+        let error = LockFile::default()
+            .save(&a_path)
+            .expect_err("a dangling symlink cycle must not be followed forever");
+
+        assert_eq!(error.kind(), filesystem_loop_kind);
+        let mut entries = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                std::ffi::OsString::from("a.lock"),
+                std::ffi::OsString::from("b.lock")
+            ],
+            "a rejected cycle must not leave a temporary file"
+        );
+    }
+
+    #[test]
+    fn lock_file_save_failure_preserves_original_complete_document() {
+        const INJECTED_ERROR: &str = "injected lock-file rename failure";
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+
+        let mut original = LockFile::default();
+        original.upsert(version_entry(
+            "github.com/carina-rs/carina-provider-awscc",
+            "0.1.0",
+        ));
+        let original_content = original.to_toml_string().unwrap();
+        fs::write(&lock_path, &original_content).unwrap();
+
+        let mut replacement = LockFile::default();
+        replacement.upsert(version_entry(
+            "github.com/carina-rs/carina-provider-awscc",
+            "0.2.0",
+        ));
+        let expected_temporary_content = replacement.to_toml_string().unwrap();
+        let expected_target = lock_path.clone();
+
+        let save_error = with_lock_file_rename_hook(
+            move |temporary_path, target_path| {
+                if target_path != expected_target {
+                    return Err(io::Error::other(format!(
+                        "rename target {} differs from expected {}",
+                        target_path.display(),
+                        expected_target.display()
+                    )));
+                }
+                if fs::read_to_string(temporary_path)? != expected_temporary_content {
+                    return Err(io::Error::other(
+                        "temporary file did not contain the complete replacement document",
+                    ));
+                }
+                Err(io::Error::other(INJECTED_ERROR))
+            },
+            || replacement.save(&lock_path),
+        )
+        .expect_err("the injected rename failure must make save fail");
+
+        assert_eq!(save_error.kind(), io::ErrorKind::Other);
+        assert_eq!(save_error.to_string(), INJECTED_ERROR);
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), original_content);
+        LockFile::load(&lock_path)
+            .expect("the preserved lock file must remain parseable")
+            .expect("the preserved lock file must still exist");
+
+        let mut entries = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("carina-providers.lock")],
+            "a failed save must not leave a temporary file"
+        );
+    }
+
+    #[test]
+    fn lock_file_save_accepts_parentless_relative_path() {
+        const CHILD_ENV: &str = "CARINA_TEST_PARENTLESS_LOCK_SAVE";
+        const TEST_NAME: &str =
+            "provider_resolver::tests::lock_file_save_accepts_parentless_relative_path";
+
+        let lock_path = Path::new("carina-providers.lock");
+        let lock = LockFile::default();
+        let expected = lock.to_toml_string().unwrap();
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            lock.save(lock_path).unwrap();
+            assert_eq!(fs::read_to_string(lock_path).unwrap(), expected);
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([TEST_NAME, "--exact", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        assert!(output.status.success(), "child test failed: {output:?}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join(lock_path)).unwrap(),
+            expected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_file_save_replaces_target_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        let old_content = LockFile::default().to_toml_string().unwrap();
+        fs::write(&lock_path, old_content).unwrap();
+        let old_inode = fs::metadata(&lock_path).unwrap().ino();
+
+        let mut new_lock = LockFile::default();
+        new_lock.upsert(version_entry(
+            "github.com/carina-rs/carina-provider-awscc",
+            "0.2.0",
+        ));
+        new_lock.save(&lock_path).unwrap();
+
+        let new_inode = fs::metadata(&lock_path).unwrap().ino();
+        assert_ne!(
+            old_inode, new_inode,
+            "save must replace the target instead of truncating it in place"
+        );
+        LockFile::load(&lock_path).unwrap().unwrap();
     }
 
     #[test]
@@ -5259,12 +5919,12 @@ transparency_log_present = false
                 discovery_sha256: "one-host-pin".into(),
             })
         );
-        let round_tripped = toml::to_string_pretty(&lock).unwrap();
+        let round_tripped = lock.to_toml_string().unwrap();
         assert_eq!(round_tripped.matches("api_base_url =").count(), 1);
         assert_eq!(round_tripped.matches("discovery_sha256 =").count(), 1);
         assert_eq!(
             LockFile::from_toml_str(&round_tripped, Path::new("carina-providers.lock"))
-                .map(|lock| toml::to_string_pretty(&lock).unwrap())
+                .map(|lock| lock.to_toml_string().unwrap())
                 .unwrap(),
             round_tripped,
             "the host table must serialize deterministically"
@@ -5608,9 +6268,7 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         let registry = lock.provider[0].registry.as_ref().unwrap();
         assert!(registry.yanked_versions().is_empty());
         assert!(
-            toml::to_string_pretty(&lock)
-                .unwrap()
-                .starts_with("version = 2\n"),
+            lock.to_toml_string().unwrap().starts_with("version = 2\n"),
             "the defaulted yank set must remain stable within lock format v2"
         );
     }
@@ -5676,11 +6334,17 @@ transparency_log_present = false
 "#
         );
 
-        let serialized = toml::to_string_pretty(&lock).unwrap();
+        let serialized = lock.to_toml_string().unwrap();
         assert_eq!(serialized, expected);
         let reparsed =
             LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock")).unwrap();
-        assert_eq!(toml::to_string_pretty(&reparsed).unwrap(), expected);
+        assert_eq!(reparsed.to_toml_string().unwrap(), expected);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("carina-providers.lock");
+        reparsed.save(&path).unwrap();
+        let saved = fs::read(path).unwrap();
+        assert_eq!(saved.as_slice(), expected.as_bytes());
     }
 
     #[test]
@@ -5693,7 +6357,7 @@ transparency_log_present = false
 
         for signature in states {
             let lock = lock_with_registry_security_state(signature.clone());
-            let serialized_lock = toml::to_string_pretty(&lock).unwrap();
+            let serialized_lock = lock.to_toml_string().unwrap();
             let reparsed_lock =
                 LockFile::from_toml_str(&serialized_lock, Path::new("carina-providers.lock"))
                     .unwrap();
@@ -6245,8 +6909,8 @@ transparency_log_present = false
             .unwrap();
 
         assert_eq!(
-            toml::to_string_pretty(&repin_then_rebootstrap).unwrap(),
-            toml::to_string_pretty(&rebootstrap_then_repin).unwrap(),
+            repin_then_rebootstrap.to_toml_string().unwrap(),
+            rebootstrap_then_repin.to_toml_string().unwrap(),
             "the two recovery operations must commute"
         );
 
@@ -6256,8 +6920,8 @@ transparency_log_present = false
         expected_registry.sequence_anchor = RegistrySequenceAnchor::Unestablished;
         expected_registry.signature = RegistrySignatureProtection::RequiredUnpinned;
         assert_eq!(
-            toml::to_string_pretty(&repin_then_rebootstrap).unwrap(),
-            toml::to_string_pretty(&expected).unwrap(),
+            repin_then_rebootstrap.to_toml_string().unwrap(),
+            expected.to_toml_string().unwrap(),
             "running both recoveries must change exactly freshness and the identity pin"
         );
 
@@ -6434,7 +7098,8 @@ transparency_log_present = true
         assert!(registry.transparency_log_present);
         assert!(lock.unpinned_registry_ratchets.is_empty());
         assert!(
-            !toml::to_string_pretty(&lock)
+            !lock
+                .to_toml_string()
                 .unwrap()
                 .contains("[unpinned_registry_ratchets."),
             "load-time attachment must leave each source in one persisted location"

@@ -11,6 +11,8 @@ pub(crate) mod legacy_name_overrides;
 pub(crate) mod module_walk;
 
 #[cfg(test)]
+mod lock_file_api_tests;
+#[cfg(test)]
 mod module_info_snapshot_tests;
 #[cfg(test)]
 mod module_list_tests;
