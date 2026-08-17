@@ -74,6 +74,13 @@ struct RawCertificate {
     raw_bytes: String,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum RekorKeyExpiryStatus {
+    NoUsableKeys,
+    AllExpiring,
+    Fine,
+}
+
 pub(super) fn embedded_document() -> Result<TrustedRootDocument, String> {
     serde_json::from_str(TRUSTED_ROOT_JSON)
         .map_err(|error| format!("cannot parse embedded trusted_root.json: {error}"))
@@ -84,22 +91,23 @@ impl TrustedRootDocument {
         &self,
         integrated_time: u64,
     ) -> Result<ManualTrustRoot<'static>, String> {
-        let mut fulcio_certs = Vec::new();
-        for authority in &self.certificate_authorities {
-            if !valid_at(authority.valid_for.as_ref(), integrated_time)? {
-                continue;
-            }
-            for certificate in &authority.cert_chain.certificates {
-                fulcio_certs.push(decode_base64("Fulcio certificate", &certificate.raw_bytes)?);
-            }
-        }
-
+        let fulcio_certs =
+            decode_valid_fulcio_certs(&self.certificate_authorities, integrated_time)?;
         let rekor_keys = decode_valid_log_keys(&self.tlogs, integrated_time)?;
         let ctfe_keys = decode_valid_log_keys(&self.ctlogs, integrated_time)?;
-        if fulcio_certs.is_empty() || rekor_keys.is_empty() || ctfe_keys.is_empty() {
+        let missing_material = [
+            fulcio_certs.is_empty().then_some("Fulcio"),
+            rekor_keys.is_empty().then_some("Rekor"),
+            ctfe_keys.is_empty().then_some("CTFE"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if !missing_material.is_empty() {
             let integrated_time = format_timestamp(integrated_time)?;
             return Err(format!(
-                "embedded trust root has no verification material valid at integrated time {integrated_time}; {TRUST_ROOT_STALENESS_HINT}"
+                "embedded trust root has no verification material valid at integrated time {integrated_time} (missing: {}); {TRUST_ROOT_STALENESS_HINT}",
+                missing_material.join(", ")
             ));
         }
 
@@ -160,28 +168,65 @@ impl TrustedRootDocument {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
         let warning_threshold = now.saturating_add(REKOR_EXPIRY_WARNING_SECONDS);
-        let all_expiring = self.every_rekor_key_expires_by(warning_threshold);
-
-        if all_expiring {
-            static WARNED: OnceLock<()> = OnceLock::new();
-            if WARNED.set(()).is_ok() {
-                eprintln!(
-                    "WARNING: every Rekor key in carina's embedded Sigstore trust root expires within 60 days or has already expired. Upgrade carina now to refresh the pinned trust root."
-                );
+        let warning = match self.rekor_key_expiry_status(warning_threshold) {
+            RekorKeyExpiryStatus::NoUsableKeys => {
+                "WARNING: carina cannot verify with any Rekor key in its embedded Sigstore trust root. Upgrade carina now to refresh the pinned trust root."
             }
+            RekorKeyExpiryStatus::AllExpiring => {
+                "WARNING: every Rekor key in carina's embedded Sigstore trust root expires within 60 days or has already expired. Upgrade carina now to refresh the pinned trust root."
+            }
+            RekorKeyExpiryStatus::Fine => return,
+        };
+
+        static WARNED: OnceLock<()> = OnceLock::new();
+        if WARNED.set(()).is_ok() {
+            eprintln!("{warning}");
         }
     }
 
-    fn every_rekor_key_expires_by(&self, timestamp: u64) -> bool {
-        !self.tlogs.is_empty()
-            && self.tlogs.iter().all(|log| {
-                log.public_key
-                    .valid_for
-                    .as_ref()
-                    .and_then(|range| range.end.as_deref())
-                    .is_some_and(|end| parse_timestamp(end).is_ok_and(|end| end <= timestamp))
-            })
+    fn rekor_key_expiry_status(&self, timestamp: u64) -> RekorKeyExpiryStatus {
+        if self.tlogs.is_empty() {
+            return RekorKeyExpiryStatus::Fine;
+        }
+
+        let mut usable_keys = usable_log_keys(&self.tlogs).peekable();
+        if usable_keys.peek().is_none() {
+            return RekorKeyExpiryStatus::NoUsableKeys;
+        }
+
+        if usable_keys.all(|log| {
+            log.public_key
+                .valid_for
+                .as_ref()
+                .and_then(|range| range.end.as_deref())
+                .is_some_and(|end| parse_timestamp(end).is_ok_and(|end| end <= timestamp))
+        }) {
+            RekorKeyExpiryStatus::AllExpiring
+        } else {
+            RekorKeyExpiryStatus::Fine
+        }
     }
+}
+
+fn decode_valid_fulcio_certs(
+    authorities: &[CertificateAuthority],
+    integrated_time: u64,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut certificates = Vec::new();
+    for authority in authorities {
+        if !valid_at(authority.valid_for.as_ref(), integrated_time)? {
+            continue;
+        }
+        for certificate in &authority.cert_chain.certificates {
+            certificates.push(decode_base64("Fulcio certificate", &certificate.raw_bytes)?);
+        }
+    }
+    Ok(certificates)
+}
+
+fn usable_log_keys(logs: &[TransparencyLog]) -> impl Iterator<Item = &TransparencyLog> {
+    logs.iter()
+        .filter(|log| log.public_key.key_details == ECDSA_P256_KEY_DETAILS)
 }
 
 fn decode_valid_log_keys(
@@ -189,7 +234,7 @@ fn decode_valid_log_keys(
     integrated_time: u64,
 ) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut keys = BTreeMap::new();
-    for log in logs {
+    for log in usable_log_keys(logs) {
         if !valid_at(log.public_key.valid_for.as_ref(), integrated_time)? {
             continue;
         }
@@ -261,6 +306,39 @@ pub(super) fn lower_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn single_rekor_log_index(logs: &[TransparencyLog], supported: bool) -> usize {
+        let matching_indices = logs
+            .iter()
+            .enumerate()
+            .filter(|(_, log)| (log.public_key.key_details == ECDSA_P256_KEY_DETAILS) == supported)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let support = if supported {
+            "supported"
+        } else {
+            "unsupported"
+        };
+        assert_eq!(
+            matching_indices.len(),
+            1,
+            "embedded trust root must contain exactly one {support} Rekor key type"
+        );
+        matching_indices[0]
+    }
+
+    fn single_supported_rekor_log(logs: &[TransparencyLog]) -> &TransparencyLog {
+        &logs[single_rekor_log_index(logs, true)]
+    }
+
+    fn single_supported_rekor_log_mut(logs: &mut [TransparencyLog]) -> &mut TransparencyLog {
+        let index = single_rekor_log_index(logs, true);
+        &mut logs[index]
+    }
+
+    fn single_unsupported_rekor_log(logs: &[TransparencyLog]) -> &TransparencyLog {
+        &logs[single_rekor_log_index(logs, false)]
+    }
+
     #[test]
     fn verifier_root_excludes_fulcio_ca_retired_before_integrated_time() {
         let root = embedded_document().unwrap();
@@ -323,17 +401,7 @@ mod tests {
     #[test]
     fn unsupported_rekor_key_type_precedes_validity_window() {
         let root = embedded_document().unwrap();
-        let unsupported_logs = root
-            .tlogs
-            .iter()
-            .filter(|log| log.public_key.key_details != ECDSA_P256_KEY_DETAILS)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            unsupported_logs.len(),
-            1,
-            "embedded trust root must contain exactly one unsupported Rekor key type"
-        );
-        let unsupported_log = unsupported_logs[0];
+        let unsupported_log = single_unsupported_rekor_log(&root.tlogs);
         let validity_start = unsupported_log
             .public_key
             .valid_for
@@ -385,17 +453,7 @@ mod tests {
     #[test]
     fn supported_rekor_key_outside_validity_window_reports_the_window() {
         let root = embedded_document().unwrap();
-        let supported_logs = root
-            .tlogs
-            .iter()
-            .filter(|log| log.public_key.key_details == ECDSA_P256_KEY_DETAILS)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            supported_logs.len(),
-            1,
-            "embedded trust root must contain exactly one supported Rekor key type"
-        );
-        let supported_log = supported_logs[0];
+        let supported_log = single_supported_rekor_log(&root.tlogs);
         let validity_start = supported_log
             .public_key
             .valid_for
@@ -431,10 +489,142 @@ mod tests {
     }
 
     #[test]
-    fn rekor_expiry_warning_requires_every_key_to_have_a_near_end() {
+    fn verifier_root_rejects_only_window_valid_rekor_key_with_unsupported_algorithm() {
         let mut root = embedded_document().unwrap();
-        assert!(!root.every_rekor_key_expires_by(u64::MAX));
+        let unsupported_log = single_unsupported_rekor_log(&root.tlogs);
+        let unsupported_validity_start = unsupported_log
+            .public_key
+            .valid_for
+            .as_ref()
+            .and_then(|range| range.start.as_deref())
+            .expect("unsupported Rekor log key must have valid_for.start")
+            .to_string();
+        let integrated_time = parse_timestamp(&unsupported_validity_start)
+            .unwrap()
+            .checked_add(1)
+            .expect("unsupported Rekor log validity-window start must permit a later timestamp");
+        assert!(
+            valid_at(
+                unsupported_log.public_key.valid_for.as_ref(),
+                integrated_time
+            )
+            .unwrap(),
+            "integrated time must be inside the unsupported Rekor key's validity window"
+        );
 
+        let supported_log = single_supported_rekor_log_mut(&mut root.tlogs);
+        supported_log
+            .public_key
+            .valid_for
+            .get_or_insert(ValidityPeriod {
+                start: None,
+                end: None,
+            })
+            .end = Some(unsupported_validity_start);
+        assert!(
+            !valid_at(supported_log.public_key.valid_for.as_ref(), integrated_time).unwrap(),
+            "integrated time must be outside the supported Rekor key's retired validity window"
+        );
+
+        let fulcio_certs =
+            decode_valid_fulcio_certs(&root.certificate_authorities, integrated_time).unwrap();
+        let rekor_keys = decode_valid_log_keys(&root.tlogs, integrated_time).unwrap();
+        let ctfe_keys = decode_valid_log_keys(&root.ctlogs, integrated_time).unwrap();
+        assert!(
+            !fulcio_certs.is_empty(),
+            "Fulcio verification material must be valid at the integrated time"
+        );
+        assert!(
+            rekor_keys.is_empty(),
+            "Rekor verification material must be empty at the integrated time"
+        );
+        assert!(
+            !ctfe_keys.is_empty(),
+            "CTFE verification material must be valid at the integrated time"
+        );
+
+        let error = root.verifier_root(integrated_time).unwrap_err();
+
+        let integrated_time = format_timestamp(integrated_time).unwrap();
+        assert_eq!(
+            error,
+            format!(
+                "embedded trust root has no verification material valid at integrated time {integrated_time} (missing: Rekor); {TRUST_ROOT_STALENESS_HINT}"
+            )
+        );
+    }
+
+    #[test]
+    fn decode_valid_log_keys_excludes_window_valid_unsupported_key() {
+        let root = embedded_document().unwrap();
+        let unsupported_log = single_unsupported_rekor_log(&root.tlogs);
+        let validity_start = unsupported_log
+            .public_key
+            .valid_for
+            .as_ref()
+            .and_then(|range| range.start.as_deref())
+            .expect("unsupported Rekor log key must have valid_for.start");
+        let inside_validity_window = parse_timestamp(validity_start)
+            .unwrap()
+            .checked_add(1)
+            .expect("unsupported Rekor log validity-window start must permit a later timestamp");
+        assert!(
+            valid_at(
+                unsupported_log.public_key.valid_for.as_ref(),
+                inside_validity_window
+            )
+            .unwrap(),
+            "timestamp must be inside the unsupported Rekor key's validity window"
+        );
+        let key_id = decode_base64("Rekor log key ID", &unsupported_log.log_id.key_id).unwrap();
+
+        let keys = decode_valid_log_keys(
+            std::slice::from_ref(unsupported_log),
+            inside_validity_window,
+        )
+        .unwrap();
+
+        assert!(
+            !keys.contains_key(&lower_hex(&key_id)),
+            "a window-valid unsupported key must not be decoded"
+        );
+    }
+
+    #[test]
+    fn rekor_expiry_warning_requires_every_usable_key_to_have_a_near_end() {
+        let mut root = embedded_document().unwrap();
+        assert_eq!(
+            root.rekor_key_expiry_status(u64::MAX),
+            RekorKeyExpiryStatus::Fine
+        );
+
+        for log in root
+            .tlogs
+            .iter_mut()
+            .filter(|log| log.public_key.key_details == ECDSA_P256_KEY_DETAILS)
+        {
+            log.public_key
+                .valid_for
+                .get_or_insert(ValidityPeriod {
+                    start: None,
+                    end: None,
+                })
+                .end = Some("2026-01-01T00:00:00Z".to_string());
+        }
+
+        assert_eq!(
+            root.rekor_key_expiry_status(u64::MAX),
+            RekorKeyExpiryStatus::AllExpiring
+        );
+    }
+
+    #[test]
+    fn rekor_expiry_warning_distinguishes_unsupported_keys_from_empty_logs() {
+        let mut root = embedded_document().unwrap();
+        root.tlogs
+            .retain(|log| log.public_key.key_details != ECDSA_P256_KEY_DETAILS);
+        assert!(!root.tlogs.is_empty());
+        assert_eq!(usable_log_keys(&root.tlogs).count(), 0);
         for log in &mut root.tlogs {
             log.public_key
                 .valid_for
@@ -445,6 +635,60 @@ mod tests {
                 .end = Some("2026-01-01T00:00:00Z".to_string());
         }
 
-        assert!(root.every_rekor_key_expires_by(u64::MAX));
+        assert_eq!(
+            root.rekor_key_expiry_status(u64::MAX),
+            RekorKeyExpiryStatus::NoUsableKeys
+        );
+
+        root.tlogs.clear();
+
+        assert_eq!(
+            root.rekor_key_expiry_status(u64::MAX),
+            RekorKeyExpiryStatus::Fine
+        );
+    }
+
+    #[test]
+    fn rekor_expiry_warning_counts_only_supported_keys() {
+        let mut root = embedded_document().unwrap();
+        let supported_log_index = single_rekor_log_index(&root.tlogs, true);
+        let unsupported_log = single_unsupported_rekor_log(&root.tlogs);
+        let retirement_end = unsupported_log
+            .public_key
+            .valid_for
+            .as_ref()
+            .and_then(|range| range.start.as_deref())
+            .expect("unsupported Rekor log key must have valid_for.start")
+            .to_string();
+        assert!(
+            unsupported_log
+                .public_key
+                .valid_for
+                .as_ref()
+                .is_some_and(|range| range.end.is_none()),
+            "unsupported Rekor log key must not have valid_for.end"
+        );
+        let retirement_end_timestamp = parse_timestamp(&retirement_end).unwrap();
+        let warning_threshold = retirement_end_timestamp
+            .checked_add(1)
+            .expect("Rekor log validity-window end must permit a later timestamp");
+
+        root.tlogs[supported_log_index]
+            .public_key
+            .valid_for
+            .get_or_insert(ValidityPeriod {
+                start: None,
+                end: None,
+            })
+            .end = Some(retirement_end);
+
+        assert_eq!(
+            root.rekor_key_expiry_status(retirement_end_timestamp),
+            RekorKeyExpiryStatus::AllExpiring
+        );
+        assert_eq!(
+            root.rekor_key_expiry_status(warning_threshold),
+            RekorKeyExpiryStatus::AllExpiring
+        );
     }
 }
