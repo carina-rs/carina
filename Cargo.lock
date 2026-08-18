@@ -1170,6 +1170,7 @@ dependencies = [
  "time",
  "toml 0.8.23",
  "ureq",
+ "url",
  "zip",
 ]
 

@@ -9,12 +9,13 @@ const HOST: &str = "registry.carina-rs.dev";
 fn write_protected_lock(base_dir: &Path) {
     fs::write(
         base_dir.join("carina-providers.lock"),
-        r#"version = 2
+        r#"version = 3
 
 [registry_host."registry.carina-rs.dev"]
 discovery_pin_present = true
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "discovery-shasum"
+
+[registry_host."registry.carina-rs.dev".discovery_values]
+"providers.v1" = "https://registry.carina-rs.dev/v1/providers/"
 
 [[provider]]
 name = "aws"
@@ -75,7 +76,7 @@ fn carina_target(
 }
 
 #[test]
-fn repin_discovery_prints_and_clears_host_pair_only() {
+fn repin_discovery_prints_and_clears_consumed_host_values_only() {
     let dir = tempfile::tempdir().unwrap();
     write_protected_lock(dir.path());
 
@@ -93,11 +94,9 @@ fn repin_discovery_prints_and_clears_host_pair_only() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("Discarding API base URL: https://registry.carina-rs.dev/v1/providers/"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("Discarding discovery document SHA256: discovery-shasum"),
+        stderr.contains(
+            "Discarding pinned discovery value providers.v1: https://registry.carina-rs.dev/v1/providers/"
+        ),
         "{stderr}"
     );
     assert!(!stdout.contains("Discarding"), "{stdout}");
@@ -109,8 +108,7 @@ fn repin_discovery_prints_and_clears_host_pair_only() {
         .expect("re-pinned lock must remain present");
     let saved = fs::read_to_string(lock_path).unwrap();
     assert!(saved.contains("discovery_pin_present = false"), "{saved}");
-    assert!(!saved.contains("api_base_url"), "{saved}");
-    assert!(!saved.contains("discovery_sha256"), "{saved}");
+    assert!(!saved.contains("discovery_values"), "{saved}");
     assert!(
         saved.contains("resolved_hostname = \"registry.carina-rs.dev\""),
         "{saved}"
