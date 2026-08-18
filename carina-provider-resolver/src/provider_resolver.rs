@@ -3098,16 +3098,72 @@ impl ResolvedRegistry {
     }
 }
 
+mod registry_resource_url {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct RegistryResourceUrl(String);
+
+    #[derive(Debug)]
+    pub(super) enum RegistryResourceUrlError {
+        Invalid(url::ParseError),
+        MustUseHttps,
+        MustHaveHost,
+        ContainsUserinfo,
+    }
+
+    impl RegistryResourceUrl {
+        pub(super) fn parse(raw: &str) -> Result<Self, RegistryResourceUrlError> {
+            let parsed = url::Url::parse(raw).map_err(RegistryResourceUrlError::Invalid)?;
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                return Err(RegistryResourceUrlError::ContainsUserinfo);
+            }
+            if parsed.scheme() != "https" {
+                return Err(RegistryResourceUrlError::MustUseHttps);
+            }
+            if !super::is_absolute_https_url(&parsed) {
+                return Err(RegistryResourceUrlError::MustHaveHost);
+            }
+            Ok(Self(raw.to_owned()))
+        }
+
+        pub(super) fn as_str(&self) -> &str {
+            &self.0
+        }
+    }
+}
+
+use registry_resource_url::{RegistryResourceUrl, RegistryResourceUrlError};
+
+fn parse_registry_resource_url(
+    raw: &str,
+    description: &str,
+) -> Result<RegistryResourceUrl, String> {
+    RegistryResourceUrl::parse(raw).map_err(|error| match error {
+        RegistryResourceUrlError::Invalid(source) => {
+            format!("{description} must be an absolute HTTPS URL: {source}")
+        }
+        RegistryResourceUrlError::MustUseHttps => {
+            format!("{description} must use HTTPS: {raw}")
+        }
+        RegistryResourceUrlError::MustHaveHost => {
+            format!("{description} must be an absolute HTTPS URL with a host")
+        }
+        RegistryResourceUrlError::ContainsUserinfo => {
+            format!("{description} must not contain userinfo")
+        }
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 enum RegistryHttpRequest<'a> {
     Discovery(&'a str),
-    Resource(&'a str),
+    Resource(&'a RegistryResourceUrl),
 }
 
 impl<'a> RegistryHttpRequest<'a> {
     fn url(self) -> &'a str {
         match self {
-            Self::Discovery(url) | Self::Resource(url) => url,
+            Self::Discovery(url) => url,
+            Self::Resource(url) => url.as_str(),
         }
     }
 }
@@ -3121,11 +3177,12 @@ enum HttpResponse {
 trait RegistryHttp {
     fn get(&self, request: RegistryHttpRequest<'_>) -> Result<HttpResponse, String>;
 
-    fn download_to_file(&self, url: &str, dest: &Path) -> Result<(), String> {
+    fn download_to_file(&self, url: &RegistryResourceUrl, dest: &Path) -> Result<(), String> {
+        let raw_url = url.as_str();
         let body = match self.get(RegistryHttpRequest::Resource(url))? {
             HttpResponse::Success { body } => body,
             HttpResponse::Failure { status } => {
-                return Err(format!("Download failed with status {status}: {url}"));
+                return Err(format!("Download failed with status {status}: {raw_url}"));
             }
         };
         if let Some(parent) = dest.parent() {
@@ -3147,7 +3204,10 @@ impl UreqRegistryHttp {
                 .max_redirects(0)
                 .build()
                 .into(),
-            RegistryHttpRequest::Resource(_) => ureq::Agent::new_with_defaults(),
+            RegistryHttpRequest::Resource(_) => ureq::Agent::config_builder()
+                .https_only(true)
+                .build()
+                .into(),
         }
     }
 }
@@ -3174,8 +3234,11 @@ impl RegistryHttp for UreqRegistryHttp {
         Ok(HttpResponse::Success { body })
     }
 
-    fn download_to_file(&self, url: &str, dest: &Path) -> Result<(), String> {
-        let response = ureq::get(url)
+    fn download_to_file(&self, url: &RegistryResourceUrl, dest: &Path) -> Result<(), String> {
+        let request = RegistryHttpRequest::Resource(url);
+        let url = url.as_str();
+        let response = Self::agent(request)
+            .get(url)
             .call()
             .map_err(|e| format!("Failed to download {url}: {e}"))?;
 
@@ -3526,18 +3589,19 @@ fn registry_revision<'a>(
 
 fn fetch_json<T: for<'de> Deserialize<'de>, H: RegistryHttp>(
     http: &H,
-    url: &str,
+    url: &RegistryResourceUrl,
 ) -> Result<T, String> {
     let body = match http.get(RegistryHttpRequest::Resource(url))? {
         HttpResponse::Success { body } => body,
         HttpResponse::Failure { status } => {
             return Err(format!(
-                "Registry request failed with status {status}: {url}"
+                "Registry request failed with status {status}: {}",
+                url.as_str()
             ));
         }
     };
     let parsed = serde_json::from_slice(&body)
-        .map_err(|e| format!("Failed to parse registry JSON from {url}: {e}"))?;
+        .map_err(|e| format!("Failed to parse registry JSON from {}: {e}", url.as_str()))?;
     Ok(parsed)
 }
 
@@ -3643,7 +3707,7 @@ fn resolve_api_base_url(discovery_url: &url::Url, providers_v1: &str) -> Result<
     let api_base_url = discovery_url.join(providers_v1).map_err(|error| {
         format!("invalid registry discovery providers.v1 reference {providers_v1:?}: {error}")
     })?;
-    if !is_absolute_https_api_base_url(&api_base_url) {
+    if !is_absolute_https_url(&api_base_url) {
         return Err(format!(
             "registry discovery providers.v1 must use HTTPS: {providers_v1}"
         ));
@@ -3675,7 +3739,7 @@ fn validate_persisted_api_base_url(value: &str) -> Result<(), RegistryDiscoveryP
             value: value.into(),
             source: Some(source),
         })?;
-    if !is_absolute_https_api_base_url(&api_base_url) {
+    if !is_absolute_https_url(&api_base_url) {
         return Err(RegistryDiscoveryPinError::InvalidApiBaseUrl {
             value: value.into(),
             source: None,
@@ -3684,7 +3748,7 @@ fn validate_persisted_api_base_url(value: &str) -> Result<(), RegistryDiscoveryP
     Ok(())
 }
 
-fn is_absolute_https_api_base_url(url: &url::Url) -> bool {
+fn is_absolute_https_url(url: &url::Url) -> bool {
     url.scheme() == "https" && url.has_host() && !url.cannot_be_a_base()
 }
 
@@ -3712,6 +3776,7 @@ fn fetch_registry_versions<H: RegistryHttp>(
         registry.api_base_url(),
         &format!("/{}/{}/versions", source.namespace, source.name),
     );
+    let url = parse_registry_resource_url(&url, "registry versions URL")?;
     let versions: RegistryVersions = fetch_json(http, &url)?;
     let validated_sequence = lock_file.validate_and_record_registry_listing(source, &versions)?;
     Ok(RecordedRegistryListing {
@@ -3822,6 +3887,7 @@ fn fetch_registry_download<H: RegistryHttp>(
         registry.api_base_url(),
         &format!("/{}/{}/{version}/download", source.namespace, source.name),
     );
+    let url = parse_registry_resource_url(&url, "registry download metadata URL")?;
     let download: RegistryDownload = fetch_json(http, &url)?;
     Ok(download)
 }
@@ -4104,14 +4170,10 @@ fn fetch_signature_bundle<H: RegistryHttp>(
     signature: &RegistrySignature,
     http: &H,
 ) -> Result<Vec<u8>, String> {
-    if !signature.bundle_url.starts_with("https://") {
-        return Err(signing::verification_failure(format!(
-            "signature bundle URL must use HTTPS: {}",
-            signature.bundle_url
-        )));
-    }
+    let bundle_url = parse_registry_resource_url(&signature.bundle_url, "signature bundle URL")
+        .map_err(signing::verification_failure)?;
     let response = http
-        .get(RegistryHttpRequest::Resource(&signature.bundle_url))
+        .get(RegistryHttpRequest::Resource(&bundle_url))
         .map_err(|error| {
         format!(
             "cannot fetch the signature bundle from {} ({error}); signature verification cannot proceed and has no override",
@@ -4184,6 +4246,8 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
         }
     }
     let download = fetch_registry_download(&registry, source, version, http)?;
+    let download_url =
+        parse_registry_resource_url(&download.download_url, "registry download URL")?;
     let transparency_log_present = download.transparency_log.is_some();
     let VerifiedRegistryLockPin {
         existing_constraint,
@@ -4223,7 +4287,7 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
             &format!("cached {provider_context}"),
         )?
     } else {
-        http.download_to_file(&download.download_url, &wasm_path)?;
+        http.download_to_file(&download_url, &wasm_path)?;
         hash_and_check(&wasm_path, &download.shasum, &provider_context)?
     };
 
@@ -9073,7 +9137,8 @@ transparency_log_present = true
             Err(format!("too many test redirects from {url}"))
         }
 
-        fn download_to_file(&self, url: &str, dest: &Path) -> Result<(), String> {
+        fn download_to_file(&self, url: &RegistryResourceUrl, dest: &Path) -> Result<(), String> {
+            let url = url.as_str();
             self.requested.lock().unwrap().push(url.to_string());
             let body = self
                 .downloads
@@ -10595,10 +10660,11 @@ transparency_log_present = true
     fn registry_source_rejects_non_https_signature_bundle_url() {
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
+        let bundle_url = "http://downloads.example.test/aws.sigstore.json";
         let http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
             "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
             &format!(
-                r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"sigstore-bundle","certificate_identity":"{SIGNED_FIXTURE_IDENTITY}","certificate_oidc_issuer":"{SIGNED_FIXTURE_ISSUER}","bundle_url":"http://downloads.example.test/aws.sigstore.json"}}}}"#
+                r#"{{"download_url":"https://downloads.example.test/aws.wasm","shasum":"{shasum}","signature":{{"type":"sigstore-bundle","certificate_identity":"{SIGNED_FIXTURE_IDENTITY}","certificate_oidc_issuer":"{SIGNED_FIXTURE_ISSUER}","bundle_url":"{bundle_url}"}}}}"#
             ),
         );
         let mut lock_file = LockFile::default();
@@ -10615,10 +10681,90 @@ transparency_log_present = true
 
         assert!(error.contains("HTTPS"), "{error}");
         assert!(error.contains("no override"), "{error}");
+        assert_eq!(http.request_count(bundle_url), 0);
         assert_eq!(
             fs::read(cache_path_wasm(dir.path(), "carina-rs/aws", "0.5.0")).unwrap(),
             SIGNED_FIXTURE_ARTIFACT
         );
+    }
+
+    #[test]
+    fn registry_source_rejects_non_https_download_url_before_requesting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = b"registry wasm bytes";
+        let shasum = sha256_bytes(body);
+        let download_url = "http://169.254.169.254/latest/meta-data/";
+        let http = registry_http(body, &shasum).json(
+            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            &format!(r#"{{"download_url":"{download_url}","shasum":"{shasum}"}}"#),
+        );
+        let mut lock_file = LockFile::default();
+
+        let error = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .unwrap_err();
+
+        assert_eq!(http.request_count(download_url), 0);
+        assert_eq!(
+            error,
+            format!("registry download URL must use HTTPS: {download_url}")
+        );
+    }
+
+    #[test]
+    fn registry_source_rejects_download_url_with_userinfo_before_requesting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = b"registry wasm bytes";
+        let shasum = sha256_bytes(body);
+        let download_url = "https://user:pass@downloads.example.test/aws.wasm";
+        let http = registry_http(body, &shasum).json(
+            "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download",
+            &format!(r#"{{"download_url":"{download_url}","shasum":"{shasum}"}}"#),
+        );
+        let mut lock_file = LockFile::default();
+
+        let error = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .unwrap_err();
+
+        assert_eq!(http.request_count(download_url), 0);
+        assert_eq!(error, "registry download URL must not contain userinfo");
+        assert!(!error.contains("user:pass"), "{error}");
+    }
+
+    #[test]
+    fn registry_source_allows_cross_origin_https_download_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = b"cross-origin registry wasm bytes";
+        let shasum = sha256_bytes(body);
+        let download_url = "https://downloads.example.test/aws.wasm";
+        let http = registry_http(body, &shasum);
+        let mut lock_file = LockFile::default();
+
+        let path = resolve_provider_with_http(
+            dir.path(),
+            "carina-rs/aws",
+            "0.5.0",
+            "aws",
+            &mut lock_file,
+            &http,
+        )
+        .expect("an HTTPS download URL may use a different origin from the registry API");
+
+        assert_eq!(fs::read(path).unwrap(), body);
+        assert_eq!(http.request_count(download_url), 1);
     }
 
     #[test]
@@ -11068,16 +11214,49 @@ transparency_log_present = false
     }
 
     #[test]
+    fn registry_resource_url_requires_https_host_and_no_userinfo() {
+        for url in [
+            "http://downloads.example.test/aws.wasm",
+            "file:///tmp/aws.wasm",
+            "ftp://downloads.example.test/aws.wasm",
+            "data:application/wasm;base64,AGFzbQ==",
+        ] {
+            assert!(
+                matches!(
+                    RegistryResourceUrl::parse(url),
+                    Err(RegistryResourceUrlError::MustUseHttps)
+                ),
+                "non-HTTPS registry resource URL was accepted: {url}"
+            );
+        }
+
+        for url in ["https://", "/relative/aws.wasm"] {
+            assert!(
+                RegistryResourceUrl::parse(url).is_err(),
+                "hostless registry resource URL was accepted: {url}"
+            );
+        }
+
+        assert!(matches!(
+            RegistryResourceUrl::parse("https://user:pass@downloads.example.test/aws.wasm"),
+            Err(RegistryResourceUrlError::ContainsUserinfo)
+        ));
+        assert!(RegistryResourceUrl::parse("https://downloads.example.test/aws.wasm").is_ok());
+    }
+
+    #[test]
     fn ureq_transport_selects_redirect_policy_by_request_type() {
         let discovery = UreqRegistryHttp::agent(RegistryHttpRequest::Discovery(
             "https://registry.example.test/.well-known/carina.json",
         ));
-        let resource = UreqRegistryHttp::agent(RegistryHttpRequest::Resource(
-            "https://registry.example.test/v1/providers/",
-        ));
+        let resource_url =
+            RegistryResourceUrl::parse("https://registry.example.test/v1/providers/").unwrap();
+        let resource = UreqRegistryHttp::agent(RegistryHttpRequest::Resource(&resource_url));
 
         assert_eq!(discovery.config().max_redirects(), 0);
+        assert!(!discovery.config().https_only());
         assert_eq!(resource.config().max_redirects(), 10);
+        assert!(resource.config().https_only());
     }
 
     #[test]
