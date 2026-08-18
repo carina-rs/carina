@@ -132,11 +132,9 @@ fn run_repin_discovery(host: &str, force: bool, base_dir: &Path) -> Result<(), A
     let pin = recovery.discovery_pin();
 
     eprintln!("Registry host: {host}");
-    eprintln!("Discarding API base URL: {}", pin.api_base_url);
-    eprintln!(
-        "Discarding discovery document SHA256: {}",
-        pin.discovery_sha256
-    );
+    for (field, value) in pin.values() {
+        eprintln!("Discarding pinned discovery value {field}: {value}");
+    }
     eprintln!("All provider entries and provider security state will be retained.");
     flush_preview()?;
 
