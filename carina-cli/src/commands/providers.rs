@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use carina_provider_resolver::LockFile;
+use carina_provider_resolver::{LockFile, LockFileMigration};
 
 use crate::error::AppError;
 
@@ -69,9 +69,9 @@ pub fn run_providers_command(command: ProvidersCommands) -> Result<(), AppError>
     }
 }
 
-fn load_lock(base_dir: &Path) -> Result<(PathBuf, LockFile), AppError> {
+fn load_lock(base_dir: &Path) -> Result<(PathBuf, LockFile, Option<LockFileMigration>), AppError> {
     let lock_path = base_dir.join(PROVIDER_LOCK_FILE);
-    let lock = LockFile::load(&lock_path)
+    let loaded = LockFile::load(&lock_path)
         .map_err(|error| AppError::Config(error.to_string()))?
         .ok_or_else(|| {
             AppError::Config(format!(
@@ -79,7 +79,14 @@ fn load_lock(base_dir: &Path) -> Result<(PathBuf, LockFile), AppError> {
                 lock_path.display()
             ))
         })?;
-    Ok((lock_path, lock))
+    let (lock, migration) = loaded.into_parts();
+    Ok((lock_path, lock, migration))
+}
+
+fn report_lock_migration(migration: Option<&LockFileMigration>) {
+    if let Some(migration) = migration {
+        eprintln!("{migration}");
+    }
 }
 
 fn flush_preview() -> Result<(), AppError> {
@@ -125,17 +132,13 @@ fn confirm_recovery(target: &str, target_label: &str, force: bool) -> Result<boo
 }
 
 fn run_repin_discovery(host: &str, force: bool, base_dir: &Path) -> Result<(), AppError> {
-    let (lock_path, mut lock) = load_lock(base_dir)?;
+    // `PreparedRegistryDiscoveryRepin::Display` folds the migration header into
+    // its discard preview, so printing this event separately would duplicate it.
+    let (lock_path, mut lock, _migration) = load_lock(base_dir)?;
     let recovery = lock
         .prepare_registry_discovery_repin(host)
         .map_err(|error| AppError::Config(error.to_string()))?;
-    let pin = recovery.discovery_pin();
-
-    eprintln!("Registry host: {host}");
-    for (field, value) in pin.values() {
-        eprintln!("Discarding pinned discovery value {field}: {value}");
-    }
-    eprintln!("All provider entries and provider security state will be retained.");
+    eprintln!("{recovery}");
     flush_preview()?;
 
     if !confirm_recovery(host, "registry host", force)? {
@@ -150,7 +153,8 @@ fn run_repin_discovery(host: &str, force: bool, base_dir: &Path) -> Result<(), A
 }
 
 fn run_repin_identity(provider: &str, force: bool, base_dir: &Path) -> Result<(), AppError> {
-    let (lock_path, mut lock) = load_lock(base_dir)?;
+    let (lock_path, mut lock, migration) = load_lock(base_dir)?;
+    report_lock_migration(migration.as_ref());
     let recovery = lock
         .prepare_registry_identity_repin(provider)
         .map_err(|error| AppError::Config(error.to_string()))?;
@@ -185,7 +189,8 @@ fn display_sequence(value: Option<u64>) -> String {
 }
 
 fn run_rebootstrap(provider: &str, force: bool, base_dir: &Path) -> Result<(), AppError> {
-    let (lock_path, mut lock) = load_lock(base_dir)?;
+    let (lock_path, mut lock, migration) = load_lock(base_dir)?;
+    report_lock_migration(migration.as_ref());
     let recovery = lock
         .prepare_registry_rebootstrap(provider)
         .map_err(|error| AppError::Config(error.to_string()))?;

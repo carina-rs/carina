@@ -537,7 +537,11 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         "{stderr}"
     );
     assert!(
-        stderr.contains("Delete it, then regenerate it with `carina init`"),
+        stderr.contains("restore this file from version control or backup"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("preserve it for manual inspection"),
         "{stderr}"
     );
 }

@@ -5180,7 +5180,7 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
 }
 
 #[test]
-fn unversioned_lock_error_reaches_cli_with_source_and_init_remediation() {
+fn unversioned_lock_error_reaches_cli_with_source_and_restore_remediation() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
     std::fs::write(
@@ -5217,7 +5217,11 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         "{rendered}"
     );
     assert!(
-        rendered.contains("Delete it, then regenerate it with `carina init`"),
+        rendered.contains("restore this file from version control or backup"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("preserve it for manual inspection"),
         "{rendered}"
     );
 
@@ -5249,7 +5253,11 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         "{formatting_rendered}"
     );
     assert!(
-        formatting_rendered.contains("Delete it, then regenerate it with `carina init`"),
+        formatting_rendered.contains("restore this file from version control or backup"),
+        "{formatting_rendered}"
+    );
+    assert!(
+        formatting_rendered.contains("preserve it for manual inspection"),
         "{formatting_rendered}"
     );
     let mut source = std::error::Error::source(formatting_error);
