@@ -1,5 +1,6 @@
 //! Provider resolution: download, extract, cache, and verify provider binaries.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
@@ -95,12 +96,72 @@ impl LockEntry<NoRegistryLock> {
     }
 }
 
+/// A registry hostname normalized once at the lock-file boundary.
+///
+/// Registry host map keys and provider references both use this type, so case
+/// differences cannot make a host record appear missing after migration.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CanonicalRegistryHostname(String);
+
+impl CanonicalRegistryHostname {
+    fn new(mut hostname: String) -> Self {
+        hostname.make_ascii_lowercase();
+        Self(hostname)
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Borrow<str> for CanonicalRegistryHostname {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for CanonicalRegistryHostname {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<String> for CanonicalRegistryHostname {
+    fn from(hostname: String) -> Self {
+        Self::new(hostname)
+    }
+}
+
+impl From<&str> for CanonicalRegistryHostname {
+    fn from(hostname: &str) -> Self {
+        Self::new(hostname.to_owned())
+    }
+}
+
+impl Serialize for CanonicalRegistryHostname {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CanonicalRegistryHostname {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::new)
+    }
+}
+
 /// Registry-only pinning metadata. Kept outside [`LockEntryKind`] so the
 /// version/revision/file shape remains a closed tagged enum.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(into = "RegistryLockSerde")]
 pub struct RegistryLock {
-    resolved_hostname: String,
+    resolved_hostname: CanonicalRegistryHostname,
     /// The greatest fully validated sequence observed for this source. This is
     /// durable across downstream failures but is not a rollback floor.
     sequence: RegistrySequence,
@@ -291,14 +352,40 @@ impl<'de> Deserialize<'de> for RegistryDiscoveryPin {
     }
 }
 
-/// A host either has its currently consumed discovery values pinned or is
-/// explicitly awaiting first contact for them after an operator-authorized
-/// re-pin. Opaque values retained from newer clients remain carried in either
-/// state.
+/// A host either has its currently consumed discovery values pinned, is
+/// explicitly awaiting first contact after an operator-authorized re-pin, or
+/// is blocked until an operator authorizes discarding a migrated legacy pin.
+/// Opaque values retained from newer clients remain carried where applicable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RegistryDiscoveryPinState {
     Pinned(RegistryDiscoveryPin),
     Unpinned(UnconsumedDiscoveryValues),
+    MigrationPendingAuthorization(LegacyRegistryDiscoveryPin),
+}
+
+/// The only host states that registry discovery is allowed to consume.
+///
+/// Constructing this view rejects migration-pending state, so resolution
+/// cannot accidentally treat migration as an operator-authorized re-pin.
+enum AuthorizedRegistryDiscoveryState<'a> {
+    Pinned(&'a RegistryDiscoveryPin),
+    Unpinned(&'a UnconsumedDiscoveryValues),
+}
+
+impl AuthorizedRegistryDiscoveryState<'_> {
+    fn pin(&self) -> Option<&RegistryDiscoveryPin> {
+        match self {
+            Self::Pinned(pin) => Some(pin),
+            Self::Unpinned(_) => None,
+        }
+    }
+
+    fn additional_values(&self) -> &UnconsumedDiscoveryValues {
+        match self {
+            Self::Pinned(pin) => &pin.additional,
+            Self::Unpinned(additional) => additional,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -313,6 +400,8 @@ struct RegistryHostLockSerde {
     discovery_pin_present: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     discovery_values: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    migration_pending_discovery_pin: Option<LegacyRegistryDiscoveryPin>,
 }
 
 #[derive(Debug)]
@@ -327,7 +416,7 @@ impl fmt::Display for RegistryHostLockError {
         match self {
             Self::Inconsistent => write!(
                 f,
-                "registry host lock is inconsistent: providers.v1 must be present in discovery_values exactly when discovery_pin_present is true; other discovery values may remain while it is false"
+                "registry host lock is inconsistent: providers.v1 must be present in discovery_values exactly when discovery_pin_present is true; migration_pending_discovery_pin is valid only as the sole discovery material while discovery_pin_present is false; other discovery values may remain in an ordinary unpinned state"
             ),
             Self::InvalidDiscoveryPin(source) => source.fmt(f),
             Self::InvalidUnconsumedDiscoveryValues(source) => source.fmt(f),
@@ -352,17 +441,26 @@ impl RegistryHostLock {
         }
     }
 
-    fn pin(&self) -> Option<&RegistryDiscoveryPin> {
+    fn authorized_discovery(
+        &self,
+    ) -> Result<AuthorizedRegistryDiscoveryState<'_>, &LegacyRegistryDiscoveryPin> {
         match &self.discovery {
-            RegistryDiscoveryPinState::Pinned(pin) => Some(pin),
-            RegistryDiscoveryPinState::Unpinned(_) => None,
+            RegistryDiscoveryPinState::Pinned(pin) => {
+                Ok(AuthorizedRegistryDiscoveryState::Pinned(pin))
+            }
+            RegistryDiscoveryPinState::Unpinned(additional) => {
+                Ok(AuthorizedRegistryDiscoveryState::Unpinned(additional))
+            }
+            RegistryDiscoveryPinState::MigrationPendingAuthorization(pin) => Err(pin),
         }
     }
 
-    fn additional_discovery_values(&self) -> &UnconsumedDiscoveryValues {
+    #[cfg(test)]
+    fn pin_for_test(&self) -> Option<&RegistryDiscoveryPin> {
         match &self.discovery {
-            RegistryDiscoveryPinState::Pinned(pin) => &pin.additional,
-            RegistryDiscoveryPinState::Unpinned(additional) => additional,
+            RegistryDiscoveryPinState::Pinned(pin) => Some(pin),
+            RegistryDiscoveryPinState::Unpinned(_)
+            | RegistryDiscoveryPinState::MigrationPendingAuthorization(_) => None,
         }
     }
 }
@@ -371,18 +469,25 @@ impl TryFrom<RegistryHostLockSerde> for RegistryHostLock {
     type Error = RegistryHostLockError;
 
     fn try_from(value: RegistryHostLockSerde) -> Result<Self, Self::Error> {
-        let discovery = match (value.discovery_pin_present, value.discovery_values) {
-            (true, Some(values)) => RegistryDiscoveryPinState::Pinned(
+        let discovery = match (
+            value.discovery_pin_present,
+            value.discovery_values,
+            value.migration_pending_discovery_pin,
+        ) {
+            (true, Some(values), None) => RegistryDiscoveryPinState::Pinned(
                 RegistryDiscoveryPin::from_values(values)
                     .map_err(RegistryHostLockError::InvalidDiscoveryPin)?,
             ),
-            (false, None) => {
+            (false, None, None) => {
                 RegistryDiscoveryPinState::Unpinned(UnconsumedDiscoveryValues::default())
             }
-            (false, Some(additional)) => RegistryDiscoveryPinState::Unpinned(
+            (false, Some(additional), None) => RegistryDiscoveryPinState::Unpinned(
                 UnconsumedDiscoveryValues::try_from_values(additional)
                     .map_err(RegistryHostLockError::InvalidUnconsumedDiscoveryValues)?,
             ),
+            (false, None, Some(pin)) => {
+                RegistryDiscoveryPinState::MigrationPendingAuthorization(pin)
+            }
             _ => return Err(RegistryHostLockError::Inconsistent),
         };
         Ok(Self { discovery })
@@ -395,6 +500,7 @@ impl From<RegistryHostLock> for RegistryHostLockSerde {
             RegistryDiscoveryPinState::Pinned(pin) => Self {
                 discovery_pin_present: true,
                 discovery_values: Some(pin.into_values()),
+                migration_pending_discovery_pin: None,
             },
             RegistryDiscoveryPinState::Unpinned(additional) => Self {
                 discovery_pin_present: false,
@@ -403,6 +509,12 @@ impl From<RegistryHostLock> for RegistryHostLockSerde {
                 } else {
                     Some(additional.into_values())
                 },
+                migration_pending_discovery_pin: None,
+            },
+            RegistryDiscoveryPinState::MigrationPendingAuthorization(pin) => Self {
+                discovery_pin_present: false,
+                discovery_values: None,
+                migration_pending_discovery_pin: Some(pin),
             },
         }
     }
@@ -414,6 +526,85 @@ impl<'de> Deserialize<'de> for RegistryHostLock {
         D: serde::Deserializer<'de>,
     {
         RegistryHostLockSerde::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Discovery material retained while migrating a v2 registry host record.
+///
+/// Neither value is a v3 discovery pin: v3 pins the resolved discovery-value
+/// map, while v2 pinned the API base alongside a hash of the document bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyRegistryDiscoveryPin {
+    api_base_url: String,
+    discovery_sha256: String,
+}
+
+#[derive(Debug)]
+enum LegacyRegistryDiscoveryPinState {
+    Pinned(LegacyRegistryDiscoveryPin),
+    Unpinned,
+}
+
+#[derive(Debug)]
+struct LegacyRegistryHostLock {
+    discovery: LegacyRegistryDiscoveryPinState,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRegistryHostLockSerde {
+    discovery_pin_present: bool,
+    #[serde(default)]
+    api_base_url: Option<String>,
+    #[serde(default)]
+    discovery_sha256: Option<String>,
+}
+
+#[derive(Debug)]
+struct LegacyRegistryHostLockError;
+
+impl fmt::Display for LegacyRegistryHostLockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "v2 registry host lock is inconsistent: api_base_url and discovery_sha256 must be present together exactly when discovery_pin_present is true"
+        )
+    }
+}
+
+impl std::error::Error for LegacyRegistryHostLockError {}
+
+impl TryFrom<LegacyRegistryHostLockSerde> for LegacyRegistryHostLock {
+    type Error = LegacyRegistryHostLockError;
+
+    fn try_from(value: LegacyRegistryHostLockSerde) -> Result<Self, Self::Error> {
+        let discovery = match (
+            value.discovery_pin_present,
+            value.api_base_url,
+            value.discovery_sha256,
+        ) {
+            (true, Some(api_base_url), Some(discovery_sha256)) => {
+                LegacyRegistryDiscoveryPinState::Pinned(LegacyRegistryDiscoveryPin {
+                    api_base_url,
+                    discovery_sha256,
+                })
+            }
+            (false, None, None) => LegacyRegistryDiscoveryPinState::Unpinned,
+            _ => return Err(LegacyRegistryHostLockError),
+        };
+        Ok(Self { discovery })
+    }
+}
+
+impl<'de> Deserialize<'de> for LegacyRegistryHostLock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        LegacyRegistryHostLockSerde::deserialize(deserializer)?
             .try_into()
             .map_err(serde::de::Error::custom)
     }
@@ -511,10 +702,13 @@ impl UnpinnedRegistryRatchets {
         self.0.remove(source)
     }
 
-    fn into_canonical(self) -> Result<Self, RegistryIdentityPinConflict> {
+    fn into_canonical(self) -> Result<Self, RegistryIdentityPinConflictRecord> {
         let mut canonical = Self::default();
         for (source, ratchets) in self.0 {
-            canonical.merge(canonical_lock_source(&source), ratchets)?;
+            let provider = canonical_lock_source(&source);
+            canonical
+                .merge(provider.clone(), ratchets)
+                .map_err(|source| RegistryIdentityPinConflictRecord { provider, source })?;
         }
         Ok(canonical)
     }
@@ -558,6 +752,12 @@ pub struct IdentityPin {
 pub struct RegistryIdentityPinConflict {
     pub left: IdentityPin,
     pub right: IdentityPin,
+}
+
+#[derive(Debug)]
+struct RegistryIdentityPinConflictRecord {
+    provider: String,
+    source: RegistryIdentityPinConflict,
 }
 
 impl fmt::Display for RegistryIdentityPinConflict {
@@ -1030,7 +1230,7 @@ impl<'de> Deserialize<'de> for RegistryRatchets {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegistryLockSerde {
-    resolved_hostname: String,
+    resolved_hostname: CanonicalRegistryHostname,
     sequence_present: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sequence: Option<u64>,
@@ -1229,7 +1429,7 @@ impl RegistrySequenceAnchor {
 
 impl RegistryLock {
     pub fn resolved_hostname(&self) -> &str {
-        &self.resolved_hostname
+        self.resolved_hostname.as_str()
     }
 
     pub fn yanked_versions(&self) -> &YankedRegistryVersions {
@@ -1246,7 +1446,7 @@ impl RegistryLock {
 #[derive(Debug, Clone)]
 pub struct LockFile {
     version: u32,
-    registry_host: BTreeMap<String, RegistryHostLock>,
+    registry_host: BTreeMap<CanonicalRegistryHostname, RegistryHostLock>,
     pub provider: Vec<LockEntry<RegistryLock>>,
     unpinned_registry_ratchets: UnpinnedRegistryRatchets,
 }
@@ -1258,7 +1458,7 @@ pub struct LockFile {
 struct SerializableLockFile<'a> {
     version: &'a u32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    registry_host: &'a BTreeMap<String, RegistryHostLock>,
+    registry_host: &'a BTreeMap<CanonicalRegistryHostname, RegistryHostLock>,
     provider: &'a Vec<LockEntry<RegistryLock>>,
     #[serde(default, skip_serializing_if = "UnpinnedRegistryRatchets::is_empty")]
     unpinned_registry_ratchets: &'a UnpinnedRegistryRatchets,
@@ -1270,7 +1470,7 @@ mod registry_lock_with_host {
     /// A provider registry record paired with the host pin it references. This
     /// is the only result of converting verified discovery into persisted state.
     pub(super) struct RegistryLockWithHost {
-        host: (String, RegistryHostLock),
+        host: (CanonicalRegistryHostname, RegistryHostLock),
         registry: RegistryLock,
     }
 
@@ -1292,6 +1492,7 @@ mod registry_lock_with_host {
                 transparency_log_present,
             } = ratchets;
             let sequence_anchor = validated_sequence.into_anchor();
+            let hostname = CanonicalRegistryHostname::from(hostname);
             RegistryLockWithHost {
                 host: (hostname.clone(), RegistryHostLock::pinned(discovery_pin)),
                 registry: Self {
@@ -1349,7 +1550,16 @@ pub struct PreparedRegistryRebootstrap<'a> {
 /// used by commit together with the concrete values it will discard.
 pub struct PreparedRegistryDiscoveryRepin<'a> {
     host: &'a mut RegistryHostLock,
-    discarded_pin: RegistryDiscoveryPin,
+    hostname: String,
+    discarded: PreparedRegistryDiscoveryRepinState,
+}
+
+enum PreparedRegistryDiscoveryRepinState {
+    Pinned {
+        discarded: RegistryDiscoveryPin,
+        retained: UnconsumedDiscoveryValues,
+    },
+    MigrationPending(LegacyRegistryDiscoveryPin),
 }
 
 #[derive(Deserialize)]
@@ -1360,7 +1570,8 @@ struct LockFileVersion {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UncheckedLockFile {
-    version: u32,
+    #[serde(rename = "version")]
+    _version: u32,
     #[serde(default)]
     registry_host: BTreeMap<String, RegistryHostLock>,
     #[serde(default)]
@@ -1369,35 +1580,241 @@ struct UncheckedLockFile {
     unpinned_registry_ratchets: UnpinnedRegistryRatchets,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UncheckedLockFileV2 {
+    #[serde(rename = "version")]
+    _version: u32,
+    #[serde(default)]
+    registry_host: BTreeMap<String, LegacyRegistryHostLock>,
+    #[serde(default)]
+    provider: Vec<LockEntry<RegistryLock>>,
+    #[serde(default)]
+    unpinned_registry_ratchets: UnpinnedRegistryRatchets,
+}
+
+fn canonicalize_registry_host_keys<T>(
+    registry_host: BTreeMap<String, T>,
+    path: &Path,
+) -> Result<BTreeMap<CanonicalRegistryHostname, T>, LockFileError> {
+    let mut canonical = BTreeMap::new();
+    for (hostname, host) in registry_host {
+        let hostname = CanonicalRegistryHostname::from(hostname);
+        if canonical.insert(hostname.clone(), host).is_some() {
+            return Err(LockFileError::RegistryHostKeyConflict {
+                path: path.to_path_buf(),
+                hostname: hostname.to_string(),
+            });
+        }
+    }
+    Ok(canonical)
+}
+
+/// Details of a v2-to-v3 provider-lock migration applied in memory.
+///
+/// The event carries every legacy discovery pin that now requires operator
+/// authorization before it can be discarded. The load operation itself never
+/// rewrites the on-disk file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockFileMigration {
+    path: PathBuf,
+    from: u32,
+    to: u32,
+    discarded_discovery_pins: BTreeMap<CanonicalRegistryHostname, LegacyRegistryDiscoveryPin>,
+}
+
+impl LockFileMigration {
+    pub fn discarded_discovery_pin(&self, host: &str) -> Option<&LegacyRegistryDiscoveryPin> {
+        let host = CanonicalRegistryHostname::from(host);
+        self.discarded_discovery_pins.get(host.as_str())
+    }
+}
+
+impl fmt::Display for LockFileMigration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "Provider lock format migration: version {} -> version {}",
+            self.from, self.to
+        )?;
+        writeln!(f, "Lock file: {}", self.path.display())?;
+        if self.discarded_discovery_pins.is_empty() {
+            writeln!(
+                f,
+                "Migration found no v2 discovery pins requiring operator authorization."
+            )?;
+            writeln!(
+                f,
+                "All provider entries and provider security state will be retained."
+            )?;
+            return write!(
+                f,
+                "The on-disk lock remains unchanged until Carina next saves it."
+            );
+        }
+        for (host, pin) in &self.discarded_discovery_pins {
+            writeln!(f, "Registry host: {host}")?;
+            writeln!(
+                f,
+                "Retaining v2 pinned discovery API base pending authorization: {}",
+                pin.api_base_url
+            )?;
+            writeln!(
+                f,
+                "Retaining v2 discovery document SHA-256 pending authorization: {}",
+                pin.discovery_sha256
+            )?;
+        }
+        writeln!(
+            f,
+            "Registry resolution is blocked for each migrated host until its legacy pin is explicitly authorized for discard."
+        )?;
+        writeln!(
+            f,
+            "All provider entries and provider security state will be retained."
+        )?;
+        write!(
+            f,
+            "Run `carina providers repin-discovery <host>` for each migrated host after verifying the change out of band. The on-disk lock remains unchanged until Carina next saves it."
+        )
+    }
+}
+
+/// A provider lock tagged with whether load migrated its wire format.
+///
+/// Production callers destructure this result so a pending v2 discovery-pin
+/// migration can be surfaced alongside the in-memory v3 lock.
 #[derive(Debug)]
-pub enum LockFileError {
+pub enum LoadedLockFile {
+    Pristine(LockFile),
+    Migrated {
+        lock_file: LockFile,
+        migration: LockFileMigration,
+    },
+}
+
+impl LoadedLockFile {
+    pub fn into_parts(self) -> (LockFile, Option<LockFileMigration>) {
+        match self {
+            Self::Pristine(lock_file) => (lock_file, None),
+            Self::Migrated {
+                lock_file,
+                migration,
+            } => (lock_file, Some(migration)),
+        }
+    }
+
+    #[cfg(test)]
+    fn into_lock_file(self) -> LockFile {
+        self.into_parts().0
+    }
+
+    fn into_resolution_lock_file(self) -> LockFile {
+        match self {
+            Self::Pristine(lock_file) => lock_file,
+            Self::Migrated {
+                lock_file,
+                migration,
+            } => {
+                eprintln!("{migration}");
+                lock_file
+            }
+        }
+    }
+}
+
+/// Keep the complete error variant set and its rendered-message samples in one
+/// declaration. Adding a variant cannot compile until it also supplies the
+/// sample scanned by `lock_file_error_messages_never_instruct_wholesale_deletion`.
+macro_rules! define_lock_file_error {
+    ($($variant:ident $fields:tt => $sample:expr),+ $(,)?) => {
+        #[derive(Debug)]
+        pub enum LockFileError {
+            $($variant $fields,)+
+        }
+
+        #[cfg(test)]
+        impl LockFileError {
+            fn display_test_samples() -> Vec<(&'static str, Self)> {
+                vec![$((stringify!($variant), $sample),)+]
+            }
+        }
+    };
+}
+
+define_lock_file_error! {
     Read {
         path: PathBuf,
         source: io::Error,
+    } => Self::Read {
+        path: PathBuf::from("carina-providers.lock"),
+        source: io::Error::new(io::ErrorKind::PermissionDenied, "permission denied"),
     },
     MissingVersion {
         path: PathBuf,
+    } => Self::MissingVersion {
+        path: PathBuf::from("carina-providers.lock"),
     },
     VersionTooNew {
         found: u32,
         supported: u32,
+    } => Self::VersionTooNew {
+        found: LockFile::CURRENT_VERSION + 1,
+        supported: LockFile::CURRENT_VERSION,
     },
     VersionTooOld {
         found: u32,
         supported: u32,
+    } => Self::VersionTooOld {
+        found: 1,
+        supported: LockFile::CURRENT_VERSION,
     },
     MissingRegistryHostRecord {
         path: PathBuf,
         provider: String,
         hostname: String,
+    } => Self::MissingRegistryHostRecord {
+        path: PathBuf::from("carina-providers.lock"),
+        provider: "carina-rs/aws".into(),
+        hostname: "registry.carina-rs.dev".into(),
+    },
+    RegistryHostKeyConflict {
+        path: PathBuf,
+        hostname: String,
+    } => Self::RegistryHostKeyConflict {
+        path: PathBuf::from("carina-providers.lock"),
+        hostname: "registry.carina-rs.dev".into(),
     },
     Parse {
         path: PathBuf,
         source: toml::de::Error,
+    } => {
+        let source = match toml::from_str::<LockFileVersion>("version = [") {
+            Ok(_) => panic!("malformed TOML unexpectedly parsed"),
+            Err(error) => error,
+        };
+        Self::Parse {
+            path: PathBuf::from("carina-providers.lock"),
+            source,
+        }
     },
     RegistryIdentityPinConflict {
         path: PathBuf,
+        provider: String,
         source: Box<RegistryIdentityPinConflict>,
+    } => Self::RegistryIdentityPinConflict {
+        path: PathBuf::from("carina-providers.lock"),
+        provider: "carina-rs/aws".into(),
+        source: Box::new(RegistryIdentityPinConflict {
+            left: IdentityPin {
+                certificate_identity: "identity-a".into(),
+                certificate_oidc_issuer: "issuer-a".into(),
+            },
+            right: IdentityPin {
+                certificate_identity: "identity-b".into(),
+                certificate_oidc_issuer: "issuer-b".into(),
+            },
+        }),
     },
 }
 
@@ -1409,7 +1826,7 @@ impl fmt::Display for LockFileError {
             }
             Self::MissingVersion { path } => write!(
                 f,
-                "Lock file {} has no format version and predates lock format versioning. It cannot be distinguished from a lock whose protection fields were stripped by an older Carina binary. Delete it, then regenerate it with `carina init`.",
+                "Lock file {} has no format version and predates lock format versioning. It cannot be distinguished from a lock whose protection fields were stripped by an older Carina binary. Because automatic migration is unsafe, restore this file from version control or backup so its recorded protection state remains intact; if no trustworthy copy exists, preserve it for manual inspection and make any decision to move it aside explicitly.",
                 path.display()
             ),
             Self::VersionTooNew { found, supported } => write!(
@@ -1418,7 +1835,7 @@ impl fmt::Display for LockFileError {
             ),
             Self::VersionTooOld { found, supported } => write!(
                 f,
-                "Lock file version {found} uses an older format that this Carina release cannot read; version {supported} is required. Delete the lock file, then run `carina init` to regenerate it. This re-establishes the pins by verifying registry discovery and the providers afresh; signing identity pins therefore return to first contact."
+                "Lock file version {found} uses an older format that this Carina release cannot read; version {supported} is required. This release can migrate version 2 only. Restore a supported lock from version control or backup, or preserve this file for manual recovery."
             ),
             Self::MissingRegistryHostRecord {
                 path,
@@ -1429,16 +1846,24 @@ impl fmt::Display for LockFileError {
                 "Lock file {} records registry provider {provider:?} as resolved through host {hostname:?}, but that host record is missing. The host record must be restored before a normal `carina init` can re-resolve against that host and re-establish the discovery pin.",
                 path.display()
             ),
-            Self::Parse { path, source } => write!(
+            Self::RegistryHostKeyConflict { path, hostname } => write!(
                 f,
-                "Failed to parse {}: {source}\nhint: delete {} and re-run `carina init`.",
-                path.display(),
+                "Lock file {} contains multiple registry host records that canonicalize to {hostname:?}. Loading cannot choose between their security states; reconcile those host records in place without discarding protection state, or restore the file from version control or backup.",
                 path.display()
             ),
-            Self::RegistryIdentityPinConflict { path, source } => write!(
+            Self::Parse { path, source } => write!(
                 f,
-                "Lock file {} contains {source}; delete it and re-run `carina init`.",
+                "Failed to parse {}: {source}\nhint: correct the reported malformed record in place, preserving every other provider and registry protection record; otherwise restore the file from version control or backup.",
                 path.display()
+            ),
+            Self::RegistryIdentityPinConflict {
+                path,
+                provider,
+                source,
+            } => write!(
+                f,
+                "Lock file {} contains {source} in records for registry provider {provider:?}; correct those provider records in place so their identity pins agree, preserving all other provider and registry protection records; otherwise restore the file from version control or backup.",
+                path.display(),
             ),
         }
     }
@@ -1453,7 +1878,8 @@ impl std::error::Error for LockFileError {
             Self::MissingVersion { .. }
             | Self::VersionTooNew { .. }
             | Self::VersionTooOld { .. }
-            | Self::MissingRegistryHostRecord { .. } => None,
+            | Self::MissingRegistryHostRecord { .. }
+            | Self::RegistryHostKeyConflict { .. } => None,
         }
     }
 }
@@ -1547,16 +1973,51 @@ impl PreparedRegistryRebootstrap<'_> {
     }
 }
 
-impl PreparedRegistryDiscoveryRepin<'_> {
-    /// Return the consumed host discovery values that commit will discard.
-    pub fn discovery_pin(&self) -> &RegistryDiscoveryPin {
-        &self.discarded_pin
+impl fmt::Display for PreparedRegistryDiscoveryRepin<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if matches!(
+            &self.discarded,
+            PreparedRegistryDiscoveryRepinState::MigrationPending(_)
+        ) {
+            writeln!(f, "Provider lock format migration: version 2 -> version 3")?;
+        }
+        writeln!(f, "Registry host: {}", self.hostname)?;
+        match &self.discarded {
+            PreparedRegistryDiscoveryRepinState::Pinned { discarded, .. } => {
+                for (field, value) in discarded.values() {
+                    writeln!(f, "Discarding pinned discovery value {field}: {value}")?;
+                }
+            }
+            PreparedRegistryDiscoveryRepinState::MigrationPending(pin) => {
+                writeln!(
+                    f,
+                    "Discarding v2 pinned discovery API base: {}",
+                    pin.api_base_url
+                )?;
+                writeln!(
+                    f,
+                    "Discarding v2 discovery document SHA-256: {}",
+                    pin.discovery_sha256
+                )?;
+            }
+        }
+        write!(
+            f,
+            "All provider entries and provider security state will be retained."
+        )
     }
+}
 
+impl PreparedRegistryDiscoveryRepin<'_> {
     /// Clear the consumed values without touching provider-owned state or
     /// pinned discovery values this client does not consume.
     pub fn commit(self) {
-        let retained = self.host.additional_discovery_values().clone();
+        let retained = match self.discarded {
+            PreparedRegistryDiscoveryRepinState::Pinned { retained, .. } => retained,
+            PreparedRegistryDiscoveryRepinState::MigrationPending(_) => {
+                UnconsumedDiscoveryValues::default()
+            }
+        };
         self.host.discovery = RegistryDiscoveryPinState::Unpinned(retained);
     }
 }
@@ -1653,8 +2114,10 @@ impl LockFile {
     /// older client does not consume.
     ///
     /// v2 pinned both the resolved API base and a hash of the discovery
-    /// document bytes. It is rejected rather than reinterpreted as the v3
-    /// values-only schema.
+    /// document bytes. Loading v2 preserves every provider-owned record and
+    /// retains each legacy host pin in a resolution-blocking state because
+    /// neither value can truthfully be reinterpreted as a v3 pin. Only an
+    /// operator-authorized discovery re-pin can leave that state.
     pub const CURRENT_VERSION: u32 = 3;
 
     fn registry_host_lock(&self, hostname: &str) -> Option<&RegistryHostLock> {
@@ -1668,10 +2131,12 @@ impl LockFile {
     /// Load `carina-providers.lock`.
     ///
     /// Returns `Ok(None)` when the file is absent (normal first-run case).
+    /// A present file is tagged as pristine or migrated so callers can surface
+    /// any legacy discovery material awaiting operator authorization.
     /// Parse errors — including an entry that can't be discriminated into a
     /// [`LockEntryKind`] variant — surface as `Err` rather than being silently
     /// collapsed into a default-empty lock.
-    pub fn load(path: &Path) -> Result<Option<Self>, LockFileError> {
+    pub fn load(path: &Path) -> Result<Option<LoadedLockFile>, LockFileError> {
         let content = match fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1682,13 +2147,12 @@ impl LockFile {
                 });
             }
         };
-        Self::from_toml_str(&content, path).map(Some)
+        Self::parse_toml_str(&content, path).map(Some)
     }
 
-    /// Validated parse seam shared by filesystem loading and unit tests. It is
-    /// private so callers cannot deserialize a `LockFile` around the version
-    /// gate.
-    fn from_toml_str(content: &str, path: &Path) -> Result<Self, LockFileError> {
+    /// Validated parse seam. It is private so callers cannot deserialize a
+    /// `LockFile` around the version gate or lose the typed migration event.
+    fn parse_toml_str(content: &str, path: &Path) -> Result<LoadedLockFile, LockFileError> {
         let version: LockFileVersion =
             toml::from_str(content).map_err(|source| LockFileError::Parse {
                 path: path.to_path_buf(),
@@ -1705,35 +2169,97 @@ impl LockFile {
                 supported: Self::CURRENT_VERSION,
             });
         }
-        if version < Self::CURRENT_VERSION {
-            // Older formats either hash discovery document bytes or keep
-            // per-provider discovery copies, so they cannot be reinterpreted
-            // as the current host-owned resolved-values map.
-            return Err(LockFileError::VersionTooOld {
+
+        match version {
+            Self::CURRENT_VERSION => {
+                let unchecked: UncheckedLockFile =
+                    toml::from_str(content).map_err(|source| LockFileError::Parse {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+                let lock_file = Self::from_unchecked(unchecked, path)?;
+                Ok(LoadedLockFile::Pristine(lock_file))
+            }
+            2 => {
+                let legacy: UncheckedLockFileV2 =
+                    toml::from_str(content).map_err(|source| LockFileError::Parse {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+
+                let mut discarded_discovery_pins = BTreeMap::new();
+                let mut registry_host = BTreeMap::new();
+                for (host, legacy_host) in
+                    canonicalize_registry_host_keys(legacy.registry_host, path)?
+                {
+                    let discovery = match legacy_host.discovery {
+                        LegacyRegistryDiscoveryPinState::Pinned(pin) => {
+                            discarded_discovery_pins.insert(host.clone(), pin.clone());
+                            RegistryDiscoveryPinState::MigrationPendingAuthorization(pin)
+                        }
+                        LegacyRegistryDiscoveryPinState::Unpinned => {
+                            RegistryDiscoveryPinState::Unpinned(UnconsumedDiscoveryValues::default())
+                        }
+                    };
+                    registry_host.insert(host, RegistryHostLock { discovery });
+                }
+                let lock_file = Self::from_parts(
+                    registry_host,
+                    legacy.provider,
+                    legacy.unpinned_registry_ratchets,
+                    path,
+                )?;
+                Ok(LoadedLockFile::Migrated {
+                    lock_file,
+                    migration: LockFileMigration {
+                        path: path.to_path_buf(),
+                        from: version,
+                        to: Self::CURRENT_VERSION,
+                        discarded_discovery_pins,
+                    },
+                })
+            }
+            _ => Err(LockFileError::VersionTooOld {
                 found: version,
                 supported: Self::CURRENT_VERSION,
-            });
+            }),
         }
-        let unchecked: UncheckedLockFile =
-            toml::from_str(content).map_err(|source| LockFileError::Parse {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        let unpinned_registry_ratchets = unchecked
-            .unpinned_registry_ratchets
-            .into_canonical()
-            .map_err(|source| LockFileError::RegistryIdentityPinConflict {
-                path: path.to_path_buf(),
-                source: Box::new(source),
-            })?;
-        for entry in &unchecked.provider {
+    }
+
+    #[cfg(test)]
+    fn from_toml_str(content: &str, path: &Path) -> Result<Self, LockFileError> {
+        Self::parse_toml_str(content, path).map(LoadedLockFile::into_lock_file)
+    }
+
+    fn from_unchecked(unchecked: UncheckedLockFile, path: &Path) -> Result<Self, LockFileError> {
+        let registry_host = canonicalize_registry_host_keys(unchecked.registry_host, path)?;
+        Self::from_parts(
+            registry_host,
+            unchecked.provider,
+            unchecked.unpinned_registry_ratchets,
+            path,
+        )
+    }
+
+    fn from_parts(
+        registry_host: BTreeMap<CanonicalRegistryHostname, RegistryHostLock>,
+        provider: Vec<LockEntry<RegistryLock>>,
+        unpinned_registry_ratchets: UnpinnedRegistryRatchets,
+        path: &Path,
+    ) -> Result<Self, LockFileError> {
+        let unpinned_registry_ratchets =
+            unpinned_registry_ratchets
+                .into_canonical()
+                .map_err(|conflict| LockFileError::RegistryIdentityPinConflict {
+                    path: path.to_path_buf(),
+                    provider: conflict.provider,
+                    source: Box::new(conflict.source),
+                })?;
+        for entry in &provider {
             let Some(registry) = &entry.registry else {
                 continue;
             };
-            if !unchecked
-                .registry_host
-                .contains_key(registry.resolved_hostname())
-            {
+            if !registry_host.contains_key(registry.resolved_hostname()) {
                 return Err(LockFileError::MissingRegistryHostRecord {
                     path: path.to_path_buf(),
                     provider: canonical_lock_source(&entry.source),
@@ -1743,17 +2269,16 @@ impl LockFile {
         }
         let mut lock = Self {
             version: Self::CURRENT_VERSION,
-            registry_host: unchecked.registry_host,
-            provider: unchecked.provider,
+            registry_host,
+            provider,
             unpinned_registry_ratchets,
         };
-        lock.attach_unpinned_registry_ratchets().map_err(|source| {
-            LockFileError::RegistryIdentityPinConflict {
+        lock.attach_unpinned_registry_ratchets()
+            .map_err(|conflict| LockFileError::RegistryIdentityPinConflict {
                 path: path.to_path_buf(),
-                source: Box::new(source),
-            }
-        })?;
-        debug_assert_eq!(unchecked.version, version);
+                provider: conflict.provider,
+                source: Box::new(conflict.source),
+            })?;
         Ok(lock)
     }
 
@@ -2017,19 +2542,30 @@ impl LockFile {
         &mut self,
         host: &str,
     ) -> Result<PreparedRegistryDiscoveryRepin<'_>, RegistryLockRecoveryError> {
-        let host = host.to_ascii_lowercase();
-        let host_lock = self.registry_host.get_mut(&host).ok_or_else(|| {
-            RegistryLockRecoveryError::RegistryHostStateNotFound { host: host.clone() }
-        })?;
-        let discarded_pin = match &host_lock.discovery {
-            RegistryDiscoveryPinState::Pinned(pin) => pin.consumed_values(),
+        let hostname = CanonicalRegistryHostname::from(host);
+        let host = hostname.as_str().to_owned();
+        let host_lock = self
+            .registry_host
+            .get_mut(hostname.as_str())
+            .ok_or_else(|| RegistryLockRecoveryError::RegistryHostStateNotFound {
+                host: host.clone(),
+            })?;
+        let discarded = match &host_lock.discovery {
+            RegistryDiscoveryPinState::Pinned(pin) => PreparedRegistryDiscoveryRepinState::Pinned {
+                discarded: pin.consumed_values(),
+                retained: pin.additional.clone(),
+            },
+            RegistryDiscoveryPinState::MigrationPendingAuthorization(pin) => {
+                PreparedRegistryDiscoveryRepinState::MigrationPending(pin.clone())
+            }
             RegistryDiscoveryPinState::Unpinned(_) => {
                 return Err(RegistryLockRecoveryError::DiscoveryAlreadyUnpinned { host });
             }
         };
         Ok(PreparedRegistryDiscoveryRepin {
             host: host_lock,
-            discarded_pin,
+            hostname: host,
+            discarded,
         })
     }
 
@@ -2072,14 +2608,21 @@ impl LockFile {
             .unwrap_or(RegistrySequenceAnchor::Unestablished)
     }
 
-    fn attach_unpinned_registry_ratchets(&mut self) -> Result<(), RegistryIdentityPinConflict> {
+    fn attach_unpinned_registry_ratchets(
+        &mut self,
+    ) -> Result<(), RegistryIdentityPinConflictRecord> {
         for entry in &mut self.provider {
             let Some(registry) = entry.registry.as_mut() else {
                 continue;
             };
             let source_key = canonical_lock_source(&entry.source);
             if let Some(unpinned) = self.unpinned_registry_ratchets.remove(&source_key) {
-                unpinned.merge_into_registry(registry)?;
+                unpinned.merge_into_registry(registry).map_err(|source| {
+                    RegistryIdentityPinConflictRecord {
+                        provider: source_key,
+                        source,
+                    }
+                })?;
             }
         }
         Ok(())
@@ -2120,7 +2663,7 @@ impl LockFile {
             let observed = self.known_registry_ratchets(&entry.source)?;
             observed.merge_into_registry(registry)?;
             self.registry_host
-                .insert(registry.resolved_hostname().to_owned(), host);
+                .insert(registry.resolved_hostname.clone(), host);
         }
         self.upsert_entry(entry);
         Ok(())
@@ -2141,6 +2684,15 @@ impl LockFile {
             self.provider.push(entry);
         }
     }
+}
+
+fn load_lock_file(path: &Path) -> Result<Option<LockFile>, LockFileError> {
+    LockFile::load(path).map(|loaded| loaded.map(LoadedLockFile::into_resolution_lock_file))
+}
+
+#[cfg(test)]
+fn load_lock_file_for_test(path: &Path) -> Result<Option<LockFile>, LockFileError> {
+    LockFile::load(path).map(|loaded| loaded.map(LoadedLockFile::into_lock_file))
 }
 
 /// The non-ratchet fields and validated sequence proof needed for a final
@@ -3026,18 +3578,32 @@ fn resolve_registry<H: RegistryHttp>(
     existing_host: Option<&RegistryHostLock>,
     http: &H,
 ) -> Result<ResolvedRegistry, String> {
+    let existing_discovery = match existing_host {
+        Some(host) => Some(host.authorized_discovery().map_err(|_| {
+            let remediation =
+                recovery_remediation(DISCOVERY_REPIN_REMEDIATION, &source.hostname);
+            format!(
+                "registry discovery for host {} is blocked because its v2 lock-format migration requires operator authorization. {remediation}",
+                source.hostname
+            )
+        })?),
+        None => None,
+    };
     let discovery_url = registry_discovery_url(&source.hostname)?;
     let discovery: DiscoveryDocument = fetch_discovery_json(http, discovery_url.as_str())?;
     let api_base_url = resolve_api_base_url(&discovery_url, &discovery.providers_v1)?;
-    let additional = existing_host
-        .map(RegistryHostLock::additional_discovery_values)
+    let additional = existing_discovery
+        .as_ref()
+        .map(AuthorizedRegistryDiscoveryState::additional_values)
         .cloned()
         .unwrap_or_default();
     let discovery_pin = RegistryDiscoveryPin {
         api_base_url,
         additional,
     };
-    if let Some(existing_pin) = existing_host.and_then(RegistryHostLock::pin)
+    if let Some(existing_pin) = existing_discovery
+        .as_ref()
+        .and_then(AuthorizedRegistryDiscoveryState::pin)
         && !same_consumed_discovery_values(existing_pin, &discovery_pin)
     {
         let host = source.hostname.as_str();
@@ -3914,7 +4480,7 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
     let source = canonical_provider_source(source)?;
 
     let lock_path = base_dir.join("carina-providers.lock");
-    let mut lock_file = LockFile::load(&lock_path)
+    let mut lock_file = load_lock_file(&lock_path)
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
 
@@ -4036,7 +4602,7 @@ pub fn find_installed_provider(
     let source = canonical_provider_source(source)?;
 
     let lock_path = base_dir.join("carina-providers.lock");
-    let lock_file = LockFile::load(&lock_path)
+    let lock_file = load_lock_file(&lock_path)
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
 
@@ -4533,7 +5099,7 @@ fn resolve_all_with_http<H: RegistryHttp>(
     http: &H,
 ) -> Result<HashMap<String, PathBuf>, String> {
     let lock_path = base_dir.join("carina-providers.lock");
-    let mut lock_file = LockFile::load(&lock_path)
+    let mut lock_file = load_lock_file(&lock_path)
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
 
@@ -4664,7 +5230,7 @@ pub fn validate_lock_constraints(
     providers: &[ProviderConfig],
 ) -> Result<(), LockConstraintError> {
     let lock_path = base_dir.join("carina-providers.lock");
-    let lock_file = match LockFile::load(&lock_path)? {
+    let lock_file = match load_lock_file(&lock_path)? {
         Some(lf) => lf,
         None => return Ok(()),
     };
@@ -4794,7 +5360,7 @@ mod tests {
     fn registry_host_table(
         hostname: &str,
         api_base_url: &str,
-    ) -> BTreeMap<String, RegistryHostLock> {
+    ) -> BTreeMap<CanonicalRegistryHostname, RegistryHostLock> {
         BTreeMap::from([(hostname.into(), registry_host_lock(api_base_url))])
     }
 
@@ -4883,6 +5449,79 @@ mod tests {
         lock.to_toml_string().unwrap()
     }
 
+    fn fully_protected_v2_lock_toml() -> &'static str {
+        r#"version = 2
+
+[registry_host."registry.carina-rs.dev"]
+discovery_pin_present = true
+api_base_url = "https://registry.carina-rs.dev/v1/providers/"
+discovery_sha256 = "legacy-discovery-sha256"
+
+[[provider]]
+name = "aws"
+source = "carina-rs/aws"
+mode = "version"
+version = "0.5.0"
+constraint = "^0.5"
+sha256 = "pinned-provider-sha256"
+
+[provider.registry]
+resolved_hostname = "registry.carina-rs.dev"
+sequence_present = true
+sequence = 7
+sequence_anchor_established = true
+sequence_anchor = 5
+valid_until_present = true
+yanked_versions = ["0.3.0", "0.4.0"]
+signature_present = true
+certificate_identity = "identity-a"
+certificate_oidc_issuer = "issuer-a"
+transparency_log_present = true
+"#
+    }
+
+    fn unpinned_v2_lock_toml() -> String {
+        fully_protected_v2_lock_toml().replace(
+            r#"discovery_pin_present = true
+api_base_url = "https://registry.carina-rs.dev/v1/providers/"
+discovery_sha256 = "legacy-discovery-sha256""#,
+            "discovery_pin_present = false",
+        )
+    }
+
+    fn two_host_v2_lock_toml() -> String {
+        let mut lock = fully_protected_v2_lock_toml().replace(
+            "\n[[provider]]",
+            r#"
+
+[registry_host."registry.example.test"]
+discovery_pin_present = true
+api_base_url = "https://registry.example.test/v1/providers/"
+discovery_sha256 = "other-legacy-discovery-sha256"
+
+[[provider]]"#,
+        );
+        lock.push_str(
+            r#"
+[[provider]]
+name = "random"
+source = "registry.example.test/carina-rs/random"
+mode = "version"
+version = "1.0.0"
+sha256 = "other-pinned-provider-sha256"
+
+[provider.registry]
+resolved_hostname = "registry.example.test"
+sequence_present = false
+sequence_anchor_established = false
+valid_until_present = false
+signature_present = false
+transparency_log_present = false
+"#,
+        );
+        lock
+    }
+
     fn lock_with_registry_security_state(signature: RegistrySignatureProtection) -> LockFile {
         lock_with_registry_security_state_for_host("registry.carina-rs.dev", signature)
     }
@@ -4962,7 +5601,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("carina-providers.lock");
         fs::write(&lock_path, content).unwrap();
-        LockFile::load(&lock_path).expect_err("invalid protection metadata must be rejected")
+        load_lock_file_for_test(&lock_path)
+            .expect_err("invalid protection metadata must be rejected")
     }
 
     fn assert_lock_toml_is_rejected(content: &str) {
@@ -5466,7 +6106,7 @@ sha256 = "abc"
         )
         .unwrap();
 
-        let err = LockFile::load(&lock_path)
+        let err = load_lock_file_for_test(&lock_path)
             .expect_err("entry without a mode tag must not parse as any variant");
         let rendered = err.to_string();
         assert!(
@@ -5555,7 +6195,7 @@ sha256 = "abc"
         )
         .expect("save must stage its temporary file in the target directory");
 
-        LockFile::load(&lock_path).unwrap().unwrap();
+        load_lock_file_for_test(&lock_path).unwrap().unwrap();
         assert_eq!(
             fs::canonicalize(lock_path.parent().unwrap()).unwrap(),
             expected_parent
@@ -5574,7 +6214,7 @@ sha256 = "abc"
         ));
 
         lock.save(&lock_path).unwrap();
-        let loaded = LockFile::load(&lock_path).unwrap().unwrap();
+        let loaded = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         assert_eq!(loaded.provider.len(), 1);
         assert_eq!(loaded.provider[0].name, "awscc");
     }
@@ -5614,7 +6254,7 @@ sha256 = "abc"
         new_lock.save(&lock_path).unwrap();
 
         assert_eq!(fs::read_to_string(&lock_path).unwrap(), expected);
-        let loaded = LockFile::load(&lock_path).unwrap().unwrap();
+        let loaded = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         assert_eq!(loaded.provider.len(), 1);
         assert_eq!(loaded.provider[0].kind.resolved_version(), Some("0.2.0"));
     }
@@ -5697,7 +6337,7 @@ sha256 = "abc"
             actual_mode, 0o444,
             "replacing a read-only lock file must preserve its mode"
         );
-        let loaded = LockFile::load(&lock_path).unwrap().unwrap();
+        let loaded = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         assert_eq!(loaded.provider.len(), 1);
         assert_eq!(loaded.provider[0].kind.resolved_version(), Some("0.2.0"));
     }
@@ -5766,7 +6406,7 @@ sha256 = "abc"
             "save through a dangling symlink must not replace the link itself"
         );
         assert_eq!(fs::read_to_string(&target_path).unwrap(), expected);
-        LockFile::load(&target_path).unwrap().unwrap();
+        load_lock_file_for_test(&target_path).unwrap().unwrap();
     }
 
     #[cfg(unix)]
@@ -5809,7 +6449,7 @@ sha256 = "abc"
             "save must preserve every intermediate symlink"
         );
         assert_eq!(fs::read_to_string(&missing_path).unwrap(), expected);
-        LockFile::load(&top_path).unwrap().unwrap();
+        load_lock_file_for_test(&top_path).unwrap().unwrap();
     }
 
     #[cfg(unix)]
@@ -5892,7 +6532,7 @@ sha256 = "abc"
         assert_eq!(save_error.kind(), io::ErrorKind::Other);
         assert_eq!(save_error.to_string(), INJECTED_ERROR);
         assert_eq!(fs::read_to_string(&lock_path).unwrap(), original_content);
-        LockFile::load(&lock_path)
+        load_lock_file_for_test(&lock_path)
             .expect("the preserved lock file must remain parseable")
             .expect("the preserved lock file must still exist");
 
@@ -5962,7 +6602,7 @@ sha256 = "abc"
             old_inode, new_inode,
             "save must replace the target instead of truncating it in place"
         );
-        LockFile::load(&lock_path).unwrap().unwrap();
+        load_lock_file_for_test(&lock_path).unwrap().unwrap();
     }
 
     #[test]
@@ -5988,7 +6628,7 @@ sha256 = "abc"
         )
         .unwrap();
 
-        let error = LockFile::load(&lock_path).unwrap_err();
+        let error = load_lock_file_for_test(&lock_path).unwrap_err();
         assert!(matches!(
             error,
             LockFileError::VersionTooNew {
@@ -6040,15 +6680,13 @@ transparency_log_present = false
         assert!(rendered.contains("version 1"), "{rendered}");
         assert!(rendered.contains("version 3"), "{rendered}");
         assert!(rendered.contains("cannot read"), "{rendered}");
-        assert!(rendered.contains("regenerate"), "{rendered}");
-        assert!(rendered.contains("`carina init`"), "{rendered}");
+        assert!(rendered.contains("can migrate version 2"), "{rendered}");
+        assert!(rendered.contains("version control or backup"), "{rendered}");
+        assert!(rendered.contains("manual recovery"), "{rendered}");
         assert!(
-            rendered.contains("verifying registry discovery"),
+            !rendered.to_ascii_lowercase().contains("delete"),
             "{rendered}"
         );
-        assert!(rendered.contains("providers afresh"), "{rendered}");
-        assert!(rendered.contains("identity pins"), "{rendered}");
-        assert!(rendered.contains("first contact"), "{rendered}");
         assert!(!rendered.contains("unknown field"), "{rendered}");
     }
 
@@ -6104,50 +6742,305 @@ transparency_log_present = false
     }
 
     #[test]
-    fn lock_load_rejects_v2_before_parsing_it_as_the_v3_schema() {
-        let error = LockFile::from_toml_str(
-            r#"version = 2
-
-[registry_host."registry.carina-rs.dev"]
-discovery_pin_present = true
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "host-pin"
-
-[[provider]]
-name = "aws"
-source = "carina-rs/aws"
-mode = "version"
-version = "0.5.0"
-sha256 = "abc"
-
-[provider.registry]
-resolved_hostname = "registry.carina-rs.dev"
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "provider-a-pin"
-sequence_present = false
-sequence_anchor_established = false
-valid_until_present = false
-signature_present = false
-transparency_log_present = false
-
-"#,
+    fn lock_load_migrates_v2_and_preserves_all_provider_security_state() {
+        let lock = LockFile::from_toml_str(
+            fully_protected_v2_lock_toml(),
             Path::new("carina-providers.lock"),
         )
-        .expect_err("v2 must be rejected before the v3 values-map schema is parsed");
+        .expect("v2 must migrate because every provider-owned field is carryable");
+
+        assert_eq!(lock.version, LockFile::CURRENT_VERSION);
+        assert_eq!(lock.provider.len(), 1);
+        let entry = &lock.provider[0];
+        assert_eq!(entry.name, "aws");
+        assert_eq!(entry.source, "carina-rs/aws");
+        assert_eq!(entry.sha256, "pinned-provider-sha256");
+        assert_eq!(
+            entry.kind,
+            LockEntryKind::Version {
+                version: "0.5.0".into(),
+                constraint: Some("^0.5".into()),
+            }
+        );
+
+        let registry = entry
+            .registry
+            .as_ref()
+            .expect("registry state must survive");
+        assert_eq!(registry.resolved_hostname(), "registry.carina-rs.dev");
+        assert_eq!(registry.sequence, RegistrySequence::Present(7));
+        assert_eq!(
+            registry.sequence_anchor,
+            RegistrySequenceAnchor::Established(5)
+        );
+        assert!(registry.valid_until_present);
+        assert!(registry.yanked_versions.contains("0.3.0"));
+        assert!(registry.yanked_versions.contains("0.4.0"));
+        assert_eq!(registry.signature, signature_pin("identity-a", "issuer-a"));
+        assert!(registry.transparency_log_present);
+
+        let host = lock
+            .registry_host
+            .get("registry.carina-rs.dev")
+            .expect("the host record itself must survive");
+        assert!(
+            matches!(
+                &host.discovery,
+                RegistryDiscoveryPinState::MigrationPendingAuthorization(pin)
+                    if pin.api_base_url == "https://registry.carina-rs.dev/v1/providers/"
+                        && pin.discovery_sha256 == "legacy-discovery-sha256"
+            ),
+            "the v2 pin must remain blocked pending explicit operator authorization"
+        );
+    }
+
+    #[test]
+    fn v2_migration_canonicalizes_mixed_case_registry_host_keys() {
+        let serialized = fully_protected_v2_lock_toml()
+            .replace(
+                "[registry_host.\"registry.carina-rs.dev\"]",
+                "[registry_host.\"Registry.Carina-RS.dev\"]",
+            )
+            .replace(
+                "resolved_hostname = \"registry.carina-rs.dev\"",
+                "resolved_hostname = \"Registry.Carina-RS.dev\"",
+            );
+
+        let loaded = LockFile::parse_toml_str(&serialized, Path::new("carina-providers.lock"))
+            .expect("migration must canonicalize a v2 host key before validating references");
+        let (lock, migration) = loaded.into_parts();
+
+        assert_eq!(
+            lock.registry_host
+                .keys()
+                .map(CanonicalRegistryHostname::as_str)
+                .collect::<Vec<_>>(),
+            vec!["registry.carina-rs.dev"]
+        );
+        assert!(matches!(
+            lock.registry_host
+                .get("registry.carina-rs.dev")
+                .map(|host| &host.discovery),
+            Some(RegistryDiscoveryPinState::MigrationPendingAuthorization(_))
+        ));
+        assert!(
+            migration
+                .expect("v2 load must expose migration details")
+                .discarded_discovery_pin("Registry.Carina-RS.dev")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn v2_migration_rejects_case_colliding_registry_host_keys() {
+        let serialized = fully_protected_v2_lock_toml()
+            .replace(
+                "[registry_host.\"registry.carina-rs.dev\"]",
+                "[registry_host.\"Registry.Carina-RS.dev\"]",
+            )
+            .replace(
+                "\n[[provider]]",
+                r#"
+[registry_host."registry.carina-rs.dev"]
+discovery_pin_present = false
+
+[[provider]]"#,
+            );
+
+        let error = LockFile::parse_toml_str(&serialized, Path::new("carina-providers.lock"))
+            .expect_err("canonicalization must not choose between colliding host security states");
 
         assert!(matches!(
             &error,
-            LockFileError::VersionTooOld {
-                found: 2,
-                supported: 3
-            }
+            LockFileError::RegistryHostKeyConflict { hostname, .. }
+                if hostname == "registry.carina-rs.dev"
         ));
-        let rendered = error.to_string();
-        assert!(rendered.contains("version 2"), "{rendered}");
-        assert!(rendered.contains("version 3"), "{rendered}");
-        assert!(rendered.contains("cannot read"), "{rendered}");
-        assert!(rendered.contains("regenerate"), "{rendered}");
-        assert!(!rendered.contains("unknown field"), "{rendered}");
+        assert!(
+            error.to_string().contains("multiple registry host records"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn v2_unpinned_host_migrates_without_authorization_gate() {
+        let loaded =
+            LockFile::parse_toml_str(&unpinned_v2_lock_toml(), Path::new("carina-providers.lock"))
+                .expect("an unpinned v2 host must migrate");
+        let (lock, migration) = loaded.into_parts();
+        let migration = migration.expect("v2 load must expose migration details");
+
+        assert!(
+            migration.discarded_discovery_pins.is_empty(),
+            "an unpinned v2 host has no discovery material to discard"
+        );
+        assert!(matches!(
+            lock.registry_host
+                .get("registry.carina-rs.dev")
+                .map(|host| &host.discovery),
+            Some(RegistryDiscoveryPinState::Unpinned(additional)) if additional.is_empty()
+        ));
+
+        let report = migration.to_string();
+        assert!(
+            report.contains("no v2 discovery pins requiring operator authorization"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("Registry resolution is blocked"),
+            "an empty migration must not claim resolution is blocked: {report}"
+        );
+        assert!(
+            !report.contains("repin-discovery"),
+            "an empty migration must not prescribe authorization: {report}"
+        );
+
+        let source = match parse_provider_source("carina-rs/aws").unwrap() {
+            ProviderSource::Registry(source) => source,
+            ProviderSource::GithubDirect { .. } => unreachable!(),
+        };
+        let http = FakeRegistryHttp::default().json(
+            "https://registry.carina-rs.dev/.well-known/carina.json",
+            r#"{"providers.v1":"/v2/providers/"}"#,
+        );
+        let resolved = resolve_registry(
+            &source,
+            lock.registry_host.get("registry.carina-rs.dev"),
+            &http,
+        )
+        .expect("an unpinned v2 host must pass the authorization gate");
+        assert_eq!(
+            resolved.api_base_url(),
+            "https://registry.carina-rs.dev/v2/providers/"
+        );
+    }
+
+    #[test]
+    fn v2_multi_host_migration_report_lists_every_discarded_pin_once() {
+        let loaded =
+            LockFile::parse_toml_str(&two_host_v2_lock_toml(), Path::new("carina-providers.lock"))
+                .expect("a multi-host v2 lock must migrate");
+        let (_, migration) = loaded.into_parts();
+        let migration = migration.expect("v2 load must expose migration details");
+
+        assert_eq!(migration.discarded_discovery_pins.len(), 2);
+        assert_eq!(
+            migration
+                .discarded_discovery_pin("registry.carina-rs.dev")
+                .map(|pin| pin.discovery_sha256.as_str()),
+            Some("legacy-discovery-sha256")
+        );
+        assert_eq!(
+            migration
+                .discarded_discovery_pin("registry.example.test")
+                .map(|pin| pin.discovery_sha256.as_str()),
+            Some("other-legacy-discovery-sha256")
+        );
+
+        let report = migration.to_string();
+        assert_eq!(
+            report.matches("Registry host:").count(),
+            2,
+            "each migrated host must have one report section: {report}"
+        );
+        let first = report
+            .find("Registry host: registry.carina-rs.dev")
+            .expect("default host must be reported");
+        let second = report
+            .find("Registry host: registry.example.test")
+            .expect("second host must be reported");
+        assert!(
+            first < second,
+            "host reporting order must be stable: {report}"
+        );
+        assert!(report.contains("legacy-discovery-sha256"), "{report}");
+        assert!(report.contains("other-legacy-discovery-sha256"), "{report}");
+    }
+
+    #[test]
+    fn migrated_v2_discovery_pin_requires_operator_authorization_before_resolution() {
+        let lock = LockFile::from_toml_str(
+            fully_protected_v2_lock_toml(),
+            Path::new("carina-providers.lock"),
+        )
+        .expect("v2 migration must keep recovery commands reachable");
+        let source = match parse_provider_source("carina-rs/aws").unwrap() {
+            ProviderSource::Registry(source) => source,
+            ProviderSource::GithubDirect { .. } => unreachable!(),
+        };
+        let http = FakeRegistryHttp::default().json(
+            "https://registry.carina-rs.dev/.well-known/carina.json",
+            r#"{"providers.v1":"/v2/providers/"}"#,
+        );
+
+        let error = resolve_registry(
+            &source,
+            lock.registry_host.get("registry.carina-rs.dev"),
+            &http,
+        )
+        .expect_err("migration must not authorize consuming new discovery values");
+
+        assert!(
+            error.contains("lock-format migration requires operator authorization"),
+            "{error}"
+        );
+        assert!(
+            error.contains("carina providers repin-discovery registry.carina-rs.dev"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn migrated_v2_lock_saves_as_v3_without_rewriting_during_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("carina-providers.lock");
+        let original = fully_protected_v2_lock_toml();
+        fs::write(&lock_path, original).unwrap();
+
+        let loaded = LockFile::load(&lock_path)
+            .expect("v2 load must succeed")
+            .expect("lock must be present");
+        let (lock, migration) = loaded.into_parts();
+        let migration = migration.expect("v2 load must expose its in-memory migration");
+        assert_eq!(migration.from, 2);
+        assert_eq!(migration.to, 3);
+        let discarded = migration
+            .discarded_discovery_pin("registry.carina-rs.dev")
+            .expect("the legacy pinned host must be reported");
+        assert_eq!(
+            discarded.api_base_url,
+            "https://registry.carina-rs.dev/v1/providers/"
+        );
+        assert_eq!(discarded.discovery_sha256, "legacy-discovery-sha256");
+        assert_eq!(
+            fs::read_to_string(&lock_path).unwrap(),
+            original,
+            "read-only load must not rewrite the v2 file"
+        );
+
+        lock.save(&lock_path).unwrap();
+        let saved = fs::read_to_string(&lock_path).unwrap();
+        assert!(saved.starts_with("version = 3\n"), "{saved}");
+        assert!(saved.contains("discovery_pin_present = false"), "{saved}");
+        assert!(saved.contains("migration_pending_discovery_pin"), "{saved}");
+        assert!(saved.contains("api_base_url"), "{saved}");
+        assert!(saved.contains("discovery_sha256"), "{saved}");
+        assert!(!saved.contains("discovery_values"), "{saved}");
+        assert!(saved.contains("yanked_versions = ["), "{saved}");
+        assert!(saved.contains("\"0.3.0\""), "{saved}");
+        assert!(saved.contains("\"0.4.0\""), "{saved}");
+        assert!(saved.contains("sequence_anchor = 5"), "{saved}");
+        assert!(saved.contains("certificate_identity = \"identity-a\""));
+
+        let reloaded = load_lock_file_for_test(&lock_path)
+            .expect("saved v3 lock must parse")
+            .expect("saved v3 lock must remain present");
+        assert!(matches!(
+            reloaded
+                .registry_host
+                .get("registry.carina-rs.dev")
+                .map(|host| &host.discovery),
+            Some(RegistryDiscoveryPinState::MigrationPendingAuthorization(_))
+        ));
     }
 
     #[test]
@@ -6198,7 +7091,7 @@ transparency_log_present = false
         assert_eq!(
             lock.registry_host
                 .get("registry.carina-rs.dev")
-                .and_then(RegistryHostLock::pin),
+                .and_then(RegistryHostLock::pin_for_test),
             Some(&discovery_pin(
                 "https://registry.carina-rs.dev/v1/providers/"
             ))
@@ -6233,7 +7126,7 @@ discovery_pin_present = true
         );
         fs::write(&lock_path, serialized).unwrap();
 
-        let lock = LockFile::load(&lock_path)
+        let lock = load_lock_file_for_test(&lock_path)
             .expect("a values-map host pin must load")
             .expect("the lock fixture must exist");
         lock.save(&lock_path).unwrap();
@@ -6244,7 +7137,7 @@ discovery_pin_present = true
             "{saved}"
         );
         assert_eq!(saved.matches("\"modules.v1\" =").count(), 1, "{saved}");
-        LockFile::load(&lock_path)
+        load_lock_file_for_test(&lock_path)
             .expect("the round-tripped lock must remain parseable")
             .expect("the round-tripped lock must remain present");
     }
@@ -6518,7 +7411,7 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         )
         .unwrap();
 
-        let error = LockFile::load(&lock_path).unwrap_err();
+        let error = load_lock_file_for_test(&lock_path).unwrap_err();
         assert!(matches!(
             &error,
             LockFileError::MissingVersion { path } if path == &lock_path
@@ -6533,7 +7426,15 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
             "{rendered}"
         );
         assert!(
-            rendered.contains("Delete it, then regenerate it with `carina init`"),
+            rendered.contains("restore this file from version control or backup"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("preserve it for manual inspection"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.to_ascii_lowercase().contains("delete"),
             "{rendered}"
         );
     }
@@ -6544,8 +7445,87 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         let lock_path = dir.path().join("carina-providers.lock");
         fs::write(&lock_path, "version = [\n").unwrap();
 
-        let error = LockFile::load(&lock_path).unwrap_err();
+        let error = load_lock_file_for_test(&lock_path).unwrap_err();
         assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("correct the reported malformed record in place"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("preserving every other provider and registry protection record"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn identity_pin_conflict_error_names_the_offending_provider_records() {
+        let error = LockFile::from_toml_str(
+            r#"version = 3
+
+[unpinned_registry_ratchets."carina-rs/aws"]
+sequence_present = false
+valid_until_present = false
+signature_present = true
+certificate_identity = "identity-a"
+certificate_oidc_issuer = "issuer-a"
+transparency_log_present = false
+
+[unpinned_registry_ratchets."registry.carina-rs.dev/carina-rs/aws"]
+sequence_present = false
+valid_until_present = false
+signature_present = true
+certificate_identity = "identity-b"
+certificate_oidc_issuer = "issuer-b"
+transparency_log_present = false
+"#,
+            Path::new("carina-providers.lock"),
+        )
+        .expect_err("canonical duplicate records with different pins must conflict");
+
+        assert!(
+            matches!(error, LockFileError::RegistryIdentityPinConflict { .. }),
+            "{error}"
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("carina-rs/aws"), "{rendered}");
+        assert!(
+            rendered.contains("correct those provider records in place"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("preserving all other provider and registry protection records"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn lock_file_error_messages_never_instruct_wholesale_deletion() {
+        let errors = LockFileError::display_test_samples();
+
+        let forbidden = [
+            "delete",
+            "remove the lock file",
+            "remove this lock file",
+            "discard the lock file",
+            "discard this lock file",
+            "erase the lock file",
+            "unlink the lock file",
+        ];
+        let mut violations = Vec::new();
+        for (variant, error) in &errors {
+            let rendered = error.to_string().to_ascii_lowercase();
+            for phrase in forbidden {
+                if rendered.contains(phrase) {
+                    violations.push(format!("{variant} contains {phrase:?}: {rendered}"));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "lock errors must direct bounded repair instead of wholesale deletion:\n{}",
+            violations.join("\n")
+        );
     }
 
     #[test]
@@ -6957,11 +7937,61 @@ transparency_log_present = false
             .unwrap();
 
         // This in-module assertion pins the structural guarantee directly:
-        // every prepared value carries a non-optional pin, and the public
-        // preview accessor is only a projection of that field.
-        assert!(std::ptr::eq(
-            prepared.discovery_pin(),
-            &prepared.discarded_pin
+        // every prepared value carries one non-optional, exhaustively tagged
+        // discard target, including the migration-pending case.
+        assert!(matches!(
+            &prepared.discarded,
+            PreparedRegistryDiscoveryRepinState::Pinned { discarded, .. }
+                if discarded == &discovery_pin("https://registry.carina-rs.dev/v1/providers/")
+        ));
+        assert!(
+            prepared
+                .to_string()
+                .contains("Discarding pinned discovery value providers.v1")
+        );
+    }
+
+    #[test]
+    fn migrated_discovery_repin_commit_is_the_authorization_transition() {
+        let mut lock = LockFile::from_toml_str(
+            fully_protected_v2_lock_toml(),
+            Path::new("carina-providers.lock"),
+        )
+        .unwrap();
+
+        let prepared = lock
+            .prepare_registry_discovery_repin("Registry.Carina-RS.dev")
+            .expect("the bounded recovery must remain reachable after migration");
+        assert!(matches!(
+            &prepared.discarded,
+            PreparedRegistryDiscoveryRepinState::MigrationPending(pin)
+                if pin.discovery_sha256 == "legacy-discovery-sha256"
+        ));
+        let preview = prepared.to_string();
+        assert!(
+            preview.contains("Provider lock format migration: version 2 -> version 3"),
+            "{preview}"
+        );
+        assert!(
+            preview.contains("Discarding v2 pinned discovery API base"),
+            "{preview}"
+        );
+        drop(prepared);
+        assert!(matches!(
+            lock.registry_host
+                .get("registry.carina-rs.dev")
+                .map(|host| &host.discovery),
+            Some(RegistryDiscoveryPinState::MigrationPendingAuthorization(_))
+        ));
+
+        lock.prepare_registry_discovery_repin("registry.carina-rs.dev")
+            .unwrap()
+            .commit();
+        assert!(matches!(
+            lock.registry_host
+                .get("registry.carina-rs.dev")
+                .map(|host| &host.discovery),
+            Some(RegistryDiscoveryPinState::Unpinned(additional)) if additional.is_empty()
         ));
     }
 
@@ -6977,7 +8007,7 @@ transparency_log_present = false
             lock.registry_host
                 .get("registry.carina-rs.dev")
                 .unwrap()
-                .pin()
+                .pin_for_test()
                 .is_none()
         );
     }
@@ -7016,17 +8046,18 @@ transparency_log_present = false
             .clone();
 
         let recovery = lock.prepare_registry_discovery_repin(hostname).unwrap();
-        assert_eq!(
-            recovery.discovery_pin(),
-            &discovery_pin("https://registry.carina-rs.dev/v1/providers/")
-        );
+        assert!(matches!(
+            &recovery.discarded,
+            PreparedRegistryDiscoveryRepinState::Pinned { discarded, .. }
+                if discarded == &discovery_pin("https://registry.carina-rs.dev/v1/providers/")
+        ));
         recovery.commit();
 
         assert!(
             lock.registry_host
                 .get(hostname)
                 .expect("the host record itself must survive")
-                .pin()
+                .pin_for_test()
                 .is_none(),
             "the next verified discovery fetch must see first contact"
         );
@@ -7090,7 +8121,7 @@ transparency_log_present = false
             LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock")).unwrap();
         let reloaded_host = reloaded.registry_host.get(hostname).unwrap();
         assert!(
-            reloaded_host.pin().is_none(),
+            reloaded_host.pin_for_test().is_none(),
             "retained unconsumed values must not re-arm the consumed API-base pin"
         );
 
@@ -7142,14 +8173,14 @@ transparency_log_present = false
             .unwrap()
             .commit();
         lock.save(&lock_path).unwrap();
-        let mut reloaded = LockFile::load(&lock_path).unwrap().unwrap();
+        let mut reloaded = load_lock_file_for_test(&lock_path).unwrap().unwrap();
 
         assert!(
             reloaded
                 .registry_host
                 .get("registry.carina-rs.dev")
                 .unwrap()
-                .pin()
+                .pin_for_test()
                 .is_none()
         );
         let error = match reloaded.prepare_registry_discovery_repin("registry.carina-rs.dev") {
@@ -7229,7 +8260,7 @@ transparency_log_present = false
         assert_eq!(after_entry.kind, before_entry.kind);
 
         lock.save(&lock_path).unwrap();
-        let reloaded = LockFile::load(&lock_path).unwrap().unwrap();
+        let reloaded = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         assert_eq!(
             reloaded.known_registry_ratchets("carina-rs/aws").unwrap(),
             ratchets
@@ -7401,7 +8432,7 @@ transparency_log_present = false
         );
 
         lock.save(&lock_path).unwrap();
-        let reloaded = LockFile::load(&lock_path).unwrap().unwrap();
+        let reloaded = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         assert_eq!(
             reloaded
                 .known_registry_ratchets("carina-rs/aws")
@@ -7907,7 +8938,7 @@ transparency_log_present = true
         assert!(dest.exists());
         assert!(dest.starts_with(tmp.path().join(".carina/providers/file")));
 
-        let lock = LockFile::load(&tmp.path().join("carina-providers.lock"))
+        let lock = load_lock_file_for_test(&tmp.path().join("carina-providers.lock"))
             .unwrap()
             .unwrap();
         let entry = lock.find_by_source(&source).unwrap();
@@ -8172,7 +9203,7 @@ transparency_log_present = true
 
     fn saved_registry_ratchets(base_dir: &Path) -> RegistryRatchets {
         let lock_path = base_dir.join("carina-providers.lock");
-        LockFile::load(&lock_path)
+        load_lock_file_for_test(&lock_path)
             .unwrap()
             .unwrap_or_default()
             .known_registry_ratchets("carina-rs/aws")
@@ -8181,7 +9212,7 @@ transparency_log_present = true
 
     fn saved_registry_sequence_anchor(base_dir: &Path) -> RegistrySequenceAnchor {
         let lock_path = base_dir.join("carina-providers.lock");
-        LockFile::load(&lock_path)
+        load_lock_file_for_test(&lock_path)
             .unwrap()
             .unwrap_or_default()
             .registry_sequence_anchor("carina-rs/aws")
@@ -8583,7 +9614,7 @@ transparency_log_present = true
         assert!(error.contains("sequence fast-forward"), "{error}");
 
         let lock_path = dir.path().join("carina-providers.lock");
-        let lock_file = LockFile::load(&lock_path).unwrap().unwrap();
+        let lock_file = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         let registry = lock_file
             .find_by_source("carina-rs/aws")
             .unwrap()
@@ -8598,7 +9629,7 @@ transparency_log_present = true
             r#"{"sequence":101,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
         resolve_single_config_with_http(dir.path(), &config, &legitimate_http).unwrap();
-        let lock_file = LockFile::load(&lock_path).unwrap().unwrap();
+        let lock_file = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         let registry = lock_file
             .find_by_source("carina-rs/aws")
             .unwrap()
@@ -8632,7 +9663,7 @@ transparency_log_present = true
         assert!(error.contains("sequence rollback"), "{error}");
 
         let lock_path = dir.path().join("carina-providers.lock");
-        let lock_file = LockFile::load(&lock_path).unwrap().unwrap();
+        let lock_file = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         let registry = lock_file
             .find_by_source("carina-rs/aws")
             .unwrap()
@@ -8657,7 +9688,7 @@ transparency_log_present = true
         )
         .expect("the rejected listing must not install valid_until presence");
 
-        let lock_file = LockFile::load(&lock_path).unwrap().unwrap();
+        let lock_file = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         let registry = lock_file
             .find_by_source("carina-rs/aws")
             .unwrap()
@@ -8736,7 +9767,9 @@ transparency_log_present = true
         );
 
         let lock_path = dir.path().join("carina-providers.lock");
-        let lock_file = LockFile::load(&lock_path).unwrap().unwrap_or_default();
+        let lock_file = load_lock_file_for_test(&lock_path)
+            .unwrap()
+            .unwrap_or_default();
         let ratchets = lock_file.known_registry_ratchets("carina-rs/aws").unwrap();
         assert!(
             !ratchets.valid_until_present,
@@ -8919,7 +9952,7 @@ transparency_log_present = true
         drop(lock_file);
 
         let lock_path = dir.path().join("carina-providers.lock");
-        let mut reloaded = LockFile::load(&lock_path).unwrap().unwrap();
+        let mut reloaded = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let unsigned_http = registry_http(SIGNED_FIXTURE_ARTIFACT, &shasum);
         let error = resolve_provider_with_http(
@@ -8971,7 +10004,7 @@ transparency_log_present = true
             "version selection alone must not establish an anti-rollback anchor"
         );
 
-        let mut reloaded = LockFile::load(&lock_path).unwrap().unwrap();
+        let mut reloaded = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         let rollback_http = registry_http_with_listing(
             ARTIFACT,
             &shasum,
@@ -9115,7 +10148,9 @@ transparency_log_present = true
         assert!(error.contains("yanked"), "round 1 should refuse: {error}");
 
         let lock_path = dir.path().join("carina-providers.lock");
-        let mut lock_round2 = LockFile::load(&lock_path).unwrap().unwrap_or_default();
+        let mut lock_round2 = load_lock_file_for_test(&lock_path)
+            .unwrap()
+            .unwrap_or_default();
         let stripped_http = registry_http(ARTIFACT, &shasum)
             .json(
                 versions_url,
@@ -9188,7 +10223,7 @@ transparency_log_present = true
 
         let lock_path = dir.path().join("carina-providers.lock");
         lock_file.save(&lock_path).unwrap();
-        let mut lock_file = LockFile::load(&lock_path).unwrap().unwrap();
+        let mut lock_file = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         let recorded = lock_file
             .find_by_source("carina-rs/aws")
             .unwrap()
@@ -9404,7 +10439,7 @@ transparency_log_present = true
         let pinned_dir = tempfile::tempdir().unwrap();
         let lock_path = pinned_dir.path().join("carina-providers.lock");
         lock_file.save(&lock_path).unwrap();
-        let mut lock_file = LockFile::load(&lock_path).unwrap().unwrap();
+        let mut lock_file = load_lock_file_for_test(&lock_path).unwrap().unwrap();
 
         let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
         let mismatched_http = signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200).json(
@@ -9628,7 +10663,7 @@ transparency_log_present = false
         );
         fs::write(&lock_path, one_sided_pin).unwrap();
 
-        let error = LockFile::load(&lock_path).unwrap_err();
+        let error = load_lock_file_for_test(&lock_path).unwrap_err();
         let rendered = error.to_string();
         assert!(rendered.contains("inconsistent"), "{error}");
         assert!(rendered.contains("certificate_identity"), "{error}");
@@ -9916,7 +10951,7 @@ transparency_log_present = false
         let host_pin = lock_file
             .registry_host
             .get(registry.resolved_hostname())
-            .and_then(RegistryHostLock::pin)
+            .and_then(RegistryHostLock::pin_for_test)
             .expect("registry host pin must be recorded");
         assert_eq!(
             host_pin.api_base_url(),
@@ -10190,7 +11225,7 @@ transparency_log_present = false
         assert!(http.was_requested("/v1/providers/carina-rs/aws/0.0.0-main.10.bbb/download"));
         assert!(!http.was_requested("/revisions/main/download"));
 
-        let lock = LockFile::load(&dir.path().join("carina-providers.lock"))
+        let lock = load_lock_file_for_test(&dir.path().join("carina-providers.lock"))
             .unwrap()
             .unwrap();
         let entry = lock.find_by_source("carina-rs/aws").unwrap();
@@ -10272,7 +11307,7 @@ transparency_log_present = false
         assert_eq!(fs::read(resolved.get("aws").unwrap()).unwrap(), new_body);
         assert!(http.was_requested("/v1/providers/carina-rs/aws/versions"));
         assert!(http.was_requested("/v1/providers/carina-rs/aws/0.0.0-main.10.bbb/download"));
-        let lock = LockFile::load(&dir.path().join("carina-providers.lock"))
+        let lock = load_lock_file_for_test(&dir.path().join("carina-providers.lock"))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -10922,7 +11957,7 @@ transparency_log_present = false
                 &http,
             )
             .unwrap();
-            let saved_lock = LockFile::load(&dir.path().join("carina-providers.lock"))
+            let saved_lock = load_lock_file_for_test(&dir.path().join("carina-providers.lock"))
                 .unwrap()
                 .unwrap();
 
@@ -10972,7 +12007,7 @@ transparency_log_present = false
                 &http,
             )
             .unwrap();
-            let saved_lock = LockFile::load(&dir.path().join("carina-providers.lock"))
+            let saved_lock = load_lock_file_for_test(&dir.path().join("carina-providers.lock"))
                 .unwrap()
                 .unwrap();
 
