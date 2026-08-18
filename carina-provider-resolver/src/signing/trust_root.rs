@@ -339,6 +339,19 @@ mod tests {
         &logs[single_rekor_log_index(logs, false)]
     }
 
+    fn earliest_supported_ctfe_validity_start(logs: &[TransparencyLog]) -> u64 {
+        usable_log_keys(logs)
+            .filter_map(|log| {
+                log.public_key
+                    .valid_for
+                    .as_ref()
+                    .and_then(|range| range.start.as_deref())
+            })
+            .map(|start| parse_timestamp(start).unwrap())
+            .min()
+            .expect("embedded trust root must contain a supported CTFE key with valid_for.start")
+    }
+
     #[test]
     fn verifier_root_excludes_fulcio_ca_retired_before_integrated_time() {
         let root = embedded_document().unwrap();
@@ -550,6 +563,84 @@ mod tests {
             error,
             format!(
                 "embedded trust root has no verification material valid at integrated time {integrated_time} (missing: Rekor); {TRUST_ROOT_STALENESS_HINT}"
+            )
+        );
+    }
+
+    #[test]
+    fn verifier_root_reports_only_missing_fulcio_material() {
+        let mut root = embedded_document().unwrap();
+        let integrated_time = earliest_supported_ctfe_validity_start(&root.ctlogs);
+        root.certificate_authorities.clear();
+
+        let fulcio_certs =
+            decode_valid_fulcio_certs(&root.certificate_authorities, integrated_time).unwrap();
+        let rekor_keys = decode_valid_log_keys(&root.tlogs, integrated_time).unwrap();
+        let ctfe_keys = decode_valid_log_keys(&root.ctlogs, integrated_time).unwrap();
+        assert!(
+            fulcio_certs.is_empty(),
+            "Fulcio verification material must be empty at the integrated time"
+        );
+        assert!(
+            !rekor_keys.is_empty(),
+            "Rekor verification material must be valid at the integrated time"
+        );
+        assert!(
+            !ctfe_keys.is_empty(),
+            "CTFE verification material must be valid at the integrated time"
+        );
+
+        let error = root
+            .verifier_root(integrated_time)
+            .expect_err("a trust root without Fulcio verification material must be rejected");
+
+        assert!(error.contains("(missing: Fulcio)"), "{error}");
+        assert!(!error.contains("Rekor"), "{error}");
+        assert!(!error.contains("CTFE"), "{error}");
+        let integrated_time = format_timestamp(integrated_time).unwrap();
+        assert_eq!(
+            error,
+            format!(
+                "embedded trust root has no verification material valid at integrated time {integrated_time} (missing: Fulcio); {TRUST_ROOT_STALENESS_HINT}"
+            )
+        );
+    }
+
+    #[test]
+    fn verifier_root_reports_only_missing_ctfe_material() {
+        let mut root = embedded_document().unwrap();
+        let integrated_time = earliest_supported_ctfe_validity_start(&root.ctlogs);
+        root.ctlogs.clear();
+
+        let fulcio_certs =
+            decode_valid_fulcio_certs(&root.certificate_authorities, integrated_time).unwrap();
+        let rekor_keys = decode_valid_log_keys(&root.tlogs, integrated_time).unwrap();
+        let ctfe_keys = decode_valid_log_keys(&root.ctlogs, integrated_time).unwrap();
+        assert!(
+            !fulcio_certs.is_empty(),
+            "Fulcio verification material must be valid at the integrated time"
+        );
+        assert!(
+            !rekor_keys.is_empty(),
+            "Rekor verification material must be valid at the integrated time"
+        );
+        assert!(
+            ctfe_keys.is_empty(),
+            "CTFE verification material must be empty at the integrated time"
+        );
+
+        let error = root
+            .verifier_root(integrated_time)
+            .expect_err("a trust root without CTFE verification material must be rejected");
+
+        assert!(error.contains("(missing: CTFE)"), "{error}");
+        assert!(!error.contains("Fulcio"), "{error}");
+        assert!(!error.contains("Rekor"), "{error}");
+        let integrated_time = format_timestamp(integrated_time).unwrap();
+        assert_eq!(
+            error,
+            format!(
+                "embedded trust root has no verification material valid at integrated time {integrated_time} (missing: CTFE); {TRUST_ROOT_STALENESS_HINT}"
             )
         );
     }
