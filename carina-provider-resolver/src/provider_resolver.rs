@@ -112,6 +112,69 @@ pub struct RegistryLock {
 }
 
 const PROVIDERS_V1_DISCOVERY_FIELD: &str = "providers.v1";
+const REGISTRY_DISCOVERY_PATH: &str = "/.well-known/carina.json";
+
+mod unconsumed_discovery_values {
+    use super::{BTreeMap, PROVIDERS_V1_DISCOVERY_FIELD, fmt};
+
+    /// Discovery values retained for round-tripping but not consumed by this
+    /// client. The map is deliberately opaque: adding a consumer requires an
+    /// explicit API change here instead of an unnoticed lookup in retained
+    /// material.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub(super) struct UnconsumedDiscoveryValues(BTreeMap<String, String>);
+
+    #[derive(Debug)]
+    pub(super) struct UnconsumedDiscoveryValuesError;
+
+    impl fmt::Display for UnconsumedDiscoveryValuesError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "unconsumed registry discovery values must not contain providers.v1"
+            )
+        }
+    }
+
+    impl std::error::Error for UnconsumedDiscoveryValuesError {}
+
+    impl UnconsumedDiscoveryValues {
+        pub(super) fn try_from_values(
+            values: BTreeMap<String, String>,
+        ) -> Result<Self, UnconsumedDiscoveryValuesError> {
+            if values.contains_key(PROVIDERS_V1_DISCOVERY_FIELD) {
+                return Err(UnconsumedDiscoveryValuesError);
+            }
+            Ok(Self(values))
+        }
+
+        pub(super) fn without_consumed(mut values: BTreeMap<String, String>) -> Self {
+            values.remove(PROVIDERS_V1_DISCOVERY_FIELD);
+            Self(values)
+        }
+
+        pub(super) fn extend_resolved_values<'a>(
+            &'a self,
+            resolved: &mut BTreeMap<&'a str, &'a str>,
+        ) {
+            resolved.extend(
+                self.0
+                    .iter()
+                    .map(|(field, value)| (field.as_str(), value.as_str())),
+            );
+        }
+
+        pub(super) fn into_values(self) -> BTreeMap<String, String> {
+            self.0
+        }
+
+        pub(super) fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+    }
+}
+
+use unconsumed_discovery_values::{UnconsumedDiscoveryValues, UnconsumedDiscoveryValuesError};
 
 /// The indivisible resolved discovery values pinned for one registry host.
 ///
@@ -121,48 +184,73 @@ const PROVIDERS_V1_DISCOVERY_FIELD: &str = "providers.v1";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryDiscoveryPin {
     api_base_url: String,
-    additional: BTreeMap<String, String>,
+    additional: UnconsumedDiscoveryValues,
 }
 
 #[derive(Debug)]
-struct RegistryDiscoveryPinError;
+enum RegistryDiscoveryPinError {
+    MissingProvidersV1,
+    InvalidApiBaseUrl {
+        value: String,
+        source: Option<url::ParseError>,
+    },
+}
 
 impl fmt::Display for RegistryDiscoveryPinError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "registry discovery values are missing required providers.v1"
-        )
+        match self {
+            Self::MissingProvidersV1 => write!(
+                f,
+                "registry discovery values are missing required providers.v1"
+            ),
+            Self::InvalidApiBaseUrl { value, source } => {
+                write!(
+                    f,
+                    "registry discovery providers.v1 pinned value must be an absolute HTTPS URL: {value:?}"
+                )?;
+                if let Some(source) = source {
+                    write!(f, ": {source}")?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
-impl std::error::Error for RegistryDiscoveryPinError {}
+impl std::error::Error for RegistryDiscoveryPinError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidApiBaseUrl {
+                source: Some(source),
+                ..
+            } => Some(source),
+            Self::MissingProvidersV1 | Self::InvalidApiBaseUrl { source: None, .. } => None,
+        }
+    }
+}
 
 impl RegistryDiscoveryPin {
-    fn from_values(
-        mut values: BTreeMap<String, String>,
-    ) -> Result<Self, RegistryDiscoveryPinError> {
+    fn from_values(values: BTreeMap<String, String>) -> Result<Self, RegistryDiscoveryPinError> {
         let api_base_url = values
-            .remove(PROVIDERS_V1_DISCOVERY_FIELD)
-            .ok_or(RegistryDiscoveryPinError)?;
+            .get(PROVIDERS_V1_DISCOVERY_FIELD)
+            .cloned()
+            .ok_or(RegistryDiscoveryPinError::MissingProvidersV1)?;
+        validate_persisted_api_base_url(&api_base_url)?;
         Ok(Self {
             api_base_url,
-            additional: values,
+            additional: UnconsumedDiscoveryValues::without_consumed(values),
         })
     }
 
-    fn into_values(mut self) -> BTreeMap<String, String> {
-        self.additional
-            .insert(PROVIDERS_V1_DISCOVERY_FIELD.into(), self.api_base_url);
-        self.additional
+    fn into_values(self) -> BTreeMap<String, String> {
+        let mut values = self.additional.into_values();
+        values.insert(PROVIDERS_V1_DISCOVERY_FIELD.into(), self.api_base_url);
+        values
     }
 
     fn resolved_values(&self) -> BTreeMap<&str, &str> {
-        let mut values = self
-            .additional
-            .iter()
-            .map(|(field, value)| (field.as_str(), value.as_str()))
-            .collect::<BTreeMap<_, _>>();
+        let mut values = BTreeMap::new();
+        self.additional.extend_resolved_values(&mut values);
         values.insert(PROVIDERS_V1_DISCOVERY_FIELD, &self.api_base_url);
         values
     }
@@ -174,7 +262,7 @@ impl RegistryDiscoveryPin {
     fn consumed_values(&self) -> Self {
         Self {
             api_base_url: self.api_base_url.clone(),
-            additional: BTreeMap::new(),
+            additional: UnconsumedDiscoveryValues::default(),
         }
     }
 
@@ -210,7 +298,7 @@ impl<'de> Deserialize<'de> for RegistryDiscoveryPin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RegistryDiscoveryPinState {
     Pinned(RegistryDiscoveryPin),
-    Unpinned(BTreeMap<String, String>),
+    Unpinned(UnconsumedDiscoveryValues),
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -231,6 +319,7 @@ struct RegistryHostLockSerde {
 enum RegistryHostLockError {
     Inconsistent,
     InvalidDiscoveryPin(RegistryDiscoveryPinError),
+    InvalidUnconsumedDiscoveryValues(UnconsumedDiscoveryValuesError),
 }
 
 impl fmt::Display for RegistryHostLockError {
@@ -241,6 +330,7 @@ impl fmt::Display for RegistryHostLockError {
                 "registry host lock is inconsistent: providers.v1 must be present in discovery_values exactly when discovery_pin_present is true; other discovery values may remain while it is false"
             ),
             Self::InvalidDiscoveryPin(source) => source.fmt(f),
+            Self::InvalidUnconsumedDiscoveryValues(source) => source.fmt(f),
         }
     }
 }
@@ -249,6 +339,7 @@ impl std::error::Error for RegistryHostLockError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidDiscoveryPin(source) => Some(source),
+            Self::InvalidUnconsumedDiscoveryValues(source) => Some(source),
             Self::Inconsistent => None,
         }
     }
@@ -268,7 +359,7 @@ impl RegistryHostLock {
         }
     }
 
-    fn additional_discovery_values(&self) -> &BTreeMap<String, String> {
+    fn additional_discovery_values(&self) -> &UnconsumedDiscoveryValues {
         match &self.discovery {
             RegistryDiscoveryPinState::Pinned(pin) => &pin.additional,
             RegistryDiscoveryPinState::Unpinned(additional) => additional,
@@ -285,10 +376,13 @@ impl TryFrom<RegistryHostLockSerde> for RegistryHostLock {
                 RegistryDiscoveryPin::from_values(values)
                     .map_err(RegistryHostLockError::InvalidDiscoveryPin)?,
             ),
-            (false, None) => RegistryDiscoveryPinState::Unpinned(BTreeMap::new()),
-            (false, Some(additional)) if !additional.contains_key(PROVIDERS_V1_DISCOVERY_FIELD) => {
-                RegistryDiscoveryPinState::Unpinned(additional)
+            (false, None) => {
+                RegistryDiscoveryPinState::Unpinned(UnconsumedDiscoveryValues::default())
             }
+            (false, Some(additional)) => RegistryDiscoveryPinState::Unpinned(
+                UnconsumedDiscoveryValues::try_from_values(additional)
+                    .map_err(RegistryHostLockError::InvalidUnconsumedDiscoveryValues)?,
+            ),
             _ => return Err(RegistryHostLockError::Inconsistent),
         };
         Ok(Self { discovery })
@@ -304,7 +398,11 @@ impl From<RegistryHostLock> for RegistryHostLockSerde {
             },
             RegistryDiscoveryPinState::Unpinned(additional) => Self {
                 discovery_pin_present: false,
-                discovery_values: (!additional.is_empty()).then_some(additional),
+                discovery_values: if additional.is_empty() {
+                    None
+                } else {
+                    Some(additional.into_values())
+                },
             },
         }
     }
@@ -2490,15 +2588,22 @@ trait RegistryHttp {
 
 struct UreqRegistryHttp;
 
+impl UreqRegistryHttp {
+    fn agent(request: RegistryHttpRequest<'_>) -> ureq::Agent {
+        match request {
+            RegistryHttpRequest::Discovery(_) => ureq::Agent::config_builder()
+                .max_redirects(0)
+                .build()
+                .into(),
+            RegistryHttpRequest::Resource(_) => ureq::Agent::new_with_defaults(),
+        }
+    }
+}
+
 impl RegistryHttp for UreqRegistryHttp {
     fn get(&self, request: RegistryHttpRequest<'_>) -> Result<HttpResponse, String> {
         let url = request.url();
-        let response = match request {
-            RegistryHttpRequest::Discovery(_) => {
-                ureq::get(url).config().max_redirects(0).build().call()
-            }
-            RegistryHttpRequest::Resource(_) => ureq::get(url).call(),
-        };
+        let response = Self::agent(request).get(url).call();
         let response = match response {
             Ok(response) => response,
             Err(ureq::Error::StatusCode(status)) => {
@@ -2921,9 +3026,9 @@ fn resolve_registry<H: RegistryHttp>(
     existing_host: Option<&RegistryHostLock>,
     http: &H,
 ) -> Result<ResolvedRegistry, String> {
-    let discovery_url = format!("https://{}/.well-known/carina.json", source.hostname);
-    let discovery: DiscoveryDocument = fetch_discovery_json(http, &discovery_url)?;
-    let api_base_url = resolve_api_base_url(&source.hostname, &discovery.providers_v1)?;
+    let discovery_url = registry_discovery_url(&source.hostname)?;
+    let discovery: DiscoveryDocument = fetch_discovery_json(http, discovery_url.as_str())?;
+    let api_base_url = resolve_api_base_url(&discovery_url, &discovery.providers_v1)?;
     let additional = existing_host
         .map(RegistryHostLock::additional_discovery_values)
         .cloned()
@@ -2949,17 +3054,36 @@ fn resolve_registry<H: RegistryHttp>(
     })
 }
 
-fn resolve_api_base_url(hostname: &str, providers_v1: &str) -> Result<String, String> {
-    let discovery_url = format!("https://{hostname}/.well-known/carina.json");
-    let discovery_url = url::Url::parse(&discovery_url)
-        .map_err(|error| format!("invalid registry discovery URL: {error}"))?;
+fn registry_discovery_url(hostname: &str) -> Result<url::Url, String> {
+    let mut discovery_url = url::Url::parse(&format!("https://{hostname}/")).map_err(|error| {
+        format!("invalid registry hostname: expected a host with optional port: {error}")
+    })?;
+    if !discovery_url.username().is_empty()
+        || discovery_url.password().is_some()
+        || discovery_url.path() != "/"
+        || discovery_url.query().is_some()
+        || discovery_url.fragment().is_some()
+    {
+        return Err(
+            "invalid registry hostname: expected a host with optional port and no URL components"
+                .into(),
+        );
+    }
+    discovery_url.set_path(REGISTRY_DISCOVERY_PATH);
+    Ok(discovery_url)
+}
+
+fn resolve_api_base_url(discovery_url: &url::Url, providers_v1: &str) -> Result<String, String> {
     let api_base_url = discovery_url.join(providers_v1).map_err(|error| {
         format!("invalid registry discovery providers.v1 reference {providers_v1:?}: {error}")
     })?;
-    if api_base_url.scheme() != "https" {
+    if !is_absolute_https_api_base_url(&api_base_url) {
         return Err(format!(
             "registry discovery providers.v1 must use HTTPS: {providers_v1}"
         ));
+    }
+    if !api_base_url.username().is_empty() || api_base_url.password().is_some() {
+        return Err("registry discovery providers.v1 API base must not contain userinfo".into());
     }
     if api_base_url.origin() != discovery_url.origin() {
         return Err(format!(
@@ -2971,7 +3095,31 @@ fn resolve_api_base_url(hostname: &str, providers_v1: &str) -> Result<String, St
             "registry discovery providers.v1 must not resolve to the discovery document: {providers_v1:?}"
         ));
     }
+    if api_base_url.query().is_some() || api_base_url.fragment().is_some() {
+        return Err(
+            "registry discovery providers.v1 API base must not contain a query or fragment".into(),
+        );
+    }
     Ok(ensure_trailing_slash(api_base_url).into())
+}
+
+fn validate_persisted_api_base_url(value: &str) -> Result<(), RegistryDiscoveryPinError> {
+    let api_base_url =
+        url::Url::parse(value).map_err(|source| RegistryDiscoveryPinError::InvalidApiBaseUrl {
+            value: value.into(),
+            source: Some(source),
+        })?;
+    if !is_absolute_https_api_base_url(&api_base_url) {
+        return Err(RegistryDiscoveryPinError::InvalidApiBaseUrl {
+            value: value.into(),
+            source: None,
+        });
+    }
+    Ok(())
+}
+
+fn is_absolute_https_api_base_url(url: &url::Url) -> bool {
+    url.scheme() == "https" && url.has_host() && !url.cannot_be_a_base()
 }
 
 fn ensure_trailing_slash(mut url: url::Url) -> url::Url {
@@ -4570,6 +4718,11 @@ mod tests {
     const REGISTRY_DOWNLOAD_URL: &str =
         "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download";
 
+    fn resolve_api_base_url_for_host(hostname: &str, providers_v1: &str) -> Result<String, String> {
+        let discovery_url = registry_discovery_url(hostname)?;
+        resolve_api_base_url(&discovery_url, providers_v1)
+    }
+
     struct LockFileRenameHookGuard;
 
     impl Drop for LockFileRenameHookGuard {
@@ -4614,7 +4767,23 @@ mod tests {
     fn discovery_pin(api_base_url: &str) -> RegistryDiscoveryPin {
         RegistryDiscoveryPin {
             api_base_url: api_base_url.into(),
-            additional: BTreeMap::new(),
+            additional: UnconsumedDiscoveryValues::default(),
+        }
+    }
+
+    fn discovery_pin_with_unconsumed_values<const N: usize>(
+        api_base_url: &str,
+        values: [(&str, &str); N],
+    ) -> RegistryDiscoveryPin {
+        RegistryDiscoveryPin {
+            api_base_url: api_base_url.into(),
+            additional: UnconsumedDiscoveryValues::try_from_values(
+                values
+                    .into_iter()
+                    .map(|(field, value)| (field.into(), value.into()))
+                    .collect(),
+            )
+            .unwrap(),
         }
     }
 
@@ -6099,8 +6268,32 @@ discovery_pin_present = true
     }
 
     #[test]
+    fn registry_discovery_pin_direct_deserialization_rejects_invalid_api_base_shape() {
+        for api_base_url in ["http://evil.test/", "#fragment", "?query=only"] {
+            let serialized = format!(r#""providers.v1" = "{api_base_url}""#);
+            let error = toml::from_str::<RegistryDiscoveryPin>(&serialized)
+                .expect_err("a persisted providers.v1 value must be an absolute HTTPS URL");
+
+            assert!(error.to_string().contains("absolute HTTPS URL"), "{error}");
+        }
+    }
+
+    #[test]
+    fn unconsumed_discovery_values_cannot_carry_providers_v1() {
+        let error = UnconsumedDiscoveryValues::try_from_values(BTreeMap::from([(
+            PROVIDERS_V1_DISCOVERY_FIELD.into(),
+            "https://registry.carina-rs.dev/v1/providers/".into(),
+        )]))
+        .expect_err("the retained-values type must reject consumed discovery material");
+
+        assert!(error.to_string().contains("providers.v1"), "{error}");
+    }
+
+    #[test]
     fn registry_host_lock_error_preserves_invalid_discovery_pin_source() {
-        let error = RegistryHostLockError::InvalidDiscoveryPin(RegistryDiscoveryPinError);
+        let error = RegistryHostLockError::InvalidDiscoveryPin(
+            RegistryDiscoveryPinError::MissingProvidersV1,
+        );
         let source = std::error::Error::source(&error)
             .expect("the invalid discovery pin must remain in the error chain");
 
@@ -6112,15 +6305,13 @@ discovery_pin_present = true
 
     #[test]
     fn discovery_pin_comparison_ignores_retained_unconsumed_values() {
-        let mut locked = discovery_pin("https://registry.carina-rs.dev/v1/providers/");
-        locked.additional.insert(
-            "modules.v1".into(),
-            "https://registry.carina-rs.dev/v1/modules/".into(),
+        let locked = discovery_pin_with_unconsumed_values(
+            "https://registry.carina-rs.dev/v1/providers/",
+            [("modules.v1", "https://registry.carina-rs.dev/v1/modules/")],
         );
-        let mut resolved = discovery_pin("https://registry.carina-rs.dev/v1/providers/");
-        resolved.additional.insert(
-            "modules.v1".into(),
-            "https://registry.carina-rs.dev/v2/modules/".into(),
+        let resolved = discovery_pin_with_unconsumed_values(
+            "https://registry.carina-rs.dev/v1/providers/",
+            [("modules.v1", "https://registry.carina-rs.dev/v2/modules/")],
         );
 
         assert!(same_consumed_discovery_values(&locked, &resolved));
@@ -6275,10 +6466,9 @@ discovery_pin_present = true
             ProviderSource::Registry(source) => source,
             ProviderSource::GithubDirect { .. } => unreachable!(),
         };
-        let mut locked_pin = discovery_pin("https://registry.carina-rs.dev/v1/providers/");
-        locked_pin.additional.insert(
-            "modules.v1".into(),
-            "opaque-retained-value-from-a-newer-client".into(),
+        let locked_pin = discovery_pin_with_unconsumed_values(
+            "https://registry.carina-rs.dev/v1/providers/",
+            [("modules.v1", "opaque-retained-value-from-a-newer-client")],
         );
         let locked_host = RegistryHostLock::pinned(locked_pin);
         let http = FakeRegistryHttp::default().json(
@@ -6440,6 +6630,19 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         ] {
             assert_lock_toml_is_rejected(&inconsistent);
         }
+    }
+
+    #[test]
+    fn registry_host_load_rejects_unpinned_state_carrying_providers_v1() {
+        let inconsistent = fully_protected_lock_toml().replace(
+            "discovery_pin_present = true\n",
+            "discovery_pin_present = false\n",
+        );
+
+        let error = LockFile::from_toml_str(&inconsistent, Path::new("carina-providers.lock"))
+            .expect_err("an unpinned host must not retain the consumed providers.v1 value");
+
+        assert!(error.to_string().contains("providers.v1"), "{error}");
     }
 
     #[test]
@@ -6863,10 +7066,11 @@ transparency_log_present = false
         let RegistryDiscoveryPinState::Pinned(pin) = &mut host.discovery else {
             panic!("fixture host must begin pinned");
         };
-        pin.additional.insert(
+        pin.additional = UnconsumedDiscoveryValues::try_from_values(BTreeMap::from([(
             "modules.v1".into(),
             "https://registry.carina-rs.dev/v1/modules/".into(),
-        );
+        )]))
+        .unwrap();
 
         lock.prepare_registry_discovery_repin(hostname)
             .unwrap()
@@ -6906,9 +7110,9 @@ transparency_log_present = false
         assert_eq!(
             resolved
                 .discovery_pin
-                .additional
-                .get("modules.v1")
-                .map(String::as_str),
+                .values()
+                .find(|(field, _)| *field == "modules.v1")
+                .map(|(_, value)| value),
             Some("https://registry.carina-rs.dev/v1/modules/")
         );
         assert_eq!(
@@ -9829,6 +10033,19 @@ transparency_log_present = false
     }
 
     #[test]
+    fn ureq_transport_selects_redirect_policy_by_request_type() {
+        let discovery = UreqRegistryHttp::agent(RegistryHttpRequest::Discovery(
+            "https://registry.example.test/.well-known/carina.json",
+        ));
+        let resource = UreqRegistryHttp::agent(RegistryHttpRequest::Resource(
+            "https://registry.example.test/v1/providers/",
+        ));
+
+        assert_eq!(discovery.config().max_redirects(), 0);
+        assert_eq!(resource.config().max_redirects(), 10);
+    }
+
+    #[test]
     fn registry_discovery_redirect_is_fetch_failure_without_repin_remediation() {
         const DISCOVERY_URL: &str = "https://registry.carina-rs.dev/.well-known/carina.json";
         const REDIRECT_TARGET: &str =
@@ -9866,7 +10083,7 @@ transparency_log_present = false
         )
         .unwrap_err();
 
-        assert!(error.contains("discovery fetch failed"), "{error}");
+        assert!(error.contains("redirect status 302"), "{error}");
         assert!(!error.contains("pin mismatch"), "{error}");
         assert!(
             !error.contains("carina providers repin-discovery"),
@@ -10867,11 +11084,13 @@ transparency_log_present = false
 
     #[test]
     fn registry_source_rejects_non_default_protocol_relative_cross_origin_base() {
-        let error = resolve_api_base_url("registry.example.test", "//evil.test/a/")
+        let error = resolve_api_base_url_for_host("registry.example.test", "//evil.test/a/")
             .expect_err("a discovery document must not relocate any registry across origins");
 
-        assert!(error.contains("cross-origin"), "{error}");
-        assert!(!error.contains("default registry"), "{error}");
+        assert_eq!(
+            error,
+            "registry discovery returned cross-origin providers.v1: //evil.test/a/"
+        );
     }
 
     /// RFC 3986 resolves a directory-relative reference beneath `/.well-known/`.
@@ -10880,11 +11099,11 @@ transparency_log_present = false
     #[test]
     fn registry_discovery_resolves_references_against_the_original_well_known_url() {
         assert_eq!(
-            resolve_api_base_url("registry.example.test", "v1/providers/").unwrap(),
+            resolve_api_base_url_for_host("registry.example.test", "v1/providers/").unwrap(),
             "https://registry.example.test/.well-known/v1/providers/"
         );
         assert_eq!(
-            resolve_api_base_url("registry.example.test", "../v1/providers/").unwrap(),
+            resolve_api_base_url_for_host("registry.example.test", "../v1/providers/").unwrap(),
             "https://registry.example.test/v1/providers/"
         );
     }
@@ -10892,7 +11111,7 @@ transparency_log_present = false
     #[test]
     fn registry_discovery_rejects_empty_query_or_fragment_only_api_base() {
         for providers_v1 in ["", "?version=1", "#fragment"] {
-            let error = resolve_api_base_url("registry.example.test", providers_v1)
+            let error = resolve_api_base_url_for_host("registry.example.test", providers_v1)
                 .expect_err("the discovery document itself cannot be an API base");
 
             assert!(error.contains("discovery document"), "{error}");
@@ -10900,8 +11119,46 @@ transparency_log_present = false
     }
 
     #[test]
+    fn registry_discovery_rejects_api_base_with_query_or_fragment() {
+        for providers_v1 in ["/v1/providers/?token=abc", "/v1/providers/#fragment"] {
+            let error = resolve_api_base_url_for_host("registry.example.test", providers_v1)
+                .expect_err("an API base cannot carry a query or fragment");
+
+            assert!(error.contains("query or fragment"), "{error}");
+        }
+    }
+
+    #[test]
+    fn registry_discovery_rejects_api_base_with_userinfo() {
+        let error = resolve_api_base_url_for_host(
+            "registry.example.test",
+            "https://user:pass@registry.example.test/v1/providers/",
+        )
+        .expect_err("an API base cannot carry credentials");
+
+        assert!(error.contains("userinfo"), "{error}");
+        assert!(!error.contains("user:pass"), "{error}");
+    }
+
+    #[test]
+    fn registry_discovery_rejects_hostname_with_url_components() {
+        for hostname in [
+            "registry.example.test?x",
+            "registry.example.test#fragment",
+            "registry.example.test/path",
+            "user@registry.example.test",
+            "https://registry.example.test",
+        ] {
+            let error = resolve_api_base_url_for_host(hostname, "/v1/providers/")
+                .expect_err("a registry hostname must not carry URL components");
+
+            assert!(error.contains("invalid registry hostname"), "{error}");
+        }
+    }
+
+    #[test]
     fn registry_discovery_rejects_discovery_document_as_api_base() {
-        let error = resolve_api_base_url(
+        let error = resolve_api_base_url_for_host(
             "registry.example.test",
             "https://registry.example.test/.well-known/carina.json",
         )
@@ -10912,8 +11169,10 @@ transparency_log_present = false
 
     #[test]
     fn registry_discovery_normalizes_api_base_trailing_slash_before_pinning() {
-        let without_slash = resolve_api_base_url("registry.example.test", "/v1/providers").unwrap();
-        let with_slash = resolve_api_base_url("registry.example.test", "/v1/providers/").unwrap();
+        let without_slash =
+            resolve_api_base_url_for_host("registry.example.test", "/v1/providers").unwrap();
+        let with_slash =
+            resolve_api_base_url_for_host("registry.example.test", "/v1/providers/").unwrap();
 
         assert_eq!(without_slash, with_slash);
         assert_eq!(with_slash, "https://registry.example.test/v1/providers/");
