@@ -400,13 +400,12 @@ impl DiagnosticEngine {
             if base_path.is_some() {
                 diagnostics.extend(self.check_module_calls(doc, parsed, &module_signatures));
             }
-            if let (Some(base), Some(expanded)) = (base_path, merged) {
+            if let (Some(_), Some(expanded)) = (base_path, merged) {
                 diagnostics.extend(self.check_composition_ref_types(
                     doc,
                     parsed,
                     &expanded.compositions,
                     &binding_index,
-                    base,
                 ));
             } else {
                 // Orphaned files and directory parses that did not produce an

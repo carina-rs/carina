@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::document::Document;
 use crate::position;
@@ -14,7 +14,7 @@ use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::suggest_similar_name;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
-use super::{DiagnosticEngine, carina_diagnostic, carina_diagnostic_range};
+use super::{DiagnosticEngine, carina_diagnostic};
 
 fn module_call_header_position(line: &str, call: &ModuleCall) -> Option<usize> {
     let module_pattern = format!("{} {{", call.module_name);
@@ -1242,7 +1242,6 @@ impl DiagnosticEngine {
         parsed: &ParsedFile,
         compositions: &[carina_core::resource::Composition],
         binding_index: &BindingIndex<'_>,
-        base_path: &std::path::Path,
     ) -> Vec<Diagnostic> {
         carina_core::validation::validate_composition_ref_types_with_bindings(
             compositions,
@@ -1250,54 +1249,52 @@ impl DiagnosticEngine {
         )
         .into_iter()
         .map(|error| {
-            let diagnostic_directory = error.diagnostic_directory();
-            let diagnostic_path = diagnostic_directory
-                .map(|directory| directory.strip_prefix(base_path).unwrap_or(directory));
-            let belongs_to_open_directory =
-                diagnostic_path.is_some_and(|path| path.as_os_str().is_empty());
-            let message = match diagnostic_path {
-                Some(path) if !path.as_os_str().is_empty() => {
-                    format!("{}: {}", path.display(), error)
+            let (line, col, width) = match &error {
+                carina_core::validation::CompositionRefError::ModuleCall(error) => {
+                    let call = parsed.module_calls.iter().find(|call| {
+                        call.binding_name
+                            .as_deref()
+                            .is_some_and(|binding| binding == error.call)
+                            || (call.binding_name.is_none()
+                                && carina_core::module_resolver::instance_prefix_for_call(call)
+                                    == error.call)
+                    });
+                    let argument_position = call.and_then(|call| {
+                        self.find_module_call_arg_position(doc, call, &error.argument)
+                            .map(|(line, col)| (line, col, error.argument.chars().count() as u32))
+                    });
+                    let call_position = call.and_then(|call| {
+                        self.find_module_call_position(doc, call)
+                            .map(|(line, col)| (line, col, call.module_name.chars().count() as u32))
+                    });
+                    let ref_text = error.path.to_dot_string();
+                    let ref_position = self
+                        .find_ref_value_position(doc, &ref_text)
+                        .map(|(line, col)| (line, col, ref_text.chars().count() as u32));
+                    argument_position
+                        .or(call_position)
+                        .or(ref_position)
+                        .unwrap_or((0, 0, 1))
                 }
-                _ => error.to_string(),
-            };
-
-            let range = if belongs_to_open_directory {
-                match &error {
-                    carina_core::validation::CompositionRefError::ModuleCall(error) => {
-                        let call = parsed.module_calls.iter().find(|call| {
-                            call.binding_name.as_deref().unwrap_or(&call.module_name)
-                                == error.call.as_str()
-                        });
-                        call.and_then(|call| {
-                            self.find_module_call_arg_position(doc, call, &error.argument)
-                                .map(|(line, col)| {
-                                    Range::new(
-                                        Position::new(line, col),
-                                        Position::new(
-                                            line,
-                                            col + error.argument.chars().count() as u32,
-                                        ),
-                                    )
-                                })
-                        })
-                        .unwrap_or_default()
-                    }
-                    carina_core::validation::CompositionRefError::Attribute(error) => self
+                carina_core::validation::CompositionRefError::Attribute(error) => {
+                    let attribute_position = self
                         .find_attributes_param_position(doc, &error.attribute)
-                        .map(|(line, col)| {
-                            Range::new(
-                                Position::new(line, col),
-                                Position::new(line, col + error.attribute.chars().count() as u32),
-                            )
-                        })
-                        .unwrap_or_default(),
+                        .map(|(line, col)| (line, col, error.attribute.chars().count() as u32));
+                    let ref_text = error.path.to_dot_string();
+                    let ref_position = self
+                        .find_ref_value_position(doc, &ref_text)
+                        .map(|(line, col)| (line, col, ref_text.chars().count() as u32));
+                    attribute_position.or(ref_position).unwrap_or((0, 0, 1))
                 }
-            } else {
-                Range::default()
             };
 
-            carina_diagnostic_range(range, DiagnosticSeverity::WARNING, message)
+            carina_diagnostic(
+                line,
+                col,
+                col + width,
+                DiagnosticSeverity::WARNING,
+                error.to_string(),
+            )
         })
         .collect()
     }

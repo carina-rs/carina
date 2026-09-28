@@ -3350,8 +3350,6 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         dependency_bindings: std::collections::BTreeSet::new(),
         module_name: "github_module".to_string(),
         instance: "github_actions_carina".to_string(),
-        call_directory: None,
-        module_directory: None,
         quoted_string_attrs: std::collections::HashSet::new(),
     };
     let sorted_resources = vec![role_resource];
@@ -3456,8 +3454,6 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
             dependency_bindings: std::collections::BTreeSet::new(),
             module_name: "mod".to_string(),
             instance: binding.to_string(),
-            call_directory: None,
-            module_directory: None,
             quoted_string_attrs: std::collections::HashSet::new(),
         }
     };
@@ -3638,8 +3634,6 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         dependency_bindings: std::collections::BTreeSet::new(),
         module_name: "carina_module".to_string(),
         instance: "carina_module".to_string(),
-        call_directory: None,
-        module_directory: None,
         quoted_string_attrs: std::collections::HashSet::new(),
     };
 

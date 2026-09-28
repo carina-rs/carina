@@ -3247,6 +3247,7 @@ let b = consumer {
         .iter()
         .filter(|diagnostic| {
             diagnostic.message.contains("target_group_ar")
+                && diagnostic.message.starts_with("module call 'b':")
                 && diagnostic
                     .message
                     .to_ascii_lowercase()
@@ -3703,16 +3704,20 @@ let instance = outer {
 
 fn assert_one_nested_lsp_mismatch(
     diagnostics: &[tower_lsp::lsp_types::Diagnostic],
-    expected_prefix: &str,
+    expected_call: &str,
+    expected_path: &str,
 ) {
     let mismatches: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| {
-            diagnostic.message.contains(&format!(
-                "{expected_prefix}module call 'b': argument 'vpc_id'"
-            )) && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+            diagnostic
+                .message
+                .contains(&format!("module call '{expected_call}': argument 'vpc_id'"))
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
                 && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
-                && diagnostic.message.contains("from a.sg_id")
+                && diagnostic
+                    .message
+                    .contains(&format!("from {expected_path}"))
         })
         .collect();
 
@@ -3735,7 +3740,7 @@ fn unannotated_nested_module_call_is_inferred_when_outer_module_is_opened() {
     let diagnostics =
         analyze_with_buffer(&engine, &fixture.outer, "main.crn", &fixture.outer_source);
 
-    assert_one_nested_lsp_mismatch(&diagnostics, "");
+    assert_one_nested_lsp_mismatch(&diagnostics, "b", "a.sg_id");
 }
 
 #[test]
@@ -3745,7 +3750,7 @@ fn annotated_nested_module_call_is_reported_when_root_module_is_opened() {
 
     let diagnostics = analyze_with_buffer(&engine, &fixture.root, "main.crn", &fixture.root_source);
 
-    assert_one_nested_lsp_mismatch(&diagnostics, "../outer: ");
+    assert_one_nested_lsp_mismatch(&diagnostics, "instance.b", "instance.a.sg_id");
 }
 
 #[test]
@@ -3755,7 +3760,7 @@ fn unannotated_nested_module_call_is_inferred_when_root_module_is_opened() {
 
     let diagnostics = analyze_with_buffer(&engine, &fixture.root, "main.crn", &fixture.root_source);
 
-    assert_one_nested_lsp_mismatch(&diagnostics, "../outer: ");
+    assert_one_nested_lsp_mismatch(&diagnostics, "instance.b", "instance.a.sg_id");
 }
 
 #[test]
@@ -3842,10 +3847,10 @@ let instance = outer {
         .filter(|diagnostic| {
             diagnostic
                 .message
-                .contains("../outer/../middle: module call 'b': argument 'vpc_id'")
+                .contains("module call 'instance.m.b': argument 'vpc_id'")
                 && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
                 && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
-                && diagnostic.message.contains("from a.sg_id")
+                && diagnostic.message.contains("from instance.m.a.sg_id")
         })
         .collect();
 

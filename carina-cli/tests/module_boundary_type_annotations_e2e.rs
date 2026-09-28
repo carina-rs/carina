@@ -303,6 +303,49 @@ fn unannotated_composition_argument_is_inferred_at_root_call_boundary_once() {
 }
 
 #[test]
+fn anonymous_module_call_argument_mismatch_is_rejected_at_call_boundary() {
+    let fixture = Fixture::module(
+        &[
+            (
+                "arguments.crn",
+                "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+            ),
+            ("resources.crn", MODULE_SECURITY_GROUP),
+        ],
+        &[(
+            "main.crn",
+            r#"let web_tier = use { source = '../web_tier' }
+
+let main_vpc = aws.ec2.Vpc {
+  name = "main"
+}
+
+let wrong = aws.ec2.SecurityGroup {
+  name   = "wrong"
+  vpc_id = main_vpc.vpc_id
+}
+
+web_tier {
+  vpc_id = wrong.group_id
+}
+"#,
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("module call 'web_tier_")
+                && diagnostic.contains("argument 'vpc_id'")
+                && diagnostic.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic.contains("from wrong.group_id")
+        }),
+        "the anonymous composition must retain and validate its typed call boundary: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn schema_typed_list_argument_checks_each_nested_reference() {
     let fixture = Fixture::module(
         &[(
@@ -445,14 +488,30 @@ fn attribute_declaration_rejects_security_group_id_as_vpc_id() {
 
     let diagnostics = fixture.validate();
 
-    assert!(
-        diagnostics.iter().any(|diagnostic| {
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
             diagnostic.contains("attribute 'security_group_id': type mismatch")
                 && diagnostic.contains("expected aws.ec2.Vpc.Id")
                 && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
-                && diagnostic.contains("from web_sg.group_id")
-        }),
-        "expected the declaration mismatch, got: {diagnostics:#?}",
+        })
+        .collect();
+    assert_eq!(
+        mismatches.len(),
+        2,
+        "each expanded call output should report the declaration mismatch: {diagnostics:#?}",
+    );
+    assert!(
+        mismatches
+            .iter()
+            .any(|diagnostic| diagnostic.contains("from web.web_sg.group_id")),
+        "expected the first expanded output path, got: {diagnostics:#?}",
+    );
+    assert!(
+        mismatches
+            .iter()
+            .any(|diagnostic| diagnostic.contains("from web2.web_sg.group_id")),
+        "expected the second expanded output path, got: {diagnostics:#?}",
     );
 }
 
@@ -650,10 +709,10 @@ fn assert_nested_module_call_mismatch(attribute_declaration: &str) {
     let mismatches: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| {
-            diagnostic.contains("module call 'b': argument 'vpc_id'")
+            diagnostic.contains("module call 'instance.b': argument 'vpc_id'")
                 && diagnostic.contains("expected aws.ec2.Vpc.Id")
                 && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
-                && diagnostic.contains("from a.sg_id")
+                && diagnostic.contains("from instance.a.sg_id")
         })
         .collect();
 
@@ -761,10 +820,10 @@ let instance = outer {
     let mismatches: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| {
-            diagnostic.contains("../outer/../middle: module call 'b': argument 'vpc_id'")
+            diagnostic.contains("module call 'instance.m.b': argument 'vpc_id'")
                 && diagnostic.contains("expected aws.ec2.Vpc.Id")
                 && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
-                && diagnostic.contains("from a.sg_id")
+                && diagnostic.contains("from instance.m.a.sg_id")
         })
         .collect();
 

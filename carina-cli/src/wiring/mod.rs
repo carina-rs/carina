@@ -489,25 +489,11 @@ pub fn validate_resource_ref_types_with_ctx<E>(
 pub fn validate_composition_ref_types_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E>,
-    base_dir: &Path,
 ) -> Vec<AppError> {
     let bindings = carina_core::binding_index::BindingIndex::from_parsed(parsed, ctx.schemas());
     validation::validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings)
         .into_iter()
-        .map(|error| {
-            let message = match error.diagnostic_directory() {
-                Some(directory) => {
-                    let diagnostic_path = directory.strip_prefix(base_dir).unwrap_or(directory);
-                    if diagnostic_path.as_os_str().is_empty() {
-                        error.to_string()
-                    } else {
-                        format!("{}: {}", diagnostic_path.display(), error)
-                    }
-                }
-                None => error.to_string(),
-            };
-            AppError::Validation(message)
-        })
+        .map(|error| AppError::Validation(error.to_string()))
         .collect()
 }
 

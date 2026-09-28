@@ -280,8 +280,6 @@ mod tests {
             dependency_bindings: dep_bindings,
             module_name: "m".to_string(),
             instance: "v".to_string(),
-            call_directory: None,
-            module_directory: None,
             quoted_string_attrs: Default::default(),
         };
 

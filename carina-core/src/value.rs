@@ -995,18 +995,14 @@ pub fn redact_secrets_in_virtual(
                     .map(|rv| (k.clone(), argument.with_value(rv)))
             })
             .collect();
-    // Redact both the runtime and validation expressions. The latter is
-    // serde-skipped, but the returned in-memory value must still satisfy the
-    // redaction contract.
     let attributes: Result<indexmap::IndexMap<String, crate::resource::CompositionAttribute>, _> =
         resource
             .signature
             .attributes
             .iter()
             .map(|(k, attr)| {
-                let runtime = redact_secrets_in_value(&attr.to_value())?;
-                let validation = redact_secrets_in_value(&attr.validation_value())?;
-                Ok((k.clone(), attr.with_values(runtime, validation)))
+                redact_secrets_in_value(&attr.to_value())
+                    .map(|value| (k.clone(), attr.with_value(value)))
             })
             .collect();
     let mut out = resource.clone();
@@ -3436,8 +3432,6 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
             module_name: "m".to_string(),
             instance: "module_instance".to_string(),
-            call_directory: None,
-            module_directory: None,
             quoted_string_attrs: HashSet::new(),
         };
 

@@ -365,13 +365,17 @@ let b = consumer_component {
 
     let diags = fixture.validate();
 
+    let call_diags: Vec<_> = diags
+        .iter()
+        .filter(|diag| diag.starts_with("module call 'b':"))
+        .collect();
     assert_eq!(
-        diags.len(),
+        call_diags.len(),
         1,
-        "one bad module-call argument ref should produce exactly one diagnostic: {diags:#?}",
+        "the bad reference should be reported once at the call boundary: {diags:#?}",
     );
     assert_eq!(
-        diags[0],
+        call_diags[0].as_str(),
         "module call 'b': unknown attribute 'target_group_ar' on 'instance' in reference instance.target_group_ar Did you mean 'target_group_arn'?",
     );
 }
@@ -419,13 +423,17 @@ let b = consumer_component {
 
     let diags = fixture.validate();
 
+    let call_diags: Vec<_> = diags
+        .iter()
+        .filter(|diag| diag.starts_with("module call 'b':"))
+        .collect();
     assert_eq!(
-        diags.len(),
+        call_diags.len(),
         1,
-        "one schema-backed typo in a module-call argument should produce exactly one diagnostic: {diags:#?}",
+        "the schema-backed typo should be reported once at the call boundary: {diags:#?}",
     );
     assert_eq!(
-        diags[0],
+        call_diags[0].as_str(),
         "module call 'b': unknown attribute 'target_group_ar' on 'tg' in reference tg.target_group_ar Did you mean 'target_group_arn'?",
     );
 }
@@ -741,11 +749,9 @@ let outer_instance = outer_module { }
         "one bad nested-module output reference should produce exactly one diagnostic: {diags:#?}",
     );
     assert!(
-        diags[0].contains("../outer:")
-            && diags[0]
-                .contains("attribute 'target_group_arn': unknown attribute 'target_group_ar'")
-            && diags[0].contains("inner_instance.target_group_ar")
+        diags[0].contains("attribute 'target_group_arn': unknown attribute 'target_group_ar'")
+            && diags[0].contains("outer_instance.inner_instance.target_group_ar")
             && diags[0].contains("Did you mean 'target_group_arn'?"),
-        "diagnostic should identify the outer module path and inner output typo: {diags:#?}",
+        "diagnostic should identify the expanded inner output path: {diags:#?}",
     );
 }

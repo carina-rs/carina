@@ -292,10 +292,9 @@ impl ModuleResolver<'_> {
                     substituted.canonicalize_in_place();
                     composition_attrs.insert(
                         attr_param.name.clone(),
-                        crate::resource::CompositionAttribute::from_value_with_validation(
+                        crate::resource::CompositionAttribute::from_value(
                             substituted,
                             attr_param.type_expr.clone(),
-                            rewritten,
                         ),
                     );
                 }
@@ -320,15 +319,6 @@ impl ModuleResolver<'_> {
                 }
             }
 
-            let module_directory = self.module_paths.get(&call.module_name).map(|source| {
-                let path = std::path::Path::new(source);
-                if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    self.base_dir.join(path)
-                }
-            });
-
             let composition = Composition {
                 id: ResourceId::with_identity("_virtual", instance_prefix),
                 signature: crate::resource::Signature {
@@ -339,8 +329,6 @@ impl ModuleResolver<'_> {
                 dependency_bindings: BTreeSet::new(),
                 module_name: call.module_name.clone(),
                 instance: instance_prefix.to_string(),
-                call_directory: Some(self.base_dir.clone()),
-                module_directory,
                 quoted_string_attrs: HashSet::new(),
             };
             compositions.push(composition);
@@ -788,14 +776,7 @@ fn prefix_module_composition(
         let v = attr.to_value();
         let prefixed =
             prefix_attr_value(&v, instance_prefix, intra_module_bindings, argument_values);
-        // Boundary validation uses the authored module-local expression. It
-        // gains outer instance prefixes like the runtime value, but does not
-        // substitute enclosing call arguments: those are validated at their
-        // own call boundary and must not be re-reported through outputs.
-        let validation_value = attr.validation_value();
-        let prefixed_validation =
-            rewrite_intra_module_refs(&validation_value, instance_prefix, intra_module_bindings);
-        substituted_attrs.insert(key.clone(), attr.with_values(prefixed, prefixed_validation));
+        substituted_attrs.insert(key.clone(), attr.with_value(prefixed));
     }
     new_virtual.signature.attributes = substituted_attrs;
 
@@ -1105,13 +1086,15 @@ pub(super) fn split_instance_prefix(name: &str) -> Option<(&str, &str)> {
 /// case by Hamming-distance matching: for each current DSL instance prefix
 /// whose address is absent from state, find a state-only prefix for the same
 /// module within `SIMHASH_HAMMING_THRESHOLD` bits; if exactly one candidate
-/// qualifies, rewrite the current resources to use the state address.
+/// qualifies, rewrite the current resources and their retained compositions
+/// to use the state address.
 ///
 /// `find_state_names_by_type` returns every state resource name for a given
 /// `(provider, resource_type)` — the reconciler uses them to discover which
 /// instance prefixes already exist in state.
 pub fn reconcile_anonymous_module_instances(
     resources: &mut [Resource],
+    compositions: &mut [Composition],
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
     claims: &crate::identifier::StateBlockClaims,
 ) {
@@ -1265,8 +1248,11 @@ pub fn reconcile_anonymous_module_instances(
         }
     }
 
-    // After remapping resource names, intra-module ResourceRefs also point at
-    // bindings with the old prefix. Walk every value and rewrite those.
+    // After remapping resource names, every expanded surface that names the
+    // anonymous instance must move with it. That includes managed-resource
+    // references plus composition identities, bindings, arguments, and
+    // outputs retained for post-expansion validation and post-apply export
+    // resolution.
     for r in resources.iter_mut() {
         let mut replacements = Vec::new();
         for (key, value) in r.attributes.iter() {
@@ -1279,6 +1265,47 @@ pub fn reconcile_anonymous_module_instances(
             r.set_attr(key, new_value);
         }
     }
+
+    for composition in compositions {
+        if let Some(identity) =
+            rewrite_name_prefix(composition.id.identity_or_empty(), &prefix_remap)
+        {
+            composition.id.set_identity(ResourceIdentity::new(identity));
+        }
+        if let Some(binding) = composition.binding.as_deref()
+            && let Some(rewritten) = rewrite_name_prefix(binding, &prefix_remap)
+        {
+            composition.binding = Some(rewritten);
+        }
+        if let Some(rewritten) = rewrite_name_prefix(&composition.instance, &prefix_remap) {
+            composition.instance = rewritten;
+        }
+
+        for argument in composition.signature.arguments.values_mut() {
+            let rewritten = rewrite_ref_prefixes(argument.value(), &prefix_remap);
+            *argument = argument.with_value(rewritten);
+        }
+        for attribute in composition.signature.attributes.values_mut() {
+            let rewritten = rewrite_ref_prefixes(&attribute.to_value(), &prefix_remap);
+            *attribute = attribute.with_value(rewritten);
+        }
+    }
+}
+
+fn rewrite_name_prefix(
+    name: &str,
+    remap: &std::collections::HashMap<(String, SimHash), SimHash>,
+) -> Option<String> {
+    let (prefix, suffix) = name
+        .split_once('.')
+        .map_or((name, None), |(prefix, rest)| (prefix, Some(rest)));
+    let (module, simhash) = parse_synthetic_instance_prefix(prefix)?;
+    let target = remap.get(&(module.to_string(), simhash))?;
+    let new_prefix = format!("{}_{:016x}", module, target);
+    Some(match suffix {
+        Some(rest) => format!("{new_prefix}.{rest}"),
+        None => new_prefix,
+    })
 }
 
 fn rewrite_ref_prefixes(
@@ -1287,21 +1314,22 @@ fn rewrite_ref_prefixes(
 ) -> Value {
     match value {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            let binding = path.binding();
-            if let Some((prefix, rest)) = binding.split_once('.')
-                && let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix)
-                && let Some(&target) = remap.get(&(module.to_string(), simhash))
-            {
-                let new_binding = format!("{}_{:016x}.{}", module, target, rest);
+            if let Some(binding) = rewrite_name_prefix(path.binding(), remap) {
                 return Value::Deferred(DeferredValue::ResourceRef {
                     path: crate::resource::AccessPath::with_segments(
-                        new_binding,
+                        binding,
                         path.attribute().to_string(),
                         path.segments().to_vec(),
                     ),
                 });
             }
             value.clone()
+        }
+        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+            rewrite_name_prefix(binding, remap).map_or_else(
+                || value.clone(),
+                |binding| Value::Deferred(DeferredValue::BindingRef { binding }),
+            )
         }
         Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items
@@ -1337,6 +1365,9 @@ fn rewrite_ref_prefixes(
                     .collect(),
             })
         }
+        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
+            Box::new(rewrite_ref_prefixes(inner, remap)),
+        )),
         _ => value.clone(),
     }
 }

@@ -1791,8 +1791,6 @@ mod substitute_placeholder_tests {
             dependency_bindings: BTreeSet::new(),
             module_name: "module_name".to_string(),
             instance: "composition_name".to_string(),
-            call_directory: None,
-            module_directory: None,
             quoted_string_attrs: HashSet::new(),
         });
 

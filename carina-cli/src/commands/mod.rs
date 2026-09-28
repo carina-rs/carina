@@ -537,9 +537,7 @@ pub fn validate_and_resolve_errors_with_factories(
         errors.extend(validate_depends_on_with_ctx(parsed));
         errors.extend(validate_wait_bindings_with_ctx(&ctx, parsed));
         errors.extend(validate_deferred_populate_refs_with_ctx(&ctx, parsed));
-        errors.extend(validate_composition_ref_types_with_ctx(
-            &ctx, parsed, base_dir,
-        ));
+        errors.extend(validate_composition_ref_types_with_ctx(&ctx, parsed));
         let mut argument_names: HashSet<String> =
             parsed.arguments.iter().map(|a| a.name.clone()).collect();
         // Upstream state bindings are resolved at plan time, skip type validation

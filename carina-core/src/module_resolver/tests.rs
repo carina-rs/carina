@@ -18,10 +18,12 @@ use crate::schema::TypeIdentity;
 
 fn reconcile_anonymous_module_instances(
     resources: &mut [Resource],
+    compositions: &mut [crate::resource::Composition],
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
 ) {
     crate::module_resolver::reconcile_anonymous_module_instances(
         resources,
+        compositions,
         find_state_names_by_type,
         &crate::identifier::StateBlockClaims::empty(),
     );
@@ -419,7 +421,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
     }];
 
     let state_lookup = |_: &str, _: &str| vec![state_name.clone()];
-    reconcile_anonymous_module_instances(&mut resources, &state_lookup);
+    reconcile_anonymous_module_instances(&mut resources, &mut [], &state_lookup);
 
     assert_eq!(
         resources[0].id.identity_or_empty(),
@@ -1256,45 +1258,104 @@ thing { name = 'after-edit' }
 "#,
     );
 
-    let before: Vec<String> = parsed
+    let before = parsed
         .resources
         .iter()
-        .filter(|r| r.id.resource_type == "iam.Role")
-        .map(|r| r.id.identity_or_empty().to_string())
-        .collect();
-    assert_eq!(before.len(), 1);
-    let (new_prefix, _) = before[0].split_once('.').unwrap();
-    let (module, new_hash) = parse_synthetic_instance_prefix(new_prefix).unwrap();
+        .find(|r| r.id.resource_type == "iam.Role")
+        .unwrap()
+        .id
+        .identity_or_empty()
+        .to_string();
+    let (new_prefix, _) = before.split_once('.').unwrap();
+    let new_prefix = new_prefix.to_string();
+    let (module, new_hash) = parse_synthetic_instance_prefix(&new_prefix).unwrap();
     assert_eq!(module, "thing");
+
+    // Model a nested call retained under the anonymous instance. Its address,
+    // binding, and argument ref must move with the managed resource.
+    let mut nested = parsed.compositions[0].clone();
+    nested
+        .id
+        .set_identity(crate::resource::ResourceIdentity::new(format!(
+            "{new_prefix}.nested"
+        )));
+    nested.binding = Some(format!("{new_prefix}.nested"));
+    nested.signature.arguments.insert(
+        "role_name".to_string(),
+        crate::resource::CompositionArgument::from_value(
+            Value::resource_ref(
+                format!("{new_prefix}.role"),
+                "role_name".to_string(),
+                vec![],
+            ),
+            Some(TypeExpr::String),
+        ),
+    );
+    parsed.compositions.push(nested);
 
     // Fabricate a state entry whose SimHash is within threshold of the
     // current one (flip one bit).
     let state_hash = new_hash.with_flipped_mask_for_test(1);
-    let state_name = format!("thing_{:016x}.role", state_hash);
+    let state_prefix = format!("thing_{state_hash:016x}");
+    let state_name = format!("{state_prefix}.role");
     let state_lookup = |_: &str, _: &str| vec![state_name.clone()];
 
-    reconcile_anonymous_module_instances(&mut parsed.resources, &state_lookup);
-
-    let after: Vec<String> = parsed
-        .resources
-        .iter()
-        .filter(|r| r.id.resource_type == "iam.Role")
-        .map(|r| r.id.identity_or_empty().to_string())
-        .collect();
-    assert_eq!(
-        after,
-        vec![state_name.clone()],
-        "expected prefix to be remapped to state's",
+    reconcile_anonymous_module_instances(
+        &mut parsed.resources,
+        &mut parsed.compositions,
+        &state_lookup,
     );
+
     let role = parsed
         .resources
         .iter()
         .find(|r| r.id.resource_type == "iam.Role")
         .unwrap();
+    assert_eq!(role.id.identity_or_empty(), state_name);
     assert_eq!(
         role.binding.as_deref(),
-        Some(format!("thing_{:016x}.role", state_hash).as_str()),
+        Some(state_name.as_str()),
         "binding should be remapped too",
+    );
+    let expanded = format!("{:?}", (&parsed.resources, &parsed.compositions));
+    assert!(
+        !expanded.contains(&new_prefix),
+        "the superseded synthetic prefix must not leak from expanded output: {expanded}",
+    );
+    assert!(expanded.contains(&state_prefix));
+
+    let outer = parsed
+        .compositions
+        .iter()
+        .find(|composition| composition.binding.is_none())
+        .unwrap();
+    assert_eq!(outer.id.identity_or_empty(), state_prefix);
+    assert_eq!(outer.instance, state_prefix);
+
+    let nested = parsed
+        .compositions
+        .iter()
+        .find(|composition| composition.binding.is_some())
+        .unwrap();
+    assert_eq!(
+        nested.id.identity_or_empty(),
+        format!("{state_prefix}.nested")
+    );
+    assert_eq!(
+        nested.binding.as_deref(),
+        Some(format!("{state_prefix}.nested").as_str())
+    );
+    assert_eq!(
+        nested
+            .signature
+            .arguments
+            .get("role_name")
+            .map(|argument| argument.value()),
+        Some(&Value::resource_ref(
+            format!("{state_prefix}.role"),
+            "role_name".to_string(),
+            vec![],
+        )),
     );
 }
 
@@ -1334,6 +1395,7 @@ thing { name = 'after-edit' }
 
     crate::module_resolver::reconcile_anonymous_module_instances(
         &mut claimed_from.resources,
+        &mut claimed_from.compositions,
         &state_lookup,
         &claims,
     );
@@ -1384,6 +1446,7 @@ thing { name = 'after-edit' }
 
     crate::module_resolver::reconcile_anonymous_module_instances(
         &mut claimed_to.resources,
+        &mut claimed_to.compositions,
         &state_lookup,
         &claims,
     );
@@ -1425,7 +1488,11 @@ thing { name = 'a' }
 
     // State entry uses a different module name.
     let state_lookup = |_: &str, _: &str| vec!["other_0000000000000001.role".to_string()];
-    reconcile_anonymous_module_instances(&mut parsed.resources, &state_lookup);
+    reconcile_anonymous_module_instances(
+        &mut parsed.resources,
+        &mut parsed.compositions,
+        &state_lookup,
+    );
 
     let after_name = parsed
         .resources
@@ -1508,7 +1575,11 @@ thing { name = 'after-edit' }
         _ => vec![],
     };
 
-    reconcile_anonymous_module_instances(&mut parsed.resources, &state_lookup);
+    reconcile_anonymous_module_instances(
+        &mut parsed.resources,
+        &mut parsed.compositions,
+        &state_lookup,
+    );
 
     let role_after = parsed
         .resources
@@ -1570,7 +1641,11 @@ thing { name = 'a' }
             ),
         ]
     };
-    reconcile_anonymous_module_instances(&mut parsed.resources, &state_lookup);
+    reconcile_anonymous_module_instances(
+        &mut parsed.resources,
+        &mut parsed.compositions,
+        &state_lookup,
+    );
 
     let after_name = parsed
         .resources
@@ -1622,7 +1697,11 @@ thing { name = 'unchanged-but-different' }
     // remap the second instance onto it.
     let first_clone = first.clone();
     let state_lookup = move |_: &str, _: &str| vec![format!("{}.role", first_clone)];
-    reconcile_anonymous_module_instances(&mut parsed.resources, &state_lookup);
+    reconcile_anonymous_module_instances(
+        &mut parsed.resources,
+        &mut parsed.compositions,
+        &state_lookup,
+    );
 
     let prefixes_after: HashSet<String> = parsed
         .resources

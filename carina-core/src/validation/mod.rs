@@ -336,7 +336,6 @@ pub struct ModuleCallRefError {
     pub argument: String,
     pub path: AccessPath,
     pub kind: ModuleCallRefErrorKind,
-    pub call_directory: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Display for ModuleCallRefError {
@@ -421,7 +420,6 @@ pub fn validate_module_call_argument_ref_types_with_bindings(
                                         expected: sink_type.resolved_type_name(),
                                         actual: source_name,
                                     },
-                                    call_directory: None,
                                 });
                             }
                         }
@@ -431,7 +429,6 @@ pub fn validate_module_call_argument_ref_types_with_bindings(
                                 argument: argument_name.clone(),
                                 path: path.clone(),
                                 kind: ModuleCallRefErrorKind::UnknownAttribute(error),
-                                call_directory: None,
                             });
                         }
                         RefType::Unchecked | RefType::UnknownBinding { .. } => {}
@@ -449,7 +446,6 @@ pub struct AttributeParamRefError {
     pub attribute: String,
     pub path: AccessPath,
     pub kind: ModuleCallRefErrorKind,
-    pub module_directory: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Display for AttributeParamRefError {
@@ -477,15 +473,6 @@ impl std::error::Error for AttributeParamRefError {}
 pub enum CompositionRefError {
     ModuleCall(ModuleCallRefError),
     Attribute(AttributeParamRefError),
-}
-
-impl CompositionRefError {
-    pub fn diagnostic_directory(&self) -> Option<&std::path::Path> {
-        match self {
-            Self::ModuleCall(error) => error.call_directory.as_deref(),
-            Self::Attribute(error) => error.module_directory.as_deref(),
-        }
-    }
 }
 
 impl std::fmt::Display for CompositionRefError {
@@ -523,49 +510,6 @@ fn composition_ref_error_kind(
     }
 }
 
-fn localize_composition_path(path: &AccessPath, prefix: Option<&str>) -> AccessPath {
-    let binding = prefix
-        .and_then(|prefix| path.binding().strip_prefix(prefix))
-        .and_then(|suffix| suffix.strip_prefix('.'))
-        .unwrap_or(path.binding());
-    AccessPath::with_segments(
-        binding.to_string(),
-        path.attribute().to_string(),
-        path.segments().to_vec(),
-    )
-}
-
-fn localize_composition_error_kind(
-    kind: ModuleCallRefErrorKind,
-    path: &AccessPath,
-) -> ModuleCallRefErrorKind {
-    match kind {
-        ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::UnknownAttribute {
-            attribute,
-            known_attributes,
-            target,
-            ..
-        }) => ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::UnknownAttribute {
-            binding: path.binding().to_string(),
-            attribute,
-            known_attributes,
-            target,
-        }),
-        ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::UnknownStructField {
-            field,
-            struct_name,
-            known_fields,
-            ..
-        }) => ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::UnknownStructField {
-            path: path.to_dot_string(),
-            field,
-            struct_name,
-            known_fields,
-        }),
-        other => other,
-    }
-}
-
 /// Validate every fully expanded module-call boundary exactly once.
 ///
 /// Both halves of the boundary live on [`crate::resource::Composition`]:
@@ -588,22 +532,22 @@ pub fn validate_composition_ref_types_with_bindings(
                     let Some(kind) = composition_ref_error_kind(path, sink, bindings) else {
                         return;
                     };
-                    let path =
-                        localize_composition_path(path, composition.containing_instance_prefix());
-                    let kind = localize_composition_error_kind(kind, &path);
                     errors.push(CompositionRefError::ModuleCall(ModuleCallRefError {
-                        call: composition.call_label().to_string(),
+                        call: composition
+                            .binding
+                            .as_deref()
+                            .unwrap_or_else(|| composition.expanded_instance())
+                            .to_string(),
                         argument: argument_name.clone(),
-                        path,
+                        path: path.clone(),
                         kind,
-                        call_directory: composition.call_directory().map(ToOwned::to_owned),
                     }));
                 },
             );
         }
 
         for (attribute_name, attribute) in &composition.signature.attributes {
-            let value = attribute.validation_value();
+            let value = attribute.to_value();
             visit_refs_with_sink(
                 &value,
                 attribute.declared_type().map(RefSink::TypeExpr),
@@ -611,14 +555,10 @@ pub fn validate_composition_ref_types_with_bindings(
                     let Some(kind) = composition_ref_error_kind(path, sink, bindings) else {
                         return;
                     };
-                    let path =
-                        localize_composition_path(path, Some(composition.expanded_instance()));
-                    let kind = localize_composition_error_kind(kind, &path);
                     errors.push(CompositionRefError::Attribute(AttributeParamRefError {
                         attribute: attribute_name.clone(),
-                        path,
+                        path: path.clone(),
                         kind,
-                        module_directory: composition.module_directory().map(ToOwned::to_owned),
                     }));
                 },
             );
@@ -626,12 +566,7 @@ pub fn validate_composition_ref_types_with_bindings(
     }
 
     let mut seen = HashSet::new();
-    errors.retain(|error| {
-        seen.insert((
-            error.diagnostic_directory().map(ToOwned::to_owned),
-            error.to_string(),
-        ))
-    });
+    errors.retain(|error| seen.insert(error.to_string()));
     errors
 }
 
