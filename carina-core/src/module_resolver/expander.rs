@@ -332,7 +332,7 @@ impl ModuleResolver<'_> {
                         arg.name.clone(),
                         crate::resource::CompositionArgument::from_value(
                             value.clone(),
-                            Some(arg.type_expr.clone()),
+                            arg.type_expr.clone(),
                         ),
                     );
                 }
@@ -348,10 +348,10 @@ impl ModuleResolver<'_> {
                 dependency_bindings: BTreeSet::new(),
                 module_name: call.module_name.clone(),
                 instance: instance_prefix.to_string(),
-                provenance: Box::new(CompositionProvenance {
-                    call: Some(expanded_call.clone()),
-                    root_call: Some(expanded_call.clone()),
-                }),
+                provenance: Box::new(CompositionProvenance::expanded(
+                    expanded_call.clone(),
+                    expanded_call.clone(),
+                )),
                 quoted_string_attrs: HashSet::new(),
             };
             compositions.push(composition);
@@ -750,12 +750,9 @@ fn prefix_module_data_source(
 }
 
 /// Instance-prefix one composition resource crossing a module boundary — the
-/// [`Composition`] analogue of [`prefix_module_resource`]. A
-/// `Composition` carries no `module_source` (it has the flattened
-/// `module_name` / `instance` fields, left unchanged as the synthetic
-/// node's own provenance) and no `prefixes` / `directives`, so only its
-/// assigned identity, `binding`, arguments, and attributes take the prefix
-/// treatment.
+/// [`Composition`] analogue of [`prefix_module_resource`]. The flattened
+/// identity/binding, diagnostic call provenance, arguments, and attributes all
+/// take the prefix treatment; compositions have no `prefixes` or `directives`.
 fn prefix_module_composition(
     composition: &Composition,
     instance_prefix: &str,
@@ -765,15 +762,15 @@ fn prefix_module_composition(
 ) -> Composition {
     let mut new_virtual = composition.clone();
 
-    let mut call = composition.diagnostic_call();
+    let mut call = composition
+        .diagnostic_call()
+        .expect("nested compositions are produced by live expansion")
+        .clone();
     call.instance = apply_instance_prefix(instance_prefix, &call.instance);
     if let Some(binding) = &call.binding {
         call.binding = Some(apply_instance_prefix(instance_prefix, binding));
     }
-    new_virtual.provenance = Box::new(CompositionProvenance {
-        call: Some(call),
-        root_call: Some(root_call.clone()),
-    });
+    *new_virtual.provenance = CompositionProvenance::expanded(call, root_call.clone());
 
     if let Some(identity) = &new_virtual.id.identity {
         let new_name = apply_instance_prefix(instance_prefix, identity.as_str());
@@ -1313,20 +1310,16 @@ pub fn reconcile_anonymous_module_instances(
         if let Some(rewritten) = rewrite_name_prefix(&composition.instance, &prefix_remap) {
             composition.instance = rewritten;
         }
-        for call in [
-            &mut composition.provenance.call,
-            &mut composition.provenance.root_call,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap) {
-                call.instance = rewritten;
-            }
-            if let Some(binding) = call.binding.as_deref()
-                && let Some(rewritten) = rewrite_name_prefix(binding, &prefix_remap)
-            {
-                call.binding = Some(rewritten);
+        if let Some((call, root_call)) = composition.provenance.calls_mut() {
+            for call in [call, root_call] {
+                if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap) {
+                    call.instance = rewritten;
+                }
+                if let Some(binding) = call.binding.as_deref()
+                    && let Some(rewritten) = rewrite_name_prefix(binding, &prefix_remap)
+                {
+                    call.binding = Some(rewritten);
+                }
             }
         }
 

@@ -141,10 +141,10 @@ impl CompositionAttribute {
 ///
 /// The declaration is validation-only and deliberately travels with every
 /// value rewrite. Keeping both fields private means callers cannot insert a
-/// raw [`Value`] into [`Signature::arguments`]; every construction site must
-/// explicitly decide which declared type accompanies it. The optional shape
-/// keeps saved-plan deserialization backward-compatible even though live
-/// expansion always supplies `Some` for declared module arguments.
+/// raw [`Value`] into [`Signature::arguments`]; every live construction site
+/// must supply the declared type. The optional storage only keeps saved-plan
+/// deserialization backward-compatible: skipped validation metadata
+/// deserializes as `None`, while [`Self::from_value`] always stores `Some`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CompositionArgument {
@@ -154,10 +154,10 @@ pub struct CompositionArgument {
 }
 
 impl CompositionArgument {
-    pub fn from_value(value: Value, declared_type: Option<TypeExpr>) -> Self {
+    pub fn from_value(value: Value, declared_type: TypeExpr) -> Self {
         Self {
             value,
-            declared_type,
+            declared_type: Some(declared_type),
         }
     }
 
@@ -171,7 +171,10 @@ impl CompositionArgument {
 
     /// Rewrite a prefixed/substituted value without dropping its declaration.
     pub fn with_value(&self, value: Value) -> Self {
-        Self::from_value(value, self.declared_type.clone())
+        Self {
+            value,
+            declared_type: self.declared_type.clone(),
+        }
     }
 }
 
@@ -218,7 +221,7 @@ pub struct Signature {
 /// `binding` and `module_name` are the authored names used by diagnostics.
 /// The optional source is the path from the corresponding `use` statement.
 /// This metadata is validation-only and is never persisted in saved plans.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CompositionCall {
     pub module_name: String,
     pub binding: Option<String>,
@@ -244,14 +247,68 @@ impl CompositionCall {
 /// produced it. LSP diagnostics use this relationship to select their owning
 /// document without parsing dot-separated instance strings.
 ///
-/// This is diagnostic-only metadata, not part of a composition's identity:
-/// all provenance values intentionally compare equal. [`Composition`] also
-/// skips this field during serialization, so the metadata is lost on saved-plan
-/// reload and replaced with [`Default::default`].
-#[derive(Debug, Clone, Default)]
+/// This is diagnostic-only metadata, not part of a composition's identity.
+/// Live expansion can only construct the `Expanded` state through
+/// [`Self::expanded`], which requires both ends of the ancestry together.
+/// Serialization skips the whole value, so a saved-plan reload enters the
+/// explicitly named `Deserialized` state instead of a partially populated
+/// pair of `Option`s.
+#[derive(Debug, Clone)]
 pub struct CompositionProvenance {
-    pub call: Option<CompositionCall>,
-    pub root_call: Option<CompositionCall>,
+    state: CompositionProvenanceState,
+}
+
+#[derive(Debug, Clone)]
+enum CompositionProvenanceState {
+    Expanded(Box<ExpandedCompositionProvenance>),
+    Deserialized,
+}
+
+#[derive(Debug, Clone)]
+struct ExpandedCompositionProvenance {
+    call: CompositionCall,
+    root_call: CompositionCall,
+}
+
+impl CompositionProvenance {
+    pub fn expanded(call: CompositionCall, root_call: CompositionCall) -> Self {
+        Self {
+            state: CompositionProvenanceState::Expanded(Box::new(ExpandedCompositionProvenance {
+                call,
+                root_call,
+            })),
+        }
+    }
+
+    pub fn deserialized() -> Self {
+        Self {
+            state: CompositionProvenanceState::Deserialized,
+        }
+    }
+
+    fn calls(&self) -> Option<(&CompositionCall, &CompositionCall)> {
+        match &self.state {
+            CompositionProvenanceState::Expanded(expanded) => {
+                Some((&expanded.call, &expanded.root_call))
+            }
+            CompositionProvenanceState::Deserialized => None,
+        }
+    }
+
+    pub(crate) fn calls_mut(&mut self) -> Option<(&mut CompositionCall, &mut CompositionCall)> {
+        match &mut self.state {
+            CompositionProvenanceState::Expanded(expanded) => {
+                Some((&mut expanded.call, &mut expanded.root_call))
+            }
+            CompositionProvenanceState::Deserialized => None,
+        }
+    }
+}
+
+impl Default for CompositionProvenance {
+    fn default() -> Self {
+        Self::deserialized()
+    }
 }
 
 impl PartialEq for CompositionProvenance {
@@ -351,33 +408,14 @@ impl Composition {
         super::EphemeralId::new(self.id.clone())
     }
 
-    /// Fully expanded instance identity (`outer.inner.call`).
-    pub fn expanded_instance(&self) -> &str {
-        self.id.identity_or_empty()
+    /// Immediate call identity when this composition came from live expansion.
+    pub fn diagnostic_call(&self) -> Option<&CompositionCall> {
+        self.provenance.calls().map(|(call, _)| call)
     }
 
-    /// Immediate call identity, falling back to the legacy flattened fields
-    /// for manually constructed or deserialized compositions.
-    pub fn diagnostic_call(&self) -> CompositionCall {
-        self.provenance
-            .call
-            .clone()
-            .unwrap_or_else(|| CompositionCall {
-                module_name: self.module_name.clone(),
-                binding: self.binding.clone(),
-                instance: self.instance.clone(),
-                module_source: None,
-                module_directory: None,
-            })
-    }
-
-    /// Root-level ancestor call for this expansion. A direct composition (or
-    /// legacy value without provenance) is its own root.
-    pub fn diagnostic_root_call(&self) -> CompositionCall {
-        self.provenance
-            .root_call
-            .clone()
-            .unwrap_or_else(|| self.diagnostic_call())
+    /// Root-level ancestor call when this composition came from live expansion.
+    pub fn diagnostic_root_call(&self) -> Option<&CompositionCall> {
+        self.provenance.calls().map(|(_, root_call)| root_call)
     }
 }
 
@@ -389,16 +427,14 @@ mod tests {
     #[test]
     fn equality_ignores_provenance_but_compares_composition_fields() {
         let provenance = |binding: &str| {
-            Box::new(CompositionProvenance {
-                call: Some(CompositionCall {
-                    module_name: "module".to_string(),
-                    binding: Some(binding.to_string()),
-                    instance: binding.to_string(),
-                    module_source: Some(format!("../{binding}")),
-                    module_directory: None,
-                }),
-                root_call: None,
-            })
+            let call = CompositionCall {
+                module_name: "module".to_string(),
+                binding: Some(binding.to_string()),
+                instance: binding.to_string(),
+                module_source: Some(format!("../{binding}")),
+                module_directory: None,
+            };
+            Box::new(CompositionProvenance::expanded(call.clone(), call))
         };
         let left = Composition {
             id: ResourceId::with_identity("_virtual", "call"),
@@ -417,6 +453,14 @@ mod tests {
         right.provenance = provenance("second");
 
         assert_eq!(left, right);
+        assert!(left.diagnostic_call().is_some());
+
+        let decoded: Composition = serde_json::from_value(
+            serde_json::to_value(&left).expect("serialize composition with provenance"),
+        )
+        .expect("deserialize composition without provenance");
+        assert!(decoded.diagnostic_call().is_none());
+        assert!(decoded.diagnostic_root_call().is_none());
 
         right.binding = Some("different".to_string());
         assert_ne!(left, right);
@@ -539,7 +583,7 @@ mod tests {
             Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::new("vpc", "vpc_id"),
             }),
-            Some(declared.clone()),
+            declared.clone(),
         );
 
         let rewritten = argument.with_value(Value::Concrete(ConcreteValue::String("x".into())));
@@ -552,12 +596,11 @@ mod tests {
         let value = Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("vpc", "vpc_id"),
         });
-        let typed = CompositionArgument::from_value(value.clone(), Some(TypeExpr::String));
-        let untyped = CompositionArgument::from_value(value.clone(), None);
+        let typed = CompositionArgument::from_value(value.clone(), TypeExpr::String);
 
         let typed_json = serde_json::to_value(&typed).expect("serialize typed argument");
-        let untyped_json = serde_json::to_value(&untyped).expect("serialize untyped argument");
-        assert_eq!(typed_json, untyped_json);
+        let value_json = serde_json::to_value(&value).expect("serialize argument value");
+        assert_eq!(typed_json, value_json);
 
         let decoded: CompositionArgument =
             serde_json::from_value(typed_json).expect("deserialize composition argument");

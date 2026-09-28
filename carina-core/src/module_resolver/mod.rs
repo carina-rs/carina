@@ -38,7 +38,6 @@ pub use loader::{
 pub use resolver::{ModuleResolver, resolve_modules, resolve_modules_with_config};
 pub use signature::{
     ResolvedModuleSignature, ResolvedModuleSignatures, load_resolved_module_signatures,
-    resolve_module_signatures_with,
 };
 
 // Bring `pub(super)` helpers into mod.rs scope so the `tests` submodule (which

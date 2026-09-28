@@ -29,6 +29,19 @@ fn module_call_header_position(line: &str, call: &ModuleCall) -> Option<usize> {
         })
 }
 
+fn module_call_occurrence(module_calls: &[ModuleCall], call_index: usize) -> Option<usize> {
+    let call = module_calls.get(call_index)?;
+    Some(
+        module_calls[..call_index]
+            .iter()
+            .filter(|candidate| {
+                candidate.module_name == call.module_name
+                    && candidate.binding_name == call.binding_name
+            })
+            .count(),
+    )
+}
+
 /// Match an expanded call site back to an authored call without interpreting
 /// its dot-separated instance path. Named calls match their structural
 /// binding; anonymous calls match the deterministic instance identity that
@@ -1120,7 +1133,9 @@ impl DiagnosticEngine {
         let mut diagnostics = Vec::new();
 
         // Check each module call
-        for call in &parsed.module_calls {
+        for (call_index, call) in parsed.module_calls.iter().enumerate() {
+            let call_occurrence = module_call_occurrence(&parsed.module_calls, call_index)
+                .expect("enumerated module call has an occurrence");
             if let Some(signature) = imported_modules.get(&call.module_name) {
                 let module_args = &signature.arguments;
                 // Check for unknown parameters
@@ -1129,7 +1144,7 @@ impl DiagnosticEngine {
 
                     if matching_arg.is_none() {
                         if let Some((line, col)) =
-                            self.find_module_call_arg_position(doc, call, arg_name)
+                            self.find_module_call_arg_position(doc, call, call_occurrence, arg_name)
                         {
                             // Find similar parameter names for suggestion
                             let suggestion = module_args
@@ -1159,7 +1174,7 @@ impl DiagnosticEngine {
                     if let Some(type_error) =
                         self.validate_module_arg_type(&arg.type_expr, arg_value)
                         && let Some((line, col)) =
-                            self.find_module_call_arg_position(doc, call, arg_name)
+                            self.find_module_call_arg_position(doc, call, call_occurrence, arg_name)
                     {
                         diagnostics.push(carina_diagnostic(
                             line,
@@ -1175,7 +1190,8 @@ impl DiagnosticEngine {
                 for arg in module_args {
                     if arg.default.is_none()
                         && !call.arguments.contains_key(&arg.name)
-                        && let Some((line, col)) = self.find_module_call_position(doc, call)
+                        && let Some((line, col)) =
+                            self.find_module_call_position(doc, call, call_occurrence)
                     {
                         diagnostics.push(carina_diagnostic(
                             line,
@@ -1225,14 +1241,13 @@ impl DiagnosticEngine {
         )
         .into_iter()
         .filter_map(|error| {
-            let call = parsed.module_calls.iter().find(|call| {
-                call.binding_name.as_deref().unwrap_or(&call.module_name) == error.call.as_str()
-            })?;
+            let call = parsed.module_calls.get(error.call_index)?;
+            let call_occurrence = module_call_occurrence(&parsed.module_calls, error.call_index)?;
             let argument_position = self
-                .find_module_call_arg_position(doc, call, &error.argument)
+                .find_module_call_arg_position(doc, call, call_occurrence, &error.argument)
                 .map(|(line, col)| (line, col, error.argument.chars().count() as u32));
             let call_position = self
-                .find_module_call_position(doc, call)
+                .find_module_call_position(doc, call, call_occurrence)
                 .map(|(line, col)| (line, col, call.module_name.chars().count() as u32));
             let (line, col, width) = argument_position.or(call_position)?;
             Some(carina_diagnostic(
@@ -1273,36 +1288,33 @@ impl DiagnosticEngine {
             let immediate_call = parsed
                 .module_calls
                 .iter()
-                .find(|call| composition_call_matches(&expanded_error.call, call));
-            let (authored_call, anchor_argument) = match immediate_call {
-                Some(call) => (call, true),
-                None => (
-                    parsed
-                        .module_calls
-                        .iter()
-                        .find(|call| composition_call_matches(&expanded_error.root_call, call))?,
-                    false,
-                ),
+                .enumerate()
+                .find(|(_, call)| composition_call_matches(&expanded_error.call, call));
+            let (call_index, authored_call, anchor_argument) = match immediate_call {
+                Some((index, call)) => (index, call, true),
+                None => {
+                    let (index, call) =
+                        parsed.module_calls.iter().enumerate().find(|(_, call)| {
+                            composition_call_matches(&expanded_error.root_call, call)
+                        })?;
+                    (index, call, false)
+                }
             };
+            let call_occurrence = module_call_occurrence(&parsed.module_calls, call_index)?;
 
             let position = if anchor_argument {
                 self.find_module_call_arg_position(
                     doc,
                     authored_call,
-                    &expanded_error.error.argument,
+                    call_occurrence,
+                    &expanded_error.argument,
                 )
-                .map(|(line, col)| {
-                    (
-                        line,
-                        col,
-                        expanded_error.error.argument.chars().count() as u32,
-                    )
-                })
+                .map(|(line, col)| (line, col, expanded_error.argument.chars().count() as u32))
             } else {
                 None
             }
             .or_else(|| {
-                self.find_module_call_position(doc, authored_call)
+                self.find_module_call_position(doc, authored_call, call_occurrence)
                     .map(|(line, col)| {
                         (line, col, authored_call.module_name.chars().count() as u32)
                     })
@@ -1334,11 +1346,17 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         call: &ModuleCall,
+        occurrence: usize,
     ) -> Option<(u32, u32)> {
         let text = doc.text();
+        let mut remaining = occurrence;
 
         for (line_idx, line) in text.lines().enumerate() {
             if let Some(byte_pos) = module_call_header_position(line, call) {
+                if remaining > 0 {
+                    remaining -= 1;
+                    continue;
+                }
                 return Some((
                     line_idx as u32,
                     position::byte_offset_to_char_offset(line, byte_pos),
@@ -1353,14 +1371,20 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         call: &ModuleCall,
+        occurrence: usize,
         arg_name: &str,
     ) -> Option<(u32, u32)> {
         let text = doc.text();
         let mut in_module_call = false;
+        let mut remaining = occurrence;
 
         for (line_idx, line) in text.lines().enumerate() {
             if module_call_header_position(line, call).is_some() {
-                in_module_call = true;
+                if remaining == 0 {
+                    in_module_call = true;
+                } else {
+                    remaining -= 1;
+                }
             }
 
             if in_module_call {

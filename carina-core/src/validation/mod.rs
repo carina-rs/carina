@@ -320,7 +320,7 @@ fn check_nested_resource_ref_existence(
     });
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ModuleCallRefErrorKind {
     TypeMismatch { expected: String, actual: String },
     UnknownAttribute(RefTypeError),
@@ -332,30 +332,42 @@ pub enum ModuleCallRefErrorKind {
 /// never has to recover source identity by parsing that message.
 #[derive(Debug, Clone)]
 pub struct ModuleCallRefError {
-    pub call: String,
+    /// Index into the `module_calls` slice passed to validation.
+    pub call_index: usize,
+    call_label: String,
     pub argument: String,
     pub path: AccessPath,
     pub kind: ModuleCallRefErrorKind,
 }
 
+fn format_module_call_ref_error(
+    f: &mut std::fmt::Formatter<'_>,
+    call_label: &str,
+    argument: &str,
+    path: &AccessPath,
+    kind: &ModuleCallRefErrorKind,
+) -> std::fmt::Result {
+    match kind {
+        ModuleCallRefErrorKind::TypeMismatch { expected, actual } => write!(
+            f,
+            "module call '{}': argument '{}': cannot assign {} to '{}': expected {}, got {} (from {})",
+            call_label,
+            argument,
+            actual,
+            argument,
+            expected,
+            actual,
+            path.to_dot_string(),
+        ),
+        ModuleCallRefErrorKind::UnknownAttribute(error) => {
+            write!(f, "module call '{}': {}", call_label, error)
+        }
+    }
+}
+
 impl std::fmt::Display for ModuleCallRefError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.kind {
-            ModuleCallRefErrorKind::TypeMismatch { expected, actual } => write!(
-                f,
-                "module call '{}': argument '{}': cannot assign {} to '{}': expected {}, got {} (from {})",
-                self.call,
-                self.argument,
-                actual,
-                self.argument,
-                expected,
-                actual,
-                self.path.to_dot_string(),
-            ),
-            ModuleCallRefErrorKind::UnknownAttribute(error) => {
-                write!(f, "module call '{}': {}", self.call, error)
-            }
-        }
+        format_module_call_ref_error(f, &self.call_label, &self.argument, &self.path, &self.kind)
     }
 }
 
@@ -376,7 +388,7 @@ pub fn validate_module_call_argument_ref_types_with_bindings(
 ) -> Vec<ModuleCallRefError> {
     let mut errors = Vec::new();
 
-    for call in module_calls {
+    for (call_index, call) in module_calls.iter().enumerate() {
         let call_name = call
             .binding_name
             .as_deref()
@@ -400,39 +412,16 @@ pub fn validate_module_call_argument_ref_types_with_bindings(
                         return;
                     }
 
-                    match bindings.ref_type(path) {
-                        RefType::Typed(source) => {
-                            let Some(sink) = sink
-                                .and_then(RefSink::as_type_expr)
-                                .and_then(lift_type_expr)
-                            else {
-                                return;
-                            };
-                            let source_type = source.type_in_schema();
-                            let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
-                            if !source_type.is_assignable_to(sink_type) {
-                                let source_name = source_type.resolved_type_name();
-                                errors.push(ModuleCallRefError {
-                                    call: call_name.to_string(),
-                                    argument: argument_name.clone(),
-                                    path: path.clone(),
-                                    kind: ModuleCallRefErrorKind::TypeMismatch {
-                                        expected: sink_type.resolved_type_name(),
-                                        actual: source_name,
-                                    },
-                                });
-                            }
-                        }
-                        RefType::UnknownAttribute(error) => {
-                            errors.push(ModuleCallRefError {
-                                call: call_name.to_string(),
-                                argument: argument_name.clone(),
-                                path: path.clone(),
-                                kind: ModuleCallRefErrorKind::UnknownAttribute(error),
-                            });
-                        }
-                        RefType::Unchecked | RefType::UnknownBinding { .. } => {}
-                    }
+                    let Some(kind) = composition_ref_error_kind(path, sink, bindings) else {
+                        return;
+                    };
+                    errors.push(ModuleCallRefError {
+                        call_index,
+                        call_label: call_name.to_string(),
+                        argument: argument_name.clone(),
+                        path: path.clone(),
+                        kind,
+                    });
                 },
             );
         }
@@ -479,14 +468,23 @@ pub enum CompositionRefError {
 /// by source-aware consumers such as the LSP.
 #[derive(Debug, Clone)]
 pub struct CompositionModuleCallRefError {
-    pub error: ModuleCallRefError,
+    pub argument: String,
+    pub path: AccessPath,
+    pub kind: ModuleCallRefErrorKind,
     pub call: CompositionCall,
     pub root_call: CompositionCall,
+    reference_position: usize,
 }
 
 impl std::fmt::Display for CompositionModuleCallRefError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.error.fmt(f)
+        format_module_call_ref_error(
+            f,
+            &self.call.display_label(),
+            &self.argument,
+            &self.path,
+            &self.kind,
+        )
     }
 }
 
@@ -499,6 +497,7 @@ pub struct CompositionAttributeRefError {
     pub module_name: String,
     pub module_source: Option<String>,
     pub module_directory: Option<std::path::PathBuf>,
+    reference_position: usize,
 }
 
 impl CompositionAttributeRefError {
@@ -531,6 +530,75 @@ impl std::fmt::Display for CompositionRefError {
 }
 
 impl std::error::Error for CompositionRefError {}
+
+/// Hashable, instance-independent error identity used only for deduplication.
+/// Binding/path strings inside [`RefTypeError`] are deliberately omitted: the
+/// reference's stable value-walk position identifies the authored occurrence,
+/// while expanded bindings differ for every module instance.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CompositionRefErrorKindKey {
+    TypeMismatch {
+        expected: String,
+        actual: String,
+    },
+    UnknownAttribute {
+        attribute: String,
+        known_attributes: Vec<String>,
+        target: crate::binding_index::RefTargetKind,
+    },
+    UnknownStructField {
+        field: String,
+        struct_name: String,
+        known_fields: Vec<String>,
+    },
+}
+
+impl From<&ModuleCallRefErrorKind> for CompositionRefErrorKindKey {
+    fn from(kind: &ModuleCallRefErrorKind) -> Self {
+        match kind {
+            ModuleCallRefErrorKind::TypeMismatch { expected, actual } => Self::TypeMismatch {
+                expected: expected.clone(),
+                actual: actual.clone(),
+            },
+            ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::UnknownAttribute {
+                attribute,
+                known_attributes,
+                target,
+                ..
+            }) => Self::UnknownAttribute {
+                attribute: attribute.clone(),
+                known_attributes: known_attributes.clone(),
+                target: target.clone(),
+            },
+            ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::UnknownStructField {
+                field,
+                struct_name,
+                known_fields,
+                ..
+            }) => Self::UnknownStructField {
+                field: field.clone(),
+                struct_name: struct_name.clone(),
+                known_fields: known_fields.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CompositionModuleCallErrorKey {
+    call_instance: String,
+    argument: String,
+    reference_position: usize,
+    kind: CompositionRefErrorKindKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CompositionAttributeErrorKey {
+    module_identity: String,
+    attribute: String,
+    reference_position: usize,
+    kind: CompositionRefErrorKindKey,
+}
 
 fn composition_ref_error_kind(
     path: &AccessPath,
@@ -570,26 +638,33 @@ pub fn validate_composition_ref_types_with_bindings(
     let mut errors = Vec::new();
 
     for composition in compositions {
-        let call = composition.diagnostic_call();
-        let root_call = composition.diagnostic_root_call();
+        let (Some(call), Some(root_call)) = (
+            composition.diagnostic_call(),
+            composition.diagnostic_root_call(),
+        ) else {
+            // Saved plans have already passed source validation and omit
+            // diagnostic provenance by design.
+            continue;
+        };
         for (argument_name, argument) in &composition.signature.arguments {
+            let mut reference_position = 0;
             visit_refs_with_sink(
                 argument.value(),
                 argument.declared_type().map(RefSink::TypeExpr),
                 &mut |path, sink| {
+                    let current_position = reference_position;
+                    reference_position += 1;
                     let Some(kind) = composition_ref_error_kind(path, sink, bindings) else {
                         return;
                     };
                     errors.push(CompositionRefError::ModuleCall(
                         CompositionModuleCallRefError {
-                            error: ModuleCallRefError {
-                                call: call.display_label(),
-                                argument: argument_name.clone(),
-                                path: path.clone(),
-                                kind,
-                            },
+                            argument: argument_name.clone(),
+                            path: path.clone(),
+                            kind,
                             call: call.clone(),
                             root_call: root_call.clone(),
+                            reference_position: current_position,
                         },
                     ));
                 },
@@ -598,10 +673,13 @@ pub fn validate_composition_ref_types_with_bindings(
 
         for (attribute_name, attribute) in &composition.signature.attributes {
             let value = attribute.to_value();
+            let mut reference_position = 0;
             visit_refs_with_sink(
                 &value,
                 attribute.declared_type().map(RefSink::TypeExpr),
                 &mut |path, sink| {
+                    let current_position = reference_position;
+                    reference_position += 1;
                     let Some(kind) = composition_ref_error_kind(path, sink, bindings) else {
                         return;
                     };
@@ -615,6 +693,7 @@ pub fn validate_composition_ref_types_with_bindings(
                             module_name: call.module_name.clone(),
                             module_source: call.module_source.clone(),
                             module_directory: call.module_directory.clone(),
+                            reference_position: current_position,
                         },
                     ));
                 },
@@ -626,10 +705,20 @@ pub fn validate_composition_ref_types_with_bindings(
     let mut seen_attributes = HashSet::new();
     errors.retain(|error| match error {
         CompositionRefError::ModuleCall(error) => {
-            seen_calls.insert((error.call.instance.clone(), error.error.to_string()))
+            seen_calls.insert(CompositionModuleCallErrorKey {
+                call_instance: error.call.instance.clone(),
+                argument: error.argument.clone(),
+                reference_position: error.reference_position,
+                kind: (&error.kind).into(),
+            })
         }
         CompositionRefError::Attribute(error) => {
-            seen_attributes.insert((error.module_identity(), error.error.attribute.clone()))
+            seen_attributes.insert(CompositionAttributeErrorKey {
+                module_identity: error.module_identity(),
+                attribute: error.error.attribute.clone(),
+                reference_position: error.reference_position,
+                kind: (&error.error.kind).into(),
+            })
         }
     });
     errors

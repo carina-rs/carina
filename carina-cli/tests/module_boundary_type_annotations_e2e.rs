@@ -255,6 +255,67 @@ let web2 = web_tier {
 }
 
 #[test]
+fn module_output_dedup_keeps_each_distinct_error_once_across_three_instances() {
+    let fixture = Fixture::module(
+        &[
+            ("arguments.crn", "arguments {\n  n: String\n}\n"),
+            (
+                "attributes.crn",
+                r#"attributes {
+  both: list(Bool) = [src.group_id, src.nonexistent_attr]
+}
+"#,
+            ),
+            (
+                "resources.crn",
+                r#"let src = aws.ec2.SecurityGroup {
+  name   = n
+  vpc_id = "vpc-fixed"
+}
+"#,
+            ),
+        ],
+        &[(
+            "main.crn",
+            r#"let bad_module = use { source = '../web_tier' }
+
+let one = bad_module { n = "one" }
+let two = bad_module { n = "two" }
+let three = bad_module { n = "three" }
+"#,
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    let declaration_errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.contains("attribute 'both'"))
+        .collect();
+
+    assert_eq!(
+        declaration_errors.len(),
+        2,
+        "both authored failures must survive, with instance copies deduplicated: {diagnostics:#?}",
+    );
+    assert_eq!(
+        declaration_errors
+            .iter()
+            .filter(|diagnostic| diagnostic.contains("type mismatch"))
+            .count(),
+        1,
+        "the mismatch must be reported once: {diagnostics:#?}",
+    );
+    assert_eq!(
+        declaration_errors
+            .iter()
+            .filter(|diagnostic| diagnostic.contains("unknown attribute 'nonexistent_attr'"))
+            .count(),
+        1,
+        "the unknown attribute must be reported once: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn schema_typed_module_argument_rejects_composition_attribute_at_call_boundary() {
     let module = issue_module("aws.ec2.Vpc.Id", ": aws.ec2.SecurityGroup.Id");
     let module = borrowed(&module);

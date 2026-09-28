@@ -94,7 +94,7 @@ impl ResolvedRefType {
 }
 
 /// Failure to resolve a statically known attribute path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RefTypeError {
     UnknownAttribute {
         binding: String,
@@ -110,7 +110,7 @@ pub enum RefTypeError {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RefTargetKind {
     Schema { resource_type: String },
     Composition,

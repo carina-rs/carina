@@ -3,7 +3,7 @@ use std::path::Path;
 
 use indexmap::IndexMap;
 
-use crate::parser::{ArgumentParameter, File, ParsedFile, ProviderContext, TypeExpr, UseStatement};
+use crate::parser::{ArgumentParameter, File, ParsedFile, ProviderContext, TypeExpr};
 
 /// The statically declared boundary of one imported module after dotted type
 /// expressions have been resolved against the caller's provider context.
@@ -16,6 +16,12 @@ pub struct ResolvedModuleSignature {
 /// Imported module alias to its resolved argument/output signature.
 pub type ResolvedModuleSignatures = HashMap<String, ResolvedModuleSignature>;
 
+// This snapshot loader does not own diagnostics. It keeps an unresolved type
+// when best-effort resolution fails so callers can still inspect the imported
+// signature; ModuleResolver::load_directory_module later runs
+// resolve_file_type_exprs over the imported module itself and rejects the
+// authored declaration before expansion. The end-to-end guarantee is pinned
+// by `carina-cli/tests/validate_unknown_custom_type_e2e.rs`.
 fn resolved_signature(parsed: &ParsedFile, config: &ProviderContext) -> ResolvedModuleSignature {
     let arguments = parsed
         .arguments
@@ -47,32 +53,18 @@ fn resolved_signature(parsed: &ParsedFile, config: &ProviderContext) -> Resolved
     }
 }
 
-/// Resolve signatures using a caller-supplied module snapshot loader.
-///
-/// The callback seam lets CLI recursive validation reuse its existing
-/// `ModuleWalk`, while ordinary CLI and LSP validation use the filesystem
-/// wrapper below. Type-expression resolution remains identical in both cases.
-pub fn resolve_module_signatures_with<E>(
-    parsed: &File<E>,
-    config: &ProviderContext,
-    mut load: impl FnMut(&UseStatement) -> Option<ParsedFile>,
-) -> ResolvedModuleSignatures {
-    parsed
-        .uses
-        .iter()
-        .filter_map(|import| {
-            load(import).map(|module| (import.alias.clone(), resolved_signature(&module, config)))
-        })
-        .collect()
-}
-
 /// Load and resolve every module signature imported by `parsed`.
 pub fn load_resolved_module_signatures<E>(
     parsed: &File<E>,
     base_dir: &Path,
     config: &ProviderContext,
 ) -> ResolvedModuleSignatures {
-    resolve_module_signatures_with(parsed, config, |import| {
-        super::load_module(&base_dir.join(&import.path))
-    })
+    parsed
+        .uses
+        .iter()
+        .filter_map(|import| {
+            super::load_module(&base_dir.join(&import.path))
+                .map(|module| (import.alias.clone(), resolved_signature(&module, config)))
+        })
+        .collect()
 }

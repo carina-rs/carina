@@ -1,7 +1,8 @@
 use super::*;
 use crate::parser::{BindingName, ParsedFile, ProviderContext, UntilPredicateAst, WaitBinding};
 use crate::resource::{
-    Composition, CompositionArgument, CompositionAttribute, Resource, ResourceId, Signature,
+    Composition, CompositionArgument, CompositionAttribute, CompositionCall, CompositionProvenance,
+    Resource, ResourceId, Signature,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
 use std::collections::HashMap;
@@ -681,6 +682,13 @@ fn make_schema(resource_type: &str, attrs: Vec<(&str, AttributeType)>) -> Resour
 }
 
 fn make_composition(binding: &str, attributes: &[&str]) -> Composition {
+    let call = CompositionCall {
+        module_name: "test_module".to_string(),
+        binding: Some(binding.to_string()),
+        instance: binding.to_string(),
+        module_source: None,
+        module_directory: None,
+    };
     Composition {
         id: ResourceId::with_identity("_virtual", binding),
         signature: Signature {
@@ -702,9 +710,21 @@ fn make_composition(binding: &str, attributes: &[&str]) -> Composition {
         dependency_bindings: Default::default(),
         module_name: "test_module".to_string(),
         instance: binding.to_string(),
-        provenance: Default::default(),
+        provenance: Box::new(CompositionProvenance::expanded(call.clone(), call)),
         quoted_string_attrs: Default::default(),
     }
+}
+
+fn set_composition_module(composition: &mut Composition, module_name: &str) {
+    composition.module_name = module_name.to_string();
+    let call = CompositionCall {
+        module_name: module_name.to_string(),
+        binding: composition.binding.clone(),
+        instance: composition.instance.clone(),
+        module_source: None,
+        module_directory: None,
+    };
+    *composition.provenance = CompositionProvenance::expanded(call.clone(), call);
 }
 
 #[test]
@@ -2830,7 +2850,7 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
         "vpc_id".to_string(),
         CompositionArgument::from_value(
             Value::resource_ref("inner".to_string(), "security_group_id".to_string(), vec![]),
-            Some(schema_type("ec2.Vpc")),
+            schema_type("ec2.Vpc"),
         ),
     );
     let mut parsed = empty_parsed();
@@ -2906,7 +2926,7 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
         );
         parsed.compositions.push(source);
         let mut consumer = make_composition(instance, &[]);
-        consumer.module_name = "bad_module".to_string();
+        set_composition_module(&mut consumer, "bad_module");
         consumer.signature.attributes.insert(
             "bad".to_string(),
             CompositionAttribute::from_value(
@@ -2934,6 +2954,74 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
 }
 
 #[test]
+fn post_expansion_module_attribute_dedup_keeps_distinct_errors() {
+    let security_group_id = TypeExpr::SchemaType {
+        provider: "aws".to_string(),
+        path: "ec2.SecurityGroup".to_string(),
+        type_name: "Id".to_string(),
+    };
+    let mut parsed = empty_parsed();
+
+    for instance in ["one", "two", "three"] {
+        let source_binding = format!("{instance}.src");
+        let mut source = make_composition(&source_binding, &[]);
+        source.signature.attributes.insert(
+            "group_id".to_string(),
+            CompositionAttribute::from_value(
+                Value::Concrete(ConcreteValue::String("sg-123".to_string())),
+                Some(security_group_id.clone()),
+            ),
+        );
+        parsed.compositions.push(source);
+
+        let mut consumer = make_composition(instance, &[]);
+        set_composition_module(&mut consumer, "bad_module");
+        consumer.signature.attributes.insert(
+            "both".to_string(),
+            CompositionAttribute::from_value(
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::resource_ref(source_binding.clone(), "group_id".to_string(), vec![]),
+                    Value::resource_ref(source_binding, "nonexistent_attr".to_string(), vec![]),
+                ])),
+                Some(TypeExpr::List(Box::new(TypeExpr::Bool))),
+            ),
+        );
+        parsed.compositions.push(consumer);
+    }
+
+    let schemas = SchemaRegistry::new();
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
+    let declaration_errors: Vec<_> = errors
+        .iter()
+        .map(ToString::to_string)
+        .filter(|error| error.contains("attribute 'both'"))
+        .collect();
+
+    assert_eq!(
+        declaration_errors.len(),
+        2,
+        "each distinct authored failure must survive exactly once: {declaration_errors:?}",
+    );
+    assert_eq!(
+        declaration_errors
+            .iter()
+            .filter(|error| error.contains("type mismatch"))
+            .count(),
+        1,
+        "the repeated type mismatch must be deduplicated per declaration: {declaration_errors:?}",
+    );
+    assert_eq!(
+        declaration_errors
+            .iter()
+            .filter(|error| error.contains("unknown attribute 'nonexistent_attr'"))
+            .count(),
+        1,
+        "the repeated unknown-attribute error must be deduplicated per declaration: {declaration_errors:?}",
+    );
+}
+
+#[test]
 fn post_expansion_anonymous_call_error_uses_module_label() {
     let schema_type = |path: &str| TypeExpr::SchemaType {
         provider: "aws".to_string(),
@@ -2951,12 +3039,12 @@ fn post_expansion_anonymous_call_error_uses_module_label() {
     let synthetic_instance = "needs_0101081440007054";
     let mut consumer = make_composition(synthetic_instance, &[]);
     consumer.binding = None;
-    consumer.module_name = "needs".to_string();
+    set_composition_module(&mut consumer, "needs");
     consumer.signature.arguments.insert(
         "vpc_id".to_string(),
         CompositionArgument::from_value(
             Value::resource_ref("source".to_string(), "group_id".to_string(), vec![]),
-            Some(schema_type("ec2.Vpc")),
+            schema_type("ec2.Vpc"),
         ),
     );
     let mut parsed = empty_parsed();

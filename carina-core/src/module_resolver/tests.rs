@@ -1288,7 +1288,7 @@ thing { name = 'after-edit' }
                 "role_name".to_string(),
                 vec![],
             ),
-            Some(TypeExpr::String),
+            TypeExpr::String,
         ),
     );
     parsed.compositions.push(nested);
@@ -2283,8 +2283,12 @@ fn test_nested_module_intra_ref_to_module_call_is_prefixed() {
         .iter()
         .find(|composition| composition.module_name == "inner")
         .expect("inner module composition must be retained");
-    let immediate_call = nested.diagnostic_call();
-    let root_call = nested.diagnostic_root_call();
+    let immediate_call = nested
+        .diagnostic_call()
+        .expect("nested expansion records its immediate call");
+    let root_call = nested
+        .diagnostic_root_call()
+        .expect("nested expansion records its root call");
     assert_eq!(immediate_call.binding.as_deref(), Some("web.net"));
     assert_eq!(immediate_call.instance, "web.net");
     assert_eq!(immediate_call.module_name, "inner");

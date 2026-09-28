@@ -3358,6 +3358,64 @@ fn module_boundary_identity_engine() -> DiagnosticEngine {
 }
 
 #[test]
+fn module_call_ref_fallback_anchors_second_anonymous_call() {
+    use carina_core::binding_index::BindingIndex;
+    use carina_core::module_resolver::ResolvedModuleSignature;
+    use carina_core::parser::{ArgumentParameter, TypeExpr};
+    use indexmap::IndexMap;
+    use std::collections::HashMap;
+
+    let engine = module_boundary_identity_engine();
+    let source = r#"let needs = use { source = '../needs' }
+
+let vpc = aws.ec2.Vpc {
+  name = "vpc"
+}
+
+let sg = aws.ec2.SecurityGroup {
+  name = "sg"
+}
+
+needs {
+  vpc_id = vpc.vpc_id
+}
+
+needs {
+  vpc_id = sg.group_id
+}
+"#;
+    let doc = create_document(source);
+    let parsed = doc.parsed().expect("fixture must parse");
+    let imported_modules = HashMap::from([(
+        "needs".to_string(),
+        ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "vpc_id".to_string(),
+                type_expr: TypeExpr::SchemaType {
+                    provider: "aws".to_string(),
+                    path: "ec2.Vpc".to_string(),
+                    type_name: "Id".to_string(),
+                },
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+        },
+    )]);
+    let bindings = BindingIndex::from_parsed(parsed, &engine.schemas);
+
+    let diagnostics =
+        engine.check_module_call_ref_types(&doc, parsed, &imported_modules, &bindings);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].range.start.line, 15,
+        "only the second anonymous call is invalid: {diagnostics:?}",
+    );
+    assert_eq!(diagnostics[0].range.start.character, 2);
+}
+
+#[test]
 fn module_attribute_schema_type_declaration_mismatch_matches_validate() {
     let engine = module_boundary_identity_engine();
     let tmp = tempfile::tempdir().unwrap();

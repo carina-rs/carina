@@ -1262,16 +1262,6 @@ pub fn validate_provider_region_with_ctx<E>(
     ))
 }
 
-pub fn validate_module_calls<E>(
-    parsed: &carina_core::parser::File<E>,
-    base_dir: &Path,
-    config: &carina_core::parser::ProviderContext,
-) -> Vec<AppError> {
-    let imported_modules =
-        module_resolver::load_resolved_module_signatures(parsed, base_dir, config);
-    validate_module_calls_with_imported(parsed, &imported_modules, config)
-}
-
 pub(crate) fn validate_module_calls_with_imported<E>(
     parsed: &carina_core::parser::File<E>,
     imported_modules: &module_resolver::ResolvedModuleSignatures,
