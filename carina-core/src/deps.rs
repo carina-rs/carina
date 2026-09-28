@@ -263,11 +263,10 @@ mod tests {
             IndexMap::new();
         attributes.insert(
             "role_arn".to_string(),
-            crate::resource::CompositionAttribute::from_value(Value::resource_ref(
-                "role".to_string(),
-                "arn",
-                vec![],
-            )),
+            crate::resource::CompositionAttribute::from_value(
+                Value::resource_ref("role".to_string(), "arn", vec![]),
+                None,
+            ),
         );
         let mut dep_bindings = BTreeSet::new();
         dep_bindings.insert("explicit_dep".to_string());

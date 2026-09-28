@@ -3257,7 +3257,7 @@ let b = consumer {
     assert_eq!(
         typo_diagnostics.len(),
         1,
-        "the LSP module-call argument walk should report the schema-backed typo once: {:?}",
+        "the shared module-call validator should report the schema-backed typo once: {:?}",
         diagnostics
             .iter()
             .map(|diagnostic| &diagnostic.message)
@@ -3266,10 +3266,282 @@ let b = consumer {
     assert!(
         typo_diagnostics[0]
             .message
-            .contains("on 'tg' (type 'elbv2.TargetGroup')"),
-        "the LSP diagnostic should resolve the argument ref through tg's schema: {:?}",
+            .contains("module call 'b': unknown attribute 'target_group_ar' on 'tg'"),
+        "the LSP diagnostic should come from the shared module-call validator: {:?}",
         typo_diagnostics[0].message,
     );
+    assert_eq!(
+        typo_diagnostics[0].range.start.line, 7,
+        "the structured argument name should anchor the diagnostic on `arn`",
+    );
+    assert_eq!(typo_diagnostics[0].range.start.character, 2);
+    assert_eq!(typo_diagnostics[0].range.end.character, 5);
+}
+
+#[test]
+fn module_call_argument_attribute_typo_is_reported_without_a_base_path() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let target_group_schema = ResourceSchema::new("elbv2.TargetGroup")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new(
+            "target_group_arn",
+            AttributeType::string(),
+        ));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", target_group_schema);
+    let engine = custom_engine(schemas);
+    let source = r#"let consumer = use { source = '../consumer_module' }
+
+let tg = awscc.elbv2.TargetGroup {
+  name = "caller"
+}
+
+let b = consumer {
+  arn = tg.target_group_ar
+}
+"#;
+    let doc = create_document(source);
+
+    let diagnostics = engine.analyze(&doc, None);
+    let typo_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("target_group_ar")
+                && diagnostic
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("unknown attribute")
+        })
+        .collect();
+
+    assert_eq!(
+        typo_diagnostics.len(),
+        1,
+        "module-call argument refs must retain existence checking without filesystem context: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(typo_diagnostics[0].range.start.line, 7);
+    assert_eq!(typo_diagnostics[0].range.start.character, 2);
+    assert_eq!(typo_diagnostics[0].range.end.character, 5);
+}
+
+fn module_boundary_identity_engine() -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+
+    let identity = |path: &str, kind: &str| {
+        AttributeType::refined_string(
+            Some(TypeIdentity::from_schema_type("aws", path, kind)),
+            None,
+            None,
+            None,
+        )
+    };
+    let vpc = ResourceSchema::new("ec2.Vpc")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("vpc_id", identity("ec2.Vpc", "Id")));
+    let security_group = ResourceSchema::new("ec2.SecurityGroup")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("vpc_id", identity("ec2.Vpc", "Id")))
+        .attribute(AttributeSchema::new(
+            "group_id",
+            identity("ec2.SecurityGroup", "Id"),
+        ));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("aws", vpc);
+    schemas.insert("aws", security_group);
+    custom_engine(schemas)
+}
+
+#[test]
+fn module_attribute_schema_type_declaration_mismatch_matches_validate() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("resources.crn"),
+        r#"let vpc = aws.ec2.Vpc {
+  name = "main"
+}
+
+let sg = aws.ec2.SecurityGroup {
+  name   = "sg"
+  vpc_id = vpc.vpc_id
+}
+"#,
+    )
+    .unwrap();
+    let attributes = r#"attributes {
+  bad: aws.ec2.Vpc.Id = sg.group_id
+}
+"#;
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("attribute 'bad': type mismatch")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic.message.contains("from sg.group_id")
+        }),
+        "LSP must report the same declaration mismatch as validate: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn composition_consumer_identity_mismatch_matches_validate() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("module");
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("attributes.crn"),
+        "attributes {\n  security_group_id = sg.group_id\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("resources.crn"),
+        r#"let sg = aws.ec2.SecurityGroup {
+  name   = "module"
+  vpc_id = vpc_id
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("main.crn"),
+        r#"let component = use { source = '../module' }
+
+let vpc = aws.ec2.Vpc {
+  name = "main"
+}
+
+let instance = component {
+  vpc_id = vpc.vpc_id
+}
+"#,
+    )
+    .unwrap();
+    let resources = r#"let consumer = aws.ec2.SecurityGroup {
+  name   = "consumer"
+  vpc_id = instance.security_group_id
+}
+"#;
+    std::fs::write(root.join("resources.crn"), resources).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "resources.crn", resources);
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("Type mismatch")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic
+                    .message
+                    .contains("from instance.security_group_id")
+        }),
+        "LSP must report the same composition-consumer mismatch as validate: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn composition_argument_identity_mismatch_matches_validate_at_call_boundary() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("module");
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        module.join("arguments.crn"),
+        r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("resources.crn"),
+        r#"let sg = aws.ec2.SecurityGroup {
+  name   = "module-sg"
+  vpc_id = vpc_id
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("attributes.crn"),
+        r#"attributes {
+  security_group_id = sg.group_id
+}
+"#,
+    )
+    .unwrap();
+    let main = r#"let issue = use { source = '../module' }
+
+let vpc = aws.ec2.Vpc {
+  name = "root"
+}
+
+let web = issue {
+  vpc_id = vpc.vpc_id
+}
+
+let web2 = issue {
+  vpc_id = web.security_group_id
+}
+"#;
+    std::fs::write(root.join("main.crn"), main).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", main);
+
+    let mismatch = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("module call 'web2': argument 'vpc_id'")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic.message.contains("from web.security_group_id")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "LSP must report the same module-call boundary mismatch as validate: {:?}",
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| &diagnostic.message)
+                    .collect::<Vec<_>>(),
+            )
+        });
+    assert_eq!(
+        mismatch.range.start.line, 11,
+        "the structured call label must anchor the second call, not the first",
+    );
+    assert_eq!(mismatch.range.start.character, 2);
 }
 
 #[test]
@@ -4986,7 +5258,7 @@ fn attributes_block_reports_unknown_attribute_on_sibling_binding() {
 }
 
 #[test]
-fn attributes_block_simple_annotation_uses_core_narrowed_snake_equality() {
+fn attributes_block_specific_identity_widens_to_simple_annotation() {
     let engine = attributes_sibling_resource_engine();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().join("module");
@@ -5004,10 +5276,9 @@ fn attributes_block_simple_annotation_uses_core_narrowed_snake_equality() {
         })
         .collect();
 
-    assert_eq!(
-        mismatches.len(),
-        1,
-        "Simple annotations must use core's narrowed snake-name equality: {:?}",
+    assert!(
+        mismatches.is_empty(),
+        "a specific aws.iam.Policy.Arn source must widen into a bare Arn sink: {:?}",
         diagnostics
             .iter()
             .map(|diagnostic| &diagnostic.message)

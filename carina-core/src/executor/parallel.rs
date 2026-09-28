@@ -1383,11 +1383,10 @@ mod tests {
             indexmap::IndexMap::new();
         virt_attrs.insert(
             "parent_id".to_string(),
-            crate::resource::CompositionAttribute::from_value(Value::resource_ref(
-                "parent",
-                "id",
-                vec![],
-            )),
+            crate::resource::CompositionAttribute::from_value(
+                Value::resource_ref("parent", "id", vec![]),
+                None,
+            ),
         );
         let virt = Composition {
             id: ResourceId::with_provider_identity("_virtual", "_virtual", "module", None),
@@ -1477,11 +1476,10 @@ mod tests {
             indexmap::IndexMap::new();
         virt_attrs.insert(
             "role_name".to_string(),
-            crate::resource::CompositionAttribute::from_value(Value::resource_ref(
-                "bootstrap.role",
-                "role_name",
-                vec![],
-            )),
+            crate::resource::CompositionAttribute::from_value(
+                Value::resource_ref("bootstrap.role", "role_name", vec![]),
+                None,
+            ),
         );
         let virt = Composition {
             id: ResourceId::with_provider_identity("_virtual", "_virtual", "bootstrap", None),

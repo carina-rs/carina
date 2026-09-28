@@ -43,9 +43,14 @@
 //! ```
 
 use crate::parser::{BindingName, ResourceRef};
-use crate::resource::{Composition, PlanInputState, Resource, ResourceId, State, Value};
-use crate::schema::{ResourceSchema, SchemaRegistry};
-use std::collections::HashMap;
+use crate::resource::{
+    AccessPath, Composition, PathSegment, PlanInputState, Resource, ResourceId, State, Subscript,
+    Value,
+};
+use crate::schema::{
+    AttributeType, ResourceSchema, SchemaRegistry, Shape, TypeInSchema, suggest_similar_name,
+};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Statically known validation surface for a binding.
 #[derive(Debug, Clone, Copy)]
@@ -60,6 +65,116 @@ pub enum BindingTarget<'a> {
 #[derive(Debug)]
 pub struct BindingEntry<'a> {
     pub target: BindingTarget<'a>,
+}
+
+/// A reference-path type paired with the definition context required to
+/// interpret any nested schema `Ref`s.
+#[derive(Debug, Clone)]
+pub struct ResolvedRefType {
+    attr_type: AttributeType,
+    defs: BTreeMap<String, AttributeType>,
+}
+
+impl ResolvedRefType {
+    fn new(attr_type: AttributeType, defs: BTreeMap<String, AttributeType>) -> Self {
+        Self { attr_type, defs }
+    }
+
+    pub fn type_in_schema(&self) -> TypeInSchema<'_> {
+        self.attr_type.in_schema(&self.defs)
+    }
+
+    pub fn attr_type(&self) -> &AttributeType {
+        &self.attr_type
+    }
+
+    pub fn defs(&self) -> &BTreeMap<String, AttributeType> {
+        &self.defs
+    }
+}
+
+/// Failure to resolve a statically known attribute path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefTypeError {
+    UnknownAttribute {
+        binding: String,
+        attribute: String,
+        known_attributes: Vec<String>,
+        target: RefTargetKind,
+    },
+    UnknownStructField {
+        path: String,
+        field: String,
+        struct_name: String,
+        known_fields: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefTargetKind {
+    Schema { resource_type: String },
+    Composition,
+}
+
+impl std::fmt::Display for RefTypeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownAttribute {
+                binding,
+                attribute,
+                known_attributes,
+                target: _,
+            } => {
+                let known: Vec<&str> = known_attributes.iter().map(String::as_str).collect();
+                write!(
+                    f,
+                    "unknown attribute '{}' on '{}' in reference {}.{}{}",
+                    attribute,
+                    binding,
+                    binding,
+                    attribute,
+                    suggestion_suffix(attribute, &known),
+                )
+            }
+            Self::UnknownStructField {
+                path,
+                field,
+                struct_name,
+                known_fields,
+            } => {
+                let known: Vec<&str> = known_fields.iter().map(String::as_str).collect();
+                write!(
+                    f,
+                    "unknown field '{}' on struct '{}' in reference {}; known fields: {}.{}",
+                    field,
+                    struct_name,
+                    path,
+                    known.join(", "),
+                    suggestion_suffix(field, &known),
+                )
+            }
+        }
+    }
+}
+
+/// Static result for one complete resource-reference path.
+#[derive(Debug, Clone)]
+pub enum RefType {
+    Typed(ResolvedRefType),
+    /// The binding exists but no sound schema type can be represented. This
+    /// includes derived composition values and resource-handle annotations.
+    Unchecked,
+    UnknownBinding {
+        binding: String,
+        attribute: String,
+    },
+    UnknownAttribute(RefTypeError),
+}
+
+fn suggestion_suffix(unknown: &str, known: &[&str]) -> String {
+    suggest_similar_name(unknown, known)
+        .map(|suggestion| format!(" Did you mean '{}'?", suggestion))
+        .unwrap_or_default()
 }
 
 /// Index of `binding_name → validation target` for every named binding
@@ -151,6 +266,106 @@ impl<'a> BindingIndex<'a> {
         self.entries.get(name)
     }
 
+    /// Resolve the static type of one complete reference path.
+    ///
+    /// Schema bindings are narrowed through the path directly. Composition
+    /// bindings prefer a liftable declared boundary type; otherwise a
+    /// forwarded output recursively inherits the target path's type. Derived
+    /// values and non-representable annotations remain unchecked. The active
+    /// path set bounds malformed/cyclic forwarded chains.
+    pub fn ref_type(&self, path: &AccessPath) -> RefType {
+        self.ref_type_inner(path, &mut HashSet::new())
+    }
+
+    fn ref_type_inner(
+        &self,
+        path: &AccessPath,
+        visiting: &mut HashSet<(String, String)>,
+    ) -> RefType {
+        let key = (path.binding().to_string(), path.attribute().to_string());
+        if !visiting.insert(key.clone()) {
+            return RefType::Unchecked;
+        }
+
+        let result = match self.entries.get(path.binding()) {
+            None if self.known_names.contains(path.binding()) => RefType::Unchecked,
+            None => RefType::UnknownBinding {
+                binding: path.binding().to_string(),
+                attribute: path.attribute().to_string(),
+            },
+            Some(entry) => match entry.target {
+                BindingTarget::Schema(schema) => {
+                    let Some(attribute) = schema.attributes.get(path.attribute()) else {
+                        visiting.remove(&key);
+                        return RefType::UnknownAttribute(unknown_attribute(
+                            path,
+                            schema.attributes.keys(),
+                            RefTargetKind::Schema {
+                                resource_type: schema.resource_type.clone(),
+                            },
+                        ));
+                    };
+                    match narrow_type(&attribute.attr_type, path.segments(), &schema.defs, path) {
+                        Ok(Some(attr_type)) => RefType::Typed(ResolvedRefType::new(
+                            attr_type.clone(),
+                            schema.defs.clone(),
+                        )),
+                        Ok(None) => RefType::Unchecked,
+                        Err(error) => RefType::UnknownAttribute(error),
+                    }
+                }
+                BindingTarget::Composition(composition) => {
+                    let Some(attribute) = composition.signature.attributes.get(path.attribute())
+                    else {
+                        visiting.remove(&key);
+                        return RefType::UnknownAttribute(unknown_attribute(
+                            path,
+                            composition.signature.attributes.keys(),
+                            RefTargetKind::Composition,
+                        ));
+                    };
+
+                    if let Some(declared) = attribute
+                        .declared_type()
+                        .and_then(crate::validation::lift_type_expr)
+                    {
+                        let defs = crate::schema::empty_defs_for_schema_walks();
+                        match narrow_type(&declared, path.segments(), defs, path) {
+                            Ok(Some(attr_type)) => RefType::Typed(ResolvedRefType::new(
+                                attr_type.clone(),
+                                defs.clone(),
+                            )),
+                            Ok(None) => RefType::Unchecked,
+                            Err(error) => RefType::UnknownAttribute(error),
+                        }
+                    } else if let Some(forwarded) = attribute.forwarded_path() {
+                        match self.ref_type_inner(forwarded, visiting) {
+                            RefType::Typed(resolved) => match narrow_type(
+                                &resolved.attr_type,
+                                path.segments(),
+                                &resolved.defs,
+                                path,
+                            ) {
+                                Ok(Some(attr_type)) => RefType::Typed(ResolvedRefType::new(
+                                    attr_type.clone(),
+                                    resolved.defs,
+                                )),
+                                Ok(None) => RefType::Unchecked,
+                                Err(error) => RefType::UnknownAttribute(error),
+                            },
+                            other => other,
+                        }
+                    } else {
+                        RefType::Unchecked
+                    }
+                }
+            },
+        };
+
+        visiting.remove(&key);
+        result
+    }
+
     /// True iff a binding by this name was declared anywhere in the parsed
     /// file, *even if its schema could not be resolved*. Used to
     /// distinguish "unknown binding" diagnostics from "known binding but
@@ -181,6 +396,60 @@ impl<'a> BindingIndex<'a> {
             })
             .collect()
     }
+}
+
+fn unknown_attribute<'a>(
+    path: &AccessPath,
+    known: impl IntoIterator<Item = &'a String>,
+    target: RefTargetKind,
+) -> RefTypeError {
+    RefTypeError::UnknownAttribute {
+        binding: path.binding().to_string(),
+        attribute: path.attribute().to_string(),
+        known_attributes: known.into_iter().cloned().collect(),
+        target,
+    }
+}
+
+fn narrow_type<'a>(
+    start: &'a AttributeType,
+    segments: &[PathSegment],
+    defs: &'a BTreeMap<String, AttributeType>,
+    full_path: &AccessPath,
+) -> Result<Option<&'a AttributeType>, RefTypeError> {
+    let mut current = start;
+    for segment in segments {
+        current = match (segment, current.shape_with_defs(defs)) {
+            (PathSegment::Field { name }, Shape::Struct { name: struct_name }) => {
+                let fields = crate::schema::struct_fields_with_defs(current, defs)
+                    .expect("Shape::Struct must expose struct fields internally");
+                let Some(field) = fields.iter().find(|field| field.name == *name) else {
+                    return Err(RefTypeError::UnknownStructField {
+                        path: full_path.to_dot_string(),
+                        field: name.clone(),
+                        struct_name: struct_name.to_string(),
+                        known_fields: fields.iter().map(|field| field.name.clone()).collect(),
+                    });
+                };
+                &field.field_type
+            }
+            (PathSegment::Field { .. }, Shape::Map { value, .. }) => value,
+            (
+                PathSegment::Subscript {
+                    index: Subscript::Int { .. },
+                },
+                Shape::List { element_type, .. },
+            ) => element_type,
+            (
+                PathSegment::Subscript {
+                    index: Subscript::Str { .. },
+                },
+                Shape::Map { value, .. },
+            ) => value,
+            _ => return Ok(None),
+        };
+    }
+    Ok(Some(current))
 }
 
 /// Origin of a binding name in [`BindingNameSet`]. Eight kinds, one per
@@ -882,6 +1151,7 @@ mod tests {
                         Value::Concrete(crate::resource::ConcreteValue::String(
                             "arn:example".to_string(),
                         )),
+                        None,
                     ),
                 },
             },
@@ -1124,6 +1394,67 @@ let vpc = aws.ec2.Vpc {
         let registry = registry_with_vpc();
         let index = BindingIndex::from_parsed(&parsed, &registry);
         assert!(index.get("missing").is_none());
+    }
+
+    #[test]
+    fn ref_type_infers_unannotated_forwarded_composition_attribute() {
+        let mut parsed = parse(
+            r#"
+let vpc = aws.ec2.Vpc {
+    name = "v"
+    cidr_block = "10.0.0.0/16"
+}
+"#,
+            &Default::default(),
+        )
+        .expect("parse");
+        let mut output = composition("instance");
+        output.signature.attributes.insert(
+            "cidr".to_string(),
+            CompositionAttribute::from_value(
+                Value::resource_ref("vpc".to_string(), "cidr_block", vec![]),
+                None,
+            ),
+        );
+        parsed.compositions.push(output);
+        let registry = registry_with_vpc();
+        let index = BindingIndex::from_parsed(&parsed, &registry);
+
+        let RefType::Typed(resolved) = index.ref_type(&AccessPath::new("instance", "cidr")) else {
+            panic!("forwarded composition attribute must inherit its source type");
+        };
+        assert_eq!(resolved.type_in_schema().resolved_type_name(), "String");
+    }
+
+    #[test]
+    fn ref_type_forwarded_composition_cycle_is_unchecked() {
+        let make_forwarder = |binding: &str, target: &str| Composition {
+            id: ResourceId::with_identity("_virtual", binding),
+            signature: Signature {
+                arguments: indexmap::IndexMap::new(),
+                attributes: indexmap::indexmap! {
+                    "out".to_string() => CompositionAttribute::from_value(
+                        Value::resource_ref(target.to_string(), "out", vec![]),
+                        None,
+                    ),
+                },
+            },
+            binding: Some(binding.to_string()),
+            dependency_bindings: Default::default(),
+            module_name: "cycle".to_string(),
+            instance: binding.to_string(),
+            quoted_string_attrs: Default::default(),
+        };
+        let mut parsed = parse("", &Default::default()).expect("parse");
+        parsed.compositions.push(make_forwarder("a", "b"));
+        parsed.compositions.push(make_forwarder("b", "a"));
+        let registry = SchemaRegistry::new();
+        let index = BindingIndex::from_parsed(&parsed, &registry);
+
+        assert!(matches!(
+            index.ref_type(&AccessPath::new("a", "out")),
+            RefType::Unchecked
+        ));
     }
 }
 

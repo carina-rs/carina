@@ -6,15 +6,28 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::document::Document;
 use crate::position;
-use carina_core::binding_index::{BindingIndex, BindingTarget};
+use carina_core::binding_index::{BindingIndex, RefTargetKind, RefType, RefTypeError};
 use carina_core::builtins;
 use carina_core::config_loader::{DeclarationKind, DirectoryParseResult, DuplicateDeclaration};
-use carina_core::parser::{ArgumentParameter, ParsedFile, TypeExpr};
+use carina_core::parser::{ModuleCall, ParsedFile, TypeExpr};
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::suggest_similar_name;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
 use super::{DiagnosticEngine, carina_diagnostic};
+
+fn module_call_header_position(line: &str, call: &ModuleCall) -> Option<usize> {
+    let module_pattern = format!("{} {{", call.module_name);
+    line.match_indices(&module_pattern)
+        .find_map(|(byte_pos, _)| {
+            let Some(binding) = call.binding_name.as_deref() else {
+                return Some(byte_pos);
+            };
+            let (lhs, _) = line[..byte_pos].rsplit_once('=')?;
+            let written_binding = lhs.trim().strip_prefix("let")?.trim();
+            (written_binding == binding).then_some(byte_pos)
+        })
+}
 
 /// Locate the `source = '<expected>'` or `source = "<expected>"` line inside
 /// an `upstream_state { ... }` block whose value equals `expected`. Returns
@@ -1081,30 +1094,21 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         parsed: &ParsedFile,
-        base_path: &std::path::Path,
+        imported_modules: &carina_core::module_resolver::ResolvedModuleSignatures,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        // Build a map of imported modules: alias -> argument parameters
-        let mut imported_modules: HashMap<String, Vec<ArgumentParameter>> = HashMap::new();
-
-        for import in &parsed.uses {
-            let module_path = base_path.join(&import.path);
-            if let Some(module_parsed) = carina_core::module_resolver::load_module(&module_path) {
-                imported_modules.insert(import.alias.clone(), module_parsed.arguments);
-            }
-        }
-
         // Check each module call
         for call in &parsed.module_calls {
-            if let Some(module_args) = imported_modules.get(&call.module_name) {
+            if let Some(signature) = imported_modules.get(&call.module_name) {
+                let module_args = &signature.arguments;
                 // Check for unknown parameters
                 for (arg_name, arg_value) in &call.arguments {
                     let matching_arg = module_args.iter().find(|arg| &arg.name == arg_name);
 
                     if matching_arg.is_none() {
                         if let Some((line, col)) =
-                            self.find_module_call_arg_position(doc, &call.module_name, arg_name)
+                            self.find_module_call_arg_position(doc, call, arg_name)
                         {
                             // Find similar parameter names for suggestion
                             let suggestion = module_args
@@ -1134,7 +1138,7 @@ impl DiagnosticEngine {
                     if let Some(type_error) =
                         self.validate_module_arg_type(&arg.type_expr, arg_value)
                         && let Some((line, col)) =
-                            self.find_module_call_arg_position(doc, &call.module_name, arg_name)
+                            self.find_module_call_arg_position(doc, call, arg_name)
                     {
                         diagnostics.push(carina_diagnostic(
                             line,
@@ -1150,8 +1154,7 @@ impl DiagnosticEngine {
                 for arg in module_args {
                     if arg.default.is_none()
                         && !call.arguments.contains_key(&arg.name)
-                        && let Some((line, col)) =
-                            self.find_module_call_position(doc, &call.module_name)
+                        && let Some((line, col)) = self.find_module_call_position(doc, call)
                     {
                         diagnostics.push(carina_diagnostic(
                             line,
@@ -1171,6 +1174,66 @@ impl DiagnosticEngine {
         diagnostics
     }
 
+    /// Type-check reference-valued module arguments through the same
+    /// lifted source→sink relation and [`BindingIndex`] resolver as the CLI.
+    /// Literal arguments remain owned by `check_module_calls` / #2860.
+    pub(super) fn check_module_call_ref_types(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+        imported_modules: &carina_core::module_resolver::ResolvedModuleSignatures,
+        binding_index: &BindingIndex<'_>,
+    ) -> Vec<Diagnostic> {
+        let mut argument_names: HashSet<String> = parsed
+            .arguments
+            .iter()
+            .map(|arg| arg.name.clone())
+            .collect();
+        argument_names.extend(
+            parsed
+                .upstream_states
+                .iter()
+                .map(|state| state.binding.clone()),
+        );
+
+        carina_core::validation::validate_module_call_argument_ref_types_with_bindings(
+            &parsed.module_calls,
+            imported_modules,
+            &argument_names,
+            binding_index,
+        )
+        .into_iter()
+        .map(|error| {
+            let call = parsed.module_calls.iter().find(|call| {
+                call.binding_name.as_deref().unwrap_or(&call.module_name) == error.call.as_str()
+            });
+            let argument_position = call.and_then(|call| {
+                self.find_module_call_arg_position(doc, call, &error.argument)
+                    .map(|(line, col)| (line, col, error.argument.chars().count() as u32))
+            });
+            let call_position = call.and_then(|call| {
+                self.find_module_call_position(doc, call)
+                    .map(|(line, col)| (line, col, call.module_name.chars().count() as u32))
+            });
+            let ref_text = error.path.to_dot_string();
+            let ref_position = self
+                .find_ref_value_position(doc, &ref_text)
+                .map(|(line, col)| (line, col, ref_text.chars().count() as u32));
+            let (line, col, width) = argument_position
+                .or(call_position)
+                .or(ref_position)
+                .unwrap_or((0, 0, 1));
+            carina_diagnostic(
+                line,
+                col,
+                col + width,
+                DiagnosticSeverity::WARNING,
+                error.to_string(),
+            )
+        })
+        .collect()
+    }
+
     /// Validate a module argument value against its expected type.
     pub(super) fn validate_module_arg_type(
         &self,
@@ -1184,13 +1247,12 @@ impl DiagnosticEngine {
     pub(super) fn find_module_call_position(
         &self,
         doc: &Document,
-        module_name: &str,
+        call: &ModuleCall,
     ) -> Option<(u32, u32)> {
         let text = doc.text();
-        let pattern = format!("{} {{", module_name);
 
         for (line_idx, line) in text.lines().enumerate() {
-            if let Some(byte_pos) = line.find(&pattern) {
+            if let Some(byte_pos) = module_call_header_position(line, call) {
                 return Some((
                     line_idx as u32,
                     position::byte_offset_to_char_offset(line, byte_pos),
@@ -1204,15 +1266,14 @@ impl DiagnosticEngine {
     pub(super) fn find_module_call_arg_position(
         &self,
         doc: &Document,
-        module_name: &str,
+        call: &ModuleCall,
         arg_name: &str,
     ) -> Option<(u32, u32)> {
         let text = doc.text();
         let mut in_module_call = false;
-        let module_pattern = format!("{} {{", module_name);
 
         for (line_idx, line) in text.lines().enumerate() {
-            if line.contains(&module_pattern) {
+            if module_call_header_position(line, call).is_some() {
                 in_module_call = true;
             }
 
@@ -1412,9 +1473,22 @@ impl DiagnosticEngine {
             }
         }
 
+        // Buffer parses use the bootstrap provider context, so dotted
+        // boundary annotations remain `DottedUnresolved` even when schemas
+        // are loaded. Resolve a local copy before the BindingIndex-backed
+        // directional check, matching the CLI's pre-expansion module pass.
+        let mut resolved_attribute_params = parsed.attribute_params.clone();
+        for parameter in &mut resolved_attribute_params {
+            if let Some(type_expr) = &parameter.type_expr
+                && let Ok(resolved) =
+                    carina_core::validation::resolve_type_expr(type_expr, &self.provider_context)
+            {
+                parameter.type_expr = Some(resolved);
+            }
+        }
         if let Err(ref_errors) =
             carina_core::validation::validate_attribute_param_ref_types_with_bindings(
-                &parsed.attribute_params,
+                &resolved_attribute_params,
                 binding_index,
             )
         {
@@ -1440,125 +1514,6 @@ impl DiagnosticEngine {
         }
 
         diagnostics
-    }
-
-    /// Resolve an export's `binding.attr` value against the sibling-binding
-    /// projection before applying the export's declared type.
-    fn check_export_ref_type(
-        &self,
-        type_expr: &TypeExpr,
-        binding: &str,
-        attr: &str,
-        sibling_bindings: &HashMap<String, String>,
-    ) -> Option<String> {
-        let resource_type = sibling_bindings.get(binding)?;
-        let (provider, rt) = resource_type
-            .split_once('.')
-            .unwrap_or(("", resource_type.as_str()));
-        let schema = self
-            .schemas
-            .get(provider, rt, carina_core::schema::SchemaKind::Resource)
-            .or_else(|| {
-                self.schemas
-                    .get(provider, rt, carina_core::schema::SchemaKind::DataSource)
-            })?;
-        let attr_schema = schema.attributes.get(attr)?;
-        let ref_type = &attr_schema.attr_type;
-        if carina_core::validation::is_type_expr_compatible_with_schema(
-            type_expr,
-            ref_type,
-            &schema.defs,
-        ) {
-            return None;
-        }
-        Some(format!(
-            "type mismatch: expected {}, got {} (from {}.{})",
-            type_expr,
-            schema.type_in_schema(ref_type).resolved_type_name(),
-            binding,
-            attr
-        ))
-    }
-
-    /// Type-check an export value, resolving cross-file references against
-    /// sibling bindings and schemas.
-    fn validate_export_type_with_ref_awareness(
-        &self,
-        type_expr: &TypeExpr,
-        value: &Value,
-        sibling_bindings: &HashMap<String, String>,
-    ) -> Option<String> {
-        match (type_expr, value) {
-            // Bare `binding.attribute` ref: check the head's schema type.
-            // Refs with subscripts or a field_path narrow inside the
-            // head's type and would need a positional walker to compare
-            // against the receiver precisely (#2475); skip the
-            // comparison rather than false-flag against the head's
-            // outer type.
-            (_, Value::Deferred(DeferredValue::ResourceRef { path }))
-                if path.segments().is_empty() =>
-            {
-                self.check_export_ref_type(
-                    type_expr,
-                    path.binding(),
-                    path.attribute(),
-                    sibling_bindings,
-                )
-            }
-            (_, Value::Deferred(DeferredValue::ResourceRef { .. })) => None,
-            // Bare-binding ref (#2847): no attribute selector means we
-            // cannot localize the type at this checkpoint without a
-            // separate let/argument lookup. Skip rather than false-flag
-            // — same policy as the `ResourceRef` fallthrough above.
-            (_, Value::Deferred(DeferredValue::BindingRef { .. })) => None,
-            // List: recurse into elements
-            (TypeExpr::List(inner), Value::Concrete(ConcreteValue::List(items))) => {
-                for (i, item) in items.iter().enumerate() {
-                    if let Some(e) =
-                        self.validate_export_type_with_ref_awareness(inner, item, sibling_bindings)
-                    {
-                        return Some(format!("Element {}: {}", i, e));
-                    }
-                }
-                None
-            }
-            // Map: recurse into values
-            (TypeExpr::Map(inner), Value::Concrete(ConcreteValue::Map(map))) => {
-                for (key, val) in map {
-                    if let Some(e) =
-                        self.validate_export_type_with_ref_awareness(inner, val, sibling_bindings)
-                    {
-                        return Some(format!("Key '{}': {}", key, e));
-                    }
-                }
-                None
-            }
-            // Recurse through this ref-aware walker — not `validate_type_expr_value` —
-            // so cross-file refs inside struct fields still resolve against sibling bindings.
-            (TypeExpr::Struct { fields }, Value::Concrete(ConcreteValue::Map(map))) => {
-                if let Some(e) = carina_core::validation::struct_field_shape_errors(fields, map) {
-                    return Some(e);
-                }
-                for (name, field_ty) in fields {
-                    if let Some(v) = map.get(name)
-                        && let Some(e) = self.validate_export_type_with_ref_awareness(
-                            field_ty,
-                            v,
-                            sibling_bindings,
-                        )
-                    {
-                        return Some(format!("field '{}': {}", name, e));
-                    }
-                }
-                None
-            }
-            // Everything else: normal validation
-            _ => carina_core::validation::validate_type_expr_value(
-                type_expr,
-                value,
-                &self.provider_context,
-            ),
-        }
     }
 
     /// Find the direct-member line for an attributes parameter and return its
@@ -1638,14 +1593,16 @@ impl DiagnosticEngine {
         doc: &Document,
         parsed: &ParsedFile,
         merged: Option<&ParsedFile>,
-        sibling_bindings: &HashMap<String, String>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
         for param in &parsed.export_params {
             if let (Some(type_expr), Some(value)) = (&param.type_expr, &param.value)
-                && let Some(type_error) =
-                    self.validate_export_type_with_ref_awareness(type_expr, value, sibling_bindings)
+                && let Some(type_error) = carina_core::validation::validate_type_expr_value(
+                    type_expr,
+                    value,
+                    &self.provider_context,
+                )
                 && let Some((line, col)) = self.find_exports_param_position(doc, &param.name)
             {
                 diagnostics.push(carina_diagnostic(
@@ -2025,8 +1982,9 @@ impl DiagnosticEngine {
     /// When a ResourceRef like `igw.internet_gateway_idd` references an attribute
     /// that doesn't exist in the referenced resource's schema, emit a warning
     /// with a "did you mean" suggestion if a similar attribute exists.
-    /// Attribute-parameter refs are excluded because `check_attributes_blocks`
-    /// maps their shared core validation errors instead.
+    /// Attribute-parameter and module-call refs are excluded because
+    /// `check_attributes_blocks` and `check_module_call_ref_types` map their
+    /// shared core validation errors instead.
     pub(super) fn check_resource_ref_attributes(
         &self,
         doc: &Document,
@@ -2045,13 +2003,6 @@ impl DiagnosticEngine {
             }
         }
 
-        // Also check module call arguments
-        for call in &parsed.module_calls {
-            for value in call.arguments.values() {
-                self.collect_ref_attr_diagnostics(doc, value, binding_index, &mut diagnostics);
-            }
-        }
-
         diagnostics
     }
 
@@ -2066,41 +2017,29 @@ impl DiagnosticEngine {
         value.visit_resource_refs(&mut |path| {
             let binding_name = path.binding();
             let attribute_name = path.attribute();
-            let Some(entry) = binding_index.get(binding_name) else {
-                return;
-            };
-            let message = match entry.target {
-                BindingTarget::Schema(ref_schema) => {
-                    if ref_schema.attributes.contains_key(attribute_name) {
-                        return;
-                    }
-                    let known_attrs: Vec<&str> = ref_schema
-                        .attributes
-                        .keys()
-                        .map(|name| name.as_str())
-                        .collect();
+            let message = match binding_index.ref_type(path) {
+                RefType::UnknownAttribute(RefTypeError::UnknownAttribute {
+                    known_attributes,
+                    target: RefTargetKind::Schema { resource_type },
+                    ..
+                }) => {
+                    let known_attrs: Vec<&str> =
+                        known_attributes.iter().map(String::as_str).collect();
                     let suggestion = suggest_similar_name(attribute_name, &known_attrs)
                         .map(|suggestion| format!(" Did you mean '{}'?", suggestion))
                         .unwrap_or_default();
                     format!(
                         "Unknown attribute '{}' on '{}' (type '{}'){}",
-                        attribute_name, binding_name, ref_schema.resource_type, suggestion,
+                        attribute_name, binding_name, resource_type, suggestion,
                     )
                 }
-                BindingTarget::Composition(composition) => {
-                    if composition
-                        .signature
-                        .attributes
-                        .contains_key(attribute_name)
-                    {
-                        return;
-                    }
-                    let known_attrs: Vec<&str> = composition
-                        .signature
-                        .attributes
-                        .keys()
-                        .map(|name| name.as_str())
-                        .collect();
+                RefType::UnknownAttribute(RefTypeError::UnknownAttribute {
+                    known_attributes,
+                    target: RefTargetKind::Composition,
+                    ..
+                }) => {
+                    let known_attrs: Vec<&str> =
+                        known_attributes.iter().map(String::as_str).collect();
                     let suffix = suggest_similar_name(attribute_name, &known_attrs)
                         .map(|suggestion| format!(". Did you mean '{}'?", suggestion))
                         .unwrap_or_else(|| ".".to_string());
@@ -2109,6 +2048,8 @@ impl DiagnosticEngine {
                         attribute_name, binding_name, suffix,
                     )
                 }
+                RefType::UnknownAttribute(error) => error.to_string(),
+                RefType::Typed(_) | RefType::Unchecked | RefType::UnknownBinding { .. } => return,
             };
 
             let ref_text = format!("{}.{}", binding_name, attribute_name);

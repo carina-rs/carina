@@ -994,12 +994,7 @@ pub fn redact_secrets_in_virtual(
             .attributes
             .iter()
             .map(|(k, attr)| {
-                redact_secrets_in_value(&attr.to_value()).map(|rv| {
-                    (
-                        k.clone(),
-                        crate::resource::CompositionAttribute::from_value(rv),
-                    )
-                })
+                redact_secrets_in_value(&attr.to_value()).map(|rv| (k.clone(), attr.with_value(rv)))
             })
             .collect();
     let mut out = resource.clone();
@@ -3404,15 +3399,19 @@ mod tests {
         let mut attrs: indexmap::IndexMap<String, CompositionAttribute> = indexmap::IndexMap::new();
         attrs.insert(
             "non_secret".to_string(),
-            CompositionAttribute::from_value(Value::Concrete(ConcreteValue::String(
-                "kept".to_string(),
-            ))),
+            CompositionAttribute::from_value(
+                Value::Concrete(ConcreteValue::String("kept".to_string())),
+                None,
+            ),
         );
         attrs.insert(
             "secret_field".to_string(),
-            CompositionAttribute::from_value(Value::Deferred(DeferredValue::Secret(Box::new(
-                Value::Concrete(ConcreteValue::String("plaintext-must-not-leak".to_string())),
-            )))),
+            CompositionAttribute::from_value(
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::String("plaintext-must-not-leak".to_string()),
+                )))),
+                None,
+            ),
         );
         let virt = Composition {
             id: ResourceId::with_identity("_virtual", "module_instance"),

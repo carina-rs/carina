@@ -7,7 +7,7 @@ use tower_lsp::lsp_types::{
 };
 
 use carina_core::builtins;
-use carina_core::parser::snake_to_pascal;
+use carina_core::parser::{TypeExpr, snake_to_pascal};
 use carina_core::schema::{AttributeType, Shape, TypeIdentity, TypeInSchema, legacy_validator};
 
 use super::{CompletionProvider, DslSource};
@@ -16,6 +16,20 @@ use super::{CompletionProvider, DslSource};
 const UPSTREAM_SOURCE_MAX_UP: usize = 6;
 /// Safety cap on the number of suggestions returned.
 const UPSTREAM_SOURCE_MAX_ITEMS: usize = 100;
+
+/// Treat non-liftable boundary declarations as unchecked; otherwise compare
+/// the declared source to the schema sink through the shared directional
+/// `AttributeType` relation.
+fn type_expr_source_is_assignable_to(
+    source: &TypeExpr,
+    sink: &AttributeType,
+    sink_defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> bool {
+    let Some(source) = carina_core::validation::lift_type_expr(source) else {
+        return true;
+    };
+    TypeInSchema::schemaless(&source).is_assignable_to(sink.in_schema(sink_defs))
+}
 
 /// Context when the user has typed `binding_name.` after `=`.
 struct BindingDotContext {
@@ -189,11 +203,8 @@ impl CompletionProvider {
         //   - `upstream_state` bindings (#2353): exports are declared by
         //     the user with a `TypeExpr` that lives in a different type
         //     system than the schema's `AttributeType`, so name equality
-        //     does not apply. `is_type_expr_compatible_with_schema`
-        //     bridges the two — it walks `Custom` base chains and accepts
-        //     structural shapes (list/map/struct), so e.g. an export
-        //     declared `: String` matches a schema attribute typed
-        //     `Custom { semantic_name: "Arn", base: String, .. }`.
+        //     does not apply. The declaration is lifted into an
+        //     `AttributeType`, then checked directionally as source → target.
         //
         // Resource bindings skip self-references (`current_binding`) because
         // their own attributes are accessible by bare attribute name within
@@ -254,7 +265,7 @@ impl CompletionProvider {
                     let Some(export_type) = &entry.type_expr else {
                         continue;
                     };
-                    if !carina_core::validation::is_type_expr_compatible_with_schema(
+                    if !type_expr_source_is_assignable_to(
                         export_type,
                         &attr_schema.attr_type,
                         &schema.defs,
@@ -283,9 +294,8 @@ impl CompletionProvider {
         // Target attribute type + the schema's `defs` table, if the
         // schema knows about this (resource_type, attr_name) pair.
         // Both are used by the arguments filter just below and the
-        // for-binding filter further down; `defs` is threaded into
-        // `is_type_expr_compatible_with_schema` so any `Ref` receiver
-        // resolves correctly.
+        // for-binding filter further down; `defs` stays paired with the
+        // target while directional assignability resolves any schema `Ref`.
         let target_schema = self.lookup_schema(resource_type);
         let target_attr_type = target_schema
             .and_then(|s| s.attributes.get(attr_name))
@@ -327,11 +337,7 @@ impl CompletionProvider {
                     else {
                         return true;
                     };
-                    carina_core::validation::is_type_expr_compatible_with_schema(
-                        arg_type_expr,
-                        attr_type,
-                        target_defs,
-                    )
+                    type_expr_source_is_assignable_to(arg_type_expr, attr_type, target_defs)
                 }));
             }
         }
@@ -356,11 +362,7 @@ impl CompletionProvider {
                     &self.schemas,
                     &mut exports_cache,
                 )
-                && !carina_core::validation::is_type_expr_compatible_with_schema(
-                    &element_type,
-                    attr_type,
-                    target_defs,
-                )
+                && !type_expr_source_is_assignable_to(&element_type, attr_type, target_defs)
             {
                 continue;
             }
@@ -1426,11 +1428,7 @@ impl CompletionProvider {
                 let Some(export_type) = &entry.type_expr else {
                     continue;
                 };
-                if !carina_core::validation::is_type_expr_compatible_with_schema(
-                    export_type,
-                    target,
-                    target_defs,
-                ) {
+                if !type_expr_source_is_assignable_to(export_type, target, target_defs) {
                     continue;
                 }
                 let full_ref = format!("{}.{}", binding, export_name);
@@ -1534,11 +1532,7 @@ impl CompletionProvider {
                 let Some(ref export_ty) = export.type_expr else {
                     continue;
                 };
-                if !carina_core::validation::is_type_expr_compatible_with_schema(
-                    export_ty,
-                    target,
-                    target_defs,
-                ) {
+                if !type_expr_source_is_assignable_to(export_ty, target, target_defs) {
                     continue;
                 }
                 let full_ref = format!("{}.{}", binding_name, export.name);

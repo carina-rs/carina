@@ -3312,8 +3312,8 @@ test.foo.bar {
 /// Issue #2358: a `: String` upstream export must NOT be offered as a
 /// candidate at a receiver typed `Custom { semantic_name: Some(_) }`.
 /// Pinned alongside the validation-side fix because completion shares
-/// the same `is_type_expr_compatible_with_schema` predicate — a future
-/// edit that loosens the predicate would silently regress the popup
+/// the same lifted, directional relation — a future edit that loosens
+/// the relation would silently regress the popup
 /// even if validation still catches the bad code at apply time.
 #[test]
 fn upstream_state_string_export_not_offered_to_specific_custom_receiver() {
@@ -4067,10 +4067,10 @@ let role = test.foo.bar {
 // At a typed value position (`attr = ▉` where the schema declares a
 // concrete type), arguments and builtin functions whose declared
 // return type is incompatible with the target attribute's type must
-// not appear in the popup. The filter uses
-// `carina_core::validation::is_type_expr_compatible_with_schema`,
-// already used elsewhere in the same handler for `for-loop` bindings
-// and `upstream_state` exports.
+// not appear in the popup. The filter lifts declarations with
+// `carina_core::validation::lift_type_expr` and uses the core
+// `AttributeType` directional relation, as do `for` bindings and
+// `upstream_state` exports in the same handler.
 //
 // Bare `let` binding names stay unfiltered (they have no scalar
 // value type — `<binding>.<attr>` REFERENCE candidates remain the

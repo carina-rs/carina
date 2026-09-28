@@ -248,7 +248,7 @@ pub(super) fn test_provider_with_custom_semantic_attr() -> CompletionProvider {
         Ok(())
     }
     let account_id = AttributeType::refined_string_with_validator(
-        Some(carina_core::schema::TypeIdentity::bare("aws_account_id")),
+        Some(carina_core::schema::TypeIdentity::bare("AwsAccountId")),
         None,
         None,
         legacy_validator(noop_validate),

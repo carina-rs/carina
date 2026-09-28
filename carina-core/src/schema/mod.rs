@@ -2882,7 +2882,11 @@ impl TypeInSchema<'_> {
     /// 4. List→List: recurse on the element types. Ordering and length metadata
     ///    remain intentionally ignored, matching the old `type_name` behavior.
     /// 5. Map→Map: recurse on both key and value types.
-    /// 6. Custom→Custom with both `identity: Some`: the source's identity
+    /// 6. Struct→Struct requires the same field-name set and recursively
+    ///    assignable field types. Struct→Map is allowed when every field is
+    ///    assignable to the map value type, preserving the DSL's structural
+    ///    object-to-homogeneous-map coercion.
+    /// 7. Custom→Custom with both `identity: Some`: the source's identity
     ///    must be [`TypeIdentity::assignable_to`] the sink's and any length
     ///    range must be contained by the sink's range. Enum→Enum additionally
     ///    recurses on the two base types. This is the final verdict for
@@ -2896,13 +2900,13 @@ impl TypeInSchema<'_> {
     ///    wider) but `aws.Arn` does not flow into `aws.iam.Role.Arn` (source
     ///    has no Role-specific evidence). `aws.Region` and `gcp.Region` are
     ///    rejected both ways (populated providers differ). Closes carina#3218.
-    /// 7. Custom→Custom where at least one side has `identity: None`: check
+    /// 8. Custom→Custom where at least one side has `identity: None`: check
     ///    pattern (literal equality) and length containment (source ⊆ sink),
     ///    then recurse on base. For both-identified pairs, see rule 6.
-    /// 8. Custom source → non-Custom sink: recurse on `source.base`.
-    /// 9. non-Custom source → Custom sink: NG (source has no proof of
-    ///    satisfying the sink's identity/pattern/length).
-    /// 10. Otherwise: same primitive type names.
+    /// 9. Custom source → non-Custom sink: recurse on `source.base`.
+    /// 10. non-Custom source → Custom sink: NG (source has no proof of
+    ///     satisfying the sink's identity/pattern/length).
+    /// 11. Otherwise: same primitive type names.
     ///
     /// # Conservative pattern/length policy
     ///
@@ -3085,6 +3089,43 @@ impl<'source> TypeInSchema<'source> {
                     sink_visited_refs,
                 )
             }
+            (
+                Struct {
+                    fields: source_fields,
+                    ..
+                },
+                Struct {
+                    fields: sink_fields,
+                    ..
+                },
+            ) => {
+                source_fields.len() == sink_fields.len()
+                    && sink_fields.iter().all(|sink_field| {
+                        source_fields
+                            .iter()
+                            .find(|source_field| source_field.name == sink_field.name)
+                            .is_some_and(|source_field| {
+                                source_field
+                                    .field_type
+                                    .in_schema(self.defs)
+                                    .is_assignable_to_on_paths(
+                                        sink_field.field_type.in_schema(sink.defs),
+                                        source_visited_refs,
+                                        sink_visited_refs,
+                                    )
+                            })
+                    })
+            }
+            (Struct { fields, .. }, Map { value, .. }) => fields.iter().all(|field| {
+                field
+                    .field_type
+                    .in_schema(self.defs)
+                    .is_assignable_to_on_paths(
+                        value.in_schema(sink.defs),
+                        source_visited_refs,
+                        sink_visited_refs,
+                    )
+            }),
             (
                 String {
                     identity: Some(s_id),

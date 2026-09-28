@@ -287,7 +287,10 @@ impl ModuleResolver<'_> {
                     substituted.canonicalize_in_place();
                     composition_attrs.insert(
                         attr_param.name.clone(),
-                        crate::resource::CompositionAttribute::from_value(substituted),
+                        crate::resource::CompositionAttribute::from_value(
+                            substituted,
+                            attr_param.type_expr.clone(),
+                        ),
                     );
                 }
             }
@@ -747,10 +750,7 @@ fn prefix_module_composition(
         let v = attr.to_value();
         let prefixed =
             prefix_attr_value(&v, instance_prefix, intra_module_bindings, argument_values);
-        substituted_attrs.insert(
-            key.clone(),
-            crate::resource::CompositionAttribute::from_value(prefixed),
-        );
+        substituted_attrs.insert(key.clone(), attr.with_value(prefixed));
     }
     new_virtual.signature.attributes = substituted_attrs;
 

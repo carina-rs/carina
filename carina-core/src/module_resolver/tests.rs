@@ -5106,9 +5106,9 @@ let registry_publish = registry {
         .attributes
         .get("target_name")
         .expect("module output must exist");
-    let crate::resource::CompositionAttribute::Forwarded(path) = target_name else {
-        panic!("module output must remain a deferred forwarded path: {target_name:?}");
-    };
+    let path = target_name.forwarded_path().unwrap_or_else(|| {
+        panic!("module output must remain a deferred forwarded path: {target_name:?}")
+    });
     assert_eq!(path.binding(), "registry_publish.target");
 }
 

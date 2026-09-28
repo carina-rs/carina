@@ -490,15 +490,18 @@ pub fn validate_module_call_argument_refs_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E>,
     argument_names: &HashSet<String>,
+    imported_modules: &module_resolver::ResolvedModuleSignatures,
 ) -> Vec<AppError> {
     let bindings = carina_core::binding_index::BindingIndex::from_parsed(parsed, ctx.schemas());
-    lift_validation_result(
-        validation::validate_module_call_argument_ref_existence_with_bindings(
-            &parsed.module_calls,
-            argument_names,
-            &bindings,
-        ),
+    validation::validate_module_call_argument_ref_types_with_bindings(
+        &parsed.module_calls,
+        imported_modules,
+        argument_names,
+        &bindings,
     )
+    .into_iter()
+    .map(|error| AppError::Validation(error.to_string()))
+    .collect()
 }
 
 pub fn validate_attribute_param_ref_types_with_ctx<E>(
@@ -1271,17 +1274,19 @@ pub fn validate_module_calls<E>(
     base_dir: &Path,
     config: &carina_core::parser::ProviderContext,
 ) -> Vec<AppError> {
-    let mut imported_modules = HashMap::new();
-    for import in &parsed.uses {
-        let module_path = base_dir.join(&import.path);
-        if let Some(module_parsed) = module_resolver::load_module(&module_path) {
-            imported_modules.insert(import.alias.clone(), module_parsed.arguments);
-        }
-    }
+    let imported_modules =
+        module_resolver::load_resolved_module_signatures(parsed, base_dir, config);
+    validate_module_calls_with_imported(parsed, &imported_modules, config)
+}
 
+pub(crate) fn validate_module_calls_with_imported<E>(
+    parsed: &carina_core::parser::File<E>,
+    imported_modules: &module_resolver::ResolvedModuleSignatures,
+    config: &carina_core::parser::ProviderContext,
+) -> Vec<AppError> {
     lift_validation_result(validation::validate_module_calls(
         &parsed.module_calls,
-        &imported_modules,
+        imported_modules,
         config,
     ))
 }
@@ -1289,17 +1294,28 @@ pub fn validate_module_calls<E>(
 pub(crate) fn validate_module_attribute_param_types(
     ctx: &WiringContext,
     module_walk: &ModuleWalk,
+    config: &carina_core::parser::ProviderContext,
 ) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
-        let module_parsed = &module.loaded().parsed;
+        let mut module_parsed = module.loaded().parsed.clone();
+        for finding in validation::resolve_file_type_exprs(&mut module_parsed, config) {
+            errors.push(AppError::Validation(format!(
+                "{}: {finding}",
+                module.diagnostic_path().display()
+            )));
+        }
         if module_parsed.attribute_params.is_empty() {
             continue;
         }
         let bindings =
-            carina_core::binding_index::BindingIndex::from_parsed(module_parsed, ctx.schemas());
-        let module_call_attributes =
-            pre_expansion_module_call_attributes(module_parsed, module.module_path(), module_walk);
+            carina_core::binding_index::BindingIndex::from_parsed(&module_parsed, ctx.schemas());
+        let module_call_attributes = pre_expansion_module_call_attributes(
+            &module_parsed,
+            module.module_path(),
+            module_walk,
+            config,
+        );
         if let Err(joined) =
             validation::validate_attribute_param_ref_types_with_bindings_and_module_calls(
                 &module_parsed.attribute_params,
@@ -1413,42 +1429,26 @@ fn pre_expansion_module_call_attributes(
     module_parsed: &carina_core::parser::ParsedFile,
     module_path: &Path,
     module_walk: &ModuleWalk,
+    config: &carina_core::parser::ProviderContext,
 ) -> validation::PreExpansionModuleCallAttributes {
-    let called_aliases: HashSet<&str> = module_parsed
-        .module_calls
-        .iter()
-        .map(|call| call.module_name.as_str())
-        .collect();
-    let mut attributes_by_alias: HashMap<String, BTreeSet<String>> = HashMap::new();
-
-    for import in &module_parsed.uses {
-        if !called_aliases.contains(import.alias.as_str()) {
-            continue;
-        }
-        // Reuse the shared walk's loaded snapshot. This keeps attribute type
-        // validation from starting a second filesystem/module traversal.
-        let Some(imported) = module_walk.parsed_at(&module_path.join(&import.path)) else {
-            continue;
-        };
-        attributes_by_alias.insert(
-            import.alias.clone(),
-            imported
-                .attribute_params
-                .iter()
-                .map(|attribute| attribute.name.clone())
-                .collect(),
-        );
-    }
+    let signatures =
+        module_resolver::resolve_module_signatures_with(module_parsed, config, |import| {
+            // Reuse the shared recursive walk's loaded snapshot instead of
+            // starting another filesystem traversal for nested signatures.
+            module_walk
+                .parsed_at(&module_path.join(&import.path))
+                .cloned()
+        });
 
     let mut attributes_by_binding = HashMap::new();
     for call in &module_parsed.module_calls {
         let Some(binding_name) = &call.binding_name else {
             continue;
         };
-        let Some(attribute_names) = attributes_by_alias.get(&call.module_name) else {
+        let Some(signature) = signatures.get(&call.module_name) else {
             continue;
         };
-        attributes_by_binding.insert(binding_name.clone(), attribute_names.clone());
+        attributes_by_binding.insert(binding_name.clone(), signature.attributes.clone());
     }
     attributes_by_binding
 }

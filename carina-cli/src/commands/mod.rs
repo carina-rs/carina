@@ -36,11 +36,12 @@ use crate::wiring::{
     resolve_names_with_ctx, validate_attribute_param_ref_types_with_ctx,
     validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
     validate_module_attribute_param_types, validate_module_call_argument_refs_with_ctx,
-    validate_module_calls, validate_no_backend_in_modules, validate_no_empty_interpolations,
-    validate_no_exports_in_modules, validate_no_provider_in_modules,
-    validate_no_state_blocks_in_modules, validate_no_upstream_states_in_modules,
-    validate_provider_region_with_ctx, validate_resource_ref_types_with_ctx,
-    validate_resources_with_ctx, validate_wait_bindings_with_ctx,
+    validate_module_calls_with_imported, validate_no_backend_in_modules,
+    validate_no_empty_interpolations, validate_no_exports_in_modules,
+    validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
+    validate_no_upstream_states_in_modules, validate_provider_region_with_ctx,
+    validate_resource_ref_types_with_ctx, validate_resources_with_ctx,
+    validate_wait_bindings_with_ctx,
 };
 
 #[must_use = "Drifted must be handled before mutating state — apply/destroy must refuse, init/plan must warn"]
@@ -443,9 +444,19 @@ pub fn validate_and_resolve_errors_with_factories(
         errors.push(AppError::Validation(finding));
     }
 
+    // Load root module signatures once before expansion. Expansion consumes
+    // `use` declarations, but reference-valued arguments still need these
+    // declared sink types during the post-expansion binding check.
+    let imported_module_signatures =
+        module_resolver::load_resolved_module_signatures(parsed, base_dir, &enriched_context);
+
     // Validate module call arguments before expansion (needs enriched
-    // context for custom type validators)
-    errors.extend(validate_module_calls(parsed, base_dir, &enriched_context));
+    // context for custom type validators).
+    errors.extend(validate_module_calls_with_imported(
+        parsed,
+        &imported_module_signatures,
+        &enriched_context,
+    ));
 
     // User-facing checks for root-owned blocks inside modules run on the
     // recursive module walk so validate/plan/apply can collect path-prefixed
@@ -463,7 +474,11 @@ pub fn validate_and_resolve_errors_with_factories(
         errors.extend(validate_no_backend_in_modules(&module_walk));
         errors.extend(validate_no_upstream_states_in_modules(&module_walk));
         errors.extend(validate_no_exports_in_modules(&module_walk));
-        errors.extend(validate_module_attribute_param_types(&ctx, &module_walk));
+        errors.extend(validate_module_attribute_param_types(
+            &ctx,
+            &module_walk,
+            &enriched_context,
+        ));
     }
 
     // Module expansion assumes the checks above succeeded — feeding
@@ -528,6 +543,7 @@ pub fn validate_and_resolve_errors_with_factories(
             &ctx,
             parsed,
             &argument_names,
+            &imported_module_signatures,
         ));
         errors.extend(validate_resource_ref_types_with_ctx(
             &ctx,

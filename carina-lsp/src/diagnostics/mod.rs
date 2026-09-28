@@ -15,7 +15,7 @@ use crate::position;
 use carina_core::parser::{ParseError, ParsedFile, ResourceRef, WarningKind};
 use carina_core::provider::ProviderFactory;
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
-use carina_core::schema::{ResourceSchema, SchemaRegistry, TypeInSchema};
+use carina_core::schema::{SchemaRegistry, TypeInSchema};
 
 /// Create a `Diagnostic` on a single line with the standard "carina" source.
 pub(crate) fn carina_diagnostic(
@@ -375,9 +375,7 @@ impl DiagnosticEngine {
             // Check for unloaded providers
             diagnostics.extend(self.check_unloaded_providers(doc, parsed));
 
-            // Check module calls
             if let Some(base) = base_path {
-                diagnostics.extend(self.check_module_calls(doc, parsed, base));
                 diagnostics.extend(self.check_upstream_state_sources(doc, parsed, base));
             }
             // Build the canonical validation-target index from the merged,
@@ -390,10 +388,27 @@ impl DiagnosticEngine {
             let binding_input = merged.unwrap_or(parsed);
             let binding_index =
                 carina_core::binding_index::BindingIndex::from_parsed(binding_input, &self.schemas);
-            // Schema-only consumers retain the borrow-valued projection and
-            // avoid per-keystroke `ResourceSchema::clone()` work.
-            let binding_schema_map = binding_index.schemas_by_name();
-
+            let module_signatures = base_path
+                .map(|base| {
+                    carina_core::module_resolver::load_resolved_module_signatures(
+                        binding_input,
+                        base,
+                        &self.provider_context,
+                    )
+                })
+                .unwrap_or_default();
+            if base_path.is_some() {
+                diagnostics.extend(self.check_module_calls(doc, parsed, &module_signatures));
+            }
+            // Attribute existence does not require a module directory. When
+            // there is no base path, the empty signature map disables only
+            // declared-sink checks.
+            diagnostics.extend(self.check_module_call_ref_types(
+                doc,
+                parsed,
+                &module_signatures,
+                &binding_index,
+            ));
             // Check resource types — include for-body template resources so
             // attribute/type/enum validation fires inside `for` loops too.
             for rref in parsed.iter_all_resources() {
@@ -693,10 +708,9 @@ impl DiagnosticEngine {
                                     },
                                     Value::Deferred(DeferredValue::ResourceRef { path }),
                                 ) => check_resource_ref_type_mismatch(
-                                    &binding_schema_map,
+                                    &binding_index,
                                     schema.type_in_schema(&attr_schema.attr_type),
-                                    path.binding(),
-                                    path.attribute(),
+                                    path,
                                 ),
                                 // Enum: the structured-payload path
                                 // above handles `InvalidEnumVariant` /
@@ -995,19 +1009,7 @@ impl DiagnosticEngine {
                 &known_bindings,
             ));
 
-            // Exports type check. When a merged parse is available the
-            // sibling-binding → resource-type map is built from it so
-            // `upstream_state` / `import` / module-call bindings are
-            // visible (#2134); otherwise fall back to an empty map and
-            // rely on the local-to-file checks that `check_exports_blocks`
-            // performs (e.g. type annotation sanity, literal-value shape).
-            // On that degraded path the legacy export pre-check gets no
-            // sibling projection; attributes instead builds its shared
-            // BindingIndex from the buffer parse.
-            let sibling_bindings = merged
-                .map(exports_sibling_bindings_from)
-                .unwrap_or_default();
-            diagnostics.extend(self.check_exports_blocks(doc, parsed, merged, &sibling_bindings));
+            diagnostics.extend(self.check_exports_blocks(doc, parsed, merged));
 
             // Unused `let` detection. When a merged parse is available,
             // run the core check against it (so references from sibling
@@ -1518,14 +1520,14 @@ fn build_enum_diagnostic(
 /// Returns `Some(message)` on mismatch, `None` when compatible or when the binding/attribute
 /// cannot be resolved (unknown bindings are not flagged here).
 fn check_resource_ref_type_mismatch(
-    binding_schema_map: &HashMap<&str, &ResourceSchema>,
+    binding_index: &carina_core::binding_index::BindingIndex<'_>,
     expected: TypeInSchema<'_>,
-    ref_binding: &str,
-    ref_attr: &str,
+    path: &carina_core::resource::AccessPath,
 ) -> Option<String> {
-    let ref_schema = binding_schema_map.get(ref_binding)?;
-    let ref_attr_schema = ref_schema.attributes.get(ref_attr)?;
-    let source = ref_schema.type_in_schema(&ref_attr_schema.attr_type);
+    let carina_core::binding_index::RefType::Typed(source) = binding_index.ref_type(path) else {
+        return None;
+    };
+    let source = source.type_in_schema();
 
     // Directional: the ref (source) must be assignable to the expected (sink).
     if source.is_assignable_to(expected) {
@@ -1535,30 +1537,10 @@ fn check_resource_ref_type_mismatch(
             "Type mismatch: expected {}, got {} (from {}.{})",
             expected.resolved_type_name(),
             source.resolved_type_name(),
-            ref_binding,
-            ref_attr
+            path.binding(),
+            path.attribute()
         ))
     }
-}
-
-/// Build the binding-name → resource-type map that
-/// [`check_exports_blocks`] uses to type-check cross-file references.
-/// Replaces the hand-rolled `Backend::scan_sibling_context` output —
-/// merged parse sees every managed resource in the directory, including
-/// those declared in sibling files (#2134).
-fn exports_sibling_bindings_from(merged: &ParsedFile) -> HashMap<String, String> {
-    merged
-        .resources
-        .iter()
-        .filter_map(|r| {
-            r.binding.as_ref().map(|b| {
-                (
-                    b.clone(),
-                    format!("{}.{}", r.id.provider, r.id.resource_type),
-                )
-            })
-        })
-        .collect()
 }
 
 fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {

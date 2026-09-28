@@ -37,6 +37,34 @@ fn validate_resource_ref_types_for_test<E>(
     super::validate_resource_ref_types(parsed, schemas, argument_names, &bindings)
 }
 
+/// Directional test adapter for the module-boundary relation: `type_expr` is
+/// the source and the schema attribute is the sink.
+fn lifted_source_is_assignable_to_schema(
+    type_expr: &TypeExpr,
+    sink: &AttributeType,
+    sink_defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> bool {
+    let Some(source) = lift_type_expr(type_expr) else {
+        return true;
+    };
+    crate::schema::TypeInSchema::schemaless(&source).is_assignable_to(sink.in_schema(sink_defs))
+}
+
+/// Directional test adapter for the opposite boundary role: a schema
+/// attribute is the source and `type_expr` is the declared sink.
+fn schema_source_is_assignable_to_lifted_sink(
+    source: &AttributeType,
+    source_defs: &std::collections::BTreeMap<String, AttributeType>,
+    type_expr: &TypeExpr,
+) -> bool {
+    let Some(sink) = lift_type_expr(type_expr) else {
+        return false;
+    };
+    source
+        .in_schema(source_defs)
+        .is_assignable_to(crate::schema::TypeInSchema::schemaless(&sink))
+}
+
 fn context_with_iam_policy_arn_validator() -> ProviderContext {
     use crate::parser::ValidatorFn;
 
@@ -58,6 +86,66 @@ fn context_with_iam_policy_arn_validator() -> ProviderContext {
         resource_types: Default::default(),
         customs_loaded: false,
     }
+}
+
+#[test]
+fn lift_type_expr_maps_schema_identity_directionally() {
+    let vpc_id_expr = TypeExpr::SchemaType {
+        provider: "aws".to_string(),
+        path: "ec2.Vpc".to_string(),
+        type_name: "Id".to_string(),
+    };
+    let vpc_id = AttributeType::refined_string(
+        Some(TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id")),
+        None,
+        None,
+        None,
+    );
+    let security_group_id = AttributeType::refined_string(
+        Some(TypeIdentity::from_schema_type(
+            "aws",
+            "ec2.SecurityGroup",
+            "Id",
+        )),
+        None,
+        None,
+        None,
+    );
+
+    assert!(schema_source_is_assignable_to_lifted_sink(
+        &vpc_id,
+        crate::schema::empty_defs_for_schema_walks(),
+        &vpc_id_expr,
+    ));
+    assert!(!schema_source_is_assignable_to_lifted_sink(
+        &security_group_id,
+        crate::schema::empty_defs_for_schema_walks(),
+        &vpc_id_expr,
+    ));
+}
+
+#[test]
+fn lift_type_expr_recurses_and_leaves_nonrepresentable_forms_unchecked() {
+    let structured = TypeExpr::List(Box::new(TypeExpr::Map(Box::new(TypeExpr::Union(vec![
+        TypeExpr::String,
+        TypeExpr::Int,
+    ])))));
+    let lifted = lift_type_expr(&structured).expect("container types must lift recursively");
+    let expected = AttributeType::list(AttributeType::map(AttributeType::union(vec![
+        AttributeType::string(),
+        AttributeType::int(),
+    ])));
+    assert!(
+        crate::schema::TypeInSchema::schemaless(&lifted)
+            .is_assignable_to(crate::schema::TypeInSchema::schemaless(&expected))
+    );
+
+    let resource_ref =
+        crate::parser::ResourceTypePath::new("aws".to_string(), "ec2.Vpc".to_string());
+    assert!(lift_type_expr(&TypeExpr::Ref(resource_ref.clone())).is_none());
+    assert!(lift_type_expr(&TypeExpr::DottedUnresolved(resource_ref)).is_none());
+    assert!(lift_type_expr(&TypeExpr::StringLiteral("x".to_string())).is_none());
+    assert!(lift_type_expr(&TypeExpr::Unknown).is_none());
 }
 
 #[test]
@@ -573,9 +661,10 @@ fn make_composition(binding: &str, attributes: &[&str]) -> Composition {
                 .map(|name| {
                     (
                         (*name).to_string(),
-                        CompositionAttribute::from_value(Value::Concrete(ConcreteValue::String(
-                            format!("{name}-value"),
-                        ))),
+                        CompositionAttribute::from_value(
+                            Value::Concrete(ConcreteValue::String(format!("{name}-value"))),
+                            None,
+                        ),
                     )
                 })
                 .collect(),
@@ -2165,7 +2254,7 @@ fn struct_field_shape_errors_is_deterministic_for_multiple_unknowns() {
 }
 
 #[test]
-fn is_type_expr_compatible_struct_rejects_missing_schema_field_when_expr_has_extra() {
+fn lifted_struct_rejects_missing_schema_field_when_source_has_extra() {
     // Regression: the old `expr.iter().all(find in schema)` logic let an
     // expr struct omit a required schema field as long as sizes matched.
     // The bijection fix must reject this.
@@ -2183,7 +2272,7 @@ fn is_type_expr_compatible_struct_rejects_missing_schema_field_when_expr_has_ext
             StructField::new("b", AttributeType::string()),
         ],
     );
-    assert!(!is_type_expr_compatible_with_schema(
+    assert!(!lifted_source_is_assignable_to_schema(
         &expr,
         &schema,
         crate::schema::empty_defs_for_schema_walks()
@@ -2191,7 +2280,7 @@ fn is_type_expr_compatible_struct_rejects_missing_schema_field_when_expr_has_ext
 }
 
 #[test]
-fn is_type_expr_compatible_struct_matches_same_shape_schema() {
+fn lifted_struct_matches_same_shape_schema() {
     use crate::schema::StructField;
     let expr = TypeExpr::Struct {
         fields: vec![
@@ -2206,7 +2295,7 @@ fn is_type_expr_compatible_struct_matches_same_shape_schema() {
             StructField::new("value", AttributeType::int()),
         ],
     );
-    assert!(is_type_expr_compatible_with_schema(
+    assert!(lifted_source_is_assignable_to_schema(
         &expr,
         &schema,
         crate::schema::empty_defs_for_schema_walks()
@@ -2214,7 +2303,7 @@ fn is_type_expr_compatible_struct_matches_same_shape_schema() {
 }
 
 #[test]
-fn is_type_expr_compatible_struct_flows_into_map_when_fields_share_type() {
+fn lifted_struct_flows_into_map_when_fields_share_type() {
     // A downstream consumer annotated `map(string)` accepts a
     // `struct { a: string, b: string }` — every field satisfies string.
     let expr = TypeExpr::Struct {
@@ -2224,7 +2313,7 @@ fn is_type_expr_compatible_struct_flows_into_map_when_fields_share_type() {
         ],
     };
     let schema = AttributeType::map_with_key(AttributeType::string(), AttributeType::string());
-    assert!(is_type_expr_compatible_with_schema(
+    assert!(lifted_source_is_assignable_to_schema(
         &expr,
         &schema,
         crate::schema::empty_defs_for_schema_walks()
@@ -2232,12 +2321,12 @@ fn is_type_expr_compatible_struct_flows_into_map_when_fields_share_type() {
 }
 
 #[test]
-fn is_type_expr_compatible_struct_rejects_map_with_wrong_element_type() {
+fn lifted_struct_rejects_map_with_wrong_element_type() {
     let expr = TypeExpr::Struct {
         fields: vec![("a".to_string(), TypeExpr::String)],
     };
     let schema = AttributeType::map_with_key(AttributeType::string(), AttributeType::int());
-    assert!(!is_type_expr_compatible_with_schema(
+    assert!(!lifted_source_is_assignable_to_schema(
         &expr,
         &schema,
         crate::schema::empty_defs_for_schema_walks()
@@ -2250,21 +2339,21 @@ fn is_type_expr_compatible_struct_rejects_map_with_wrong_element_type() {
 // `String` constraint cannot prove it satisfies the more specific
 // invariants the receiver demands.
 #[test]
-fn is_type_expr_compatible_unknown_rejects_all_concrete_receivers() {
-    // Sentinel for failed inference (#2360 stage 2): never matches any
-    // concrete receiver — the inference_errors channel surfaces the
-    // actionable "type annotation required" instead.
-    assert!(!is_type_expr_compatible_with_schema(
+fn non_liftable_unknown_is_unchecked_for_concrete_sinks() {
+    // Sentinel for failed inference (#2360 stage 2): the boundary relation
+    // remains unchecked while the inference-errors channel surfaces the
+    // actionable "type annotation required" diagnostic.
+    assert!(lifted_source_is_assignable_to_schema(
         &TypeExpr::Unknown,
         &AttributeType::string(),
         crate::schema::empty_defs_for_schema_walks(),
     ));
-    assert!(!is_type_expr_compatible_with_schema(
+    assert!(lifted_source_is_assignable_to_schema(
         &TypeExpr::Unknown,
         &AttributeType::int(),
         crate::schema::empty_defs_for_schema_walks(),
     ));
-    assert!(!is_type_expr_compatible_with_schema(
+    assert!(lifted_source_is_assignable_to_schema(
         &TypeExpr::Unknown,
         &AttributeType::bool(),
         crate::schema::empty_defs_for_schema_walks(),
@@ -2272,7 +2361,7 @@ fn is_type_expr_compatible_unknown_rejects_all_concrete_receivers() {
 }
 
 #[test]
-fn is_type_expr_compatible_unknown_rejects_custom_receiver() {
+fn non_liftable_unknown_is_unchecked_for_custom_sink() {
     use crate::schema::legacy_validator;
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
@@ -2284,7 +2373,7 @@ fn is_type_expr_compatible_unknown_rejects_custom_receiver() {
         legacy_validator(noop),
         None,
     );
-    assert!(!is_type_expr_compatible_with_schema(
+    assert!(lifted_source_is_assignable_to_schema(
         &TypeExpr::Unknown,
         &custom,
         crate::schema::empty_defs_for_schema_walks(),
@@ -2292,7 +2381,7 @@ fn is_type_expr_compatible_unknown_rejects_custom_receiver() {
 }
 
 #[test]
-fn is_type_expr_compatible_string_rejects_custom_with_semantic_name() {
+fn directional_relation_rejects_plain_string_for_identified_sink() {
     use crate::schema::legacy_validator;
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
@@ -2305,7 +2394,7 @@ fn is_type_expr_compatible_string_rejects_custom_with_semantic_name() {
         None,
     );
     assert!(
-        !is_type_expr_compatible_with_schema(
+        !lifted_source_is_assignable_to_schema(
             &TypeExpr::String,
             &schema,
             crate::schema::empty_defs_for_schema_walks()
@@ -2314,12 +2403,10 @@ fn is_type_expr_compatible_string_rejects_custom_with_semantic_name() {
     );
 }
 
-// Companion: a Custom receiver with no semantic_name (anonymous Custom,
-// e.g. a bare `String` enriched with pattern/length but no semantic
-// label) keeps accepting `TypeExpr::String` — it has no specific
-// identity to demand.
+// A pattern is still a constraint even without an identity. The shared
+// relation requires the source to carry proof of that constraint.
 #[test]
-fn is_type_expr_compatible_string_accepts_custom_without_semantic_name() {
+fn directional_relation_rejects_plain_string_for_pattern_sink_without_proof() {
     use crate::schema::legacy_validator;
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
@@ -2332,21 +2419,20 @@ fn is_type_expr_compatible_string_accepts_custom_without_semantic_name() {
         None,
     );
     assert!(
-        is_type_expr_compatible_with_schema(
+        !lifted_source_is_assignable_to_schema(
             &TypeExpr::String,
             &schema,
             crate::schema::empty_defs_for_schema_walks()
         ),
-        "TypeExpr::String must satisfy Custom with no semantic_name"
+        "plain String has no proof that it satisfies the sink pattern"
     );
 }
 
-// Issue #2358 Union descent: a `TypeExpr::String` declaration must not
-// satisfy a `Union` receiver that contains *any* `Custom { semantic_name }`
-// alternative — the value might end up flowing into the specific
-// branch, and `String` cannot prove that branch's invariants.
+// Under the shared directional relation a union sink accepts a source when
+// any member accepts it. This intentionally differs from the removed ad-hoc
+// #2358 union rule; the direct String -> VpcId rejection remains pinned above.
 #[test]
-fn is_type_expr_compatible_string_rejects_union_containing_specific_custom() {
+fn directional_relation_accepts_string_through_plain_union_member() {
     use crate::schema::legacy_validator;
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
@@ -2362,12 +2448,12 @@ fn is_type_expr_compatible_string_rejects_union_containing_specific_custom() {
         ),
     ]);
     assert!(
-        !is_type_expr_compatible_with_schema(
+        lifted_source_is_assignable_to_schema(
             &TypeExpr::String,
             &schema,
             crate::schema::empty_defs_for_schema_walks()
         ),
-        "TypeExpr::String must not satisfy a Union containing Custom{{semantic}}"
+        "the union's plain String member accepts the source"
     );
 }
 
@@ -2375,7 +2461,7 @@ fn is_type_expr_compatible_string_rejects_union_containing_specific_custom() {
 // more clearly String-incompatible — every branch demands a specific
 // identity that String can't prove.
 #[test]
-fn is_type_expr_compatible_string_rejects_union_of_only_specific_customs() {
+fn directional_relation_rejects_string_for_union_of_only_identified_sinks() {
     use crate::schema::legacy_validator;
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
@@ -2391,7 +2477,7 @@ fn is_type_expr_compatible_string_rejects_union_of_only_specific_customs() {
     };
     let schema = AttributeType::union(vec![mk("VpcId"), mk("SubnetId")]);
     assert!(
-        !is_type_expr_compatible_with_schema(
+        !lifted_source_is_assignable_to_schema(
             &TypeExpr::String,
             &schema,
             crate::schema::empty_defs_for_schema_walks()
@@ -2404,7 +2490,7 @@ fn is_type_expr_compatible_string_rejects_union_of_only_specific_customs() {
 // keep accepting `TypeExpr::String` (no specific-Custom alternative
 // exists, so the value can safely flow into any branch).
 #[test]
-fn is_type_expr_compatible_string_accepts_union_of_only_strings() {
+fn directional_relation_accepts_string_for_union_with_plain_string_member() {
     let schema = AttributeType::union(vec![
         AttributeType::string(),
         AttributeType::enum_(
@@ -2416,7 +2502,7 @@ fn is_type_expr_compatible_string_accepts_union_of_only_strings() {
         ),
     ]);
     assert!(
-        is_type_expr_compatible_with_schema(
+        lifted_source_is_assignable_to_schema(
             &TypeExpr::String,
             &schema,
             crate::schema::empty_defs_for_schema_walks()
@@ -2429,7 +2515,7 @@ fn is_type_expr_compatible_string_accepts_union_of_only_strings() {
 // continue to satisfy a receiver of the same Custom type. Pin so the
 // strictness fix doesn't accidentally reject the correct direction.
 #[test]
-fn is_type_expr_compatible_simple_vpcid_accepts_custom_vpcid() {
+fn lifted_simple_vpc_id_accepts_matching_custom_identity() {
     use crate::schema::legacy_validator;
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
@@ -2443,7 +2529,7 @@ fn is_type_expr_compatible_simple_vpcid_accepts_custom_vpcid() {
     );
     // Parser normalizes `: VpcId` to TypeExpr::Simple("vpc_id") (snake).
     let expr = TypeExpr::Simple("vpc_id".to_string());
-    assert!(is_type_expr_compatible_with_schema(
+    assert!(lifted_source_is_assignable_to_schema(
         &expr,
         &schema,
         crate::schema::empty_defs_for_schema_walks()
@@ -2473,13 +2559,16 @@ fn validate_module_calls_rejects_custom_type() {
     let mut imported_modules = HashMap::new();
     imported_modules.insert(
         "github".to_string(),
-        vec![ArgumentParameter {
-            name: "managed_policy_arns".to_string(),
-            type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("iam_policy_arn".to_string()))),
-            default: None,
-            description: None,
-            validations: Vec::new(),
-        }],
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "managed_policy_arns".to_string(),
+                type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("iam_policy_arn".to_string()))),
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+        },
     );
 
     let result = validate_module_calls(&module_calls, &imported_modules, &config);
@@ -2544,7 +2633,7 @@ fn attribute_param_ref_type_mismatch_detected() {
     );
     let err = result.unwrap_err();
     assert!(err.contains("type mismatch"), "Error: {err}");
-    assert!(err.contains("iam_role_arn"), "Error: {err}");
+    assert!(err.contains("IamRoleArn"), "Error: {err}");
 
     // Attribute param: role_arn: iam_role_arn = role.arn (MATCH: IamRoleArn matches iam_role_arn)
     let params_match = vec![AttributeParameter {
@@ -2588,7 +2677,7 @@ fn attribute_param_ref_type_resolves_terminal_schema_ref() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
     let params = vec![AttributeParameter {
         name: "value".to_string(),
-        type_expr: Some(TypeExpr::Simple("string".to_string())),
+        type_expr: Some(TypeExpr::String),
         value: Some(Value::resource_ref(
             "source".to_string(),
             "value".to_string(),
@@ -2688,6 +2777,182 @@ fn attribute_param_ref_type_checks_composition_attribute_membership_only() {
     assert!(
         err.contains("attribute 'invalid': unknown attribute 'target_group_ar' on 'instance'"),
         "expected composition membership error, got: {err}",
+    );
+}
+
+#[test]
+fn pre_expansion_module_attribute_schema_types_use_directional_relation() {
+    use crate::parser::AttributeParameter;
+
+    let schema_type = |path: &str| TypeExpr::SchemaType {
+        provider: "aws".to_string(),
+        path: path.to_string(),
+        type_name: "Id".to_string(),
+    };
+    let params = vec![AttributeParameter {
+        name: "vpc_id".to_string(),
+        type_expr: Some(schema_type("ec2.Vpc")),
+        value: Some(Value::resource_ref(
+            "inner".to_string(),
+            "security_group_id".to_string(),
+            vec![],
+        )),
+    }];
+    let parsed = empty_parsed();
+    let schemas = SchemaRegistry::new();
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let module_call_attributes = HashMap::from([(
+        "inner".to_string(),
+        IndexMap::from([(
+            "security_group_id".to_string(),
+            Some(schema_type("ec2.SecurityGroup")),
+        )]),
+    )]);
+
+    let err = validate_attribute_param_ref_types_with_bindings_and_module_calls(
+        &params,
+        &bindings,
+        &module_call_attributes,
+    )
+    .unwrap_err();
+
+    assert!(
+        err.contains("attribute 'vpc_id': type mismatch")
+            && err.contains("expected aws.ec2.Vpc.Id")
+            && err.contains("got aws.ec2.SecurityGroup.Id")
+            && err.contains("from inner.security_group_id"),
+        "pre-expansion module outputs must use the shared source-to-sink relation: {err}",
+    );
+}
+
+#[test]
+fn pre_expansion_module_attribute_typo_is_reported_once() {
+    use crate::parser::AttributeParameter;
+
+    let params = vec![AttributeParameter {
+        name: "x".to_string(),
+        type_expr: Some(TypeExpr::String),
+        value: Some(Value::resource_ref(
+            "inner".to_string(),
+            "typo".to_string(),
+            vec![],
+        )),
+    }];
+    let parsed = empty_parsed();
+    let schemas = SchemaRegistry::new();
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let module_call_attributes = HashMap::from([(
+        "inner".to_string(),
+        IndexMap::from([("actual".to_string(), Some(TypeExpr::String))]),
+    )]);
+
+    let err = validate_attribute_param_ref_types_with_bindings_and_module_calls(
+        &params,
+        &bindings,
+        &module_call_attributes,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.lines().count(),
+        1,
+        "a typed attribute reference must be visited exactly once: {err}",
+    );
+    assert!(
+        err.contains("attribute 'x': unknown attribute 'typo' on 'inner'"),
+        "expected the pre-expansion module surface diagnostic, got: {err}",
+    );
+}
+
+#[test]
+fn module_call_argument_checks_each_ref_inside_a_typed_list() {
+    use crate::parser::ArgumentParameter;
+    use crate::schema::AttributeSchema;
+
+    let subnet_id = AttributeType::refined_string(
+        Some(TypeIdentity::from_schema_type("aws", "ec2.Subnet", "Id")),
+        None,
+        None,
+        None,
+    );
+    let security_group_id = AttributeType::refined_string(
+        Some(TypeIdentity::from_schema_type(
+            "aws",
+            "ec2.SecurityGroup",
+            "Id",
+        )),
+        None,
+        None,
+        None,
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("ec2.Subnet").attribute(AttributeSchema::new("subnet_id", subnet_id)),
+    );
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("ec2.SecurityGroup")
+            .attribute(AttributeSchema::new("group_id", security_group_id)),
+    );
+
+    let mut parsed = empty_parsed();
+    parsed
+        .resources
+        .push(Resource::with_provider("aws", "ec2.Subnet", "a", None).with_binding("a"));
+    parsed
+        .resources
+        .push(Resource::with_provider("aws", "ec2.SecurityGroup", "web", None).with_binding("web"));
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+
+    let call = ModuleCall {
+        module_name: "consumer".to_string(),
+        binding_name: Some("instance".to_string()),
+        arguments: HashMap::from([(
+            "subnet_ids".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::resource_ref("a".to_string(), "subnet_id".to_string(), vec![]),
+                Value::resource_ref("web".to_string(), "group_id".to_string(), vec![]),
+            ])),
+        )]),
+    };
+    let imported_modules = HashMap::from([(
+        "consumer".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "subnet_ids".to_string(),
+                type_expr: TypeExpr::List(Box::new(TypeExpr::SchemaType {
+                    provider: "aws".to_string(),
+                    path: "ec2.Subnet".to_string(),
+                    type_name: "Id".to_string(),
+                })),
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+        },
+    )]);
+
+    let errors = validate_module_call_argument_ref_types_with_bindings(
+        &[call],
+        &imported_modules,
+        &HashSet::new(),
+        &bindings,
+    );
+
+    assert_eq!(
+        errors.len(),
+        1,
+        "only the SecurityGroup Id should fail the list element sink: {errors:?}",
+    );
+    let err = errors[0].to_string();
+    assert!(
+        err.contains("argument 'subnet_ids'")
+            && err.contains("expected aws.ec2.Subnet.Id")
+            && err.contains("got aws.ec2.SecurityGroup.Id")
+            && err.contains("from web.group_id"),
+        "nested list refs must use the element type as their sink: {err}",
     );
 }
 
@@ -3148,8 +3413,9 @@ fn validate_export_params_rejects_type_mismatch() {
 }
 
 #[test]
-fn type_compat_subtype_accepted() {
-    // arn accepts a provider-scoped KMS key ARN (narrower segments, same kind).
+fn type_relation_provider_scoped_subtype_flows_into_bare_annotation() {
+    // #1874: a declared `Arn` sink accepts a provider-scoped KMS key ARN
+    // source (narrower segments, same kind).
     let kms_key_arn = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::new(Some("aws"), ["kms", "Key"], "Arn")),
         None,
@@ -3157,16 +3423,16 @@ fn type_compat_subtype_accepted() {
         crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
-    assert!(is_type_expr_compatible_with_schema(
-        &TypeExpr::Simple("arn".to_string()),
+    assert!(schema_source_is_assignable_to_lifted_sink(
         &kms_key_arn,
         crate::schema::empty_defs_for_schema_walks(),
+        &TypeExpr::Simple("arn".to_string()),
     ));
 }
 
 #[test]
-fn type_compat_sibling_rejected() {
-    // kms_key_arn rejects an IAM role ARN sibling.
+fn type_relation_sibling_rejected_by_declared_sink() {
+    // A declared `KmsKeyArn` sink rejects an IAM role ARN source.
     let iam_role_arn = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::new(Some("aws"), ["iam", "Role"], "Arn")),
         None,
@@ -3174,16 +3440,17 @@ fn type_compat_sibling_rejected() {
         crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
-    assert!(!is_type_expr_compatible_with_schema(
-        &TypeExpr::Simple("kms_key_arn".to_string()),
+    assert!(!schema_source_is_assignable_to_lifted_sink(
         &iam_role_arn,
         crate::schema::empty_defs_for_schema_walks(),
+        &TypeExpr::Simple("kms_key_arn".to_string()),
     ));
 }
 
 #[test]
-fn type_compat_resource_id_subtype() {
-    // resource_id accepts VPC resource IDs (narrower segments, same kind).
+fn type_relation_resource_id_subtype_flows_into_bare_annotation() {
+    // A declared `ResourceId` sink accepts VPC resource IDs (narrower
+    // segments, same kind).
     let vpc_id = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::new(Some("aws"), ["ec2", "Vpc"], "ResourceId")),
         None,
@@ -3191,16 +3458,16 @@ fn type_compat_resource_id_subtype() {
         crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
-    assert!(is_type_expr_compatible_with_schema(
-        &TypeExpr::Simple("resource_id".to_string()),
+    assert!(schema_source_is_assignable_to_lifted_sink(
         &vpc_id,
         crate::schema::empty_defs_for_schema_walks(),
+        &TypeExpr::Simple("resource_id".to_string()),
     ));
 }
 
 #[test]
-fn type_compat_resource_id_siblings_rejected() {
-    // vpc_id rejects SubnetId (sibling)
+fn type_relation_resource_id_siblings_rejected() {
+    // A declared `VpcId` sink rejects a SubnetId source.
     let subnet_id = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("SubnetId")),
         None,
@@ -3208,15 +3475,15 @@ fn type_compat_resource_id_siblings_rejected() {
         crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
-    assert!(!is_type_expr_compatible_with_schema(
-        &TypeExpr::Simple("vpc_id".to_string()),
+    assert!(!schema_source_is_assignable_to_lifted_sink(
         &subnet_id,
         crate::schema::empty_defs_for_schema_walks(),
+        &TypeExpr::Simple("vpc_id".to_string()),
     ));
 }
 
 #[test]
-fn type_compat_exact_match() {
+fn type_relation_exact_identity_match() {
     let arn = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("Arn")),
         None,
@@ -3224,10 +3491,10 @@ fn type_compat_exact_match() {
         crate::schema::legacy_validator(|_| Ok(())),
         None,
     );
-    assert!(is_type_expr_compatible_with_schema(
-        &TypeExpr::Simple("arn".to_string()),
+    assert!(schema_source_is_assignable_to_lifted_sink(
         &arn,
         crate::schema::empty_defs_for_schema_walks(),
+        &TypeExpr::Simple("arn".to_string()),
     ));
 }
 
@@ -3255,7 +3522,13 @@ fn string_compatible_predicate_uses_concrete_member_through_mutual_ref_cycle() {
     let (root, defs) = mutually_recursive_string_union_fixture();
 
     assert!(is_string_compatible_type(&root, &defs));
-    assert!(is_type_expr_compatible_with_schema(
+}
+
+#[test]
+fn directional_relation_finds_concrete_member_through_mutual_ref_cycle() {
+    let (root, defs) = mutually_recursive_string_union_fixture();
+
+    assert!(lifted_source_is_assignable_to_schema(
         &TypeExpr::String,
         &root,
         &defs,
@@ -3263,27 +3536,11 @@ fn string_compatible_predicate_uses_concrete_member_through_mutual_ref_cycle() {
 }
 
 #[test]
-fn plain_string_union_predicate_uses_concrete_member_through_mutual_ref_cycle() {
-    let (root, defs) = mutually_recursive_string_union_fixture();
-
-    assert!(is_plain_string_or_string_union(&root, &defs));
-}
-
-#[test]
-fn specific_custom_predicate_skips_mutual_ref_cycle_without_custom_member() {
-    let (root, defs) = mutually_recursive_string_union_fixture();
-
-    assert!(!attr_type_demands_specific_custom(&root, &defs));
-}
-
-#[test]
-fn type_compat_simple_rejected_by_mixed_string_int_union_receiver() {
-    // The subtyping branch only fires when *every* member of a
-    // `Union` receiver is plain String. A receiver typed
-    // `Union<[String, Int]>` cannot accept a `Simple(name)` value
-    // because the Int member would silently reinterpret the data.
+fn directional_relation_accepts_refined_string_through_mixed_union_string_member() {
+    // Union sinks use ordinary sum-type assignability: one accepting member
+    // is sufficient, regardless of other scalar alternatives.
     let mixed = AttributeType::union(vec![AttributeType::string(), AttributeType::int()]);
-    assert!(!is_type_expr_compatible_with_schema(
+    assert!(lifted_source_is_assignable_to_schema(
         &TypeExpr::Simple("aws_account_id".to_string()),
         &mixed,
         crate::schema::empty_defs_for_schema_walks(),
@@ -3291,14 +3548,14 @@ fn type_compat_simple_rejected_by_mixed_string_int_union_receiver() {
 }
 
 #[test]
-fn type_compat_simple_subtypes_into_plain_string() {
+fn lifted_simple_subtypes_into_plain_string() {
     // `Simple("aws_account_id")` is a particular kind of string;
     // the plain-`String` receiver wants any string, so the value
     // satisfies it. The reverse direction (plain `String` value
     // into a `Custom { semantic_name: AwsAccountId }` receiver) is
-    // rejected by `attr_type_demands_specific_custom`. See #1874
-    // and #2643.
-    assert!(is_type_expr_compatible_with_schema(
+    // remains rejected by directional identity assignability. See #1874 and
+    // #2643.
+    assert!(lifted_source_is_assignable_to_schema(
         &TypeExpr::Simple("aws_account_id".to_string()),
         &AttributeType::string(),
         crate::schema::empty_defs_for_schema_walks(),
@@ -3314,7 +3571,7 @@ fn type_compat_simple_subtypes_into_plain_string() {
 // at runtime, and the Struct member only accepts map-shaped values, so
 // the two members are shape-disjoint and the assignment is safe.
 #[test]
-fn type_compat_simple_into_union_struct_or_string() {
+fn lifted_simple_flows_into_union_struct_or_string() {
     use crate::schema::StructField;
     let principal_union = AttributeType::union(vec![
         AttributeType::struct_(
@@ -3334,7 +3591,7 @@ fn type_compat_simple_into_union_struct_or_string() {
         "kms_key_arn",
     ] {
         assert!(
-            is_type_expr_compatible_with_schema(
+            lifted_source_is_assignable_to_schema(
                 &TypeExpr::Simple(name.to_string()),
                 &principal_union,
                 crate::schema::empty_defs_for_schema_walks(),
@@ -3344,14 +3601,11 @@ fn type_compat_simple_into_union_struct_or_string() {
     }
 }
 
-// Guards the boundary the new rule must not cross: if any non-String
-// member of the union is *also* scalar-shaped, the union receiver can
-// reinterpret the value down a non-string branch, which is the unsafe
-// case the original `Union<String, Int>` test pinned. A union mixing
-// Struct, String, and Int must still reject `Simple(name)` because the
-// Int branch competes for primitive values.
+// The removed compatibility predicate rejected this shape because another
+// scalar branch exists. The shared directional relation treats a union as a
+// sum type, so its plain String member is enough.
 #[test]
-fn type_compat_simple_rejected_when_union_has_other_scalar() {
+fn directional_relation_accepts_refined_string_when_union_has_other_scalar() {
     use crate::schema::StructField;
     let mixed = AttributeType::union(vec![
         AttributeType::struct_(
@@ -3361,7 +3615,7 @@ fn type_compat_simple_rejected_when_union_has_other_scalar() {
         AttributeType::string(),
         AttributeType::int(),
     ]);
-    assert!(!is_type_expr_compatible_with_schema(
+    assert!(lifted_source_is_assignable_to_schema(
         &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
         &mixed,
         crate::schema::empty_defs_for_schema_walks(),
@@ -3371,7 +3625,7 @@ fn type_compat_simple_rejected_when_union_has_other_scalar() {
 // A union without any plain-String member cannot accept a Simple value:
 // even a List<String> member shapes its values as a list, not a string.
 #[test]
-fn type_compat_simple_rejected_when_union_has_no_plain_string() {
+fn lifted_simple_rejected_when_union_has_no_compatible_member() {
     use crate::schema::StructField;
     let no_string = AttributeType::union(vec![
         AttributeType::struct_(
@@ -3380,23 +3634,17 @@ fn type_compat_simple_rejected_when_union_has_no_plain_string() {
         ),
         AttributeType::list(AttributeType::string()),
     ]);
-    assert!(!is_type_expr_compatible_with_schema(
+    assert!(!lifted_source_is_assignable_to_schema(
         &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
         &no_string,
         crate::schema::empty_defs_for_schema_walks(),
     ));
 }
 
-// `Custom` and `Enum` are deliberately excluded from the new
-// Union allow-list: both are string-shaped at runtime, so a `Simple`
-// value sharing a union with one of them is ambiguous about which
-// branch the consumer treats as the route. The Custom-chain walk
-// above already handles the *specific* "Simple subtypes of this
-// Custom" case at the top of the arm; the union escape hatch is for
-// shape-disjoint members only. If these arms are ever folded into the
-// allow-list, this test will fail and force a re-think.
+// Identified/enum peers do not invalidate an independently compatible plain
+// String member under normal union-sink assignability.
 #[test]
-fn type_compat_simple_rejected_when_union_has_string_shaped_peer() {
+fn directional_relation_accepts_refined_string_with_string_shaped_union_peers() {
     let arn = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::bare("Arn")),
         None,
@@ -3405,7 +3653,7 @@ fn type_compat_simple_rejected_when_union_has_string_shaped_peer() {
         None,
     );
     let with_custom = AttributeType::union(vec![AttributeType::string(), arn]);
-    assert!(!is_type_expr_compatible_with_schema(
+    assert!(lifted_source_is_assignable_to_schema(
         &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
         &with_custom,
         crate::schema::empty_defs_for_schema_walks(),
@@ -3420,7 +3668,7 @@ fn type_compat_simple_rejected_when_union_has_string_shaped_peer() {
             None,
         ),
     ]);
-    assert!(!is_type_expr_compatible_with_schema(
+    assert!(lifted_source_is_assignable_to_schema(
         &TypeExpr::Simple("iam_oidc_provider_arn".to_string()),
         &with_enum,
         crate::schema::empty_defs_for_schema_walks(),
@@ -3827,7 +4075,7 @@ fn export_param_ref_types_flags_unknown_struct_field_inside_path() {
         .unwrap_err();
     assert!(
         err.contains(
-            "export 'x': unknown attribute 'bad_field' on 'vpc' in reference vpc.config.bad_field"
+            "export 'x': unknown field 'bad_field' on struct 'VpcConfig' in reference vpc.config.bad_field"
         ),
         "expected export unknown struct field error, got: {err}",
     );
@@ -4460,7 +4708,7 @@ fn ref_with_chained_subscript_then_field_rejects_real_mismatch() {
 /// while the schema has migrated to a nested
 /// `domain_validation_options[0].resource_record.name`), validation
 /// must flag the unknown field by name with a suggestion. Pre-fix
-/// `narrow_attribute_type` returned `None` silently, the caller
+/// the old per-consumer narrowing returned `None` silently, the caller
 /// swallowed it, and the failure only surfaced at apply time with a
 /// misleading "Add a `wait` block" message — `wait` could never have
 /// helped, because the attribute will never exist under that spelling.

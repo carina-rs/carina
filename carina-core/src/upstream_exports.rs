@@ -19,8 +19,9 @@ use std::path::Path;
 
 use crate::config_loader::{find_crn_files_in_dir, parse_directory};
 use crate::parser::{ProviderContext, ResourceContext, ResourceRef, TypeExpr, UpstreamState};
-use crate::resource::{ConcreteValue, DeferredValue, Subscript, Value};
+use crate::resource::{Subscript, Value};
 use crate::schema::{AttributeType, SchemaRegistry, suggest_similar_name};
+use crate::validation::{RefSink, visit_refs_with_sink};
 
 /// One export's declared type and literal value, as carried through
 /// [`UpstreamExports`]. `type_expr` is `None` when the upstream's
@@ -579,147 +580,27 @@ fn check_ref_against_type(
     location: &str,
     errors: &mut Vec<UpstreamTypeError>,
 ) {
-    walk_value_against_type(value, expected, defs, exports, location, errors);
-}
-
-/// Positional walker: descend `value` and `expected` in lockstep,
-/// threading the inner expected type to each leaf `Value::Deferred(DeferredValue::ResourceRef)`
-/// so the comparison fires against the *position's* schema type rather
-/// than the outer attribute's. Without this, a ref deep inside a
-/// struct field or interpolation gets compared to the outer attr type
-/// and either false-flags or silently passes (the
-/// `is_scalar_type_expr` short-circuit before #2475).
-///
-/// Assumes the receiver `AttributeType` exposes its container shape
-/// directly: a `Map`/`List`/`Struct` receiver is matched as such.
-/// `Custom { base: <Container> }` is not unwrapped here — provider
-/// schemas keep `Custom` over scalar bases only, so the catch-all
-/// best-effort walk is sufficient. If a future schema introduces a
-/// `Custom { base: Map(_) }` shape, add an explicit `Custom` arm that
-/// recurses on `base`.
-fn walk_value_against_type(
-    value: &Value,
-    expected: &AttributeType,
-    defs: &std::collections::BTreeMap<String, AttributeType>,
-    exports: &UpstreamExports,
-    location: &str,
-    errors: &mut Vec<UpstreamTypeError>,
-) {
-    // Project onto `Shape` so `Ref` is peeled at the type level
-    // (carina#3349). Without this, `Ref<List<T>>` / `Ref<Struct>`
-    // would fall through the wildcard arms below and the
-    // leaf-ref check would compare against the raw `Ref` instead
-    // of its resolved target.
-    let expected_shape = expected.shape_with_defs(defs);
-    match value {
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            check_resource_ref_at_position(path, expected, defs, exports, location, errors);
-        }
-        Value::Concrete(ConcreteValue::List(items)) => {
-            // Descend `list(T)` element-wise. For non-list receivers
-            // the existing top-level shape check (run elsewhere)
-            // already flags the kind mismatch, so we just walk each
-            // element against the same expected type — the leaf-ref
-            // comparison will fire if the element doesn't fit.
-            let inner = match expected_shape {
-                crate::schema::Shape::List {
-                    element_type: inner,
-                    ..
-                } => inner,
-                _ => expected,
-            };
-            for item in items {
-                walk_value_against_type(item, inner, defs, exports, location, errors);
+    visit_refs_with_sink(
+        value,
+        Some(RefSink::AttributeType {
+            attr_type: expected,
+            defs,
+        }),
+        &mut |path, sink| match sink {
+            Some(RefSink::AttributeType { attr_type, defs }) => {
+                check_resource_ref_at_position(path, attr_type, defs, exports, location, errors);
             }
-        }
-        Value::Concrete(ConcreteValue::Map(entries)) => match expected_shape {
-            crate::schema::Shape::Map { value: inner, .. } => {
-                for v in entries.values() {
-                    walk_value_against_type(v, inner, defs, exports, location, errors);
-                }
-            }
-            crate::schema::Shape::Struct { .. } => {
-                let fields = crate::schema::struct_fields_with_defs(expected, defs)
-                    .expect("Shape::Struct must expose struct fields internally");
-                // Resolve via `build_accepted_field_map` so `block_name`
-                // aliases (`field { ... }` block syntax) reach the
-                // same field as the canonical name. Without this a
-                // ref written under the alias key would silently skip
-                // the type check.
-                let accepted = crate::schema::build_accepted_field_map(fields);
-                for (key, v) in entries {
-                    if let Some(field) = accepted.get(key.as_str()) {
-                        walk_value_against_type(
-                            v,
-                            &field.field_type,
-                            defs,
-                            exports,
-                            location,
-                            errors,
-                        );
-                    }
-                    // Unknown struct fields are flagged by the schema
-                    // validator; don't double-report here.
-                }
-            }
-            _ => {
-                // Receiver isn't a `Map`/`Struct` — Union receivers in
-                // particular land here. We don't try each Union member
-                // (would require committing to a best-fit member, which
-                // is the schema validator's job at the top level);
-                // walking each value against the whole Union still lets
-                // leaf-ref checks dispatch via
-                // `is_type_expr_compatible_with_schema`'s Union arm.
-                for v in entries.values() {
-                    walk_value_against_type(v, expected, defs, exports, location, errors);
-                }
-            }
+            Some(RefSink::String) => check_resource_ref_at_position(
+                path,
+                &AttributeType::string(),
+                defs,
+                exports,
+                location,
+                errors,
+            ),
+            Some(RefSink::TypeExpr(_)) | None => {}
         },
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            // The result of an interpolation is always a string, so
-            // every embedded `Expr` part sits in a String position
-            // regardless of where the interpolation itself appears.
-            for part in parts {
-                if let crate::resource::InterpolationPart::Expr(v) = part {
-                    walk_value_against_type(
-                        v,
-                        &AttributeType::string(),
-                        defs,
-                        exports,
-                        location,
-                        errors,
-                    );
-                }
-            }
-        }
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            walk_value_against_type(inner, expected, defs, exports, location, errors);
-        }
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
-            // Function arguments occupy function-internal positions
-            // whose declared types live on the function definition
-            // (out of reach here). Walk with `expected` as a
-            // best-effort so leaf refs get *some* check; precision
-            // would require typed function signatures.
-            for arg in args {
-                walk_value_against_type(arg, expected, defs, exports, location, errors);
-            }
-        }
-        Value::Concrete(ConcreteValue::String(_))
-        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
-        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
-        | Value::Concrete(ConcreteValue::Int(_))
-        | Value::Concrete(ConcreteValue::Float(_))
-        | Value::Concrete(ConcreteValue::Bool(_))
-        | Value::Concrete(ConcreteValue::Duration(_))
-        | Value::Concrete(ConcreteValue::StringList(_))
-        | Value::Deferred(DeferredValue::Unknown(_)) => {}
-        // `BindingRef` carries no attribute, so there is nothing to
-        // type-check at a "field reference" position. The same applies
-        // to all other walkers in this module: a bare-binding seed
-        // cannot stand in for an attribute reference. (#2847)
-        Value::Deferred(DeferredValue::BindingRef { .. }) => {}
-    }
+    );
 }
 
 /// Compare a single `ResourceRef` against the receiver type at its
@@ -754,20 +635,12 @@ fn check_resource_ref_at_position(
         // double-reporting.
         return;
     };
-    if crate::validation::is_type_expr_compatible_with_schema(&narrowed, expected, defs) {
+    let Some(source) = crate::validation::lift_type_expr(&narrowed) else {
+        // Resource handles and the other deliberately non-liftable forms are
+        // unchecked at module boundaries (carina#3803).
         return;
-    }
-    // String-shaped value into a string-compatible receiver. The
-    // strict compat check above accepts `Simple(name) → String` /
-    // `Union<plain Strings>` directly via subtyping (#2643), so this
-    // fallback only handles the receivers it doesn't yet cover —
-    // `Custom { identity: None }`-shaped wrappers and
-    // `Enum` receivers — and the non-`Simple` string-shaped
-    // values (e.g. `SchemaType` / scalar `String` literal) the
-    // strict path also doesn't recognise. The reverse direction
-    // (`String → Custom { semantic_name: Some(_) }`) stays strict
-    // via `attr_type_demands_specific_custom`. #2475 / #2643.
-    if narrowed.is_string_shaped() && crate::validation::is_string_compatible_type(expected, defs) {
+    };
+    if crate::schema::TypeInSchema::schemaless(&source).is_assignable_to(expected.in_schema(defs)) {
         return;
     }
     errors.push(UpstreamTypeError {
@@ -1319,6 +1192,7 @@ fn visit_subscript_access(
 mod tests {
     use super::*;
     use crate::parser::ParsedFile;
+    use crate::resource::DeferredValue;
     use std::fs;
     use std::path::PathBuf;
 
@@ -2112,10 +1986,12 @@ mod tests {
     }
 
     #[test]
-    fn type_check_accepts_custom_type_chain() {
-        // Consumer attribute is `Custom { name: "KmsKeyArn", base: Arn }`;
-        // export declares plain `TypeExpr::Simple("arn")`. The type checker
-        // walks Custom's base chain, so `arn` accepts `KmsKeyArn`.
+    fn type_check_rejects_distinct_bare_refinement_kinds() {
+        // `KmsKeyArn` and `Arn` are distinct bare identity kinds; the shared
+        // relation cannot infer a subtype edge from their spelling. #1874's
+        // safe widening is represented by structured identities that retain
+        // kind `Arn` and place `kms.Key` on the segments axis (covered by the
+        // core directional-relation tests).
         use crate::schema::{AttributeType, TypeIdentity};
         let parsed = parse_project_with_provider(
             r#"
@@ -2126,20 +2002,23 @@ mod tests {
             "#,
             "test",
         );
-        let exports =
-            mk_typed_exports(&[("orgs", &[("key_arn", TypeExpr::Simple("arn".to_string()))])]);
-        let kms_arn = AttributeType::refined_string_with_validator(
-            Some(TypeIdentity::bare("KmsKeyArn")),
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[("key_arn", TypeExpr::Simple("kms_key_arn".to_string()))],
+        )]);
+        let arn = AttributeType::refined_string_with_validator(
+            Some(TypeIdentity::bare("Arn")),
             None,
             None,
             crate::schema::legacy_validator(|_| Ok(())),
             None,
         );
-        let schemas = schema_with_attr("name", kms_arn);
+        let schemas = schema_with_attr("name", arn);
         let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
-        assert!(
-            errs.is_empty(),
-            "Custom type chain must accept base ancestor, got: {errs:?}"
+        assert_eq!(
+            errs.len(),
+            1,
+            "distinct bare identity kinds must not be treated as a subtype chain: {errs:?}"
         );
     }
 

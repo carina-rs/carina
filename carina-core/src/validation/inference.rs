@@ -1613,11 +1613,14 @@ mod tests {
             indexmap::IndexMap::new();
         virt_attrs.insert(
             "role_id".to_string(),
-            crate::resource::CompositionAttribute::from_value(Value::resource_ref(
-                "github_actions_carina.role".to_string(),
-                "vpc_id".to_string(),
-                vec![],
-            )),
+            crate::resource::CompositionAttribute::from_value(
+                Value::resource_ref(
+                    "github_actions_carina.role".to_string(),
+                    "vpc_id".to_string(),
+                    vec![],
+                ),
+                None,
+            ),
         );
         let virt = crate::resource::Composition {
             id: crate::resource::ResourceId::with_identity("_virtual", "github_actions_carina"),

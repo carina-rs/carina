@@ -55,7 +55,7 @@ fn make_virtual(binding: &str, attrs: &[(&str, Value)]) -> Composition {
     for (k, v) in attrs {
         attributes.insert(
             (*k).into(),
-            crate::resource::CompositionAttribute::from_value(v.clone()),
+            crate::resource::CompositionAttribute::from_value(v.clone(), None),
         );
     }
     Composition {
