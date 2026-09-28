@@ -486,22 +486,29 @@ pub fn validate_resource_ref_types_with_ctx<E>(
     ))
 }
 
-pub fn validate_module_call_argument_refs_with_ctx<E>(
+pub fn validate_composition_ref_types_with_ctx<E>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E>,
-    argument_names: &HashSet<String>,
-    imported_modules: &module_resolver::ResolvedModuleSignatures,
+    base_dir: &Path,
 ) -> Vec<AppError> {
     let bindings = carina_core::binding_index::BindingIndex::from_parsed(parsed, ctx.schemas());
-    validation::validate_module_call_argument_ref_types_with_bindings(
-        &parsed.module_calls,
-        imported_modules,
-        argument_names,
-        &bindings,
-    )
-    .into_iter()
-    .map(|error| AppError::Validation(error.to_string()))
-    .collect()
+    validation::validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings)
+        .into_iter()
+        .map(|error| {
+            let message = match error.diagnostic_directory() {
+                Some(directory) => {
+                    let diagnostic_path = directory.strip_prefix(base_dir).unwrap_or(directory);
+                    if diagnostic_path.as_os_str().is_empty() {
+                        error.to_string()
+                    } else {
+                        format!("{}: {}", diagnostic_path.display(), error)
+                    }
+                }
+                None => error.to_string(),
+            };
+            AppError::Validation(message)
+        })
+        .collect()
 }
 
 pub fn validate_attribute_param_ref_types_with_ctx<E>(
@@ -1291,69 +1298,36 @@ pub(crate) fn validate_module_calls_with_imported<E>(
     ))
 }
 
-/// Validate both call arguments and output attributes in every recursively
-/// imported module against the same pre-expansion module signature surfaces.
-pub(crate) fn validate_module_boundary_ref_types(
+/// Preserve source-local module-output diagnostics when module expansion
+/// fails before compositions can be built (for example, on an import cycle).
+///
+/// Successful validation never calls this fallback: imported module outputs
+/// are owned exclusively by the post-expansion composition pass. Without a
+/// complete expansion graph, the local [`BindingIndex`] can still validate
+/// direct resource/data-source references in each `attributes {}` block, but
+/// deliberately does not approximate forwarded composition inference.
+pub(crate) fn validate_module_attribute_refs_after_expansion_failure(
     ctx: &WiringContext,
     module_walk: &ModuleWalk,
     config: &carina_core::parser::ProviderContext,
 ) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
-        let mut module_parsed = module.loaded().parsed.clone();
-        for finding in validation::resolve_file_type_exprs(&mut module_parsed, config) {
+        let mut parsed = module.loaded().parsed.clone();
+        for finding in validation::resolve_file_type_exprs(&mut parsed, config) {
             errors.push(AppError::Validation(format!(
                 "{}: {finding}",
                 module.diagnostic_path().display()
             )));
         }
         let bindings =
-            carina_core::binding_index::BindingIndex::from_parsed(&module_parsed, ctx.schemas());
-        let imported_modules = pre_expansion_module_signatures(
-            &module_parsed,
-            module.module_path(),
-            module_walk,
-            config,
-        );
-        let module_call_attributes = validation::pre_expansion_module_call_attributes(
-            &module_parsed.module_calls,
-            &imported_modules,
-        );
-        let argument_names = module_parsed
-            .arguments
-            .iter()
-            .map(|argument| argument.name.clone())
-            .chain(
-                module_parsed
-                    .upstream_states
-                    .iter()
-                    .map(|state| state.binding.clone()),
-            )
-            .collect();
-        errors.extend(
-            validation::validate_module_call_argument_ref_types_with_bindings_and_module_calls(
-                &module_parsed.module_calls,
-                &imported_modules,
-                &argument_names,
-                &bindings,
-                &module_call_attributes,
-            )
-            .into_iter()
-            .map(|error| {
-                AppError::Validation(format!("{}: {}", module.diagnostic_path().display(), error))
-            }),
-        );
-        if let Err(joined) =
-            validation::validate_attribute_param_ref_types_with_bindings_and_module_calls(
-                &module_parsed.attribute_params,
-                &bindings,
-                &module_call_attributes,
-            )
-        {
-            // Preserve the module-path prefix the legacy wrapper emitted
-            // so diagnostics point at which imported module failed.
-            errors.extend(joined.split('\n').filter(|s| !s.is_empty()).map(|s| {
-                AppError::Validation(format!("{}: {}", module.diagnostic_path().display(), s))
+            carina_core::binding_index::BindingIndex::from_parsed(&parsed, ctx.schemas());
+        if let Err(joined) = validation::validate_attribute_param_ref_types_with_bindings(
+            &parsed.attribute_params,
+            &bindings,
+        ) {
+            errors.extend(joined.lines().filter(|line| !line.is_empty()).map(|line| {
+                AppError::Validation(format!("{}: {line}", module.diagnostic_path().display()))
             }));
         }
     }
@@ -1450,21 +1424,6 @@ pub(crate) fn validate_no_exports_in_modules(module_walk: &ModuleWalk) -> Vec<Ap
         }
     }
     errors
-}
-
-fn pre_expansion_module_signatures(
-    module_parsed: &carina_core::parser::ParsedFile,
-    module_path: &Path,
-    module_walk: &ModuleWalk,
-    config: &carina_core::parser::ProviderContext,
-) -> module_resolver::ResolvedModuleSignatures {
-    module_resolver::resolve_module_signatures_with(module_parsed, config, |import| {
-        // Reuse the shared recursive walk's loaded snapshot instead of
-        // starting another filesystem traversal for nested signatures.
-        module_walk
-            .parsed_at(&module_path.join(&import.path))
-            .cloned()
-    })
 }
 
 pub async fn get_provider_with_ctx<E>(

@@ -68,6 +68,8 @@ fn make_virtual(binding: &str, attrs: &[(&str, Value)]) -> Composition {
         dependency_bindings: BTreeSet::new(),
         module_name: "m".into(),
         instance: binding.into(),
+        call_directory: None,
+        module_directory: None,
         quoted_string_attrs: Default::default(),
     }
 }

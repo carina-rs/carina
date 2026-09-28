@@ -4,11 +4,11 @@ pub mod deferred_populate;
 pub mod depends_on;
 pub mod wait;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use indexmap::IndexMap;
 
-use crate::binding_index::{BindingIndex, RefTargetKind, RefType, RefTypeError, ResolvedRefType};
+use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
 use crate::deps::collect_dependencies;
 use crate::parser::{
     ModuleCall, ProviderContext, ResourceRef, ResourceTypePath, TypeExpr, validate_custom_type,
@@ -270,62 +270,6 @@ pub(crate) fn visit_refs_with_sink<'a>(
     }
 }
 
-/// Pre-expansion module-call attribute surface shared by every module-boundary
-/// reference check. Each attribute carries its optional declared type.
-pub type PreExpansionModuleCallAttributes = HashMap<String, IndexMap<String, Option<TypeExpr>>>;
-
-/// Build the declared output surface for the module-call bindings in one file.
-///
-/// Callers resolve imported signatures once, then share this surface between
-/// module-call argument checking and `attributes {}` checking. Unannotated
-/// outputs still establish attribute existence, but do not invent a type.
-pub fn pre_expansion_module_call_attributes(
-    module_calls: &[ModuleCall],
-    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
-) -> PreExpansionModuleCallAttributes {
-    module_calls
-        .iter()
-        .filter_map(|call| {
-            let binding = call.binding_name.as_ref()?;
-            let signature = imported_modules.get(&call.module_name)?;
-            Some((binding.clone(), signature.attributes.clone()))
-        })
-        .collect()
-}
-
-enum PreExpansionRefType<'a> {
-    Typed(&'a TypeExpr),
-    Unchecked,
-    UnknownBinding,
-    UnknownAttribute(RefTypeError),
-}
-
-/// Resolve one reference through the declared pre-expansion module surface.
-/// This is the single lookup used by both call-argument and output-attribute
-/// validation when [`BindingIndex`] cannot yet see a synthesized Composition.
-fn pre_expansion_module_call_ref_type<'a>(
-    path: &AccessPath,
-    module_call_attributes: &'a PreExpansionModuleCallAttributes,
-) -> PreExpansionRefType<'a> {
-    let Some(known_attributes) = module_call_attributes.get(path.binding()) else {
-        return PreExpansionRefType::UnknownBinding;
-    };
-    let Some(source_type) = known_attributes.get(path.attribute()) else {
-        return PreExpansionRefType::UnknownAttribute(RefTypeError::UnknownAttribute {
-            binding: path.binding().to_string(),
-            attribute: path.attribute().to_string(),
-            known_attributes: known_attributes.keys().cloned().collect(),
-            target: RefTargetKind::Composition,
-        });
-    };
-    if !path.segments().is_empty() {
-        return PreExpansionRefType::Unchecked;
-    }
-    source_type
-        .as_ref()
-        .map_or(PreExpansionRefType::Unchecked, PreExpansionRefType::Typed)
-}
-
 fn check_resource_ref_existence(
     resource_id: &crate::resource::ResourceId,
     ref_path: &crate::resource::AccessPath,
@@ -392,6 +336,7 @@ pub struct ModuleCallRefError {
     pub argument: String,
     pub path: AccessPath,
     pub kind: ModuleCallRefErrorKind,
+    pub call_directory: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Display for ModuleCallRefError {
@@ -429,27 +374,6 @@ pub fn validate_module_call_argument_ref_types_with_bindings(
     imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
     argument_names: &HashSet<String>,
     bindings: &BindingIndex<'_>,
-) -> Vec<ModuleCallRefError> {
-    let module_call_attributes =
-        pre_expansion_module_call_attributes(module_calls, imported_modules);
-    validate_module_call_argument_ref_types_with_bindings_and_module_calls(
-        module_calls,
-        imported_modules,
-        argument_names,
-        bindings,
-        &module_call_attributes,
-    )
-}
-
-/// Reuse a precomputed declared module-output surface while checking call
-/// argument references. Recursive module validation shares this exact surface
-/// with its attributes-block check.
-pub fn validate_module_call_argument_ref_types_with_bindings_and_module_calls(
-    module_calls: &[ModuleCall],
-    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
-    argument_names: &HashSet<String>,
-    bindings: &BindingIndex<'_>,
-    module_call_attributes: &PreExpansionModuleCallAttributes,
 ) -> Vec<ModuleCallRefError> {
     let mut errors = Vec::new();
 
@@ -497,6 +421,7 @@ pub fn validate_module_call_argument_ref_types_with_bindings_and_module_calls(
                                         expected: sink_type.resolved_type_name(),
                                         actual: source_name,
                                     },
+                                    call_directory: None,
                                 });
                             }
                         }
@@ -506,19 +431,10 @@ pub fn validate_module_call_argument_ref_types_with_bindings_and_module_calls(
                                 argument: argument_name.clone(),
                                 path: path.clone(),
                                 kind: ModuleCallRefErrorKind::UnknownAttribute(error),
+                                call_directory: None,
                             });
                         }
-                        RefType::UnknownBinding { .. } => {
-                            check_pre_expansion_module_call_argument_ref(
-                                call_name,
-                                argument_name,
-                                sink.and_then(RefSink::as_type_expr),
-                                path,
-                                module_call_attributes,
-                                &mut errors,
-                            );
-                        }
-                        RefType::Unchecked => {}
+                        RefType::Unchecked | RefType::UnknownBinding { .. } => {}
                     }
                 },
             );
@@ -528,46 +444,195 @@ pub fn validate_module_call_argument_ref_types_with_bindings_and_module_calls(
     errors
 }
 
-fn check_pre_expansion_module_call_argument_ref(
-    call_name: &str,
-    argument_name: &str,
-    expected_type: Option<&TypeExpr>,
-    path: &AccessPath,
-    module_call_attributes: &PreExpansionModuleCallAttributes,
-    errors: &mut Vec<ModuleCallRefError>,
-) {
-    match pre_expansion_module_call_ref_type(path, module_call_attributes) {
-        PreExpansionRefType::Typed(source_type) => {
-            let (Some(source), Some(sink)) = (
-                lift_type_expr(source_type),
-                expected_type.and_then(lift_type_expr),
-            ) else {
-                return;
-            };
-            let source_type = crate::schema::TypeInSchema::schemaless(&source);
-            let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
-            if !source_type.is_assignable_to(sink_type) {
-                errors.push(ModuleCallRefError {
-                    call: call_name.to_string(),
-                    argument: argument_name.to_string(),
-                    path: path.clone(),
-                    kind: ModuleCallRefErrorKind::TypeMismatch {
-                        expected: sink_type.resolved_type_name(),
-                        actual: source_type.resolved_type_name(),
-                    },
-                });
+#[derive(Debug, Clone)]
+pub struct AttributeParamRefError {
+    pub attribute: String,
+    pub path: AccessPath,
+    pub kind: ModuleCallRefErrorKind,
+    pub module_directory: Option<std::path::PathBuf>,
+}
+
+impl std::fmt::Display for AttributeParamRefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            ModuleCallRefErrorKind::TypeMismatch { expected, actual } => write!(
+                f,
+                "attribute '{}': type mismatch: expected {}, got {} (from {})",
+                self.attribute,
+                expected,
+                actual,
+                self.path.to_dot_string(),
+            ),
+            ModuleCallRefErrorKind::UnknownAttribute(error) => {
+                write!(f, "attribute '{}': {}", self.attribute, error)
             }
         }
-        PreExpansionRefType::UnknownAttribute(error) => {
-            errors.push(ModuleCallRefError {
-                call: call_name.to_string(),
-                argument: argument_name.to_string(),
-                path: path.clone(),
-                kind: ModuleCallRefErrorKind::UnknownAttribute(error),
-            });
-        }
-        PreExpansionRefType::Unchecked | PreExpansionRefType::UnknownBinding => {}
     }
+}
+
+impl std::error::Error for AttributeParamRefError {}
+
+/// A reference-type failure found on one fully expanded composition boundary.
+#[derive(Debug, Clone)]
+pub enum CompositionRefError {
+    ModuleCall(ModuleCallRefError),
+    Attribute(AttributeParamRefError),
+}
+
+impl CompositionRefError {
+    pub fn diagnostic_directory(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::ModuleCall(error) => error.call_directory.as_deref(),
+            Self::Attribute(error) => error.module_directory.as_deref(),
+        }
+    }
+}
+
+impl std::fmt::Display for CompositionRefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ModuleCall(error) => error.fmt(f),
+            Self::Attribute(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for CompositionRefError {}
+
+fn composition_ref_error_kind(
+    path: &AccessPath,
+    sink: Option<RefSink<'_>>,
+    bindings: &BindingIndex<'_>,
+) -> Option<ModuleCallRefErrorKind> {
+    match bindings.ref_type(path) {
+        RefType::Typed(source) => {
+            let sink = sink
+                .and_then(RefSink::as_type_expr)
+                .and_then(lift_type_expr)?;
+            let source_type = source.type_in_schema();
+            let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
+            (!source_type.is_assignable_to(sink_type)).then(|| {
+                ModuleCallRefErrorKind::TypeMismatch {
+                    expected: sink_type.resolved_type_name(),
+                    actual: source_type.resolved_type_name(),
+                }
+            })
+        }
+        RefType::UnknownAttribute(error) => Some(ModuleCallRefErrorKind::UnknownAttribute(error)),
+        RefType::Unchecked | RefType::UnknownBinding { .. } => None,
+    }
+}
+
+fn localize_composition_path(path: &AccessPath, prefix: Option<&str>) -> AccessPath {
+    let binding = prefix
+        .and_then(|prefix| path.binding().strip_prefix(prefix))
+        .and_then(|suffix| suffix.strip_prefix('.'))
+        .unwrap_or(path.binding());
+    AccessPath::with_segments(
+        binding.to_string(),
+        path.attribute().to_string(),
+        path.segments().to_vec(),
+    )
+}
+
+fn localize_composition_error_kind(
+    kind: ModuleCallRefErrorKind,
+    path: &AccessPath,
+) -> ModuleCallRefErrorKind {
+    match kind {
+        ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::UnknownAttribute {
+            attribute,
+            known_attributes,
+            target,
+            ..
+        }) => ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::UnknownAttribute {
+            binding: path.binding().to_string(),
+            attribute,
+            known_attributes,
+            target,
+        }),
+        ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::UnknownStructField {
+            field,
+            struct_name,
+            known_fields,
+            ..
+        }) => ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::UnknownStructField {
+            path: path.to_dot_string(),
+            field,
+            struct_name,
+            known_fields,
+        }),
+        other => other,
+    }
+}
+
+/// Validate every fully expanded module-call boundary exactly once.
+///
+/// Both halves of the boundary live on [`crate::resource::Composition`]:
+/// typed call arguments and typed output attributes. The shared
+/// [`BindingIndex`] is built only after all nested compositions have been
+/// prefixed into the root parse, so unannotated forwarded outputs can inherit
+/// their resource-schema type through arbitrarily deep composition chains.
+pub fn validate_composition_ref_types_with_bindings(
+    compositions: &[crate::resource::Composition],
+    bindings: &BindingIndex<'_>,
+) -> Vec<CompositionRefError> {
+    let mut errors = Vec::new();
+
+    for composition in compositions {
+        for (argument_name, argument) in &composition.signature.arguments {
+            visit_refs_with_sink(
+                argument.value(),
+                argument.declared_type().map(RefSink::TypeExpr),
+                &mut |path, sink| {
+                    let Some(kind) = composition_ref_error_kind(path, sink, bindings) else {
+                        return;
+                    };
+                    let path =
+                        localize_composition_path(path, composition.containing_instance_prefix());
+                    let kind = localize_composition_error_kind(kind, &path);
+                    errors.push(CompositionRefError::ModuleCall(ModuleCallRefError {
+                        call: composition.call_label().to_string(),
+                        argument: argument_name.clone(),
+                        path,
+                        kind,
+                        call_directory: composition.call_directory().map(ToOwned::to_owned),
+                    }));
+                },
+            );
+        }
+
+        for (attribute_name, attribute) in &composition.signature.attributes {
+            let value = attribute.validation_value();
+            visit_refs_with_sink(
+                &value,
+                attribute.declared_type().map(RefSink::TypeExpr),
+                &mut |path, sink| {
+                    let Some(kind) = composition_ref_error_kind(path, sink, bindings) else {
+                        return;
+                    };
+                    let path =
+                        localize_composition_path(path, Some(composition.expanded_instance()));
+                    let kind = localize_composition_error_kind(kind, &path);
+                    errors.push(CompositionRefError::Attribute(AttributeParamRefError {
+                        attribute: attribute_name.clone(),
+                        path,
+                        kind,
+                        module_directory: composition.module_directory().map(ToOwned::to_owned),
+                    }));
+                },
+            );
+        }
+    }
+
+    let mut seen = HashSet::new();
+    errors.retain(|error| {
+        seen.insert((
+            error.diagnostic_directory().map(ToOwned::to_owned),
+            error.to_string(),
+        ))
+    });
+    errors
 }
 
 /// Validate resources against their schemas.
@@ -779,29 +844,6 @@ pub fn validate_attribute_param_ref_types_with_bindings(
     attribute_params: &[crate::parser::AttributeParameter],
     bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
-    validate_attribute_param_ref_types_with_bindings_and_module_calls(
-        attribute_params,
-        bindings,
-        &HashMap::new(),
-    )
-}
-
-/// Validate module attribute parameters before nested module expansion.
-///
-/// [`BindingIndex`] remains the sole post-expansion authority. At this seam,
-/// however, `load_module` intentionally returns an unexpanded parse, so nested
-/// module calls have no
-/// [`BindingTarget::Composition`](crate::binding_index::BindingTarget::Composition)
-/// entry yet. The second
-/// lookup contains the declared `attributes {}` surfaces loaded from those
-/// calls' imported modules. Unannotated outputs still provide existence but no
-/// pre-expansion type; after expansion [`BindingIndex::ref_type`] can infer a
-/// forwarded value through the resulting composition.
-pub fn validate_attribute_param_ref_types_with_bindings_and_module_calls(
-    attribute_params: &[crate::parser::AttributeParameter],
-    bindings: &BindingIndex<'_>,
-    module_call_attributes: &PreExpansionModuleCallAttributes,
-) -> Result<(), String> {
     let mut errors = Vec::new();
 
     for param in attribute_params {
@@ -818,7 +860,6 @@ pub fn validate_attribute_param_ref_types_with_bindings_and_module_calls(
                     sink.and_then(RefSink::as_type_expr),
                     path,
                     bindings,
-                    module_call_attributes,
                     &mut errors,
                 );
             },
@@ -837,7 +878,6 @@ fn check_attribute_param_ref(
     expected_type: Option<&TypeExpr>,
     path: &crate::resource::AccessPath,
     bindings: &BindingIndex<'_>,
-    module_call_attributes: &PreExpansionModuleCallAttributes,
     errors: &mut Vec<String>,
 ) {
     match bindings.ref_type(path) {
@@ -860,47 +900,7 @@ fn check_attribute_param_ref(
         RefType::UnknownAttribute(error) => {
             errors.push(format!("attribute '{}': {}", param_name, error));
         }
-        RefType::UnknownBinding { .. } => check_pre_expansion_module_call_attribute_ref(
-            param_name,
-            expected_type,
-            path,
-            module_call_attributes,
-            errors,
-        ),
-        RefType::Unchecked => {}
-    }
-}
-
-fn check_pre_expansion_module_call_attribute_ref(
-    param_name: &str,
-    expected_type: Option<&TypeExpr>,
-    path: &AccessPath,
-    module_call_attributes: &PreExpansionModuleCallAttributes,
-    errors: &mut Vec<String>,
-) {
-    match pre_expansion_module_call_ref_type(path, module_call_attributes) {
-        PreExpansionRefType::Typed(source_type) => {
-            if let (Some(source), Some(sink)) = (
-                lift_type_expr(source_type),
-                expected_type.and_then(lift_type_expr),
-            ) {
-                let source_type = crate::schema::TypeInSchema::schemaless(&source);
-                let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
-                if !source_type.is_assignable_to(sink_type) {
-                    errors.push(format!(
-                        "attribute '{}': type mismatch: expected {}, got {} (from {})",
-                        param_name,
-                        expected_type.expect("lifted expected type exists"),
-                        source_type.resolved_type_name(),
-                        path.to_dot_string(),
-                    ));
-                }
-            }
-        }
-        PreExpansionRefType::UnknownAttribute(error) => {
-            errors.push(format!("attribute '{}': {}", param_name, error));
-        }
-        PreExpansionRefType::Unchecked | PreExpansionRefType::UnknownBinding => {}
+        RefType::Unchecked | RefType::UnknownBinding { .. } => {}
     }
 }
 

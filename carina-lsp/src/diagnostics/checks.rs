@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
 use crate::position;
@@ -14,7 +14,7 @@ use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::suggest_similar_name;
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
-use super::{DiagnosticEngine, carina_diagnostic};
+use super::{DiagnosticEngine, carina_diagnostic, carina_diagnostic_range};
 
 fn module_call_header_position(line: &str, call: &ModuleCall) -> Option<usize> {
     let module_pattern = format!("{} {{", call.module_name);
@@ -1234,6 +1234,74 @@ impl DiagnosticEngine {
         .collect()
     }
 
+    /// Validate all expanded module boundaries, including calls nested below
+    /// the directory currently open in the editor.
+    pub(super) fn check_composition_ref_types(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+        compositions: &[carina_core::resource::Composition],
+        binding_index: &BindingIndex<'_>,
+        base_path: &std::path::Path,
+    ) -> Vec<Diagnostic> {
+        carina_core::validation::validate_composition_ref_types_with_bindings(
+            compositions,
+            binding_index,
+        )
+        .into_iter()
+        .map(|error| {
+            let diagnostic_directory = error.diagnostic_directory();
+            let diagnostic_path = diagnostic_directory
+                .map(|directory| directory.strip_prefix(base_path).unwrap_or(directory));
+            let belongs_to_open_directory =
+                diagnostic_path.is_some_and(|path| path.as_os_str().is_empty());
+            let message = match diagnostic_path {
+                Some(path) if !path.as_os_str().is_empty() => {
+                    format!("{}: {}", path.display(), error)
+                }
+                _ => error.to_string(),
+            };
+
+            let range = if belongs_to_open_directory {
+                match &error {
+                    carina_core::validation::CompositionRefError::ModuleCall(error) => {
+                        let call = parsed.module_calls.iter().find(|call| {
+                            call.binding_name.as_deref().unwrap_or(&call.module_name)
+                                == error.call.as_str()
+                        });
+                        call.and_then(|call| {
+                            self.find_module_call_arg_position(doc, call, &error.argument)
+                                .map(|(line, col)| {
+                                    Range::new(
+                                        Position::new(line, col),
+                                        Position::new(
+                                            line,
+                                            col + error.argument.chars().count() as u32,
+                                        ),
+                                    )
+                                })
+                        })
+                        .unwrap_or_default()
+                    }
+                    carina_core::validation::CompositionRefError::Attribute(error) => self
+                        .find_attributes_param_position(doc, &error.attribute)
+                        .map(|(line, col)| {
+                            Range::new(
+                                Position::new(line, col),
+                                Position::new(line, col + error.attribute.chars().count() as u32),
+                            )
+                        })
+                        .unwrap_or_default(),
+                }
+            } else {
+                Range::default()
+            };
+
+            carina_diagnostic_range(range, DiagnosticSeverity::WARNING, message)
+        })
+        .collect()
+    }
+
     /// Validate a module argument value against its expected type.
     pub(super) fn validate_module_arg_type(
         &self,
@@ -1476,7 +1544,9 @@ impl DiagnosticEngine {
         // Buffer parses use the bootstrap provider context, so dotted
         // boundary annotations remain `DottedUnresolved` even when schemas
         // are loaded. Resolve a local copy before the BindingIndex-backed
-        // directional check, matching the CLI's pre-expansion module pass.
+        // directional check. Expanded compositions handle imported-module
+        // boundaries; this source-local walk covers the open module's own
+        // `attributes {}` declaration.
         let mut resolved_attribute_params = parsed.attribute_params.clone();
         for parameter in &mut resolved_attribute_params {
             if let Some(type_expr) = &parameter.type_expr

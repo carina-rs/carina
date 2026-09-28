@@ -16,6 +16,7 @@
 //! `module_name` + `instance` — those are always set for compositions.
 
 use std::collections::{BTreeSet, HashSet};
+use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,12 @@ pub struct CompositionAttribute {
     value: CompositionAttributeValue,
     #[serde(skip)]
     declared_type: Option<TypeExpr>,
+    /// Module-local expression used for boundary validation before call
+    /// arguments were substituted into the runtime value. Keeping argument
+    /// placeholders here prevents one bad call argument from being reported
+    /// again as every output that forwards it.
+    #[serde(skip)]
+    validation_value: Option<Value>,
 }
 
 impl CompositionAttribute {
@@ -88,6 +95,17 @@ impl CompositionAttribute {
     /// interpolation, function call, etc.) and lifts into
     /// classified as derived.
     pub fn from_value(value: Value, declared_type: Option<TypeExpr>) -> Self {
+        let validation_value = value.clone();
+        Self::from_value_with_validation(value, declared_type, validation_value)
+    }
+
+    /// Classify the runtime value while retaining the module-local expression
+    /// that should be inspected by boundary validation.
+    pub fn from_value_with_validation(
+        value: Value,
+        declared_type: Option<TypeExpr>,
+        validation_value: Value,
+    ) -> Self {
         let value = match value {
             Value::Deferred(DeferredValue::ResourceRef { path }) => {
                 CompositionAttributeValue::Forwarded(path)
@@ -97,6 +115,7 @@ impl CompositionAttribute {
         Self {
             value,
             declared_type,
+            validation_value: Some(validation_value),
         }
     }
 
@@ -115,7 +134,13 @@ impl CompositionAttribute {
 
     /// Reclassify a rewritten value while preserving its declaration.
     pub fn with_value(&self, value: Value) -> Self {
-        Self::from_value(value, self.declared_type.clone())
+        Self::from_value_with_validation(value, self.declared_type.clone(), self.validation_value())
+    }
+
+    /// Reclassify both runtime and validation expressions while preserving the
+    /// declared boundary type.
+    pub fn with_values(&self, value: Value, validation_value: Value) -> Self {
+        Self::from_value_with_validation(value, self.declared_type.clone(), validation_value)
     }
 
     /// Reify back into a [`Value`] for callers that have not yet been
@@ -133,6 +158,52 @@ impl CompositionAttribute {
             }
             CompositionAttributeValue::Derived(v) => v.clone(),
         }
+    }
+
+    /// Expression to inspect for boundary diagnostics. Legacy saved plans do
+    /// not carry it, so deserialized values fall back to their runtime shape.
+    pub fn validation_value(&self) -> Value {
+        self.validation_value
+            .clone()
+            .unwrap_or_else(|| self.to_value())
+    }
+}
+
+/// One resolved module-call argument together with its declared boundary type.
+///
+/// The declaration is validation-only and deliberately travels with every
+/// value rewrite. Keeping both fields private means callers cannot insert a
+/// raw [`Value`] into [`Signature::arguments`]; every construction site must
+/// explicitly decide which declared type accompanies it. The optional shape
+/// keeps saved-plan deserialization backward-compatible even though live
+/// expansion always supplies `Some` for declared module arguments.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CompositionArgument {
+    value: Value,
+    #[serde(skip)]
+    declared_type: Option<TypeExpr>,
+}
+
+impl CompositionArgument {
+    pub fn from_value(value: Value, declared_type: Option<TypeExpr>) -> Self {
+        Self {
+            value,
+            declared_type,
+        }
+    }
+
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
+
+    pub fn declared_type(&self) -> Option<&TypeExpr> {
+        self.declared_type.as_ref()
+    }
+
+    /// Rewrite a prefixed/substituted value without dropping its declaration.
+    pub fn with_value(&self, value: Value) -> Self {
+        Self::from_value(value, self.declared_type.clone())
     }
 }
 
@@ -164,7 +235,7 @@ pub struct Signature {
     /// produced by a module that does not declare any `argument`
     /// parameters, or when the call site passed no arguments.
     #[serde(default)]
-    pub arguments: IndexMap<String, Value>,
+    pub arguments: IndexMap<String, CompositionArgument>,
     /// Module-output values classified by how they are produced
     /// (#3294): forwarded values are single-hop aliases and derived values are
     /// multi-source expressions. Each entry also carries its optional declared
@@ -241,6 +312,16 @@ pub struct Composition {
     pub module_name: String,
     /// Module instance binding name (e.g. "web").
     pub instance: String,
+    /// Directory containing the module call represented by this composition.
+    /// Validation uses it to qualify diagnostics for nested calls. It is
+    /// plan-local provenance and is intentionally absent from saved plans.
+    #[serde(skip)]
+    pub call_directory: Option<PathBuf>,
+    /// Directory containing the called module's `attributes {}` declaration.
+    /// This differs from `call_directory`: argument errors belong to the
+    /// caller, while output declaration errors belong to the callee.
+    #[serde(skip)]
+    pub module_directory: Option<PathBuf>,
     /// Parser-level: attributes whose value was written as a quoted
     /// string literal. Parse-time only; `#[serde(skip)]` keeps it out
     /// of state — mirrors [`Resource::quoted_string_attrs`](super::Resource).
@@ -257,6 +338,35 @@ impl Composition {
     /// compile error.
     pub fn ephemeral_id(&self) -> super::EphemeralId {
         super::EphemeralId::new(self.id.clone())
+    }
+
+    /// The local DSL label for this call, excluding any expansion prefix.
+    pub fn call_label(&self) -> &str {
+        self.binding
+            .as_deref()
+            .and_then(|binding| binding.rsplit('.').next())
+            .unwrap_or(&self.module_name)
+    }
+
+    pub fn call_directory(&self) -> Option<&Path> {
+        self.call_directory.as_deref()
+    }
+
+    pub fn module_directory(&self) -> Option<&Path> {
+        self.module_directory.as_deref()
+    }
+
+    /// Fully expanded instance identity (`outer.inner.call`).
+    pub fn expanded_instance(&self) -> &str {
+        self.id.identity_or_empty()
+    }
+
+    /// Expanded prefix of the module containing this call (`outer.inner` for
+    /// `outer.inner.call`). Root calls have no containing prefix.
+    pub fn containing_instance_prefix(&self) -> Option<&str> {
+        self.expanded_instance()
+            .rsplit_once('.')
+            .map(|(prefix, _)| prefix)
     }
 }
 
@@ -368,6 +478,43 @@ mod tests {
         let decoded: CompositionAttribute =
             serde_json::from_value(typed_json).expect("deserialize legacy-compatible attribute");
         assert_eq!(decoded.to_value(), value);
+        assert_eq!(decoded.declared_type(), None);
+    }
+
+    #[test]
+    fn argument_declared_type_is_carried_with_value_rewrites() {
+        let declared = TypeExpr::SchemaType {
+            provider: "aws".to_string(),
+            path: "ec2.Vpc".to_string(),
+            type_name: "Id".to_string(),
+        };
+        let argument = CompositionArgument::from_value(
+            Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new("vpc", "vpc_id"),
+            }),
+            Some(declared.clone()),
+        );
+
+        let rewritten = argument.with_value(Value::Concrete(ConcreteValue::String("x".into())));
+
+        assert_eq!(rewritten.declared_type(), Some(&declared));
+    }
+
+    #[test]
+    fn argument_declared_type_is_validation_only_in_serde_round_trip() {
+        let value = Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("vpc", "vpc_id"),
+        });
+        let typed = CompositionArgument::from_value(value.clone(), Some(TypeExpr::String));
+        let untyped = CompositionArgument::from_value(value.clone(), None);
+
+        let typed_json = serde_json::to_value(&typed).expect("serialize typed argument");
+        let untyped_json = serde_json::to_value(&untyped).expect("serialize untyped argument");
+        assert_eq!(typed_json, untyped_json);
+
+        let decoded: CompositionArgument =
+            serde_json::from_value(typed_json).expect("deserialize composition argument");
+        assert_eq!(decoded.value(), &value);
         assert_eq!(decoded.declared_type(), None);
     }
 }

@@ -985,19 +985,32 @@ pub fn redact_secrets_in_data_source(
 pub fn redact_secrets_in_virtual(
     resource: &crate::resource::Composition,
 ) -> Result<crate::resource::Composition, SerializationError> {
-    // Reify each `CompositionAttribute` to a `Value`, redact secrets,
-    // then re-classify with `CompositionAttribute::from_value` so
-    // single-hop alias structure is preserved across the round-trip.
+    let arguments: Result<indexmap::IndexMap<String, crate::resource::CompositionArgument>, _> =
+        resource
+            .signature
+            .arguments
+            .iter()
+            .map(|(k, argument)| {
+                redact_secrets_in_value(argument.value())
+                    .map(|rv| (k.clone(), argument.with_value(rv)))
+            })
+            .collect();
+    // Redact both the runtime and validation expressions. The latter is
+    // serde-skipped, but the returned in-memory value must still satisfy the
+    // redaction contract.
     let attributes: Result<indexmap::IndexMap<String, crate::resource::CompositionAttribute>, _> =
         resource
             .signature
             .attributes
             .iter()
             .map(|(k, attr)| {
-                redact_secrets_in_value(&attr.to_value()).map(|rv| (k.clone(), attr.with_value(rv)))
+                let runtime = redact_secrets_in_value(&attr.to_value())?;
+                let validation = redact_secrets_in_value(&attr.validation_value())?;
+                Ok((k.clone(), attr.with_values(runtime, validation)))
             })
             .collect();
     let mut out = resource.clone();
+    out.signature.arguments = arguments?;
     out.signature.attributes = attributes?;
     Ok(out)
 }
@@ -3423,6 +3436,8 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
             module_name: "m".to_string(),
             instance: "module_instance".to_string(),
+            call_directory: None,
+            module_directory: None,
             quoted_string_attrs: HashSet::new(),
         };
 

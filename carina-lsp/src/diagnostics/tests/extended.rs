@@ -3621,6 +3621,245 @@ let b = needs_vpc {
     assert_eq!(mismatches[0].range.start.character, 2);
 }
 
+struct NestedModuleCallLspFixture {
+    _temp: tempfile::TempDir,
+    outer: std::path::PathBuf,
+    root: std::path::PathBuf,
+    outer_source: String,
+    root_source: String,
+}
+
+fn nested_module_call_lsp_fixture(attribute_declaration: &str) -> NestedModuleCallLspFixture {
+    let temp = tempfile::tempdir().unwrap();
+    let web_tier = temp.path().join("web_tier");
+    let needs_vpc = temp.path().join("needs_vpc");
+    let outer = temp.path().join("outer");
+    let root = temp.path().join("root");
+    for directory in [&web_tier, &needs_vpc, &outer, &root] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    std::fs::write(
+        web_tier.join("main.crn"),
+        format!(
+            r#"arguments {{
+  vpc_id: aws.ec2.Vpc.Id
+}}
+
+let web_sg = aws.ec2.SecurityGroup {{
+  name   = "web"
+  vpc_id = vpc_id
+}}
+
+attributes {{
+  sg_id{attribute_declaration} = web_sg.group_id
+}}
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        needs_vpc.join("main.crn"),
+        "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+    )
+    .unwrap();
+    let outer_source = r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let web_tier = use { source = '../web_tier' }
+let needs_vpc = use { source = '../needs_vpc' }
+
+let a = web_tier {
+  vpc_id = vpc_id
+}
+
+let b = needs_vpc {
+  vpc_id = a.sg_id
+}
+"#
+    .to_string();
+    std::fs::write(outer.join("main.crn"), &outer_source).unwrap();
+    let root_source = r#"let outer = use { source = '../outer' }
+
+let main_vpc = aws.ec2.Vpc {
+  name = "main"
+}
+
+let instance = outer {
+  vpc_id = main_vpc.vpc_id
+}
+"#
+    .to_string();
+    std::fs::write(root.join("main.crn"), &root_source).unwrap();
+
+    NestedModuleCallLspFixture {
+        _temp: temp,
+        outer,
+        root,
+        outer_source,
+        root_source,
+    }
+}
+
+fn assert_one_nested_lsp_mismatch(
+    diagnostics: &[tower_lsp::lsp_types::Diagnostic],
+    expected_prefix: &str,
+) {
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains(&format!(
+                "{expected_prefix}module call 'b': argument 'vpc_id'"
+            )) && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic.message.contains("from a.sg_id")
+        })
+        .collect();
+
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "the LSP must report the nested call boundary once: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn unannotated_nested_module_call_is_inferred_when_outer_module_is_opened() {
+    let engine = module_boundary_identity_engine();
+    let fixture = nested_module_call_lsp_fixture("");
+
+    let diagnostics =
+        analyze_with_buffer(&engine, &fixture.outer, "main.crn", &fixture.outer_source);
+
+    assert_one_nested_lsp_mismatch(&diagnostics, "");
+}
+
+#[test]
+fn annotated_nested_module_call_is_reported_when_root_module_is_opened() {
+    let engine = module_boundary_identity_engine();
+    let fixture = nested_module_call_lsp_fixture(": aws.ec2.SecurityGroup.Id");
+
+    let diagnostics = analyze_with_buffer(&engine, &fixture.root, "main.crn", &fixture.root_source);
+
+    assert_one_nested_lsp_mismatch(&diagnostics, "../outer: ");
+}
+
+#[test]
+fn unannotated_nested_module_call_is_inferred_when_root_module_is_opened() {
+    let engine = module_boundary_identity_engine();
+    let fixture = nested_module_call_lsp_fixture("");
+
+    let diagnostics = analyze_with_buffer(&engine, &fixture.root, "main.crn", &fixture.root_source);
+
+    assert_one_nested_lsp_mismatch(&diagnostics, "../outer: ");
+}
+
+#[test]
+fn depth_three_unannotated_module_call_is_inferred_when_root_module_is_opened() {
+    let engine = module_boundary_identity_engine();
+    let temp = tempfile::tempdir().unwrap();
+    let web_tier = temp.path().join("web_tier");
+    let needs_vpc = temp.path().join("needs_vpc");
+    let middle = temp.path().join("middle");
+    let outer = temp.path().join("outer");
+    let root = temp.path().join("root");
+    for directory in [&web_tier, &needs_vpc, &middle, &outer, &root] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    std::fs::write(
+        web_tier.join("main.crn"),
+        r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let web_sg = aws.ec2.SecurityGroup {
+  name   = "web"
+  vpc_id = vpc_id
+}
+
+attributes {
+  sg_id = web_sg.group_id
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        needs_vpc.join("main.crn"),
+        "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        middle.join("main.crn"),
+        r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let web_tier = use { source = '../web_tier' }
+let needs_vpc = use { source = '../needs_vpc' }
+
+let a = web_tier {
+  vpc_id = vpc_id
+}
+
+let b = needs_vpc {
+  vpc_id = a.sg_id
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        outer.join("main.crn"),
+        r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let middle = use { source = '../middle' }
+let m = middle {
+  vpc_id = vpc_id
+}
+"#,
+    )
+    .unwrap();
+    let root_source = r#"let outer = use { source = '../outer' }
+
+let main_vpc = aws.ec2.Vpc {
+  name = "main"
+}
+
+let instance = outer {
+  vpc_id = main_vpc.vpc_id
+}
+"#;
+    std::fs::write(root.join("main.crn"), root_source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", root_source);
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("../outer/../middle: module call 'b': argument 'vpc_id'")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic.message.contains("from a.sg_id")
+        })
+        .collect();
+
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "the depth-three LSP boundary must be reported once: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
 #[test]
 fn no_undefined_resource_for_sibling_binding_in_exports() {
     let engine = DiagnosticEngine::new(

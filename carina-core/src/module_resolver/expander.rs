@@ -22,9 +22,10 @@ use super::validation::{evaluate_require_expr, evaluate_validate_expr, format_va
 impl ModuleResolver<'_> {
     /// Expand a module call into resources.
     ///
-    /// If the module defines `attributes` and the call has a `binding_name`,
-    /// a [`Composition`] is created to expose the module's attribute
-    /// values. Virtual resources are skipped by the differ.
+    /// Every module call creates a [`Composition`]. Bound calls expose module
+    /// outputs through it; all calls retain their typed argument boundary for
+    /// one post-expansion validation pass. Virtual resources are skipped by
+    /// the differ.
     ///
     /// `enclosing_args` is the argument signature of the module the call
     /// lives inside (`None` for a top-level call). When this call is being
@@ -227,6 +228,10 @@ impl ModuleResolver<'_> {
                     .iter()
                     .filter_map(|c| c.binding_name.clone()),
             )
+            // Nested compositions may already carry a multi-segment binding
+            // (`middle.inner`). When this module is itself expanded, refs to
+            // that exact binding must gain the new outer prefix as well.
+            .chain(module.compositions.iter().filter_map(|c| c.binding.clone()))
             .collect();
 
         // Expand managed resources with substituted values.
@@ -265,9 +270,9 @@ impl ModuleResolver<'_> {
             ));
         }
 
-        // Create a composition resource if the module has attributes and the call has a binding
-        if !module.attribute_params.is_empty()
-            && let Some(binding_name) = &call.binding_name
+        // Every call becomes a composition, including calls with no outputs
+        // and anonymous calls. Besides exposing outputs for bound calls, the
+        // node is the post-expansion record of the call boundary itself.
         {
             let mut composition_attrs: IndexMap<String, crate::resource::CompositionAttribute> =
                 IndexMap::new();
@@ -287,9 +292,10 @@ impl ModuleResolver<'_> {
                     substituted.canonicalize_in_place();
                     composition_attrs.insert(
                         attr_param.name.clone(),
-                        crate::resource::CompositionAttribute::from_value(
+                        crate::resource::CompositionAttribute::from_value_with_validation(
                             substituted,
                             attr_param.type_expr.clone(),
+                            rewritten,
                         ),
                     );
                 }
@@ -300,23 +306,41 @@ impl ModuleResolver<'_> {
             // is a HashMap (look-up keyed); we record them on the
             // composition in `module.arguments` declaration order so
             // the trace is stable across runs.
-            let mut signature_arguments: IndexMap<String, Value> = IndexMap::new();
+            let mut signature_arguments: IndexMap<String, crate::resource::CompositionArgument> =
+                IndexMap::new();
             for arg in &module.arguments {
                 if let Some(value) = argument_values.get(&arg.name) {
-                    signature_arguments.insert(arg.name.clone(), value.clone());
+                    signature_arguments.insert(
+                        arg.name.clone(),
+                        crate::resource::CompositionArgument::from_value(
+                            value.clone(),
+                            Some(arg.type_expr.clone()),
+                        ),
+                    );
                 }
             }
 
+            let module_directory = self.module_paths.get(&call.module_name).map(|source| {
+                let path = std::path::Path::new(source);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    self.base_dir.join(path)
+                }
+            });
+
             let composition = Composition {
-                id: ResourceId::with_identity("_virtual", binding_name),
+                id: ResourceId::with_identity("_virtual", instance_prefix),
                 signature: crate::resource::Signature {
                     arguments: signature_arguments,
                     attributes: composition_attrs,
                 },
-                binding: Some(binding_name.clone()),
+                binding: call.binding_name.clone(),
                 dependency_bindings: BTreeSet::new(),
                 module_name: call.module_name.clone(),
                 instance: instance_prefix.to_string(),
+                call_directory: Some(self.base_dir.clone()),
+                module_directory,
                 quoted_string_attrs: HashSet::new(),
             };
             compositions.push(composition);
@@ -720,7 +744,8 @@ fn prefix_module_data_source(
 /// `Composition` carries no `module_source` (it has the flattened
 /// `module_name` / `instance` fields, left unchanged as the synthetic
 /// node's own provenance) and no `prefixes` / `directives`, so only its
-/// assigned identity, `binding`, and attributes take the prefix treatment.
+/// assigned identity, `binding`, arguments, and attributes take the prefix
+/// treatment.
 fn prefix_module_composition(
     composition: &Composition,
     instance_prefix: &str,
@@ -738,6 +763,19 @@ fn prefix_module_composition(
         new_virtual.binding = Some(apply_instance_prefix(instance_prefix, binding));
     }
 
+    let mut substituted_arguments: IndexMap<String, crate::resource::CompositionArgument> =
+        IndexMap::new();
+    for (key, argument) in &new_virtual.signature.arguments {
+        let prefixed = prefix_attr_value(
+            argument.value(),
+            instance_prefix,
+            intra_module_bindings,
+            argument_values,
+        );
+        substituted_arguments.insert(key.clone(), argument.with_value(prefixed));
+    }
+    new_virtual.signature.arguments = substituted_arguments;
+
     let mut substituted_attrs: IndexMap<String, crate::resource::CompositionAttribute> =
         IndexMap::new();
     for (key, attr) in &new_virtual.signature.attributes {
@@ -750,7 +788,14 @@ fn prefix_module_composition(
         let v = attr.to_value();
         let prefixed =
             prefix_attr_value(&v, instance_prefix, intra_module_bindings, argument_values);
-        substituted_attrs.insert(key.clone(), attr.with_value(prefixed));
+        // Boundary validation uses the authored module-local expression. It
+        // gains outer instance prefixes like the runtime value, but does not
+        // substitute enclosing call arguments: those are validated at their
+        // own call boundary and must not be re-reported through outputs.
+        let validation_value = attr.validation_value();
+        let prefixed_validation =
+            rewrite_intra_module_refs(&validation_value, instance_prefix, intra_module_bindings);
+        substituted_attrs.insert(key.clone(), attr.with_values(prefixed, prefixed_validation));
     }
     new_virtual.signature.attributes = substituted_attrs;
 

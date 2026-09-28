@@ -400,15 +400,26 @@ impl DiagnosticEngine {
             if base_path.is_some() {
                 diagnostics.extend(self.check_module_calls(doc, parsed, &module_signatures));
             }
-            // Attribute existence does not require a module directory. When
-            // there is no base path, the empty signature map disables only
-            // declared-sink checks.
-            diagnostics.extend(self.check_module_call_ref_types(
-                doc,
-                parsed,
-                &module_signatures,
-                &binding_index,
-            ));
+            if let (Some(base), Some(expanded)) = (base_path, merged) {
+                diagnostics.extend(self.check_composition_ref_types(
+                    doc,
+                    parsed,
+                    &expanded.compositions,
+                    &binding_index,
+                    base,
+                ));
+            } else {
+                // Orphaned files and directory parses that did not produce an
+                // expanded view retain the source-local fallback. It can
+                // validate schema bindings, while composition inference is
+                // intentionally owned by the expanded pass above.
+                diagnostics.extend(self.check_module_call_ref_types(
+                    doc,
+                    parsed,
+                    &module_signatures,
+                    &binding_index,
+                ));
+            }
             // Check resource types — include for-body template resources so
             // attribute/type/enum validation fires inside `for` loops too.
             for rref in parsed.iter_all_resources() {

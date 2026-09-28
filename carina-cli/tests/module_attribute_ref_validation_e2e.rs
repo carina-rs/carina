@@ -1,10 +1,10 @@
 //! End-to-end validation regressions for carina#3710.
 //!
-//! Module output (`attributes {}`) references are validated before module
-//! expansion, while each module still has its own binding namespace. These
-//! fixtures are deliberately directory-scoped and split declarations across
-//! sibling `.crn` files so the test exercises the same loader boundary as a
-//! real configuration.
+//! Module output (`attributes {}`) references are validated on expanded
+//! compositions, with a source-local fallback when expansion itself fails.
+//! These fixtures are deliberately directory-scoped and split declarations
+//! across sibling `.crn` files so the test exercises the same loader boundary
+//! as a real configuration.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

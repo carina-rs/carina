@@ -279,6 +279,30 @@ fn schema_typed_module_argument_rejects_composition_attribute_at_call_boundary()
 }
 
 #[test]
+fn unannotated_composition_argument_is_inferred_at_root_call_boundary_once() {
+    let module = issue_module("aws.ec2.Vpc.Id", "");
+    let module = borrowed(&module);
+    let fixture = Fixture::module(&module, &[("main.crn", root_with_two_calls())]);
+
+    let diagnostics = fixture.validate();
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.contains("module call 'web2': argument 'vpc_id'")
+                && diagnostic.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic.contains("from web.security_group_id")
+        })
+        .collect();
+
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "the post-expansion root call check must infer the output and report it once: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn schema_typed_list_argument_checks_each_nested_reference() {
     let fixture = Fixture::module(
         &[(
@@ -548,8 +572,7 @@ let consumer = aws.ec2.SecurityGroup {
     );
 }
 
-#[test]
-fn nested_module_call_checks_declared_output_type_at_its_call_boundary() {
+fn nested_module_call_fixture(attribute_declaration: &str) -> Fixture {
     let temp = tempfile::tempdir().expect("tempdir");
     let web_tier = temp.path().join("web_tier");
     let needs_vpc = temp.path().join("needs_vpc");
@@ -561,19 +584,21 @@ fn nested_module_call_checks_declared_output_type_at_its_call_boundary() {
 
     std::fs::write(
         web_tier.join("main.crn"),
-        r#"arguments {
+        format!(
+            r#"arguments {{
   vpc_id: aws.ec2.Vpc.Id
-}
+}}
 
-let web_sg = aws.ec2.SecurityGroup {
+let web_sg = aws.ec2.SecurityGroup {{
   name   = "web"
   vpc_id = vpc_id
-}
+}}
 
-attributes {
-  sg_id: aws.ec2.SecurityGroup.Id = web_sg.group_id
-}
-"#,
+attributes {{
+  sg_id{attribute_declaration} = web_sg.group_id
+}}
+"#
+        ),
     )
     .expect("web_tier module");
     std::fs::write(
@@ -615,7 +640,11 @@ let instance = outer {
 "#,
     )
     .expect("root module");
-    let fixture = Fixture { _temp: temp, root };
+    Fixture { _temp: temp, root }
+}
+
+fn assert_nested_module_call_mismatch(attribute_declaration: &str) {
+    let fixture = nested_module_call_fixture(attribute_declaration);
 
     let diagnostics = fixture.validate();
     let mismatches: Vec<_> = diagnostics
@@ -632,6 +661,117 @@ let instance = outer {
         mismatches.len(),
         1,
         "every nested call boundary must be checked exactly once: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn nested_module_call_checks_declared_output_type_at_its_call_boundary() {
+    assert_nested_module_call_mismatch(": aws.ec2.SecurityGroup.Id");
+}
+
+#[test]
+fn nested_module_call_infers_unannotated_output_type_at_its_call_boundary() {
+    assert_nested_module_call_mismatch("");
+}
+
+#[test]
+fn depth_three_module_call_infers_unannotated_output_type_at_its_call_boundary() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let web_tier = temp.path().join("web_tier");
+    let needs_vpc = temp.path().join("needs_vpc");
+    let middle = temp.path().join("middle");
+    let outer = temp.path().join("outer");
+    let root = temp.path().join("root");
+    for directory in [&web_tier, &needs_vpc, &middle, &outer, &root] {
+        std::fs::create_dir(directory).expect("fixture directory");
+    }
+
+    std::fs::write(
+        web_tier.join("main.crn"),
+        r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let web_sg = aws.ec2.SecurityGroup {
+  name   = "web"
+  vpc_id = vpc_id
+}
+
+attributes {
+  sg_id = web_sg.group_id
+}
+"#,
+    )
+    .expect("web_tier module");
+    std::fs::write(
+        needs_vpc.join("main.crn"),
+        "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+    )
+    .expect("needs_vpc module");
+    std::fs::write(
+        middle.join("main.crn"),
+        r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let web_tier = use { source = '../web_tier' }
+let needs_vpc = use { source = '../needs_vpc' }
+
+let a = web_tier {
+  vpc_id = vpc_id
+}
+
+let b = needs_vpc {
+  vpc_id = a.sg_id
+}
+"#,
+    )
+    .expect("middle module");
+    std::fs::write(
+        outer.join("main.crn"),
+        r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let middle = use { source = '../middle' }
+let m = middle {
+  vpc_id = vpc_id
+}
+"#,
+    )
+    .expect("outer module");
+    write_provider(&root);
+    std::fs::write(
+        root.join("main.crn"),
+        r#"let outer = use { source = '../outer' }
+
+let main_vpc = aws.ec2.Vpc {
+  name = "main"
+}
+
+let instance = outer {
+  vpc_id = main_vpc.vpc_id
+}
+"#,
+    )
+    .expect("root module");
+    let fixture = Fixture { _temp: temp, root };
+
+    let diagnostics = fixture.validate();
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.contains("../outer/../middle: module call 'b': argument 'vpc_id'")
+                && diagnostic.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic.contains("from a.sg_id")
+        })
+        .collect();
+
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "depth-three call boundaries must be checked exactly once: {diagnostics:#?}",
     );
 }
 

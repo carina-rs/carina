@@ -1,7 +1,10 @@
 use super::*;
 use crate::parser::{BindingName, ParsedFile, ProviderContext, UntilPredicateAst, WaitBinding};
-use crate::resource::{Composition, CompositionAttribute, Resource, ResourceId, Signature};
+use crate::resource::{
+    Composition, CompositionArgument, CompositionAttribute, Resource, ResourceId, Signature,
+};
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
+use std::collections::HashMap;
 
 fn empty_parsed() -> ParsedFile {
     ParsedFile {
@@ -699,6 +702,8 @@ fn make_composition(binding: &str, attributes: &[&str]) -> Composition {
         dependency_bindings: Default::default(),
         module_name: "test_module".to_string(),
         instance: binding.to_string(),
+        call_directory: None,
+        module_directory: None,
         quoted_string_attrs: Default::default(),
     }
 }
@@ -2807,86 +2812,78 @@ fn attribute_param_ref_type_checks_composition_attribute_membership_only() {
 }
 
 #[test]
-fn pre_expansion_module_attribute_schema_types_use_directional_relation() {
-    use crate::parser::AttributeParameter;
-
+fn post_expansion_composition_argument_schema_types_use_directional_relation() {
     let schema_type = |path: &str| TypeExpr::SchemaType {
         provider: "aws".to_string(),
         path: path.to_string(),
         type_name: "Id".to_string(),
     };
-    let params = vec![AttributeParameter {
-        name: "vpc_id".to_string(),
-        type_expr: Some(schema_type("ec2.Vpc")),
-        value: Some(Value::resource_ref(
-            "inner".to_string(),
-            "security_group_id".to_string(),
-            vec![],
-        )),
-    }];
-    let parsed = empty_parsed();
+    let mut source = make_composition("inner", &[]);
+    source.signature.attributes.insert(
+        "security_group_id".to_string(),
+        CompositionAttribute::from_value(
+            Value::Concrete(ConcreteValue::String("sg-123".to_string())),
+            Some(schema_type("ec2.SecurityGroup")),
+        ),
+    );
+    let mut consumer = make_composition("consumer", &[]);
+    consumer.signature.arguments.insert(
+        "vpc_id".to_string(),
+        CompositionArgument::from_value(
+            Value::resource_ref("inner".to_string(), "security_group_id".to_string(), vec![]),
+            Some(schema_type("ec2.Vpc")),
+        ),
+    );
+    let mut parsed = empty_parsed();
+    parsed.compositions.extend([source, consumer]);
     let schemas = SchemaRegistry::new();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let module_call_attributes = HashMap::from([(
-        "inner".to_string(),
-        IndexMap::from([(
-            "security_group_id".to_string(),
-            Some(schema_type("ec2.SecurityGroup")),
-        )]),
-    )]);
-
-    let err = validate_attribute_param_ref_types_with_bindings_and_module_calls(
-        &params,
-        &bindings,
-        &module_call_attributes,
-    )
-    .unwrap_err();
+    let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
+    let err = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(
-        err.contains("attribute 'vpc_id': type mismatch")
+        err.contains("module call 'consumer': argument 'vpc_id'")
             && err.contains("expected aws.ec2.Vpc.Id")
             && err.contains("got aws.ec2.SecurityGroup.Id")
             && err.contains("from inner.security_group_id"),
-        "pre-expansion module outputs must use the shared source-to-sink relation: {err}",
+        "expanded composition outputs must use the shared source-to-sink relation: {err}",
     );
 }
 
 #[test]
-fn pre_expansion_module_attribute_typo_is_reported_once() {
-    use crate::parser::AttributeParameter;
-
-    let params = vec![AttributeParameter {
-        name: "x".to_string(),
-        type_expr: Some(TypeExpr::String),
-        value: Some(Value::resource_ref(
-            "inner".to_string(),
-            "typo".to_string(),
-            vec![],
-        )),
-    }];
-    let parsed = empty_parsed();
+fn post_expansion_composition_attribute_typo_is_reported_once() {
+    let source = make_composition("inner", &["actual"]);
+    let mut consumer = make_composition("consumer", &[]);
+    consumer.signature.attributes.insert(
+        "x".to_string(),
+        CompositionAttribute::from_value(
+            Value::resource_ref("inner".to_string(), "typo".to_string(), vec![]),
+            Some(TypeExpr::String),
+        ),
+    );
+    let mut parsed = empty_parsed();
+    parsed.compositions.extend([source, consumer]);
     let schemas = SchemaRegistry::new();
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let module_call_attributes = HashMap::from([(
-        "inner".to_string(),
-        IndexMap::from([("actual".to_string(), Some(TypeExpr::String))]),
-    )]);
-
-    let err = validate_attribute_param_ref_types_with_bindings_and_module_calls(
-        &params,
-        &bindings,
-        &module_call_attributes,
-    )
-    .unwrap_err();
+    let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
+    let err = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert_eq!(
-        err.lines().count(),
+        errors.len(),
         1,
         "a typed attribute reference must be visited exactly once: {err}",
     );
     assert!(
         err.contains("attribute 'x': unknown attribute 'typo' on 'inner'"),
-        "expected the pre-expansion module surface diagnostic, got: {err}",
+        "expected the expanded composition surface diagnostic, got: {err}",
     );
 }
 

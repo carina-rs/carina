@@ -982,16 +982,33 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
     // The composition's signature.arguments must contain BOTH values
     // passed at the call site, keyed by argument name.
     assert_eq!(
-        composition.signature.arguments.get("region"),
+        composition
+            .signature
+            .arguments
+            .get("region")
+            .map(|argument| argument.value()),
         Some(&Value::Concrete(ConcreteValue::String(
             "ap-northeast-1".to_string()
         ))),
         "region argument must be recorded on the composition signature",
     );
     assert_eq!(
-        composition.signature.arguments.get("instance_count"),
+        composition
+            .signature
+            .arguments
+            .get("instance_count")
+            .map(|argument| argument.value()),
         Some(&Value::Concrete(ConcreteValue::Int(3))),
         "instance_count argument must be recorded on the composition signature",
+    );
+    assert_eq!(
+        composition
+            .signature
+            .arguments
+            .get("region")
+            .and_then(|argument| argument.declared_type()),
+        Some(&TypeExpr::String),
+        "the declared sink type must travel with the argument value",
     );
 
     // Arguments are recorded in module.arguments declaration order so
@@ -1013,7 +1030,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
 }
 
 #[test]
-fn test_expand_module_call_without_binding_no_virtual() {
+fn test_expand_module_call_without_binding_still_records_boundary_composition() {
     let resolver = {
         let mut r = ModuleResolver::new(".");
         r.imported_modules
@@ -1031,8 +1048,9 @@ fn test_expand_module_call_without_binding_no_virtual() {
     let expanded = resolver
         .expand_module_call(&call, "web_tier", None)
         .unwrap();
-    // No `binding_name` ⇒ no synthetic composition resource is created.
-    assert!(expanded.compositions.is_empty());
+    assert_eq!(expanded.compositions.len(), 1);
+    assert_eq!(expanded.compositions[0].binding, None);
+    assert_eq!(expanded.compositions[0].module_name, "web_tier");
 }
 
 /// Regression fixtures for #2197. Writes a minimal `modules/thing` module

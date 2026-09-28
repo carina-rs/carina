@@ -7,7 +7,6 @@ use carina_core::module_resolver::{self, LoadedModule};
 pub(crate) struct LoadedModuleAtPath {
     diagnostic_path: PathBuf,
     module_path: PathBuf,
-    guard_path: PathBuf,
     loaded: LoadedModule,
 }
 
@@ -54,16 +53,6 @@ impl ModuleWalk {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &LoadedModuleAtPath> {
         self.modules.iter()
     }
-
-    /// Find a module already loaded by this walk using the same canonical-path
-    /// identity as the recursion guard.
-    pub(crate) fn parsed_at(&self, module_path: &Path) -> Option<&carina_core::parser::ParsedFile> {
-        let guard_path = canonical_guard_path(module_path);
-        self.modules
-            .iter()
-            .find(|module| module.guard_path == guard_path)
-            .map(|module| &module.loaded.parsed)
-    }
 }
 
 fn canonical_guard_path(module_path: &Path) -> PathBuf {
@@ -98,7 +87,6 @@ fn visit_module(
     modules.push(LoadedModuleAtPath {
         diagnostic_path: diagnostic_path.to_path_buf(),
         module_path: module_path.to_path_buf(),
-        guard_path,
         loaded,
     });
 
