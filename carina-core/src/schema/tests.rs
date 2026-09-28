@@ -4270,6 +4270,28 @@ fn assignable_plain_string_accepts_identityless_string_refinements() {
 }
 
 #[test]
+fn assignable_plain_int_accepts_identityless_range_sink() {
+    let sink = AttributeType::refined_int(None, Some((Some(1), Some(65_535))));
+
+    assert!(assignable(&AttributeType::int(), &sink));
+}
+
+#[test]
+fn assignable_plain_float_accepts_identityless_range_sink() {
+    let sink = AttributeType::refined_float(None, Some((Some(1.0), Some(65_535.0))));
+
+    assert!(assignable(&AttributeType::float(), &sink));
+}
+
+#[test]
+fn assignable_wider_float_range_rejects_narrower_identityless_range_sink() {
+    let source = AttributeType::refined_float(None, Some((Some(0.0), Some(100.0))));
+    let sink = AttributeType::refined_float(None, Some((Some(25.0), Some(75.0))));
+
+    assert!(!assignable(&source, &sink));
+}
+
+#[test]
 fn assignable_plain_string_rejects_identified_sink() {
     let vpc_id = AttributeType::refined_string_with_validator(
         Some(TypeIdentity::new(Some("aws"), ["ec2", "Vpc"], "Id")),
@@ -4280,6 +4302,15 @@ fn assignable_plain_string_rejects_identified_sink() {
     );
 
     assert!(!assignable(&AttributeType::string(), &vpc_id));
+}
+
+#[test]
+fn assignable_plain_numeric_types_reject_identified_sinks() {
+    let int_sink = AttributeType::refined_int(Some(TypeIdentity::bare("Port")), None);
+    let float_sink = AttributeType::refined_float(Some(TypeIdentity::bare("Ratio")), None);
+
+    assert!(!assignable(&AttributeType::int(), &int_sink));
+    assert!(!assignable(&AttributeType::float(), &float_sink));
 }
 
 #[test]
