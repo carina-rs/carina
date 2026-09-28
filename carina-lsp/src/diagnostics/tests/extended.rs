@@ -3416,6 +3416,135 @@ needs {
 }
 
 #[test]
+fn module_argument_types_are_sources_in_open_module_document() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    let source = r#"arguments {
+  vpc_id: String
+}
+
+attributes {
+  x: aws.ec2.Vpc.Id = vpc_id
+}
+
+let sg = aws.ec2.SecurityGroup {
+  name   = "module"
+  vpc_id = vpc_id
+}
+"#;
+    std::fs::write(module.join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &module, "main.crn", source);
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("attribute 'x': type mismatch")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got String")
+                && diagnostic.message.contains("from vpc_id")
+        }),
+        "the open module's attribute declaration must use its argument declaration as the source type: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("Type mismatch")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got String")
+                && diagnostic.message.contains("from vpc_id")
+        }),
+        "the open module's resource attribute must use its argument declaration as the source type: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
+    use carina_core::binding_index::BindingIndex;
+    use carina_core::parser::TypeExpr;
+    use carina_core::resource::{
+        Composition, CompositionArgument, CompositionAttribute, CompositionCall,
+        CompositionProvenance, ConcreteValue, ResourceId, Signature, Value,
+    };
+    use indexmap::IndexMap;
+
+    fn schema_type(path: &str) -> TypeExpr {
+        TypeExpr::SchemaType {
+            provider: "aws".to_string(),
+            path: path.to_string(),
+            type_name: "Id".to_string(),
+        }
+    }
+
+    fn composition(binding: &str, call_binding: &str) -> Composition {
+        let call = CompositionCall {
+            module_name: "missing".to_string(),
+            binding: Some(call_binding.to_string()),
+            instance: call_binding.to_string(),
+            module_source: Some("../missing".to_string()),
+            module_directory: None,
+        };
+        Composition {
+            id: ResourceId::with_identity("_virtual", binding),
+            signature: Signature {
+                arguments: IndexMap::new(),
+                attributes: IndexMap::new(),
+            },
+            binding: Some(binding.to_string()),
+            dependency_bindings: Default::default(),
+            module_name: "missing".to_string(),
+            instance: call_binding.to_string(),
+            provenance: Box::new(CompositionProvenance::expanded(call.clone(), call)),
+            quoted_string_attrs: Default::default(),
+        }
+    }
+
+    let engine = module_boundary_identity_engine();
+    let doc = create_document(
+        r#"let unrelated = use { source = '../unrelated' }
+let first = unrelated { }
+"#,
+    );
+    let parsed = doc.parsed().expect("fixture must parse");
+    let mut binding_input = parsed.clone();
+
+    let mut source = composition("source", "missing-source-call");
+    source.signature.attributes.insert(
+        "sg".to_string(),
+        CompositionAttribute::from_value(
+            Value::Concrete(ConcreteValue::String("sg-123".to_string())),
+            Some(schema_type("ec2.SecurityGroup")),
+        ),
+    );
+    let mut consumer = composition("consumer", "missing-consumer-call");
+    consumer.signature.arguments.insert(
+        "vpc_id".to_string(),
+        CompositionArgument::from_value(
+            Value::resource_ref("source", "sg", vec![]),
+            schema_type("ec2.Vpc"),
+        ),
+    );
+    binding_input.compositions.extend([source, consumer]);
+    let bindings = BindingIndex::from_parsed(&binding_input, &engine.schemas);
+
+    let diagnostics =
+        engine.check_composition_ref_types(&doc, parsed, &binding_input.compositions, &bindings);
+
+    assert!(
+        diagnostics.is_empty(),
+        "an error whose immediate and root calls are absent from this document must not attach to its first unrelated call: {diagnostics:?}",
+    );
+}
+
+#[test]
 fn module_attribute_schema_type_declaration_mismatch_matches_validate() {
     let engine = module_boundary_identity_engine();
     let tmp = tempfile::tempdir().unwrap();
@@ -4284,6 +4413,34 @@ for name, _ in orgs.accounts {
         "known field should not be flagged, got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn upstream_state_typed_struct_missing_field_is_reported_once() {
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+let vpc = awscc.ec2.Vpc {
+    name = orgs.account.nope
+    cidr_block = '10.0.0.0/16'
+}
+"#,
+        Some(
+            r#"exports {
+    account: struct { id: String } = { id = "account-123" }
+}
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+    let missing: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("nope"))
+        .collect();
+
+    assert_eq!(missing.len(), 1, "{diagnostics:#?}");
 }
 
 #[test]

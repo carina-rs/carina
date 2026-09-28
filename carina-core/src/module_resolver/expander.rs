@@ -302,6 +302,28 @@ impl ModuleResolver<'_> {
             // `CompositionAttribute::from_value` (#3294).
             for attr_param in &module.attribute_params {
                 if let Some(value) = &attr_param.value {
+                    let source_argument = match value {
+                        Value::Deferred(DeferredValue::BindingRef { binding })
+                            if argument_values.contains_key(binding) =>
+                        {
+                            Some(binding.clone())
+                        }
+                        Value::Deferred(DeferredValue::ResourceRef { path })
+                            if argument_values.contains_key(path.binding()) =>
+                        {
+                            Some(path.binding().to_string())
+                        }
+                        _ => None,
+                    };
+                    let declared_type = attr_param.type_expr.clone().or_else(|| {
+                        source_argument.as_deref().and_then(|source_argument| {
+                            module
+                                .arguments
+                                .iter()
+                                .find(|argument| argument.name == source_argument)
+                                .map(|argument| argument.type_expr.clone())
+                        })
+                    });
                     // Rewrite intra-module refs and substitute arguments
                     let rewritten =
                         rewrite_intra_module_refs(value, instance_prefix, &intra_module_bindings);
@@ -313,8 +335,9 @@ impl ModuleResolver<'_> {
                         attr_param.name.clone(),
                         crate::resource::CompositionAttribute::from_value(
                             substituted,
-                            attr_param.type_expr.clone(),
-                        ),
+                            declared_type,
+                        )
+                        .with_source_argument(source_argument),
                     );
                 }
             }

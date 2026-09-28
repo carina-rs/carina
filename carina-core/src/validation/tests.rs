@@ -4366,8 +4366,8 @@ fn validate_export_param_ref_types_against_inferred_inputs() {
 /// ResourceRef(...)`. Phase 2 (RFC #2972) makes the validate dispatcher
 /// project `&Value` through `as_concrete()` so deferred values like
 /// `ResourceRef` cannot reach `validate_list` by construction — the
-/// type-fitness check for upstream-typed refs is the deferred-aware
-/// checker's job (`check_upstream_state_field_types`).
+/// type-fitness check for upstream-typed refs is the unified deferred-reference
+/// validator's job (`BindingIndex::ref_type` / `validate_resource_ref_types`).
 #[test]
 fn validate_resources_accepts_resource_ref_in_list_position() {
     let mut schemas = SchemaRegistry::new();

@@ -44,8 +44,8 @@
 
 use crate::parser::{BindingName, ResourceRef};
 use crate::resource::{
-    AccessPath, Composition, PathSegment, PlanInputState, Resource, ResourceId, State, Subscript,
-    Value,
+    AccessPath, Composition, PathSegment, PlanInputState, ReferencePathRef, Resource, ResourceId,
+    State, Subscript, Value,
 };
 use crate::schema::{
     AttributeType, ResourceSchema, SchemaRegistry, Shape, TypeInSchema, suggest_similar_name,
@@ -57,6 +57,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub enum BindingTarget<'a> {
     Schema(&'a ResourceSchema),
     Composition(&'a Composition),
+    Argument(&'a crate::parser::TypeExpr),
+    UpstreamState(&'a crate::upstream_exports::UpstreamExportEntries),
 }
 
 /// One entry in the binding index. The target is non-`Option`: managed/data
@@ -108,6 +110,11 @@ pub enum RefTypeError {
         struct_name: String,
         known_fields: Vec<String>,
     },
+    UnknownUpstreamExport {
+        binding: String,
+        export: String,
+        known_exports: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -151,6 +158,21 @@ impl std::fmt::Display for RefTypeError {
                     path,
                     known.join(", "),
                     suggestion_suffix(field, &known),
+                )
+            }
+            Self::UnknownUpstreamExport {
+                binding,
+                export,
+                known_exports,
+            } => {
+                let known: Vec<&str> = known_exports.iter().map(String::as_str).collect();
+                let suggestion = suggest_similar_name(export, &known)
+                    .map(|suggestion| format!(" Did you mean `{}`?", suggestion))
+                    .unwrap_or_default();
+                write!(
+                    f,
+                    "upstream_state `{}` does not export `{}`.{}",
+                    binding, export, suggestion
                 )
             }
         }
@@ -206,6 +228,25 @@ impl<'a> BindingIndex<'a> {
         parsed: &'a crate::parser::File<E>,
         registry: &'a SchemaRegistry,
     ) -> Self {
+        Self::build(parsed, registry, None)
+    }
+
+    /// Build the index with statically resolved `upstream_state` exports.
+    /// Bindings whose source could not be loaded are still recorded as known
+    /// and therefore resolve to [`RefType::Unchecked`].
+    pub fn from_parsed_with_upstream_exports<E>(
+        parsed: &'a crate::parser::File<E>,
+        registry: &'a SchemaRegistry,
+        upstream_exports: &'a crate::upstream_exports::UpstreamExports,
+    ) -> Self {
+        Self::build(parsed, registry, Some(upstream_exports))
+    }
+
+    fn build<E>(
+        parsed: &'a crate::parser::File<E>,
+        registry: &'a SchemaRegistry,
+        upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports>,
+    ) -> Self {
         let mut entries = HashMap::new();
         let mut known_names = std::collections::HashSet::new();
         // Walk top-level resources only — managed resources, data
@@ -256,6 +297,35 @@ impl<'a> BindingIndex<'a> {
                 entries.insert(wait_name.to_string(), BindingEntry { target });
             }
         }
+
+        // Module arguments are typed values in their own module scope. They
+        // come after addressable resource bindings so malformed duplicate-name
+        // input preserves BindingNameSet's resource-first precedence.
+        for argument in &parsed.arguments {
+            known_names.insert(argument.name.clone());
+            entries
+                .entry(argument.name.clone())
+                .or_insert(BindingEntry {
+                    target: BindingTarget::Argument(&argument.type_expr),
+                });
+        }
+
+        // An upstream binding is addressable only when its source directory
+        // resolved. Missing/unloadable sources remain known-but-untyped, while
+        // a successfully loaded empty export map is a typed surface on which
+        // every field access produces the canonical "does not export" error.
+        for upstream in &parsed.upstream_states {
+            known_names.insert(upstream.binding.clone());
+            if let Some(exports) =
+                upstream_exports.and_then(|all_exports| all_exports.get(&upstream.binding))
+            {
+                entries
+                    .entry(upstream.binding.clone())
+                    .or_insert(BindingEntry {
+                        target: BindingTarget::UpstreamState(exports),
+                    });
+            }
+        }
         Self {
             entries,
             known_names,
@@ -273,28 +343,35 @@ impl<'a> BindingIndex<'a> {
     /// forwarded output recursively inherits the target path's type. Derived
     /// values and non-representable annotations remain unchecked. The active
     /// path set bounds malformed/cyclic forwarded chains.
-    pub fn ref_type(&self, path: &AccessPath) -> RefType {
-        self.ref_type_inner(path, &mut HashSet::new())
+    pub fn ref_type<'p>(&self, path: impl Into<ReferencePathRef<'p>>) -> RefType {
+        self.ref_type_inner(path.into(), &mut HashSet::new())
     }
 
     fn ref_type_inner(
         &self,
-        path: &AccessPath,
-        visiting: &mut HashSet<(String, String)>,
+        reference: ReferencePathRef<'_>,
+        visiting: &mut HashSet<String>,
     ) -> RefType {
-        let key = (path.binding().to_string(), path.attribute().to_string());
+        let key = reference.to_dot_string();
         if !visiting.insert(key.clone()) {
             return RefType::Unchecked;
         }
 
-        let result = match self.entries.get(path.binding()) {
-            None if self.known_names.contains(path.binding()) => RefType::Unchecked,
+        let result = match self.entries.get(reference.binding()) {
+            None if self.known_names.contains(reference.binding()) => RefType::Unchecked,
             None => RefType::UnknownBinding {
-                binding: path.binding().to_string(),
-                attribute: path.attribute().to_string(),
+                binding: reference.binding().to_string(),
+                attribute: match reference {
+                    ReferencePathRef::Access(path) => path.attribute().to_string(),
+                    ReferencePathRef::Binding(_) => String::new(),
+                },
             },
             Some(entry) => match entry.target {
                 BindingTarget::Schema(schema) => {
+                    let ReferencePathRef::Access(path) = reference else {
+                        visiting.remove(&key);
+                        return RefType::Unchecked;
+                    };
                     let Some(attribute) = schema.attributes.get(path.attribute()) else {
                         visiting.remove(&key);
                         return RefType::UnknownAttribute(unknown_attribute(
@@ -315,6 +392,10 @@ impl<'a> BindingIndex<'a> {
                     }
                 }
                 BindingTarget::Composition(composition) => {
+                    let ReferencePathRef::Access(path) = reference else {
+                        visiting.remove(&key);
+                        return RefType::Unchecked;
+                    };
                     let Some(attribute) = composition.signature.attributes.get(path.attribute())
                     else {
                         visiting.remove(&key);
@@ -325,9 +406,8 @@ impl<'a> BindingIndex<'a> {
                         ));
                     };
 
-                    if let Some(declared) = attribute
-                        .declared_type()
-                        .and_then(crate::validation::lift_type_expr)
+                    if let Some(declared_type) = attribute.declared_type()
+                        && let Some(declared) = crate::validation::lift_type_expr(declared_type)
                     {
                         let defs = crate::schema::empty_defs_for_schema_walks();
                         match narrow_type(&declared, path.segments(), defs, path) {
@@ -338,8 +418,16 @@ impl<'a> BindingIndex<'a> {
                             Ok(None) => RefType::Unchecked,
                             Err(error) => RefType::UnknownAttribute(error),
                         }
+                    } else if attribute.source_argument().is_some()
+                        && attribute.declared_type().is_some()
+                    {
+                        // The declaration is the source of truth for a directly
+                        // forwarded module argument. Non-liftable argument
+                        // types (notably `TypeExpr::Ref`) stay unchecked rather
+                        // than inheriting the caller's substituted value type.
+                        RefType::Unchecked
                     } else if let Some(forwarded) = attribute.forwarded_path() {
-                        match self.ref_type_inner(forwarded, visiting) {
+                        match self.ref_type_inner(ReferencePathRef::Access(forwarded), visiting) {
                             RefType::Typed(resolved) => match narrow_type(
                                 &resolved.attr_type,
                                 path.segments(),
@@ -357,6 +445,69 @@ impl<'a> BindingIndex<'a> {
                         }
                     } else {
                         RefType::Unchecked
+                    }
+                }
+                BindingTarget::Argument(type_expr) => {
+                    let Some(declared) = crate::validation::lift_type_expr(type_expr) else {
+                        visiting.remove(&key);
+                        return RefType::Unchecked;
+                    };
+                    let defs = crate::schema::empty_defs_for_schema_walks();
+                    match reference {
+                        ReferencePathRef::Binding(_) => {
+                            RefType::Typed(ResolvedRefType::new(declared, defs.clone()))
+                        }
+                        ReferencePathRef::Access(path) => {
+                            let mut segments = Vec::with_capacity(path.segments().len() + 1);
+                            segments.push(PathSegment::Field {
+                                name: path.attribute().to_string(),
+                            });
+                            segments.extend_from_slice(path.segments());
+                            match narrow_type(&declared, &segments, defs, path) {
+                                Ok(Some(attr_type)) => RefType::Typed(ResolvedRefType::new(
+                                    attr_type.clone(),
+                                    defs.clone(),
+                                )),
+                                Ok(None) => RefType::Unchecked,
+                                Err(error) => RefType::UnknownAttribute(error),
+                            }
+                        }
+                    }
+                }
+                BindingTarget::UpstreamState(exports) => {
+                    let ReferencePathRef::Access(path) = reference else {
+                        visiting.remove(&key);
+                        return RefType::Unchecked;
+                    };
+                    let Some(export) = exports.get(path.attribute()) else {
+                        let mut known_exports: Vec<String> = exports.keys().cloned().collect();
+                        known_exports.sort();
+                        visiting.remove(&key);
+                        return RefType::UnknownAttribute(RefTypeError::UnknownUpstreamExport {
+                            binding: path.binding().to_string(),
+                            export: path.attribute().to_string(),
+                            known_exports,
+                        });
+                    };
+                    if !export.has_declared_type {
+                        visiting.remove(&key);
+                        return RefType::Unchecked;
+                    }
+                    let Some(declared) = export
+                        .type_expr
+                        .as_ref()
+                        .and_then(crate::validation::lift_type_expr)
+                    else {
+                        visiting.remove(&key);
+                        return RefType::Unchecked;
+                    };
+                    let defs = crate::schema::empty_defs_for_schema_walks();
+                    match narrow_type(&declared, path.segments(), defs, path) {
+                        Ok(Some(attr_type)) => {
+                            RefType::Typed(ResolvedRefType::new(attr_type.clone(), defs.clone()))
+                        }
+                        Ok(None) => RefType::Unchecked,
+                        Err(error) => RefType::UnknownAttribute(error),
                     }
                 }
             },
@@ -392,7 +543,9 @@ impl<'a> BindingIndex<'a> {
             .iter()
             .filter_map(|(name, entry)| match entry.target {
                 BindingTarget::Schema(schema) => Some((name.as_str(), schema)),
-                BindingTarget::Composition(_) => None,
+                BindingTarget::Composition(_)
+                | BindingTarget::Argument(_)
+                | BindingTarget::UpstreamState(_) => None,
             })
             .collect()
     }
@@ -1125,7 +1278,10 @@ impl IterableBindings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{BindingName, UntilPredicateAst, WaitBinding, parse};
+    use crate::parser::{
+        ArgumentParameter, BindingName, ResourceTypePath, TypeExpr, UntilPredicateAst,
+        UpstreamState, WaitBinding, parse,
+    };
     use crate::resource::{CompositionAttribute, Signature};
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
@@ -1425,6 +1581,141 @@ let vpc = aws.ec2.Vpc {
             panic!("forwarded composition attribute must inherit its source type");
         };
         assert_eq!(resolved.type_in_schema().resolved_type_name(), "String");
+    }
+
+    #[test]
+    fn ref_type_resolves_bare_and_struct_field_module_arguments() {
+        let mut parsed = parse("", &Default::default()).expect("parse");
+        parsed.arguments.extend([
+            ArgumentParameter {
+                name: "name".to_string(),
+                type_expr: TypeExpr::String,
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            },
+            ArgumentParameter {
+                name: "cfg".to_string(),
+                type_expr: TypeExpr::Struct {
+                    fields: vec![("enabled".to_string(), TypeExpr::Bool)],
+                },
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            },
+        ]);
+        let registry = SchemaRegistry::new();
+        let index = BindingIndex::from_parsed(&parsed, &registry);
+
+        let RefType::Typed(name) = index.ref_type("name") else {
+            panic!("bare module argument must resolve to its declared type");
+        };
+        assert_eq!(name.type_in_schema().resolved_type_name(), "String");
+
+        let RefType::Typed(enabled) = index.ref_type(&AccessPath::new("cfg", "enabled")) else {
+            panic!("field access into a struct argument must narrow its declared type");
+        };
+        assert_eq!(enabled.type_in_schema().resolved_type_name(), "Bool");
+    }
+
+    #[test]
+    fn ref_type_leaves_resource_handle_argument_unchecked() {
+        let mut parsed = parse("", &Default::default()).expect("parse");
+        parsed.arguments.push(ArgumentParameter {
+            name: "vpc".to_string(),
+            type_expr: TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Vpc")),
+            default: None,
+            description: None,
+            validations: Vec::new(),
+        });
+        let registry = SchemaRegistry::new();
+        let index = BindingIndex::from_parsed(&parsed, &registry);
+
+        assert!(matches!(index.ref_type("vpc"), RefType::Unchecked));
+    }
+
+    #[test]
+    fn ref_type_resolves_upstream_export_and_reports_missing_export() {
+        let mut parsed = parse("", &Default::default()).expect("parse");
+        parsed.upstream_states.push(UpstreamState {
+            binding: "up".to_string(),
+            source: "../upstream".into(),
+        });
+        let exports = HashMap::from([(
+            "up".to_string(),
+            HashMap::from([(
+                "vpc".to_string(),
+                crate::upstream_exports::UpstreamExportEntry {
+                    type_expr: Some(TypeExpr::SchemaType {
+                        provider: "aws".to_string(),
+                        path: "ec2.Vpc".to_string(),
+                        type_name: "Id".to_string(),
+                    }),
+                    has_declared_type: true,
+                    value: None,
+                },
+            )]),
+        )]);
+        let registry = SchemaRegistry::new();
+        let index = BindingIndex::from_parsed_with_upstream_exports(&parsed, &registry, &exports);
+
+        let RefType::Typed(vpc) = index.ref_type(&AccessPath::new("up", "vpc")) else {
+            panic!("annotated upstream export must resolve to its declared type");
+        };
+        assert_eq!(vpc.type_in_schema().resolved_type_name(), "aws.ec2.Vpc.Id");
+
+        assert!(matches!(
+            index.ref_type(&AccessPath::new("up", "missing")),
+            RefType::UnknownAttribute(RefTypeError::UnknownUpstreamExport {
+                binding,
+                export,
+                ..
+            }) if binding == "up" && export == "missing"
+        ));
+    }
+
+    #[test]
+    fn ref_type_leaves_inferred_but_unannotated_upstream_export_unchecked() {
+        let mut parsed = parse("", &Default::default()).expect("parse");
+        parsed.upstream_states.push(UpstreamState {
+            binding: "up".to_string(),
+            source: "../upstream".into(),
+        });
+        let exports = HashMap::from([(
+            "up".to_string(),
+            HashMap::from([(
+                "opaque".to_string(),
+                crate::upstream_exports::UpstreamExportEntry {
+                    type_expr: Some(TypeExpr::String),
+                    has_declared_type: false,
+                    value: None,
+                },
+            )]),
+        )]);
+        let registry = SchemaRegistry::new();
+        let index = BindingIndex::from_parsed_with_upstream_exports(&parsed, &registry, &exports);
+
+        assert!(matches!(
+            index.ref_type(&AccessPath::new("up", "opaque")),
+            RefType::Unchecked
+        ));
+    }
+
+    #[test]
+    fn ref_type_leaves_unloadable_upstream_binding_unchecked() {
+        let mut parsed = parse("", &Default::default()).expect("parse");
+        parsed.upstream_states.push(UpstreamState {
+            binding: "up".to_string(),
+            source: "../missing".into(),
+        });
+        let exports = HashMap::new();
+        let registry = SchemaRegistry::new();
+        let index = BindingIndex::from_parsed_with_upstream_exports(&parsed, &registry, &exports);
+
+        assert!(matches!(
+            index.ref_type(&AccessPath::new("up", "anything")),
+            RefType::Unchecked
+        ));
     }
 
     #[test]

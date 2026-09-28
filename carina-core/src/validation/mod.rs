@@ -11,10 +11,13 @@ use indexmap::IndexMap;
 use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
 use crate::deps::collect_dependencies;
 use crate::parser::{
-    ModuleCall, ProviderContext, ResourceRef, ResourceTypePath, TypeExpr, validate_custom_type,
+    ModuleCall, ProviderContext, ResourceContext, ResourceRef, ResourceTypePath, TypeExpr,
+    validate_custom_type,
 };
 use crate::provider::ProviderFactory;
-use crate::resource::{AccessPath, CompositionCall, ConcreteValue, DeferredValue, Value};
+use crate::resource::{
+    CompositionCall, ConcreteValue, DeferredValue, ReferencePath, ReferencePathRef, Value,
+};
 use crate::schema::{AttributeType, SchemaRegistry, Shape, TypeIdentity};
 
 /// Lift a module-boundary [`TypeExpr`] into the schema type system.
@@ -225,10 +228,15 @@ fn unique_union_map_member<'a>(
 pub(crate) fn visit_refs_with_sink<'a>(
     value: &Value,
     sink: Option<RefSink<'a>>,
-    f: &mut impl FnMut(&AccessPath, Option<RefSink<'a>>),
+    f: &mut impl FnMut(ReferencePathRef<'_>, Option<RefSink<'a>>),
 ) {
     match value {
-        Value::Deferred(DeferredValue::ResourceRef { path }) => f(path, sink),
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            f(ReferencePathRef::Access(path), sink)
+        }
+        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+            f(ReferencePathRef::Binding(binding), sink)
+        }
         Value::Concrete(ConcreteValue::List(items)) => {
             let child_sink = sink.and_then(RefSink::list_element);
             for item in items {
@@ -265,33 +273,25 @@ pub(crate) fn visit_refs_with_sink<'a>(
         | Value::Concrete(ConcreteValue::Bool(_))
         | Value::Concrete(ConcreteValue::Duration(_))
         | Value::Concrete(ConcreteValue::StringList(_))
-        | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::Unknown(_)) => {}
     }
 }
 
-fn check_resource_ref_existence(
+fn resolve_resource_reference(
     resource_id: &crate::resource::ResourceId,
-    ref_path: &crate::resource::AccessPath,
-    argument_names: &HashSet<String>,
+    reference: ReferencePathRef<'_>,
     bindings: &BindingIndex<'_>,
     all_errors: &mut Vec<String>,
 ) -> Option<ResolvedRefType> {
-    let ref_binding = ref_path.binding();
-    let ref_attr = ref_path.attribute();
-
-    // Skip type checking for argument parameter references (resolved at call site)
-    if argument_names.contains(ref_binding) {
-        return None;
-    }
-
-    match bindings.ref_type(ref_path) {
+    match bindings.ref_type(reference) {
         RefType::Typed(resolved) => Some(resolved),
         RefType::Unchecked => None,
         RefType::UnknownBinding { .. } => {
             all_errors.push(format!(
-                "{}: unknown binding '{}' in reference {}.{}",
-                resource_id, ref_binding, ref_binding, ref_attr,
+                "{}: unknown binding '{}' in reference {}",
+                resource_id,
+                reference.binding(),
+                reference.to_dot_string(),
             ));
             None
         }
@@ -300,24 +300,6 @@ fn check_resource_ref_existence(
             None
         }
     }
-}
-
-fn check_nested_resource_ref_existence(
-    resource_id: &crate::resource::ResourceId,
-    attr_value: &Value,
-    argument_names: &HashSet<String>,
-    bindings: &BindingIndex<'_>,
-    all_errors: &mut Vec<String>,
-) {
-    attr_value.visit_resource_refs(&mut |ref_path| {
-        let _ = check_resource_ref_existence(
-            resource_id,
-            ref_path,
-            argument_names,
-            bindings,
-            all_errors,
-        );
-    });
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -336,7 +318,7 @@ pub struct ModuleCallRefError {
     pub call_index: usize,
     call_label: String,
     pub argument: String,
-    pub path: AccessPath,
+    pub path: ReferencePath,
     pub kind: ModuleCallRefErrorKind,
 }
 
@@ -344,7 +326,7 @@ fn format_module_call_ref_error(
     f: &mut std::fmt::Formatter<'_>,
     call_label: &str,
     argument: &str,
-    path: &AccessPath,
+    path: &ReferencePath,
     kind: &ModuleCallRefErrorKind,
 ) -> std::fmt::Result {
     match kind {
@@ -383,8 +365,37 @@ impl std::error::Error for ModuleCallRefError {}
 pub fn validate_module_call_argument_ref_types_with_bindings(
     module_calls: &[ModuleCall],
     imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
-    argument_names: &HashSet<String>,
+    _argument_names: &HashSet<String>,
     bindings: &BindingIndex<'_>,
+) -> Vec<ModuleCallRefError> {
+    validate_module_call_argument_ref_types_inner(module_calls, imported_modules, bindings, None)
+}
+
+/// Validate only references rooted in one of `source_bindings`.
+///
+/// This is used by the module-definition pre-expansion pass: argument-backed
+/// references must be checked in their declaring module, while all other
+/// references retain the established post-expansion diagnostics and source
+/// provenance.
+pub fn validate_module_call_argument_ref_types_for_bindings(
+    module_calls: &[ModuleCall],
+    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
+    source_bindings: &HashSet<String>,
+    bindings: &BindingIndex<'_>,
+) -> Vec<ModuleCallRefError> {
+    validate_module_call_argument_ref_types_inner(
+        module_calls,
+        imported_modules,
+        bindings,
+        Some(source_bindings),
+    )
+}
+
+fn validate_module_call_argument_ref_types_inner(
+    module_calls: &[ModuleCall],
+    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
+    bindings: &BindingIndex<'_>,
+    source_bindings: Option<&HashSet<String>>,
 ) -> Vec<ModuleCallRefError> {
     let mut errors = Vec::new();
 
@@ -408,10 +419,9 @@ pub fn validate_module_call_argument_ref_types_with_bindings(
                 value,
                 declared_sink.map(RefSink::TypeExpr),
                 &mut |path, sink| {
-                    if argument_names.contains(path.binding()) {
+                    if source_bindings.is_some_and(|bindings| !bindings.contains(path.binding())) {
                         return;
                     }
-
                     let Some(kind) = composition_ref_error_kind(path, sink, bindings) else {
                         return;
                     };
@@ -419,7 +429,7 @@ pub fn validate_module_call_argument_ref_types_with_bindings(
                         call_index,
                         call_label: call_name.to_string(),
                         argument: argument_name.clone(),
-                        path: path.clone(),
+                        path: path.to_owned(),
                         kind,
                     });
                 },
@@ -433,7 +443,7 @@ pub fn validate_module_call_argument_ref_types_with_bindings(
 #[derive(Debug, Clone)]
 pub struct AttributeParamRefError {
     pub attribute: String,
-    pub path: AccessPath,
+    pub path: ReferencePath,
     pub kind: ModuleCallRefErrorKind,
 }
 
@@ -469,7 +479,7 @@ pub enum CompositionRefError {
 #[derive(Debug, Clone)]
 pub struct CompositionModuleCallRefError {
     pub argument: String,
-    pub path: AccessPath,
+    pub path: ReferencePath,
     pub kind: ModuleCallRefErrorKind,
     pub call: CompositionCall,
     pub root_call: CompositionCall,
@@ -551,6 +561,10 @@ enum CompositionRefErrorKindKey {
         struct_name: String,
         known_fields: Vec<String>,
     },
+    UnknownUpstreamExport {
+        export: String,
+        known_exports: Vec<String>,
+    },
 }
 
 impl From<&ModuleCallRefErrorKind> for CompositionRefErrorKindKey {
@@ -580,6 +594,14 @@ impl From<&ModuleCallRefErrorKind> for CompositionRefErrorKindKey {
                 struct_name: struct_name.clone(),
                 known_fields: known_fields.clone(),
             },
+            ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::UnknownUpstreamExport {
+                export,
+                known_exports,
+                ..
+            }) => Self::UnknownUpstreamExport {
+                export: export.clone(),
+                known_exports: known_exports.clone(),
+            },
         }
     }
 }
@@ -601,7 +623,7 @@ struct CompositionAttributeErrorKey {
 }
 
 fn composition_ref_error_kind(
-    path: &AccessPath,
+    path: ReferencePathRef<'_>,
     sink: Option<RefSink<'_>>,
     bindings: &BindingIndex<'_>,
 ) -> Option<ModuleCallRefErrorKind> {
@@ -660,7 +682,7 @@ pub fn validate_composition_ref_types_with_bindings(
                     errors.push(CompositionRefError::ModuleCall(
                         CompositionModuleCallRefError {
                             argument: argument_name.clone(),
-                            path: path.clone(),
+                            path: path.to_owned(),
                             kind,
                             call: call.clone(),
                             root_call: root_call.clone(),
@@ -672,6 +694,13 @@ pub fn validate_composition_ref_types_with_bindings(
         }
 
         for (attribute_name, attribute) in &composition.signature.attributes {
+            if attribute.source_argument().is_some() {
+                // The module-local declaration is checked against the
+                // argument's declared type before expansion. Re-checking the
+                // substituted caller value here duplicates call-boundary
+                // errors and incorrectly blames the module output.
+                continue;
+            }
             let value = attribute.to_value();
             let mut reference_position = 0;
             visit_refs_with_sink(
@@ -687,7 +716,7 @@ pub fn validate_composition_ref_types_with_bindings(
                         CompositionAttributeRefError {
                             error: AttributeParamRefError {
                                 attribute: attribute_name.clone(),
-                                path: path.clone(),
+                                path: path.to_owned(),
                                 kind,
                             },
                             module_name: call.module_name.clone(),
@@ -832,8 +861,27 @@ pub fn validate_resources<E>(
 pub fn validate_resource_ref_types<E>(
     parsed: &crate::parser::File<E>,
     registry: &SchemaRegistry,
-    argument_names: &HashSet<String>,
+    _argument_names: &HashSet<String>,
     bindings: &BindingIndex<'_>,
+) -> Result<(), String> {
+    validate_resource_ref_types_inner(parsed, registry, bindings, None)
+}
+
+/// Validate resource-attribute references rooted in `source_bindings` only.
+pub fn validate_resource_ref_types_for_bindings<E>(
+    parsed: &crate::parser::File<E>,
+    registry: &SchemaRegistry,
+    source_bindings: &HashSet<String>,
+    bindings: &BindingIndex<'_>,
+) -> Result<(), String> {
+    validate_resource_ref_types_inner(parsed, registry, bindings, Some(source_bindings))
+}
+
+fn validate_resource_ref_types_inner<E>(
+    parsed: &crate::parser::File<E>,
+    registry: &SchemaRegistry,
+    bindings: &BindingIndex<'_>,
+    source_bindings: Option<&HashSet<String>>,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
 
@@ -850,6 +898,12 @@ pub fn validate_resource_ref_types<E>(
             continue;
         };
         let resource_id = rref.id();
+        let resource_location = match rref.context() {
+            ResourceContext::Direct => resource_id.to_string(),
+            ResourceContext::Deferred(deferred) => {
+                format!("for-body `{}` {}", deferred.header, resource_id)
+            }
+        };
 
         let attrs = rref.attributes();
         for (attr_name, attr_value) in attrs.iter() {
@@ -857,62 +911,49 @@ pub fn validate_resource_ref_types<E>(
                 continue;
             }
 
-            let Some(attr_schema) = schema.attributes.get(attr_name) else {
-                check_nested_resource_ref_existence(
-                    resource_id,
-                    attr_value,
-                    argument_names,
-                    bindings,
-                    &mut all_errors,
-                );
-                continue;
-            };
-
-            if let Value::Deferred(DeferredValue::ResourceRef { path: ref_path }) = attr_value {
-                let Some(source) = check_resource_ref_existence(
-                    resource_id,
-                    ref_path,
-                    argument_names,
-                    bindings,
-                    &mut all_errors,
-                ) else {
-                    continue;
+            let sink = schema
+                .attributes
+                .get(attr_name)
+                .map(|attribute| RefSink::AttributeType {
+                    attr_type: &attribute.attr_type,
+                    defs: &schema.defs,
+                });
+            let string_sink = AttributeType::string();
+            visit_refs_with_sink(attr_value, sink, &mut |reference, sink| {
+                if source_bindings.is_some_and(|bindings| !bindings.contains(reference.binding())) {
+                    return;
+                }
+                let Some(source) =
+                    resolve_resource_reference(resource_id, reference, bindings, &mut all_errors)
+                else {
+                    return;
+                };
+                let Some(sink_type) = (match sink {
+                    Some(RefSink::AttributeType { attr_type, defs }) => {
+                        Some(attr_type.in_schema(defs))
+                    }
+                    Some(RefSink::String) => {
+                        Some(crate::schema::TypeInSchema::schemaless(&string_sink))
+                    }
+                    Some(RefSink::TypeExpr(_)) | None => None,
+                }) else {
+                    return;
                 };
                 let source_type = source.type_in_schema();
-                let sink_type = schema.type_in_schema(&attr_schema.attr_type);
-                let ref_type_name = source_type.resolved_type_name();
-                let expected_type_name = sink_type.resolved_type_name();
-
-                // Directional check: source (the referenced attribute, post
-                // path narrowing) must be assignable to the sink (the
-                // current resource's attribute).
                 if source_type.is_assignable_to(sink_type) {
-                    continue;
+                    return;
                 }
-
+                let source_name = source_type.resolved_type_name();
                 all_errors.push(format!(
-                    "{}: cannot assign {} to '{}': expected {}, got {} (from {}.{})",
-                    resource_id,
-                    ref_type_name,
+                    "{}: cannot assign {} to '{}': expected {}, got {} (from {})",
+                    resource_location,
+                    source_name,
                     attr_name,
-                    expected_type_name,
-                    ref_type_name,
-                    ref_path.binding(),
-                    ref_path.attribute(),
+                    sink_type.resolved_type_name(),
+                    source_name,
+                    reference.to_dot_string(),
                 ));
-            } else {
-                // Nested ResourceRefs are checked for binding/attribute
-                // existence only. Assignability for these refs needs the
-                // nested field type context from the surrounding Map/List/Struct
-                // shape and should be added where that context is threaded.
-                check_nested_resource_ref_existence(
-                    resource_id,
-                    attr_value,
-                    argument_names,
-                    bindings,
-                    &mut all_errors,
-                );
-            }
+            });
         }
     }
 
@@ -933,6 +974,23 @@ pub fn validate_attribute_param_ref_types_with_bindings(
     attribute_params: &[crate::parser::AttributeParameter],
     bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
+    validate_attribute_param_ref_types_inner(attribute_params, bindings, None)
+}
+
+/// Validate attribute-declaration references rooted in `source_bindings` only.
+pub fn validate_attribute_param_ref_types_for_bindings(
+    attribute_params: &[crate::parser::AttributeParameter],
+    source_bindings: &HashSet<String>,
+    bindings: &BindingIndex<'_>,
+) -> Result<(), String> {
+    validate_attribute_param_ref_types_inner(attribute_params, bindings, Some(source_bindings))
+}
+
+fn validate_attribute_param_ref_types_inner(
+    attribute_params: &[crate::parser::AttributeParameter],
+    bindings: &BindingIndex<'_>,
+    source_bindings: Option<&HashSet<String>>,
+) -> Result<(), String> {
     let mut errors = Vec::new();
 
     for param in attribute_params {
@@ -944,6 +1002,9 @@ pub fn validate_attribute_param_ref_types_with_bindings(
             value,
             param.type_expr.as_ref().map(RefSink::TypeExpr),
             &mut |path, sink| {
+                if source_bindings.is_some_and(|bindings| !bindings.contains(path.binding())) {
+                    return;
+                }
                 check_attribute_param_ref(
                     &param.name,
                     sink.and_then(RefSink::as_type_expr),
@@ -965,7 +1026,7 @@ pub fn validate_attribute_param_ref_types_with_bindings(
 fn check_attribute_param_ref(
     param_name: &str,
     expected_type: Option<&TypeExpr>,
-    path: &crate::resource::AccessPath,
+    path: ReferencePathRef<'_>,
     bindings: &BindingIndex<'_>,
     errors: &mut Vec<String>,
 ) {
@@ -1040,7 +1101,7 @@ pub fn validate_export_param_ref_types_with_bindings(
 fn check_export_ref(
     param_name: &str,
     expected_type: Option<&TypeExpr>,
-    path: &crate::resource::AccessPath,
+    path: ReferencePathRef<'_>,
     bindings: &BindingIndex<'_>,
     errors: &mut Vec<String>,
 ) {

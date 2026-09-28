@@ -193,9 +193,27 @@ impl DiagnosticEngine {
             diagnostics.extend(self.check_mixed_tag_key_styles(current_file, base, result));
         }
         let merged = merged_result.as_ref().map(|result| &result.parsed);
+        let upstream_resolution = match (base_path, merged) {
+            (Some(base), Some(merged)) => Some(
+                carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
+                    base,
+                    &merged.upstream_states,
+                    &self.provider_context,
+                    Some(&self.schemas),
+                ),
+            ),
+            _ => None,
+        };
 
-        if let (Some(base), Some(merged)) = (base_path, merged) {
-            diagnostics.extend(self.check_upstream_state_field_references(doc, merged, base));
+        if let (Some(merged), Some((exports, resolve_errors))) =
+            (merged, upstream_resolution.as_ref())
+        {
+            diagnostics.extend(self.check_upstream_state_field_references(
+                doc,
+                merged,
+                exports,
+                resolve_errors,
+            ));
             diagnostics.extend(self.check_for_iterable_bindings(doc, merged, current_file_name));
         }
 
@@ -386,8 +404,17 @@ impl DiagnosticEngine {
             // deliberately gives both composition-attribute existence checks
             // and `check_resource_ref_type_mismatch` directory-wide targets.
             let binding_input = merged.unwrap_or(parsed);
+            let empty_upstream_exports = Default::default();
+            let upstream_exports = upstream_resolution
+                .as_ref()
+                .map(|(exports, _)| exports)
+                .unwrap_or(&empty_upstream_exports);
             let binding_index =
-                carina_core::binding_index::BindingIndex::from_parsed(binding_input, &self.schemas);
+                carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports(
+                    binding_input,
+                    &self.schemas,
+                    upstream_exports,
+                );
             let module_signatures = base_path
                 .map(|base| {
                     carina_core::module_resolver::load_resolved_module_signatures(
@@ -703,25 +730,23 @@ impl DiagnosticEngine {
                                     "Type mismatch: expected Float, got String \"{}\".",
                                     s
                                 )),
-                                // ResourceRef type check for Union, Enum, and Custom types
-                                (
-                                    carina_core::schema::Shape::Union
-                                    | carina_core::schema::Shape::Enum { .. }
-                                    | carina_core::schema::Shape::String {
-                                        identity: Some(_), ..
-                                    }
-                                    | carina_core::schema::Shape::Int {
-                                        identity: Some(_), ..
-                                    }
-                                    | carina_core::schema::Shape::Float {
-                                        identity: Some(_), ..
-                                    },
-                                    Value::Deferred(DeferredValue::ResourceRef { path }),
-                                ) => check_resource_ref_type_mismatch(
-                                    &binding_index,
-                                    schema.type_in_schema(&attr_schema.attr_type),
-                                    path,
-                                ),
+                                // Every statically typed deferred reference is
+                                // checked through the same BindingIndex source
+                                // resolver, including bare module arguments.
+                                (_, Value::Deferred(DeferredValue::ResourceRef { path })) => {
+                                    check_resource_ref_type_mismatch(
+                                        &binding_index,
+                                        schema.type_in_schema(&attr_schema.attr_type),
+                                        path.into(),
+                                    )
+                                }
+                                (_, Value::Deferred(DeferredValue::BindingRef { binding })) => {
+                                    check_resource_ref_type_mismatch(
+                                        &binding_index,
+                                        schema.type_in_schema(&attr_schema.attr_type),
+                                        binding.as_str().into(),
+                                    )
+                                }
                                 // Enum: the structured-payload path
                                 // above handles `InvalidEnumVariant` /
                                 // `StringLiteralExpectedEnum` and
@@ -933,6 +958,18 @@ impl DiagnosticEngine {
                         &lookup,
                     ) {
                         for error in errors {
+                            if let carina_core::schema::TypeError::ResourceValidationFailed {
+                                attribute: Some(attribute),
+                                ..
+                            } = &error
+                                && matches!(
+                                    resource_attributes.get(attribute),
+                                    Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+                                        | Some(Value::Deferred(DeferredValue::BindingRef { .. }))
+                                )
+                            {
+                                continue;
+                            }
                             // Skip errors that are already reported with precise positions
                             // by the attribute-level checks above.
                             if matches!(
@@ -1532,7 +1569,7 @@ fn build_enum_diagnostic(
 fn check_resource_ref_type_mismatch(
     binding_index: &carina_core::binding_index::BindingIndex<'_>,
     expected: TypeInSchema<'_>,
-    path: &carina_core::resource::AccessPath,
+    path: carina_core::resource::ReferencePathRef<'_>,
 ) -> Option<String> {
     let carina_core::binding_index::RefType::Typed(source) = binding_index.ref_type(path) else {
         return None;
@@ -1544,11 +1581,10 @@ fn check_resource_ref_type_mismatch(
         None
     } else {
         Some(format!(
-            "Type mismatch: expected {}, got {} (from {}.{})",
+            "Type mismatch: expected {}, got {} (from {})",
             expected.resolved_type_name(),
             source.resolved_type_name(),
-            path.binding(),
-            path.attribute()
+            path.to_dot_string(),
         ))
     }
 }

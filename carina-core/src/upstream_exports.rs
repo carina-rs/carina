@@ -14,14 +14,13 @@
 //! Both are pure functions so `validate`, LSP diagnostics, and any other
 //! surface can share the same logic without duplicating traversal code.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::config_loader::{find_crn_files_in_dir, parse_directory};
 use crate::parser::{ProviderContext, ResourceContext, ResourceRef, TypeExpr, UpstreamState};
 use crate::resource::{Subscript, Value};
-use crate::schema::{AttributeType, SchemaRegistry, suggest_similar_name};
-use crate::validation::{RefSink, visit_refs_with_sink};
+use crate::schema::suggest_similar_name;
 
 /// One export's declared type and literal value, as carried through
 /// [`UpstreamExports`]. `type_expr` is `None` when the upstream's
@@ -31,7 +30,13 @@ use crate::validation::{RefSink, visit_refs_with_sink};
 /// future grammar widenings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpstreamExportEntry {
+    /// Effective type used by shape-aware tooling. This can be inferred when
+    /// the declaration omits an annotation.
     pub type_expr: Option<TypeExpr>,
+    /// Whether `type_expr` originated from an explicit export annotation.
+    /// Reference assignment checking intentionally trusts declared contracts
+    /// only; an inferred export remains [`crate::binding_index::RefType::Unchecked`].
+    pub has_declared_type: bool,
     pub value: Option<Value>,
 }
 
@@ -48,13 +53,12 @@ pub type UpstreamExports = HashMap<String, UpstreamExportEntries>;
 /// A diagnostic about a `binding.field` reference whose downstream usage
 /// doesn't fit the upstream's exports.
 ///
-/// Five error types share this shape — name-not-exported
-/// ([`UpstreamFieldError`]), top-level type mismatch
-/// ([`UpstreamTypeError`]), `for`-iterable shape mismatch
-/// ([`UpstreamForIterableShapeError`]), attribute-access shape
-/// mismatch ([`UpstreamAttributeAccessShapeError`]), and subscript
-/// shape mismatch ([`UpstreamSubscriptShapeError`]). They share their
-/// CLI and LSP wirings through this trait so adding a sixth check is
+/// Four error types share this shape — name-not-exported
+/// ([`UpstreamFieldError`]), `for`-iterable shape mismatch
+/// ([`UpstreamForIterableShapeError`]), attribute-access shape mismatch
+/// ([`UpstreamAttributeAccessShapeError`]), and subscript shape mismatch
+/// ([`UpstreamSubscriptShapeError`]). They share their
+/// CLI and LSP wirings through this trait so adding another check is
 /// one `impl`, not three identical extends/loops.
 ///
 /// Excludes [`UpstreamResolveError`] on purpose: a resolve failure
@@ -204,6 +208,12 @@ pub fn resolve_upstream_exports_with_schemas(
         }
         match parse_directory(&source_abs, config) {
             Ok(mut parsed) => {
+                // Dotted type annotations are intentionally parser-produced as
+                // `DottedUnresolved`. Normalize registered export annotations
+                // before inference so `BindingIndex::ref_type` can lift them.
+                // Invalid annotations remain non-liftable and are reported by
+                // validation of the upstream project itself.
+                let _ = crate::validation::resolve_file_type_exprs(&mut parsed, config);
                 // Expand module calls before inference so that
                 // `attributes { ... }`-typed `Virtual` resources land in
                 // `parsed.resources` (#2493). Without this the inferer
@@ -221,6 +231,12 @@ pub fn resolve_upstream_exports_with_schemas(
                     &source_abs,
                     config,
                 );
+                let declared_export_names: HashSet<String> = parsed
+                    .export_params
+                    .iter()
+                    .filter(|export| export.type_expr.is_some())
+                    .map(|export| export.name.clone())
+                    .collect();
                 // When schemas are available, hoist the upstream parse
                 // through `apply_inference` so every export carries a
                 // bare `TypeExpr` (possibly the `Unknown` sentinel for
@@ -240,10 +256,12 @@ pub fn resolve_upstream_exports_with_schemas(
                             // surface for sentinels — Unknown carries
                             // nothing worth forwarding to the consumer.
                             .map(|e| {
+                                let has_declared_type = declared_export_names.contains(&e.name);
                                 (
                                     e.name,
                                     UpstreamExportEntry {
                                         type_expr: e.type_expr.into_known(),
+                                        has_declared_type,
                                         value: e.value,
                                     },
                                 )
@@ -258,10 +276,12 @@ pub fn resolve_upstream_exports_with_schemas(
                         .export_params
                         .into_iter()
                         .map(|e| {
+                            let has_declared_type = e.type_expr.is_some();
                             (
                                 e.name,
                                 UpstreamExportEntry {
                                     type_expr: e.type_expr,
+                                    has_declared_type,
                                     value: e.value,
                                 },
                             )
@@ -319,34 +339,13 @@ where
     }
 }
 
-/// Walk every ref-bearing value outside resources — `let` bindings,
-/// `attributes` parameter defaults, `exports` values, and module-call
-/// arguments — yielding `(value, location_string)`. Used by
-/// [`check_upstream_state_field_references`] and
-/// [`check_upstream_state_attribute_access_shapes`]; centralized so a
-/// fifth check that wants the same reach gets it for free.
-///
-/// `scope` controls which subset is walked, mirroring what each
-/// existing caller walks today. See [`NonResourceScope`] for the two
-/// shapes.
-fn for_each_non_resource_value<E, F>(
-    parsed: &crate::parser::File<E>,
-    scope: NonResourceScope,
-    mut f: F,
-) where
+/// Walk ref-bearing export values and module-call arguments outside resources,
+/// yielding `(value, location_string)` for the upstream shape checks.
+fn for_each_non_resource_value<E, F>(parsed: &crate::parser::File<E>, mut f: F)
+where
     E: crate::parser::ExportParamLike,
     F: FnMut(&Value, &str),
 {
-    if matches!(scope, NonResourceScope::All) {
-        for (name, value) in parsed.variables.iter() {
-            f(value, &format!("let {}", name));
-        }
-        for attr in &parsed.attribute_params {
-            if let Some(value) = &attr.value {
-                f(value, &format!("attributes.{}", attr.name));
-            }
-        }
-    }
     for export in &parsed.export_params {
         if let Some(value) = export.value() {
             f(value, &format!("exports.{}", export.name()));
@@ -363,23 +362,6 @@ fn for_each_non_resource_value<E, F>(
     }
 }
 
-/// Which non-resource scopes a check walks today. The variants are not
-/// a generic taxonomy — they pin the existing per-caller asymmetry so
-/// the refactor stays behavior-preserving. Whether
-/// [`check_upstream_state_attribute_access_shapes`] *should* widen to
-/// `All` (i.e. also walk `let`/attribute_params, like field-references
-/// does) is an open question for a follow-up; until then,
-/// `ExportsAndModules` exists to preserve the historical reach.
-#[derive(Debug, Clone, Copy)]
-enum NonResourceScope {
-    /// Variables (`let`), attribute_params, export_params, module_calls
-    /// — what `check_upstream_state_field_references` walks today.
-    All,
-    /// Just export_params and module_calls — what
-    /// `check_upstream_state_attribute_access_shapes` walks today.
-    ExportsAndModules,
-}
-
 /// Walk a parsed project and return an error for every reference whose root
 /// binding is in `exports` but whose field isn't in its declared key set.
 /// Also covers deferred for-iterables (e.g. `for _ in orgs.accounts`), which
@@ -390,6 +372,26 @@ enum NonResourceScope {
 pub fn check_upstream_state_field_references<E: crate::parser::ExportParamLike>(
     parsed: &crate::parser::File<E>,
     exports: &UpstreamExports,
+) -> Vec<UpstreamFieldError> {
+    check_upstream_state_field_references_inner(parsed, exports, true)
+}
+
+/// Check only scopes that do not have a typed consumer and therefore cannot
+/// route existence through [`crate::binding_index::BindingIndex::ref_type`].
+/// Production validation uses this alongside the unified typed-reference
+/// passes; the broader legacy entry point above remains useful to callers that
+/// run this check in isolation.
+pub fn check_upstream_state_untyped_field_references<E: crate::parser::ExportParamLike>(
+    parsed: &crate::parser::File<E>,
+    exports: &UpstreamExports,
+) -> Vec<UpstreamFieldError> {
+    check_upstream_state_field_references_inner(parsed, exports, false)
+}
+
+fn check_upstream_state_field_references_inner<E: crate::parser::ExportParamLike>(
+    parsed: &crate::parser::File<E>,
+    exports: &UpstreamExports,
+    include_typed_consumers: bool,
 ) -> Vec<UpstreamFieldError> {
     let mut errors: Vec<UpstreamFieldError> = Vec::new();
 
@@ -427,16 +429,24 @@ pub fn check_upstream_state_field_references<E: crate::parser::ExportParamLike>(
             });
         };
 
-        // Direct resources and deferred for-body template resources share
-        // one walk via `iter_all_resources` (helper). Location strings
-        // use the `ResourceContext::Deferred` branch to mention the for
-        // header so users can tell body errors from top-level ones.
-        for_each_resource_attr(parsed, |rref, attr_name, value| {
-            check(value, &resource_attr_location(rref, attr_name));
-        });
-        for_each_non_resource_value(parsed, NonResourceScope::All, |value, location| {
-            check(value, location);
-        });
+        if include_typed_consumers {
+            for_each_resource_attr(parsed, |rref, attr_name, value| {
+                check(value, &resource_attr_location(rref, attr_name));
+            });
+            for attr in &parsed.attribute_params {
+                if let Some(value) = &attr.value {
+                    check(value, &format!("attributes.{}", attr.name));
+                }
+            }
+            for_each_non_resource_value(parsed, |value, location| {
+                check(value, location);
+            });
+        }
+
+        // `let` values have no sink-driven validation pass of their own.
+        for (name, value) in &parsed.variables {
+            check(value, &format!("let {name}"));
+        }
     }
 
     // Deferred for-expression iterables are a direct
@@ -475,184 +485,7 @@ pub fn check_upstream_state_field_references<E: crate::parser::ExportParamLike>(
     errors
 }
 
-/// A reference to an `upstream_state` export whose declared type is
-/// incompatible with the consumer's expected type.
-///
-/// Complements `UpstreamFieldError`: this one fires when the *name* is
-/// valid but the *type* isn't. Types are kept structured so future code
-/// actions (e.g. wrap in a cast, jump to definition) can inspect them.
-#[derive(Debug, Clone)]
-pub struct UpstreamTypeError {
-    pub location: String,
-    pub binding: String,
-    pub field: String,
-    pub export_type: TypeExpr,
-    pub expected_type: AttributeType,
-}
-
-impl UpstreamTypeError {
-    pub fn diagnostic_message(&self) -> String {
-        format!(
-            "upstream_state `{}.{}` is declared as `{}` but this position expects `{}`",
-            self.binding,
-            self.field,
-            self.export_type,
-            self.expected_type.type_name()
-        )
-    }
-}
-
-impl std::fmt::Display for UpstreamTypeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.location, self.diagnostic_message())
-    }
-}
-
-impl std::error::Error for UpstreamTypeError {}
-
-impl UpstreamRefDiagnostic for UpstreamTypeError {
-    fn location(&self) -> &str {
-        &self.location
-    }
-    fn binding(&self) -> &str {
-        &self.binding
-    }
-    fn field(&self) -> &str {
-        &self.field
-    }
-    fn diagnostic_message(&self) -> String {
-        UpstreamTypeError::diagnostic_message(self)
-    }
-}
-
-/// For each resource attribute whose value is an `upstream_state` field
-/// reference, compare the export's declared type against the attribute's
-/// expected type and emit an error when they don't fit.
-///
-/// Exports without a declared type (no `: T` annotation) are skipped —
-/// there's nothing to compare.
-pub fn check_upstream_state_field_types<E>(
-    parsed: &crate::parser::File<E>,
-    exports: &UpstreamExports,
-    registry: &SchemaRegistry,
-) -> Vec<UpstreamTypeError> {
-    let mut errors: Vec<UpstreamTypeError> = Vec::new();
-    for_each_resource_attr(parsed, |rref, attr_name, value| {
-        // A deferred for-expression template body is always managed.
-        let schema = match rref {
-            ResourceRef::Composition(_) => return,
-            ResourceRef::DataSource(d) => registry.get_for_data_source(d),
-            ResourceRef::Resource(m) | ResourceRef::Deferred { resource: m, .. } => {
-                registry.get_for(m)
-            }
-        };
-        let Some(schema) = schema else {
-            return;
-        };
-        let Some(attr_schema) = schema.attributes.get(attr_name) else {
-            return;
-        };
-        let location = resource_attr_location(rref, attr_name);
-        check_ref_against_type(
-            value,
-            &attr_schema.attr_type,
-            &schema.defs,
-            exports,
-            &location,
-            &mut errors,
-        );
-    });
-    errors.sort_by(|a, b| {
-        (a.location.as_str(), a.binding.as_str(), a.field.as_str()).cmp(&(
-            b.location.as_str(),
-            b.binding.as_str(),
-            b.field.as_str(),
-        ))
-    });
-    errors
-}
-
-fn check_ref_against_type(
-    value: &Value,
-    expected: &AttributeType,
-    defs: &std::collections::BTreeMap<String, AttributeType>,
-    exports: &UpstreamExports,
-    location: &str,
-    errors: &mut Vec<UpstreamTypeError>,
-) {
-    visit_refs_with_sink(
-        value,
-        Some(RefSink::AttributeType {
-            attr_type: expected,
-            defs,
-        }),
-        &mut |path, sink| match sink {
-            Some(RefSink::AttributeType { attr_type, defs }) => {
-                check_resource_ref_at_position(path, attr_type, defs, exports, location, errors);
-            }
-            Some(RefSink::String) => check_resource_ref_at_position(
-                path,
-                &AttributeType::string(),
-                defs,
-                exports,
-                location,
-                errors,
-            ),
-            Some(RefSink::TypeExpr(_)) | None => {}
-        },
-    );
-}
-
-/// Compare a single `ResourceRef` against the receiver type at its
-/// position. Narrows the export type through the access path's
-/// `field_path` / `subscripts` first (a positional walker by itself is
-/// not enough — `accounts['k']` still has to step through `map(T) → T`
-/// before comparing).
-fn check_resource_ref_at_position(
-    path: &crate::resource::AccessPath,
-    expected: &AttributeType,
-    defs: &std::collections::BTreeMap<String, AttributeType>,
-    exports: &UpstreamExports,
-    location: &str,
-    errors: &mut Vec<UpstreamTypeError>,
-) {
-    let binding = path.binding();
-    let field = path.attribute();
-    let Some(keys) = exports.get(binding) else {
-        return;
-    };
-    let Some(UpstreamExportEntry {
-        type_expr: Some(export_type),
-        ..
-    }) = keys.get(field)
-    else {
-        return;
-    };
-    let Some(narrowed) = narrow_type_expr(export_type, path.segments()) else {
-        // Kind mismatch through the access path — already reported by
-        // `check_upstream_state_attribute_access_shapes` /
-        // `check_upstream_state_subscript_shapes`. Skip to avoid
-        // double-reporting.
-        return;
-    };
-    let Some(source) = crate::validation::lift_type_expr(&narrowed) else {
-        // Resource handles and the other deliberately non-liftable forms are
-        // unchecked at module boundaries (carina#3803).
-        return;
-    };
-    if crate::schema::TypeInSchema::schemaless(&source).is_assignable_to(expected.in_schema(defs)) {
-        return;
-    }
-    errors.push(UpstreamTypeError {
-        location: location.to_string(),
-        binding: binding.to_string(),
-        field: field.to_string(),
-        export_type: narrowed,
-        expected_type: expected.clone(),
-    });
-}
-
-use crate::validation::{narrow_type_expr, walk_type_expr_fields};
+use crate::validation::walk_type_expr_fields;
 
 /// A `for` expression iterates an `upstream_state` field whose declared
 /// export type doesn't match the binding pattern's expected shape:
@@ -781,6 +614,7 @@ pub fn check_upstream_state_for_iterable_shapes<E>(
         };
         let Some(UpstreamExportEntry {
             type_expr: Some(export_type),
+            has_declared_type: true,
             ..
         }) = fields.get(&deferred.iterable_attr)
         else {
@@ -921,7 +755,7 @@ impl UpstreamRefDiagnostic for UpstreamAttributeAccessShapeError {
 /// - the export has no declared type (`account` without `: T`) — there's
 ///   no upstream type to compare the path against;
 /// - the `field_path` is empty — that's a top-level field access,
-///   already handled by `check_upstream_state_field_types`.
+///   handled by the typed consumer through `BindingIndex::ref_type`.
 ///
 /// Sibling of [`check_upstream_state_for_iterable_shapes`] from #2317;
 /// both surface "downstream usage doesn't fit upstream's declared
@@ -930,12 +764,35 @@ pub fn check_upstream_state_attribute_access_shapes<E: crate::parser::ExportPara
     parsed: &crate::parser::File<E>,
     exports: &UpstreamExports,
 ) -> Vec<UpstreamAttributeAccessShapeError> {
+    check_upstream_state_attribute_access_shapes_inner(parsed, exports, true)
+}
+
+/// Check only attribute-access shapes that
+/// [`crate::binding_index::BindingIndex::ref_type`] cannot represent.
+///
+/// The unified resolver reports missing fields on declared structs itself.
+/// List, map, and scalar values reached through field syntax resolve to
+/// `Unchecked`, so this fallback retains their more specific upstream shape
+/// diagnostics without reporting a struct-field typo twice.
+pub fn check_upstream_state_attribute_access_shape_fallbacks<E: crate::parser::ExportParamLike>(
+    parsed: &crate::parser::File<E>,
+    exports: &UpstreamExports,
+) -> Vec<UpstreamAttributeAccessShapeError> {
+    check_upstream_state_attribute_access_shapes_inner(parsed, exports, false)
+}
+
+fn check_upstream_state_attribute_access_shapes_inner<E: crate::parser::ExportParamLike>(
+    parsed: &crate::parser::File<E>,
+    exports: &UpstreamExports,
+    include_resolver_struct_errors: bool,
+) -> Vec<UpstreamAttributeAccessShapeError> {
     let mut errors: Vec<UpstreamAttributeAccessShapeError> = Vec::new();
     for_each_resource_attr(parsed, |rref, attr_name, value| {
         visit_attribute_access(
             value,
             exports,
             &resource_attr_location(rref, attr_name),
+            include_resolver_struct_errors,
             &mut errors,
         );
     });
@@ -943,13 +800,15 @@ pub fn check_upstream_state_attribute_access_shapes<E: crate::parser::ExportPara
     // too — they aren't iterated by `iter_all_resources`. Walking them
     // (via the helper) matches the reach of
     // `check_upstream_state_field_references` for those scopes.
-    for_each_non_resource_value(
-        parsed,
-        NonResourceScope::ExportsAndModules,
-        |value, location| {
-            visit_attribute_access(value, exports, location, &mut errors);
-        },
-    );
+    for_each_non_resource_value(parsed, |value, location| {
+        visit_attribute_access(
+            value,
+            exports,
+            location,
+            include_resolver_struct_errors,
+            &mut errors,
+        );
+    });
     errors.sort_by(|a, b| {
         (a.location.as_str(), a.binding.as_str(), a.field.as_str()).cmp(&(
             b.location.as_str(),
@@ -967,6 +826,7 @@ fn visit_attribute_access(
     value: &Value,
     exports: &UpstreamExports,
     location: &str,
+    include_resolver_struct_errors: bool,
     errors: &mut Vec<UpstreamAttributeAccessShapeError>,
 ) {
     value.visit_resource_refs(&mut |path| {
@@ -981,6 +841,7 @@ fn visit_attribute_access(
         };
         let Some(UpstreamExportEntry {
             type_expr: Some(export_type),
+            has_declared_type: true,
             ..
         }) = fields.get(attribute)
         else {
@@ -988,6 +849,9 @@ fn visit_attribute_access(
         };
         let walk_result = walk_type_expr_fields(export_type, &leading);
         if let Err((mismatched_at, bad_segment)) = walk_result {
+            if !include_resolver_struct_errors && matches!(mismatched_at, TypeExpr::Struct { .. }) {
+                return;
+            }
             let mismatched_at = mismatched_at.clone();
             let bad_segment = bad_segment.to_string();
             errors.push(UpstreamAttributeAccessShapeError {
@@ -1103,13 +967,9 @@ pub fn check_upstream_state_subscript_shapes<E: crate::parser::ExportParamLike>(
             &mut errors,
         );
     });
-    for_each_non_resource_value(
-        parsed,
-        NonResourceScope::ExportsAndModules,
-        |value, location| {
-            visit_subscript_access(value, exports, location, &mut errors);
-        },
-    );
+    for_each_non_resource_value(parsed, |value, location| {
+        visit_subscript_access(value, exports, location, &mut errors);
+    });
     errors.sort_by(|a, b| {
         (a.location.as_str(), a.binding.as_str(), a.field.as_str()).cmp(&(
             b.location.as_str(),
@@ -1149,6 +1009,7 @@ fn visit_subscript_access(
         };
         let Some(UpstreamExportEntry {
             type_expr: Some(export_type),
+            has_declared_type: true,
             ..
         }) = fields.get(attribute)
         else {
@@ -1193,6 +1054,7 @@ mod tests {
     use super::*;
     use crate::parser::ParsedFile;
     use crate::resource::DeferredValue;
+    use crate::schema::SchemaRegistry;
     use std::fs;
     use std::path::PathBuf;
 
@@ -1229,6 +1091,7 @@ mod tests {
                                 s.to_string(),
                                 UpstreamExportEntry {
                                     type_expr: None,
+                                    has_declared_type: false,
                                     value: None,
                                 },
                             )
@@ -1745,7 +1608,7 @@ mod tests {
     }
 
     // ================================================================
-    // Phase 2 of #1992: type compatibility (`check_upstream_state_field_types`)
+    // Phase 2 of #1992: type compatibility through the unified binding resolver
     // ================================================================
 
     /// Build an `UpstreamExports` with typed entries.
@@ -1762,6 +1625,7 @@ mod tests {
                                 name.to_string(),
                                 UpstreamExportEntry {
                                     type_expr: Some(ty.clone()),
+                                    has_declared_type: true,
                                     value: None,
                                 },
                             )
@@ -1796,6 +1660,27 @@ mod tests {
         parse_directory(tmp.path(), &ctx()).expect("parse_directory")
     }
 
+    /// Preserve the historical positional-walker coverage while exercising
+    /// the unified binding resolver used by production validation.
+    fn check_upstream_ref_types_via_binding_index(
+        parsed: &ParsedFile,
+        exports: &UpstreamExports,
+        schemas: &SchemaRegistry,
+    ) -> Vec<String> {
+        let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports(
+            parsed, schemas, exports,
+        );
+        crate::validation::validate_resource_ref_types(
+            parsed,
+            schemas,
+            &std::collections::HashSet::new(),
+            &bindings,
+        )
+        .err()
+        .map(|joined| joined.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+    }
+
     #[test]
     fn type_check_flags_string_consumer_with_int_export() {
         // Export is `int`, consumer expects string-compatible — mismatch.
@@ -1810,16 +1695,11 @@ mod tests {
         );
         let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
         let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert_eq!(errs.len(), 1, "unexpected: {errs:?}");
-        assert_eq!(errs[0].binding, "orgs");
-        assert_eq!(errs[0].field, "count");
-        assert!(matches!(errs[0].export_type, TypeExpr::Int));
-        assert!(matches!(
-            errs[0].expected_type.kind(),
-            crate::schema::AttrTypeKind::String { .. }
-        ));
-        assert!(errs[0].diagnostic_message().contains("String"));
+        assert!(errs[0].contains("orgs.count"), "unexpected: {errs:?}");
+        assert!(errs[0].contains("expected String"), "unexpected: {errs:?}");
+        assert!(errs[0].contains("got Int"), "unexpected: {errs:?}");
     }
 
     #[test]
@@ -1835,7 +1715,7 @@ mod tests {
         );
         let exports = mk_typed_exports(&[("orgs", &[("region", TypeExpr::String)])]);
         let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
@@ -1858,19 +1738,20 @@ mod tests {
             "count".to_string(),
             UpstreamExportEntry {
                 type_expr: None,
+                has_declared_type: false,
                 value: None,
             },
         );
         exports.insert("orgs".to_string(), fields);
         let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
     #[test]
-    fn type_check_skips_unknown_field() {
-        // Field isn't in the export set at all — that's the field-name
-        // checker's job (#1990). The type checker must not double-report.
+    fn unified_ref_check_reports_unknown_field() {
+        // Existence and type now share `BindingIndex::ref_type`, so the same
+        // pass emits the canonical missing-export diagnostic exactly once.
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -1882,8 +1763,12 @@ mod tests {
         );
         let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
         let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
-        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
+        assert_eq!(errs.len(), 1, "unexpected errors: {errs:?}");
+        assert!(
+            errs[0].contains("upstream_state `orgs` does not export `missing`"),
+            "unexpected errors: {errs:?}",
+        );
     }
 
     #[test]
@@ -1906,7 +1791,7 @@ mod tests {
             "name",
             crate::schema::AttributeType::list(crate::schema::AttributeType::string()),
         );
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert_eq!(errs.len(), 1, "unexpected: {errs:?}");
     }
 
@@ -1927,7 +1812,7 @@ mod tests {
         )]);
         let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
 
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
 
         assert!(
             errs.is_empty(),
@@ -1955,7 +1840,7 @@ mod tests {
             ]),
         );
 
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
 
         assert_eq!(
             errs.len(),
@@ -1984,7 +1869,7 @@ mod tests {
             ]),
         );
 
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
 
         assert_eq!(
             errs.len(),
@@ -2021,7 +1906,7 @@ mod tests {
             ]),
         );
 
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
 
         assert_eq!(
             errs.len(),
@@ -2058,7 +1943,7 @@ mod tests {
             ]),
         );
 
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
 
         assert!(
             errs.is_empty(),
@@ -2087,13 +1972,13 @@ mod tests {
             ],
         )]);
         let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert_eq!(
             errs.len(),
             1,
             "expected one error inside for body, got {errs:?}"
         );
-        assert!(errs[0].location.contains("for"));
+        assert!(errs[0].contains("for-body"), "unexpected: {errs:?}");
     }
 
     // Issue #2663: a semantic-ARN refinement (e.g. `IamOidcProviderArn`)
@@ -2134,7 +2019,7 @@ mod tests {
             AttributeType::string(),
         ]);
         let schemas = schema_with_attr("name", principal_union);
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert!(
             errs.is_empty(),
             "IamOidcProviderArn must be assignable into Union<Struct, String>, got: {errs:?}"
@@ -2170,7 +2055,7 @@ mod tests {
             None,
         );
         let schemas = schema_with_attr("name", arn);
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert_eq!(
             errs.len(),
             1,
@@ -2218,7 +2103,7 @@ mod tests {
             None,
         );
         let schemas = schema_with_attr("name", aws_account_id);
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert!(
             errs.is_empty(),
             "subscript narrows map(T) to T before compare, got: {errs:?}"
@@ -2258,7 +2143,7 @@ mod tests {
             vec![StructField::new("statement", AttributeType::string()).required()],
         );
         let schemas = schema_with_attr("policy", policy_struct);
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert!(
             errs.is_empty(),
             "subscript-narrowed scalar must not be rejected against outer \
@@ -2292,7 +2177,7 @@ mod tests {
             &[("accounts", TypeExpr::Map(Box::new(account_struct)))],
         )]);
         let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert!(
             errs.is_empty(),
             "dot-walk through map into struct field must resolve to leaf type, got: {errs:?}"
@@ -2317,7 +2202,7 @@ mod tests {
             &[("regions", TypeExpr::List(Box::new(TypeExpr::String)))],
         )]);
         let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert!(
             errs.is_empty(),
             "list subscript narrows list(T) to T before compare, got: {errs:?}"
@@ -2365,7 +2250,7 @@ mod tests {
             ],
         );
         let schemas = schema_with_attr("policy", policy_struct);
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert_eq!(
             errs.len(),
             1,
@@ -2400,7 +2285,7 @@ mod tests {
             vec![StructField::new("port", AttributeType::int()).required()],
         );
         let schemas = schema_with_attr("config", cfg_struct);
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert!(
             errs.is_empty(),
             "narrowed Int in Int-typed struct field must pass strict compat, got: {errs:?}"
@@ -2434,7 +2319,7 @@ mod tests {
             vec![StructField::new("statement", AttributeType::string()).required()],
         );
         let schemas = schema_with_attr("policy", policy_struct);
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert_eq!(
             errs.len(),
             1,
@@ -2474,7 +2359,7 @@ mod tests {
             vec![StructField::new("statement", AttributeType::string()).required()],
         );
         let schemas = schema_with_attr("policy", policy_struct);
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert!(
             errs.is_empty(),
             "narrowed AwsAccountId in String-shaped position must pass, got: {errs:?}"
@@ -2510,7 +2395,7 @@ mod tests {
             )],
         )]);
         let schemas = schema_with_attr("tags", AttributeType::map(AttributeType::string()));
-        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
         assert_eq!(
             errs.len(),
             1,
@@ -2692,6 +2577,7 @@ mod tests {
             "accounts".to_string(),
             UpstreamExportEntry {
                 type_expr: None,
+                has_declared_type: false,
                 value: None,
             },
         );
@@ -3123,6 +3009,7 @@ mod tests {
             "account".to_string(),
             UpstreamExportEntry {
                 type_expr: None,
+                has_declared_type: false,
                 value: None,
             },
         );
@@ -3176,7 +3063,7 @@ mod tests {
     #[test]
     fn attribute_access_skipped_when_field_path_empty() {
         // `orgs.account` (no `.foo`) — that's just a top-level field
-        // ref, handled by `check_upstream_state_field_types`.
+        // ref, handled by the typed consumer through `BindingIndex::ref_type`.
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -3569,6 +3456,7 @@ mod tests {
             "accounts".to_string(),
             UpstreamExportEntry {
                 type_expr: None,
+                has_declared_type: false,
                 value: None,
             },
         );
@@ -3685,7 +3573,7 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn upstream_ref_diagnostic_trait_covers_all_five_error_types() {
+    fn upstream_ref_diagnostic_trait_covers_all_four_error_types() {
         // Building a `Vec<&dyn UpstreamRefDiagnostic>` proves each type
         // implements the trait and that the LSP/CLI can iterate them
         // uniformly. The CLI/LSP wirings rely on this being possible.
@@ -3694,13 +3582,6 @@ mod tests {
             binding: "orgs".to_string(),
             field: "missing".to_string(),
             suggestion: Some("accounts".to_string()),
-        };
-        let type_err = UpstreamTypeError {
-            location: "loc-b".to_string(),
-            binding: "orgs".to_string(),
-            field: "count".to_string(),
-            export_type: TypeExpr::Int,
-            expected_type: crate::schema::AttributeType::string(),
         };
         let shape_err = UpstreamForIterableShapeError {
             location: "for-expression `for x in orgs.accounts`".to_string(),
@@ -3738,13 +3619,6 @@ mod tests {
                 "orgs",
                 "missing",
                 field_err.diagnostic_message(),
-            ),
-            (
-                &type_err,
-                "loc-b",
-                "orgs",
-                "count",
-                type_err.diagnostic_message(),
             ),
             (
                 &shape_err,

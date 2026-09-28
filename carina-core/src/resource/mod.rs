@@ -754,6 +754,90 @@ impl std::fmt::Display for AccessPath {
     }
 }
 
+/// A reference-shaped value, including both attribute access and a bare
+/// binding. [`AccessPath`] deliberately requires an attribute, while module
+/// arguments are commonly forwarded as bare [`DeferredValue::BindingRef`]
+/// values. This enum lets static type resolution cover both without weakening
+/// `AccessPath`'s non-empty-attribute invariant.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ReferencePath {
+    Access(AccessPath),
+    Binding(String),
+}
+
+impl ReferencePath {
+    pub fn as_ref(&self) -> ReferencePathRef<'_> {
+        match self {
+            Self::Access(path) => ReferencePathRef::Access(path),
+            Self::Binding(binding) => ReferencePathRef::Binding(binding),
+        }
+    }
+
+    pub fn to_dot_string(&self) -> String {
+        match self {
+            Self::Access(path) => path.to_dot_string(),
+            Self::Binding(binding) => binding.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for ReferencePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Access(path) => path.fmt(f),
+            Self::Binding(binding) => binding.fmt(f),
+        }
+    }
+}
+
+/// Borrowed projection of [`ReferencePath`] used by validation walkers.
+#[derive(Debug, Clone, Copy)]
+pub enum ReferencePathRef<'a> {
+    Access(&'a AccessPath),
+    Binding(&'a str),
+}
+
+impl<'a> ReferencePathRef<'a> {
+    pub fn binding(self) -> &'a str {
+        match self {
+            Self::Access(path) => path.binding(),
+            Self::Binding(binding) => binding,
+        }
+    }
+
+    pub fn to_dot_string(self) -> String {
+        match self {
+            Self::Access(path) => path.to_dot_string(),
+            Self::Binding(binding) => binding.to_string(),
+        }
+    }
+
+    pub fn to_owned(self) -> ReferencePath {
+        match self {
+            Self::Access(path) => ReferencePath::Access(path.clone()),
+            Self::Binding(binding) => ReferencePath::Binding(binding.to_string()),
+        }
+    }
+}
+
+impl<'a> From<&'a AccessPath> for ReferencePathRef<'a> {
+    fn from(path: &'a AccessPath) -> Self {
+        Self::Access(path)
+    }
+}
+
+impl<'a> From<&'a str> for ReferencePathRef<'a> {
+    fn from(binding: &'a str) -> Self {
+        Self::Binding(binding)
+    }
+}
+
+impl<'a> From<&'a ReferencePath> for ReferencePathRef<'a> {
+    fn from(path: &'a ReferencePath) -> Self {
+        path.as_ref()
+    }
+}
+
 /// Peel `Value::Secret` wrappers, returning the inner value and the
 /// number of layers peeled. Pair with [`rewrap_secrets`] so dot-form /
 /// subscript access can descend into a secret container and re-tag the
@@ -995,7 +1079,7 @@ impl ConcreteValue {
 /// function evaluation).
 ///
 /// Sub-systems that need to walk only deferred values (e.g.
-/// `check_upstream_state_field_types`, `validate_resource_ref_types`,
+/// `BindingIndex::ref_type`, `validate_resource_ref_types`,
 /// dependency analysis) take `&DeferredValueRef<'_>` so they cannot
 /// accidentally consume a concrete value as a placeholder.
 ///

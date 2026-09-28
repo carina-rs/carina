@@ -2333,8 +2333,8 @@ impl AttributeType {
     ///    values (`ResourceRef`, `BindingRef`, `Interpolation`,
     ///    `FunctionCall`, `Secret`, `Unknown`) return `None` and are
     ///    accepted unconditionally — type fitness for those is the
-    ///    deferred-aware checker's job (`check_upstream_state_field_types`,
-    ///    `validate_resource_ref_types`).
+    ///    unified deferred-reference validation's job
+    ///    (`BindingIndex::ref_type`, `validate_resource_ref_types`).
     /// 2. Dispatch the projected `ConcreteValueRef<'_>` to the
     ///    per-variant helper. Helpers cannot receive deferred values by
     ///    construction — the projection is the single place that filter

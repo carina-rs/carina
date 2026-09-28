@@ -1310,6 +1310,73 @@ pub(crate) fn validate_module_attribute_refs_after_expansion_failure(
     errors
 }
 
+/// Validate references inside every imported module before substituting call
+/// arguments. At this stage `BindingIndex` can use each argument's declaration
+/// as the source type, so diagnostics belong to the module definition rather
+/// than to whichever caller value happened to be expanded into it.
+pub(crate) fn validate_module_internal_ref_types(
+    ctx: &WiringContext,
+    module_walk: &ModuleWalk,
+    config: &carina_core::parser::ProviderContext,
+) -> Vec<AppError> {
+    let mut errors = Vec::new();
+    for module in module_walk.iter() {
+        let mut parsed = module.loaded().parsed.clone();
+        let prefix = module.diagnostic_path().display();
+        // Module expansion retains the established diagnostic for malformed
+        // declarations. This pass only needs successful resolution so valid
+        // dotted argument types can act as sources before expansion.
+        let _ = validation::resolve_file_type_exprs(&mut parsed, config);
+
+        let bindings =
+            carina_core::binding_index::BindingIndex::from_parsed(&parsed, ctx.schemas());
+        let argument_names: HashSet<String> = parsed
+            .arguments
+            .iter()
+            .map(|argument| argument.name.clone())
+            .collect();
+        if let Err(joined) = validation::validate_resource_ref_types_for_bindings(
+            &parsed,
+            ctx.schemas(),
+            &argument_names,
+            &bindings,
+        ) {
+            errors.extend(
+                joined
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(|line| AppError::Validation(format!("{prefix}: {line}"))),
+            );
+        }
+        if let Err(joined) = validation::validate_attribute_param_ref_types_for_bindings(
+            &parsed.attribute_params,
+            &argument_names,
+            &bindings,
+        ) {
+            errors.extend(
+                joined
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(|line| AppError::Validation(format!("{prefix}: {line}"))),
+            );
+        }
+
+        let imported =
+            module_resolver::load_resolved_module_signatures(&parsed, module.module_path(), config);
+        errors.extend(
+            validation::validate_module_call_argument_ref_types_for_bindings(
+                &parsed.module_calls,
+                &imported,
+                &argument_names,
+                &bindings,
+            )
+            .into_iter()
+            .map(|error| AppError::Validation(format!("{prefix}: {error}"))),
+        );
+    }
+    errors
+}
+
 /// Reject providers in every recursively loaded module and preserve each
 /// module's import path in the resulting user-facing diagnostic. The module
 /// directory unit deliberately includes imported-but-uncalled nested modules,

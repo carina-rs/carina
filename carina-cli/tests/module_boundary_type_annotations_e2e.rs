@@ -177,6 +177,14 @@ struct Fixture {
 
 impl Fixture {
     fn module(module_files: &[(&str, &str)], root_files: &[(&str, &str)]) -> Self {
+        Self::module_with_upstream(module_files, root_files, &[])
+    }
+
+    fn module_with_upstream(
+        module_files: &[(&str, &str)],
+        root_files: &[(&str, &str)],
+        upstream_files: &[(&str, &str)],
+    ) -> Self {
         let temp = tempfile::tempdir().expect("tempdir");
         let module = temp.path().join("web_tier");
         let root = temp.path().join("root");
@@ -188,6 +196,13 @@ impl Fixture {
         write_provider(&root);
         for (name, source) in root_files {
             std::fs::write(root.join(name), source).expect("root fixture file");
+        }
+        if !upstream_files.is_empty() {
+            let upstream = temp.path().join("upstream");
+            std::fs::create_dir(&upstream).expect("upstream directory");
+            for (name, source) in upstream_files {
+                std::fs::write(upstream.join(name), source).expect("upstream fixture file");
+            }
         }
         Self { _temp: temp, root }
     }
@@ -313,6 +328,483 @@ let three = bad_module { n = "three" }
         1,
         "the unknown attribute must be reported once: {diagnostics:#?}",
     );
+}
+
+#[test]
+fn module_output_dedup_keeps_two_same_kind_reference_positions() {
+    let fixture = Fixture::module(
+        &[
+            ("arguments.crn", "arguments {\n  n: String\n}\n"),
+            (
+                "attributes.crn",
+                r#"attributes {
+  y: list(Bool) = [p.group_id, q.group_id]
+}
+"#,
+            ),
+            (
+                "resources.crn",
+                r#"let p = aws.ec2.SecurityGroup {
+  name   = n
+  vpc_id = "vpc-fixed"
+}
+
+let q = aws.ec2.SecurityGroup {
+  name   = "q"
+  vpc_id = "vpc-fixed"
+}
+"#,
+            ),
+        ],
+        &[(
+            "main.crn",
+            r#"let bad_module = use { source = '../web_tier' }
+
+let one = bad_module { n = "one" }
+let two = bad_module { n = "two" }
+"#,
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.contains("attribute 'y': type mismatch")
+                && diagnostic.contains("expected Bool")
+                && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
+        })
+        .collect();
+
+    assert_eq!(
+        mismatches.len(),
+        2,
+        "both authored references with the same error kind must survive instance dedup: {diagnostics:#?}",
+    );
+    assert!(mismatches.iter().any(|error| error.contains("p.group_id")));
+    assert!(mismatches.iter().any(|error| error.contains("q.group_id")));
+}
+
+#[test]
+fn module_call_dedup_keeps_two_same_kind_reference_positions() {
+    let fixture = Fixture::module(
+        &[
+            (
+                "arguments.crn",
+                "arguments {\n  vpc_ids: list(aws.ec2.Vpc.Id)\n}\n",
+            ),
+            (
+                "attributes.crn",
+                r#"attributes {
+  sg: aws.ec2.SecurityGroup.Id = s.group_id
+}
+"#,
+            ),
+            (
+                "resources.crn",
+                r#"let s = aws.ec2.SecurityGroup {
+  name   = "module"
+  vpc_id = "vpc-fixed"
+}
+"#,
+            ),
+        ],
+        &[(
+            "main.crn",
+            r#"let m = use { source = '../web_tier' }
+
+let v = aws.ec2.Vpc { name = "v" }
+let a = m { vpc_ids = [v.vpc_id] }
+let c = m { vpc_ids = [v.vpc_id] }
+let b = m { vpc_ids = [a.sg, c.sg] }
+"#,
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.contains("module call 'b': argument 'vpc_ids'")
+                && diagnostic.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
+        })
+        .collect();
+
+    assert_eq!(
+        mismatches.len(),
+        2,
+        "both argument references with the same error kind must survive dedup: {diagnostics:#?}",
+    );
+    assert!(mismatches.iter().any(|error| error.contains("a.sg")));
+    assert!(mismatches.iter().any(|error| error.contains("c.sg")));
+}
+
+#[test]
+fn module_attribute_checks_bare_string_argument_as_typed_source() {
+    let fixture = Fixture::module(
+        &[
+            ("arguments.crn", "arguments {\n  vpc_id: String\n}\n"),
+            (
+                "attributes.crn",
+                "attributes {\n  x: aws.ec2.Vpc.Id = vpc_id\n}\n",
+            ),
+        ],
+        &[(
+            "main.crn",
+            r#"let m = use { source = '../web_tier' }
+let v = aws.ec2.Vpc { name = "v" }
+let instance = m { vpc_id = v.vpc_id }
+"#,
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.contains("attribute 'x': type mismatch"))
+        .collect();
+    assert_eq!(mismatches.len(), 1, "{diagnostics:#?}");
+    assert!(mismatches[0].contains("expected aws.ec2.Vpc.Id"));
+    assert!(mismatches[0].contains("got String"));
+    assert!(mismatches[0].contains("from vpc_id"));
+}
+
+#[test]
+fn module_resource_checks_bare_string_argument_as_typed_source() {
+    let fixture = Fixture::module(
+        &[
+            ("arguments.crn", "arguments {\n  vpc_id: String\n}\n"),
+            (
+                "resources.crn",
+                r#"let s = aws.ec2.SecurityGroup {
+  name   = "module"
+  vpc_id = vpc_id
+}
+"#,
+            ),
+        ],
+        &[(
+            "main.crn",
+            r#"let m = use { source = '../web_tier' }
+let v = aws.ec2.Vpc { name = "v" }
+let instance = m { vpc_id = v.vpc_id }
+"#,
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.contains("cannot assign String to 'vpc_id'")
+                && diagnostic.contains("from vpc_id")
+        })
+        .collect();
+    assert_eq!(mismatches.len(), 1, "{diagnostics:#?}");
+    assert!(mismatches[0].contains("../web_tier"));
+}
+
+#[test]
+fn module_attribute_checks_struct_argument_field_as_typed_source() {
+    let fixture = Fixture::module(
+        &[
+            (
+                "arguments.crn",
+                "arguments {\n  cfg: struct { vpc: aws.ec2.SecurityGroup.Id }\n}\n",
+            ),
+            (
+                "attributes.crn",
+                "attributes {\n  x: aws.ec2.Vpc.Id = cfg.vpc\n}\n",
+            ),
+        ],
+        &[(
+            "main.crn",
+            r#"let m = use { source = '../web_tier' }
+let v = aws.ec2.Vpc { name = "v" }
+let sg = aws.ec2.SecurityGroup {
+  name   = "sg"
+  vpc_id = v.vpc_id
+}
+let instance = m { cfg = { vpc = sg.group_id } }
+"#,
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.contains("attribute 'x': type mismatch"))
+        .collect();
+    assert_eq!(mismatches.len(), 1, "{diagnostics:#?}");
+    assert!(mismatches[0].contains("expected aws.ec2.Vpc.Id"));
+    assert!(mismatches[0].contains("got aws.ec2.SecurityGroup.Id"));
+    assert!(mismatches[0].contains("from cfg.vpc"));
+}
+
+#[test]
+fn unannotated_forwarded_output_keeps_module_argument_type_after_expansion() {
+    let fixture = Fixture::module(
+        &[
+            ("arguments.crn", "arguments {\n  value: String\n}\n"),
+            ("attributes.crn", "attributes {\n  forwarded = value\n}\n"),
+        ],
+        &[(
+            "main.crn",
+            r#"let m = use { source = '../web_tier' }
+let v = aws.ec2.Vpc { name = "v" }
+let instance = m { value = v.vpc_id }
+let consumer = aws.ec2.SecurityGroup {
+  name   = "consumer"
+  vpc_id = instance.forwarded
+}
+"#,
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("aws.ec2.SecurityGroup.consumer")
+                && diagnostic.contains("cannot assign String to 'vpc_id'")
+                && diagnostic.contains("from instance.forwarded")
+        }),
+        "the output must retain the module argument's declared String type: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn forwarded_argument_typo_is_reported_only_at_call_boundary() {
+    let fixture = Fixture::module(
+        &[
+            (
+                "arguments.crn",
+                "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+            ),
+            ("attributes.crn", "attributes {\n  x = vpc_id\n}\n"),
+        ],
+        &[(
+            "main.crn",
+            r#"let m = use { source = '../web_tier' }
+let v = aws.ec2.Vpc { name = "v" }
+let a = m { vpc_id = v.vpc_id }
+let b = m { vpc_id = a.nope }
+"#,
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    let typo_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.contains("unknown attribute 'nope'"))
+        .collect();
+    assert_eq!(typo_diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(typo_diagnostics[0].contains("module call 'b'"));
+    assert!(!typo_diagnostics[0].contains("attribute 'x'"));
+}
+
+#[test]
+fn upstream_identity_is_checked_at_module_call_boundary() {
+    let fixture = Fixture::module_with_upstream(
+        &[(
+            "arguments.crn",
+            "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+        )],
+        &[(
+            "main.crn",
+            r#"let m = use { source = '../web_tier' }
+let up = upstream_state { source = '../upstream' }
+let bad = m { vpc_id = up.sg }
+let good = m { vpc_id = up.vpc }
+"#,
+        )],
+        &[(
+            "exports.crn",
+            r#"exports {
+  sg: aws.ec2.SecurityGroup.Id = "sg-123"
+  vpc: aws.ec2.Vpc.Id = "vpc-123"
+}
+"#,
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.contains("module call 'bad': argument 'vpc_id'"))
+        .collect();
+    assert_eq!(mismatches.len(), 1, "{diagnostics:#?}");
+    assert!(mismatches[0].contains("expected aws.ec2.Vpc.Id"));
+    assert!(mismatches[0].contains("got aws.ec2.SecurityGroup.Id"));
+    assert!(mismatches[0].contains("from up.sg"));
+}
+
+#[test]
+fn upstream_security_group_id_is_rejected_by_resource_vpc_id_sink() {
+    let fixture = Fixture::module_with_upstream(
+        &[],
+        &[(
+            "main.crn",
+            r#"let up = upstream_state { source = '../upstream' }
+let bad = aws.ec2.SecurityGroup {
+  name   = "bad"
+  vpc_id = up.sg
+}
+"#,
+        )],
+        &[(
+            "exports.crn",
+            "exports {\n  sg: aws.ec2.SecurityGroup.Id = \"sg-123\"\n}\n",
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("aws.ec2.SecurityGroup.bad")
+                && diagnostic.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic.contains("from up.sg")
+        }),
+        "SecurityGroup.Id must not flow into a Vpc.Id resource sink: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn unannotated_upstream_export_remains_unchecked_at_module_call_boundary() {
+    let fixture = Fixture::module_with_upstream(
+        &[(
+            "arguments.crn",
+            "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+        )],
+        &[(
+            "main.crn",
+            r#"let m = use { source = '../web_tier' }
+let up = upstream_state { source = '../upstream' }
+let instance = m { vpc_id = up.opaque }
+"#,
+        )],
+        &[("exports.crn", "exports {\n  opaque = \"not-a-vpc-id\"\n}\n")],
+    );
+
+    let diagnostics = fixture.validate();
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.contains("argument 'vpc_id'")),
+        "an inferred type must not replace an explicit upstream contract: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn upstream_identity_is_checked_in_attribute_and_export_declarations() {
+    let attribute_fixture = Fixture::module_with_upstream(
+        &[],
+        &[(
+            "main.crn",
+            r#"let up = upstream_state { source = '../upstream' }
+attributes {
+  attr: aws.ec2.Vpc.Id = up.sg
+}
+"#,
+        )],
+        &[(
+            "exports.crn",
+            "exports {\n  sg: aws.ec2.SecurityGroup.Id = \"sg-123\"\n}\n",
+        )],
+    );
+
+    let diagnostics = attribute_fixture.validate();
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.contains("attribute 'attr': type mismatch"))
+            .count(),
+        1,
+        "{diagnostics:#?}",
+    );
+
+    let export_fixture = Fixture::module_with_upstream(
+        &[],
+        &[(
+            "main.crn",
+            r#"let up = upstream_state { source = '../upstream' }
+exports {
+  exported: aws.ec2.Vpc.Id = up.sg
+}
+"#,
+        )],
+        &[(
+            "exports.crn",
+            "exports {\n  sg: aws.ec2.SecurityGroup.Id = \"sg-123\"\n}\n",
+        )],
+    );
+    let diagnostics = export_fixture.validate();
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.contains("export 'exported': type mismatch"))
+            .count(),
+        1,
+        "{diagnostics:#?}",
+    );
+}
+
+#[test]
+fn missing_upstream_export_in_module_argument_is_reported_once() {
+    let fixture = Fixture::module_with_upstream(
+        &[(
+            "arguments.crn",
+            "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+        )],
+        &[(
+            "main.crn",
+            r#"let m = use { source = '../web_tier' }
+let up = upstream_state { source = '../upstream' }
+let bad = m { vpc_id = up.nope }
+"#,
+        )],
+        &[(
+            "exports.crn",
+            "exports {\n  vpc: aws.ec2.Vpc.Id = \"vpc-123\"\n}\n",
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    let missing: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.contains("does not export `nope`"))
+        .collect();
+    assert_eq!(missing.len(), 1, "{diagnostics:#?}");
+}
+
+#[test]
+fn missing_field_in_typed_upstream_struct_is_reported_once() {
+    let fixture = Fixture::module_with_upstream(
+        &[],
+        &[(
+            "main.crn",
+            r#"let up = upstream_state { source = '../upstream' }
+let bad = aws.ec2.SecurityGroup {
+  name = up.account.nope
+}
+"#,
+        )],
+        &[(
+            "exports.crn",
+            r#"exports {
+  account: struct { id: String } = { id = "account-123" }
+}
+"#,
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    let missing: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.contains("nope"))
+        .collect();
+    assert_eq!(missing.len(), 1, "{diagnostics:#?}");
 }
 
 #[test]

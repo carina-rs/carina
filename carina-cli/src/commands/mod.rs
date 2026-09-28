@@ -33,15 +33,13 @@ use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
 use crate::wiring::{
     WiringContext, build_factories_from_providers, compute_anonymous_identifiers_with_ctx,
-    resolve_names_with_ctx, validate_attribute_param_ref_types_with_ctx,
-    validate_composition_ref_types_with_ctx, validate_deferred_populate_refs_with_ctx,
-    validate_depends_on_with_ctx, validate_module_attribute_refs_after_expansion_failure,
-    validate_module_calls_with_imported, validate_no_backend_in_modules,
+    resolve_names_with_ctx, validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
+    validate_module_attribute_refs_after_expansion_failure, validate_module_calls_with_imported,
+    validate_module_internal_ref_types, validate_no_backend_in_modules,
     validate_no_empty_interpolations, validate_no_exports_in_modules,
     validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
     validate_no_upstream_states_in_modules, validate_provider_region_with_ctx,
-    validate_resource_ref_types_with_ctx, validate_resources_with_ctx,
-    validate_wait_bindings_with_ctx,
+    validate_resources_with_ctx, validate_wait_bindings_with_ctx,
 };
 
 #[must_use = "Drifted must be handled before mutating state — apply/destroy must refuse, init/plan must warn"]
@@ -443,6 +441,13 @@ pub fn validate_and_resolve_errors_with_factories(
     {
         errors.push(AppError::Validation(finding));
     }
+    if !skip_resource_validation {
+        errors.extend(validate_module_internal_ref_types(
+            &ctx,
+            &module_walk,
+            &enriched_context,
+        ));
+    }
 
     // Load root module signatures once before expansion for concrete argument,
     // missing-argument, and unknown-argument validation.
@@ -526,6 +531,17 @@ pub fn validate_and_resolve_errors_with_factories(
         return errors;
     }
 
+    let (upstream_exports, upstream_resolve_errors) = if skip_resource_validation {
+        (Default::default(), Vec::new())
+    } else {
+        carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
+            base_dir,
+            &parsed.upstream_states,
+            &enriched_context,
+            Some(ctx.schemas()),
+        )
+    };
+
     if !skip_resource_validation {
         // Mid-edit `${}` is parser-accepted (#2480) so the AST stays
         // intact for LSP diagnostics, but it must not reach a provider —
@@ -537,40 +553,56 @@ pub fn validate_and_resolve_errors_with_factories(
         errors.extend(validate_depends_on_with_ctx(parsed));
         errors.extend(validate_wait_bindings_with_ctx(&ctx, parsed));
         errors.extend(validate_deferred_populate_refs_with_ctx(&ctx, parsed));
-        errors.extend(validate_composition_ref_types_with_ctx(&ctx, parsed));
-        let mut argument_names: HashSet<String> =
-            parsed.arguments.iter().map(|a| a.name.clone()).collect();
-        // Upstream state bindings are resolved at plan time, skip type validation
-        for us in &parsed.upstream_states {
-            argument_names.insert(us.binding.clone());
-        }
-        errors.extend(validate_resource_ref_types_with_ctx(
-            &ctx,
-            parsed,
-            &argument_names,
-        ));
-        errors.extend(validate_attribute_param_ref_types_with_ctx(&ctx, parsed));
-        if !errors.is_empty() {
-            return errors;
-        }
-    }
+        errors.extend(
+            upstream_resolve_errors
+                .iter()
+                .map(|error| AppError::Validation(error.to_string())),
+        );
 
-    // Validate export values against their type annotations
-    if !skip_resource_validation {
+        let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports(
+            parsed,
+            ctx.schemas(),
+            &upstream_exports,
+        );
+        errors.extend(
+            carina_core::validation::validate_composition_ref_types_with_bindings(
+                &parsed.compositions,
+                &bindings,
+            )
+            .into_iter()
+            .map(|error| AppError::Validation(error.to_string())),
+        );
+        if let Err(message) = carina_core::validation::validate_resource_ref_types(
+            parsed,
+            ctx.schemas(),
+            &HashSet::new(),
+            &bindings,
+        ) {
+            errors.extend(split_validation_message(&message));
+        }
+        if let Err(message) =
+            carina_core::validation::validate_attribute_param_ref_types_with_bindings(
+                &parsed.attribute_params,
+                &bindings,
+            )
+        {
+            errors.extend(split_validation_message(&message));
+        }
         if let Err(msg) = carina_core::validation::validate_export_params(
             &parsed.export_params,
             &enriched_context,
         ) {
             errors.extend(split_validation_message(&msg));
         }
-        let export_bindings =
-            carina_core::binding_index::BindingIndex::from_parsed(parsed, ctx.schemas());
         if let Err(msg) = carina_core::validation::validate_export_param_ref_types_with_bindings(
             &parsed.export_params,
-            &export_bindings,
+            &bindings,
             &reported_inference_error_indices,
         ) {
             errors.extend(split_validation_message(&msg));
+        }
+        if !errors.is_empty() {
+            return errors;
         }
     }
 
@@ -599,27 +631,11 @@ pub fn validate_and_resolve_errors_with_factories(
     // that situation. No state I/O: we parse the upstream's `.crn`
     // files directly.
     if !skip_resource_validation {
-        let (upstream_exports, resolve_errors) =
-            carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
-                base_dir,
-                &parsed.upstream_states,
-                &enriched_context,
-                Some(ctx.schemas()),
+        let field_errors =
+            carina_core::upstream_exports::check_upstream_state_untyped_field_references(
+                parsed,
+                &upstream_exports,
             );
-        let field_errors = carina_core::upstream_exports::check_upstream_state_field_references(
-            parsed,
-            &upstream_exports,
-        );
-        // Phase 2 of #1992: names are known to exist; now check each
-        // reference's declared export type against the consuming
-        // attribute's expected type. Skipped when the export has no
-        // `: T` annotation (nothing to compare) — see
-        // `check_upstream_state_field_types` for the details.
-        let type_errors = carina_core::upstream_exports::check_upstream_state_field_types(
-            parsed,
-            &upstream_exports,
-            ctx.schemas(),
-        );
         // #1894 (option 2): cross-directory `for`-iterable shape check.
         // Surfaces pending `list ↔ map` migrations in the upstream's
         // `exports.crn` before they hit apply.
@@ -632,7 +648,7 @@ pub fn validate_and_resolve_errors_with_factories(
         // the downstream's `.field` chain doesn't fit the upstream's
         // declared `TypeExpr`.
         let attribute_access_errors =
-            carina_core::upstream_exports::check_upstream_state_attribute_access_shapes(
+            carina_core::upstream_exports::check_upstream_state_attribute_access_shape_fallbacks(
                 parsed,
                 &upstream_exports,
             );
@@ -640,22 +656,16 @@ pub fn validate_and_resolve_errors_with_factories(
             parsed,
             &upstream_exports,
         );
-        errors.extend(
-            resolve_errors
-                .iter()
-                .map(|e| AppError::Validation(e.to_string())),
-        );
-        // The five upstream-ref checks return distinct concrete types
+        // The four upstream-ref shape/existence checks return distinct concrete types
         // but share `UpstreamRefDiagnostic`. Chain them through the
         // trait (`Display` supertrait gives the canonical
         // `"location: message"` form — the per-type `Display` impl is
-        // the single source of truth) so adding a sixth check is one
+        // the single source of truth) so adding another check is one
         // extra `chain(...)`.
         errors.extend(
             field_errors
                 .iter()
                 .map(|e| e as &dyn UpstreamRefDiagnostic)
-                .chain(type_errors.iter().map(|e| e as &dyn UpstreamRefDiagnostic))
                 .chain(shape_errors.iter().map(|e| e as &dyn UpstreamRefDiagnostic))
                 .chain(
                     attribute_access_errors

@@ -77,6 +77,12 @@ pub struct CompositionAttribute {
     value: CompositionAttributeValue,
     #[serde(skip)]
     declared_type: Option<TypeExpr>,
+    /// The module argument directly forwarded by this output before call-site
+    /// substitution. Validation checks that declaration in the module's own
+    /// scope; retaining the provenance prevents an expanded caller value from
+    /// being checked again and blamed on the output declaration.
+    #[serde(skip)]
+    source_argument: Option<String>,
 }
 
 impl CompositionAttribute {
@@ -98,6 +104,7 @@ impl CompositionAttribute {
         Self {
             value,
             declared_type,
+            source_argument: None,
         }
     }
 
@@ -114,9 +121,19 @@ impl CompositionAttribute {
         }
     }
 
+    pub fn source_argument(&self) -> Option<&str> {
+        self.source_argument.as_deref()
+    }
+
+    pub(crate) fn with_source_argument(mut self, source_argument: Option<String>) -> Self {
+        self.source_argument = source_argument;
+        self
+    }
+
     /// Reclassify a rewritten value while preserving its declaration.
     pub fn with_value(&self, value: Value) -> Self {
         Self::from_value(value, self.declared_type.clone())
+            .with_source_argument(self.source_argument.clone())
     }
 
     /// Reify back into a [`Value`] for callers that have not yet been

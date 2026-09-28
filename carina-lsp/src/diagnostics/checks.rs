@@ -892,16 +892,9 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         merged: &ParsedFile,
-        base_path: &std::path::Path,
+        exports: &carina_core::upstream_exports::UpstreamExports,
+        resolve_errors: &[carina_core::upstream_exports::UpstreamResolveError],
     ) -> Vec<Diagnostic> {
-        let (exports, resolve_errors) =
-            carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
-                base_path,
-                &merged.upstream_states,
-                &self.provider_context,
-                Some(&self.schemas),
-            );
-
         let mut diagnostics = Vec::new();
         let text = doc.text();
 
@@ -931,33 +924,30 @@ impl DiagnosticEngine {
         // Phase 1 (unknown name) and Phase 2 (type mismatch) so two errors
         // on the same ref don't collide on the first occurrence either.
         let field_errors =
-            carina_core::upstream_exports::check_upstream_state_field_references(merged, &exports);
-        let type_errors = carina_core::upstream_exports::check_upstream_state_field_types(
-            merged,
-            &exports,
-            &self.schemas,
-        );
+            carina_core::upstream_exports::check_upstream_state_untyped_field_references(
+                merged, exports,
+            );
         // #1894 (option 2): cross-directory `for`-iterable shape check.
         // Anchored at the same `binding.field` ref occurrence so the
         // editor squiggle lands on the iterable expression.
         let shape_errors = carina_core::upstream_exports::check_upstream_state_for_iterable_shapes(
-            merged, &exports,
+            merged, exports,
         );
         // #1894 follow-up: cross-directory attribute-access shape check.
         // Anchored at `binding.field` so the squiggle lands at the start
         // of the access chain (the rest of `.foo.bar` is part of the
         // diagnostic message rather than the range).
         let attribute_access_errors =
-            carina_core::upstream_exports::check_upstream_state_attribute_access_shapes(
-                merged, &exports,
+            carina_core::upstream_exports::check_upstream_state_attribute_access_shape_fallbacks(
+                merged, exports,
             );
         let subscript_errors =
-            carina_core::upstream_exports::check_upstream_state_subscript_shapes(merged, &exports);
+            carina_core::upstream_exports::check_upstream_state_subscript_shapes(merged, exports);
         let mut seen_count: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        // The five upstream-ref checks return distinct concrete types
+        // The four upstream-ref shape/existence checks return distinct concrete types
         // but share `UpstreamRefDiagnostic`; chain them through the
-        // trait so adding a sixth check is one extra `chain(...)`.
+        // trait so adding another check is one extra `chain(...)`.
         self.push_upstream_ref_diagnostics(
             doc,
             &mut seen_count,
@@ -965,7 +955,6 @@ impl DiagnosticEngine {
             field_errors
                 .iter()
                 .map(|e| e as &dyn UpstreamRefDiagnostic)
-                .chain(type_errors.iter().map(|e| e as &dyn UpstreamRefDiagnostic))
                 .chain(shape_errors.iter().map(|e| e as &dyn UpstreamRefDiagnostic))
                 .chain(
                     attribute_access_errors
@@ -1221,22 +1210,10 @@ impl DiagnosticEngine {
         imported_modules: &carina_core::module_resolver::ResolvedModuleSignatures,
         binding_index: &BindingIndex<'_>,
     ) -> Vec<Diagnostic> {
-        let mut argument_names: HashSet<String> = parsed
-            .arguments
-            .iter()
-            .map(|arg| arg.name.clone())
-            .collect();
-        argument_names.extend(
-            parsed
-                .upstream_states
-                .iter()
-                .map(|state| state.binding.clone()),
-        );
-
         carina_core::validation::validate_module_call_argument_ref_types_with_bindings(
             &parsed.module_calls,
             imported_modules,
-            &argument_names,
+            &HashSet::new(),
             binding_index,
         )
         .into_iter()
@@ -1564,6 +1541,11 @@ impl DiagnosticEngine {
                 // Deferred resource refs intentionally pass through this function;
                 // the BindingIndex-backed validator below is their sole authority.
                 if let Some(type_expr) = &attr_param.type_expr
+                    && !matches!(
+                        value,
+                        Value::Deferred(DeferredValue::ResourceRef { .. })
+                            | Value::Deferred(DeferredValue::BindingRef { .. })
+                    )
                     && let Some(type_error) = carina_core::validation::validate_type_expr_value(
                         type_expr,
                         value,
