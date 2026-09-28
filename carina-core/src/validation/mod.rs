@@ -8,14 +8,14 @@ use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 
-use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
+use crate::binding_index::{BindingIndex, RefTargetKind, RefType, RefTypeError, ResolvedRefType};
 use crate::deps::collect_dependencies;
 use crate::parser::{
     ModuleCall, ProviderContext, ResourceRef, ResourceTypePath, TypeExpr, validate_custom_type,
 };
 use crate::provider::ProviderFactory;
 use crate::resource::{AccessPath, ConcreteValue, DeferredValue, Value};
-use crate::schema::{AttributeType, SchemaRegistry, Shape, TypeIdentity, suggest_similar_name};
+use crate::schema::{AttributeType, SchemaRegistry, Shape, TypeIdentity};
 
 /// Lift a module-boundary [`TypeExpr`] into the schema type system.
 ///
@@ -111,6 +111,13 @@ impl<'a> RefSink<'a> {
     fn list_element(self) -> Option<Self> {
         match self {
             Self::TypeExpr(TypeExpr::List(inner)) => Some(Self::TypeExpr(inner)),
+            Self::TypeExpr(TypeExpr::Union(members)) => {
+                exactly_one(members.iter().filter_map(|member| match member {
+                    TypeExpr::List(inner) => Some(inner.as_ref()),
+                    _ => None,
+                }))
+                .map(Self::TypeExpr)
+            }
             Self::AttributeType { attr_type, defs } => match attr_type.shape_with_defs(defs) {
                 Shape::List {
                     element_type: inner,
@@ -119,6 +126,12 @@ impl<'a> RefSink<'a> {
                     attr_type: inner,
                     defs,
                 }),
+                Shape::Union => {
+                    unique_union_list_element(attr_type, defs).map(|inner| Self::AttributeType {
+                        attr_type: inner,
+                        defs,
+                    })
+                }
                 _ => None,
             },
             Self::TypeExpr(_) | Self::String => None,
@@ -132,6 +145,12 @@ impl<'a> RefSink<'a> {
                 .iter()
                 .find(|(name, _)| name == key)
                 .map(|(_, field_type)| Self::TypeExpr(field_type)),
+            Self::TypeExpr(TypeExpr::Union(members)) => exactly_one(
+                members
+                    .iter()
+                    .filter(|member| matches!(member, TypeExpr::Map(_) | TypeExpr::Struct { .. })),
+            )
+            .and_then(|member| Self::TypeExpr(member).map_entry(key)),
             Self::AttributeType { attr_type, defs } => match attr_type.shape_with_defs(defs) {
                 Shape::Map { value: inner, .. } => Some(Self::AttributeType {
                     attr_type: inner,
@@ -146,6 +165,13 @@ impl<'a> RefSink<'a> {
                         defs,
                     })
                 }
+                Shape::Union => unique_union_map_member(attr_type, defs).and_then(|member| {
+                    Self::AttributeType {
+                        attr_type: member,
+                        defs,
+                    }
+                    .map_entry(key)
+                }),
                 _ => None,
             },
             Self::TypeExpr(_) | Self::String => None,
@@ -153,14 +179,49 @@ impl<'a> RefSink<'a> {
     }
 }
 
+fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Option<T> {
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn unique_union_list_element<'a>(
+    attr_type: &'a AttributeType,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+) -> Option<&'a AttributeType> {
+    let members = crate::schema::union_members_with_defs(attr_type, defs)?;
+    exactly_one(members.iter().flatten().filter_map(|member| {
+        match member.as_attr().shape_with_defs(defs) {
+            Shape::List { element_type, .. } => Some(element_type),
+            _ => None,
+        }
+    }))
+}
+
+fn unique_union_map_member<'a>(
+    attr_type: &'a AttributeType,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+) -> Option<&'a AttributeType> {
+    let members = crate::schema::union_members_with_defs(attr_type, defs)?;
+    exactly_one(members.iter().flatten().filter_map(|member| {
+        matches!(
+            member.as_attr().shape_with_defs(defs),
+            Shape::Map { .. } | Shape::Struct { .. }
+        )
+        .then_some(member.as_attr())
+    }))
+}
+
 /// Visit every resource reference exactly once while carrying the declared
 /// sink type for its structural position.
 ///
 /// Lists, maps, and structs descend in lockstep with their declared type.
 /// When a value shape has no corresponding declared position, descendants are
-/// still visited with `None` so existence diagnostics are never lost. Function
-/// arguments likewise have no locally available signature. Secrets preserve
-/// their enclosing sink and interpolation expressions use a string sink.
+/// still visited with `None` so existence diagnostics are never lost. A Union
+/// contributes a nested sink only when exactly one member matches the concrete
+/// List or Map value shape. Function arguments likewise have no locally
+/// available signature and deliberately receive `None`: the function's result
+/// sink says nothing sound about its input positions. Secrets preserve their
+/// enclosing sink and interpolation expressions use a string sink.
 pub(crate) fn visit_refs_with_sink<'a>(
     value: &Value,
     sink: Option<RefSink<'a>>,
@@ -188,6 +249,9 @@ pub(crate) fn visit_refs_with_sink<'a>(
             }
         }
         Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            // The enclosing sink constrains the function result, not its
+            // inputs. Parameter signatures are unavailable here, so carrying
+            // that sink into an argument would be unsound.
             for argument in args {
                 visit_refs_with_sink(argument, None, f);
             }
@@ -206,40 +270,60 @@ pub(crate) fn visit_refs_with_sink<'a>(
     }
 }
 
-/// Render the trailing `" Did you mean 'X'?"` segment for an unknown
-/// name in a diagnostic, or an empty string when nothing close enough
-/// is found. The leading space is part of the convention so callers
-/// can concat unconditionally onto an already-punctuated message.
-fn did_you_mean(unknown: &str, known: &[&str]) -> String {
-    suggest_similar_name(unknown, known)
-        .map(|s| format!(" Did you mean '{}'?", s))
-        .unwrap_or_default()
+/// Pre-expansion module-call attribute surface shared by every module-boundary
+/// reference check. Each attribute carries its optional declared type.
+pub type PreExpansionModuleCallAttributes = HashMap<String, IndexMap<String, Option<TypeExpr>>>;
+
+/// Build the declared output surface for the module-call bindings in one file.
+///
+/// Callers resolve imported signatures once, then share this surface between
+/// module-call argument checking and `attributes {}` checking. Unannotated
+/// outputs still establish attribute existence, but do not invent a type.
+pub fn pre_expansion_module_call_attributes(
+    module_calls: &[ModuleCall],
+    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
+) -> PreExpansionModuleCallAttributes {
+    module_calls
+        .iter()
+        .filter_map(|call| {
+            let binding = call.binding_name.as_ref()?;
+            let signature = imported_modules.get(&call.module_name)?;
+            Some((binding.clone(), signature.attributes.clone()))
+        })
+        .collect()
 }
 
-/// Return the shared unknown-attribute diagnostic suffix for a statically
-/// known attribute surface, or `None` when the referenced attribute exists.
-fn unknown_attribute_error<'a>(
-    path: &AccessPath,
-    known_attribute_names: impl IntoIterator<Item = &'a String>,
-) -> Option<String> {
-    let known_attrs: Vec<&str> = known_attribute_names
-        .into_iter()
-        .map(String::as_str)
-        .collect();
-    let ref_attr = path.attribute();
-    if known_attrs.contains(&ref_attr) {
-        return None;
-    }
+enum PreExpansionRefType<'a> {
+    Typed(&'a TypeExpr),
+    Unchecked,
+    UnknownBinding,
+    UnknownAttribute(RefTypeError),
+}
 
-    let ref_binding = path.binding();
-    Some(format!(
-        "unknown attribute '{}' on '{}' in reference {}.{}{}",
-        ref_attr,
-        ref_binding,
-        ref_binding,
-        ref_attr,
-        did_you_mean(ref_attr, &known_attrs),
-    ))
+/// Resolve one reference through the declared pre-expansion module surface.
+/// This is the single lookup used by both call-argument and output-attribute
+/// validation when [`BindingIndex`] cannot yet see a synthesized Composition.
+fn pre_expansion_module_call_ref_type<'a>(
+    path: &AccessPath,
+    module_call_attributes: &'a PreExpansionModuleCallAttributes,
+) -> PreExpansionRefType<'a> {
+    let Some(known_attributes) = module_call_attributes.get(path.binding()) else {
+        return PreExpansionRefType::UnknownBinding;
+    };
+    let Some(source_type) = known_attributes.get(path.attribute()) else {
+        return PreExpansionRefType::UnknownAttribute(RefTypeError::UnknownAttribute {
+            binding: path.binding().to_string(),
+            attribute: path.attribute().to_string(),
+            known_attributes: known_attributes.keys().cloned().collect(),
+            target: RefTargetKind::Composition,
+        });
+    };
+    if !path.segments().is_empty() {
+        return PreExpansionRefType::Unchecked;
+    }
+    source_type
+        .as_ref()
+        .map_or(PreExpansionRefType::Unchecked, PreExpansionRefType::Typed)
 }
 
 fn check_resource_ref_existence(
@@ -333,19 +417,39 @@ impl std::fmt::Display for ModuleCallRefError {
 
 impl std::error::Error for ModuleCallRefError {}
 
-/// Validate references carried by module-call argument values against the
-/// post-expansion binding surfaces and the called module's declared argument
-/// types.
+/// Validate references carried by module-call argument values against binding
+/// surfaces and the called module's declared argument types.
 ///
 /// Unknown bindings and enclosing-module argument names are intentionally
 /// ignored here: their resolution belongs to the existing scope/module-call
 /// passes. This walk only closes attribute-existence gaps for binding targets
-/// that have a statically known schema or composition signature.
+/// that have a statically known schema or module signature.
 pub fn validate_module_call_argument_ref_types_with_bindings(
     module_calls: &[ModuleCall],
     imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
     argument_names: &HashSet<String>,
     bindings: &BindingIndex<'_>,
+) -> Vec<ModuleCallRefError> {
+    let module_call_attributes =
+        pre_expansion_module_call_attributes(module_calls, imported_modules);
+    validate_module_call_argument_ref_types_with_bindings_and_module_calls(
+        module_calls,
+        imported_modules,
+        argument_names,
+        bindings,
+        &module_call_attributes,
+    )
+}
+
+/// Reuse a precomputed declared module-output surface while checking call
+/// argument references. Recursive module validation shares this exact surface
+/// with its attributes-block check.
+pub fn validate_module_call_argument_ref_types_with_bindings_and_module_calls(
+    module_calls: &[ModuleCall],
+    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
+    argument_names: &HashSet<String>,
+    bindings: &BindingIndex<'_>,
+    module_call_attributes: &PreExpansionModuleCallAttributes,
 ) -> Vec<ModuleCallRefError> {
     let mut errors = Vec::new();
 
@@ -404,7 +508,17 @@ pub fn validate_module_call_argument_ref_types_with_bindings(
                                 kind: ModuleCallRefErrorKind::UnknownAttribute(error),
                             });
                         }
-                        RefType::Unchecked | RefType::UnknownBinding { .. } => {}
+                        RefType::UnknownBinding { .. } => {
+                            check_pre_expansion_module_call_argument_ref(
+                                call_name,
+                                argument_name,
+                                sink.and_then(RefSink::as_type_expr),
+                                path,
+                                module_call_attributes,
+                                &mut errors,
+                            );
+                        }
+                        RefType::Unchecked => {}
                     }
                 },
             );
@@ -412,6 +526,48 @@ pub fn validate_module_call_argument_ref_types_with_bindings(
     }
 
     errors
+}
+
+fn check_pre_expansion_module_call_argument_ref(
+    call_name: &str,
+    argument_name: &str,
+    expected_type: Option<&TypeExpr>,
+    path: &AccessPath,
+    module_call_attributes: &PreExpansionModuleCallAttributes,
+    errors: &mut Vec<ModuleCallRefError>,
+) {
+    match pre_expansion_module_call_ref_type(path, module_call_attributes) {
+        PreExpansionRefType::Typed(source_type) => {
+            let (Some(source), Some(sink)) = (
+                lift_type_expr(source_type),
+                expected_type.and_then(lift_type_expr),
+            ) else {
+                return;
+            };
+            let source_type = crate::schema::TypeInSchema::schemaless(&source);
+            let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
+            if !source_type.is_assignable_to(sink_type) {
+                errors.push(ModuleCallRefError {
+                    call: call_name.to_string(),
+                    argument: argument_name.to_string(),
+                    path: path.clone(),
+                    kind: ModuleCallRefErrorKind::TypeMismatch {
+                        expected: sink_type.resolved_type_name(),
+                        actual: source_type.resolved_type_name(),
+                    },
+                });
+            }
+        }
+        PreExpansionRefType::UnknownAttribute(error) => {
+            errors.push(ModuleCallRefError {
+                call: call_name.to_string(),
+                argument: argument_name.to_string(),
+                path: path.clone(),
+                kind: ModuleCallRefErrorKind::UnknownAttribute(error),
+            });
+        }
+        PreExpansionRefType::Unchecked | PreExpansionRefType::UnknownBinding => {}
+    }
 }
 
 /// Validate resources against their schemas.
@@ -630,12 +786,6 @@ pub fn validate_attribute_param_ref_types_with_bindings(
     )
 }
 
-/// Pre-expansion module-call attribute surface used only while recursively
-/// validating an imported module's own `attributes {}` block. Each attribute
-/// carries its optional declared type so this path can use the same lifted,
-/// directional relation as post-expansion validation.
-pub type PreExpansionModuleCallAttributes = HashMap<String, IndexMap<String, Option<TypeExpr>>>;
-
 /// Validate module attribute parameters before nested module expansion.
 ///
 /// [`BindingIndex`] remains the sole post-expansion authority. At this seam,
@@ -728,33 +878,29 @@ fn check_pre_expansion_module_call_attribute_ref(
     module_call_attributes: &PreExpansionModuleCallAttributes,
     errors: &mut Vec<String>,
 ) {
-    let Some(known_attributes) = module_call_attributes.get(path.binding()) else {
-        return;
-    };
-    let Some(source_type) = known_attributes.get(path.attribute()) else {
-        let error = unknown_attribute_error(path, known_attributes.keys())
-            .expect("missing pre-expansion attribute must produce an error");
-        errors.push(format!("attribute '{}': {}", param_name, error));
-        return;
-    };
-    if !path.segments().is_empty() {
-        return;
-    }
-    if let (Some(source), Some(sink)) = (
-        source_type.as_ref().and_then(lift_type_expr),
-        expected_type.and_then(lift_type_expr),
-    ) {
-        let source_type = crate::schema::TypeInSchema::schemaless(&source);
-        let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
-        if !source_type.is_assignable_to(sink_type) {
-            errors.push(format!(
-                "attribute '{}': type mismatch: expected {}, got {} (from {})",
-                param_name,
-                expected_type.expect("lifted expected type exists"),
-                source_type.resolved_type_name(),
-                path.to_dot_string(),
-            ));
+    match pre_expansion_module_call_ref_type(path, module_call_attributes) {
+        PreExpansionRefType::Typed(source_type) => {
+            if let (Some(source), Some(sink)) = (
+                lift_type_expr(source_type),
+                expected_type.and_then(lift_type_expr),
+            ) {
+                let source_type = crate::schema::TypeInSchema::schemaless(&source);
+                let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
+                if !source_type.is_assignable_to(sink_type) {
+                    errors.push(format!(
+                        "attribute '{}': type mismatch: expected {}, got {} (from {})",
+                        param_name,
+                        expected_type.expect("lifted expected type exists"),
+                        source_type.resolved_type_name(),
+                        path.to_dot_string(),
+                    ));
+                }
+            }
         }
+        PreExpansionRefType::UnknownAttribute(error) => {
+            errors.push(format!("attribute '{}': {}", param_name, error));
+        }
+        PreExpansionRefType::Unchecked | PreExpansionRefType::UnknownBinding => {}
     }
 }
 

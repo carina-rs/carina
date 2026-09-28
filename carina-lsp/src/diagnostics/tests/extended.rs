@@ -3518,9 +3518,9 @@ let web2 = issue {
 
     let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", main);
 
-    let mismatch = diagnostics
+    let mismatches: Vec<_> = diagnostics
         .iter()
-        .find(|diagnostic| {
+        .filter(|diagnostic| {
             diagnostic
                 .message
                 .contains("module call 'web2': argument 'vpc_id'")
@@ -3528,20 +3528,97 @@ let web2 = issue {
                 && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
                 && diagnostic.message.contains("from web.security_group_id")
         })
-        .unwrap_or_else(|| {
-            panic!(
-                "LSP must report the same module-call boundary mismatch as validate: {:?}",
-                diagnostics
-                    .iter()
-                    .map(|diagnostic| &diagnostic.message)
-                    .collect::<Vec<_>>(),
-            )
-        });
+        .collect();
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "LSP must report the root module-call boundary mismatch exactly once: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    let mismatch = mismatches[0];
     assert_eq!(
         mismatch.range.start.line, 11,
         "the structured call label must anchor the second call, not the first",
     );
     assert_eq!(mismatch.range.start.character, 2);
+}
+
+#[test]
+fn nested_module_call_identity_mismatch_is_reported_when_outer_module_is_opened() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let web_tier = tmp.path().join("web_tier");
+    let needs_vpc = tmp.path().join("needs_vpc");
+    let outer = tmp.path().join("outer");
+    for directory in [&web_tier, &needs_vpc, &outer] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    std::fs::write(
+        web_tier.join("main.crn"),
+        r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let web_sg = aws.ec2.SecurityGroup {
+  name   = "web"
+  vpc_id = vpc_id
+}
+
+attributes {
+  sg_id: aws.ec2.SecurityGroup.Id = web_sg.group_id
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        needs_vpc.join("main.crn"),
+        "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+    )
+    .unwrap();
+    let outer_source = r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let web_tier = use { source = '../web_tier' }
+let needs_vpc = use { source = '../needs_vpc' }
+
+let a = web_tier {
+  vpc_id = vpc_id
+}
+
+let b = needs_vpc {
+  vpc_id = a.sg_id
+}
+"#;
+    std::fs::write(outer.join("main.crn"), outer_source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &outer, "main.crn", outer_source);
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("module call 'b': argument 'vpc_id'")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic.message.contains("from a.sg_id")
+        })
+        .collect();
+
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "the open outer module must report its nested call boundary once: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(mismatches[0].range.start.line, 12);
+    assert_eq!(mismatches[0].range.start.character, 2);
 }
 
 #[test]

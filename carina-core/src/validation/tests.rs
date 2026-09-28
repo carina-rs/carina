@@ -28,6 +28,32 @@ fn empty_parsed() -> ParsedFile {
     }
 }
 
+#[test]
+fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
+    let value = Value::Deferred(DeferredValue::FunctionCall {
+        name: "identity".to_string(),
+        args: vec![Value::resource_ref(
+            "source".to_string(),
+            "value".to_string(),
+            vec![],
+        )],
+    });
+    let result_type = TypeExpr::String;
+    let mut visited = Vec::new();
+
+    visit_refs_with_sink(
+        &value,
+        Some(RefSink::TypeExpr(&result_type)),
+        &mut |path, sink| visited.push((path.to_dot_string(), sink.is_none())),
+    );
+
+    assert_eq!(
+        visited,
+        vec![("source.value".to_string(), true)],
+        "the walker must visit function arguments for existence checks without applying the result sink",
+    );
+}
+
 fn validate_resource_ref_types_for_test<E>(
     parsed: &crate::parser::File<E>,
     schemas: &SchemaRegistry,

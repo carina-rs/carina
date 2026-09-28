@@ -1911,6 +1911,162 @@ mod tests {
     }
 
     #[test]
+    fn type_check_does_not_apply_function_result_sink_to_function_arguments() {
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = join(",", orgs.counts)
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[(
+            "orgs",
+            &[("counts", TypeExpr::List(Box::new(TypeExpr::Int)))],
+        )]);
+        let schemas = schema_with_attr("name", crate::schema::AttributeType::string());
+
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+
+        assert!(
+            errs.is_empty(),
+            "a function argument must not be checked against the function result's String sink: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn type_check_selects_unique_list_member_of_union_for_nested_refs() {
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = [orgs.count]
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
+        let schemas = schema_with_attr(
+            "name",
+            crate::schema::AttributeType::union(vec![
+                crate::schema::AttributeType::list(crate::schema::AttributeType::string()),
+                crate::schema::AttributeType::string(),
+            ]),
+        );
+
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+
+        assert_eq!(
+            errs.len(),
+            1,
+            "the list value must select the union's List member and check its String element sink: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn type_check_selects_unique_map_member_of_union_for_nested_refs() {
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = { count = orgs.count }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
+        let schemas = schema_with_attr(
+            "name",
+            crate::schema::AttributeType::union(vec![
+                crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
+                crate::schema::AttributeType::string(),
+            ]),
+        );
+
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+
+        assert_eq!(
+            errs.len(),
+            1,
+            "the map value must select the union's Map member and check its String value sink: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn type_check_selects_unique_struct_member_of_union_for_map_value() {
+        use crate::schema::StructField;
+
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = { count = orgs.count }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
+        let schemas = schema_with_attr(
+            "name",
+            crate::schema::AttributeType::union(vec![
+                crate::schema::AttributeType::struct_(
+                    "Count".to_string(),
+                    vec![StructField::new(
+                        "count",
+                        crate::schema::AttributeType::string(),
+                    )],
+                ),
+                crate::schema::AttributeType::string(),
+            ]),
+        );
+
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+
+        assert_eq!(
+            errs.len(),
+            1,
+            "the map value must select the union's Struct member and check its String field sink: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn type_check_leaves_ambiguous_map_shaped_union_without_a_nested_sink() {
+        use crate::schema::StructField;
+
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = { count = orgs.count }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::Int)])]);
+        let schemas = schema_with_attr(
+            "name",
+            crate::schema::AttributeType::union(vec![
+                crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
+                crate::schema::AttributeType::struct_(
+                    "Count".to_string(),
+                    vec![StructField::new(
+                        "count",
+                        crate::schema::AttributeType::string(),
+                    )],
+                ),
+            ]),
+        );
+
+        let errs = check_upstream_state_field_types(&parsed, &exports, &schemas);
+
+        assert!(
+            errs.is_empty(),
+            "Map and Struct both match the value shape, so no unique nested sink may be guessed: {errs:?}",
+        );
+    }
+
+    #[test]
     fn type_check_flags_for_body_attribute() {
         let parsed = parse_project_with_provider(
             r#"

@@ -1291,7 +1291,9 @@ pub(crate) fn validate_module_calls_with_imported<E>(
     ))
 }
 
-pub(crate) fn validate_module_attribute_param_types(
+/// Validate both call arguments and output attributes in every recursively
+/// imported module against the same pre-expansion module signature surfaces.
+pub(crate) fn validate_module_boundary_ref_types(
     ctx: &WiringContext,
     module_walk: &ModuleWalk,
     config: &carina_core::parser::ProviderContext,
@@ -1305,16 +1307,41 @@ pub(crate) fn validate_module_attribute_param_types(
                 module.diagnostic_path().display()
             )));
         }
-        if module_parsed.attribute_params.is_empty() {
-            continue;
-        }
         let bindings =
             carina_core::binding_index::BindingIndex::from_parsed(&module_parsed, ctx.schemas());
-        let module_call_attributes = pre_expansion_module_call_attributes(
+        let imported_modules = pre_expansion_module_signatures(
             &module_parsed,
             module.module_path(),
             module_walk,
             config,
+        );
+        let module_call_attributes = validation::pre_expansion_module_call_attributes(
+            &module_parsed.module_calls,
+            &imported_modules,
+        );
+        let argument_names = module_parsed
+            .arguments
+            .iter()
+            .map(|argument| argument.name.clone())
+            .chain(
+                module_parsed
+                    .upstream_states
+                    .iter()
+                    .map(|state| state.binding.clone()),
+            )
+            .collect();
+        errors.extend(
+            validation::validate_module_call_argument_ref_types_with_bindings_and_module_calls(
+                &module_parsed.module_calls,
+                &imported_modules,
+                &argument_names,
+                &bindings,
+                &module_call_attributes,
+            )
+            .into_iter()
+            .map(|error| {
+                AppError::Validation(format!("{}: {}", module.diagnostic_path().display(), error))
+            }),
         );
         if let Err(joined) =
             validation::validate_attribute_param_ref_types_with_bindings_and_module_calls(
@@ -1425,32 +1452,19 @@ pub(crate) fn validate_no_exports_in_modules(module_walk: &ModuleWalk) -> Vec<Ap
     errors
 }
 
-fn pre_expansion_module_call_attributes(
+fn pre_expansion_module_signatures(
     module_parsed: &carina_core::parser::ParsedFile,
     module_path: &Path,
     module_walk: &ModuleWalk,
     config: &carina_core::parser::ProviderContext,
-) -> validation::PreExpansionModuleCallAttributes {
-    let signatures =
-        module_resolver::resolve_module_signatures_with(module_parsed, config, |import| {
-            // Reuse the shared recursive walk's loaded snapshot instead of
-            // starting another filesystem traversal for nested signatures.
-            module_walk
-                .parsed_at(&module_path.join(&import.path))
-                .cloned()
-        });
-
-    let mut attributes_by_binding = HashMap::new();
-    for call in &module_parsed.module_calls {
-        let Some(binding_name) = &call.binding_name else {
-            continue;
-        };
-        let Some(signature) = signatures.get(&call.module_name) else {
-            continue;
-        };
-        attributes_by_binding.insert(binding_name.clone(), signature.attributes.clone());
-    }
-    attributes_by_binding
+) -> module_resolver::ResolvedModuleSignatures {
+    module_resolver::resolve_module_signatures_with(module_parsed, config, |import| {
+        // Reuse the shared recursive walk's loaded snapshot instead of
+        // starting another filesystem traversal for nested signatures.
+        module_walk
+            .parsed_at(&module_path.join(&import.path))
+            .cloned()
+    })
 }
 
 pub async fn get_provider_with_ctx<E>(

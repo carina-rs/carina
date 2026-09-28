@@ -3029,7 +3029,7 @@ fn module_and_provider_wrappers_return_vec_app_error() {
     assert!(errors.is_empty(), "module_calls: got {errors:?}");
 
     let module_walk = crate::module_walk::ModuleWalk::load(&parsed, base_dir);
-    let errors = validate_module_attribute_param_types(&ctx, &module_walk, &provider_ctx);
+    let errors = validate_module_boundary_ref_types(&ctx, &module_walk, &provider_ctx);
     assert!(
         errors.is_empty(),
         "module_attribute_param_types: got {errors:?}",

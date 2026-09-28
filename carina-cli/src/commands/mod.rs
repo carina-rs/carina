@@ -35,7 +35,7 @@ use crate::wiring::{
     WiringContext, build_factories_from_providers, compute_anonymous_identifiers_with_ctx,
     resolve_names_with_ctx, validate_attribute_param_ref_types_with_ctx,
     validate_deferred_populate_refs_with_ctx, validate_depends_on_with_ctx,
-    validate_module_attribute_param_types, validate_module_call_argument_refs_with_ctx,
+    validate_module_boundary_ref_types, validate_module_call_argument_refs_with_ctx,
     validate_module_calls_with_imported, validate_no_backend_in_modules,
     validate_no_empty_interpolations, validate_no_exports_in_modules,
     validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
@@ -458,6 +458,29 @@ pub fn validate_and_resolve_errors_with_factories(
         &enriched_context,
     ));
 
+    // Check root call boundaries once before expansion using declared module
+    // output surfaces. This is the same phase used for recursively imported
+    // modules below. A failing pre-expansion check reaches the shared error
+    // gate before the post-expansion pass, so one call site cannot emit the
+    // same declared-type diagnostic twice. Unannotated forwarded outputs
+    // remain for the post-expansion BindingIndex pass to infer.
+    if !skip_resource_validation {
+        let mut argument_names: HashSet<String> =
+            parsed.arguments.iter().map(|a| a.name.clone()).collect();
+        argument_names.extend(
+            parsed
+                .upstream_states
+                .iter()
+                .map(|state| state.binding.clone()),
+        );
+        errors.extend(validate_module_call_argument_refs_with_ctx(
+            &ctx,
+            parsed,
+            &argument_names,
+            &imported_module_signatures,
+        ));
+    }
+
     // User-facing checks for root-owned blocks inside modules run on the
     // recursive module walk so validate/plan/apply can collect path-prefixed
     // findings alongside other validation errors. As with the duplicate and
@@ -474,7 +497,7 @@ pub fn validate_and_resolve_errors_with_factories(
         errors.extend(validate_no_backend_in_modules(&module_walk));
         errors.extend(validate_no_upstream_states_in_modules(&module_walk));
         errors.extend(validate_no_exports_in_modules(&module_walk));
-        errors.extend(validate_module_attribute_param_types(
+        errors.extend(validate_module_boundary_ref_types(
             &ctx,
             &module_walk,
             &enriched_context,

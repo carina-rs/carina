@@ -261,15 +261,20 @@ fn schema_typed_module_argument_rejects_composition_attribute_at_call_boundary()
     let fixture = Fixture::module(&module, &[("main.crn", root_with_two_calls())]);
 
     let diagnostics = fixture.validate();
-
-    assert!(
-        diagnostics.iter().any(|diagnostic| {
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
             diagnostic.contains("module call 'web2': argument 'vpc_id'")
                 && diagnostic.contains("expected aws.ec2.Vpc.Id")
                 && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
                 && diagnostic.contains("from web.security_group_id")
-        }),
-        "expected a call-boundary identity mismatch, got: {diagnostics:#?}",
+        })
+        .collect();
+
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "the root call boundary must report its identity mismatch exactly once: {diagnostics:#?}",
     );
 }
 
@@ -386,6 +391,21 @@ fn unannotated_composition_attribute_is_inferred_for_resource_consumer() {
 #[test]
 fn string_annotated_composition_attribute_is_too_wide_for_identity_sink() {
     assert_plain_resource_consumer_rejected(": String");
+}
+
+#[test]
+fn declared_string_output_overrides_forwarded_vpc_id_inference_after_expansion() {
+    let diagnostics = vpc_output_fixture(": String").validate();
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("aws.ec2.SecurityGroup.consumer")
+                && diagnostic.contains("cannot assign String to 'vpc_id'")
+                && diagnostic.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.contains("from web.vpc_id")
+        }),
+        "the expanded composition must carry the declared String type instead of the forwarded Vpc.Id inference: {diagnostics:#?}",
+    );
 }
 
 #[test]
@@ -525,6 +545,93 @@ let consumer = aws.ec2.SecurityGroup {
     assert!(
         diagnostics.is_empty(),
         "expected nested composition inference to preserve Vpc.Id: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn nested_module_call_checks_declared_output_type_at_its_call_boundary() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let web_tier = temp.path().join("web_tier");
+    let needs_vpc = temp.path().join("needs_vpc");
+    let outer = temp.path().join("outer");
+    let root = temp.path().join("root");
+    for directory in [&web_tier, &needs_vpc, &outer, &root] {
+        std::fs::create_dir(directory).expect("fixture directory");
+    }
+
+    std::fs::write(
+        web_tier.join("main.crn"),
+        r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let web_sg = aws.ec2.SecurityGroup {
+  name   = "web"
+  vpc_id = vpc_id
+}
+
+attributes {
+  sg_id: aws.ec2.SecurityGroup.Id = web_sg.group_id
+}
+"#,
+    )
+    .expect("web_tier module");
+    std::fs::write(
+        needs_vpc.join("main.crn"),
+        "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+    )
+    .expect("needs_vpc module");
+    std::fs::write(
+        outer.join("main.crn"),
+        r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let web_tier = use { source = '../web_tier' }
+let needs_vpc = use { source = '../needs_vpc' }
+
+let a = web_tier {
+  vpc_id = vpc_id
+}
+
+let b = needs_vpc {
+  vpc_id = a.sg_id
+}
+"#,
+    )
+    .expect("outer module");
+    write_provider(&root);
+    std::fs::write(
+        root.join("main.crn"),
+        r#"let outer = use { source = '../outer' }
+
+let main_vpc = aws.ec2.Vpc {
+  name = "main"
+}
+
+let instance = outer {
+  vpc_id = main_vpc.vpc_id
+}
+"#,
+    )
+    .expect("root module");
+    let fixture = Fixture { _temp: temp, root };
+
+    let diagnostics = fixture.validate();
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.contains("module call 'b': argument 'vpc_id'")
+                && diagnostic.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic.contains("from a.sg_id")
+        })
+        .collect();
+
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "every nested call boundary must be checked exactly once: {diagnostics:#?}",
     );
 }
 
