@@ -10,8 +10,8 @@ use crate::parser::{
     ArgumentParameter, BindingName, DeferredForExpression, ModuleCall, ParsedFile, WaitBinding,
 };
 use crate::resource::{
-    Composition, ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, ResourceIdentity,
-    Value,
+    Composition, CompositionCall, CompositionProvenance, ConcreteValue, DataSource, DeferredValue,
+    Resource, ResourceId, ResourceIdentity, Value,
 };
 
 use super::error::ModuleError;
@@ -258,6 +258,24 @@ impl ModuleResolver<'_> {
             ));
         }
 
+        let module_source = self.module_paths.get(&call.module_name).cloned();
+        let module_directory = module_source.as_deref().map(|source| {
+            let source = std::path::Path::new(source);
+            let path = if source.is_absolute() {
+                source.to_path_buf()
+            } else {
+                self.base_dir.join(source)
+            };
+            path.canonicalize().unwrap_or(path)
+        });
+        let expanded_call = CompositionCall {
+            module_name: call.module_name.clone(),
+            binding: call.binding_name.clone(),
+            instance: instance_prefix.to_string(),
+            module_source: module_source.clone(),
+            module_directory,
+        };
+
         // Propagate the module's own composition resources (synthesized by
         // nested module-call expansion), instance-prefixed.
         let mut compositions: Vec<Composition> = Vec::new();
@@ -267,6 +285,7 @@ impl ModuleResolver<'_> {
                 instance_prefix,
                 &intra_module_bindings,
                 &argument_values,
+                &expanded_call,
             ));
         }
 
@@ -329,6 +348,10 @@ impl ModuleResolver<'_> {
                 dependency_bindings: BTreeSet::new(),
                 module_name: call.module_name.clone(),
                 instance: instance_prefix.to_string(),
+                provenance: Box::new(CompositionProvenance {
+                    call: Some(expanded_call.clone()),
+                    root_call: Some(expanded_call.clone()),
+                }),
                 quoted_string_attrs: HashSet::new(),
             };
             compositions.push(composition);
@@ -379,8 +402,7 @@ impl ModuleResolver<'_> {
         // back to a path-less header — only relevant in test harnesses
         // that bypass `process_imports`; real expansions always have
         // a recorded path.
-        let source_path: Option<&str> =
-            self.module_paths.get(&call.module_name).map(String::as_str);
+        let source_path = module_source.as_deref();
         let expansion_trace = build_expansion_trace(
             instance_prefix,
             source_path,
@@ -739,8 +761,19 @@ fn prefix_module_composition(
     instance_prefix: &str,
     intra_module_bindings: &HashSet<String>,
     argument_values: &HashMap<String, Value>,
+    root_call: &CompositionCall,
 ) -> Composition {
     let mut new_virtual = composition.clone();
+
+    let mut call = composition.diagnostic_call();
+    call.instance = apply_instance_prefix(instance_prefix, &call.instance);
+    if let Some(binding) = &call.binding {
+        call.binding = Some(apply_instance_prefix(instance_prefix, binding));
+    }
+    new_virtual.provenance = Box::new(CompositionProvenance {
+        call: Some(call),
+        root_call: Some(root_call.clone()),
+    });
 
     if let Some(identity) = &new_virtual.id.identity {
         let new_name = apply_instance_prefix(instance_prefix, identity.as_str());
@@ -1279,6 +1312,22 @@ pub fn reconcile_anonymous_module_instances(
         }
         if let Some(rewritten) = rewrite_name_prefix(&composition.instance, &prefix_remap) {
             composition.instance = rewritten;
+        }
+        for call in [
+            &mut composition.provenance.call,
+            &mut composition.provenance.root_call,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap) {
+                call.instance = rewritten;
+            }
+            if let Some(binding) = call.binding.as_deref()
+                && let Some(rewritten) = rewrite_name_prefix(binding, &prefix_remap)
+            {
+                call.binding = Some(rewritten);
+            }
         }
 
         for argument in composition.signature.arguments.values_mut() {

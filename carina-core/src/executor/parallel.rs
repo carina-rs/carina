@@ -1398,6 +1398,7 @@ mod tests {
             dependency_bindings: std::collections::BTreeSet::new(),
             module_name: "network".to_string(),
             instance: "module".to_string(),
+            provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         };
 
@@ -1491,6 +1492,7 @@ mod tests {
             dependency_bindings: std::collections::BTreeSet::new(),
             module_name: "github-oidc".to_string(),
             instance: "bootstrap".to_string(),
+            provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         };
 

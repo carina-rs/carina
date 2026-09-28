@@ -3432,6 +3432,7 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
             module_name: "m".to_string(),
             instance: "module_instance".to_string(),
+            provenance: Default::default(),
             quoted_string_attrs: HashSet::new(),
         };
 

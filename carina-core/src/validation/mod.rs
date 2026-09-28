@@ -14,7 +14,7 @@ use crate::parser::{
     ModuleCall, ProviderContext, ResourceRef, ResourceTypePath, TypeExpr, validate_custom_type,
 };
 use crate::provider::ProviderFactory;
-use crate::resource::{AccessPath, ConcreteValue, DeferredValue, Value};
+use crate::resource::{AccessPath, CompositionCall, ConcreteValue, DeferredValue, Value};
 use crate::schema::{AttributeType, SchemaRegistry, Shape, TypeIdentity};
 
 /// Lift a module-boundary [`TypeExpr`] into the schema type system.
@@ -471,8 +471,54 @@ impl std::error::Error for AttributeParamRefError {}
 /// A reference-type failure found on one fully expanded composition boundary.
 #[derive(Debug, Clone)]
 pub enum CompositionRefError {
-    ModuleCall(ModuleCallRefError),
-    Attribute(AttributeParamRefError),
+    ModuleCall(CompositionModuleCallRefError),
+    Attribute(CompositionAttributeRefError),
+}
+
+/// A call-boundary failure together with structural expansion ancestry used
+/// by source-aware consumers such as the LSP.
+#[derive(Debug, Clone)]
+pub struct CompositionModuleCallRefError {
+    pub error: ModuleCallRefError,
+    pub call: CompositionCall,
+    pub root_call: CompositionCall,
+}
+
+impl std::fmt::Display for CompositionModuleCallRefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+/// A module-output declaration failure. The module identity remains attached
+/// after expansion so repeated instances collapse to one authored error and
+/// CLI output can identify the declaration's source.
+#[derive(Debug, Clone)]
+pub struct CompositionAttributeRefError {
+    pub error: AttributeParamRefError,
+    pub module_name: String,
+    pub module_source: Option<String>,
+    pub module_directory: Option<std::path::PathBuf>,
+}
+
+impl CompositionAttributeRefError {
+    fn module_label(&self) -> &str {
+        self.module_source.as_deref().unwrap_or(&self.module_name)
+    }
+
+    fn module_identity(&self) -> String {
+        self.module_directory
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .or_else(|| self.module_source.clone())
+            .unwrap_or_else(|| self.module_name.clone())
+    }
+}
+
+impl std::fmt::Display for CompositionAttributeRefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "module '{}': {}", self.module_label(), self.error)
+    }
 }
 
 impl std::fmt::Display for CompositionRefError {
@@ -524,6 +570,8 @@ pub fn validate_composition_ref_types_with_bindings(
     let mut errors = Vec::new();
 
     for composition in compositions {
+        let call = composition.diagnostic_call();
+        let root_call = composition.diagnostic_root_call();
         for (argument_name, argument) in &composition.signature.arguments {
             visit_refs_with_sink(
                 argument.value(),
@@ -532,16 +580,18 @@ pub fn validate_composition_ref_types_with_bindings(
                     let Some(kind) = composition_ref_error_kind(path, sink, bindings) else {
                         return;
                     };
-                    errors.push(CompositionRefError::ModuleCall(ModuleCallRefError {
-                        call: composition
-                            .binding
-                            .as_deref()
-                            .unwrap_or_else(|| composition.expanded_instance())
-                            .to_string(),
-                        argument: argument_name.clone(),
-                        path: path.clone(),
-                        kind,
-                    }));
+                    errors.push(CompositionRefError::ModuleCall(
+                        CompositionModuleCallRefError {
+                            error: ModuleCallRefError {
+                                call: call.display_label(),
+                                argument: argument_name.clone(),
+                                path: path.clone(),
+                                kind,
+                            },
+                            call: call.clone(),
+                            root_call: root_call.clone(),
+                        },
+                    ));
                 },
             );
         }
@@ -555,18 +605,33 @@ pub fn validate_composition_ref_types_with_bindings(
                     let Some(kind) = composition_ref_error_kind(path, sink, bindings) else {
                         return;
                     };
-                    errors.push(CompositionRefError::Attribute(AttributeParamRefError {
-                        attribute: attribute_name.clone(),
-                        path: path.clone(),
-                        kind,
-                    }));
+                    errors.push(CompositionRefError::Attribute(
+                        CompositionAttributeRefError {
+                            error: AttributeParamRefError {
+                                attribute: attribute_name.clone(),
+                                path: path.clone(),
+                                kind,
+                            },
+                            module_name: call.module_name.clone(),
+                            module_source: call.module_source.clone(),
+                            module_directory: call.module_directory.clone(),
+                        },
+                    ));
                 },
             );
         }
     }
 
-    let mut seen = HashSet::new();
-    errors.retain(|error| seen.insert(error.to_string()));
+    let mut seen_calls = HashSet::new();
+    let mut seen_attributes = HashSet::new();
+    errors.retain(|error| match error {
+        CompositionRefError::ModuleCall(error) => {
+            seen_calls.insert((error.call.instance.clone(), error.error.to_string()))
+        }
+        CompositionRefError::Attribute(error) => {
+            seen_attributes.insert((error.module_identity(), error.error.attribute.clone()))
+        }
+    });
     errors
 }
 

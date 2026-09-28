@@ -171,6 +171,7 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
             module_name: "m".to_string(),
             instance: "i".to_string(),
+            provenance: Default::default(),
             quoted_string_attrs: HashSet::new(),
         };
         let id = c.id.clone();

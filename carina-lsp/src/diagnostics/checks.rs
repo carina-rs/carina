@@ -29,6 +29,27 @@ fn module_call_header_position(line: &str, call: &ModuleCall) -> Option<usize> {
         })
 }
 
+/// Match an expanded call site back to an authored call without interpreting
+/// its dot-separated instance path. Named calls match their structural
+/// binding; anonymous calls match the deterministic instance identity that
+/// was recorded during expansion.
+fn composition_call_matches(
+    expanded: &carina_core::resource::CompositionCall,
+    authored: &ModuleCall,
+) -> bool {
+    if expanded.module_name != authored.module_name {
+        return false;
+    }
+
+    match (&expanded.binding, &authored.binding_name) {
+        (Some(expanded), Some(authored)) => expanded == authored,
+        (None, None) => {
+            expanded.instance == carina_core::module_resolver::instance_prefix_for_call(authored)
+        }
+        _ => false,
+    }
+}
+
 /// Locate the `source = '<expected>'` or `source = "<expected>"` line inside
 /// an `upstream_state { ... }` block whose value equals `expected`. Returns
 /// `(line, start_col, end_col)` in character columns, positioned over the
@@ -1203,33 +1224,24 @@ impl DiagnosticEngine {
             binding_index,
         )
         .into_iter()
-        .map(|error| {
+        .filter_map(|error| {
             let call = parsed.module_calls.iter().find(|call| {
                 call.binding_name.as_deref().unwrap_or(&call.module_name) == error.call.as_str()
-            });
-            let argument_position = call.and_then(|call| {
-                self.find_module_call_arg_position(doc, call, &error.argument)
-                    .map(|(line, col)| (line, col, error.argument.chars().count() as u32))
-            });
-            let call_position = call.and_then(|call| {
-                self.find_module_call_position(doc, call)
-                    .map(|(line, col)| (line, col, call.module_name.chars().count() as u32))
-            });
-            let ref_text = error.path.to_dot_string();
-            let ref_position = self
-                .find_ref_value_position(doc, &ref_text)
-                .map(|(line, col)| (line, col, ref_text.chars().count() as u32));
-            let (line, col, width) = argument_position
-                .or(call_position)
-                .or(ref_position)
-                .unwrap_or((0, 0, 1));
-            carina_diagnostic(
+            })?;
+            let argument_position = self
+                .find_module_call_arg_position(doc, call, &error.argument)
+                .map(|(line, col)| (line, col, error.argument.chars().count() as u32));
+            let call_position = self
+                .find_module_call_position(doc, call)
+                .map(|(line, col)| (line, col, call.module_name.chars().count() as u32));
+            let (line, col, width) = argument_position.or(call_position)?;
+            Some(carina_diagnostic(
                 line,
                 col,
                 col + width,
                 DiagnosticSeverity::WARNING,
                 error.to_string(),
-            )
+            ))
         })
         .collect()
     }
@@ -1248,53 +1260,62 @@ impl DiagnosticEngine {
             binding_index,
         )
         .into_iter()
-        .map(|error| {
-            let (line, col, width) = match &error {
-                carina_core::validation::CompositionRefError::ModuleCall(error) => {
-                    let call = parsed.module_calls.iter().find(|call| {
-                        call.binding_name
-                            .as_deref()
-                            .is_some_and(|binding| binding == error.call)
-                            || (call.binding_name.is_none()
-                                && carina_core::module_resolver::instance_prefix_for_call(call)
-                                    == error.call)
-                    });
-                    let argument_position = call.and_then(|call| {
-                        self.find_module_call_arg_position(doc, call, &error.argument)
-                            .map(|(line, col)| (line, col, error.argument.chars().count() as u32))
-                    });
-                    let call_position = call.and_then(|call| {
-                        self.find_module_call_position(doc, call)
-                            .map(|(line, col)| (line, col, call.module_name.chars().count() as u32))
-                    });
-                    let ref_text = error.path.to_dot_string();
-                    let ref_position = self
-                        .find_ref_value_position(doc, &ref_text)
-                        .map(|(line, col)| (line, col, ref_text.chars().count() as u32));
-                    argument_position
-                        .or(call_position)
-                        .or(ref_position)
-                        .unwrap_or((0, 0, 1))
-                }
-                carina_core::validation::CompositionRefError::Attribute(error) => {
-                    let attribute_position = self
-                        .find_attributes_param_position(doc, &error.attribute)
-                        .map(|(line, col)| (line, col, error.attribute.chars().count() as u32));
-                    let ref_text = error.path.to_dot_string();
-                    let ref_position = self
-                        .find_ref_value_position(doc, &ref_text)
-                        .map(|(line, col)| (line, col, ref_text.chars().count() as u32));
-                    attribute_position.or(ref_position).unwrap_or((0, 0, 1))
-                }
+        .filter_map(|error| {
+            let carina_core::validation::CompositionRefError::ModuleCall(expanded_error) = &error
+            else {
+                // Output declaration diagnostics are owned by the module file's
+                // source-local `check_attributes_blocks` pass. Reporting their
+                // expanded copies here would duplicate once per instance and
+                // has no declaration range in a calling document.
+                return None;
             };
 
-            carina_diagnostic(
+            let immediate_call = parsed
+                .module_calls
+                .iter()
+                .find(|call| composition_call_matches(&expanded_error.call, call));
+            let (authored_call, anchor_argument) = match immediate_call {
+                Some(call) => (call, true),
+                None => (
+                    parsed
+                        .module_calls
+                        .iter()
+                        .find(|call| composition_call_matches(&expanded_error.root_call, call))?,
+                    false,
+                ),
+            };
+
+            let position = if anchor_argument {
+                self.find_module_call_arg_position(
+                    doc,
+                    authored_call,
+                    &expanded_error.error.argument,
+                )
+                .map(|(line, col)| {
+                    (
+                        line,
+                        col,
+                        expanded_error.error.argument.chars().count() as u32,
+                    )
+                })
+            } else {
+                None
+            }
+            .or_else(|| {
+                self.find_module_call_position(doc, authored_call)
+                    .map(|(line, col)| {
+                        (line, col, authored_call.module_name.chars().count() as u32)
+                    })
+            })?;
+            let (line, col, width) = position;
+
+            Some(carina_diagnostic(
                 line,
                 col,
                 col + width,
                 DiagnosticSeverity::WARNING,
                 error.to_string(),
-            )
+            ))
         })
         .collect()
     }

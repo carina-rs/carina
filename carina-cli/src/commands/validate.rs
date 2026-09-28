@@ -231,6 +231,16 @@ impl std::fmt::Display for ValidatedEntry<'_> {
 fn validated_entries<E>(parsed: &File<E>) -> Vec<ValidatedEntry<'_>> {
     parsed
         .iter_all_resources()
+        // Every call now has a composition so its typed boundary survives
+        // expansion, but an unbound call has no address the user can write.
+        // Keep those internal nodes available to validation while excluding
+        // them from the command's user-facing resource inventory.
+        .filter(|rref| {
+            !matches!(
+                rref,
+                ResourceRef::Composition(composition) if composition.binding.is_none()
+            )
+        })
         .map(|rref| match rref {
             ResourceRef::Deferred { deferred: d, .. } => ValidatedEntry::DeferredLoop {
                 resource_type: &d.resource_type,
@@ -541,6 +551,40 @@ mod tests {
             "rendered Pending entry must not be a trailing-dot string; got: {rendered:?}"
         );
         assert_eq!(rendered, "aws.s3.Bucket.<pending>");
+    }
+
+    #[test]
+    fn validation_listing_excludes_unbound_compositions() {
+        use carina_core::parser::ParsedFile;
+        use carina_core::resource::{Composition, ResourceId, Signature};
+
+        let composition = |instance: &str, binding: Option<&str>| Composition {
+            id: ResourceId::with_identity("_virtual", instance),
+            signature: Signature {
+                arguments: indexmap::IndexMap::new(),
+                attributes: indexmap::IndexMap::new(),
+            },
+            binding: binding.map(str::to_string),
+            dependency_bindings: Default::default(),
+            module_name: "example".to_string(),
+            instance: instance.to_string(),
+            provenance: Default::default(),
+            quoted_string_attrs: Default::default(),
+        };
+        let mut parsed = ParsedFile::default();
+        parsed
+            .compositions
+            .push(composition("bound", Some("bound")));
+        parsed
+            .compositions
+            .push(composition("example_deadbeefdeadbeef", None));
+
+        let rendered: Vec<_> = validated_entries(&parsed)
+            .into_iter()
+            .map(|entry| entry.to_string())
+            .collect();
+
+        assert_eq!(rendered, vec!["_virtual.bound"]);
     }
 
     fn upstream(binding: &str, source: &str) -> UpstreamState {

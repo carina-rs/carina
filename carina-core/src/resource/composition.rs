@@ -16,6 +16,7 @@
 //! `module_name` + `instance` — those are always set for compositions.
 
 use std::collections::{BTreeSet, HashSet};
+use std::path::PathBuf;
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -211,6 +212,56 @@ pub struct Signature {
     pub attributes: IndexMap<String, CompositionAttribute>,
 }
 
+/// Structural identity for one module call that produced a composition.
+///
+/// `instance` is retained for unambiguous internal identity, while
+/// `binding` and `module_name` are the authored names used by diagnostics.
+/// The optional source is the path from the corresponding `use` statement.
+/// This metadata is validation-only and is never persisted in saved plans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositionCall {
+    pub module_name: String,
+    pub binding: Option<String>,
+    pub instance: String,
+    pub module_source: Option<String>,
+    pub module_directory: Option<PathBuf>,
+}
+
+impl CompositionCall {
+    /// User-facing call label. Anonymous calls deliberately hide their
+    /// content-derived synthetic instance identifier.
+    pub fn display_label(&self) -> String {
+        self.binding
+            .clone()
+            .unwrap_or_else(|| format!("{} (anonymous call)", self.module_name))
+    }
+}
+
+/// Diagnostic lineage recorded while nested module calls are expanded.
+///
+/// `call` identifies the immediate boundary represented by the composition;
+/// `root_call` identifies the root-level call whose expansion transitively
+/// produced it. LSP diagnostics use this relationship to select their owning
+/// document without parsing dot-separated instance strings.
+///
+/// This is diagnostic-only metadata, not part of a composition's identity:
+/// all provenance values intentionally compare equal. [`Composition`] also
+/// skips this field during serialization, so the metadata is lost on saved-plan
+/// reload and replaced with [`Default::default`].
+#[derive(Debug, Clone, Default)]
+pub struct CompositionProvenance {
+    pub call: Option<CompositionCall>,
+    pub root_call: Option<CompositionCall>,
+}
+
+impl PartialEq for CompositionProvenance {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for CompositionProvenance {}
+
 /// A composition resource created by module-call expansion.
 ///
 /// # Dropped fields (compile-time invariants)
@@ -279,6 +330,9 @@ pub struct Composition {
     pub module_name: String,
     /// Module instance binding name (e.g. "web").
     pub instance: String,
+    /// Diagnostic-only call ancestry; see [`CompositionProvenance`].
+    #[serde(skip)]
+    pub provenance: Box<CompositionProvenance>,
     /// Parser-level: attributes whose value was written as a quoted
     /// string literal. Parse-time only; `#[serde(skip)]` keeps it out
     /// of state — mirrors [`Resource::quoted_string_attrs`](super::Resource).
@@ -301,12 +355,72 @@ impl Composition {
     pub fn expanded_instance(&self) -> &str {
         self.id.identity_or_empty()
     }
+
+    /// Immediate call identity, falling back to the legacy flattened fields
+    /// for manually constructed or deserialized compositions.
+    pub fn diagnostic_call(&self) -> CompositionCall {
+        self.provenance
+            .call
+            .clone()
+            .unwrap_or_else(|| CompositionCall {
+                module_name: self.module_name.clone(),
+                binding: self.binding.clone(),
+                instance: self.instance.clone(),
+                module_source: None,
+                module_directory: None,
+            })
+    }
+
+    /// Root-level ancestor call for this expansion. A direct composition (or
+    /// legacy value without provenance) is its own root.
+    pub fn diagnostic_root_call(&self) -> CompositionCall {
+        self.provenance
+            .root_call
+            .clone()
+            .unwrap_or_else(|| self.diagnostic_call())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::resource::ConcreteValue;
+
+    #[test]
+    fn equality_ignores_provenance_but_compares_composition_fields() {
+        let provenance = |binding: &str| {
+            Box::new(CompositionProvenance {
+                call: Some(CompositionCall {
+                    module_name: "module".to_string(),
+                    binding: Some(binding.to_string()),
+                    instance: binding.to_string(),
+                    module_source: Some(format!("../{binding}")),
+                    module_directory: None,
+                }),
+                root_call: None,
+            })
+        };
+        let left = Composition {
+            id: ResourceId::with_identity("_virtual", "call"),
+            signature: Signature {
+                arguments: IndexMap::new(),
+                attributes: IndexMap::new(),
+            },
+            binding: Some("call".to_string()),
+            dependency_bindings: BTreeSet::new(),
+            module_name: "module".to_string(),
+            instance: "call".to_string(),
+            provenance: provenance("first"),
+            quoted_string_attrs: HashSet::new(),
+        };
+        let mut right = left.clone();
+        right.provenance = provenance("second");
+
+        assert_eq!(left, right);
+
+        right.binding = Some("different".to_string());
+        assert_ne!(left, right);
+    }
 
     #[test]
     fn from_value_resource_ref_classifies_as_forwarded() {

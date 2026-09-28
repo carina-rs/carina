@@ -1159,6 +1159,7 @@ mod tests {
             dependency_bindings: Default::default(),
             module_name: "test_module".to_string(),
             instance: binding.to_string(),
+            provenance: Default::default(),
             quoted_string_attrs: Default::default(),
         }
     }
@@ -1443,6 +1444,7 @@ let vpc = aws.ec2.Vpc {
             dependency_bindings: Default::default(),
             module_name: "cycle".to_string(),
             instance: binding.to_string(),
+            provenance: Default::default(),
             quoted_string_attrs: Default::default(),
         };
         let mut parsed = parse("", &Default::default()).expect("parse");

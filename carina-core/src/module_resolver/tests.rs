@@ -2277,6 +2277,20 @@ fn test_nested_module_intra_ref_to_module_call_is_prefixed() {
         }
         other => panic!("expected ResourceRef for sg.vpc_id, got: {:?}", other),
     }
+
+    let nested = parsed
+        .compositions
+        .iter()
+        .find(|composition| composition.module_name == "inner")
+        .expect("inner module composition must be retained");
+    let immediate_call = nested.diagnostic_call();
+    let root_call = nested.diagnostic_root_call();
+    assert_eq!(immediate_call.binding.as_deref(), Some("web.net"));
+    assert_eq!(immediate_call.instance, "web.net");
+    assert_eq!(immediate_call.module_name, "inner");
+    assert_eq!(root_call.binding.as_deref(), Some("web"));
+    assert_eq!(root_call.instance, "web");
+    assert_eq!(root_call.module_name, "outer");
 }
 
 #[test]

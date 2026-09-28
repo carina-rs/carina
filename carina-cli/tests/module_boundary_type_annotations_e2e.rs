@@ -335,7 +335,7 @@ web_tier {
     let diagnostics = fixture.validate();
     assert!(
         diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("module call 'web_tier_")
+            diagnostic.contains("module call 'web_tier (anonymous call)'")
                 && diagnostic.contains("argument 'vpc_id'")
                 && diagnostic.contains("expected aws.ec2.Vpc.Id")
                 && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
@@ -498,20 +498,13 @@ fn attribute_declaration_rejects_security_group_id_as_vpc_id() {
         .collect();
     assert_eq!(
         mismatches.len(),
-        2,
-        "each expanded call output should report the declaration mismatch: {diagnostics:#?}",
+        1,
+        "one authored output declaration should report once regardless of call count: {diagnostics:#?}",
     );
     assert!(
-        mismatches
-            .iter()
-            .any(|diagnostic| diagnostic.contains("from web.web_sg.group_id")),
-        "expected the first expanded output path, got: {diagnostics:#?}",
-    );
-    assert!(
-        mismatches
-            .iter()
-            .any(|diagnostic| diagnostic.contains("from web2.web_sg.group_id")),
-        "expected the second expanded output path, got: {diagnostics:#?}",
+        mismatches[0].contains("module '../web_tier'")
+            && mismatches[0].contains("from web.web_sg.group_id"),
+        "the declaration diagnostic should identify its module and one source path: {diagnostics:#?}",
     );
 }
 

@@ -702,6 +702,7 @@ fn make_composition(binding: &str, attributes: &[&str]) -> Composition {
         dependency_bindings: Default::default(),
         module_name: "test_module".to_string(),
         instance: binding.to_string(),
+        provenance: Default::default(),
         quoted_string_attrs: Default::default(),
     }
 }
@@ -2883,6 +2884,98 @@ fn post_expansion_composition_attribute_typo_is_reported_once() {
         err.contains("attribute 'x': unknown attribute 'typo' on 'inner'"),
         "expected the expanded composition surface diagnostic, got: {err}",
     );
+}
+
+#[test]
+fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
+    let schema_type = |path: &str| TypeExpr::SchemaType {
+        provider: "aws".to_string(),
+        path: path.to_string(),
+        type_name: "Id".to_string(),
+    };
+    let mut parsed = empty_parsed();
+    for instance in ["one", "two", "three"] {
+        let source_binding = format!("source_{instance}");
+        let mut source = make_composition(&source_binding, &[]);
+        source.signature.attributes.insert(
+            "group_id".to_string(),
+            CompositionAttribute::from_value(
+                Value::Concrete(ConcreteValue::String("sg-123".to_string())),
+                Some(schema_type("ec2.SecurityGroup")),
+            ),
+        );
+        parsed.compositions.push(source);
+        let mut consumer = make_composition(instance, &[]);
+        consumer.module_name = "bad_module".to_string();
+        consumer.signature.attributes.insert(
+            "bad".to_string(),
+            CompositionAttribute::from_value(
+                Value::resource_ref(source_binding, "group_id".to_string(), vec![]),
+                Some(schema_type("ec2.Vpc")),
+            ),
+        );
+        parsed.compositions.push(consumer);
+    }
+    let schemas = SchemaRegistry::new();
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+
+    let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
+    let declaration_errors: Vec<_> = errors
+        .iter()
+        .map(ToString::to_string)
+        .filter(|error| error.contains("attribute 'bad'"))
+        .collect();
+
+    assert_eq!(declaration_errors.len(), 1, "{declaration_errors:?}");
+    assert!(
+        declaration_errors[0].contains("module 'bad_module'"),
+        "the declaration diagnostic must identify its module: {declaration_errors:?}",
+    );
+}
+
+#[test]
+fn post_expansion_anonymous_call_error_uses_module_label() {
+    let schema_type = |path: &str| TypeExpr::SchemaType {
+        provider: "aws".to_string(),
+        path: path.to_string(),
+        type_name: "Id".to_string(),
+    };
+    let mut source = make_composition("source", &[]);
+    source.signature.attributes.insert(
+        "group_id".to_string(),
+        CompositionAttribute::from_value(
+            Value::Concrete(ConcreteValue::String("sg-123".to_string())),
+            Some(schema_type("ec2.SecurityGroup")),
+        ),
+    );
+    let synthetic_instance = "needs_0101081440007054";
+    let mut consumer = make_composition(synthetic_instance, &[]);
+    consumer.binding = None;
+    consumer.module_name = "needs".to_string();
+    consumer.signature.arguments.insert(
+        "vpc_id".to_string(),
+        CompositionArgument::from_value(
+            Value::resource_ref("source".to_string(), "group_id".to_string(), vec![]),
+            Some(schema_type("ec2.Vpc")),
+        ),
+    );
+    let mut parsed = empty_parsed();
+    parsed.compositions.extend([source, consumer]);
+    let schemas = SchemaRegistry::new();
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+
+    let errors = validate_composition_ref_types_with_bindings(&parsed.compositions, &bindings);
+    let rendered = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("module call 'needs (anonymous call)'"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains(synthetic_instance), "{rendered}");
 }
 
 #[test]

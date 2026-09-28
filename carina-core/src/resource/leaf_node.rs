@@ -182,6 +182,7 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
             module_name: "m".to_string(),
             instance: "i".to_string(),
+            provenance: Default::default(),
             quoted_string_attrs: HashSet::new(),
         }
     }
@@ -263,6 +264,7 @@ mod tests {
     ///     dependency_bindings: BTreeSet::new(),
     ///     module_name: "m".to_string(),
     ///     instance: "i".to_string(),
+    ///     provenance: Default::default(),
     ///     quoted_string_attrs: HashSet::new(),
     /// };
     /// // No `From<Composition> for LeafNode` impl exists. This must

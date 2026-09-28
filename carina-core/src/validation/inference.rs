@@ -1632,6 +1632,7 @@ mod tests {
             dependency_bindings: std::collections::BTreeSet::new(),
             module_name: "github_module".to_string(),
             instance: "github_actions_carina".to_string(),
+            provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         };
         parsed.compositions.push(virt); // allow: direct — fixture test inspection

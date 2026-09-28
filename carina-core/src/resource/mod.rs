@@ -3269,7 +3269,10 @@ pub mod graph_node;
 pub mod leaf_node;
 pub mod persistent_id;
 
-pub use composition::{Composition, CompositionArgument, CompositionAttribute, Signature};
+pub use composition::{
+    Composition, CompositionArgument, CompositionAttribute, CompositionCall, CompositionProvenance,
+    Signature,
+};
 pub use data_source::{DataSource, ResolvedDataSource};
 pub use expansion_trace::{CallSite, ExpansionTrace};
 pub use graph_node::GraphNode;
