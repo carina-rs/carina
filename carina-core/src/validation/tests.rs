@@ -2453,10 +2453,11 @@ fn directional_relation_rejects_plain_string_for_identified_sink() {
     );
 }
 
-// A pattern is still a constraint even without an identity. The shared
-// relation requires the source to carry proof of that constraint.
+// Issue #3798's settled rule-10 exception: a plain source can cross an
+// identity-less refinement boundary. The concrete value is checked against
+// the pattern when known (carina#3805).
 #[test]
-fn directional_relation_rejects_plain_string_for_pattern_sink_without_proof() {
+fn directional_relation_accepts_plain_string_for_identityless_pattern_sink() {
     use crate::schema::legacy_validator;
     fn noop(_v: &crate::resource::Value) -> Result<(), String> {
         Ok(())
@@ -2469,12 +2470,12 @@ fn directional_relation_rejects_plain_string_for_pattern_sink_without_proof() {
         None,
     );
     assert!(
-        !lifted_source_is_assignable_to_schema(
+        lifted_source_is_assignable_to_schema(
             &TypeExpr::String,
             &schema,
             crate::schema::empty_defs_for_schema_walks()
         ),
-        "plain String has no proof that it satisfies the sink pattern"
+        "plain String should defer an identity-less pattern to value validation"
     );
 }
 

@@ -3409,21 +3409,18 @@ fn make_custom(name: &str, base: AttributeType) -> AttributeType {
     }
 }
 
-fn make_custom_anon_pattern(pattern: &str) -> AttributeType {
-    AttributeType::refined_string_with_validator(
-        None,
-        Some(pattern.to_string()),
-        None,
-        crate::schema::legacy_validator(|_| Ok(())),
-        None,
-    )
+fn make_custom_anon_len(min: u64, max: u64) -> AttributeType {
+    make_custom_anon_pattern_and_len(None, Some((Some(min), Some(max))))
 }
 
-fn make_custom_anon_len(min: u64, max: u64) -> AttributeType {
+fn make_custom_anon_pattern_and_len(
+    pattern: Option<&str>,
+    length: Option<(Option<u64>, Option<u64>)>,
+) -> AttributeType {
     AttributeType::refined_string_with_validator(
         None,
-        None,
-        Some((Some(min), Some(max))),
+        pattern.map(str::to_string),
+        length,
         crate::schema::legacy_validator(|_| Ok(())),
         None,
     )
@@ -4237,25 +4234,132 @@ fn assignable_narrow_to_anonymous_unconstrained_sink() {
 }
 
 #[test]
-fn assignable_source_without_pattern_rejected_by_patterned_sink() {
-    let account = make_custom("AwsAccountId", AttributeType::string());
-    let anon = make_custom_anon_pattern("^\\d{12}$");
-    // Source has no pattern; sink demands one → NG.
-    assert!(!assignable(&account, &anon));
+fn assignable_identified_source_without_length_rejected_by_identityless_length_sink() {
+    let log_group_arn = AttributeType::refined_string_with_validator(
+        Some(TypeIdentity::new(Some("aws"), ["logs", "LogGroup"], "Arn")),
+        None,
+        None,
+        crate::schema::legacy_validator(|_| Ok(())),
+        None,
+    );
+    let at_most_1024 = make_custom_anon_pattern_and_len(None, Some((None, Some(1024))));
+
+    // Rule 8 is unchanged: this source carries identity evidence, so it is a
+    // refined source whose absent length does not prove the sink's bound.
+    assert!(!assignable(&log_group_arn, &at_most_1024));
 }
 
 #[test]
-fn assignable_anon_to_anon_length_containment() {
-    let narrow = make_custom_anon_len(1, 36);
-    let wide = make_custom_anon_len(1, 64);
-    assert!(assignable(&narrow, &wide));
-    assert!(!assignable(&wide, &narrow));
+fn assignable_identityless_length_requires_source_containment() {
+    let at_most_1024 = make_custom_anon_pattern_and_len(None, Some((None, Some(1024))));
+    let at_most_512 = make_custom_anon_len(1, 512);
+    let at_most_2048 = make_custom_anon_len(1, 2048);
+
+    assert!(assignable(&at_most_512, &at_most_1024));
+    assert!(!assignable(&at_most_2048, &at_most_1024));
 }
 
 #[test]
-fn assignable_rejects_non_custom_to_custom() {
-    let vpc = make_custom("VpcId", AttributeType::string());
-    assert!(!assignable(&AttributeType::string(), &vpc));
+fn assignable_plain_string_accepts_identityless_string_refinements() {
+    let length_only = make_custom_anon_pattern_and_len(None, Some((None, Some(1024))));
+    let pattern_and_length =
+        make_custom_anon_pattern_and_len(Some(r"^[A-Za-z0-9.-]+$"), Some((Some(1), Some(1024))));
+
+    assert!(assignable(&AttributeType::string(), &length_only));
+    assert!(assignable(&AttributeType::string(), &pattern_and_length));
+}
+
+#[test]
+fn assignable_plain_string_rejects_identified_sink() {
+    let vpc_id = AttributeType::refined_string_with_validator(
+        Some(TypeIdentity::new(Some("aws"), ["ec2", "Vpc"], "Id")),
+        None,
+        None,
+        crate::schema::legacy_validator(|_| Ok(())),
+        None,
+    );
+
+    assert!(!assignable(&AttributeType::string(), &vpc_id));
+}
+
+#[test]
+fn assignable_plain_string_rejects_enum_sink_through_composite_types() {
+    let status = AttributeType::enum_(
+        crate::schema::enum_identity("Status", Some("aws.test.Widget")),
+        Some(vec!["Enabled".to_string(), "Disabled".to_string()]),
+        vec![],
+        None,
+        None,
+    );
+
+    // Enum identities and their membership sets are semantic evidence. A
+    // plain String carries neither, so Enum follows the identified-sink side
+    // of rule 10 rather than the identity-less value-constraint exception.
+    assert!(!assignable(&AttributeType::string(), &status));
+    assert!(!assignable(
+        &AttributeType::list(AttributeType::string()),
+        &AttributeType::list(status.clone()),
+    ));
+    assert!(!assignable(
+        &AttributeType::map(AttributeType::string()),
+        &AttributeType::map(status.clone()),
+    ));
+    assert!(!assignable(
+        &AttributeType::struct_(
+            "Source",
+            vec![StructField::new("value", AttributeType::string())],
+        ),
+        &AttributeType::struct_("Sink", vec![StructField::new("value", status.clone())],),
+    ));
+
+    let other_status = AttributeType::enum_(
+        crate::schema::enum_identity("Mode", Some("aws.test.Widget")),
+        Some(vec!["Automatic".to_string()]),
+        vec![],
+        None,
+        None,
+    );
+    assert!(!assignable(
+        &AttributeType::string(),
+        &AttributeType::union(vec![status, other_status]),
+    ));
+}
+
+#[test]
+fn assignable_identityless_sink_rule_recurses_through_composite_types() {
+    let constrained =
+        make_custom_anon_pattern_and_len(Some(r"^[a-z]+$"), Some((Some(1), Some(32))));
+    let identified = make_custom("VpcId", AttributeType::string());
+
+    assert!(assignable(
+        &AttributeType::list(AttributeType::string()),
+        &AttributeType::list(constrained.clone()),
+    ));
+    assert!(assignable(
+        &AttributeType::map_with_key(AttributeType::string(), AttributeType::string()),
+        &AttributeType::map_with_key(constrained.clone(), constrained.clone()),
+    ));
+    assert!(assignable(
+        &AttributeType::struct_(
+            "Source",
+            vec![StructField::new("value", AttributeType::string())],
+        ),
+        &AttributeType::struct_("Sink", vec![StructField::new("value", constrained.clone())],),
+    ));
+
+    let sink_union = AttributeType::union(vec![identified.clone(), constrained.clone()]);
+    assert!(assignable(&AttributeType::string(), &sink_union));
+    let source_union = AttributeType::union(vec![AttributeType::string(), AttributeType::string()]);
+    assert!(assignable(&source_union, &constrained));
+    let conflicting_source_union =
+        AttributeType::union(vec![AttributeType::string(), identified.clone()]);
+    assert!(!assignable(&conflicting_source_union, &constrained));
+
+    // The same recursive paths do not create an identity exception.
+    assert!(!assignable(
+        &AttributeType::list(AttributeType::string()),
+        &AttributeType::list(identified),
+    ));
 }
 
 #[test]
@@ -4327,26 +4431,15 @@ fn assignable_int_custom_rejects_string_custom() {
 // - pattern: differing literal strings are conservatively *incompatible*
 //   (we cannot prove a regex is a refinement of another by string compare,
 //   so we err on the side of rejecting). `None` on the sink means "no
-//   pattern constraint" and admits any source pattern (or none). `None`
-//   on the source against a `Some` sink is rejected — the source has no
-//   proof its values match the sink's pattern.
+//   pattern constraint" and admits any source pattern (or none). A source
+//   that carries some other refinement but no pattern is rejected against a
+//   `Some` sink because its own evidence does not prove that pattern.
 // - length: source ⊆ sink (sink.min ≤ source.min AND source.max ≤ sink.max,
 //   missing bounds treated as unbounded on that side). `None` on the sink
-//   admits any source length; `None` on the source against a `Some` sink
-//   is rejected — the source has no proof its values fit the sink range.
-
-fn make_custom_anon_pattern_and_len(
-    pattern: Option<&str>,
-    length: Option<(Option<u64>, Option<u64>)>,
-) -> AttributeType {
-    AttributeType::refined_string_with_validator(
-        None,
-        pattern.map(str::to_string),
-        length,
-        crate::schema::legacy_validator(|_| Ok(())),
-        None,
-    )
-}
+//   admits any source length. A source that carries some other refinement but
+//   no length is rejected against a bounded sink. A completely unrefined
+//   source is the rule-10 exception tested below; its concrete value is
+//   validated separately under carina#3805.
 
 #[test]
 fn assignable_anon_pattern_equal_strings_compatible() {
@@ -4367,12 +4460,14 @@ fn assignable_anon_pattern_differing_strings_incompatible() {
 }
 
 #[test]
-fn assignable_anon_pattern_source_none_sink_some_rejected() {
-    // Source has no pattern; sink demands one — source has no proof
-    // its values match the sink's pattern.
+fn assignable_unrefined_source_accepts_identityless_pattern_sink() {
     let source = make_custom_anon_pattern_and_len(None, None);
     let sink = make_custom_anon_pattern_and_len(Some("^x+$"), None);
-    assert!(!assignable(&source, &sink));
+
+    // Issue #3798's settled rule-10 decision: with no identity, pattern, or
+    // length evidence of its own, the source is the plain base type. The
+    // identity-less sink's value constraint is enforced under carina#3805.
+    assert!(assignable(&source, &sink));
 }
 
 #[test]
@@ -4424,11 +4519,13 @@ fn assignable_anon_length_source_unbounded_min_against_bounded_sink_rejected() {
 }
 
 #[test]
-fn assignable_anon_length_source_none_sink_some_rejected() {
-    // Source has no length constraint at all; sink does → no proof.
+fn assignable_unrefined_source_accepts_identityless_length_sink() {
     let source = make_custom_anon_pattern_and_len(None, None);
     let sink = make_custom_anon_pattern_and_len(None, Some((Some(10), Some(40))));
-    assert!(!assignable(&source, &sink));
+
+    // Issue #3798's settled rule-10 decision; unlike a wider refined source,
+    // this source carries no refinement evidence that could conflict.
+    assert!(assignable(&source, &sink));
 }
 
 #[test]

@@ -11,7 +11,9 @@ use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
 use carina_core::resource::{DataSource, Value};
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
+};
 use indexmap::IndexMap;
 use tempfile::TempDir;
 
@@ -59,7 +61,14 @@ impl ProviderFactory for AwsTestFactory {
     }
 
     fn schemas(&self) -> Vec<ResourceSchema> {
-        vec![vpc_schema(), subnet_schema(), security_group_schema()]
+        vec![
+            vpc_schema(),
+            subnet_schema(),
+            security_group_schema(),
+            hosted_zone_schema(),
+            domain_lookup_schema(),
+            nested_domain_consumer_schema(),
+        ]
     }
 }
 
@@ -163,6 +172,37 @@ fn security_group_schema() -> ResourceSchema {
         .attribute(
             AttributeSchema::new("group_id", identity("ec2.SecurityGroup", "Id")).read_only(),
         )
+        .with_unique_name_attribute("name")
+}
+
+fn hosted_zone_schema() -> ResourceSchema {
+    let domain_name = AttributeType::refined_string(None, None, Some((None, Some(1024))), None);
+    ResourceSchema::new("route53.HostedZone")
+        .attribute(AttributeSchema::new("name", domain_name).required())
+        .with_unique_name_attribute("name")
+}
+
+fn domain_lookup_schema() -> ResourceSchema {
+    ResourceSchema::new("test.DomainLookup")
+        .attribute(AttributeSchema::new("query", AttributeType::string()).required())
+        .attribute(AttributeSchema::new("domain_name", AttributeType::string()).read_only())
+        .as_data_source()
+}
+
+fn nested_domain_consumer_schema() -> ResourceSchema {
+    let constrained_domain = AttributeType::refined_string(
+        None,
+        Some(r"^[A-Za-z0-9.-]+$".to_string()),
+        Some((Some(1), Some(1024))),
+        None,
+    );
+    let endpoint = AttributeType::struct_(
+        "Endpoint",
+        vec![StructField::new("domain_name", constrained_domain)],
+    );
+    ResourceSchema::new("test.NestedDomainConsumer")
+        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
+        .attribute(AttributeSchema::new("endpoint", endpoint).required())
         .with_unique_name_attribute("name")
 }
 
@@ -494,6 +534,8 @@ let instance = m { vpc_id = v.vpc_id }
     );
 
     let diagnostics = fixture.validate();
+    // Issue #3798 case (c): rule 10 remains strict when the sink carries the
+    // aws.ec2.Vpc.Id identity; the module argument has no identity evidence.
     let mismatches: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -503,6 +545,64 @@ let instance = m { vpc_id = v.vpc_id }
         .collect();
     assert_eq!(mismatches.len(), 1, "{diagnostics:#?}");
     assert!(mismatches[0].contains("../web_tier"));
+}
+
+#[test]
+fn module_string_argument_flows_to_awscc_like_identityless_length_sink() {
+    let fixture = Fixture::module(
+        &[
+            ("arguments.crn", "arguments {\n  domain_name: String\n}\n"),
+            (
+                "resources.crn",
+                r#"let zone = aws.route53.HostedZone {
+  name = domain_name
+}
+"#,
+            ),
+        ],
+        &[(
+            "main.crn",
+            r#"let hosted_zone = use { source = '../web_tier' }
+
+let zone = hosted_zone {
+  domain_name = "example.com"
+}
+"#,
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    assert!(
+        diagnostics.is_empty(),
+        "plain module String should reach HostedZone.name's identity-less ..=1024 constraint: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn data_source_string_attribute_flows_to_nested_identityless_refinement() {
+    let fixture = Fixture::module(
+        &[],
+        &[(
+            "main.crn",
+            r#"let lookup = read aws.test.DomainLookup {
+  query = "example.com"
+}
+
+let consumer = aws.test.NestedDomainConsumer {
+  name = "consumer"
+  endpoint = {
+    domain_name = lookup.domain_name
+  }
+}
+"#,
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    assert!(
+        diagnostics.is_empty(),
+        "a data-source String should recurse into a nested pattern+length sink: {diagnostics:#?}",
+    );
 }
 
 #[test]

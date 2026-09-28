@@ -2902,33 +2902,39 @@ impl TypeInSchema<'_> {
     ///    rejected both ways (populated providers differ). Closes carina#3218.
     /// 8. Custom→Custom where at least one side has `identity: None`: check
     ///    pattern (literal equality) and length containment (source ⊆ sink),
-    ///    then recurse on base. For both-identified pairs, see rule 6.
+    ///    then recurse on base. For both-identified pairs, see rule 7.
     /// 9. Custom source → non-Custom sink: recurse on `source.base`.
-    /// 10. non-Custom source → Custom sink: NG (source has no proof of
-    ///     satisfying the sink's identity/pattern/length).
+    /// 10. A plain, unrefined primitive source → refined sink is split by
+    ///     the sink's identity. An identified sink (including every Enum) is
+    ///     NG because the source has no identity evidence. An identity-less
+    ///     sink is OK when the primitive bases are assignable; its
+    ///     pattern/length/range is a value constraint, enforced when the
+    ///     concrete value is known (carina#3805). Rules 4–6 make the same
+    ///     leaf decision recursively inside List/Map/Struct, and rules 2–3
+    ///     preserve their normal all/any Union semantics.
     /// 11. Otherwise: same primitive type names.
     ///
     /// # Conservative pattern/length policy
     ///
-    /// Pattern compatibility is decided by **literal string equality**,
-    /// not by regex-language containment. Two `pattern: Some(...)` values
-    /// that describe the same regex language but differ by a single
-    /// character are still considered incompatible. Proving regex
-    /// containment in the general case is undecidable for arbitrary
-    /// PCRE-style patterns, so we err toward false negatives (a few
-    /// rejected refs the user must split with an explicit cast) over
-    /// false positives (assignment that compiles but fails at apply time).
+    /// Rule 8 remains evidence-preserving for a source that carries any
+    /// refinement of its own. A populated sink pattern requires literal
+    /// string equality; regex-language containment is not inferred. A sink
+    /// length range requires the source range to be a subset (`sink.min ≤
+    /// source.min` and `source.max ≤ sink.max`, with absent bounds treated
+    /// as unbounded). Thus a source whose own pattern differs, whose range is
+    /// wider, or whose other refinement evidence does not establish the
+    /// sink's constraint is rejected.
     ///
-    /// Length compatibility is a strict subset check: `sink.min ≤
-    /// source.min` and `source.max ≤ sink.max`, treating absent bounds
-    /// as unbounded on that side. A source with `length: None` cannot
-    /// satisfy a sink with `length: Some(...)` — the source carries no
-    /// proof of its values' length range. Likewise for `pattern: None`
-    /// against `pattern: Some(_)`.
+    /// A completely unrefined source is intentionally different: it makes
+    /// no refinement claim that can conflict with the sink. Rule 10 accepts
+    /// its assignable primitive base only into an identity-less sink, then
+    /// leaves the sink's pattern/length value check to carina#3805. It never
+    /// supplies evidence for an identified custom type or Enum.
     ///
-    /// **Do not loosen these checks** without a concrete plan to track
-    /// regex-containment proofs through the type system. Loosening here
-    /// re-introduces the silent-false-positive class that #2218 closed.
+    /// **Do not loosen rule 8's evidence comparisons.** Accepting a wider or
+    /// differently refined source would re-introduce the silent-false-positive
+    /// class that #2218 closed. Rule 10's no-evidence exception is limited to
+    /// identity-less sinks and does not weaken those comparisons.
     pub fn is_assignable_to(self, sink: TypeInSchema<'_>) -> bool {
         let mut source_visited_refs = Vec::new();
         let mut sink_visited_refs = Vec::new();
@@ -3177,6 +3183,35 @@ impl<'source> TypeInSchema<'source> {
                     identity: Some(_), ..
                 },
             ) => false,
+            // A completely unrefined primitive source carries no competing
+            // refinement evidence. Identity-less sink metadata is a value
+            // constraint checked when the concrete value is known (#3805).
+            // The identified-sink arm above must remain ahead of this one.
+            (
+                String {
+                    identity: None,
+                    pattern: None,
+                    length: None,
+                    ..
+                },
+                String { identity: None, .. },
+            ) => true,
+            (
+                Int {
+                    identity: None,
+                    range: None,
+                    ..
+                },
+                Int { identity: None, .. },
+            ) => true,
+            (
+                Float {
+                    identity: None,
+                    range: None,
+                    ..
+                },
+                Float { identity: None, .. },
+            ) => true,
             (
                 String {
                     pattern: s_pat,
