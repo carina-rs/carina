@@ -125,17 +125,17 @@ The LSP supports formatting `.crn` files. In VS Code, use **Format Document** (S
 You can also format from the CLI:
 
 ```bash
-# Format a single file
-carina fmt main.crn
+# Format all .crn files in the current directory
+carina fmt
 
 # Format all .crn files in the current directory recursively
 carina fmt --recursive
 
 # Check formatting without modifying files
-carina fmt --check main.crn
+carina fmt --check
 
-# Show diff of formatting changes
-carina fmt --diff main.crn
+# Show diff of formatting changes without modifying files
+carina fmt --diff
 ```
 
 ## Troubleshooting

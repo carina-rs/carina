@@ -420,7 +420,7 @@ $ carina fmt -r
 # Check formatting without modifying files
 $ carina fmt --check
 
-# Show diff of formatting changes
+# Show diff of formatting changes without modifying files
 $ carina fmt --diff
 ```
 
