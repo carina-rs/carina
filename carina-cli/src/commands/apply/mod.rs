@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use colored::Colorize;
@@ -64,6 +64,15 @@ use carina_core::hint::ProjectCommand;
 pub type ApplyResult = ExecutionResult;
 
 type ObserverFactory<'a> = dyn Fn(&Plan) -> Box<dyn ExecutionObserver> + 'a;
+
+#[derive(serde::Deserialize)]
+struct PlanFileHeader {
+    version: u32,
+    #[serde(rename = "timestamp")]
+    _timestamp: serde::de::IgnoredAny,
+    #[serde(default)]
+    source_path: Option<serde_json::Value>,
+}
 
 fn cli_observer_factory(plan: &Plan) -> Box<dyn ExecutionObserver> {
     Box::new(CliObserver::new(plan))
@@ -230,6 +239,15 @@ fn saved_plan_replan_project_dir(source_path: &Path) -> &Path {
     } else {
         source_path
     }
+}
+
+fn saved_plan_replan_command(plan_path: &Path, source_path: &Path) -> String {
+    ApplyTarget::SavedPlan {
+        plan_file: plan_path,
+        source_dir: saved_plan_replan_project_dir(source_path),
+    }
+    .replan_command()
+    .to_string()
 }
 
 /// Execute all effects in a plan, resolving references dynamically.
@@ -1924,7 +1942,7 @@ fn ensure_saved_plan_backend_matches_current(
 }
 
 pub async fn run_apply_from_plan(
-    plan_path: &PathBuf,
+    plan_path: &Path,
     auto_approve: bool,
     lock: bool,
     parallelism: NonZeroUsize,
@@ -1948,7 +1966,7 @@ pub async fn run_apply_from_plan(
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_with_observer_factory(
-    plan_path: &PathBuf,
+    plan_path: &Path,
     auto_approve: bool,
     lock: bool,
     parallelism: NonZeroUsize,
@@ -1957,12 +1975,41 @@ async fn run_apply_from_plan_with_observer_factory(
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_>,
 ) -> Result<(), AppError> {
-    // Read and deserialize the plan file
-    let content =
-        fs::read_to_string(plan_path).map_err(|e| format!("Failed to read plan file: {}", e))?;
-    let plan_file: PlanFile =
-        serde_json::from_str(&content).map_err(|e| format!("Failed to parse plan file: {}", e))?;
-    let source_path = std::path::PathBuf::from(&plan_file.source_path);
+    let bytes = fs::read(plan_path).map_err(|source| AppError::PlanFileRead {
+        path: plan_path.to_path_buf(),
+        source,
+    })?;
+    let header: PlanFileHeader =
+        serde_json::from_slice(&bytes).map_err(|source| match source.classify() {
+            serde_json::error::Category::Data => AppError::InvalidPlanFile {
+                path: plan_path.to_path_buf(),
+                source,
+            },
+            serde_json::error::Category::Syntax
+            | serde_json::error::Category::Eof
+            | serde_json::error::Category::Io => AppError::UnreadableJsonPlanFile {
+                path: plan_path.to_path_buf(),
+                source,
+            },
+        })?;
+    if bytes
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        != Some(b'{')
+    {
+        return Err(AppError::InvalidPlanFile {
+            path: plan_path.to_path_buf(),
+            source: <serde_json::Error as serde::de::Error>::custom(
+                "expected a top-level JSON object",
+            ),
+        });
+    }
+    let replan_command = header
+        .source_path
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
     // Validate version compatibility. Plan-file version 10 persists
     // `Effect::Delete.generation`; older binaries would silently
@@ -1991,19 +2038,22 @@ async fn run_apply_from_plan_with_observer_factory(
     // view as the live-apply path (carina#3246). Older plans cannot be
     // applied by the post-#3248 binding-construction path and are
     // rejected outright per the repo's no-backward-compat policy.
-    if plan_file.version != PlanFile::CURRENT_VERSION {
-        return Err(AppError::Config(format!(
-            "Unsupported plan file version: {} (expected {}). \
-             Re-run `{}` to produce a plan in the current format.",
-            plan_file.version,
-            PlanFile::CURRENT_VERSION,
-            ApplyTarget::SavedPlan {
-                plan_file: plan_path,
-                source_dir: saved_plan_replan_project_dir(&source_path),
-            }
-            .replan_command()
-        )));
+    if header.version != PlanFile::CURRENT_VERSION {
+        return Err(AppError::UnsupportedPlanVersion {
+            path: plan_path.to_path_buf(),
+            found: header.version,
+            expected: PlanFile::CURRENT_VERSION,
+            replan_command,
+        });
     }
+
+    let plan_file: PlanFile =
+        serde_json::from_slice(&bytes).map_err(|source| AppError::CorruptPlanFile {
+            path: plan_path.to_path_buf(),
+            replan_command,
+            source,
+        })?;
+    let source_path = std::path::PathBuf::from(&plan_file.source_path);
     let apply_target = ApplyTarget::SavedPlan {
         plan_file: plan_path,
         source_dir: &source_path,

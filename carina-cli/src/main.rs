@@ -1,5 +1,6 @@
+use std::io::ErrorKind;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{CompleteEnv, Shell, generate};
@@ -87,7 +88,7 @@ enum Commands {
     },
     /// Apply changes to reach the desired state
     Apply {
-        /// Path to directory containing .crn files
+        /// Path to a project directory or a plan file written by `carina plan --out`
         #[arg(default_value = ".")]
         path: PathBuf,
 
@@ -265,6 +266,35 @@ enum SkillsCommands {
     Status,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyInput<'a> {
+    Project(&'a Path),
+    SavedPlan(&'a Path),
+}
+
+fn classify_apply_input(path: &Path) -> Result<ApplyInput<'_>, error::AppError> {
+    match path.metadata() {
+        Ok(metadata) if metadata.is_dir() => Ok(ApplyInput::Project(path)),
+        Ok(_) => Ok(ApplyInput::SavedPlan(path)),
+        Err(source) if source.kind() == ErrorKind::NotFound => match path.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(error::AppError::ApplyInputDanglingSymlink {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
+            _ => Err(error::AppError::ApplyInputNotFound {
+                path: path.to_path_buf(),
+                source,
+            }),
+        },
+        Err(source) => Err(error::AppError::ApplyInputInspection {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 /// Create the parser configuration with AWS KMS decryptor.
 ///
 /// Uses the tokio runtime to call KMS synchronously from within the parse-time
@@ -378,21 +408,10 @@ async fn main() {
                 lock,
                 parallelism,
                 accept_legacy_name_overrides,
-            } => {
-                if path.extension().is_some_and(|ext| ext == "json") {
+            } => match classify_apply_input(&path) {
+                Ok(ApplyInput::SavedPlan(plan_path)) => {
                     run_apply_from_plan(
-                        &path,
-                        auto_approve,
-                        lock,
-                        parallelism,
-                        accept_legacy_name_overrides,
-                        &provider_context,
-                        shutdown.clone(),
-                    )
-                    .await
-                } else {
-                    run_apply(
-                        &path,
+                        plan_path,
                         auto_approve,
                         lock,
                         parallelism,
@@ -402,7 +421,20 @@ async fn main() {
                     )
                     .await
                 }
-            }
+                Ok(ApplyInput::Project(project_path)) => {
+                    run_apply(
+                        project_path,
+                        auto_approve,
+                        lock,
+                        parallelism,
+                        accept_legacy_name_overrides,
+                        &provider_context,
+                        shutdown.clone(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            },
             Commands::Destroy {
                 path,
                 auto_approve,
