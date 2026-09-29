@@ -1348,7 +1348,7 @@ async fn execute_plan_returns_completed_when_not_cancelled() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1433,7 +1433,7 @@ async fn invalid_resolved_create_value_never_reaches_provider() {
     let schemas = provider_boundary_constraint_schemas();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1494,7 +1494,10 @@ async fn invalid_secret_create_value_is_masked_and_never_reaches_provider() {
     let observer = MockObserver::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &unresolved,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved,
+            data_source_origins: &[],
+        },
         compositions: &[],
         bindings,
         current_states: HashMap::new(),
@@ -1568,7 +1571,7 @@ async fn invalid_resolved_value_is_rejected_before_provider_normalization() {
     let schemas = provider_boundary_constraint_schemas();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1622,7 +1625,7 @@ async fn invalid_resolved_update_value_never_reaches_provider() {
     let schemas = provider_boundary_constraint_schemas();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1682,7 +1685,7 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
     let schemas = provider_boundary_constraint_schemas();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1743,10 +1746,16 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
     let mut plan = Plan::new();
     plan.add(create_effect(producer.clone()));
     plan.add(create_effect(consumer.clone()));
-    let unresolved = HashMap::from([(
-        consumer.id.clone(),
-        UnresolvedResource::from_pre_resolve(consumer.clone()),
-    )]);
+    let unresolved = HashMap::from([
+        (
+            producer.id.clone(),
+            UnresolvedResource::from_pre_resolve(producer.clone()),
+        ),
+        (
+            consumer.id.clone(),
+            UnresolvedResource::from_pre_resolve(consumer.clone()),
+        ),
+    ]);
     let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
         managed: &[producer, consumer],
         compositions: &[],
@@ -1758,7 +1767,10 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
     let schemas = provider_boundary_constraint_schemas();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &unresolved,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved,
+            data_source_origins: &[],
+        },
         compositions: &[],
         bindings,
         current_states: HashMap::new(),
@@ -1834,10 +1846,16 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
         to: resolved(planned_consumer.clone()),
         changed_attributes: vec!["target".to_string()],
     });
-    let unresolved = HashMap::from([(
-        consumer_id,
-        UnresolvedResource::from_pre_resolve(unresolved_consumer.clone()),
-    )]);
+    let unresolved = HashMap::from([
+        (
+            producer.id.clone(),
+            UnresolvedResource::from_pre_resolve(producer.clone()),
+        ),
+        (
+            consumer_id,
+            UnresolvedResource::from_pre_resolve(unresolved_consumer.clone()),
+        ),
+    ]);
     let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
         managed: &[producer, unresolved_consumer],
         compositions: &[],
@@ -1849,7 +1867,10 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
     let schemas = provider_boundary_constraint_schemas();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &unresolved,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved,
+            data_source_origins: &[],
+        },
         compositions: &[],
         bindings,
         current_states: HashMap::new(),
@@ -1921,7 +1942,7 @@ async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
     let schemas = deferred_child_constraint_schemas();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1997,7 +2018,7 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
     let schemas = deferred_data_source_constraint_schemas();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
         current_states: HashMap::new(),
@@ -2155,7 +2176,7 @@ async fn pending_module_validation_and_require_block_first_consuming_effect() {
     let observer = MockObserver::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2220,7 +2241,7 @@ async fn nested_forwarded_module_constraint_blocks_provider_dispatch() {
     let observer = MockObserver::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings,
         current_states: HashMap::new(),
@@ -2281,7 +2302,7 @@ async fn outer_module_constraint_blocks_nested_inner_consumer_provider_dispatch(
     plan.add(create_effect(inner_resource));
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&outer),
         bindings,
         current_states: HashMap::new(),
@@ -2351,7 +2372,7 @@ async fn module_export_constraint_blocks_top_level_consumer_provider_dispatch() 
     plan.add(create_effect(top_level));
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings,
         current_states: HashMap::new(),
@@ -2403,7 +2424,7 @@ async fn repeated_module_violation_blocks_every_dispatch_but_reports_once() {
     let observer = MockObserver::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2476,7 +2497,7 @@ async fn module_constraint_rechecks_after_binding_changes_in_same_apply() {
     plan.add(create_effect(second));
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings,
         current_states: HashMap::new(),
@@ -2529,7 +2550,7 @@ async fn unresolved_instance_constraint_waits_for_terminal_sweep() {
     let observer = MockObserver::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2590,7 +2611,7 @@ async fn unapplied_module_argument_reference_stays_pending_at_early_gate() {
     let observer = MockObserver::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2644,7 +2665,7 @@ async fn terminal_module_constraint_sweep_rejects_unconsumed_violation() {
     let observer = MockObserver::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings,
         current_states: HashMap::new(),
@@ -2684,7 +2705,7 @@ async fn terminal_module_constraint_sweep_rejects_still_pending_input() {
     let observer = MockObserver::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2730,7 +2751,7 @@ async fn terminal_pending_constraint_is_silent_after_failed_and_skipped_effects(
     let observer = MockObserver::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2798,7 +2819,7 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
     let observer = MockObserver::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
         current_states: HashMap::from([(target_id, pending_state)]),
@@ -2858,7 +2879,7 @@ async fn execute_plan_with_pre_cancelled_token_returns_cancelled_at_t4_or_later(
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2892,7 +2913,7 @@ async fn execute_plan_with_empty_plan_and_pre_cancelled_token_returns_completed(
     let plan = Plan::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2926,7 +2947,7 @@ async fn execute_plan_cancelled_after_three_completed_keeps_in_flight_and_drops_
     let plan = create_independent_create_plan(["r1", "r2", "r3", "r4", "r5"]);
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2982,7 +3003,7 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3046,7 +3067,7 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3105,7 +3126,7 @@ async fn execute_plan_cancelled_while_effect_in_flight_records_that_effect() {
     let plan = create_independent_create_plan(["r1", "r2", "r3"]);
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3140,7 +3161,7 @@ async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_ef
     let plan = create_independent_create_plan(["r1", "r2", "r3"]);
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3184,7 +3205,7 @@ async fn execute_plan_harvests_ready_effect_before_cleanup_priority() {
     let observer = MockObserver::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3239,7 +3260,7 @@ async fn execute_plan_cleanup_priority_abandons_a_pending_failure_refresh() {
     let observer = PrioritizeCleanupOnRefresh { trigger };
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3274,7 +3295,7 @@ async fn test_simple_create() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3322,7 +3343,7 @@ async fn partial_create_records_state_and_diagnostic() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3374,7 +3395,7 @@ async fn test_apply_renormalizes_after_resolution() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3458,7 +3479,10 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
     );
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &unresolved,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved,
+            data_source_origins: &[],
+        },
         compositions: &[],
         bindings,
         current_states: HashMap::new(),
@@ -3495,6 +3519,169 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
     );
 }
 
+/// A plan-normalized effect is invalid executor input unless its authored
+/// pre-normalization snapshot accompanies it. Treating a missing snapshot as
+/// authored silently turns the apply gate back into a full check of normalized
+/// values.
+#[tokio::test]
+async fn plan_normalized_resource_without_authored_origin_is_an_invariant_error() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let provider = MockProvider::new();
+    let mut planned = make_resource("missing-origin", &[]);
+    planned.set_attr(
+        "marker",
+        Value::Concrete(ConcreteValue::String("CANONICAL".to_string())),
+    );
+    let id = planned.id.clone();
+    provider.push_create(Ok(ok_state(&id)));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(planned));
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test").attribute(AttributeSchema::new(
+            "marker",
+            AttributeType::refined_string(None, Some("^raw_dsl$".to_string()), None, None),
+        )),
+    );
+    let resource_origins = HashMap::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &resource_origins,
+            data_source_origins: &[],
+        },
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let events = observer.events().join("\n");
+
+    assert_eq!(result.failure_count, 1);
+    assert!(
+        events.contains("missing authored value origin for plan-normalized resource"),
+        "expected an executor invariant error, got: {events}"
+    );
+    assert!(provider.captured_create_resources().is_empty());
+}
+
+/// Saved plans carry canonical provider input plus the authored source used to
+/// identify which attributes became known at apply. A literal canonicalized at
+/// plan time must not be rechecked merely because a sibling reference resolves.
+#[tokio::test]
+async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let provider = MockProvider::new();
+    let producer = make_resource("data-source-origin-producer", &[]);
+    let producer_id = producer.id.clone();
+
+    let mut authored = DataSource::with_provider("test", "Lookup", "origin-check", None);
+    authored.binding = Some("origin-check".to_string());
+    authored.set_attr(
+        "marker",
+        Value::Concrete(ConcreteValue::String("raw_dsl".to_string())),
+    );
+    authored.set_attr(
+        "runtime",
+        Value::resource_ref("data-source-origin-producer", "value", vec![]),
+    );
+    let data_source_id = authored.id.clone();
+
+    let mut planned = authored.clone();
+    planned.set_attr(
+        "marker",
+        Value::Concrete(ConcreteValue::String("CANONICAL".to_string())),
+    );
+
+    provider.push_create(Ok(State::existing(
+        producer_id.clone(),
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("known-at-apply".to_string())),
+        )]),
+    )
+    .with_identifier("producer-id")));
+    provider.push_read(Ok(
+        State::existing(data_source_id.clone(), HashMap::new()).with_identifier("lookup-id")
+    ));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(producer.clone()));
+    plan.add(Effect::Read {
+        resource: resolved_data_source(planned),
+    });
+
+    let mut deferred_reads = DeferredDataSourceReads::none();
+    deferred_reads.insert(
+        data_source_id.clone(),
+        unresolved_data_source_inputs(&authored),
+    );
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: std::slice::from_ref(&producer),
+        compositions: &[],
+        data_sources: std::slice::from_ref(&authored),
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+    let resource_origins = HashMap::from([(
+        producer_id.clone(),
+        UnresolvedResource::from_pre_resolve(producer.clone()),
+    )]);
+    let data_source_origins = [authored];
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("Lookup")
+            .as_data_source()
+            .attribute(AttributeSchema::new(
+                "marker",
+                AttributeType::refined_string(None, Some("^raw_dsl$".to_string()), None, None),
+            ))
+            .attribute(AttributeSchema::new("runtime", AttributeType::string())),
+    );
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &resource_origins,
+            data_source_origins: &data_source_origins,
+        },
+        compositions: &[],
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: deferred_reads,
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let events = observer.events().join("\n");
+
+    assert_eq!(result.failure_count, 0, "{events}");
+    assert_eq!(result.success_count, 2, "{events}");
+    assert_eq!(provider.captured_data_source_reads().len(), 1);
+}
+
 /// carina#3063: the apply path must also re-apply plan-time stage 3
 /// (enum-alias resolution, `get_enum_alias_reverse`), not just
 /// `normalize_desired` (stage 2). After plan-time normalization the
@@ -3525,7 +3712,7 @@ async fn test_apply_reapplies_enum_alias_stage() {
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AliasFactory)];
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3588,7 +3775,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AliasFactory)];
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3644,7 +3831,7 @@ async fn test_apply_reapplies_canonicalize_stage() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3705,7 +3892,7 @@ async fn test_apply_renormalizes_update_path() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3792,7 +3979,7 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3902,7 +4089,7 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3967,7 +4154,7 @@ async fn test_apply_effective_changed_skips_internal_and_write_only_attributes()
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4036,7 +4223,7 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4105,7 +4292,7 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4163,7 +4350,7 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4303,7 +4490,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
     };
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4371,7 +4558,7 @@ async fn test_simple_delete() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4411,7 +4598,7 @@ async fn test_failed_effect_propagates_to_dependent() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4451,7 +4638,7 @@ async fn test_observer_events_emitted_correctly() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4485,7 +4672,7 @@ async fn test_read_effect_is_no_op() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4530,7 +4717,7 @@ async fn test_independent_effects_run_in_parallel() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4585,7 +4772,7 @@ async fn test_parallel_failure_skips_dependents() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4637,7 +4824,7 @@ async fn test_dependency_levels_sequential_chain() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4881,7 +5068,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -5099,7 +5286,10 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> usize {
     let provider = YieldingUpdateProvider::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &unresolved_resources,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved_resources,
+            data_source_origins: &[],
+        },
         compositions: &[],
         bindings,
         current_states,
@@ -5170,7 +5360,10 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
     let provider = YieldingUpdateProvider::violates_unrelated_id();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &unresolved_resources,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved_resources,
+            data_source_origins: &[],
+        },
         compositions: &[],
         bindings,
         current_states,
@@ -5240,7 +5433,7 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -5507,7 +5700,7 @@ async fn test_update_effect_binding_map_propagation() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -5639,7 +5832,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -6025,7 +6218,10 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
     let provider = CascadeReplaceProvider::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &unresolved_resources,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved_resources,
+            data_source_origins: &[],
+        },
         compositions: &[],
         bindings,
         current_states,
@@ -6131,7 +6327,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -6282,7 +6478,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -6364,7 +6560,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -6485,7 +6681,7 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -6669,7 +6865,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -6882,7 +7078,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -6932,7 +7128,7 @@ async fn deferred_create_returns_error_when_upstream_binding_missing() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -6975,7 +7171,7 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -7026,7 +7222,7 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -7124,7 +7320,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -7218,7 +7414,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -7438,8 +7634,9 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
     let mut plan = Plan::new();
     let cert = resource_with_binding("cert", "cert");
     let cert_id = cert.id.clone();
+    let alb = resource_with_binding("alb", "alb");
     plan.add(create_effect(cert.clone()));
-    plan.add(create_effect(resource_with_binding("alb", "alb")));
+    plan.add(create_effect(alb.clone()));
     plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -7462,10 +7659,16 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
         template: Box::new(validation_deferred_for_expression()),
     })));
 
-    let unresolved = HashMap::from([(cert_id, UnresolvedResource::from_pre_resolve(cert.clone()))]);
+    let unresolved = HashMap::from([
+        (cert_id, UnresolvedResource::from_pre_resolve(cert.clone())),
+        (alb.id.clone(), UnresolvedResource::from_pre_resolve(alb)),
+    ]);
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &unresolved,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved,
+            data_source_origins: &[],
+        },
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -7654,7 +7857,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
         current_states,
@@ -7796,7 +7999,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
         current_states,
@@ -7932,7 +8135,7 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
         current_states,
@@ -8015,7 +8218,7 @@ async fn test_apply_time_data_source_read_retries_throttling_errors() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
         current_states,
@@ -8111,7 +8314,7 @@ async fn test_pre_apply_data_source_read_remains_noop_in_executor() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
         current_states,

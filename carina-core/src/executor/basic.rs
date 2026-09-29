@@ -10,16 +10,18 @@ use crate::differ::{
     AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
 };
 use crate::effect::{BasicEffect, DeletedInstanceKey, Effect, EffectGeneration};
-use crate::executor::UnresolvedResource;
-use crate::executor::prepare_provider_ready_resource;
-use crate::executor::provider_ready::prepare_provider_ready_resource_after_resolution;
+use crate::executor::provider_ready::{
+    CheckInput, ResolvedCheckInput, prepare_provider_ready_resource_after_resolution,
+};
 use crate::parser::ProviderConfig;
 use crate::provider::{
     CreateRequest, DeleteRequest, PartialReadDiagnostic, Provider, ProviderNormalizer,
     ProviderReadyResource, ReadRequest, UpdateOutcome, UpdateRequest,
 };
 use crate::resolver::resolve_ref_value;
-use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
+use crate::resource::{
+    ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, State, Value,
+};
 use crate::value::{SecretHashContext, SerializationContext, SerializationError};
 
 use super::wait::AppliedStates;
@@ -135,18 +137,63 @@ pub(super) async fn refresh_pending_states(
 /// that populate asynchronously (ACM `domain_validation_options`,
 /// CloudFront `domain_name`, etc.).
 pub(super) async fn resolve_resource(
-    resource: &Resource,
+    input: Result<CheckInput<Resource>, String>,
     bindings: &ResolvedBindings,
     pipeline: &RenormalizePipeline<'_>,
 ) -> Result<ProviderReadyResource, String> {
-    let mut resolved = resource.clone();
-    for (key, expr) in &resource.attributes {
-        let resolved_value = resolve_ref_value(expr, bindings)?;
-        assert_fully_resolved(&resolved_value, key, bindings)?;
-        resolved.attributes.insert(key.clone(), resolved_value);
-    }
-    prepare_provider_ready_resource(
-        resolved,
+    let input = input?;
+    let checked = match input {
+        CheckInput::Authored(source) => {
+            let mut resolved = source.clone();
+            for (key, expr) in &source.attributes {
+                let resolved_value = resolve_ref_value(expr, bindings)?;
+                assert_fully_resolved(&resolved_value, key, bindings)?;
+                resolved.attributes.insert(key.clone(), resolved_value);
+            }
+            ResolvedCheckInput::authored(resolved)
+        }
+        CheckInput::PlanNormalized {
+            resolved: target,
+            authored: source,
+        } => {
+            let mut resolved = target.clone();
+            let mut validation_attributes = source.resolved_attributes();
+            let mut apply_resolved_attributes = HashSet::new();
+            for (key, target_expr) in &target.attributes {
+                let source_expr = source.attributes.get(key);
+                let resolves_at_apply = source_expr.is_some_and(needs_apply_resolution);
+                let expr = source_expr
+                    .filter(|source_expr| needs_apply_resolution(source_expr))
+                    .unwrap_or(target_expr);
+                let resolved_value = resolve_ref_value(expr, bindings)?;
+                assert_fully_resolved(&resolved_value, key, bindings)?;
+                if resolves_at_apply {
+                    validation_attributes.insert(key.clone(), resolved_value.clone());
+                    apply_resolved_attributes.insert(key.clone());
+                }
+                resolved.attributes.insert(key.clone(), resolved_value);
+            }
+            for (key, source_expr) in &source.attributes {
+                if target.attributes.contains_key(key) {
+                    continue;
+                }
+                let resolved_value = resolve_ref_value(source_expr, bindings)?;
+                assert_fully_resolved(&resolved_value, key, bindings)?;
+                if needs_apply_resolution(source_expr) {
+                    validation_attributes.insert(key.clone(), resolved_value.clone());
+                    apply_resolved_attributes.insert(key.clone());
+                }
+                resolved.attributes.insert(key.clone(), resolved_value);
+            }
+            ResolvedCheckInput::plan_normalized(
+                resolved,
+                validation_attributes,
+                apply_resolved_attributes,
+            )
+        }
+    };
+    prepare_provider_ready_resource_after_resolution(
+        checked,
         bindings,
         pipeline.module_gate,
         pipeline.provider_configs,
@@ -183,92 +230,60 @@ fn needs_apply_resolution(value: &Value) -> bool {
     }
 }
 
-async fn resolve_create_resource_with_source(
-    target: &Resource,
-    source: &Resource,
+pub(super) fn resolve_data_source(
+    input: Result<CheckInput<DataSource>, String>,
     bindings: &ResolvedBindings,
-    pipeline: &RenormalizePipeline<'_>,
-) -> Result<ProviderReadyResource, String> {
-    let mut resolved = target.clone();
-    let mut validation_attributes = source.resolved_attributes();
-    let mut apply_resolved_attributes = HashSet::new();
-    for (key, target_expr) in &target.attributes {
-        let source_expr = source.attributes.get(key);
-        let resolves_at_apply = source_expr.is_some_and(needs_apply_resolution);
-        let expr = source_expr
-            .filter(|source_expr| needs_apply_resolution(source_expr))
-            .unwrap_or(target_expr);
-        let resolved_value = resolve_ref_value(expr, bindings)?;
-        assert_fully_resolved(&resolved_value, key, bindings)?;
-        if resolves_at_apply {
-            validation_attributes.insert(key.clone(), resolved_value.clone());
-            apply_resolved_attributes.insert(key.clone());
+) -> Result<ResolvedCheckInput<DataSource>, String> {
+    match input? {
+        CheckInput::Authored(source) => {
+            let mut resolved = source.clone();
+            for (key, expr) in &source.attributes {
+                let resolved_value = resolve_ref_value(expr, bindings)?;
+                assert_fully_resolved(&resolved_value, key, bindings)?;
+                resolved.attributes.insert(key.clone(), resolved_value);
+            }
+            Ok(ResolvedCheckInput::authored(resolved))
         }
-        resolved.attributes.insert(key.clone(), resolved_value);
+        CheckInput::PlanNormalized {
+            resolved: target,
+            authored: source,
+        } => {
+            let mut resolved = target.clone();
+            let mut validation_attributes = crate::resource::attrs_to_hashmap(&source.attributes);
+            let mut apply_resolved_attributes = HashSet::new();
+            for (key, target_expr) in &target.attributes {
+                let source_expr = source.attributes.get(key);
+                let resolves_at_apply = source_expr.is_some_and(needs_apply_resolution);
+                let expr = source_expr
+                    .filter(|source_expr| needs_apply_resolution(source_expr))
+                    .unwrap_or(target_expr);
+                let resolved_value = resolve_ref_value(expr, bindings)?;
+                assert_fully_resolved(&resolved_value, key, bindings)?;
+                if resolves_at_apply {
+                    validation_attributes.insert(key.clone(), resolved_value.clone());
+                    apply_resolved_attributes.insert(key.clone());
+                }
+                resolved.attributes.insert(key.clone(), resolved_value);
+            }
+            for (key, source_expr) in &source.attributes {
+                if target.attributes.contains_key(key) {
+                    continue;
+                }
+                let resolved_value = resolve_ref_value(source_expr, bindings)?;
+                assert_fully_resolved(&resolved_value, key, bindings)?;
+                if needs_apply_resolution(source_expr) {
+                    validation_attributes.insert(key.clone(), resolved_value.clone());
+                    apply_resolved_attributes.insert(key.clone());
+                }
+                resolved.attributes.insert(key.clone(), resolved_value);
+            }
+            Ok(ResolvedCheckInput::plan_normalized(
+                resolved,
+                validation_attributes,
+                apply_resolved_attributes,
+            ))
+        }
     }
-    for (key, source_expr) in &source.attributes {
-        if target.attributes.contains_key(key) {
-            continue;
-        }
-        let resolved_value = resolve_ref_value(source_expr, bindings)?;
-        assert_fully_resolved(&resolved_value, key, bindings)?;
-        if needs_apply_resolution(source_expr) {
-            validation_attributes.insert(key.clone(), resolved_value.clone());
-            apply_resolved_attributes.insert(key.clone());
-        }
-        resolved.attributes.insert(key.clone(), resolved_value);
-    }
-    prepare_provider_ready_resource_after_resolution(
-        resolved,
-        &validation_attributes,
-        &apply_resolved_attributes,
-        bindings,
-        pipeline.module_gate,
-        pipeline.provider_configs,
-        pipeline.normalizer,
-        pipeline.factories,
-        pipeline.schemas,
-    )
-    .await
-    .map_err(|err| err.to_string())
-}
-
-/// Resolve a resource, preferring unresolved source for re-resolution.
-/// Secret values are unwrapped so the provider receives the plain inner value.
-///
-/// See [`resolve_resource`] for the fail-fast contract on
-/// still-deferred values.
-pub(super) async fn resolve_resource_with_source(
-    target: &Resource,
-    source: &Resource,
-    bindings: &ResolvedBindings,
-    pipeline: &RenormalizePipeline<'_>,
-) -> Result<ProviderReadyResource, String> {
-    let mut resolved = target.clone();
-    let mut validation_attributes = source.resolved_attributes();
-    let mut apply_resolved_attributes = HashSet::new();
-    for (key, expr) in &source.attributes {
-        let resolved_value = resolve_ref_value(expr, bindings)?;
-        assert_fully_resolved(&resolved_value, key, bindings)?;
-        if needs_apply_resolution(expr) {
-            validation_attributes.insert(key.clone(), resolved_value.clone());
-            apply_resolved_attributes.insert(key.clone());
-        }
-        resolved.attributes.insert(key.clone(), resolved_value);
-    }
-    prepare_provider_ready_resource_after_resolution(
-        resolved,
-        &validation_attributes,
-        &apply_resolved_attributes,
-        bindings,
-        pipeline.module_gate,
-        pipeline.provider_configs,
-        pipeline.normalizer,
-        pipeline.factories,
-        pipeline.schemas,
-    )
-    .await
-    .map_err(|err| err.to_string())
 }
 
 #[cfg(test)]
@@ -533,7 +548,8 @@ pub(super) fn count_actionable_effects(effects: &[Effect]) -> usize {
 pub(super) struct BasicEffectCtx<'a> {
     pub(super) provider: &'a dyn Provider,
     pub(super) bindings: &'a ResolvedBindings,
-    pub(super) unresolved: &'a HashMap<ResourceId, UnresolvedResource>,
+    pub(super) provider_check_inputs: &'a super::ProviderCheckInputs<'a>,
+    pub(super) runtime_authored: bool,
     pub(super) pipeline: &'a RenormalizePipeline<'a>,
     pub(super) completed: &'a AtomicUsize,
     pub(super) total: usize,
@@ -559,7 +575,6 @@ pub(super) async fn execute_basic_effect<'a>(
 ) -> BasicEffectResult {
     let provider = ctx.provider;
     let bindings = ctx.bindings;
-    let unresolved = ctx.unresolved;
     let pipeline = ctx.pipeline;
     let completed = ctx.completed;
     let total = ctx.total;
@@ -574,17 +589,10 @@ pub(super) async fn execute_basic_effect<'a>(
 
     match basic {
         BasicEffect::Create { resource, .. } => {
-            let resolved = match if let Some(resolve_source) = unresolved.get(&resource.id) {
-                resolve_create_resource_with_source(
-                    resource,
-                    resolve_source.as_resource(),
-                    bindings,
-                    pipeline,
-                )
-                .await
-            } else {
-                resolve_resource(resource, bindings, pipeline).await
-            } {
+            let check_input = ctx
+                .provider_check_inputs
+                .resource_input(resource.as_inner(), ctx.runtime_authored);
+            let resolved = match resolve_resource(check_input, bindings, pipeline).await {
                 Ok(r) => r,
                 Err(e) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {
@@ -653,12 +661,18 @@ pub(super) async fn execute_basic_effect<'a>(
             ..
         } => {
             let id = &to.id;
-            let source = unresolved.get(id).map(UnresolvedResource::as_resource);
-            let resolved_to = match if let Some(resolve_source) = source {
-                resolve_resource_with_source(to, resolve_source, bindings, pipeline).await
-            } else {
-                resolve_resource(to, bindings, pipeline).await
-            } {
+            let check_input = ctx
+                .provider_check_inputs
+                .resource_input(to.as_inner(), ctx.runtime_authored);
+            let resolve_source = check_input
+                .as_ref()
+                .ok()
+                .and_then(|input| match input {
+                    CheckInput::Authored(_) => None,
+                    CheckInput::PlanNormalized { authored, .. } => Some(authored.clone()),
+                })
+                .unwrap_or_else(|| to.as_inner().clone());
+            let resolved_to = match resolve_resource(check_input, bindings, pipeline).await {
                 Ok(r) => r,
                 Err(e) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {
@@ -670,7 +684,6 @@ pub(super) async fn execute_basic_effect<'a>(
                     return BasicEffectResult::Failure { refresh: None };
                 }
             };
-            let resolve_source = source.unwrap_or(to.as_inner());
             let identifier = from.identifier.as_deref().unwrap_or("");
             // Augment plan-time `changed_attributes` with any
             // ResourceRef-derived attributes whose resolved value at

@@ -34,7 +34,7 @@ use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::create_plan;
 use carina_core::executor::{
     DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
-    UnresolvedResource, execute_plan,
+    ProviderCheckInputs, UnresolvedResource, execute_plan,
 };
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
@@ -574,7 +574,10 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     };
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &unresolved_resources,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved_resources,
+            data_source_origins: &parsed.data_sources,
+        },
         compositions: &parsed.compositions,
         bindings: ResolvedBindings::default(),
         current_states,

@@ -93,6 +93,12 @@ pub struct PlanFile {
     /// bindings.
     #[serde(default)]
     pub data_sources: Vec<carina_core::resource::DataSource>,
+    /// Authored, pre-normalization counterparts of `data_sources`, paired by
+    /// index and rewritten to the resolved IDs above. Apply uses these to
+    /// derive which input attributes became known at runtime without
+    /// rechecking canonicalized literals as authored values.
+    #[serde(default)]
+    pub data_source_origins: Vec<carina_core::resource::DataSource>,
     /// Current states (for binding_map + state saving)
     pub current_states: Vec<CurrentStateEntry>,
     /// `upstream_state` bindings as resolved at plan time (#2303).
@@ -126,7 +132,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 11;
+    pub const CURRENT_VERSION: u32 = 12;
 
     pub(crate) fn validate_replace_display(&self) -> Result<(), String> {
         let effects = self.plan.effects();
@@ -291,6 +297,11 @@ fn build_plan_file<E>(
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
 ) -> Result<PlanFile, carina_core::value::SerializationError> {
+    assert_eq!(
+        ctx.data_sources.len(),
+        parsed.data_sources.len(),
+        "plan data sources must stay paired with their authored origins"
+    );
     let source_path = path
         .canonicalize()
         .unwrap_or_else(|_| path.to_path_buf())
@@ -298,6 +309,12 @@ fn build_plan_file<E>(
         .to_string();
 
     Ok(PlanFile {
+        // carina#3805: bumped 11→12 — `data_source_origins` preserves the
+        // authored input paired with each canonical plan-time data source so
+        // apply can validate only values that become known at runtime.
+        // A v11 plan cannot distinguish normalized literals from authored
+        // values at the provider gate.
+        //
         // carina#3805: bumped 10→11 — `compositions` now stores the
         // post-preprocessing pending module constraints required by apply.
         // A v10 plan cannot enforce those constraints at the provider gate.
@@ -355,6 +372,16 @@ fn build_plan_file<E>(
             .data_sources
             .iter()
             .map(carina_core::value::redact_secrets_in_data_source)
+            .collect::<Result<Vec<_>, _>>()?,
+        data_source_origins: ctx
+            .data_sources
+            .iter()
+            .zip(&parsed.data_sources)
+            .map(|(resolved, authored)| {
+                let mut authored = authored.clone();
+                authored.id = resolved.id.clone();
+                carina_core::value::redact_secrets_in_data_source(&authored)
+            })
             .collect::<Result<Vec<_>, _>>()?,
         current_states: ctx
             .current_states
@@ -1863,6 +1890,13 @@ mod run_plan_out_tests {
         assert!(
             matches!(saved, Value::Deferred(DeferredValue::ResourceRef { .. })),
             "saved plans must preserve deferred data-source refs for apply --plan, got {saved:?}"
+        );
+        assert_eq!(
+            plan_file.data_source_origins[0].get_attr("name_regex"),
+            Some(&Value::Concrete(
+                carina_core::resource::ConcreteValue::String("^target$".to_string())
+            )),
+            "saved plans must separately preserve the authored pre-normalization input"
         );
     }
 

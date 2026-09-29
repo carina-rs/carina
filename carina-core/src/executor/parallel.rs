@@ -11,9 +11,11 @@ use crate::provider::Provider;
 use crate::resource::{Resource, ResourceId, Value};
 use crate::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
+#[cfg(test)]
+use super::ProviderCheckInputs;
 use super::basic::{
     BasicEffectCtx, ExecutionState, RenormalizePipeline, count_actionable_effects,
-    execute_basic_effect, process_basic_result, refresh_pending_states,
+    execute_basic_effect, process_basic_result, refresh_pending_states, resolve_data_source,
 };
 use super::deferred_dispatch::PureMetaCtx;
 use super::replace::SingleEffectResult;
@@ -228,6 +230,7 @@ pub(super) async fn execute_effects_sequential(
     let permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
     let mut runtime_synthesized_resources: Vec<Resource> = Vec::new();
+    let mut runtime_authored_resource_ids: HashSet<ResourceId> = HashSet::new();
     let module_gate = super::ModuleConstraintGate::new(input.compositions);
 
     let ExpandedEffects {
@@ -238,9 +241,14 @@ pub(super) async fn execute_effects_sequential(
     let mut total = count_runtime_effects(&effects, &input.deferred_data_source_reads);
     let completed = AtomicUsize::new(0);
 
+    let empty_resource_origins = HashMap::new();
+    let resource_origins = input
+        .provider_check_inputs
+        .resource_origins()
+        .unwrap_or(&empty_resource_origins);
     let mut deps_of = build_scheduler_deps(
         &effects,
-        input.unresolved_resources,
+        resource_origins,
         input.compositions,
         &deferred_replace_delete_deps,
     );
@@ -393,6 +401,7 @@ pub(super) async fn execute_effects_sequential(
                         for child in children {
                             let child_idx = effects.len();
                             if let Effect::Create(resource) = &child {
+                                runtime_authored_resource_ids.insert(resource.id.clone());
                                 runtime_synthesized_resources.push(resource.clone().into_inner());
                             }
                             if let Some(binding) = failure_binding_name(&child) {
@@ -403,7 +412,7 @@ pub(super) async fn execute_effects_sequential(
                         }
                         deps_of = build_scheduler_deps(
                             &effects,
-                            input.unresolved_resources,
+                            resource_origins,
                             input.compositions,
                             &deferred_replace_delete_deps,
                         );
@@ -417,7 +426,8 @@ pub(super) async fn execute_effects_sequential(
             // Snapshot bindings for this effect's resolution.
             let binding_snapshot = input.bindings.clone();
             let wait_identifiers = wait_identifiers.clone();
-            let unresolved = &input.unresolved_resources;
+            let provider_check_inputs = &input.provider_check_inputs;
+            let runtime_authored = runtime_authored_resource_ids.contains(effect.resource_id());
             let pipeline = RenormalizePipeline {
                 module_gate: &module_gate,
                 normalizer: input.normalizer,
@@ -444,7 +454,8 @@ pub(super) async fn execute_effects_sequential(
                             &BasicEffectCtx {
                                 provider,
                                 bindings: &binding_snapshot,
-                                unresolved,
+                                provider_check_inputs,
+                                runtime_authored,
                                 pipeline: &pipeline,
                                 completed: completed_ref,
                                 total,
@@ -472,16 +483,15 @@ pub(super) async fn execute_effects_sequential(
                             };
                             let mut resolved = resource.as_inner().clone();
                             let outcome = {
-                                let resolved_slice = std::slice::from_mut(&mut resolved);
-                                match crate::resolver::resolve_data_source_refs(
-                                    resolved_slice,
-                                    &binding_snapshot,
-                                ) {
-                                    Ok(()) => {
-                                        let unresolved = unresolved_data_source_inputs(&resolved);
+                                let check_input =
+                                    provider_check_inputs.data_source_input(resource.as_inner());
+                                match resolve_data_source(check_input, &binding_snapshot) {
+                                    Ok(resolved_input) => {
+                                        let unresolved =
+                                            unresolved_data_source_inputs(resolved_input.value());
                                         if unresolved.is_empty() {
-                                            match super::prepare_provider_ready_data_source(
-                                                resolved.clone(),
+                                            match super::provider_ready::prepare_provider_ready_data_source_after_resolution(
+                                                resolved_input,
                                                 &binding_snapshot,
                                                 pipeline.module_gate,
                                                 pipeline.factories,
@@ -1101,7 +1111,10 @@ mod tests {
         let schemas = SchemaRegistry::new();
         let mut input = ExecutionInput {
             plan: &plan,
-            unresolved_resources: &unresolved,
+            provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+                resource_origins: &unresolved,
+                data_source_origins: &[],
+            },
             compositions: &[],
             bindings: Default::default(),
             current_states: HashMap::new(),
@@ -1211,7 +1224,10 @@ mod tests {
         let schemas = SchemaRegistry::new();
         let mut input = ExecutionInput {
             plan: &plan,
-            unresolved_resources: &unresolved,
+            provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+                resource_origins: &unresolved,
+                data_source_origins: &[],
+            },
             compositions: &[],
             bindings: Default::default(),
             current_states: HashMap::new(),

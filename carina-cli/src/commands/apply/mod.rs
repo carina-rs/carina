@@ -14,7 +14,7 @@ use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
 use carina_core::executor::{
     DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
-    UnresolvedResource,
+    ProviderCheckInputs, UnresolvedResource,
 };
 use carina_core::override_aware::OverrideAwareResources;
 use carina_core::plan::Plan;
@@ -228,6 +228,7 @@ pub async fn execute_effects(
     bindings: &mut ResolvedBindings,
     current_states: &mut HashMap<ResourceId, State>,
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
+    data_source_origins: &[DataSource],
     compositions: &[carina_core::resource::Composition],
     cancel: ShutdownToken,
     parallelism: NonZeroUsize,
@@ -243,6 +244,7 @@ pub async fn execute_effects(
         bindings,
         current_states,
         unresolved_resources,
+        data_source_origins,
         compositions,
         DeferredDataSourceReads::none(),
         cancel.clone(),
@@ -263,6 +265,7 @@ async fn execute_effects_with_observer(
     bindings: &mut ResolvedBindings,
     current_states: &mut HashMap<ResourceId, State>,
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
+    data_source_origins: &[DataSource],
     compositions: &[carina_core::resource::Composition],
     deferred_data_source_reads: DeferredDataSourceReads,
     cancel: ShutdownToken,
@@ -271,7 +274,10 @@ async fn execute_effects_with_observer(
 ) -> ExecutionOutcome {
     let input = ExecutionInput {
         plan,
-        unresolved_resources,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: unresolved_resources,
+            data_source_origins,
+        },
         compositions,
         bindings: bindings.clone(),
         current_states: std::mem::take(current_states),
@@ -1812,6 +1818,7 @@ async fn run_apply_locked(
         &mut bindings,
         &mut current_states,
         &unresolved_resources,
+        &data_sources,
         &pre_resolve_compositions,
         deferred_data_source_reads,
         cancel.clone(),
@@ -2147,6 +2154,8 @@ async fn run_apply_from_plan_locked(
     let sorted_resources = &plan_file.sorted_resources;
     let plan_compositions: &[carina_core::resource::Composition] = &plan_file.compositions;
     let plan_data_sources: &[carina_core::resource::DataSource] = &plan_file.data_sources;
+    let plan_data_source_origins: &[carina_core::resource::DataSource] =
+        &plan_file.data_source_origins;
 
     // Rebuild planned current_states HashMap from plan file
     let planned_states: HashMap<ResourceId, State> = plan_file
@@ -2155,7 +2164,7 @@ async fn run_apply_from_plan_locked(
         .map(|entry| (entry.id, entry.state))
         .collect();
     let deferred_data_source_reads = deferred_data_source_reads_from_data_sources(
-        plan_data_sources,
+        plan_data_source_origins,
         sorted_resources,
         &planned_states,
     );
@@ -2320,6 +2329,7 @@ async fn run_apply_from_plan_locked(
         &mut bindings,
         &mut current_states,
         &unresolved_resources,
+        plan_data_source_origins,
         plan_compositions,
         deferred_data_source_reads,
         cancel.clone(),

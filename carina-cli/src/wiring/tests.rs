@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use carina_core::effect::PlanOp;
 use carina_core::executor::{
     DeferredDataSourceReads, ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionOutcome,
-    UnresolvedResource, execute_plan,
+    ProviderCheckInputs, UnresolvedResource, execute_plan,
 };
 use carina_core::provider::{
     BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, ProviderResult, ReadRequest,
@@ -2101,7 +2101,10 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     let provider = CascadeCreateProvider::default();
     let input = ExecutionInput {
         plan: &plan_ctx.plan,
-        unresolved_resources: &unresolved_resources,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved_resources,
+            data_source_origins: &plan_ctx.data_sources,
+        },
         compositions: &[],
         bindings,
         current_states: plan_ctx.current_states,

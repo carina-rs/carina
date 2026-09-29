@@ -1268,7 +1268,8 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         sorted_resources: vec![target.clone(), consumer.clone()],
         unresolved_resources: vec![target, consumer],
         compositions: Vec::new(),
-        data_sources: vec![lookup],
+        data_sources: vec![lookup.clone()],
+        data_source_origins: vec![lookup],
         current_states: vec![
             crate::commands::plan::CurrentStateEntry {
                 id: target_id,
@@ -1391,6 +1392,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         unresolved_resources: vec![producer, consumer],
         compositions: vec![composition],
         data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
         current_states: vec![
             crate::commands::plan::CurrentStateEntry {
                 id: producer_id.clone(),
@@ -1453,6 +1455,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         unresolved_resources: Vec::new(),
         compositions: vec![saved_module_composition(string_value("bad"), "bad")],
         data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
         current_states: Vec::new(),
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
@@ -4510,11 +4513,11 @@ mod saved_plan_version_tests {
     }
 
     #[tokio::test]
-    async fn version_10_saved_plan_is_rejected_after_constraint_persistence_bump() {
+    async fn version_11_saved_plan_is_rejected_without_data_source_origins() {
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
-        let v10 = serde_json::json!({
-            "version": 10,
+        let v11 = serde_json::json!({
+            "version": 11,
             "carina_version": "0.4.0",
             "timestamp": "2026-07-02T00:00:00Z",
             "source_path": "test.crn",
@@ -4532,7 +4535,7 @@ mod saved_plan_version_tests {
             "upstream_sources": [],
             "wait_bindings": [],
         });
-        std::fs::write(&plan_path, serde_json::to_string(&v10).unwrap()).expect("write plan");
+        std::fs::write(&plan_path, serde_json::to_string(&v11).unwrap()).expect("write plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
             &plan_path,
@@ -4545,15 +4548,15 @@ mod saved_plan_version_tests {
         )
         .await;
 
-        let err = result.expect_err("v10 saved plan must be rejected after v11 bump");
+        let err = result.expect_err("v11 saved plan must be rejected after v12 bump");
         let msg = err.to_string();
         assert!(
-            msg.contains("Unsupported plan file version: 10"),
-            "error must name the rejected v10 version, got: {msg}",
+            msg.contains("Unsupported plan file version: 11"),
+            "error must name the rejected v11 version, got: {msg}",
         );
         assert!(
-            msg.contains("expected 11"),
-            "error must name the v11 expected version, got: {msg}",
+            msg.contains("expected 12"),
+            "error must name the v12 expected version, got: {msg}",
         );
     }
 
@@ -4620,6 +4623,7 @@ mod saved_plan_version_tests {
             unresolved_resources: vec![resource],
             compositions: Vec::new(),
             data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
             current_states: vec![crate::commands::plan::CurrentStateEntry {
                 id,
                 state: current_state,
