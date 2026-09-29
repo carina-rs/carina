@@ -437,7 +437,6 @@ fn decode_base64(kind: &str, encoded: &str) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine as _;
     use serde_json::{Value, json};
 
     use super::*;
