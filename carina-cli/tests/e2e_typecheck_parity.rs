@@ -110,6 +110,69 @@ fn cli_diagnostics(factories: Vec<Box<dyn ProviderFactory>>, fixture: &TempDir) 
     carina_cli::commands::validate::validate_with_factories(&path, factories)
 }
 
+#[test]
+fn module_validation_evaluation_error_is_reported_once_with_cli_lsp_parity() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let module = fixture.path().join("checked");
+    std::fs::create_dir_all(&module).expect("create module directory");
+    std::fs::write(
+        module.join("main.crn"),
+        r#"arguments {
+  x: String {
+    validation {
+      condition     = x > 5
+      error_message = "x must be greater than five"
+    }
+  }
+}
+"#,
+    )
+    .expect("write module");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"let checked = use { source = './checked' }
+
+let instance = checked {
+  x = "abc"
+}
+"#,
+    )
+    .expect("write root configuration");
+
+    let lsp_diags = lsp_diagnostics(
+        &engine_with_schemas(SchemaRegistry::new()),
+        &fixture,
+        "main.crn",
+    );
+    let cli_diags = cli_diagnostics(Vec::new(), &fixture);
+    let lsp_constraint_messages = lsp_diags
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Validation failed for argument 'x'")
+        })
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    let cli_constraint_messages = cli_diags
+        .iter()
+        .filter(|diagnostic| diagnostic.contains("Validation failed for argument 'x'"))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        lsp_constraint_messages.len(),
+        1,
+        "LSP must report the evaluator error once: {lsp_constraint_messages:#?}; all diagnostics: {lsp_diags:#?}"
+    );
+    assert_eq!(
+        cli_constraint_messages.len(),
+        1,
+        "CLI must report the evaluator error once: {cli_constraint_messages:#?}; all diagnostics: {cli_diags:#?}"
+    );
+    assert_eq!(lsp_constraint_messages, cli_constraint_messages);
+}
+
 // NOTE: case-sensitive `contains`. LSP and CLI surfaces sometimes
 // differ in casing (e.g. "Type mismatch" vs "type mismatch") because
 // some diagnostics originate in carina-lsp and others in carina-core.

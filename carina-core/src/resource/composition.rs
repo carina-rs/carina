@@ -216,6 +216,18 @@ impl ModuleConstraintId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The argument owned by an argument-local validation constraint.
+    ///
+    /// `validation` blocks are nested in an argument declaration and may
+    /// evaluate only against that argument. Keeping that scope encoded in the
+    /// stable constraint ID lets saved plans preserve the language rule
+    /// without adding a second, independently maintained discriminator.
+    pub fn validation_argument(&self) -> Option<&str> {
+        self.0
+            .strip_prefix("argument:")
+            .and_then(|rest| rest.rsplit_once(':').map(|(argument, _)| argument))
+    }
 }
 
 /// A module constraint whose referenced arguments were not fully known at

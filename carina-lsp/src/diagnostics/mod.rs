@@ -443,9 +443,6 @@ impl DiagnosticEngine {
                             .as_ref()
                             .and_then(|result| result.module_error_owner.as_deref()),
                     )
-                    && diagnostics
-                        .iter()
-                        .all(|existing| existing.message != diagnostic.message)
                 {
                     diagnostics.push(diagnostic);
                 }

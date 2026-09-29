@@ -695,9 +695,9 @@ impl DiagnosticEngine {
     }
 
     /// Anchor a concrete nested module-constraint resolver failure at the
-    /// root call that owns its instance path. Direct-call failures normally
-    /// come from `check_module_calls`; callers deduplicate the identical
-    /// message before adding this fallback.
+    /// root call that owns its instance path. Direct-call constraints are
+    /// emitted solely by `check_module_calls` from the shared core result;
+    /// this fallback owns only failures below that root call.
     pub(super) fn module_resolver_constraint_diagnostic(
         &self,
         doc: &Document,
@@ -705,15 +705,14 @@ impl DiagnosticEngine {
         error: &carina_core::module_resolver::ModuleError,
         owner: Option<&str>,
     ) -> Option<Diagnostic> {
-        let (instance, argument) = match error {
+        let instance = match error {
             carina_core::module_resolver::ModuleError::ArgumentValidationFailed {
                 instance,
-                argument,
                 ..
-            } => (instance.as_str(), Some(argument.as_str())),
+            } => instance.as_str(),
             carina_core::module_resolver::ModuleError::RequireConstraintFailed {
                 instance, ..
-            } => (instance.as_str(), None),
+            } => instance.as_str(),
             _ => return None,
         };
 
@@ -731,18 +730,13 @@ impl DiagnosticEngine {
                 if !owns_failure {
                     return None;
                 }
+                if instance == root_instance {
+                    return None;
+                }
                 let occurrence = module_call_occurrence(&parsed.module_calls, call_index)?;
-                let argument_position = (instance == root_instance)
-                    .then_some(argument)
-                    .flatten()
-                    .and_then(|name| {
-                        self.find_module_call_arg_position(doc, call, occurrence, name)
-                            .map(|(line, col)| (line, col, name.chars().count() as u32))
-                    });
-                let (line, col, width) = argument_position.or_else(|| {
-                    self.find_module_call_position(doc, call, occurrence)
-                        .map(|(line, col)| (line, col, call.module_name.chars().count() as u32))
-                })?;
+                let (line, col, width) = self
+                    .find_module_call_position(doc, call, occurrence)
+                    .map(|(line, col)| (line, col, call.module_name.chars().count() as u32))?;
                 Some(carina_diagnostic(
                     line,
                     col,
@@ -1300,147 +1294,40 @@ impl DiagnosticEngine {
                     }
                 }
 
-                // Run the same tri-state value-constraint evaluator used by
-                // module expansion. Reference-valued arguments remain
-                // pending; only concrete violations become editor errors.
-                for argument in module_args {
-                    let Some(value) = argument_values.get(&argument.name) else {
-                        // The missing-argument diagnostic above owns this
-                        // case. Do not turn it into a second constraint error.
+                for evaluated in carina_core::module_resolver::evaluate_module_constraints(
+                    carina_core::module_resolver::ModuleConstraints::declarations(
+                        module_args,
+                        &signature.requires,
+                    ),
+                    &argument_values,
+                ) {
+                    let Some(error) = evaluated.module_error(&call.module_name, &instance) else {
                         continue;
                     };
-                    for validation in &argument.validations {
-                        let authored_message =
-                            validation.error_message.clone().unwrap_or_else(|| {
-                                format!("validation failed for argument '{}'", argument.name)
-                            });
-                        let evaluation = carina_core::module_resolver::evaluate_constraint(
-                            &validation.condition,
-                            &argument_values,
-                            authored_message.clone(),
-                        );
-                        let message = match evaluation {
-                            Ok(carina_core::module_resolver::ConstraintEvaluation::Satisfied)
-                            | Ok(carina_core::module_resolver::ConstraintEvaluation::Pending) => {
-                                continue;
-                            }
-                            Ok(carina_core::module_resolver::ConstraintEvaluation::Violated(
-                                violation,
-                            )) => {
-                                let actual = violation
-                                    .actuals
-                                    .iter()
-                                    .find(|(name, _)| name == &argument.name)
-                                    .map(|(_, rendered)| rendered.clone())
-                                    .unwrap_or_else(|| carina_core::value::format_value(value));
-                                format!(
-                                    "Validation failed for argument '{}' in module '{}' instance '{}': {} (got {})",
-                                    argument.name,
-                                    call.module_name,
-                                    instance,
-                                    violation.message,
-                                    actual,
-                                )
-                            }
-                            Err(error) => format!(
-                                "Validation failed for argument '{}' in module '{}' instance '{}': {} (error evaluating constraint: {}; got {})",
-                                argument.name,
-                                call.module_name,
-                                instance,
-                                authored_message,
-                                error,
-                                carina_core::value::format_value(value),
-                            ),
-                        };
-                        let position = self
+                    let position = match evaluated.kind() {
+                        carina_core::module_resolver::ModuleConstraintKind::ArgumentValidation {
+                            argument,
+                        } => self
                             .find_module_call_arg_position(
                                 doc,
                                 call,
                                 call_occurrence,
-                                &argument.name,
+                                argument,
                             )
-                            .or_else(|| self.find_module_call_position(doc, call, call_occurrence));
-                        if let Some((line, col)) = position {
-                            diagnostics.push(carina_diagnostic(
-                                line,
-                                col,
-                                col + argument.name.chars().count() as u32,
-                                DiagnosticSeverity::ERROR,
-                                message,
-                            ));
-                        }
-                    }
-                }
-
-                for require in &signature.requires {
-                    let referenced = carina_core::module_resolver::referenced_constraint_arguments(
-                        &require.condition,
-                    );
-                    if referenced
-                        .iter()
-                        .any(|argument| !argument_values.contains_key(argument))
-                    {
-                        // Missing arguments are already reported above.
-                        continue;
-                    }
-                    let evaluation = carina_core::module_resolver::evaluate_constraint(
-                        &require.condition,
-                        &argument_values,
-                        require.error_message.clone(),
-                    );
-                    let message = match evaluation {
-                        Ok(carina_core::module_resolver::ConstraintEvaluation::Satisfied)
-                        | Ok(carina_core::module_resolver::ConstraintEvaluation::Pending) => {
-                            continue;
-                        }
-                        Ok(carina_core::module_resolver::ConstraintEvaluation::Violated(
-                            violation,
-                        )) => {
-                            let arguments = violation.arguments.join(", ");
-                            let actuals = violation
-                                .actuals
-                                .iter()
-                                .map(|(name, value)| format!("{name} = {value}"))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            format!(
-                                "Require constraint failed in module '{}' instance '{}' for arguments [{}]: {} (got {})",
-                                call.module_name, instance, arguments, violation.message, actuals,
-                            )
-                        }
-                        Err(error) => {
-                            let actuals = referenced
-                                .iter()
-                                .filter_map(|name| {
-                                    argument_values.get(name).map(|value| {
-                                        format!(
-                                            "{name} = {}",
-                                            carina_core::value::format_value(value)
-                                        )
-                                    })
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            format!(
-                                "Require constraint failed in module '{}' instance '{}' for arguments [{}]: {} (error evaluating constraint: {}; got {})",
-                                call.module_name,
-                                instance,
-                                referenced.join(", "),
-                                require.error_message,
-                                error,
-                                actuals,
-                            )
-                        }
+                            .map(|(line, col)| (line, col, argument.chars().count() as u32)),
+                        carina_core::module_resolver::ModuleConstraintKind::Require => self
+                            .find_module_call_position(doc, call, call_occurrence)
+                            .map(|(line, col)| {
+                                (line, col, call.module_name.chars().count() as u32)
+                            }),
                     };
-                    if let Some((line, col)) =
-                        self.find_module_call_position(doc, call, call_occurrence)
-                    {
+                    if let Some((line, col, width)) = position {
                         diagnostics.push(carina_diagnostic(
                             line,
                             col,
-                            col + call.module_name.chars().count() as u32,
+                            col + width,
                             DiagnosticSeverity::ERROR,
-                            message,
+                            error.to_string(),
                         ));
                     }
                 }

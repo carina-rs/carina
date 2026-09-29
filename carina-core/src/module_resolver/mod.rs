@@ -40,7 +40,8 @@ pub use signature::{
     ResolvedModuleSignature, ResolvedModuleSignatures, load_resolved_module_signatures,
 };
 pub use validation::{
-    ConstraintEvaluation, ModuleConstraintFailure, ModuleConstraintViolation, evaluate_constraint,
+    ConstraintEvaluation, EvaluatedModuleConstraint, ModuleConstraintFailure, ModuleConstraintKind,
+    ModuleConstraintViolation, ModuleConstraints, evaluate_constraint, evaluate_module_constraints,
     evaluate_pending_constraints, referenced_constraint_arguments,
 };
 

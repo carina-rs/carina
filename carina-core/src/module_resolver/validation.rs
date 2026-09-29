@@ -4,10 +4,13 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use crate::binding_index::ResolvedBindings;
-use crate::parser::{CompareOp, ValidateExpr};
+use crate::parser::{ArgumentParameter, CompareOp, RequireBlock, ValidateExpr};
 use crate::resource::{
-    Composition, ConcreteValue, DeferredValue, ModuleConstraintId, ResourceId, Value,
+    Composition, ConcreteValue, DeferredValue, ModuleConstraintId, PendingModuleConstraint,
+    ResourceId, Value,
 };
+
+use super::ModuleError;
 
 /// A failed module value constraint with deterministic, display-safe actuals.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +79,238 @@ pub enum ConstraintEvaluation {
     Satisfied,
     Pending,
     Violated(ModuleConstraintViolation),
+    EvalError(String),
+}
+
+/// Where a module constraint is declared, and therefore which arguments are
+/// visible while it is evaluated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleConstraintKind {
+    /// A `validation` block nested in one argument declaration. Only that
+    /// argument is in scope, even when the module declares other arguments.
+    ArgumentValidation { argument: String },
+    /// A module-level `require`, which may reference any module argument.
+    Require,
+}
+
+/// The constraint definitions to evaluate at one value-resolution boundary.
+///
+/// Expansion and editor diagnostics start from authored declarations. Plan
+/// and apply re-evaluate the subset that was pending during expansion and was
+/// retained on the composition. Both paths enter the same evaluator.
+#[derive(Clone, Copy)]
+pub enum ModuleConstraints<'a> {
+    Declarations {
+        arguments: &'a [ArgumentParameter],
+        requires: &'a [RequireBlock],
+    },
+    Pending(&'a [PendingModuleConstraint]),
+}
+
+impl<'a> ModuleConstraints<'a> {
+    pub fn declarations(arguments: &'a [ArgumentParameter], requires: &'a [RequireBlock]) -> Self {
+        Self::Declarations {
+            arguments,
+            requires,
+        }
+    }
+
+    pub fn pending(constraints: &'a [PendingModuleConstraint]) -> Self {
+        Self::Pending(constraints)
+    }
+}
+
+/// One authored module constraint together with its evaluation at the current
+/// resolution boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvaluatedModuleConstraint {
+    constraint: PendingModuleConstraint,
+    kind: ModuleConstraintKind,
+    arguments: Vec<String>,
+    actuals: Vec<(String, String)>,
+    evaluation: ConstraintEvaluation,
+}
+
+impl EvaluatedModuleConstraint {
+    pub fn constraint(&self) -> &PendingModuleConstraint {
+        &self.constraint
+    }
+
+    pub fn kind(&self) -> &ModuleConstraintKind {
+        &self.kind
+    }
+
+    pub fn arguments(&self) -> &[String] {
+        &self.arguments
+    }
+
+    pub fn actuals(&self) -> &[(String, String)] {
+        &self.actuals
+    }
+
+    pub fn evaluation(&self) -> &ConstraintEvaluation {
+        &self.evaluation
+    }
+
+    pub fn into_constraint(self) -> PendingModuleConstraint {
+        self.constraint
+    }
+
+    /// Convert a concrete failure to the resolver's public error type.
+    /// Expansion and LSP diagnostics both use this renderer, so their text
+    /// cannot drift independently.
+    pub fn module_error(&self, module: &str, instance: &str) -> Option<ModuleError> {
+        let message = match &self.evaluation {
+            ConstraintEvaluation::Violated(violation) => violation.message.clone(),
+            ConstraintEvaluation::EvalError(error) => format!(
+                "{} (error evaluating constraint: {error})",
+                self.constraint.message()
+            ),
+            ConstraintEvaluation::Satisfied | ConstraintEvaluation::Pending => return None,
+        };
+        match &self.kind {
+            ModuleConstraintKind::ArgumentValidation { argument } => {
+                let actual = self
+                    .actuals
+                    .first()
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_else(|| "<missing>".to_string());
+                Some(ModuleError::ArgumentValidationFailed {
+                    module: module.to_string(),
+                    instance: instance.to_string(),
+                    argument: argument.clone(),
+                    message,
+                    actual,
+                })
+            }
+            ModuleConstraintKind::Require => Some(ModuleError::RequireConstraintFailed {
+                module: module.to_string(),
+                instance: instance.to_string(),
+                arguments: self.arguments.join(", "),
+                message,
+                actuals: self
+                    .actuals
+                    .iter()
+                    .map(|(name, value)| format!("{name} = {value}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }),
+        }
+    }
+}
+
+/// Collect and evaluate every module constraint using the language's single
+/// scoping rule: an argument-local `validation` sees only its own argument;
+/// a module-level `require` sees every argument.
+pub fn evaluate_module_constraints(
+    constraints: ModuleConstraints<'_>,
+    argument_values: &HashMap<String, Value>,
+) -> Vec<EvaluatedModuleConstraint> {
+    let definitions = match constraints {
+        ModuleConstraints::Declarations {
+            arguments,
+            requires,
+        } => {
+            let validations = arguments.iter().flat_map(|argument| {
+                argument
+                    .validations
+                    .iter()
+                    .enumerate()
+                    .map(move |(ordinal, validation)| {
+                        (
+                            PendingModuleConstraint {
+                                id: ModuleConstraintId::argument_validation(
+                                    &argument.name,
+                                    ordinal,
+                                ),
+                                expression: validation.condition.clone(),
+                                message: validation.error_message.clone().unwrap_or_else(|| {
+                                    format!("validation failed for argument '{}'", argument.name)
+                                }),
+                            },
+                            ModuleConstraintKind::ArgumentValidation {
+                                argument: argument.name.clone(),
+                            },
+                        )
+                    })
+            });
+            let requirements = requires.iter().enumerate().map(|(ordinal, require)| {
+                (
+                    PendingModuleConstraint {
+                        id: ModuleConstraintId::require(ordinal),
+                        expression: require.condition.clone(),
+                        message: require.error_message.clone(),
+                    },
+                    ModuleConstraintKind::Require,
+                )
+            });
+            validations.chain(requirements).collect::<Vec<_>>()
+        }
+        ModuleConstraints::Pending(constraints) => constraints
+            .iter()
+            .cloned()
+            .map(|constraint| {
+                let kind = constraint
+                    .id()
+                    .validation_argument()
+                    .map(|argument| ModuleConstraintKind::ArgumentValidation {
+                        argument: argument.to_string(),
+                    })
+                    .unwrap_or(ModuleConstraintKind::Require);
+                (constraint, kind)
+            })
+            .collect(),
+    };
+
+    definitions
+        .into_iter()
+        .map(|(constraint, kind)| {
+            let arguments = match &kind {
+                ModuleConstraintKind::ArgumentValidation { argument } => vec![argument.clone()],
+                ModuleConstraintKind::Require => {
+                    referenced_constraint_arguments(constraint.expression())
+                }
+            };
+            let actuals = constraint_actuals(&arguments, argument_values);
+            let evaluation = match &kind {
+                ModuleConstraintKind::ArgumentValidation { argument } => {
+                    let Some(value) = argument_values.get(argument) else {
+                        return EvaluatedModuleConstraint {
+                            constraint,
+                            kind,
+                            arguments,
+                            actuals,
+                            evaluation: ConstraintEvaluation::Pending,
+                        };
+                    };
+                    evaluate_constraint(
+                        constraint.expression(),
+                        &HashMap::from([(argument.clone(), value.clone())]),
+                        constraint.message(),
+                    )
+                }
+                ModuleConstraintKind::Require
+                    if arguments
+                        .iter()
+                        .any(|argument| !argument_values.contains_key(argument)) =>
+                {
+                    ConstraintEvaluation::Pending
+                }
+                ModuleConstraintKind::Require => evaluate_constraint(
+                    constraint.expression(),
+                    argument_values,
+                    constraint.message(),
+                ),
+            };
+            EvaluatedModuleConstraint {
+                constraint,
+                kind,
+                arguments,
+                actuals,
+                evaluation,
+            }
+        })
+        .collect()
 }
 
 /// Evaluate a module `validation` or `require` expression.
@@ -89,6 +324,17 @@ pub fn evaluate_constraint(
     expr: &ValidateExpr,
     arguments: &HashMap<String, Value>,
     message: impl Into<String>,
+) -> ConstraintEvaluation {
+    match evaluate_constraint_inner(expr, arguments, message.into()) {
+        Ok(evaluation) => evaluation,
+        Err(error) => ConstraintEvaluation::EvalError(error),
+    }
+}
+
+fn evaluate_constraint_inner(
+    expr: &ValidateExpr,
+    arguments: &HashMap<String, Value>,
+    message: String,
 ) -> Result<ConstraintEvaluation, String> {
     let referenced = referenced_constraint_arguments(expr);
     for name in &referenced {
@@ -122,7 +368,7 @@ pub fn evaluate_constraint(
         .collect();
     Ok(ConstraintEvaluation::Violated(ModuleConstraintViolation {
         arguments: referenced,
-        message: message.into(),
+        message,
         actuals,
     }))
 }
@@ -194,8 +440,12 @@ pub fn evaluate_pending_constraints(
             }
         }
 
-        for constraint in &composition.signature.pending_constraints {
-            let arguments = referenced_constraint_arguments(constraint.expression());
+        for evaluated in evaluate_module_constraints(
+            ModuleConstraints::pending(&composition.signature.pending_constraints),
+            &resolved_arguments,
+        ) {
+            let constraint = evaluated.constraint();
+            let arguments = evaluated.arguments().to_vec();
             let failure =
                 |message: String, actuals: Vec<(String, String)>, detail: Option<String>| {
                     ModuleConstraintFailure {
@@ -209,7 +459,7 @@ pub fn evaluate_pending_constraints(
                         detail,
                     }
                 };
-            let actuals = || constraint_actuals(&arguments, &resolved_arguments);
+            let actuals = || evaluated.actuals().to_vec();
             let resolution_error = arguments
                 .iter()
                 .find_map(|name| resolution_errors.get(name).map(|error| (name, error)));
@@ -222,26 +472,26 @@ pub fn evaluate_pending_constraints(
                 continue;
             }
 
-            match evaluate_constraint(
-                constraint.expression(),
-                &resolved_arguments,
-                constraint.message(),
-            ) {
-                Ok(ConstraintEvaluation::Satisfied) => {}
-                Ok(ConstraintEvaluation::Pending) if !terminal => {}
-                Ok(ConstraintEvaluation::Pending) => failures.push(failure(
+            match evaluated.evaluation() {
+                ConstraintEvaluation::Satisfied => {}
+                ConstraintEvaluation::Pending if !terminal => {}
+                ConstraintEvaluation::Pending => failures.push(failure(
                     constraint.message().to_string(),
                     actuals(),
                     Some("constraint inputs are still unresolved at end of apply".to_string()),
                 )),
-                Ok(ConstraintEvaluation::Violated(violation)) => {
-                    failures.push(failure(violation.message, violation.actuals, None));
+                ConstraintEvaluation::Violated(violation) => {
+                    failures.push(failure(
+                        violation.message.clone(),
+                        violation.actuals.clone(),
+                        None,
+                    ));
                 }
-                Err(error) => {
+                ConstraintEvaluation::EvalError(error) => {
                     failures.push(failure(
                         constraint.message().to_string(),
                         actuals(),
-                        Some(error),
+                        Some(format!("error evaluating constraint: {error}")),
                     ));
                 }
             }
@@ -516,7 +766,7 @@ mod tests {
         )]);
 
         assert_eq!(
-            evaluate_constraint(&expression, &arguments, "port must be positive").unwrap(),
+            evaluate_constraint(&expression, &arguments, "port must be positive"),
             ConstraintEvaluation::Pending
         );
     }
@@ -555,7 +805,7 @@ mod tests {
             let expression = length_at_least(name, 2);
             let arguments = HashMap::from([(name.to_string(), value)]);
             assert_eq!(
-                evaluate_constraint(&expression, &arguments, "too short").unwrap(),
+                evaluate_constraint(&expression, &arguments, "too short"),
                 ConstraintEvaluation::Satisfied,
                 "length() rejected {name}"
             );
@@ -576,7 +826,7 @@ mod tests {
             )))),
         )]);
 
-        let result = evaluate_constraint(&expression, &arguments, "password is invalid").unwrap();
+        let result = evaluate_constraint(&expression, &arguments, "password is invalid");
         let ConstraintEvaluation::Violated(violation) = result else {
             panic!("expected a violation");
         };
@@ -590,5 +840,51 @@ mod tests {
         assert!(!rendered.contains("plaintext"), "{rendered}");
         assert!(!rendered.contains("Deferred("), "{rendered}");
         assert!(!rendered.contains("ResourceRef"), "{rendered}");
+    }
+
+    #[test]
+    fn argument_validation_cannot_reference_a_sibling_argument() {
+        use crate::parser::{TypeExpr, ValidationBlock};
+
+        let declarations = vec![
+            ArgumentParameter {
+                name: "x".to_string(),
+                type_expr: TypeExpr::Int,
+                default: None,
+                description: None,
+                validations: vec![ValidationBlock {
+                    condition: ValidateExpr::Compare {
+                        lhs: Box::new(ValidateExpr::Var("y".to_string())),
+                        op: CompareOp::Gt,
+                        rhs: Box::new(ValidateExpr::Int(0)),
+                    },
+                    error_message: Some("x must be valid".to_string()),
+                }],
+            },
+            ArgumentParameter {
+                name: "y".to_string(),
+                type_expr: TypeExpr::Int,
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            },
+        ];
+        let values = HashMap::from([
+            ("x".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+            ("y".to_string(), Value::Concrete(ConcreteValue::Int(2))),
+        ]);
+
+        let evaluated = evaluate_module_constraints(
+            ModuleConstraints::declarations(&declarations, &[]),
+            &values,
+        );
+
+        assert_eq!(evaluated.len(), 1);
+        assert_eq!(
+            evaluated[0].evaluation(),
+            &ConstraintEvaluation::EvalError(
+                "unknown variable 'y' in constraint expression".to_string()
+            )
+        );
     }
 }

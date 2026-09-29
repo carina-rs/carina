@@ -17,9 +17,7 @@ use crate::resource::{
 use super::error::ModuleError;
 use super::resolver::ModuleResolver;
 use super::typecheck::check_module_arg_type;
-use super::validation::{
-    ConstraintEvaluation, evaluate_constraint, referenced_constraint_arguments,
-};
+use super::validation::{ConstraintEvaluation, ModuleConstraints, evaluate_module_constraints};
 
 impl ModuleResolver<'_> {
     /// Expand a module call into resources.
@@ -155,108 +153,23 @@ impl ModuleResolver<'_> {
             )?;
         }
 
-        // Validate argument values against validate blocks
+        // Collect and evaluate argument-local validations and module-level
+        // requirements through the single constraint seam shared by the LSP,
+        // planning, and apply.
         let mut pending_constraints = Vec::new();
-        for arg in &module.arguments {
-            let value = argument_values.get(&arg.name).unwrap();
-            for (validation_index, validation_block) in arg.validations.iter().enumerate() {
-                let message = validation_block
-                    .error_message
-                    .clone()
-                    .unwrap_or_else(|| format!("validation failed for argument '{}'", arg.name));
-                let constraint_arguments = HashMap::from([(arg.name.clone(), value.clone())]);
-                match evaluate_constraint(
-                    &validation_block.condition,
-                    &constraint_arguments,
-                    message.clone(),
-                ) {
-                    Ok(ConstraintEvaluation::Satisfied) => {}
-                    Ok(ConstraintEvaluation::Pending) => {
-                        pending_constraints.push(crate::resource::PendingModuleConstraint {
-                            id: crate::resource::ModuleConstraintId::argument_validation(
-                                &arg.name,
-                                validation_index,
-                            ),
-                            expression: validation_block.condition.clone(),
-                            message,
-                        });
-                    }
-                    Ok(ConstraintEvaluation::Violated(violation)) => {
-                        let actual = violation
-                            .actuals
-                            .first()
-                            .map(|(_, value)| value.clone())
-                            .unwrap_or_else(|| crate::value::format_value(value));
-                        return Err(ModuleError::ArgumentValidationFailed {
-                            module: call.module_name.clone(),
-                            instance: instance_prefix.to_string(),
-                            argument: arg.name.clone(),
-                            message: violation.message,
-                            actual,
-                        });
-                    }
-                    Err(e) => {
-                        return Err(ModuleError::ArgumentValidationFailed {
-                            module: call.module_name.clone(),
-                            instance: instance_prefix.to_string(),
-                            argument: arg.name.clone(),
-                            message: format!("error evaluating validate expression: {}", e),
-                            actual: crate::value::format_value(value),
-                        });
-                    }
+        for evaluated in evaluate_module_constraints(
+            ModuleConstraints::declarations(&module.arguments, &module.requires),
+            &argument_values,
+        ) {
+            match evaluated.evaluation() {
+                ConstraintEvaluation::Satisfied => {}
+                ConstraintEvaluation::Pending => {
+                    pending_constraints.push(evaluated.into_constraint());
                 }
-            }
-        }
-
-        // Evaluate require blocks (cross-argument constraints)
-        for (require_index, require) in module.requires.iter().enumerate() {
-            match evaluate_constraint(
-                &require.condition,
-                &argument_values,
-                require.error_message.clone(),
-            ) {
-                Ok(ConstraintEvaluation::Satisfied) => {}
-                Ok(ConstraintEvaluation::Pending) => {
-                    pending_constraints.push(crate::resource::PendingModuleConstraint {
-                        id: crate::resource::ModuleConstraintId::require(require_index),
-                        expression: require.condition.clone(),
-                        message: require.error_message.clone(),
-                    });
-                }
-                Ok(ConstraintEvaluation::Violated(violation)) => {
-                    let arguments = violation.arguments.join(", ");
-                    let actuals = violation
-                        .actuals
-                        .iter()
-                        .map(|(name, value)| format!("{name} = {value}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(ModuleError::RequireConstraintFailed {
-                        module: call.module_name.clone(),
-                        instance: instance_prefix.to_string(),
-                        arguments,
-                        message: violation.message,
-                        actuals,
-                    });
-                }
-                Err(e) => {
-                    let arguments = referenced_constraint_arguments(&require.condition);
-                    let actuals = arguments
-                        .iter()
-                        .filter_map(|name| {
-                            argument_values.get(name).map(|value| {
-                                format!("{name} = {}", crate::value::format_value(value))
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(ModuleError::RequireConstraintFailed {
-                        module: call.module_name.clone(),
-                        instance: instance_prefix.to_string(),
-                        arguments: arguments.join(", "),
-                        message: format!("error evaluating require expression: {}", e),
-                        actuals,
-                    });
+                ConstraintEvaluation::Violated(_) | ConstraintEvaluation::EvalError(_) => {
+                    return Err(evaluated
+                        .module_error(&call.module_name, instance_prefix)
+                        .expect("concrete constraint failure has a resolver error"));
                 }
             }
         }
