@@ -15,6 +15,9 @@ pub mod skills;
 pub mod state;
 pub mod validate;
 
+/// CLI command for migrating state to the configured backend.
+pub(crate) const MIGRATE_STATE_COMMAND: &str = "carina init --migrate-state";
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -162,7 +165,7 @@ fn backend_drift_header(existing: &BackendLock, configured: &BackendLock) -> Str
 pub fn drift_warning(existing: &BackendLock, configured: &BackendLock) -> String {
     format!(
         "{}\n\n    plan reads state from the OLD backend recorded in carina-backend.lock.\n    \
-         Before running apply or destroy, run `carina init --migrate-state .`\n    \
+         Before running apply or destroy, run `{MIGRATE_STATE_COMMAND}`\n    \
          to migrate state from the OLD backend to the new one.\n\n    \
          To revert instead, restore the backend block to match the lock.",
         backend_drift_header(existing, configured)
@@ -176,7 +179,7 @@ pub fn drift_error_message(
 ) -> String {
     format!(
         "{}\n\n{} without first migrating the state. State migration is an\n\
-         explicit, named operation:\n\n    carina init --migrate-state .\n\n\
+         explicit, named operation:\n\n    {MIGRATE_STATE_COMMAND}\n\n\
          Or revert the `backend` block to match the lock if the change was unintended.",
         backend_drift_header(existing, configured),
         command.verb_phrase()
@@ -826,6 +829,7 @@ mod tests {
             let error = drift_error_message(DriftCommand::Apply, &old, &new);
 
             assert!(error.contains("carina init --migrate-state"));
+            assert!(!error.contains("carina init --migrate-state ."));
             assert!(error.contains("Cannot apply without first migrating the state"));
         }
 

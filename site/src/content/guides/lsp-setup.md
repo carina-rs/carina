@@ -128,8 +128,8 @@ You can also format from the CLI:
 # Format a single file
 carina fmt main.crn
 
-# Format all .crn files in a directory recursively
-carina fmt --recursive .
+# Format all .crn files in the current directory recursively
+carina fmt --recursive
 
 # Check formatting without modifying files
 carina fmt --check main.crn
