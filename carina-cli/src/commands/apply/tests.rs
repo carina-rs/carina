@@ -2500,72 +2500,72 @@ fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::Backend
     }
 }
 
+struct BootstrapRecordingProvider {
+    create_calls: AtomicUsize,
+}
+
+impl Provider for BootstrapRecordingProvider {
+    fn name(&self) -> &str {
+        "aws"
+    }
+
+    fn read(
+        &self,
+        id: &ResourceId,
+        _identifier: Option<&str>,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        Box::pin(async move { Ok(State::not_found(id)) })
+    }
+
+    fn read_data_source(
+        &self,
+        resource: &carina_core::provider::ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = resource.id.clone();
+        Box::pin(async move { Ok(State::not_found(id)) })
+    }
+
+    fn create(
+        &self,
+        id: &ResourceId,
+        _request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
+        self.create_calls.fetch_add(1, Ordering::SeqCst);
+        let state = State::existing(id.clone(), HashMap::new()).with_identifier("bucket-id");
+        Box::pin(async move { Ok(carina_core::provider::CreateOutcome::Success { state }) })
+    }
+
+    fn update(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
+        Box::pin(async { Err(ProviderError::internal("unexpected update")) })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
+    }
+
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: carina_core::effect::PlanOp,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 #[tokio::test]
 async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create() {
-    struct BootstrapRecordingProvider {
-        create_calls: AtomicUsize,
-    }
-
-    impl Provider for BootstrapRecordingProvider {
-        fn name(&self) -> &str {
-            "aws"
-        }
-
-        fn read(
-            &self,
-            id: &ResourceId,
-            _identifier: Option<&str>,
-            _request: ReadRequest,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
-            let id = id.clone();
-            Box::pin(async move { Ok(State::not_found(id)) })
-        }
-
-        fn read_data_source(
-            &self,
-            resource: &carina_core::provider::ProviderReadyDataSource,
-        ) -> BoxFuture<'_, ProviderResult<State>> {
-            let id = resource.id.clone();
-            Box::pin(async move { Ok(State::not_found(id)) })
-        }
-
-        fn create(
-            &self,
-            id: &ResourceId,
-            _request: CreateRequest,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
-            self.create_calls.fetch_add(1, Ordering::SeqCst);
-            let state = State::existing(id.clone(), HashMap::new()).with_identifier("bucket-id");
-            Box::pin(async move { Ok(carina_core::provider::CreateOutcome::Success { state }) })
-        }
-
-        fn update(
-            &self,
-            _id: &ResourceId,
-            _identifier: &str,
-            _request: UpdateRequest,
-        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
-            Box::pin(async { Err(ProviderError::internal("unexpected update")) })
-        }
-
-        fn delete(
-            &self,
-            _id: &ResourceId,
-            _identifier: &str,
-            _request: DeleteRequest,
-        ) -> BoxFuture<'_, ProviderResult<()>> {
-            Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
-        }
-
-        fn required_permissions(
-            &self,
-            _id: &ResourceId,
-            _op: carina_core::effect::PlanOp,
-        ) -> Vec<String> {
-            Vec::new()
-        }
-    }
-
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
     };
@@ -2583,12 +2583,62 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
         )),
     );
 
-    let result =
-        create_checked_bootstrap_resource(&provider, resource, &[], &NoopNormalizer, &[], &schemas)
-            .await;
+    let parsed = carina_core::parser::InferredFile::default();
+    let result = create_checked_bootstrap_resource(
+        &provider,
+        resource,
+        &parsed,
+        &NoopNormalizer,
+        &[],
+        &schemas,
+    )
+    .await;
 
     assert!(result.is_err());
     assert_eq!(provider.create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+    };
+    let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
+    resource.set_attr(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("state-bucket".to_string())),
+    );
+    let parsed = carina_core::parser::InferredFile {
+        compositions: vec![saved_module_composition(
+            Value::Concrete(ConcreteValue::String("forbidden".to_string())),
+            "forbidden",
+        )],
+        ..Default::default()
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::new("bucket", AttributeType::string())),
+    );
+
+    let result = create_checked_bootstrap_resource(
+        &provider,
+        resource,
+        &parsed,
+        &NoopNormalizer,
+        &[],
+        &schemas,
+    )
+    .await;
+
+    assert_eq!(
+        provider.create_calls.load(Ordering::SeqCst),
+        0,
+        "the bootstrap provider dispatch must be gated by module constraints"
+    );
+    let error = result.expect_err("the violating constraint must fail bootstrap preparation");
+    assert!(error.to_string().contains("value must not be forbidden"));
 }
 
 #[test]

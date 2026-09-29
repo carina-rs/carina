@@ -8,7 +8,7 @@ use colored::Colorize;
 
 use futures::stream::{self, StreamExt};
 
-use carina_core::binding_index::{ResolvedBindings, WaitAliasSpec};
+use carina_core::binding_index::{PreApplyInputs, ResolvedBindings, WaitAliasSpec};
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
@@ -71,23 +71,22 @@ fn format_total_apply_line(elapsed: Duration) -> String {
     format!("Done in {}.", format_duration(elapsed))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn create_checked_bootstrap_resource(
     provider: &dyn Provider,
     resource: Resource,
-    provider_configs: &[ProviderConfig],
+    parsed: &carina_core::parser::InferredFile,
     normalizer: &dyn ProviderNormalizer,
     factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &carina_core::schema::SchemaRegistry,
 ) -> Result<(), AppError> {
     let id = resource.id.clone();
-    let bindings = ResolvedBindings::default();
-    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+    let bindings = bootstrap_resolved_bindings(parsed);
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
     let request = carina_core::executor::prepare_create_request(
         resource,
         &bindings,
         &module_gate,
-        provider_configs,
+        &parsed.providers,
         normalizer,
         factories,
         schemas,
@@ -103,6 +102,24 @@ async fn create_checked_bootstrap_resource(
         .await
         .map_err(|err| AppError::Config(format!("Failed to create state bucket: {err}")))?;
     Ok(())
+}
+
+fn bootstrap_resolved_bindings(parsed: &carina_core::parser::InferredFile) -> ResolvedBindings {
+    let current_states = HashMap::new();
+    let remote_bindings = HashMap::new();
+    let wait_aliases: Vec<WaitAliasSpec> = parsed
+        .wait_bindings
+        .iter()
+        .map(WaitAliasSpec::from)
+        .collect();
+    ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: &parsed.resources,
+        compositions: &parsed.compositions,
+        data_sources: &parsed.data_sources,
+        current_states: &current_states,
+        remote_bindings: &remote_bindings,
+        wait_aliases: &wait_aliases,
+    })
 }
 
 fn split_execution_outcome(outcome: ExecutionOutcome) -> (ExecutionResult, bool) {
@@ -924,10 +941,15 @@ async fn run_apply_with_observer_factory(
                 let bucket_normalizer = factory
                     .create_normalizer(None, &provider_config_attrs)
                     .await;
+                // Module expansion can place a module-owned state-bucket
+                // resource in `parsed.resources`; `find_resource_by_attr`
+                // does not imply top-level ownership. Gate bootstrap with
+                // the same expanded compositions and resolved config values
+                // that are available before any provider effect runs.
                 create_checked_bootstrap_resource(
                     bucket_provider.as_ref(),
                     bucket_resource.clone(),
-                    &parsed.providers,
+                    &parsed,
                     bucket_normalizer.as_ref(),
                     ctx.factories(),
                     ctx.schemas(),
