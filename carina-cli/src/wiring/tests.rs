@@ -5321,11 +5321,15 @@ mod resolved_value_constraint_gate {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use carina_core::binding_index::PreApplyInputs;
+    use carina_core::parser::{CompareOp, TypeExpr, ValidateExpr};
     use carina_core::plan::PlanErrorKind;
     use carina_core::provider::{
         BoxFuture, ProviderFactory, ProviderNormalizer, ProviderResult, ready_noop,
     };
-    use carina_core::resource::{AccessPath, Composition, DataSource, UnknownReason};
+    use carina_core::resource::{
+        AccessPath, Composition, CompositionArgument, DataSource, ModuleConstraintId,
+        PendingModuleConstraint, Signature, UnknownReason,
+    };
     use carina_core::schema::{TypeError, TypeIdentity};
 
     fn text(value: &str) -> Value {
@@ -5525,6 +5529,89 @@ mod resolved_value_constraint_gate {
             .await
     }
 
+    fn pending_composition(
+        arguments: Vec<(&str, Value)>,
+        constraint: PendingModuleConstraint,
+    ) -> Composition {
+        Composition {
+            id: ResourceId::with_identity("_virtual", "checked"),
+            signature: Signature {
+                arguments: arguments
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (
+                            name.to_string(),
+                            CompositionArgument::from_value(value, TypeExpr::String),
+                        )
+                    })
+                    .collect(),
+                attributes: IndexMap::new(),
+                pending_constraints: vec![constraint],
+            },
+            binding: Some("checked".to_string()),
+            dependency_bindings: BTreeSet::new(),
+            module_name: "checked_module".to_string(),
+            instance: "root.checked".to_string(),
+            provenance: Default::default(),
+            quoted_string_attrs: HashSet::new(),
+        }
+    }
+
+    fn not_bad(variable: &str) -> ValidateExpr {
+        ValidateExpr::Compare {
+            lhs: Box::new(ValidateExpr::Var(variable.to_string())),
+            op: CompareOp::Ne,
+            rhs: Box::new(ValidateExpr::String("bad".to_string())),
+        }
+    }
+
+    async fn prepare_composition(
+        producer_values: Vec<(&str, Value)>,
+        composition: &mut Composition,
+    ) -> Result<(), Vec<carina_core::plan::PlanError>> {
+        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)]);
+        let mut producer =
+            Resource::with_provider("test", "source", "producer", None).with_binding("producer");
+        for (name, value) in producer_values {
+            producer.set_attr(name, value);
+        }
+        let compositions = std::slice::from_ref(composition);
+        let empty_data_sources = Vec::<DataSource>::new();
+        let current_states = HashMap::new();
+        let remote_bindings = HashMap::new();
+        let wait_aliases = Vec::new();
+        let mut resources = OverrideAwareResources::build(
+            vec![producer],
+            None::<&carina_state::StateFile>,
+            PreApplyInputs {
+                managed: &[],
+                compositions,
+                data_sources: &empty_data_sources,
+                current_states: &current_states,
+                remote_bindings: &remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+        )
+        .unwrap();
+        let origins = resources.paired_unresolved_resources();
+        let mut states = HashMap::new();
+        let mut data_sources = Vec::new();
+        let mut waits = Vec::new();
+
+        PlanPreprocessor::new(&carina_core::provider::NoopNormalizer, &ctx)
+            .prepare(
+                &mut resources,
+                &origins,
+                std::slice::from_mut(composition),
+                &mut states,
+                &[],
+                &mut data_sources,
+                &[],
+                &mut waits,
+            )
+            .await
+    }
+
     fn assert_resolved_error(
         errors: &[carina_core::plan::PlanError],
         expected_type: &str,
@@ -5638,5 +5725,171 @@ mod resolved_value_constraint_gate {
 
         assert_resolved_error(&errors, "lookup.Pattern", "required pattern");
         assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn resolved_module_argument_validation_is_a_structured_plan_error() {
+        let source = ref_value();
+        let constraint = PendingModuleConstraint::ArgumentValidation {
+            id: ModuleConstraintId::argument_validation("value", 0),
+            argument: "value".to_string(),
+            expression: not_bad("value"),
+            message: "value must not be bad".to_string(),
+            referenced_arguments: vec!["value".to_string()],
+        };
+        let mut composition = pending_composition(vec![("value", source.clone())], constraint);
+
+        let errors = prepare_composition(vec![("value", text("bad"))], &mut composition)
+            .await
+            .expect_err("resolved invalid module argument must fail planning");
+
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        match &errors[0].kind {
+            PlanErrorKind::ModuleConstraint {
+                module,
+                instance,
+                arguments,
+                message,
+                actuals,
+            } => {
+                assert_eq!(module, "checked_module");
+                assert_eq!(instance, "root.checked");
+                assert_eq!(arguments, &["value"]);
+                assert_eq!(message, "value must not be bad");
+                assert_eq!(actuals, &[("value".to_string(), "\"bad\"".to_string())]);
+            }
+            other => panic!("unexpected plan error: {other:?}"),
+        }
+        let rendered = errors[0].to_string();
+        for expected in [
+            "checked_module",
+            "root.checked",
+            "value",
+            "value must not be bad",
+            "\"bad\"",
+        ] {
+            assert!(rendered.contains(expected), "{rendered}");
+        }
+        assert_eq!(
+            composition.signature.arguments["value"].value(),
+            &source,
+            "plan evaluation must not replace the stored source expression"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_cross_argument_require_is_a_structured_plan_error() {
+        let constraint = PendingModuleConstraint::Require {
+            id: ModuleConstraintId::require(0),
+            expression: ValidateExpr::Compare {
+                lhs: Box::new(ValidateExpr::Var("left".to_string())),
+                op: CompareOp::Eq,
+                rhs: Box::new(ValidateExpr::Var("right".to_string())),
+            },
+            message: "left and right must match".to_string(),
+            referenced_arguments: vec!["left".to_string(), "right".to_string()],
+        };
+        let mut composition = pending_composition(
+            vec![
+                ("left", ref_value()),
+                (
+                    "right",
+                    Value::Deferred(DeferredValue::ResourceRef {
+                        path: AccessPath::new("producer", "other"),
+                    }),
+                ),
+            ],
+            constraint,
+        );
+
+        let errors = prepare_composition(
+            vec![("value", text("left")), ("other", text("right"))],
+            &mut composition,
+        )
+        .await
+        .expect_err("resolved invalid require must fail planning");
+
+        match &errors[0].kind {
+            PlanErrorKind::ModuleConstraint {
+                arguments,
+                message,
+                actuals,
+                ..
+            } => {
+                assert_eq!(arguments, &["left", "right"]);
+                assert_eq!(message, "left and right must match");
+                assert_eq!(
+                    actuals,
+                    &[
+                        ("left".to_string(), "\"left\"".to_string()),
+                        ("right".to_string(), "\"right\"".to_string()),
+                    ]
+                );
+            }
+            other => panic!("unexpected plan error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_module_argument_stays_pending_without_rewriting_source() {
+        let source = ref_value();
+        let constraint = PendingModuleConstraint::ArgumentValidation {
+            id: ModuleConstraintId::argument_validation("value", 0),
+            argument: "value".to_string(),
+            expression: not_bad("value"),
+            message: "value must not be bad".to_string(),
+            referenced_arguments: vec!["value".to_string()],
+        };
+        let mut composition = pending_composition(vec![("value", source.clone())], constraint);
+        let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+            path: AccessPath::new("producer", "value"),
+        }));
+
+        prepare_composition(vec![("value", unknown)], &mut composition)
+            .await
+            .expect("unknown module argument must remain pending");
+
+        assert_eq!(composition.signature.pending_constraints.len(), 1);
+        assert_eq!(composition.signature.arguments["value"].value(), &source);
+    }
+
+    #[tokio::test]
+    async fn satisfied_module_constraint_is_removed_from_prepared_composition() {
+        let constraint = PendingModuleConstraint::ArgumentValidation {
+            id: ModuleConstraintId::argument_validation("value", 0),
+            argument: "value".to_string(),
+            expression: not_bad("value"),
+            message: "value must not be bad".to_string(),
+            referenced_arguments: vec!["value".to_string()],
+        };
+        let mut composition = pending_composition(vec![("value", ref_value())], constraint);
+
+        prepare_composition(vec![("value", text("good"))], &mut composition)
+            .await
+            .expect("satisfied constraint must pass");
+
+        assert!(composition.signature.pending_constraints.is_empty());
+    }
+
+    #[tokio::test]
+    async fn module_constraint_actuals_mask_secret_values() {
+        let constraint = PendingModuleConstraint::ArgumentValidation {
+            id: ModuleConstraintId::argument_validation("value", 0),
+            argument: "value".to_string(),
+            expression: not_bad("value"),
+            message: "value must not be bad".to_string(),
+            referenced_arguments: vec!["value".to_string()],
+        };
+        let mut composition = pending_composition(vec![("value", ref_value())], constraint);
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(text("bad"))));
+
+        let errors = prepare_composition(vec![("value", secret)], &mut composition)
+            .await
+            .expect_err("invalid secret value must fail without disclosure");
+        let rendered = errors[0].to_string();
+
+        assert!(rendered.contains("(secret)"), "{rendered}");
+        assert!(!rendered.contains("\"bad\""), "{rendered}");
+        assert!(!rendered.contains("Secret("), "{rendered}");
     }
 }

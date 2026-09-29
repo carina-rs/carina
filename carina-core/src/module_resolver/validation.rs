@@ -2,12 +2,25 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use crate::binding_index::ResolvedBindings;
 use crate::parser::{CompareOp, ValidateExpr};
-use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::resource::{Composition, ConcreteValue, DeferredValue, ResourceId, Value};
 
 /// A failed module value constraint with deterministic, display-safe actuals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleConstraintViolation {
+    pub arguments: Vec<String>,
+    pub message: String,
+    pub actuals: Vec<(String, String)>,
+}
+
+/// A pending module constraint that became invalid at a later resolution
+/// boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingModuleConstraintFailure {
+    pub composition_id: ResourceId,
+    pub module: String,
+    pub instance: String,
     pub arguments: Vec<String>,
     pub message: String,
     pub actuals: Vec<(String, String)>,
@@ -106,6 +119,108 @@ pub fn referenced_constraint_arguments(expr: &ValidateExpr) -> Vec<String> {
     let mut names = BTreeSet::new();
     collect(expr, &mut names);
     names.into_iter().collect()
+}
+
+/// Resolve and evaluate every constraint currently pending on compositions.
+///
+/// Argument resolution is deliberately temporary: the authored source values
+/// stored in [`Composition::signature`] remain untouched so apply can resolve
+/// them again against newer bindings. Satisfied constraints are removed,
+/// unresolved constraints remain pending, and violations are returned with
+/// display-safe actual values.
+pub fn evaluate_pending_constraints(
+    compositions: &mut [Composition],
+    bindings: &ResolvedBindings,
+) -> Vec<PendingModuleConstraintFailure> {
+    let mut failures = Vec::new();
+
+    for composition in compositions {
+        let mut resolved_arguments = HashMap::new();
+        let mut resolution_errors = HashMap::new();
+        for (name, argument) in &composition.signature.arguments {
+            match crate::resolver::resolve_ref_value(argument.value(), bindings) {
+                Ok(value) => {
+                    resolved_arguments.insert(name.clone(), value);
+                }
+                Err(error) => {
+                    resolution_errors.insert(name.clone(), error);
+                    resolved_arguments.insert(name.clone(), argument.value().clone());
+                }
+            }
+        }
+
+        let mut still_pending = Vec::new();
+        for constraint in std::mem::take(&mut composition.signature.pending_constraints) {
+            let mut arguments = constraint.referenced_arguments().to_vec();
+            arguments.sort();
+            arguments.dedup();
+            let resolution_error = arguments
+                .iter()
+                .find_map(|name| resolution_errors.get(name).map(|error| (name, error)));
+            if let Some((name, error)) = resolution_error {
+                failures.push(PendingModuleConstraintFailure {
+                    composition_id: composition.id.clone(),
+                    module: composition.module_name.clone(),
+                    instance: composition.instance.clone(),
+                    arguments: arguments.clone(),
+                    message: format!(
+                        "{} (could not resolve argument '{name}': {error})",
+                        constraint.message()
+                    ),
+                    actuals: constraint_actuals(&arguments, &resolved_arguments),
+                });
+                continue;
+            }
+
+            match evaluate_constraint(
+                constraint.expression(),
+                &resolved_arguments,
+                constraint.message(),
+            ) {
+                Ok(ConstraintEvaluation::Satisfied) => {}
+                Ok(ConstraintEvaluation::Pending) => still_pending.push(constraint),
+                Ok(ConstraintEvaluation::Violated(violation)) => {
+                    failures.push(PendingModuleConstraintFailure {
+                        composition_id: composition.id.clone(),
+                        module: composition.module_name.clone(),
+                        instance: composition.instance.clone(),
+                        arguments: violation.arguments,
+                        message: violation.message,
+                        actuals: violation.actuals,
+                    });
+                }
+                Err(error) => {
+                    failures.push(PendingModuleConstraintFailure {
+                        composition_id: composition.id.clone(),
+                        module: composition.module_name.clone(),
+                        instance: composition.instance.clone(),
+                        arguments: arguments.clone(),
+                        message: format!("{} ({error})", constraint.message()),
+                        actuals: constraint_actuals(&arguments, &resolved_arguments),
+                    });
+                }
+            }
+        }
+        composition.signature.pending_constraints = still_pending;
+    }
+
+    failures
+}
+
+fn constraint_actuals(
+    arguments: &[String],
+    values: &HashMap<String, Value>,
+) -> Vec<(String, String)> {
+    arguments
+        .iter()
+        .map(|name| {
+            let rendered = values
+                .get(name)
+                .map(crate::value::format_value)
+                .unwrap_or_else(|| "<missing>".to_string());
+            (name.clone(), rendered)
+        })
+        .collect()
 }
 
 fn is_recursively_concrete(value: &Value) -> bool {

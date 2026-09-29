@@ -87,6 +87,15 @@ pub enum PlanErrorKind {
         /// Schema or provider-validator diagnostic.
         message: String,
     },
+    /// A module argument constraint failed after its inputs became known.
+    ModuleConstraint {
+        module: String,
+        instance: String,
+        arguments: Vec<String>,
+        message: String,
+        /// Secret-aware rendered argument values.
+        actuals: Vec<(String, String)>,
+    },
 }
 
 impl PlanError {
@@ -179,6 +188,32 @@ impl std::fmt::Display for PlanErrorKind {
                     ),
                     (true, true) => write!(f, "resolved value constraint failed: {message}"),
                 }
+            }
+            Self::ModuleConstraint {
+                module,
+                instance,
+                arguments,
+                message,
+                actuals,
+            } => {
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| format!("`{argument}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let actuals = actuals
+                    .iter()
+                    .map(|(argument, value)| format!("{argument} = {value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "module `{module}` instance `{instance}` constraint failed for argument(s) {arguments}: {message}"
+                )?;
+                if !actuals.is_empty() {
+                    write!(f, " (actual: {actuals})")?;
+                }
+                Ok(())
             }
         }
     }

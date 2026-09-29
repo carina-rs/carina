@@ -1235,7 +1235,7 @@ impl<'a> PlanPreprocessor<'a> {
         &self,
         resources: &mut OverrideAwareResources,
         resource_origins: &[Resource],
-        _compositions: &mut [Composition],
+        compositions: &mut [Composition],
         current_states: &mut HashMap<ResourceId, State>,
         provider_configs: &[ProviderConfig],
         data_sources: &mut [DataSource],
@@ -1243,12 +1243,28 @@ impl<'a> PlanPreprocessor<'a> {
         wait_bindings: &mut [carina_core::parser::WaitBinding],
     ) -> Result<(), Vec<PlanError>> {
         let schemas = self.ctx.schemas();
-        let errors = validate_resolved_value_constraints(
+        let mut errors = validate_resolved_value_constraints(
             self.ctx,
             resources.resources(),
             resource_origins,
             data_sources,
             data_source_origins,
+        );
+        errors.extend(
+            module_resolver::evaluate_pending_constraints(compositions, resources.bindings())
+                .into_iter()
+                .map(|failure| {
+                    PlanError::new(
+                        failure.composition_id,
+                        PlanErrorKind::ModuleConstraint {
+                            module: failure.module,
+                            instance: failure.instance,
+                            arguments: failure.arguments,
+                            message: failure.message,
+                            actuals: failure.actuals,
+                        },
+                    )
+                }),
         );
         if !errors.is_empty() {
             return Err(errors);
