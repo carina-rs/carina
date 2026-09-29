@@ -3509,6 +3509,7 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
             signature: Signature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),
+                pending_constraints: Vec::new(),
             },
             binding: Some(binding.to_string()),
             dependency_bindings: Default::default(),

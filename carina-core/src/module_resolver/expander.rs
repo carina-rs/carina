@@ -157,9 +157,10 @@ impl ModuleResolver<'_> {
         }
 
         // Validate argument values against validate blocks
+        let mut pending_constraints = Vec::new();
         for arg in &module.arguments {
             let value = argument_values.get(&arg.name).unwrap();
-            for validation_block in &arg.validations {
+            for (validation_index, validation_block) in arg.validations.iter().enumerate() {
                 let message = validation_block
                     .error_message
                     .clone()
@@ -170,7 +171,25 @@ impl ModuleResolver<'_> {
                     &constraint_arguments,
                     message,
                 ) {
-                    Ok(ConstraintEvaluation::Satisfied | ConstraintEvaluation::Pending) => {}
+                    Ok(ConstraintEvaluation::Satisfied) => {}
+                    Ok(ConstraintEvaluation::Pending) => {
+                        pending_constraints.push(
+                            crate::resource::PendingModuleConstraint::ArgumentValidation {
+                                id: crate::resource::ModuleConstraintId::argument_validation(
+                                    &arg.name,
+                                    validation_index,
+                                ),
+                                argument: arg.name.clone(),
+                                expression: validation_block.condition.clone(),
+                                message: validation_block.error_message.clone().unwrap_or_else(
+                                    || format!("validation failed for argument '{}'", arg.name),
+                                ),
+                                referenced_arguments: referenced_constraint_arguments(
+                                    &validation_block.condition,
+                                ),
+                            },
+                        );
+                    }
                     Ok(ConstraintEvaluation::Violated(violation)) => {
                         let actual = violation
                             .actuals
@@ -199,13 +218,21 @@ impl ModuleResolver<'_> {
         }
 
         // Evaluate require blocks (cross-argument constraints)
-        for require in &module.requires {
+        for (require_index, require) in module.requires.iter().enumerate() {
             match evaluate_constraint(
                 &require.condition,
                 &argument_values,
                 require.error_message.clone(),
             ) {
-                Ok(ConstraintEvaluation::Satisfied | ConstraintEvaluation::Pending) => {}
+                Ok(ConstraintEvaluation::Satisfied) => {}
+                Ok(ConstraintEvaluation::Pending) => {
+                    pending_constraints.push(crate::resource::PendingModuleConstraint::Require {
+                        id: crate::resource::ModuleConstraintId::require(require_index),
+                        expression: require.condition.clone(),
+                        message: require.error_message.clone(),
+                        referenced_arguments: referenced_constraint_arguments(&require.condition),
+                    });
+                }
                 Ok(ConstraintEvaluation::Violated(violation)) => {
                     let arguments = violation.arguments.join(", ");
                     let actuals = violation
@@ -409,6 +436,7 @@ impl ModuleResolver<'_> {
                 signature: crate::resource::Signature {
                     arguments: signature_arguments,
                     attributes: composition_attrs,
+                    pending_constraints,
                 },
                 binding: call.binding_name.clone(),
                 dependency_bindings: BTreeSet::new(),
@@ -846,6 +874,7 @@ fn prefix_module_composition(
     if let Some(ref binding) = new_virtual.binding {
         new_virtual.binding = Some(apply_instance_prefix(instance_prefix, binding));
     }
+    new_virtual.instance = apply_instance_prefix(instance_prefix, &new_virtual.instance);
 
     let mut substituted_arguments: IndexMap<String, crate::resource::CompositionArgument> =
         IndexMap::new();

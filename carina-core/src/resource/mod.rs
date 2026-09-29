@@ -3355,7 +3355,7 @@ pub mod persistent_id;
 
 pub use composition::{
     Composition, CompositionArgument, CompositionAttribute, CompositionCall, CompositionProvenance,
-    Signature,
+    ModuleConstraintId, PendingModuleConstraint, Signature,
 };
 pub use data_source::{DataSource, ResolvedDataSource};
 pub use expansion_trace::{CallSite, ExpansionTrace};

@@ -1393,6 +1393,7 @@ mod tests {
             signature: crate::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: virt_attrs,
+                pending_constraints: Vec::new(),
             },
             binding: Some("module".to_string()),
             dependency_bindings: std::collections::BTreeSet::new(),
@@ -1487,6 +1488,7 @@ mod tests {
             signature: crate::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: virt_attrs,
+                pending_constraints: Vec::new(),
             },
             binding: Some("bootstrap".to_string()),
             dependency_bindings: std::collections::BTreeSet::new(),

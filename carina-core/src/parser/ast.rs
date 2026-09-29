@@ -423,7 +423,7 @@ pub struct ArgumentParameter {
 }
 
 /// A validate block: `validation { condition = <expr> error_message = "..." }`
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ValidationBlock {
     pub condition: ValidateExpr,
     pub error_message: Option<String>,
@@ -432,7 +432,7 @@ pub struct ValidationBlock {
 // `CompareOp` lives in `expressions::validate_expr` (re-exported above).
 
 /// Validate expression AST node
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ValidateExpr {
     /// Boolean literal
     Bool(bool),
@@ -469,7 +469,7 @@ pub enum ValidateExpr {
 
 /// A require block: `require <condition>, "error message"`
 /// Used for cross-argument constraints at the module top level.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RequireBlock {
     pub condition: ValidateExpr,
     pub error_message: String,
@@ -1786,6 +1786,7 @@ mod substitute_placeholder_tests {
             signature: Signature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),
+                pending_constraints: Vec::new(),
             },
             binding: Some("composition_name".to_string()),
             dependency_bindings: BTreeSet::new(),

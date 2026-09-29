@@ -2718,8 +2718,14 @@ fn test_argument_validation_passes_with_valid_value() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "web", None);
-    assert!(result.is_ok());
+    let result = resolver.expand_module_call(&call, "web", None).unwrap();
+    assert!(
+        result.compositions[0]
+            .signature
+            .pending_constraints
+            .is_empty(),
+        "satisfied constraints must not be persisted"
+    );
 }
 
 #[test]
@@ -2755,11 +2761,139 @@ fn test_argument_validation_with_resource_reference_is_pending() {
         )]),
     };
 
-    let expanded = resolver.expand_module_call(&call, "web", None);
-    assert!(
-        expanded.is_ok(),
-        "a reference-valued constraint must remain pending, got {expanded:?}"
+    let expanded = resolver
+        .expand_module_call(&call, "web", None)
+        .expect("a reference-valued constraint must remain pending");
+    let constraints = &expanded.compositions[0].signature.pending_constraints;
+    assert_eq!(constraints.len(), 1);
+    assert!(matches!(
+        &constraints[0],
+        crate::resource::PendingModuleConstraint::ArgumentValidation {
+            argument,
+            referenced_arguments,
+            ..
+        } if argument == "port" && referenced_arguments == &["port"]
+    ));
+}
+
+#[test]
+fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
+    use crate::parser::{CompareOp, ValidateExpr};
+    use crate::resource::{
+        Composition, CompositionArgument, CompositionCall, CompositionProvenance,
+        ModuleConstraintId, PendingModuleConstraint, Signature,
+    };
+
+    let inner_call = CompositionCall {
+        module_name: "inner".to_string(),
+        binding: Some("inner".to_string()),
+        instance: "inner".to_string(),
+        module_source: None,
+        module_directory: None,
+    };
+    let inner = Composition {
+        id: ResourceId::with_identity("_virtual", "inner"),
+        signature: Signature {
+            arguments: IndexMap::from([(
+                "port".to_string(),
+                CompositionArgument::from_value(
+                    Value::Deferred(DeferredValue::BindingRef {
+                        binding: "outer_port".to_string(),
+                    }),
+                    TypeExpr::String,
+                ),
+            )]),
+            attributes: IndexMap::new(),
+            pending_constraints: vec![PendingModuleConstraint::ArgumentValidation {
+                id: ModuleConstraintId::argument_validation("port", 0),
+                argument: "port".to_string(),
+                expression: ValidateExpr::Compare {
+                    lhs: Box::new(ValidateExpr::FunctionCall {
+                        name: "length".to_string(),
+                        args: vec![ValidateExpr::Var("port".to_string())],
+                    }),
+                    op: CompareOp::Gt,
+                    rhs: Box::new(ValidateExpr::Int(0)),
+                },
+                message: "port must not be empty".to_string(),
+                referenced_arguments: vec!["port".to_string()],
+            }],
+        },
+        binding: Some("inner".to_string()),
+        dependency_bindings: BTreeSet::new(),
+        module_name: "inner".to_string(),
+        instance: "inner".to_string(),
+        provenance: Box::new(CompositionProvenance::expanded(
+            inner_call.clone(),
+            inner_call,
+        )),
+        quoted_string_attrs: HashSet::new(),
+    };
+    let outer = ParsedFile {
+        providers: vec![],
+        data_sources: vec![],
+        compositions: vec![inner],
+        resources: vec![],
+        variables: IndexMap::new(),
+        uses: vec![],
+        module_calls: vec![],
+        arguments: vec![ArgumentParameter {
+            name: "outer_port".to_string(),
+            type_expr: TypeExpr::String,
+            default: None,
+            description: None,
+            validations: vec![],
+        }],
+        attribute_params: vec![],
+        export_params: vec![],
+        backend: None,
+        state_blocks: vec![],
+        user_functions: HashMap::new(),
+        upstream_states: vec![],
+        wait_bindings: vec![],
+        requires: vec![],
+        structural_bindings: HashSet::new(),
+        warnings: vec![],
+        deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
+    };
+    let resolver = {
+        let mut resolver = ModuleResolver::new(".");
+        resolver.imported_modules.insert("outer".to_string(), outer);
+        resolver
+    };
+    let call = ModuleCall {
+        module_name: "outer".to_string(),
+        binding_name: Some("root".to_string()),
+        arguments: HashMap::from([(
+            "outer_port".to_string(),
+            Value::resource_ref("producer", "port", Vec::new()),
+        )]),
+    };
+
+    let expanded = resolver.expand_module_call(&call, "root", None).unwrap();
+    let nested = expanded
+        .compositions
+        .iter()
+        .find(|composition| composition.module_name == "inner")
+        .expect("nested composition");
+    assert_eq!(nested.instance, "root.inner");
+    assert_eq!(
+        nested
+            .signature
+            .arguments
+            .get("port")
+            .map(CompositionArgument::value),
+        Some(&Value::resource_ref("producer", "port", Vec::new()))
     );
+    assert!(matches!(
+        &nested.signature.pending_constraints[0],
+        PendingModuleConstraint::ArgumentValidation {
+            argument,
+            referenced_arguments,
+            ..
+        } if argument == "port" && referenced_arguments == &["port"]
+    ));
 }
 
 #[test]

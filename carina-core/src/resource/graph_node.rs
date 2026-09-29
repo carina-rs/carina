@@ -166,6 +166,7 @@ mod tests {
             signature: super::super::Signature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),
+                pending_constraints: Vec::new(),
             },
             binding: None,
             dependency_bindings: BTreeSet::new(),

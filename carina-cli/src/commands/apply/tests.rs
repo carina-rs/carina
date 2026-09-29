@@ -3345,6 +3345,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         signature: carina_core::resource::Signature {
             arguments: indexmap::IndexMap::new(),
             attributes: virt_attrs,
+            pending_constraints: Vec::new(),
         },
         binding: Some("github_actions_carina".to_string()),
         dependency_bindings: std::collections::BTreeSet::new(),
@@ -3450,6 +3451,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
             signature: carina_core::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes,
+                pending_constraints: Vec::new(),
             },
             binding: Some(binding.to_string()),
             dependency_bindings: std::collections::BTreeSet::new(),
@@ -3631,6 +3633,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         signature: carina_core::resource::Signature {
             arguments: indexmap::IndexMap::new(),
             attributes: virt_attrs,
+            pending_constraints: Vec::new(),
         },
         binding: Some("carina_module".to_string()),
         dependency_bindings: std::collections::BTreeSet::new(),

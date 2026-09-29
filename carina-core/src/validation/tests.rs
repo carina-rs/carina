@@ -705,6 +705,7 @@ fn make_composition(binding: &str, attributes: &[&str]) -> Composition {
                     )
                 })
                 .collect(),
+            pending_constraints: Vec::new(),
         },
         binding: Some(binding.to_string()),
         dependency_bindings: Default::default(),

@@ -1627,6 +1627,7 @@ mod tests {
             signature: crate::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: virt_attrs,
+                pending_constraints: Vec::new(),
             },
             binding: Some("github_actions_carina".to_string()),
             dependency_bindings: std::collections::BTreeSet::new(),
