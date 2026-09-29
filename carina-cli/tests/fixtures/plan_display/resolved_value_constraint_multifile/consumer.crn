@@ -1,0 +1,7 @@
+let consumer = fixture.test.Consumer {
+  target = producer.value
+}
+
+exports {
+  target = consumer.target
+}

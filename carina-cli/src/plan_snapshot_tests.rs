@@ -181,6 +181,24 @@ fn snapshot_all_create() {
 }
 
 #[test]
+fn snapshot_resolved_value_constraint_multifile() {
+    let fp = build_plan_from_fixture_name("resolved_value_constraint_multifile");
+    assert!(
+        !fp.plan.errors().is_empty(),
+        "the fixture planner must run the resolved-value constraint gate"
+    );
+    let output = fp
+        .plan
+        .errors()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn non_module_anonymous_dependency_keeps_historical_fallback_identity() {
     let (plan, _schemas, _moved) = build_plan_from_fixture("all_create");
     let route_table = plan
