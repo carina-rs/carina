@@ -34,7 +34,7 @@ Destroy even resources that have `prevent_destroy = true` in their `directives` 
 
 Before destroying resources, Carina checks the current project backend
 against `carina-backend.lock`. If the backend changed, destroy refuses
-and points at `carina init --migrate-state .`; this prevents silently
+and points at `carina init --migrate-state`; this prevents silently
 reading or writing state from the new backend before migration is
 explicit.
 

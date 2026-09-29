@@ -214,4 +214,4 @@ awscc.ec2.RouteTable {
 }
 ```
 
-Run `carina plan .` from the directory containing your `.crn` files to preview the changes, and `carina apply .` to create the resources.
+Run `carina plan` from the directory containing your `.crn` files to preview the changes, and `carina apply` to create the resources.

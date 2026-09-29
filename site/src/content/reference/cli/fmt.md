@@ -43,7 +43,7 @@ carina fmt main.crn
 Format every `.crn` under the current tree:
 
 ```bash
-carina fmt --recursive .
+carina fmt --recursive
 ```
 
 Show the diff without writing changes:
@@ -55,5 +55,5 @@ carina fmt --diff main.crn
 Verify formatting in CI:
 
 ```bash
-carina fmt --check --recursive .
+carina fmt --check --recursive
 ```

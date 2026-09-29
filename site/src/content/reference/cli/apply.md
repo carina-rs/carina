@@ -46,7 +46,7 @@ When applying a saved plan, Carina checks the state lineage and serial number ag
 Before applying either a live configuration or a saved plan, Carina also
 checks the current project backend against `carina-backend.lock`. If the
 backend changed, apply refuses and points at
-`carina init --migrate-state .`; this prevents silently writing state to
+`carina init --migrate-state`; this prevents silently writing state to
 the new backend before migration is explicit. Saved-plan apply re-loads
 the project's current `.crn` files from the plan's recorded source path
 before running the same gate.

@@ -281,11 +281,11 @@ give you: doctests need a separate `cargo test --workspace --doc` before
 opening a PR, and it is process-per-test.
 
 ```bash
-# CLI commands — the path must be a DIRECTORY, not a file
-cargo run -- plan .
+# CLI commands — path defaults to cwd; if given, it must be a DIRECTORY, not a file
+cargo run -- plan
 
 # Anything hitting AWS needs the credential wrapper
-aws-vault exec <profile> -- cargo run -- plan .
+aws-vault exec <profile> -- cargo run -- plan
 ```
 
 ## Verify Protocol — Do Not Run Redundant Builds

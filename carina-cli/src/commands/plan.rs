@@ -15,7 +15,7 @@ use carina_core::value::{
 };
 use carina_state::{BackendConfig as StateBackendConfig, StateBackend, StateFile, create_backend};
 
-use super::{BackendDriftStatus, drift_warning, inspect_backend_drift};
+use super::{BackendDriftStatus, MIGRATE_STATE_COMMAND, drift_warning, inspect_backend_drift};
 use crate::DetailLevel;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::display::{print_plan, refresh_plan_separator};
@@ -588,11 +588,10 @@ pub async fn run_plan(
             plan_file_backend_config = Some(parser_backend_config_from_state(&locked_config));
             plan_backend_config = Some(locked_config);
             use_locked_backend = true;
-            Some(
+            Some(format!(
                 "Backend migration pending: plan read state from the OLD backend recorded in \
-                 carina-backend.lock. Run `carina init --migrate-state .` before apply."
-                    .to_string(),
-            )
+                 carina-backend.lock. Run `{MIGRATE_STATE_COMMAND}` before apply."
+            ))
         }
     };
 

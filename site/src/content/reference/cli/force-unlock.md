@@ -22,5 +22,5 @@ carina force-unlock <LOCK_ID> [PATH]
 Release the lock identified in a failed run:
 
 ```bash
-carina force-unlock 1730000000000-abcd1234 .
+carina force-unlock 1730000000000-abcd1234
 ```

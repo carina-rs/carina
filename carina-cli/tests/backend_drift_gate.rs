@@ -246,6 +246,14 @@ mod backend_drift_gate {
             .find("Backend migration pending: plan read state from the OLD backend")
             .expect("backend migration warning must be present in stdout");
         assert!(
+            stdout.contains("carina init --migrate-state"),
+            "migration-pending note must name the migration command, got stdout:\n{stdout}",
+        );
+        assert!(
+            !stdout.contains("carina init --migrate-state ."),
+            "migration-pending note must not include a redundant path argument, got stdout:\n{stdout}",
+        );
+        assert!(
             warning_idx > no_changes_idx,
             "warning must appear after the plan summary, got stdout:\n{stdout}",
         );
