@@ -5333,10 +5333,12 @@ mod resolved_value_constraint_gate {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use carina_core::binding_index::PreApplyInputs;
+    use carina_core::effect::PlanOp;
     use carina_core::parser::{CompareOp, TypeExpr, ValidateExpr};
     use carina_core::plan::PlanErrorKind;
     use carina_core::provider::{
-        BoxFuture, ProviderFactory, ProviderNormalizer, ProviderResult, ready_noop,
+        BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, ProviderFactory,
+        ProviderNormalizer, ProviderResult, ReadRequest, UpdateOutcome, UpdateRequest, ready_noop,
     };
     use carina_core::resource::{
         AccessPath, Composition, CompositionArgument, DataSource, ModuleConstraintId,
@@ -5434,6 +5436,106 @@ mod resolved_value_constraint_gate {
         }
     }
 
+    struct RecordingDataSourceFactory {
+        reads: Arc<AtomicUsize>,
+    }
+
+    struct RecordingDataSourceProvider {
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl ProviderFactory for RecordingDataSourceFactory {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn display_name(&self) -> &str {
+            "module constraint refresh test provider"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "local".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _attributes: &IndexMap<String, Value>,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            let reads = self.reads.clone();
+            Box::pin(async move {
+                Ok(Box::new(RecordingDataSourceProvider { reads }) as Box<dyn Provider>)
+            })
+        }
+
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            vec![ResourceSchema::new("lookup").as_data_source()]
+        }
+    }
+
+    impl Provider for RecordingDataSourceProvider {
+        fn name(&self) -> &str {
+            "recording-data-source"
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            _identifier: Option<&str>,
+            _request: ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(State::not_found(id)) })
+        }
+
+        fn read_data_source(
+            &self,
+            resource: &carina_core::provider::ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let id = resource.id.clone();
+            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+        }
+
+        fn create(
+            &self,
+            _id: &ResourceId,
+            _request: CreateRequest,
+        ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
+            Box::pin(async { Err(ProviderError::internal("unexpected create")) })
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: UpdateRequest,
+        ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
+            Box::pin(async { Err(ProviderError::internal("unexpected update")) })
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: DeleteRequest,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
+        }
+
+        fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
     #[derive(Default)]
     struct RewritingNormalizer {
         desired_calls: AtomicUsize,
@@ -5522,6 +5624,7 @@ mod resolved_value_constraint_gate {
         let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)]);
         let (mut resources, origins) = managed_resources(consumer_type, producer_value);
         let compositions = Vec::new();
+        let module_gate = carina_core::executor::ModuleConstraintGate::new(&compositions);
         let mut current_states = HashMap::new();
         let mut data_sources = Vec::new();
         let data_source_origins = Vec::new();
@@ -5531,7 +5634,7 @@ mod resolved_value_constraint_gate {
             .prepare(
                 &mut resources,
                 &origins,
-                &compositions,
+                &module_gate,
                 &mut current_states,
                 &[],
                 &mut data_sources,
@@ -5609,12 +5712,14 @@ mod resolved_value_constraint_gate {
         let mut states = HashMap::new();
         let mut data_sources = Vec::new();
         let mut waits = Vec::new();
+        let module_gate =
+            carina_core::executor::ModuleConstraintGate::new(std::slice::from_ref(composition));
 
         PlanPreprocessor::new(&carina_core::provider::NoopNormalizer, &ctx)
             .prepare(
                 &mut resources,
                 &origins,
-                std::slice::from_ref(composition),
+                &module_gate,
                 &mut states,
                 &[],
                 &mut data_sources,
@@ -5743,12 +5848,13 @@ mod resolved_value_constraint_gate {
             DataSource::with_provider("test", "lookup.Pattern", "lookup", None)
                 .with_attribute("target", ref_value()),
         ];
+        let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
 
         let errors = PlanPreprocessor::new(&normalizer, &ctx)
             .prepare(
                 &mut resources,
                 &[],
-                &[],
+                &module_gate,
                 &mut HashMap::new(),
                 &[],
                 &mut data_sources,
@@ -5808,6 +5914,66 @@ mod resolved_value_constraint_gate {
             &source,
             "plan evaluation must not replace the stored source expression"
         );
+    }
+
+    #[tokio::test]
+    async fn plan_refresh_reports_module_constraint_without_dispatching_data_source() {
+        let constraint = PendingModuleConstraint {
+            id: ModuleConstraintId::argument_validation("value", 0),
+            expression: not_bad("value"),
+            message: "value must not be bad".to_string(),
+        };
+        let composition = pending_composition(vec![("value", text("bad"))], constraint);
+        let data_source = DataSource::with_provider("test", "lookup", "unrelated", None)
+            .with_attribute("query", text("literal"));
+        let provider_config = ProviderConfig {
+            name: "test".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+            is_default: true,
+        };
+        let mut parsed = carina_core::parser::InferredFile::default();
+        parsed.providers.push(provider_config);
+        parsed.compositions.push(composition);
+        parsed.data_sources.push(data_source);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let ctx = WiringContext::new(vec![Box::new(RecordingDataSourceFactory {
+            reads: reads.clone(),
+        })]);
+        let temp = tempfile::tempdir().unwrap();
+
+        let plan = create_plan_from_parsed_with_upstream_with_ctx(
+            &ctx,
+            &parsed,
+            &[],
+            &None,
+            true,
+            &HashMap::new(),
+            &StateBlockClaims::default(),
+            &ResolvedStateBlockTargets::default(),
+            temp.path(),
+        )
+        .await
+        .expect("module violations must be represented by the plan");
+
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert_eq!(plan.plan.errors().len(), 1, "{:#?}", plan.plan.errors());
+        assert!(matches!(
+            &plan.plan.errors()[0].kind,
+            PlanErrorKind::ModuleConstraint {
+                module,
+                instance,
+                message,
+                ..
+            } if module == "checked_module"
+                && instance == "root.checked"
+                && message == "value must not be bad"
+        ));
     }
 
     #[tokio::test]

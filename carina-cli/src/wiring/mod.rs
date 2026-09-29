@@ -1209,6 +1209,29 @@ fn append_resolved_value_constraint_errors(
     }
 }
 
+fn module_constraint_plan_errors(
+    error: carina_core::executor::ModuleConstraintGateError,
+) -> Vec<PlanError> {
+    error
+        .failures()
+        .iter()
+        .cloned()
+        .map(|failure| {
+            let message = failure.message_with_detail();
+            PlanError::new(
+                failure.composition_id,
+                PlanErrorKind::ModuleConstraint {
+                    module: failure.module,
+                    instance: failure.instance,
+                    arguments: failure.arguments,
+                    message,
+                    actuals: failure.actuals,
+                },
+            )
+        })
+        .collect()
+}
+
 impl<'a> PlanPreprocessor<'a> {
     pub fn new(normalizer: &'a dyn ProviderNormalizer, ctx: &'a WiringContext) -> Self {
         Self { normalizer, ctx }
@@ -1230,7 +1253,7 @@ impl<'a> PlanPreprocessor<'a> {
         &self,
         resources: &mut OverrideAwareResources,
         resource_origins: &[Resource],
-        compositions: &[Composition],
+        module_gate: &carina_core::executor::ModuleConstraintGate,
         current_states: &mut HashMap<ResourceId, State>,
         provider_configs: &[ProviderConfig],
         data_sources: &mut [DataSource],
@@ -1245,27 +1268,9 @@ impl<'a> PlanPreprocessor<'a> {
             data_sources,
             data_source_origins,
         );
-        errors.extend(
-            module_resolver::evaluate_pending_constraints(
-                compositions,
-                resources.bindings(),
-                false,
-            )
-            .into_iter()
-            .map(|failure| {
-                let message = failure.message_with_detail();
-                PlanError::new(
-                    failure.composition_id,
-                    PlanErrorKind::ModuleConstraint {
-                        module: failure.module,
-                        instance: failure.instance,
-                        arguments: failure.arguments,
-                        message,
-                        actuals: failure.actuals,
-                    },
-                )
-            }),
-        );
+        if let Err(error) = module_gate.check(resources.bindings()) {
+            errors.extend(module_constraint_plan_errors(error));
+        }
         if !errors.is_empty() {
             return Err(errors);
         }
@@ -2545,6 +2550,8 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // resets it (Round-4 finding — see the reset after expansion below).
     let mut refresh_printed_bars = false;
     let mut deferred_data_source_ids: HashSet<ResourceId> = HashSet::new();
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
+    let mut refresh_module_constraint_errors = Vec::new();
 
     if refresh {
         RefreshProgress::start_header();
@@ -2687,7 +2694,6 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             ctx.schemas(),
             &ds_wait_aliases,
         );
-        let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
         let data_source_refreshes = resolve_data_source_refs_for_refresh(
             &sorted_resources,
             &parsed.compositions,
@@ -2708,35 +2714,43 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 }
             }
         }
-        refresh_printed_bars |= !resolved_data_sources.is_empty();
+        if let Err(error) = module_gate.check(&data_source_bindings) {
+            refresh_module_constraint_errors.extend(module_constraint_plan_errors(error));
+        }
+        refresh_printed_bars |=
+            !resolved_data_sources.is_empty() && refresh_module_constraint_errors.is_empty();
         let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
-            stream::iter(resolved_data_sources.iter())
-                .map(|resource| {
-                    let progress = RefreshProgress::begin_multi(&multi, &resource.id);
-                    let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
-                    let data_source_bindings = &data_source_bindings;
-                    let module_gate = &module_gate;
-                    async move {
-                        let mut state = read_data_source_with_retry(
-                            provider_ref,
-                            resource,
-                            data_source_bindings,
-                            module_gate,
-                            ctx.factories(),
-                            ctx.schemas(),
-                        )
-                        .await
-                        .map_err(AppError::Provider)?;
-                        if let Some(deps) = dep_bindings {
-                            state.dependency_bindings = deps;
+            if refresh_module_constraint_errors.is_empty() {
+                stream::iter(resolved_data_sources.iter())
+                    .map(|resource| {
+                        let progress = RefreshProgress::begin_multi(&multi, &resource.id);
+                        let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
+                        let data_source_bindings = &data_source_bindings;
+                        let module_gate = &module_gate;
+                        async move {
+                            let mut state = read_data_source_with_retry(
+                                provider_ref,
+                                resource,
+                                data_source_bindings,
+                                module_gate,
+                                ctx.factories(),
+                                ctx.schemas(),
+                            )
+                            .await
+                            .map_err(AppError::Provider)?;
+                            if let Some(deps) = dep_bindings {
+                                state.dependency_bindings = deps;
+                            }
+                            progress.finish();
+                            Ok((resource.id.clone(), state))
                         }
-                        progress.finish();
-                        Ok((resource.id.clone(), state))
-                    }
-                })
-                .buffer_unordered(5)
-                .collect()
-                .await;
+                    })
+                    .buffer_unordered(5)
+                    .collect()
+                    .await
+            } else {
+                Vec::new()
+            };
         for result in phase2_results {
             let (id, state) = result?;
             current_states.insert(id, state);
@@ -2957,18 +2971,22 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // wait `until` predicates — carina#3358). Order matters.
     let mut wait_bindings = parsed.wait_bindings.clone();
     let preprocessor = PlanPreprocessor::new(&provider, ctx);
-    let preparation = preprocessor
-        .prepare(
-            &mut override_aware_resources,
-            &constraint_origin_resources,
-            &prepared_compositions,
-            &mut current_states,
-            &parsed.providers,
-            &mut data_sources_for_plan,
-            &data_sources,
-            &mut wait_bindings,
-        )
-        .await;
+    let preparation = if refresh_module_constraint_errors.is_empty() {
+        preprocessor
+            .prepare(
+                &mut override_aware_resources,
+                &constraint_origin_resources,
+                &module_gate,
+                &mut current_states,
+                &parsed.providers,
+                &mut data_sources_for_plan,
+                &data_sources,
+                &mut wait_bindings,
+            )
+            .await
+    } else {
+        Err(refresh_module_constraint_errors)
+    };
     if let Err(errors) = preparation {
         let mut plan = Plan::new();
         for error in errors {

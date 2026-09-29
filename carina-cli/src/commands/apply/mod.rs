@@ -1581,7 +1581,7 @@ async fn run_apply_locked(
         .prepare(
             &mut override_aware_resources,
             &constraint_origin_resources,
-            &pre_resolve_compositions,
+            &module_gate,
             &mut current_states,
             &parsed.providers,
             &mut data_sources_for_plan,

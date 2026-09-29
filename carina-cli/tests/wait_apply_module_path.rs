@@ -515,13 +515,14 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let provider = NoopProvider { cert_publishes_arn };
     let mut wait_bindings = parsed.wait_bindings.clone();
     let compositions = parsed.compositions.clone();
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&compositions);
     let mut data_sources = parsed.data_sources.clone();
     let preprocessor = PlanPreprocessor::new(&NoopNormalizer, &ctx);
     preprocessor
         .prepare(
             &mut override_aware_resources,
             &resource_origins,
-            &compositions,
+            &module_gate,
             &mut current_states,
             &parsed.providers,
             &mut data_sources,

@@ -125,6 +125,10 @@ pub enum AppError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
 
+    /// A module argument constraint became decidable during an operation.
+    #[error(transparent)]
+    ModuleConstraint(#[from] carina_core::executor::ModuleConstraintGateError),
+
     /// Provider lock-file loading or constraint errors.
     #[error(transparent)]
     LockConstraint(#[from] carina_provider_resolver::LockConstraintError),

@@ -286,6 +286,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let constraint_origin_resources = override_aware_resources
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
     let prepared_compositions = parsed.compositions.clone();
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&prepared_compositions);
     let mut wait_bindings = parsed.wait_bindings.clone();
     let preparation = {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -299,7 +300,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         rt.block_on(PlanPreprocessor::new(&router, &wiring).prepare(
             &mut override_aware_resources,
             &constraint_origin_resources,
-            &prepared_compositions,
+            &module_gate,
             &mut current_states,
             &parsed.providers,
             &mut data_sources_for_plan,
