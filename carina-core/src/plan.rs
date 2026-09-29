@@ -77,6 +77,16 @@ pub enum PlanErrorKind {
         wait_binding: String,
         reason: String,
     },
+    /// A schema value constraint failed after one or more authored
+    /// references became known.
+    ResolvedValueConstraint {
+        /// Top-level resource attributes implicated by the failure.
+        attributes: Vec<String>,
+        /// Authored reference paths that supplied the newly known values.
+        origins: Vec<String>,
+        /// Schema or provider-validator diagnostic.
+        message: String,
+    },
 }
 
 impl PlanError {
@@ -139,6 +149,37 @@ impl std::fmt::Display for PlanErrorKind {
                 f,
                 "wait `{wait_binding}`: invalid predicate attribute path: {reason}"
             ),
+            Self::ResolvedValueConstraint {
+                attributes,
+                origins,
+                message,
+            } => {
+                let attributes = attributes
+                    .iter()
+                    .map(|attribute| format!("`{attribute}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let origins = origins
+                    .iter()
+                    .map(|origin| format!("`{origin}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match (attributes.is_empty(), origins.is_empty()) {
+                    (false, false) => write!(
+                        f,
+                        "resolved value constraint failed for attribute(s) {attributes} from reference(s) {origins}: {message}"
+                    ),
+                    (false, true) => write!(
+                        f,
+                        "resolved value constraint failed for attribute(s) {attributes}: {message}"
+                    ),
+                    (true, false) => write!(
+                        f,
+                        "resolved value constraint failed for reference(s) {origins}: {message}"
+                    ),
+                    (true, true) => write!(f, "resolved value constraint failed: {message}"),
+                }
+            }
         }
     }
 }

@@ -5315,3 +5315,328 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
     assert!(error.to_string().contains("locked at version 1.0.0"));
     assert!(error.to_string().contains("carina init --upgrade"));
 }
+
+mod resolved_value_constraint_gate {
+    use super::super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use carina_core::binding_index::PreApplyInputs;
+    use carina_core::plan::PlanErrorKind;
+    use carina_core::provider::{
+        BoxFuture, ProviderFactory, ProviderNormalizer, ProviderResult, ready_noop,
+    };
+    use carina_core::resource::{AccessPath, Composition, DataSource, UnknownReason};
+    use carina_core::schema::{TypeError, TypeIdentity};
+
+    fn text(value: &str) -> Value {
+        Value::Concrete(ConcreteValue::String(value.to_string()))
+    }
+
+    fn reject_bad_target(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+        if attributes.get("target") == Some(&text("bad")) {
+            Err(vec![TypeError::ResourceValidationFailed {
+                message: "target pair rejected".to_string(),
+                attribute: Some("target".to_string()),
+            }])
+        } else {
+            Ok(())
+        }
+    }
+
+    struct ConstraintFactory;
+
+    impl ProviderFactory for ConstraintFactory {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn display_name(&self) -> &str {
+            "resolved constraint test provider"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn validate_custom_type(&self, identity: &TypeIdentity, value: &str) -> Result<(), String> {
+            if identity.kind == "ExternalId" && value == "bad" {
+                Err("external id rejected".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "local".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _attributes: &IndexMap<String, Value>,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            Box::pin(async { Ok(Box::new(MockProvider::new()) as Box<dyn Provider>) })
+        }
+
+        fn create_normalizer(
+            &self,
+            _binding: Option<&str>,
+            _attributes: &IndexMap<String, Value>,
+        ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
+            Box::pin(async {
+                Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>
+            })
+        }
+
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            let pattern_type =
+                AttributeType::refined_string(None, Some("^good-".to_string()), None, None);
+            let custom_type = AttributeType::refined_string(
+                Some(TypeIdentity::bare("ExternalId")),
+                None,
+                None,
+                None,
+            );
+            vec![
+                ResourceSchema::new("source")
+                    .attribute(AttributeSchema::new("value", AttributeType::string())),
+                ResourceSchema::new("consumer.Pattern")
+                    .attribute(AttributeSchema::new("target", pattern_type.clone())),
+                ResourceSchema::new("consumer.Custom")
+                    .attribute(AttributeSchema::new("target", custom_type)),
+                ResourceSchema::new("consumer.Validated")
+                    .attribute(AttributeSchema::new("target", AttributeType::string()))
+                    .with_validator(reject_bad_target),
+                ResourceSchema::new("lookup.Pattern")
+                    .attribute(AttributeSchema::new("target", pattern_type))
+                    .as_data_source(),
+            ]
+        }
+    }
+
+    #[derive(Default)]
+    struct RewritingNormalizer {
+        desired_calls: AtomicUsize,
+    }
+
+    impl ProviderNormalizer for RewritingNormalizer {
+        fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+            self.desired_calls.fetch_add(1, Ordering::SeqCst);
+            for resource in resources {
+                if resource.attributes.contains_key("target") {
+                    resource.set_attr("target", text("good-normalized"));
+                }
+            }
+            ready_noop()
+        }
+
+        fn normalize_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+        ) -> BoxFuture<'a, ()> {
+            ready_noop()
+        }
+
+        fn hydrate_read_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+            _saved_attrs: &'a carina_core::provider::SavedAttrs,
+        ) -> BoxFuture<'a, ()> {
+            ready_noop()
+        }
+
+        fn merge_default_tags<'a>(
+            &'a self,
+            _resources: &'a mut [Resource],
+            _default_tags: &'a IndexMap<String, Value>,
+            _registry: &'a SchemaRegistry,
+        ) -> BoxFuture<'a, ()> {
+            ready_noop()
+        }
+    }
+
+    fn ref_value() -> Value {
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("producer", "value"),
+        })
+    }
+
+    fn managed_resources(
+        consumer_type: &str,
+        producer_value: Value,
+    ) -> (OverrideAwareResources, Vec<Resource>) {
+        let producer = Resource::with_provider("test", "source", "producer", None)
+            .with_binding("producer")
+            .with_attribute("value", producer_value);
+        let consumer = Resource::with_provider("test", consumer_type, "consumer", None)
+            .with_binding("consumer")
+            .with_attribute("target", ref_value());
+        let source = vec![producer, consumer];
+        let compositions = Vec::<Composition>::new();
+        let data_sources = Vec::<DataSource>::new();
+        let current_states = HashMap::new();
+        let remote_bindings = HashMap::new();
+        let wait_aliases = Vec::new();
+        let resources = OverrideAwareResources::build(
+            source,
+            None::<&carina_state::StateFile>,
+            PreApplyInputs {
+                managed: &[],
+                compositions: &compositions,
+                data_sources: &data_sources,
+                current_states: &current_states,
+                remote_bindings: &remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+        )
+        .expect("test references resolve");
+        let origins = resources.paired_unresolved_resources();
+        (resources, origins)
+    }
+
+    async fn prepare_managed(
+        consumer_type: &str,
+        producer_value: Value,
+        normalizer: &RewritingNormalizer,
+    ) -> Result<(), Vec<carina_core::plan::PlanError>> {
+        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)]);
+        let (mut resources, origins) = managed_resources(consumer_type, producer_value);
+        let mut compositions = Vec::new();
+        let mut current_states = HashMap::new();
+        let mut data_sources = Vec::new();
+        let data_source_origins = Vec::new();
+        let mut wait_bindings = Vec::new();
+
+        PlanPreprocessor::new(normalizer, &ctx)
+            .prepare(
+                &mut resources,
+                &origins,
+                &mut compositions,
+                &mut current_states,
+                &[],
+                &mut data_sources,
+                &data_source_origins,
+                &mut wait_bindings,
+            )
+            .await
+    }
+
+    fn assert_resolved_error(
+        errors: &[carina_core::plan::PlanError],
+        expected_type: &str,
+        expected_message: &str,
+    ) {
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert_eq!(errors[0].resource_id.resource_type, expected_type);
+        match &errors[0].kind {
+            PlanErrorKind::ResolvedValueConstraint {
+                attributes,
+                origins,
+                message,
+            } => {
+                assert_eq!(attributes, &["target"]);
+                assert_eq!(origins, &["producer.value"]);
+                assert!(message.contains(expected_message), "{message}");
+            }
+            other => panic!("unexpected plan error: {other:?}"),
+        }
+        let rendered = errors[0].to_string();
+        assert!(rendered.contains(expected_type), "{rendered}");
+        assert!(rendered.contains("target"), "{rendered}");
+        assert!(rendered.contains("producer.value"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn resolved_reference_constraint_fails_before_normalization() {
+        let normalizer = RewritingNormalizer::default();
+        let errors = prepare_managed("consumer.Pattern", text("bad"), &normalizer)
+            .await
+            .expect_err("resolved invalid pattern must fail planning");
+
+        assert_resolved_error(&errors, "consumer.Pattern", "required pattern");
+        assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn still_unknown_reference_is_not_rejected() {
+        let normalizer = RewritingNormalizer::default();
+        let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+            path: AccessPath::new("producer", "value"),
+        }));
+
+        prepare_managed("consumer.Pattern", unknown, &normalizer)
+            .await
+            .expect("unknown value must remain pending");
+        assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn resolved_reference_runs_provider_custom_type_lookup() {
+        let normalizer = RewritingNormalizer::default();
+        let errors = prepare_managed("consumer.Custom", text("bad"), &normalizer)
+            .await
+            .expect_err("provider custom type must run at the resolution gate");
+
+        assert_resolved_error(&errors, "consumer.Custom", "external id rejected");
+        assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn resolved_reference_runs_resource_validator() {
+        let normalizer = RewritingNormalizer::default();
+        let errors = prepare_managed("consumer.Validated", text("bad"), &normalizer)
+            .await
+            .expect_err("resource validator must run at the resolution gate");
+
+        assert_resolved_error(&errors, "consumer.Validated", "target pair rejected");
+        assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn resolved_data_source_input_uses_the_same_gate() {
+        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)]);
+        let normalizer = RewritingNormalizer::default();
+        let mut resources = OverrideAwareResources::build(
+            Vec::new(),
+            None::<&carina_state::StateFile>,
+            PreApplyInputs {
+                managed: &[],
+                compositions: &[],
+                data_sources: &[],
+                current_states: &HashMap::new(),
+                remote_bindings: &HashMap::new(),
+                wait_aliases: &[],
+            },
+        )
+        .unwrap();
+        let mut data_sources = vec![
+            DataSource::with_provider("test", "lookup.Pattern", "lookup", None)
+                .with_attribute("target", text("bad")),
+        ];
+        let data_source_origins = vec![
+            DataSource::with_provider("test", "lookup.Pattern", "lookup", None)
+                .with_attribute("target", ref_value()),
+        ];
+
+        let errors = PlanPreprocessor::new(&normalizer, &ctx)
+            .prepare(
+                &mut resources,
+                &[],
+                &mut [],
+                &mut HashMap::new(),
+                &[],
+                &mut data_sources,
+                &data_source_origins,
+                &mut [],
+            )
+            .await
+            .expect_err("invalid resolved data-source input must fail planning");
+
+        assert_resolved_error(&errors, "lookup.Pattern", "required pattern");
+        assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
+    }
+}

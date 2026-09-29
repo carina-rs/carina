@@ -1483,7 +1483,7 @@ async fn run_apply_locked(
     // after any Replace on a referenced managed resource.
     // carina#3181: composition resources live in `parsed.compositions`
     // as their own typed slice.
-    let pre_resolve_compositions: Vec<carina_core::resource::Composition> =
+    let mut pre_resolve_compositions: Vec<carina_core::resource::Composition> =
         parsed.compositions.clone();
 
     let pre_apply_input_states = carina_core::resource::into_plan_input_map(
@@ -1527,28 +1527,40 @@ async fn run_apply_locked(
         .filter(|resource| deferred_data_source_reads.contains(&resource.id))
         .map(|resource| resource.id.clone())
         .collect();
-    let data_sources_for_plan = prepare_data_sources_for_plan(
+    let mut data_sources_for_plan = prepare_data_sources_for_plan(
         &data_sources,
         &deferred_data_source_ids,
         override_aware_resources.bindings(),
         None,
-        ctx.schemas(),
     )?;
+    let constraint_origin_resources = override_aware_resources
+        .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
     // Run the normalization pipeline (same as plan path in wiring.rs).
     // `prepare` also canonicalizes the wait `until` predicate enum
     // aliases (carina#3358); the apply path is a separate pipeline that
     // calls `create_plan` directly, so it relies on the same shared seam.
     let mut wait_bindings = parsed.wait_bindings.clone();
     let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);
-    preprocessor
+    let preparation = preprocessor
         .prepare(
-            override_aware_resources.resources_mut(),
+            &mut override_aware_resources,
+            &constraint_origin_resources,
+            &mut pre_resolve_compositions,
             &mut current_states,
             &parsed.providers,
-            &data_sources_for_plan,
+            &mut data_sources_for_plan,
+            &data_sources,
             &mut wait_bindings,
         )
         .await;
+    if let Err(errors) = preparation {
+        let mut plan = Plan::new();
+        for error in errors {
+            plan.add_error(error);
+        }
+        render_plan_errors_and_abort(&plan)?;
+        unreachable!("render_plan_errors_and_abort returns an error for an invalid plan");
+    }
     reconcile_late_anonymous_identities(
         ctx,
         LateAnonymousIdentityInputs {

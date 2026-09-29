@@ -5,7 +5,6 @@ use std::hash::{Hash, Hasher};
 use std::io::IsTerminal;
 use std::path::Path;
 
-#[cfg(test)]
 use indexmap::IndexMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,17 +32,17 @@ use carina_core::override_aware::OverrideAwareResources;
 #[cfg(test)]
 use carina_core::parser::MovedAddresses;
 use carina_core::parser::{ProviderConfig, StateBlock, StateBlockAddress, WarningKind};
-use carina_core::plan::Plan;
+use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::provider::{
     self as provider_mod, LiftedSavedAttrs, Provider, ProviderError, ProviderFactory,
     ProviderNormalizer, ProviderRouter,
 };
 use carina_core::resource::{
-    ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, State, Value,
+    Composition, ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
-    resolve_block_names,
+    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField, TypeError,
+    TypeIdentity, resolve_block_names,
 };
 use carina_core::validation;
 use carina_provider_mock::MockProvider;
@@ -1055,6 +1054,166 @@ pub struct PlanPreprocessor<'a> {
     ctx: &'a WiringContext,
 }
 
+fn type_error_attribute(error: &TypeError) -> Option<&str> {
+    match error {
+        TypeError::InvalidEnumVariant { attribute, .. }
+        | TypeError::PatternMismatch { attribute, .. }
+        | TypeError::LengthOutOfRange { attribute, .. }
+        | TypeError::StringLiteralExpectedEnum { attribute, .. }
+        | TypeError::ResourceValidationFailed { attribute, .. } => attribute.as_deref(),
+        TypeError::BlockSyntaxNotAllowed { attribute } => Some(attribute),
+        TypeError::ListItemError { inner, .. }
+        | TypeError::MapKeyError { inner, .. }
+        | TypeError::MapValueError { inner, .. }
+        | TypeError::StructFieldError { inner, .. } => type_error_attribute(inner),
+        TypeError::TypeMismatch { .. }
+        | TypeError::ValidationFailed { .. }
+        | TypeError::MissingRequired { .. }
+        | TypeError::ReadOnlyAttribute { .. }
+        | TypeError::UnknownAttribute { .. }
+        | TypeError::UnknownStructField { .. }
+        | TypeError::UnionStructMismatch { .. } => None,
+    }
+}
+
+fn resolved_constraint_context(
+    error: &TypeError,
+    origin_attributes: &IndexMap<String, Value>,
+    schema: &ResourceSchema,
+) -> (Vec<String>, Vec<String>) {
+    let mut origins_by_attribute: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (attribute, value) in origin_attributes {
+        if !schema.attributes.contains_key(attribute) {
+            continue;
+        }
+        value.visit_resource_refs(&mut |path| {
+            origins_by_attribute
+                .entry(attribute.clone())
+                .or_default()
+                .insert(path.to_dot_string());
+        });
+    }
+
+    let explicit_attribute = type_error_attribute(error).map(str::to_string);
+    let attributes = if let Some(attribute) = explicit_attribute {
+        vec![attribute]
+    } else if origins_by_attribute.is_empty() {
+        let mut known = origin_attributes
+            .keys()
+            .filter(|attribute| schema.attributes.contains_key(*attribute))
+            .cloned()
+            .collect::<Vec<_>>();
+        known.sort();
+        known
+    } else {
+        origins_by_attribute.keys().cloned().collect()
+    };
+
+    let mut origins = BTreeSet::new();
+    for attribute in &attributes {
+        if let Some(paths) = origins_by_attribute.get(attribute) {
+            origins.extend(paths.iter().cloned());
+        }
+    }
+    if origins.is_empty() {
+        origins.extend(origins_by_attribute.into_values().flatten());
+    }
+
+    (attributes, origins.into_iter().collect())
+}
+
+fn provider_custom_type_lookup<'a>(
+    ctx: &'a WiringContext,
+) -> impl Fn(&TypeIdentity, &Value) -> Result<(), TypeError> + Send + Sync + 'a {
+    move |identity, value| {
+        let Some(text) = value
+            .as_concrete()
+            .and_then(|concrete| concrete.as_string_like())
+        else {
+            return Ok(());
+        };
+        for factory in ctx.factories() {
+            factory
+                .validate_custom_type(identity, text)
+                .map_err(|message| TypeError::ValidationFailed { message })?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_resolved_value_constraints(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    resource_origins: &[Resource],
+    data_sources: &[DataSource],
+    data_source_origins: &[DataSource],
+) -> Vec<PlanError> {
+    assert_eq!(
+        resources.len(),
+        resource_origins.len(),
+        "plan value checking requires paired managed resources"
+    );
+    assert_eq!(
+        data_sources.len(),
+        data_source_origins.len(),
+        "plan value checking requires paired data sources"
+    );
+
+    let lookup = provider_custom_type_lookup(ctx);
+    let mut plan_errors = Vec::new();
+    for (resource, origin) in resources.iter().zip(resource_origins) {
+        let Some(schema) = ctx.schemas().get_for(resource) else {
+            continue;
+        };
+        let is_string_literal = |attribute: &str| resource.quoted_string_attrs.contains(attribute);
+        if let Err(errors) = schema.validate_known_values_with_origins_and_lookup(
+            &resource.resolved_attributes(),
+            &is_string_literal,
+            &lookup,
+        ) {
+            for error in errors {
+                let (attributes, origins) =
+                    resolved_constraint_context(&error, &origin.attributes, schema);
+                plan_errors.push(PlanError::new(
+                    resource.id.clone(),
+                    PlanErrorKind::ResolvedValueConstraint {
+                        attributes,
+                        origins,
+                        message: error.to_string(),
+                    },
+                ));
+            }
+        }
+    }
+
+    for (resource, origin) in data_sources.iter().zip(data_source_origins) {
+        let Some(schema) = ctx.schemas().get_for_data_source(resource) else {
+            continue;
+        };
+        let is_string_literal = |attribute: &str| resource.quoted_string_attrs.contains(attribute);
+        if let Err(errors) = schema.validate_known_values_with_origins_and_lookup(
+            &carina_core::resource::attrs_to_hashmap(&resource.attributes),
+            &is_string_literal,
+            &lookup,
+        ) {
+            for error in errors {
+                let (attributes, origins) =
+                    resolved_constraint_context(&error, &origin.attributes, schema);
+                plan_errors.push(PlanError::new(
+                    resource.id.clone(),
+                    PlanErrorKind::ResolvedValueConstraint {
+                        attributes,
+                        origins,
+                        message: error.to_string(),
+                    },
+                ));
+            }
+        }
+    }
+
+    plan_errors
+}
+
 impl<'a> PlanPreprocessor<'a> {
     pub fn new(normalizer: &'a dyn ProviderNormalizer, ctx: &'a WiringContext) -> Self {
         Self { normalizer, ctx }
@@ -1071,16 +1230,33 @@ impl<'a> PlanPreprocessor<'a> {
     /// cannot canonicalize resources/states while silently skipping
     /// waits. `wait_bindings` is mutated in place; pass the same slice
     /// on to `create_plan`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn prepare(
         &self,
-        resources: &mut [Resource],
+        resources: &mut OverrideAwareResources,
+        resource_origins: &[Resource],
+        _compositions: &mut [Composition],
         current_states: &mut HashMap<ResourceId, State>,
         provider_configs: &[ProviderConfig],
-        data_sources: &[carina_core::resource::DataSource],
+        data_sources: &mut [DataSource],
+        data_source_origins: &[DataSource],
         wait_bindings: &mut [carina_core::parser::WaitBinding],
-    ) {
+    ) -> Result<(), Vec<PlanError>> {
         let schemas = self.ctx.schemas();
+        let errors = validate_resolved_value_constraints(
+            self.ctx,
+            resources.resources(),
+            resource_origins,
+            data_sources,
+            data_source_origins,
+        );
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        let resources = resources.resources_mut();
         carina_core::value::canonicalize_resources_with_schemas(resources, schemas);
+        carina_core::value::canonicalize_data_sources_with_schemas(data_sources, schemas);
 
         // RFC #2371 stage 2 + #2387: strip every attribute the WASM
         // provider boundary refuses to serialize — `Value::Deferred(DeferredValue::Unknown)`
@@ -1116,6 +1292,7 @@ impl<'a> PlanPreprocessor<'a> {
         // so target lookup is valid at this point.
         resolve_enum_aliases_in_wait_bindings(self.ctx, wait_bindings, resources, data_sources);
         restore_stripped_attributes(resources, stripped);
+        Ok(())
     }
 }
 
@@ -2730,28 +2907,56 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // Resolve and canonicalize only refresh-time data sources. Deferred
     // reads keep their original input refs so the plan/executor dependency
     // graph still contains the upstream create edge.
-    let data_sources_for_plan = prepare_data_sources_for_plan(
+    let mut data_sources_for_plan = prepare_data_sources_for_plan(
         &data_sources,
         &deferred_data_source_ids,
         override_aware_resources.bindings(),
         Some(&upstream_binding_names),
-        ctx.schemas(),
     )?;
+    let constraint_origin_resources = override_aware_resources
+        .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
+    let mut prepared_compositions = parsed.compositions.clone();
 
     // Run the normalization pipeline: normalize_desired → normalize_state →
     // merge_default_tags → resolve_enum_aliases (resources, states, and
     // wait `until` predicates — carina#3358). Order matters.
     let mut wait_bindings = parsed.wait_bindings.clone();
     let preprocessor = PlanPreprocessor::new(&provider, ctx);
-    preprocessor
+    let preparation = preprocessor
         .prepare(
-            override_aware_resources.resources_mut(),
+            &mut override_aware_resources,
+            &constraint_origin_resources,
+            &mut prepared_compositions,
             &mut current_states,
             &parsed.providers,
-            &data_sources_for_plan,
+            &mut data_sources_for_plan,
+            &data_sources,
             &mut wait_bindings,
         )
         .await;
+    if let Err(errors) = preparation {
+        let mut plan = Plan::new();
+        for error in errors {
+            plan.add_error(error);
+        }
+        let moved_origins = moved_pairs
+            .iter()
+            .map(|(from, to)| (to.clone(), from.clone()))
+            .collect();
+        return Ok(PlanContext {
+            plan,
+            provider,
+            sorted_resources: constraint_origin_resources.clone(),
+            unresolved_resources: constraint_origin_resources,
+            data_sources: data_sources_for_plan,
+            current_states,
+            moved_origins,
+            upstream_snapshot: remote_bindings.clone(),
+            prev_explicit,
+            residual_deferred_for,
+            expansion_trace: parsed.expansion_trace.clone(),
+        });
+    }
 
     // Anonymous resources whose identity attributes include ResourceRefs can
     // only be named and matched after plan-time refs and provider normalization
@@ -2836,7 +3041,6 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         .collect();
     let paired_unresolved_resources = override_aware_resources
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
-
     Ok(PlanContext {
         plan,
         provider,
@@ -3904,7 +4108,6 @@ pub(crate) fn prepare_data_sources_for_plan(
     deferred_data_source_ids: &HashSet<ResourceId>,
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: Option<&std::collections::HashSet<&str>>,
-    schemas: &SchemaRegistry,
 ) -> Result<Vec<DataSource>, AppError> {
     let mut prepared = Vec::with_capacity(data_sources.len());
     for resource in data_sources {
@@ -3924,10 +4127,6 @@ pub(crate) fn prepare_data_sources_for_plan(
                 )
                 .map_err(AppError::Validation)?;
             }
-            carina_core::value::canonicalize_data_sources_with_schemas(
-                std::slice::from_mut(&mut resource),
-                schemas,
-            );
         }
         prepared.push(resource);
     }
