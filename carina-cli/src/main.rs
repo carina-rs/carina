@@ -9,7 +9,7 @@ use carina_cli::commands;
 use carina_cli::commands::apply::{run_apply, run_apply_from_plan};
 use carina_cli::commands::destroy::run_destroy;
 use carina_cli::commands::docs;
-use carina_cli::commands::fmt::run_fmt;
+use carina_cli::commands::fmt::{FmtMode, run_fmt};
 use carina_cli::commands::lint::run_lint;
 use carina_cli::commands::module::{ModuleCommands, run_module_command};
 use carina_cli::commands::plan::run_plan;
@@ -161,7 +161,7 @@ enum Commands {
         #[arg(long, short)]
         check: bool,
 
-        /// Show diff of formatting changes
+        /// Show the formatting diff without writing files
         #[arg(long)]
         diff: bool,
 
@@ -439,7 +439,7 @@ async fn main() {
                 check,
                 diff,
                 recursive,
-            } => run_fmt(&path, check, diff, recursive),
+            } => run_fmt(&path, FmtMode::from_flags(check, diff), recursive),
             Commands::Module { command } => run_module_command(command, &provider_context),
             Commands::ForceUnlock { lock_id, path } => {
                 run_force_unlock(&lock_id, &path, &provider_context).await

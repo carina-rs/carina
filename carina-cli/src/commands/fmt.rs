@@ -18,6 +18,68 @@ use crate::wiring::{
     FormattingFactoryLoad, WiringContext, build_factories_from_providers_for_formatting,
 };
 
+/// Controls how formatting changes are applied and reported.
+#[derive(Debug, Eq, PartialEq)]
+pub enum FmtMode {
+    /// Rewrites files in place.
+    Write,
+    /// Implements `--diff`: prints diffs, writes nothing, and exits 0 for formatting changes.
+    Preview,
+    /// Implements `--check`: writes nothing, fails on formatting changes, and may print diffs.
+    Check { show_diff: bool },
+}
+
+impl FmtMode {
+    /// Selects a formatting mode from the command-line flags, with `--check` taking precedence.
+    pub fn from_flags(check: bool, diff: bool) -> Self {
+        match (check, diff) {
+            (false, false) => Self::Write,
+            (false, true) => Self::Preview,
+            (true, false) => Self::Check { show_diff: false },
+            (true, true) => Self::Check { show_diff: true },
+        }
+    }
+
+    fn print_diff_if_requested(&self, file: &Path, original: &str, formatted: &str) {
+        match self {
+            Self::Write | Self::Check { show_diff: false } => {}
+            Self::Preview | Self::Check { show_diff: true } => {
+                print_diff(file, original, formatted);
+            }
+        }
+    }
+
+    fn write_file_if_requested(&self, file: &Path, formatted: &str) -> Result<(), AppError> {
+        match self {
+            Self::Write => {
+                fs::write(file, formatted)
+                    .map_err(|e| format!("Failed to write {}: {}", file.display(), e))?;
+                println!("{} {}", "Formatted:".green(), file.display());
+                Ok(())
+            }
+            Self::Preview | Self::Check { .. } => Ok(()),
+        }
+    }
+
+    fn warn_if_providers_unavailable(&self, diagnostics: &BTreeSet<String>) {
+        match self {
+            Self::Write => {}
+            Self::Preview | Self::Check { .. } => {
+                if !diagnostics.is_empty() {
+                    eprintln!(
+                        "{}",
+                        "Warning: provider(s) unavailable; block-syntax conversion skipped"
+                            .yellow()
+                    );
+                    for diagnostic in diagnostics {
+                        eprintln!("  {diagnostic}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct DirectoryBlockNames {
     block_names: HashMap<String, String>,
@@ -199,20 +261,20 @@ where
 /// Format `.crn` files without making provider availability a hard dependency.
 ///
 /// Provider load failures silently degrade affected block-syntax conversion to
-/// plain formatting. In `--check` mode, the same degradation also emits a
-/// warning so CI results remain diagnosable. Recursive formatting lets modules
-/// inherit schemas from caller directories visible in the same walk. Formatting
-/// a module directory alone remains plain because that invocation has no caller
-/// context, matching an LSP session opened without the caller workspace.
-pub fn run_fmt(path: &Path, check: bool, show_diff: bool, recursive: bool) -> Result<(), AppError> {
+/// plain formatting. In non-writing modes (`--check` and/or `--diff`), the same
+/// degradation also emits a warning so results remain diagnosable. Recursive
+/// formatting lets modules inherit schemas from caller directories visible in
+/// the same walk. Formatting a module directory alone remains plain because
+/// that invocation has no caller context, matching an LSP session opened
+/// without the caller workspace.
+pub fn run_fmt(path: &Path, mode: FmtMode, recursive: bool) -> Result<(), AppError> {
     // Schema-aware conversion costs one installed-WASM provider load per
     // provider-declaring directory visible to the invocation. The startup cost
     // is intentional: editor and CLI formatting correctness must win over the
     // old schema-free fast path.
     run_fmt_with_factory_builder(
         path,
-        check,
-        show_diff,
+        mode,
         recursive,
         build_factories_from_providers_for_formatting,
     )
@@ -220,8 +282,7 @@ pub fn run_fmt(path: &Path, check: bool, show_diff: bool, recursive: bool) -> Re
 
 fn run_fmt_with_factory_builder<F>(
     path: &Path,
-    check: bool,
-    show_diff: bool,
+    mode: FmtMode,
     recursive: bool,
     mut build_factories: F,
 ) -> Result<(), AppError>
@@ -276,15 +337,8 @@ where
                 if content != formatted {
                     needs_formatting.push((file.clone(), content.clone(), formatted.clone()));
 
-                    if show_diff {
-                        print_diff(file, &content, &formatted);
-                    }
-
-                    if !check {
-                        fs::write(file, &formatted)
-                            .map_err(|e| format!("Failed to write {}: {}", file.display(), e))?;
-                        println!("{} {}", "Formatted:".green(), file.display());
-                    }
+                    mode.print_diff_if_requested(file, &content, &formatted);
+                    mode.write_file_if_requested(file, &formatted)?;
                 }
             }
             Err(e) => {
@@ -293,51 +347,68 @@ where
         }
     }
 
-    if check && !provider_load_diagnostics.is_empty() {
-        eprintln!(
-            "{}",
-            "Warning: provider(s) unavailable; block-syntax conversion skipped".yellow()
-        );
-        for diagnostic in provider_load_diagnostics {
-            eprintln!("  {diagnostic}");
-        }
-    }
+    mode.warn_if_providers_unavailable(&provider_load_diagnostics);
 
     // Print summary
-    if check {
-        if needs_formatting.is_empty() && errors.is_empty() {
-            println!("{}", "All files are properly formatted.".green());
-            Ok(())
-        } else {
-            if !needs_formatting.is_empty() {
-                println!("{}", "The following files need formatting:".yellow());
-                for (file, _, _) in &needs_formatting {
-                    println!("  {}", file.display());
+    match mode {
+        FmtMode::Check { .. } => {
+            if needs_formatting.is_empty() && errors.is_empty() {
+                println!("{}", "All files are properly formatted.".green());
+                Ok(())
+            } else {
+                if !needs_formatting.is_empty() {
+                    println!("{}", "The following files need formatting:".yellow());
+                    for (file, _, _) in &needs_formatting {
+                        println!("  {}", file.display());
+                    }
                 }
+                for (file, err) in &errors {
+                    eprintln!("{} {}: {}", "Error:".red(), file.display(), err);
+                }
+                Err(AppError::Validation(
+                    "Some files are not properly formatted".to_string(),
+                ))
             }
-            for (file, err) in &errors {
-                eprintln!("{} {}: {}", "Error:".red(), file.display(), err);
+        }
+        FmtMode::Preview => {
+            report_formatting_errors(&errors)?;
+            let count = needs_formatting.len();
+            if count > 0 {
+                println!(
+                    "{}",
+                    format!("{} file(s) would be reformatted.", count)
+                        .yellow()
+                        .bold()
+                );
+            } else {
+                println!("{}", "All files are already properly formatted.".green());
             }
-            Err(AppError::Validation(
-                "Some files are not properly formatted".to_string(),
-            ))
+            Ok(())
         }
-    } else if !errors.is_empty() {
-        for (file, err) in &errors {
-            eprintln!("{} {}: {}", "Error:".red(), file.display(), err);
+        FmtMode::Write => {
+            report_formatting_errors(&errors)?;
+            let count = needs_formatting.len();
+            if count > 0 {
+                println!("{}", format!("Formatted {} file(s).", count).green().bold());
+            } else {
+                println!("{}", "All files are already properly formatted.".green());
+            }
+            Ok(())
         }
-        Err(AppError::Validation(
-            "Some files had formatting errors".to_string(),
-        ))
-    } else {
-        let count = needs_formatting.len();
-        if count > 0 {
-            println!("{}", format!("Formatted {} file(s).", count).green().bold());
-        } else {
-            println!("{}", "All files are already properly formatted.".green());
-        }
-        Ok(())
     }
+}
+
+fn report_formatting_errors(errors: &[(PathBuf, String)]) -> Result<(), AppError> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+
+    for (file, err) in errors {
+        eprintln!("{} {}: {}", "Error:".red(), file.display(), err);
+    }
+    Err(AppError::Validation(
+        "Some files had formatting errors".to_string(),
+    ))
 }
 
 fn print_diff(file: &Path, original: &str, formatted: &str) {
@@ -361,6 +432,20 @@ mod tests {
     use carina_core::resource::Value;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
     use indexmap::IndexMap;
+
+    #[test]
+    fn fmt_mode_from_flags_covers_all_combinations() {
+        assert_eq!(FmtMode::from_flags(false, false), FmtMode::Write);
+        assert_eq!(FmtMode::from_flags(false, true), FmtMode::Preview);
+        assert_eq!(
+            FmtMode::from_flags(true, false),
+            FmtMode::Check { show_diff: false }
+        );
+        assert_eq!(
+            FmtMode::from_flags(true, true),
+            FmtMode::Check { show_diff: true }
+        );
+    }
 
     struct FactoryWithBlockSchema {
         block_name: &'static str,
@@ -453,7 +538,7 @@ mod tests {
         .unwrap();
         let mut builder_calls = 0;
 
-        let error = run_fmt_with_factory_builder(&file, false, false, false, |_, _| {
+        let error = run_fmt_with_factory_builder(&file, FmtMode::Write, false, |_, _| {
             builder_calls += 1;
             (Vec::new(), HashMap::new())
         })
@@ -528,7 +613,7 @@ let imported = use {{
         write_provider_caller(&tmp.path().join("a-caller"), "a", "../modules/m");
         let mut built_for = Vec::new();
 
-        run_fmt_with_factory_builder(tmp.path(), false, false, true, |_, base_dir| {
+        run_fmt_with_factory_builder(tmp.path(), FmtMode::Write, true, |_, base_dir| {
             let directory_name = base_dir.file_name().and_then(|name| name.to_str()).unwrap();
             built_for.push(directory_name.to_string());
             let block_name = match directory_name {
@@ -556,7 +641,7 @@ let imported = use {{
         let resource = write_convertible_module(&module);
         let mut builder_calls = 0;
 
-        run_fmt_with_factory_builder(&module, false, false, false, |_, _| {
+        run_fmt_with_factory_builder(&module, FmtMode::Write, false, |_, _| {
             builder_calls += 1;
             (Vec::new(), HashMap::new())
         })
@@ -593,7 +678,7 @@ let imported = use {{
         }
         let mut built_for = Vec::new();
 
-        run_fmt_with_factory_builder(tmp.path(), false, false, true, |_, base_dir| {
+        run_fmt_with_factory_builder(tmp.path(), FmtMode::Write, true, |_, base_dir| {
             let directory_name = base_dir.file_name().and_then(|name| name.to_str()).unwrap();
             built_for.push(directory_name.to_string());
             let block_name = match directory_name {
