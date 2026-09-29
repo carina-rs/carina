@@ -151,12 +151,22 @@ impl ModuleConstraintGate {
 
     /// Evaluate every remaining constraint at the end of apply.
     ///
-    /// A constraint whose arguments are still unresolved is an explicit
-    /// failure here. Failures already emitted by a consuming provider effect
-    /// are re-evaluated but omitted from this returned diagnostic only when
-    /// the complete rendered failure is unchanged.
-    pub fn finish(&self, bindings: &ResolvedBindings) -> Result<(), ModuleConstraintGateError> {
-        let failures = evaluate_pending_constraints(&self.compositions, bindings, true);
+    /// When `report_unresolved` is true, a constraint whose arguments are
+    /// still unresolved is an explicit failure. An execution that already has
+    /// failed or skipped effects passes false because those effects may be the
+    /// only reason an input was never published. Decidable violations are
+    /// evaluated and reported in either mode.
+    ///
+    /// Failures already emitted by a consuming provider effect are
+    /// re-evaluated but omitted from this returned diagnostic only when the
+    /// complete rendered failure is unchanged.
+    pub fn finish(
+        &self,
+        bindings: &ResolvedBindings,
+        report_unresolved: bool,
+    ) -> Result<(), ModuleConstraintGateError> {
+        let failures =
+            evaluate_pending_constraints(&self.compositions, bindings, report_unresolved);
         self.report_new(failures)
     }
 

@@ -117,7 +117,7 @@ fn finalize_module_constraints(
     bindings: &ResolvedBindings,
 ) -> Result<(), AppError> {
     carina_core::executor::ModuleConstraintGate::new(compositions)
-        .finish(bindings)
+        .finish(bindings, true)
         .map_err(|error| AppError::Validation(error.to_string()))
 }
 

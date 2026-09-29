@@ -2714,6 +2714,141 @@ async fn terminal_module_constraint_sweep_rejects_still_pending_input() {
 }
 
 #[tokio::test]
+async fn terminal_pending_constraint_is_silent_after_failed_and_skipped_effects() {
+    let provider = MockProvider::new();
+    let failed = make_resource("failed", &[]);
+    let skipped = make_resource("skipped", &["failed"]);
+    provider.push_create(Err(ProviderError::api_error("upstream create failed")));
+    let composition = pending_module_composition(
+        "root.unused",
+        vec![("value", Value::resource_ref("missing", "value", vec![]))],
+        vec![module_not_bad_constraint("value")],
+    );
+    let mut plan = Plan::new();
+    plan.add(create_effect(failed));
+    plan.add(create_effect(skipped));
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: std::slice::from_ref(&composition),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let events = observer.events().join("\n");
+
+    assert_eq!(result.failure_count, 1, "events: {events}");
+    assert_eq!(result.skip_count, 1, "events: {events}");
+    assert!(
+        events.contains("upstream create failed"),
+        "events: {events}"
+    );
+    assert!(
+        !events.contains("still unresolved at end of apply"),
+        "the upstream failure already explains the pending input: {events}"
+    );
+    assert!(
+        !events.contains("module_constraint_failed"),
+        "pending constraint was double-counted: {events}"
+    );
+}
+
+#[tokio::test]
+async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+
+    let provider = MockProvider::new();
+    let target_id = ResourceId::with_identity("test", "wait-target");
+    let pending_state = State::existing(
+        target_id.clone(),
+        HashMap::from([(
+            "status".to_string(),
+            Value::Concrete(ConcreteValue::String("PENDING".to_string())),
+        )]),
+    )
+    .with_identifier("target-id");
+    provider.push_read(Ok(pending_state.clone()));
+    let composition = pending_module_composition(
+        "root.unused",
+        vec![("value", Value::resource_ref("missing", "value", vec![]))],
+        vec![module_not_bad_constraint("value")],
+    );
+    let mut plan = Plan::new();
+    plan.add(Effect::Wait {
+        identity: ResourceIdentity::new("target_ready"),
+        target_id: crate::resource::ResolvedResourceId::new(target_id.clone()),
+        until: WaitPredicate::Equals {
+            attr: AttrPath::single("status"),
+            value: Value::Concrete(ConcreteValue::String("READY".to_string())),
+        },
+        until_surface: "wait-target.status == READY".to_string(),
+        timeout: std::time::Duration::from_secs(60),
+        interval: std::time::Duration::from_millis(1),
+        explicit_dependencies: HashSet::new(),
+    });
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: std::slice::from_ref(&composition),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::from([(target_id, pending_state)]),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let events = observer.events().join("\n");
+
+    assert_eq!(result.failure_count, 0, "events: {events}");
+    assert_eq!(result.skip_count, 1, "events: {events}");
+    assert!(events.contains("no mutator remaining"), "events: {events}");
+    assert!(
+        !events.contains("still unresolved at end of apply"),
+        "the skipped effect already explains the pending input: {events}"
+    );
+    assert!(
+        !events.contains("module_constraint_failed"),
+        "pending constraint was double-counted: {events}"
+    );
+}
+
+#[test]
+fn terminal_gate_still_reports_decidable_violations_when_pending_is_suppressed() {
+    let composition = pending_module_composition(
+        "root.known",
+        vec![(
+            "value",
+            Value::Concrete(ConcreteValue::String("bad".to_string())),
+        )],
+        vec![module_not_bad_constraint("value")],
+    );
+    let gate = ModuleConstraintGate::new(std::slice::from_ref(&composition));
+
+    let error = gate
+        .finish(&ResolvedBindings::default(), false)
+        .expect_err("a known violation must not be suppressed with pending inputs");
+
+    assert_eq!(error.failures().len(), 1);
+    assert!(error.to_string().contains("value must not be bad"));
+    assert!(!error.to_string().contains("still unresolved"));
+}
+
+#[tokio::test]
 async fn execute_plan_with_pre_cancelled_token_returns_cancelled_at_t4_or_later() {
     let provider = MockProvider::new();
     let resource = make_resource("one", &[]);

@@ -822,7 +822,10 @@ pub(super) async fn execute_effects_sequential(
     };
     cancelled |= refresh_cancelled;
 
-    if !cancelled && let Err(error) = module_gate.finish(&input.bindings) {
+    let report_unresolved_constraints = failure_count == 0 && skip_count == 0;
+    if !cancelled
+        && let Err(error) = module_gate.finish(&input.bindings, report_unresolved_constraints)
+    {
         for failure in error.failures() {
             let message = failure.to_string();
             observer.on_event(&ExecutionEvent::ModuleConstraintFailed { error: &message });
