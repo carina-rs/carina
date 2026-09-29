@@ -41,8 +41,8 @@ use carina_core::resource::{
     Composition, ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField, TypeError,
-    TypeIdentity, resolve_block_names,
+    AttributeSchema, AttributeType, CustomTypeLookup, ResourceSchema, SchemaRegistry, StructField,
+    TypeError, resolve_block_names,
 };
 use carina_core::validation;
 use carina_provider_mock::MockProvider;
@@ -1125,25 +1125,6 @@ fn resolved_constraint_context(
     (attributes, origins.into_iter().collect())
 }
 
-fn provider_custom_type_lookup<'a>(
-    ctx: &'a WiringContext,
-) -> impl Fn(&TypeIdentity, &Value) -> Result<(), TypeError> + Send + Sync + 'a {
-    move |identity, value| {
-        let Some(text) = value
-            .as_concrete()
-            .and_then(|concrete| concrete.as_string_like())
-        else {
-            return Ok(());
-        };
-        for factory in ctx.factories() {
-            factory
-                .validate_custom_type(identity, text)
-                .map_err(|message| TypeError::ValidationFailed { message })?;
-        }
-        Ok(())
-    }
-}
-
 fn validate_resolved_value_constraints(
     ctx: &WiringContext,
     resources: &[Resource],
@@ -1162,59 +1143,70 @@ fn validate_resolved_value_constraints(
         "plan value checking requires paired data sources"
     );
 
-    let lookup = provider_custom_type_lookup(ctx);
+    let lookup = carina_core::executor::provider_custom_type_lookup(ctx.factories());
     let mut plan_errors = Vec::new();
     for (resource, origin) in resources.iter().zip(resource_origins) {
         let Some(schema) = ctx.schemas().get_for(resource) else {
             continue;
         };
-        let is_string_literal = |attribute: &str| resource.quoted_string_attrs.contains(attribute);
-        if let Err(errors) = schema.validate_known_values_with_origins_and_lookup(
+        append_resolved_value_constraint_errors(
+            &mut plan_errors,
+            &resource.id,
+            schema,
             &resource.resolved_attributes(),
-            &is_string_literal,
+            &resource.quoted_string_attrs,
+            &origin.attributes,
             &lookup,
-        ) {
-            for error in errors {
-                let (attributes, origins) =
-                    resolved_constraint_context(&error, &origin.attributes, schema);
-                plan_errors.push(PlanError::new(
-                    resource.id.clone(),
-                    PlanErrorKind::ResolvedValueConstraint {
-                        attributes,
-                        origins,
-                        message: error.to_string(),
-                    },
-                ));
-            }
-        }
+        );
     }
 
     for (resource, origin) in data_sources.iter().zip(data_source_origins) {
         let Some(schema) = ctx.schemas().get_for_data_source(resource) else {
             continue;
         };
-        let is_string_literal = |attribute: &str| resource.quoted_string_attrs.contains(attribute);
-        if let Err(errors) = schema.validate_known_values_with_origins_and_lookup(
+        append_resolved_value_constraint_errors(
+            &mut plan_errors,
+            &resource.id,
+            schema,
             &carina_core::resource::attrs_to_hashmap(&resource.attributes),
-            &is_string_literal,
+            &resource.quoted_string_attrs,
+            &origin.attributes,
             &lookup,
-        ) {
-            for error in errors {
-                let (attributes, origins) =
-                    resolved_constraint_context(&error, &origin.attributes, schema);
-                plan_errors.push(PlanError::new(
-                    resource.id.clone(),
-                    PlanErrorKind::ResolvedValueConstraint {
-                        attributes,
-                        origins,
-                        message: error.to_string(),
-                    },
-                ));
-            }
-        }
+        );
     }
 
     plan_errors
+}
+
+fn append_resolved_value_constraint_errors(
+    plan_errors: &mut Vec<PlanError>,
+    id: &ResourceId,
+    schema: &ResourceSchema,
+    attributes: &HashMap<String, Value>,
+    quoted_string_attrs: &HashSet<String>,
+    origin_attributes: &IndexMap<String, Value>,
+    lookup: CustomTypeLookup<'_>,
+) {
+    let is_string_literal = |attribute: &str| quoted_string_attrs.contains(attribute);
+    let Err(errors) = schema.validate_known_values_with_origins_and_lookup(
+        attributes,
+        &is_string_literal,
+        lookup,
+    ) else {
+        return;
+    };
+
+    for error in errors {
+        let (attributes, origins) = resolved_constraint_context(&error, origin_attributes, schema);
+        plan_errors.push(PlanError::new(
+            id.clone(),
+            PlanErrorKind::ResolvedValueConstraint {
+                attributes,
+                origins,
+                message: error.to_string(),
+            },
+        ));
+    }
 }
 
 impl<'a> PlanPreprocessor<'a> {
@@ -1238,7 +1230,7 @@ impl<'a> PlanPreprocessor<'a> {
         &self,
         resources: &mut OverrideAwareResources,
         resource_origins: &[Resource],
-        compositions: &mut [Composition],
+        compositions: &[Composition],
         current_states: &mut HashMap<ResourceId, State>,
         provider_configs: &[ProviderConfig],
         data_sources: &mut [DataSource],
@@ -1254,20 +1246,25 @@ impl<'a> PlanPreprocessor<'a> {
             data_source_origins,
         );
         errors.extend(
-            module_resolver::evaluate_pending_constraints(compositions, resources.bindings())
-                .into_iter()
-                .map(|failure| {
-                    PlanError::new(
-                        failure.composition_id,
-                        PlanErrorKind::ModuleConstraint {
-                            module: failure.module,
-                            instance: failure.instance,
-                            arguments: failure.arguments,
-                            message: failure.message,
-                            actuals: failure.actuals,
-                        },
-                    )
-                }),
+            module_resolver::evaluate_pending_constraints(
+                compositions,
+                resources.bindings(),
+                false,
+            )
+            .into_iter()
+            .map(|failure| {
+                let message = failure.message_with_detail();
+                PlanError::new(
+                    failure.composition_id,
+                    PlanErrorKind::ModuleConstraint {
+                        module: failure.module,
+                        instance: failure.instance,
+                        arguments: failure.arguments,
+                        message,
+                        actuals: failure.actuals,
+                    },
+                )
+            }),
         );
         if !errors.is_empty() {
             return Err(errors);
@@ -2953,7 +2950,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     )?;
     let constraint_origin_resources = override_aware_resources
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
-    let mut prepared_compositions = parsed.compositions.clone();
+    let prepared_compositions = parsed.compositions.clone();
 
     // Run the normalization pipeline: normalize_desired → normalize_state →
     // merge_default_tags → resolve_enum_aliases (resources, states, and
@@ -2964,7 +2961,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         .prepare(
             &mut override_aware_resources,
             &constraint_origin_resources,
-            &mut prepared_compositions,
+            &prepared_compositions,
             &mut current_states,
             &parsed.providers,
             &mut data_sources_for_plan,

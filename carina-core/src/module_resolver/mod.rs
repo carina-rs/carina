@@ -40,8 +40,8 @@ pub use signature::{
     ResolvedModuleSignature, ResolvedModuleSignatures, load_resolved_module_signatures,
 };
 pub use validation::{
-    ConstraintEvaluation, ModuleConstraintViolation, PendingModuleConstraintFailure,
-    evaluate_constraint, evaluate_pending_constraints, referenced_constraint_arguments,
+    ConstraintEvaluation, ModuleConstraintFailure, ModuleConstraintViolation, evaluate_constraint,
+    evaluate_pending_constraints, referenced_constraint_arguments,
 };
 
 // Bring `pub(super)` helpers into mod.rs scope so the `tests` submodule (which

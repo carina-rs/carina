@@ -1,10 +1,13 @@
 //! Expression evaluator for module `validation` and `require` blocks.
 
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 
 use crate::binding_index::ResolvedBindings;
 use crate::parser::{CompareOp, ValidateExpr};
-use crate::resource::{Composition, ConcreteValue, DeferredValue, ResourceId, Value};
+use crate::resource::{
+    Composition, ConcreteValue, DeferredValue, ModuleConstraintId, ResourceId, Value,
+};
 
 /// A failed module value constraint with deterministic, display-safe actuals.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,16 +17,57 @@ pub struct ModuleConstraintViolation {
     pub actuals: Vec<(String, String)>,
 }
 
-/// A pending module constraint that became invalid at a later resolution
-/// boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingModuleConstraintFailure {
+/// A pending module constraint that failed at a later resolution boundary.
+///
+/// Actual values are rendered eagerly with the secret-aware value formatter;
+/// this type never retains a [`Value`] and is therefore safe to display or
+/// debug-log.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModuleConstraintFailure {
     pub composition_id: ResourceId,
+    constraint_id: ModuleConstraintId,
     pub module: String,
     pub instance: String,
     pub arguments: Vec<String>,
     pub message: String,
     pub actuals: Vec<(String, String)>,
+    pub detail: Option<String>,
+}
+
+impl ModuleConstraintFailure {
+    /// The authored message plus any evaluator or resolution detail.
+    pub fn message_with_detail(&self) -> String {
+        match &self.detail {
+            Some(detail) => format!("{} ({detail})", self.message),
+            None => self.message.clone(),
+        }
+    }
+}
+
+impl fmt::Display for ModuleConstraintFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let arguments = self
+            .arguments
+            .iter()
+            .map(|argument| format!("`{argument}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let actuals = self
+            .actuals
+            .iter()
+            .map(|(argument, value)| format!("{argument} = {value}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            f,
+            "module `{}` instance `{}` constraint failed for argument(s) {}: {}; values: {}",
+            self.module, self.instance, arguments, self.message, actuals
+        )?;
+        if let Some(detail) = &self.detail {
+            write!(f, " ({detail})")?;
+        }
+        Ok(())
+    }
 }
 
 /// Result of evaluating a module value constraint at a resolution boundary.
@@ -32,11 +76,6 @@ pub enum ConstraintEvaluation {
     Satisfied,
     Pending,
     Violated(ModuleConstraintViolation),
-}
-
-/// Format a value for a constraint error without exposing secret contents.
-pub(super) fn format_value_for_error(value: &Value) -> String {
-    crate::value::format_value(value)
 }
 
 /// Evaluate a module `validation` or `require` expression.
@@ -121,22 +160,26 @@ pub fn referenced_constraint_arguments(expr: &ValidateExpr) -> Vec<String> {
     names.into_iter().collect()
 }
 
-/// Resolve and evaluate every constraint currently pending on compositions.
+/// Resolve and evaluate every constraint pending on the supplied compositions.
 ///
 /// Argument resolution is deliberately temporary: the authored source values
 /// stored in [`Composition::signature`] remain untouched so apply can resolve
-/// them again against newer bindings. Planning reports violations but keeps
-/// every constraint that was pending at expansion so apply can re-evaluate it
-/// against values published by upstream effects. This includes constraints
-/// satisfied by the pre-apply state: a replacement or update may publish a
-/// different value. Violations are returned with display-safe actual values.
+/// them again against newer bindings. Evaluation never removes constraints,
+/// so apply can re-evaluate constraints that planning found satisfied against
+/// values published by upstream effects. A replacement or update may publish
+/// a value different from the pre-apply state. Violations are returned with
+/// display-safe actual values.
+/// When `terminal` is false, constraints with unresolved inputs remain pending.
+/// When it is true, unresolved inputs become failures because no later effect
+/// can make them decidable.
 pub fn evaluate_pending_constraints(
-    compositions: &mut [Composition],
+    compositions: &[Composition],
     bindings: &ResolvedBindings,
-) -> Vec<PendingModuleConstraintFailure> {
+    terminal: bool,
+) -> Vec<ModuleConstraintFailure> {
     let mut failures = Vec::new();
 
-    for composition in compositions.iter() {
+    for composition in compositions {
         let mut resolved_arguments = HashMap::new();
         let mut resolution_errors = HashMap::new();
         for (name, argument) in &composition.signature.arguments {
@@ -152,24 +195,30 @@ pub fn evaluate_pending_constraints(
         }
 
         for constraint in &composition.signature.pending_constraints {
-            let mut arguments = constraint.referenced_arguments().to_vec();
-            arguments.sort();
-            arguments.dedup();
+            let arguments = referenced_constraint_arguments(constraint.expression());
+            let failure =
+                |message: String, actuals: Vec<(String, String)>, detail: Option<String>| {
+                    ModuleConstraintFailure {
+                        composition_id: composition.id.clone(),
+                        constraint_id: constraint.id().clone(),
+                        module: composition.module_name.clone(),
+                        instance: composition.instance.clone(),
+                        arguments: arguments.clone(),
+                        message,
+                        actuals,
+                        detail,
+                    }
+                };
+            let actuals = || constraint_actuals(&arguments, &resolved_arguments);
             let resolution_error = arguments
                 .iter()
                 .find_map(|name| resolution_errors.get(name).map(|error| (name, error)));
             if let Some((name, error)) = resolution_error {
-                failures.push(PendingModuleConstraintFailure {
-                    composition_id: composition.id.clone(),
-                    module: composition.module_name.clone(),
-                    instance: composition.instance.clone(),
-                    arguments: arguments.clone(),
-                    message: format!(
-                        "{} (could not resolve argument '{name}': {error})",
-                        constraint.message()
-                    ),
-                    actuals: constraint_actuals(&arguments, &resolved_arguments),
-                });
+                failures.push(failure(
+                    constraint.message().to_string(),
+                    actuals(),
+                    Some(format!("could not resolve argument `{name}`: {error}")),
+                ));
                 continue;
             }
 
@@ -178,26 +227,22 @@ pub fn evaluate_pending_constraints(
                 &resolved_arguments,
                 constraint.message(),
             ) {
-                Ok(ConstraintEvaluation::Satisfied | ConstraintEvaluation::Pending) => {}
+                Ok(ConstraintEvaluation::Satisfied) => {}
+                Ok(ConstraintEvaluation::Pending) if !terminal => {}
+                Ok(ConstraintEvaluation::Pending) => failures.push(failure(
+                    constraint.message().to_string(),
+                    actuals(),
+                    Some("constraint inputs are still unresolved at end of apply".to_string()),
+                )),
                 Ok(ConstraintEvaluation::Violated(violation)) => {
-                    failures.push(PendingModuleConstraintFailure {
-                        composition_id: composition.id.clone(),
-                        module: composition.module_name.clone(),
-                        instance: composition.instance.clone(),
-                        arguments: violation.arguments,
-                        message: violation.message,
-                        actuals: violation.actuals,
-                    });
+                    failures.push(failure(violation.message, violation.actuals, None));
                 }
                 Err(error) => {
-                    failures.push(PendingModuleConstraintFailure {
-                        composition_id: composition.id.clone(),
-                        module: composition.module_name.clone(),
-                        instance: composition.instance.clone(),
-                        arguments: arguments.clone(),
-                        message: format!("{} ({error})", constraint.message()),
-                        actuals: constraint_actuals(&arguments, &resolved_arguments),
-                    });
+                    failures.push(failure(
+                        constraint.message().to_string(),
+                        actuals(),
+                        Some(error),
+                    ));
                 }
             }
         }

@@ -38,9 +38,8 @@ fn saved_module_composition(argument: Value, rejected: &str) -> Composition {
                 CompositionArgument::from_value(argument, carina_core::parser::TypeExpr::String),
             )]),
             attributes: indexmap::IndexMap::new(),
-            pending_constraints: vec![PendingModuleConstraint::ArgumentValidation {
+            pending_constraints: vec![PendingModuleConstraint {
                 id: ModuleConstraintId::argument_validation(argument_name, 0),
-                argument: argument_name.to_string(),
                 expression: carina_core::parser::ValidateExpr::Compare {
                     lhs: Box::new(carina_core::parser::ValidateExpr::Var(
                         argument_name.to_string(),
@@ -51,7 +50,6 @@ fn saved_module_composition(argument: Value, rejected: &str) -> Composition {
                     )),
                 },
                 message: format!("value must not be {rejected}"),
-                referenced_arguments: vec![argument_name.to_string()],
             }],
         },
         binding: Some("checked".to_string()),

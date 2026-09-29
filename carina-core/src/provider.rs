@@ -461,21 +461,10 @@ pub struct DeleteRequest {
 /// `ops`. Although patch values remain source-compatible for provider helper
 /// code, an [`UpdateRequest`] cannot be constructed without the private
 /// provider-readiness witness.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UpdatePatch {
     /// Operations derived from the desired resource.
     pub ops: Vec<PatchOp>,
-}
-
-impl UpdatePatch {
-    fn checked(ops: Vec<PatchOp>) -> Self {
-        Self { ops }
-    }
-
-    /// Borrow the checked patch operations.
-    pub fn ops(&self) -> &[PatchOp] {
-        &self.ops
-    }
 }
 
 /// A single operation inside an [`UpdatePatch`].
@@ -555,7 +544,7 @@ pub fn build_update_patch(
             }
         })
         .collect();
-    UpdatePatch::checked(ops)
+    UpdatePatch { ops }
 }
 
 /// Return type for async operations

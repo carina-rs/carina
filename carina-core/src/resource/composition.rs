@@ -221,61 +221,23 @@ impl ModuleConstraintId {
 /// A module constraint whose referenced arguments were not fully known at
 /// expansion time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum PendingModuleConstraint {
-    ArgumentValidation {
-        id: ModuleConstraintId,
-        argument: String,
-        expression: ValidateExpr,
-        message: String,
-        referenced_arguments: Vec<String>,
-    },
-    Require {
-        id: ModuleConstraintId,
-        expression: ValidateExpr,
-        message: String,
-        referenced_arguments: Vec<String>,
-    },
+pub struct PendingModuleConstraint {
+    pub id: ModuleConstraintId,
+    pub expression: ValidateExpr,
+    pub message: String,
 }
 
 impl PendingModuleConstraint {
     pub fn id(&self) -> &ModuleConstraintId {
-        match self {
-            Self::ArgumentValidation { id, .. } | Self::Require { id, .. } => id,
-        }
+        &self.id
     }
 
     pub fn expression(&self) -> &ValidateExpr {
-        match self {
-            Self::ArgumentValidation { expression, .. } | Self::Require { expression, .. } => {
-                expression
-            }
-        }
+        &self.expression
     }
 
     pub fn message(&self) -> &str {
-        match self {
-            Self::ArgumentValidation { message, .. } | Self::Require { message, .. } => message,
-        }
-    }
-
-    pub fn referenced_arguments(&self) -> &[String] {
-        match self {
-            Self::ArgumentValidation {
-                referenced_arguments,
-                ..
-            }
-            | Self::Require {
-                referenced_arguments,
-                ..
-            } => referenced_arguments,
-        }
-    }
-
-    pub fn argument(&self) -> Option<&str> {
-        match self {
-            Self::ArgumentValidation { argument, .. } => Some(argument),
-            Self::Require { .. } => None,
-        }
+        &self.message
     }
 }
 
@@ -716,9 +678,8 @@ mod tests {
 
     #[test]
     fn pending_constraints_survive_serde_round_trip_and_secret_redaction() {
-        let constraint = PendingModuleConstraint::ArgumentValidation {
+        let constraint = PendingModuleConstraint {
             id: ModuleConstraintId::argument_validation("password", 0),
-            argument: "password".to_string(),
             expression: ValidateExpr::Compare {
                 lhs: Box::new(ValidateExpr::FunctionCall {
                     name: "length".to_string(),
@@ -728,7 +689,6 @@ mod tests {
                 rhs: Box::new(ValidateExpr::Int(12)),
             },
             message: "password must contain at least 12 characters".to_string(),
-            referenced_arguments: vec!["password".to_string()],
         };
         let composition = Composition {
             id: ResourceId::with_identity("_virtual", "secure"),

@@ -1519,7 +1519,7 @@ async fn run_apply_locked(
     // after any Replace on a referenced managed resource.
     // carina#3181: composition resources live in `parsed.compositions`
     // as their own typed slice.
-    let mut pre_resolve_compositions: Vec<carina_core::resource::Composition> =
+    let pre_resolve_compositions: Vec<carina_core::resource::Composition> =
         parsed.compositions.clone();
 
     let pre_apply_input_states = carina_core::resource::into_plan_input_map(
@@ -1581,7 +1581,7 @@ async fn run_apply_locked(
         .prepare(
             &mut override_aware_resources,
             &constraint_origin_resources,
-            &mut pre_resolve_compositions,
+            &pre_resolve_compositions,
             &mut current_states,
             &parsed.providers,
             &mut data_sources_for_plan,

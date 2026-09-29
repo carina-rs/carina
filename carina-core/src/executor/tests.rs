@@ -2004,16 +2004,14 @@ fn module_not_bad_constraint(argument: &str) -> crate::resource::PendingModuleCo
     use crate::parser::{CompareOp, ValidateExpr};
     use crate::resource::{ModuleConstraintId, PendingModuleConstraint};
 
-    PendingModuleConstraint::ArgumentValidation {
+    PendingModuleConstraint {
         id: ModuleConstraintId::argument_validation(argument, 0),
-        argument: argument.to_string(),
         expression: ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::Var(argument.to_string())),
             op: CompareOp::Ne,
             rhs: Box::new(ValidateExpr::String("bad".to_string())),
         },
         message: format!("{argument} must not be bad"),
-        referenced_arguments: vec![argument.to_string()],
     }
 }
 
@@ -2024,7 +2022,7 @@ fn module_require_equal_constraint(
     use crate::parser::{CompareOp, ValidateExpr};
     use crate::resource::{ModuleConstraintId, PendingModuleConstraint};
 
-    PendingModuleConstraint::Require {
+    PendingModuleConstraint {
         id: ModuleConstraintId::require(0),
         expression: ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::Var(left.to_string())),
@@ -2032,7 +2030,6 @@ fn module_require_equal_constraint(
             rhs: Box::new(ValidateExpr::Var(right.to_string())),
         },
         message: format!("{left} and {right} must match"),
-        referenced_arguments: vec![left.to_string(), right.to_string()],
     }
 }
 

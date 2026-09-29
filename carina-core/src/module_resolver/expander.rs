@@ -18,8 +18,7 @@ use super::error::ModuleError;
 use super::resolver::ModuleResolver;
 use super::typecheck::check_module_arg_type;
 use super::validation::{
-    ConstraintEvaluation, evaluate_constraint, format_value_for_error,
-    referenced_constraint_arguments,
+    ConstraintEvaluation, evaluate_constraint, referenced_constraint_arguments,
 };
 
 impl ModuleResolver<'_> {
@@ -169,33 +168,25 @@ impl ModuleResolver<'_> {
                 match evaluate_constraint(
                     &validation_block.condition,
                     &constraint_arguments,
-                    message,
+                    message.clone(),
                 ) {
                     Ok(ConstraintEvaluation::Satisfied) => {}
                     Ok(ConstraintEvaluation::Pending) => {
-                        pending_constraints.push(
-                            crate::resource::PendingModuleConstraint::ArgumentValidation {
-                                id: crate::resource::ModuleConstraintId::argument_validation(
-                                    &arg.name,
-                                    validation_index,
-                                ),
-                                argument: arg.name.clone(),
-                                expression: validation_block.condition.clone(),
-                                message: validation_block.error_message.clone().unwrap_or_else(
-                                    || format!("validation failed for argument '{}'", arg.name),
-                                ),
-                                referenced_arguments: referenced_constraint_arguments(
-                                    &validation_block.condition,
-                                ),
-                            },
-                        );
+                        pending_constraints.push(crate::resource::PendingModuleConstraint {
+                            id: crate::resource::ModuleConstraintId::argument_validation(
+                                &arg.name,
+                                validation_index,
+                            ),
+                            expression: validation_block.condition.clone(),
+                            message,
+                        });
                     }
                     Ok(ConstraintEvaluation::Violated(violation)) => {
                         let actual = violation
                             .actuals
                             .first()
                             .map(|(_, value)| value.clone())
-                            .unwrap_or_else(|| format_value_for_error(value));
+                            .unwrap_or_else(|| crate::value::format_value(value));
                         return Err(ModuleError::ArgumentValidationFailed {
                             module: call.module_name.clone(),
                             instance: instance_prefix.to_string(),
@@ -210,7 +201,7 @@ impl ModuleResolver<'_> {
                             instance: instance_prefix.to_string(),
                             argument: arg.name.clone(),
                             message: format!("error evaluating validate expression: {}", e),
-                            actual: format_value_for_error(value),
+                            actual: crate::value::format_value(value),
                         });
                     }
                 }
@@ -226,11 +217,10 @@ impl ModuleResolver<'_> {
             ) {
                 Ok(ConstraintEvaluation::Satisfied) => {}
                 Ok(ConstraintEvaluation::Pending) => {
-                    pending_constraints.push(crate::resource::PendingModuleConstraint::Require {
+                    pending_constraints.push(crate::resource::PendingModuleConstraint {
                         id: crate::resource::ModuleConstraintId::require(require_index),
                         expression: require.condition.clone(),
                         message: require.error_message.clone(),
-                        referenced_arguments: referenced_constraint_arguments(&require.condition),
                     });
                 }
                 Ok(ConstraintEvaluation::Violated(violation)) => {
@@ -254,9 +244,9 @@ impl ModuleResolver<'_> {
                     let actuals = arguments
                         .iter()
                         .filter_map(|name| {
-                            argument_values
-                                .get(name)
-                                .map(|value| format!("{name} = {}", format_value_for_error(value)))
+                            argument_values.get(name).map(|value| {
+                                format!("{name} = {}", crate::value::format_value(value))
+                            })
                         })
                         .collect::<Vec<_>>()
                         .join(", ");

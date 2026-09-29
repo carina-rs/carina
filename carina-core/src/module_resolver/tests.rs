@@ -2766,14 +2766,14 @@ fn test_argument_validation_with_resource_reference_is_pending() {
         .expect("a reference-valued constraint must remain pending");
     let constraints = &expanded.compositions[0].signature.pending_constraints;
     assert_eq!(constraints.len(), 1);
-    assert!(matches!(
-        &constraints[0],
-        crate::resource::PendingModuleConstraint::ArgumentValidation {
-            argument,
-            referenced_arguments,
-            ..
-        } if argument == "port" && referenced_arguments == &["port"]
-    ));
+    assert_eq!(
+        constraints[0].id,
+        crate::resource::ModuleConstraintId::argument_validation("port", 0)
+    );
+    assert_eq!(
+        referenced_constraint_arguments(&constraints[0].expression),
+        ["port"]
+    );
 }
 
 #[test]
@@ -2804,9 +2804,8 @@ fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
                 ),
             )]),
             attributes: IndexMap::new(),
-            pending_constraints: vec![PendingModuleConstraint::ArgumentValidation {
+            pending_constraints: vec![PendingModuleConstraint {
                 id: ModuleConstraintId::argument_validation("port", 0),
-                argument: "port".to_string(),
                 expression: ValidateExpr::Compare {
                     lhs: Box::new(ValidateExpr::FunctionCall {
                         name: "length".to_string(),
@@ -2816,7 +2815,6 @@ fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
                     rhs: Box::new(ValidateExpr::Int(0)),
                 },
                 message: "port must not be empty".to_string(),
-                referenced_arguments: vec!["port".to_string()],
             }],
         },
         binding: Some("inner".to_string()),
@@ -2886,14 +2884,15 @@ fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
             .map(CompositionArgument::value),
         Some(&Value::resource_ref("producer", "port", Vec::new()))
     );
-    assert!(matches!(
-        &nested.signature.pending_constraints[0],
-        PendingModuleConstraint::ArgumentValidation {
-            argument,
-            referenced_arguments,
-            ..
-        } if argument == "port" && referenced_arguments == &["port"]
-    ));
+    let constraint = &nested.signature.pending_constraints[0];
+    assert_eq!(
+        constraint.id,
+        ModuleConstraintId::argument_validation("port", 0)
+    );
+    assert_eq!(
+        referenced_constraint_arguments(&constraint.expression),
+        ["port"]
+    );
 }
 
 #[test]

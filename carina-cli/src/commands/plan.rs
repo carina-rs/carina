@@ -1885,16 +1885,14 @@ mod run_plan_out_tests {
             signature: Signature {
                 arguments,
                 attributes: indexmap::IndexMap::new(),
-                pending_constraints: vec![PendingModuleConstraint::ArgumentValidation {
+                pending_constraints: vec![PendingModuleConstraint {
                     id: ModuleConstraintId::argument_validation("name", 0),
-                    argument: "name".to_string(),
                     expression: ValidateExpr::Compare {
                         lhs: Box::new(ValidateExpr::Var("name".to_string())),
                         op: CompareOp::Ne,
                         rhs: Box::new(ValidateExpr::String("bad".to_string())),
                     },
                     message: "name must not be bad".to_string(),
-                    referenced_arguments: vec!["name".to_string()],
                 }],
             },
             binding: Some("checked".to_string()),

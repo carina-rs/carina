@@ -5521,7 +5521,7 @@ mod resolved_value_constraint_gate {
     ) -> Result<(), Vec<carina_core::plan::PlanError>> {
         let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)]);
         let (mut resources, origins) = managed_resources(consumer_type, producer_value);
-        let mut compositions = Vec::new();
+        let compositions = Vec::new();
         let mut current_states = HashMap::new();
         let mut data_sources = Vec::new();
         let data_source_origins = Vec::new();
@@ -5531,7 +5531,7 @@ mod resolved_value_constraint_gate {
             .prepare(
                 &mut resources,
                 &origins,
-                &mut compositions,
+                &compositions,
                 &mut current_states,
                 &[],
                 &mut data_sources,
@@ -5614,7 +5614,7 @@ mod resolved_value_constraint_gate {
             .prepare(
                 &mut resources,
                 &origins,
-                std::slice::from_mut(composition),
+                std::slice::from_ref(composition),
                 &mut states,
                 &[],
                 &mut data_sources,
@@ -5725,7 +5725,7 @@ mod resolved_value_constraint_gate {
             .prepare(
                 &mut resources,
                 &[],
-                &mut [],
+                &[],
                 &mut HashMap::new(),
                 &[],
                 &mut data_sources,
@@ -5742,12 +5742,10 @@ mod resolved_value_constraint_gate {
     #[tokio::test]
     async fn resolved_module_argument_validation_is_a_structured_plan_error() {
         let source = ref_value();
-        let constraint = PendingModuleConstraint::ArgumentValidation {
+        let constraint = PendingModuleConstraint {
             id: ModuleConstraintId::argument_validation("value", 0),
-            argument: "value".to_string(),
             expression: not_bad("value"),
             message: "value must not be bad".to_string(),
-            referenced_arguments: vec!["value".to_string()],
         };
         let mut composition = pending_composition(vec![("value", source.clone())], constraint);
 
@@ -5791,7 +5789,7 @@ mod resolved_value_constraint_gate {
 
     #[tokio::test]
     async fn resolved_cross_argument_require_is_a_structured_plan_error() {
-        let constraint = PendingModuleConstraint::Require {
+        let constraint = PendingModuleConstraint {
             id: ModuleConstraintId::require(0),
             expression: ValidateExpr::Compare {
                 lhs: Box::new(ValidateExpr::Var("left".to_string())),
@@ -5799,7 +5797,6 @@ mod resolved_value_constraint_gate {
                 rhs: Box::new(ValidateExpr::Var("right".to_string())),
             },
             message: "left and right must match".to_string(),
-            referenced_arguments: vec!["left".to_string(), "right".to_string()],
         };
         let mut composition = pending_composition(
             vec![
@@ -5845,12 +5842,10 @@ mod resolved_value_constraint_gate {
     #[tokio::test]
     async fn unknown_module_argument_stays_pending_without_rewriting_source() {
         let source = ref_value();
-        let constraint = PendingModuleConstraint::ArgumentValidation {
+        let constraint = PendingModuleConstraint {
             id: ModuleConstraintId::argument_validation("value", 0),
-            argument: "value".to_string(),
             expression: not_bad("value"),
             message: "value must not be bad".to_string(),
-            referenced_arguments: vec!["value".to_string()],
         };
         let mut composition = pending_composition(vec![("value", source.clone())], constraint);
         let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
@@ -5868,12 +5863,10 @@ mod resolved_value_constraint_gate {
     #[tokio::test]
     async fn unpublished_module_argument_stays_pending_without_plan_error() {
         let source = ref_value();
-        let constraint = PendingModuleConstraint::ArgumentValidation {
+        let constraint = PendingModuleConstraint {
             id: ModuleConstraintId::argument_validation("value", 0),
-            argument: "value".to_string(),
             expression: not_bad("value"),
             message: "value must not be bad".to_string(),
-            referenced_arguments: vec!["value".to_string()],
         };
         let mut composition = pending_composition(vec![("value", source.clone())], constraint);
 
@@ -5887,12 +5880,10 @@ mod resolved_value_constraint_gate {
 
     #[tokio::test]
     async fn satisfied_module_constraint_is_retained_for_apply_time_recheck() {
-        let constraint = PendingModuleConstraint::ArgumentValidation {
+        let constraint = PendingModuleConstraint {
             id: ModuleConstraintId::argument_validation("value", 0),
-            argument: "value".to_string(),
             expression: not_bad("value"),
             message: "value must not be bad".to_string(),
-            referenced_arguments: vec!["value".to_string()],
         };
         let mut composition = pending_composition(vec![("value", ref_value())], constraint);
 
@@ -5905,12 +5896,10 @@ mod resolved_value_constraint_gate {
 
     #[tokio::test]
     async fn module_constraint_actuals_mask_secret_values() {
-        let constraint = PendingModuleConstraint::ArgumentValidation {
+        let constraint = PendingModuleConstraint {
             id: ModuleConstraintId::argument_validation("value", 0),
-            argument: "value".to_string(),
             expression: not_bad("value"),
             message: "value must not be bad".to_string(),
-            referenced_arguments: vec!["value".to_string()],
         };
         let mut composition = pending_composition(vec![("value", ref_value())], constraint);
         let secret = Value::Deferred(DeferredValue::Secret(Box::new(text("bad"))));
