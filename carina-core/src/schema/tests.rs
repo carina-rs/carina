@@ -1756,6 +1756,188 @@ fn resource_validator_called() {
 }
 
 #[test]
+fn validate_known_values_defers_constraints_until_values_are_concrete() {
+    use crate::resource::UnknownReason;
+
+    let schema = ResourceSchema::new("test.KnownValues")
+        .attribute(AttributeSchema::new(
+            "pattern",
+            AttributeType::refined_string(None, Some("^[a-z]+$".to_string()), None, None),
+        ))
+        .attribute(AttributeSchema::new(
+            "length",
+            AttributeType::refined_string(None, None, Some((Some(2), Some(4))), None),
+        ))
+        .attribute(AttributeSchema::new(
+            "range",
+            AttributeType::refined_int(None, Some((Some(1), Some(10)))),
+        ))
+        .attribute(AttributeSchema::new(
+            "custom",
+            AttributeType::refined_string(Some(TypeIdentity::bare("CheckedId")), None, None, None),
+        ));
+    let unknown = || Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
+    let mut attributes = HashMap::from([
+        ("pattern".to_string(), unknown()),
+        ("length".to_string(), unknown()),
+        ("range".to_string(), unknown()),
+        ("custom".to_string(), unknown()),
+    ]);
+    let lookup = |identity: &TypeIdentity, value: &Value| {
+        if identity.kind == "CheckedId"
+            && matches!(value, Value::Concrete(ConcreteValue::String(value)) if value == "invalid")
+        {
+            Err(TypeError::ValidationFailed {
+                message: "custom value rejected".to_string(),
+            })
+        } else {
+            Ok(())
+        }
+    };
+
+    assert_eq!(
+        schema.validate_known_values_with_origins_and_lookup(&attributes, &|_| false, &lookup,),
+        Ok(())
+    );
+
+    attributes.insert(
+        "pattern".to_string(),
+        Value::Concrete(ConcreteValue::String("INVALID".to_string())),
+    );
+    attributes.insert(
+        "length".to_string(),
+        Value::Concrete(ConcreteValue::String("x".to_string())),
+    );
+    attributes.insert("range".to_string(), Value::Concrete(ConcreteValue::Int(11)));
+    attributes.insert(
+        "custom".to_string(),
+        Value::Concrete(ConcreteValue::String("invalid".to_string())),
+    );
+
+    let errors = schema
+        .validate_known_values_with_origins_and_lookup(&attributes, &|_| false, &lookup)
+        .expect_err("concrete invalid values must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, TypeError::PatternMismatch { attribute: Some(name), .. } if name == "pattern")),
+        "missing pattern error: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, TypeError::LengthOutOfRange { attribute: Some(name), .. } if name == "length")),
+        "missing length error: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(
+            |error| matches!(error, TypeError::ValidationFailed { message } if message.contains("outside allowed range"))
+        ),
+        "missing range error: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            TypeError::ResourceValidationFailed {
+                message,
+                attribute: Some(name),
+            } if message == "custom value rejected" && name == "custom"
+        )),
+        "missing custom lookup error: {errors:?}"
+    );
+}
+
+#[test]
+fn validate_known_values_checks_concrete_siblings_beside_deferred_leaves() {
+    use crate::resource::UnknownReason;
+
+    let schema = ResourceSchema::new("test.NestedKnownValues").attribute(AttributeSchema::new(
+        "names",
+        AttributeType::list(AttributeType::refined_string(
+            None,
+            Some("^[a-z]+$".to_string()),
+            None,
+            None,
+        )),
+    ));
+    let attributes = HashMap::from([(
+        "names".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            Value::Concrete(ConcreteValue::String("INVALID".to_string())),
+        ])),
+    )]);
+
+    let errors = schema
+        .validate_known_values_with_origins_and_lookup(&attributes, &|_| false, no_lookup())
+        .expect_err("the concrete sibling must still be checked");
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            TypeError::ListItemError { index: 1, inner }
+                if matches!(inner.as_ref(), TypeError::PatternMismatch { .. })
+        )),
+        "unexpected errors: {errors:?}"
+    );
+}
+
+#[test]
+fn validate_known_values_runs_resource_validator_without_structural_errors() {
+    fn reject_forbidden(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+        if attributes.contains_key("forbidden") {
+            Err(vec![TypeError::ValidationFailed {
+                message: "resource validator rejected value".to_string(),
+            }])
+        } else {
+            Ok(())
+        }
+    }
+
+    let schema = ResourceSchema::new("test.KnownValues")
+        .attribute(AttributeSchema::new("required", AttributeType::string()).required())
+        .attribute(AttributeSchema::new("read_only", AttributeType::string()).read_only())
+        .attribute(AttributeSchema::new("choice_a", AttributeType::string()))
+        .attribute(AttributeSchema::new("choice_b", AttributeType::string()))
+        .attribute(AttributeSchema::new("forbidden", AttributeType::string()))
+        .exclusive_required(&["choice_a", "choice_b"])
+        .with_validator(reject_forbidden);
+    let structurally_invalid = HashMap::from([
+        (
+            "unknown".to_string(),
+            Value::Concrete(ConcreteValue::String("ignored".to_string())),
+        ),
+        (
+            "read_only".to_string(),
+            Value::Concrete(ConcreteValue::String("provider value".to_string())),
+        ),
+    ]);
+
+    assert_eq!(
+        schema.validate_known_values_with_origins_and_lookup(
+            &structurally_invalid,
+            &|_| false,
+            no_lookup(),
+        ),
+        Ok(()),
+        "missing, unknown, read-only, and exclusive-required checks belong to structural validation"
+    );
+
+    let forbidden = HashMap::from([(
+        "forbidden".to_string(),
+        Value::Concrete(ConcreteValue::String("present".to_string())),
+    )]);
+    let errors = schema
+        .validate_known_values_with_origins_and_lookup(&forbidden, &|_| false, no_lookup())
+        .expect_err("resource validators must run at the known-value gate");
+    assert_eq!(
+        errors,
+        vec![TypeError::ValidationFailed {
+            message: "resource validator rejected value".to_string(),
+        }]
+    );
+}
+
+#[test]
 fn validate_exclusive_required_helper() {
     use validators::validate_exclusive_required;
 

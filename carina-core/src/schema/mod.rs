@@ -5565,6 +5565,44 @@ impl ResourceSchema {
         self.validate_inner(attributes, is_string_literal, lookup)
     }
 
+    /// Validate constraints on values that are currently known.
+    ///
+    /// Unlike [`Self::validate_with_origins_and_lookup`], this entry point
+    /// deliberately omits shape-of-resource checks that were already made
+    /// when the source was expanded: required attributes, unknown
+    /// attributes, provider-populated attributes, and exclusive-required
+    /// groups. It is intended for a later resolution boundary, where a value
+    /// that was deferred during expansion may have become concrete.
+    ///
+    /// Deferred leaves are ignored while concrete siblings in the same
+    /// collection are still checked. The resource validator is re-run because
+    /// it may express cross-attribute value constraints.
+    pub fn validate_known_values_with_origins_and_lookup(
+        &self,
+        attributes: &HashMap<String, Value>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+    ) -> Result<(), Vec<TypeError>> {
+        let mut errors = self.validate_value_entries(
+            attributes,
+            is_string_literal,
+            lookup,
+            ValueEntryValidation::KnownWritableOnly,
+        );
+
+        if let Some(validator) = self.validator
+            && let Err(mut validation_errors) = validator(attributes)
+        {
+            errors.append(&mut validation_errors);
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     fn validate_inner(
         &self,
         attributes: &HashMap<String, Value>,
@@ -5579,6 +5617,44 @@ impl ResourceSchema {
                 errors.push(TypeError::MissingRequired { name: name.clone() });
             }
         }
+
+        errors.extend(self.validate_value_entries(
+            attributes,
+            is_string_literal,
+            lookup,
+            ValueEntryValidation::FullInput,
+        ));
+
+        // Evaluate declarative exclusive-required groups (WASM-safe).
+        for group in &self.exclusive_required {
+            let refs: Vec<&str> = group.iter().map(|s| s.as_str()).collect();
+            if let Err(mut e) = validators::validate_exclusive_required(attributes, &refs) {
+                errors.append(&mut e);
+            }
+        }
+
+        // Run custom validator if present
+        if let Some(validator) = self.validator
+            && let Err(mut validation_errors) = validator(attributes)
+        {
+            errors.append(&mut validation_errors);
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    fn validate_value_entries(
+        &self,
+        attributes: &HashMap<String, Value>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+        mode: ValueEntryValidation,
+    ) -> Vec<TypeError> {
+        let mut errors = Vec::new();
 
         // Build block_name -> canonical_name map for alias resolution
         let bn_map = self.block_name_map();
@@ -5616,7 +5692,7 @@ impl ResourceSchema {
                 // `read_only` attributes are provider-populated, so accepting a user
                 // value would silently drop it. Reject before type checking so the
                 // diagnostic reports writability instead of a confusing type error.
-                if schema.is_read_only() {
+                if schema.is_read_only() && mode == ValueEntryValidation::FullInput {
                     errors.push(TypeError::ReadOnlyAttribute { name: name.clone() });
                     continue;
                 }
@@ -5641,7 +5717,7 @@ impl ResourceSchema {
                     &self.defs,
                     &mut errors,
                 );
-            } else {
+            } else if mode == ValueEntryValidation::FullInput {
                 let suggestion = suggest_similar_name(name, &known);
                 errors.push(TypeError::UnknownAttribute {
                     name: name.clone(),
@@ -5650,27 +5726,14 @@ impl ResourceSchema {
             }
         }
 
-        // Evaluate declarative exclusive-required groups (WASM-safe).
-        for group in &self.exclusive_required {
-            let refs: Vec<&str> = group.iter().map(|s| s.as_str()).collect();
-            if let Err(mut e) = validators::validate_exclusive_required(attributes, &refs) {
-                errors.append(&mut e);
-            }
-        }
-
-        // Run custom validator if present
-        if let Some(validator) = self.validator
-            && let Err(mut validation_errors) = validator(attributes)
-        {
-            errors.append(&mut validation_errors);
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        errors
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ValueEntryValidation {
+    FullInput,
+    KnownWritableOnly,
 }
 
 /// Collect all attribute_name -> block_name mappings from all schemas.
