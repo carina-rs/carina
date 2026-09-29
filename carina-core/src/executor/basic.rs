@@ -1,7 +1,7 @@
 //! Single-effect execution: Create, Update, Delete dispatch, resource resolution,
 //! Secret unwrapping, and post-apply binding updates.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -12,6 +12,7 @@ use crate::differ::{
 use crate::effect::{BasicEffect, DeletedInstanceKey, Effect, EffectGeneration};
 use crate::executor::UnresolvedResource;
 use crate::executor::prepare_provider_ready_resource;
+use crate::executor::provider_ready::prepare_provider_ready_resource_after_resolution;
 use crate::parser::ProviderConfig;
 use crate::provider::{
     CreateRequest, DeleteRequest, PartialReadDiagnostic, Provider, ProviderNormalizer,
@@ -189,14 +190,20 @@ async fn resolve_create_resource_with_source(
     pipeline: &RenormalizePipeline<'_>,
 ) -> Result<ProviderReadyResource, String> {
     let mut resolved = target.clone();
+    let mut validation_attributes = source.resolved_attributes();
+    let mut apply_resolved_attributes = HashSet::new();
     for (key, target_expr) in &target.attributes {
-        let expr = source
-            .attributes
-            .get(key)
+        let source_expr = source.attributes.get(key);
+        let resolves_at_apply = source_expr.is_some_and(needs_apply_resolution);
+        let expr = source_expr
             .filter(|source_expr| needs_apply_resolution(source_expr))
             .unwrap_or(target_expr);
         let resolved_value = resolve_ref_value(expr, bindings)?;
         assert_fully_resolved(&resolved_value, key, bindings)?;
+        if resolves_at_apply {
+            validation_attributes.insert(key.clone(), resolved_value.clone());
+            apply_resolved_attributes.insert(key.clone());
+        }
         resolved.attributes.insert(key.clone(), resolved_value);
     }
     for (key, source_expr) in &source.attributes {
@@ -205,10 +212,16 @@ async fn resolve_create_resource_with_source(
         }
         let resolved_value = resolve_ref_value(source_expr, bindings)?;
         assert_fully_resolved(&resolved_value, key, bindings)?;
+        if needs_apply_resolution(source_expr) {
+            validation_attributes.insert(key.clone(), resolved_value.clone());
+            apply_resolved_attributes.insert(key.clone());
+        }
         resolved.attributes.insert(key.clone(), resolved_value);
     }
-    prepare_provider_ready_resource(
+    prepare_provider_ready_resource_after_resolution(
         resolved,
+        &validation_attributes,
+        &apply_resolved_attributes,
         bindings,
         pipeline.module_gate,
         pipeline.provider_configs,
@@ -232,13 +245,21 @@ pub(super) async fn resolve_resource_with_source(
     pipeline: &RenormalizePipeline<'_>,
 ) -> Result<ProviderReadyResource, String> {
     let mut resolved = target.clone();
+    let mut validation_attributes = source.resolved_attributes();
+    let mut apply_resolved_attributes = HashSet::new();
     for (key, expr) in &source.attributes {
         let resolved_value = resolve_ref_value(expr, bindings)?;
         assert_fully_resolved(&resolved_value, key, bindings)?;
+        if needs_apply_resolution(expr) {
+            validation_attributes.insert(key.clone(), resolved_value.clone());
+            apply_resolved_attributes.insert(key.clone());
+        }
         resolved.attributes.insert(key.clone(), resolved_value);
     }
-    prepare_provider_ready_resource(
+    prepare_provider_ready_resource_after_resolution(
         resolved,
+        &validation_attributes,
+        &apply_resolved_attributes,
         bindings,
         pipeline.module_gate,
         pipeline.provider_configs,
@@ -632,22 +653,24 @@ pub(super) async fn execute_basic_effect<'a>(
             ..
         } => {
             let id = &to.id;
-            let resolve_source = unresolved
-                .get(id)
-                .map_or(to.as_inner(), UnresolvedResource::as_resource);
-            let resolved_to =
-                match resolve_resource_with_source(to, resolve_source, bindings, pipeline).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
-                            error: &e,
-                            duration: started.elapsed(),
-                            progress,
-                        });
-                        return BasicEffectResult::Failure { refresh: None };
-                    }
-                };
+            let source = unresolved.get(id).map(UnresolvedResource::as_resource);
+            let resolved_to = match if let Some(resolve_source) = source {
+                resolve_resource_with_source(to, resolve_source, bindings, pipeline).await
+            } else {
+                resolve_resource(to, bindings, pipeline).await
+            } {
+                Ok(r) => r,
+                Err(e) => {
+                    observer.on_event(&ExecutionEvent::EffectFailed {
+                        effect,
+                        error: &e,
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    return BasicEffectResult::Failure { refresh: None };
+                }
+            };
+            let resolve_source = source.unwrap_or(to.as_inner());
             let identifier = from.identifier.as_deref().unwrap_or("");
             // Augment plan-time `changed_attributes` with any
             // ResourceRef-derived attributes whose resolved value at

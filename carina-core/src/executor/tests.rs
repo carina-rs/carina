@@ -3403,6 +3403,98 @@ async fn test_apply_renormalizes_after_resolution() {
     );
 }
 
+/// Plan-time normalization may deliberately transform a literal into a form
+/// that does not satisfy a constraint written for the authored DSL spelling.
+/// The literal already passed the plan-time gate in authored form, so apply
+/// must not re-check the normalized plan value merely because another
+/// attribute on the resource needs apply-time resolution.
+#[tokio::test]
+async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
+    use crate::binding_index::BindingValueSource;
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let provider = MockProvider::new();
+    let mut source = make_resource("normalized-literal", &[]);
+    source.set_attr(
+        "marker",
+        Value::Concrete(ConcreteValue::String("raw_dsl".to_string())),
+    );
+    source.set_attr(
+        "runtime",
+        Value::resource_ref("runtime-value", "value", vec![]),
+    );
+    let id = source.id.clone();
+
+    // This is the resource persisted in the plan after normalize_desired.
+    let mut planned = source.clone();
+    planned.set_attr(
+        "marker",
+        Value::Concrete(ConcreteValue::String("CANONICAL".to_string())),
+    );
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(planned));
+    provider.push_create(Ok(ok_state(&id)));
+
+    let unresolved = HashMap::from([(id.clone(), UnresolvedResource::from_pre_resolve(source))]);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test")
+            .attribute(AttributeSchema::new(
+                "marker",
+                AttributeType::refined_string(None, Some("^raw_dsl$".to_string()), None, None),
+            ))
+            .attribute(AttributeSchema::new("runtime", AttributeType::string())),
+    );
+    let mut bindings = ResolvedBindings::default();
+    bindings.set(
+        "runtime-value",
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("known-at-apply".to_string())),
+        )]),
+        BindingValueSource::Local,
+    );
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &unresolved,
+        compositions: &[],
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &CanonicalizingNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let events = observer.events().join("\n");
+
+    assert!(
+        !events.contains("Invalid value 'CANONICAL'"),
+        "apply revalidated the plan-normalized literal instead of only the runtime value: {events}"
+    );
+    assert_eq!(
+        result.failure_count, 0,
+        "normalized literals were checked in authored form during planning"
+    );
+    assert_eq!(result.success_count, 1);
+    let captured = provider.captured_create_resources();
+    assert_eq!(captured.len(), 1, "the provider must be called once");
+    assert_eq!(
+        captured[0].get_attr("marker"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "CANONICAL".to_string()
+        ))),
+        "the provider still receives the normalized representation"
+    );
+}
+
 /// carina#3063: the apply path must also re-apply plan-time stage 3
 /// (enum-alias resolution, `get_enum_alias_reverse`), not just
 /// `normalize_desired` (stage 2). After plan-time normalization the
