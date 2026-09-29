@@ -12,7 +12,6 @@ use carina_core::binding_index::{ResolvedBindings, WaitAliasSpec};
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
-use carina_core::executor::normalized::apply_desired_normalization;
 use carina_core::executor::{
     DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
     UnresolvedResource,
@@ -53,9 +52,9 @@ use crate::display::print_plan;
 use crate::error::AppError;
 use crate::wiring::{
     DataSourceRefreshResolution, LateAnonymousIdentityInputs, WiringContext,
-    build_factories_from_providers, create_providers_from_configs, get_provider_with_ctx,
-    prepare_data_sources_for_plan, read_data_source_with_retry, read_with_retry,
-    reconcile_anonymous_identifiers_with_ctx, reconcile_late_anonymous_identities,
+    build_factories_from_providers, create_providers_from_configs, data_source_refresh_bindings,
+    get_provider_with_ctx, prepare_data_sources_for_plan, read_data_source_with_retry,
+    read_with_retry, reconcile_anonymous_identifiers_with_ctx, reconcile_late_anonymous_identities,
     reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
 };
 
@@ -72,11 +71,54 @@ fn format_total_apply_line(elapsed: Duration) -> String {
     format!("Done in {}.", format_duration(elapsed))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn create_checked_bootstrap_resource(
+    provider: &dyn Provider,
+    resource: Resource,
+    provider_configs: &[ProviderConfig],
+    normalizer: &dyn ProviderNormalizer,
+    factories: &[Box<dyn carina_core::provider::ProviderFactory>],
+    schemas: &carina_core::schema::SchemaRegistry,
+) -> Result<(), AppError> {
+    let id = resource.id.clone();
+    let bindings = ResolvedBindings::default();
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+    let request = carina_core::executor::prepare_create_request(
+        resource,
+        &bindings,
+        &module_gate,
+        provider_configs,
+        normalizer,
+        factories,
+        schemas,
+    )
+    .await
+    .map_err(|err| {
+        AppError::Config(format!(
+            "Failed to prepare state bucket before create: {err}"
+        ))
+    })?;
+    provider
+        .create(&id, request)
+        .await
+        .map_err(|err| AppError::Config(format!("Failed to create state bucket: {err}")))?;
+    Ok(())
+}
+
 fn split_execution_outcome(outcome: ExecutionOutcome) -> (ExecutionResult, bool) {
     match outcome {
         ExecutionOutcome::Completed(result) => (result, false),
         ExecutionOutcome::Cancelled(result) => (result, true),
     }
+}
+
+fn finalize_module_constraints(
+    compositions: &[carina_core::resource::Composition],
+    bindings: &ResolvedBindings,
+) -> Result<(), AppError> {
+    carina_core::executor::ModuleConstraintGate::new(compositions)
+        .finish(bindings)
+        .map_err(|error| AppError::Validation(error.to_string()))
 }
 
 fn deferred_data_source_reads_from_data_sources(
@@ -876,41 +918,16 @@ async fn run_apply_with_observer_factory(
                 let bucket_normalizer = factory
                     .create_normalizer(None, &provider_config_attrs)
                     .await;
-                let normalized_bucket = apply_desired_normalization(
+                create_checked_bootstrap_resource(
+                    bucket_provider.as_ref(),
                     bucket_resource.clone(),
                     &parsed.providers,
                     bucket_normalizer.as_ref(),
                     ctx.factories(),
                     ctx.schemas(),
                 )
-                .await;
-                let resolved_bucket =
-                    carina_core::executor::resolve_normalized_for_provider(normalized_bucket)
-                        .map_err(|err| {
-                            AppError::Config(format!(
-                                "Failed to resolve state bucket before create: {err}"
-                            ))
-                        })?;
-
-                match bucket_provider
-                    .create(
-                        &bucket_resource.id,
-                        carina_core::provider::CreateRequest {
-                            resource: resolved_bucket,
-                        },
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        println!("  {} Created state bucket: {}", "✓".green(), bucket_name);
-                    }
-                    Err(e) => {
-                        return Err(AppError::Config(format!(
-                            "Failed to create state bucket: {}",
-                            e
-                        )));
-                    }
-                }
+                .await?;
+                println!("  {} Created state bucket: {}", "✓".green(), bucket_name);
             } else {
                 // Auto-create the bucket if auto_create is enabled
                 let auto_create = verified_backend
@@ -1357,6 +1374,16 @@ async fn run_apply_locked(
 
     // Phase 2: resolve data source inputs against the consolidated state
     // and refresh them via `read_data_source` (#1683, #1685).
+    let data_source_bindings = data_source_refresh_bindings(
+        &sorted_resources,
+        &parsed.compositions,
+        &data_sources,
+        &current_states,
+        &remote_bindings,
+        ctx.schemas(),
+        &wait_aliases,
+    );
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
     let data_source_refreshes = resolve_data_source_refs_for_refresh(
         &sorted_resources,
         &parsed.compositions,
@@ -1386,10 +1413,19 @@ async fn run_apply_locked(
             .map(|resource| {
                 let progress = RefreshProgress::begin_multi(&multi, &resource.id);
                 let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
+                let data_source_bindings = &data_source_bindings;
+                let module_gate = &module_gate;
                 async move {
-                    let mut state = read_data_source_with_retry(provider_ref, resource)
-                        .await
-                        .map_err(AppError::Provider)?;
+                    let mut state = read_data_source_with_retry(
+                        provider_ref,
+                        resource,
+                        data_source_bindings,
+                        module_gate,
+                        ctx.factories(),
+                        ctx.schemas(),
+                    )
+                    .await
+                    .map_err(AppError::Provider)?;
                     if let Some(deps) = dep_bindings {
                         state.dependency_bindings = deps;
                     }
@@ -1637,6 +1673,10 @@ async fn run_apply_locked(
         // mutation does) silently falls through into the
         // resource-apply pipeline and the `Persisting N export
         // change(s) to state.` banner never prints (carina#3270).
+        finalize_module_constraints(
+            &pre_resolve_compositions,
+            override_aware_resources.bindings(),
+        )?;
         let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
             &parsed.export_params,
             &paired_unresolved_resources,
@@ -1772,7 +1812,7 @@ async fn run_apply_locked(
         &mut bindings,
         &mut current_states,
         &unresolved_resources,
-        &parsed.compositions,
+        &pre_resolve_compositions,
         deferred_data_source_reads,
         cancel.clone(),
         parallelism,
@@ -2165,6 +2205,29 @@ async fn run_apply_from_plan_locked(
         // resource-apply pipeline. Mirrors the source-driven apply
         // path's gate (carina#3270 → run_apply_locked).
         // carina#3275.
+        let terminal_wait_aliases: Vec<WaitAliasSpec> = plan_file
+            .wait_bindings
+            .iter()
+            .map(|wb| WaitAliasSpec {
+                binding: carina_core::parser::BindingName::new(wb.binding.clone()),
+                target: carina_core::parser::BindingName::new(wb.target.clone()),
+            })
+            .collect();
+        let terminal_input_states = carina_core::resource::into_plan_input_map(
+            current_states.clone(),
+            ctx.schemas(),
+            sorted_resources,
+        );
+        let terminal_bindings =
+            ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
+                managed: sorted_resources,
+                compositions: plan_compositions,
+                data_sources: plan_data_sources,
+                current_states: &terminal_input_states,
+                remote_bindings: &plan_file.upstream_snapshot,
+                wait_aliases: &terminal_wait_aliases,
+            });
+        finalize_module_constraints(plan_compositions, &terminal_bindings)?;
         println!("{}", "No changes needed.".green());
         return Ok(None);
     }

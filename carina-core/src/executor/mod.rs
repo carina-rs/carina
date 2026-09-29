@@ -24,8 +24,9 @@ pub(crate) mod wait;
 
 pub use crate::effect::deps::UnresolvedResource;
 pub use provider_ready::{
-    ProviderPreparationError, prepare_create_request, prepare_provider_ready_resource,
-    prepare_update_request,
+    ModuleConstraintFailure, ModuleConstraintGate, ModuleConstraintGateError,
+    ProviderPreparationError, prepare_create_request, prepare_provider_ready_data_source,
+    prepare_provider_ready_resource, prepare_update_request,
 };
 pub use replace::compute_full_diff_patch;
 
@@ -36,7 +37,9 @@ use std::time::Duration;
 use crate::binding_index::ResolvedBindings;
 use crate::effect::{DeletedInstanceKey, Effect};
 use crate::parser::ProviderConfig;
-use crate::provider::{PartialReadDiagnostic, Provider, ProviderError, ProviderNormalizer};
+use crate::provider::{
+    PartialReadDiagnostic, Provider, ProviderError, ProviderNormalizer, ProviderReadyDataSource,
+};
 use crate::resource::{
     AccessPath, ConcreteValue, DataSource, DeferredValue, InterpolationPart, Resource, ResourceId,
     State, UnknownReason, Value,
@@ -193,7 +196,7 @@ fn is_throttling_error(err: &ProviderError) -> bool {
 /// policy the CLI refresh path uses.
 pub async fn read_data_source_with_retry(
     provider: &dyn Provider,
-    resource: &DataSource,
+    resource: &ProviderReadyDataSource,
 ) -> Result<State, ProviderError> {
     let max_retries = 3;
     for attempt in 0..=max_retries {
@@ -336,6 +339,10 @@ pub enum ExecutionEvent<'a> {
     },
     RefreshFailed {
         id: &'a ResourceId,
+        error: &'a str,
+    },
+    /// A terminal module constraint failed without an owning provider effect.
+    ModuleConstraintFailed {
         error: &'a str,
     },
 }

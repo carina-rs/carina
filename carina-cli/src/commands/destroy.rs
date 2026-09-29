@@ -1757,7 +1757,6 @@ pub(crate) async fn finalize_destroy(
 mod tests {
     use super::*;
     use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult};
-    use carina_core::resource::DataSource;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[path = "cancellation_fixture.rs"]
@@ -2121,7 +2120,10 @@ mod tests {
             })
         }
 
-        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        fn read_data_source(
+            &self,
+            resource: &carina_core::provider::ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
             self.read(&resource.id, None, carina_core::provider::ReadRequest)
         }
 

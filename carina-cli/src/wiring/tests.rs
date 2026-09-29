@@ -120,7 +120,7 @@ impl Provider for CascadeCreateProvider {
 
     fn read_data_source(
         &self,
-        _resource: &carina_core::resource::DataSource,
+        _resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
@@ -238,7 +238,7 @@ impl Provider for ReadWithRetryProvider {
 
     fn read_data_source(
         &self,
-        resource: &carina_core::resource::DataSource,
+        resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         self.data_source_read_calls.fetch_add(1, Ordering::SeqCst);
         let id = resource.id.clone();
@@ -2733,12 +2733,21 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
     .expect("literal inputs should be refreshable");
 
     let provider = ReadWithRetryProvider::new(ReadBehavior::NotFound);
+    let bindings = ResolvedBindings::default();
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
     for resolution in resolved {
         match resolution {
             DataSourceRefreshResolution::Resolved(resource) => {
-                read_data_source_with_retry(&provider, &resource)
-                    .await
-                    .expect("literal input read should succeed");
+                read_data_source_with_retry(
+                    &provider,
+                    &resource,
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &empty_registry,
+                )
+                .await
+                .expect("literal input read should succeed");
             }
             DataSourceRefreshResolution::DeferredToApply { .. } => {
                 panic!("literal input read must not be deferred");
@@ -3270,7 +3279,7 @@ fn validate_passes_when_no_empty_interpolation() {
 mod read_with_retry_identifier_tests {
     use super::*;
     use carina_core::provider::{ProviderResult, ReadRequest};
-    use carina_core::resource::{DataSource, State};
+    use carina_core::resource::State;
     use futures::future::BoxFuture;
     use std::sync::Mutex;
 
@@ -3308,7 +3317,10 @@ mod read_with_retry_identifier_tests {
             Box::pin(async move { Ok(State::existing(id, std::collections::HashMap::new())) })
         }
 
-        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        fn read_data_source(
+            &self,
+            resource: &carina_core::provider::ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = resource.id.clone();
             Box::pin(async move { Ok(State::not_found(id)) })
         }
@@ -4792,7 +4804,7 @@ mod wait_until_enum_alias {
         }
         fn read_data_source(
             &self,
-            r: &carina_core::resource::DataSource,
+            r: &carina_core::provider::ProviderReadyDataSource,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = r.id.clone();
             Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
@@ -5848,6 +5860,26 @@ mod resolved_value_constraint_gate {
         prepare_composition(vec![("value", unknown)], &mut composition)
             .await
             .expect("unknown module argument must remain pending");
+
+        assert_eq!(composition.signature.pending_constraints.len(), 1);
+        assert_eq!(composition.signature.arguments["value"].value(), &source);
+    }
+
+    #[tokio::test]
+    async fn unpublished_module_argument_stays_pending_without_plan_error() {
+        let source = ref_value();
+        let constraint = PendingModuleConstraint::ArgumentValidation {
+            id: ModuleConstraintId::argument_validation("value", 0),
+            argument: "value".to_string(),
+            expression: not_bad("value"),
+            message: "value must not be bad".to_string(),
+            referenced_arguments: vec!["value".to_string()],
+        };
+        let mut composition = pending_composition(vec![("value", source.clone())], constraint);
+
+        prepare_composition(Vec::new(), &mut composition)
+            .await
+            .expect("an unpublished argument must remain pending during planning");
 
         assert_eq!(composition.signature.pending_constraints.len(), 1);
         assert_eq!(composition.signature.arguments["value"].value(), &source);

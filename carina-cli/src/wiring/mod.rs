@@ -58,6 +58,9 @@ pub struct PlanContext {
     pub provider: ProviderRouter,
     pub sorted_resources: Vec<Resource>,
     pub unresolved_resources: Vec<Resource>,
+    /// Module compositions after plan-time constraint evaluation. Pending
+    /// constraints must survive in saved plans for apply-time re-evaluation.
+    pub compositions: Vec<Composition>,
     /// Data sources exactly as supplied to the differ. Refresh-time reads
     /// have concrete inputs; apply-time deferred reads keep structural refs so
     /// saved-plan apply can reconstruct the same deferred-read set.
@@ -2678,6 +2681,16 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             .iter()
             .map(WaitAliasSpec::from)
             .collect();
+        let data_source_bindings = data_source_refresh_bindings(
+            &sorted_resources,
+            &parsed.compositions,
+            &data_sources,
+            &current_states,
+            remote_bindings,
+            ctx.schemas(),
+            &ds_wait_aliases,
+        );
+        let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
         let data_source_refreshes = resolve_data_source_refs_for_refresh(
             &sorted_resources,
             &parsed.compositions,
@@ -2704,10 +2717,19 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 .map(|resource| {
                     let progress = RefreshProgress::begin_multi(&multi, &resource.id);
                     let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
+                    let data_source_bindings = &data_source_bindings;
+                    let module_gate = &module_gate;
                     async move {
-                        let mut state = read_data_source_with_retry(provider_ref, resource)
-                            .await
-                            .map_err(AppError::Provider)?;
+                        let mut state = read_data_source_with_retry(
+                            provider_ref,
+                            resource,
+                            data_source_bindings,
+                            module_gate,
+                            ctx.factories(),
+                            ctx.schemas(),
+                        )
+                        .await
+                        .map_err(AppError::Provider)?;
                         if let Some(deps) = dep_bindings {
                             state.dependency_bindings = deps;
                         }
@@ -2964,6 +2986,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             provider,
             sorted_resources: constraint_origin_resources.clone(),
             unresolved_resources: constraint_origin_resources,
+            compositions: prepared_compositions,
             data_sources: data_sources_for_plan,
             current_states,
             moved_origins,
@@ -3062,6 +3085,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         provider,
         sorted_resources: paired_unresolved_resources.clone(),
         unresolved_resources: paired_unresolved_resources,
+        compositions: prepared_compositions,
         data_sources: data_sources_for_plan,
         current_states,
         moved_origins,
@@ -3881,8 +3905,22 @@ pub(crate) fn finish_refresh_bar_region(started_bar: bool) {
 pub async fn read_data_source_with_retry(
     provider: &dyn Provider,
     resource: &carina_core::resource::DataSource,
+    bindings: &ResolvedBindings,
+    module_gate: &carina_core::executor::ModuleConstraintGate,
+    factories: &[Box<dyn carina_core::provider::ProviderFactory>],
+    schemas: &carina_core::schema::SchemaRegistry,
 ) -> Result<State, ProviderError> {
-    carina_core::executor::read_data_source_with_retry(provider, resource).await
+    let ready = carina_core::executor::prepare_provider_ready_data_source(
+        resource.clone(),
+        bindings,
+        module_gate,
+        factories,
+        schemas,
+    )
+    .map_err(|err| {
+        ProviderError::invalid_input(err.to_string()).for_resource(resource.id.clone())
+    })?;
+    carina_core::executor::read_data_source_with_retry(provider, &ready).await
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3913,18 +3951,15 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
     // carina#3248: unified pre-apply bindings include compositions so a
     // data-source input referencing `<module_instance>.<attr>` chains
     // through the composition layer to the managed sibling literal.
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = data_source_refresh_bindings(
         managed,
         compositions,
         data_sources,
-        current_states: &carina_core::resource::into_plan_input_map(
-            current_states.clone(),
-            schemas,
-            managed,
-        ),
+        current_states,
         remote_bindings,
+        schemas,
         wait_aliases,
-    });
+    );
     let deferred =
         classify_apply_time_data_source_read_inputs(data_sources, managed, current_states);
 
@@ -3960,6 +3995,29 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
     }
 
     Ok(resolutions)
+}
+
+pub(crate) fn data_source_refresh_bindings(
+    managed: &[Resource],
+    compositions: &[carina_core::resource::Composition],
+    data_sources: &[DataSource],
+    current_states: &HashMap<ResourceId, State>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    schemas: &carina_core::schema::SchemaRegistry,
+    wait_aliases: &[WaitAliasSpec],
+) -> ResolvedBindings {
+    ResolvedBindings::pre_apply(PreApplyInputs {
+        managed,
+        compositions,
+        data_sources,
+        current_states: &carina_core::resource::into_plan_input_map(
+            current_states.clone(),
+            schemas,
+            managed,
+        ),
+        remote_bindings,
+        wait_aliases,
+    })
 }
 
 /// Classify data-source reads that must run after apply-time publication.

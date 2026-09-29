@@ -75,7 +75,7 @@ mod tests {
 
         fn read_data_source(
             &self,
-            _resource: &crate::resource::DataSource,
+            _resource: &crate::provider::ProviderReadyDataSource,
         ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<crate::resource::State>>
         {
             Box::pin(async { panic!("unexpected read_data_source") })

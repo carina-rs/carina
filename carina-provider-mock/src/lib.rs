@@ -11,7 +11,7 @@ use carina_core::provider::{
     BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, PatchOpKind, Provider, ProviderError,
     ProviderResult, ReadRequest, UpdateOutcome, UpdateRequest,
 };
-use carina_core::resource::{ConcreteValue, DataSource, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::value::{json_to_dsl_value, value_to_json};
 
 pub struct MockProvider {
@@ -505,7 +505,10 @@ impl Provider for MockProvider {
         })
     }
 
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        resource: &carina_core::provider::ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         self.read(&resource.id, None, ReadRequest)
     }
 
@@ -756,6 +759,9 @@ mod tests {
         let resource = Resource::with_provider("mock", "test.resource", "web-acl-new", None)
             .with_attribute("name", string_value("web-acl-new"))
             .with_attribute("comment", string_value("v1"));
+        let update_resource = resource
+            .clone()
+            .with_attribute("comment", string_value("v2"));
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -771,21 +777,23 @@ mod tests {
             from_attrs.insert("name".to_string(), string_value("web-acl-new"));
             from_attrs.insert("comment".to_string(), string_value("v1"));
             let from = State::existing(id.clone(), from_attrs).with_identifier("mock-id");
+            let bindings = carina_core::binding_index::ResolvedBindings::default();
+            let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+            let request = carina_core::executor::prepare_update_request(
+                update_resource,
+                from,
+                &["comment".to_string()],
+                &bindings,
+                &module_gate,
+                &[],
+                &carina_core::provider::NoopNormalizer,
+                &[],
+                &carina_core::schema::SchemaRegistry::new(),
+            )
+            .await
+            .expect("update request should pass checked preparation");
             provider
-                .update(
-                    &id,
-                    "mock-id",
-                    UpdateRequest {
-                        from,
-                        patch: carina_core::provider::UpdatePatch {
-                            ops: vec![carina_core::provider::PatchOp {
-                                kind: PatchOpKind::Replace,
-                                key: "comment".to_string(),
-                                value: Some(string_value("v2")),
-                            }],
-                        },
-                    },
-                )
+                .update(&id, "mock-id", request)
                 .await
                 .expect("update should succeed");
 

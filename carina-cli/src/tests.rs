@@ -86,7 +86,10 @@ impl Provider for TestProvider {
         Box::pin(async move { result.map_err(ProviderError::internal) })
     }
 
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        resource: &carina_core::provider::ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         self.read(&resource.id, None, carina_core::provider::ReadRequest)
     }
 

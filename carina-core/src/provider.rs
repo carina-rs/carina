@@ -11,14 +11,18 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::effect::PlanOp;
+#[cfg(test)]
+use crate::resource::DataSource;
 use crate::resource::{
-    ConcreteValue, DataSource, Directives, PartialReadMarker, Resource, ResourceId, State, Value,
+    ConcreteValue, Directives, PartialReadMarker, Resource, ResourceId, State, Value,
 };
 use crate::schema::{SchemaRegistry, TypeIdentity};
 use crate::wait::BindingPattern;
 use crate::wait::predicate::AttrPath;
 
-pub use crate::executor::provider_ready::{ProviderReady, ProviderReadyResource};
+pub use crate::executor::provider_ready::{
+    ProviderReady, ProviderReadyDataSource, ProviderReadyResource,
+};
 
 /// Contextual metadata attached to every [`ProviderError`] variant.
 ///
@@ -358,6 +362,15 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 /// Per-operation request record for [`Provider::create`].
 ///
 /// Mirrors `create-request` in `wit/types.wit`.
+/// A merely resolved resource is not sufficient to build this request:
+///
+/// ```compile_fail
+/// use carina_core::provider::CreateRequest;
+/// use carina_core::resource::{ResolvedResource, Resource};
+///
+/// let resource = ResolvedResource::new(Resource::new("test", "example"));
+/// let _request = CreateRequest { resource };
+/// ```
 #[derive(Debug, Clone)]
 pub struct CreateRequest {
     /// Full desired state for the new resource.
@@ -382,6 +395,19 @@ pub struct ReadRequest;
 /// because exposing the full desired resource invites providers to
 /// touch fields the user never specified (the root cause of
 /// `carina-rs/carina#2559`).
+///
+/// External callers cannot assemble an update request from raw state and
+/// patch data; the private witness is supplied only by the checked provider
+/// preparation path:
+///
+/// ```compile_fail
+/// use carina_core::provider::UpdateRequest;
+///
+/// let _request = UpdateRequest {
+///     from: unimplemented!(),
+///     patch: unimplemented!(),
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct UpdateRequest {
     /// Current provider-side state. May be used for read-modify-write
@@ -390,7 +416,26 @@ pub struct UpdateRequest {
     pub from: State,
     /// Structured description of the user's intended change.
     pub patch: UpdatePatch,
+    /// Proof that the desired resource passed the provider-preparation gate.
+    _provider_ready: ProviderRequestWitness,
 }
+
+impl UpdateRequest {
+    pub(crate) fn checked(
+        from: State,
+        patch: UpdatePatch,
+        _resource: &ProviderReadyResource,
+    ) -> Self {
+        Self {
+            from,
+            patch,
+            _provider_ready: ProviderRequestWitness,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderRequestWitness;
 
 /// Per-operation request record for [`Provider::delete`].
 ///
@@ -409,56 +454,23 @@ pub struct DeleteRequest {
 /// appear in the patch.
 ///
 /// Providers MUST NOT modify any attribute that is not represented in
-/// `ops`.
+/// `ops`. Although patch values remain source-compatible for provider helper
+/// code, an [`UpdateRequest`] cannot be constructed without the private
+/// provider-readiness witness.
 #[derive(Debug, Clone)]
 pub struct UpdatePatch {
-    /// Immutable operations produced from a checked desired resource.
-    pub ops: ProviderReadyPatchOps,
+    /// Operations derived from the desired resource.
+    pub ops: Vec<PatchOp>,
 }
 
 impl UpdatePatch {
     fn checked(ops: Vec<PatchOp>) -> Self {
-        Self {
-            ops: ProviderReadyPatchOps(ops),
-        }
+        Self { ops }
     }
 
     /// Borrow the checked patch operations.
     pub fn ops(&self) -> &[PatchOp] {
         &self.ops
-    }
-}
-
-/// Immutable operation storage for [`UpdatePatch`].
-///
-/// The field is private so callers can inspect a checked patch through normal
-/// slice operations but cannot replace or mutate its values after validation.
-#[derive(Debug, Clone)]
-pub struct ProviderReadyPatchOps(Vec<PatchOp>);
-
-impl std::ops::Deref for ProviderReadyPatchOps {
-    type Target = [PatchOp];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<'a> IntoIterator for &'a ProviderReadyPatchOps {
-    type Item = &'a PatchOp;
-    type IntoIter = std::slice::Iter<'a, PatchOp>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
-    }
-}
-
-impl IntoIterator for ProviderReadyPatchOps {
-    type Item = PatchOp;
-    type IntoIter = std::vec::IntoIter<PatchOp>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
     }
 }
 
@@ -498,6 +510,15 @@ pub enum PatchOpKind {
 ///
 /// `Remove` ops carry `value: None`; others carry a clone of the
 /// value from `to`.
+///
+/// ```compile_fail
+/// use carina_core::provider::build_update_patch;
+/// use carina_core::resource::{ResolvedResource, Resource, State};
+///
+/// let resource = ResolvedResource::new(Resource::new("test", "example"));
+/// let state: State = unimplemented!();
+/// let _patch = build_update_patch(&[], &resource, &state);
+/// ```
 pub fn build_update_patch(
     changed_attributes: &[String],
     to: &ProviderReadyResource,
@@ -798,8 +819,8 @@ pub trait Provider: Send + Sync {
 
     /// Read a data source resource.
     ///
-    /// Unlike [`Provider::read`], this receives the full [`DataSource`] so the
-    /// provider can see the user-supplied input attributes (e.g. the
+    /// Unlike [`Provider::read`], this receives the full checked data source so
+    /// the provider can see the user-supplied input attributes (e.g. the
     /// `identity_store_id` + `user_name` that `aws.identitystore.user`
     /// needs to resolve itself via the AWS SDK).
     ///
@@ -823,7 +844,21 @@ pub trait Provider: Send + Sync {
     /// `state.exists`, so `exists: false` causes the binding to drop
     /// the read state entirely and downstream `ResourceRef`s fail with
     /// the "has not been published yet" diagnostic (carina#3252).
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>>;
+    ///
+    /// A raw data source cannot cross this boundary:
+    ///
+    /// ```compile_fail
+    /// use carina_core::provider::Provider;
+    /// use carina_core::resource::DataSource;
+    ///
+    /// fn dispatch(provider: &dyn Provider, resource: &DataSource) {
+    ///     let _ = provider.read_data_source(resource);
+    /// }
+    /// ```
+    fn read_data_source(
+        &self,
+        resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>>;
 
     /// Create the resource described by `request.resource` and return
     /// the resulting state (with `identifier` set to the cloud-side
@@ -1153,7 +1188,10 @@ impl Provider for ProviderRouter {
         }
     }
 
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         match self.get_provider_or_error(&resource.id) {
             Ok(provider) => provider.read_data_source(resource),
             Err(e) => Box::pin(async move { Err(e) }),
@@ -1585,7 +1623,10 @@ impl Provider for Box<dyn Provider> {
         (**self).read(id, identifier, request)
     }
 
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         (**self).read_data_source(resource)
     }
 
@@ -1941,14 +1982,31 @@ mod tests {
     }
 
     fn resolved_for_test(resource: Resource) -> ProviderReadyResource {
+        let bindings = crate::binding_index::ResolvedBindings::default();
+        let gate = crate::executor::ModuleConstraintGate::new(&[]);
         futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
             resource,
+            &bindings,
+            &gate,
             &[],
             &NoopNormalizer,
             &[],
             &crate::schema::SchemaRegistry::new(),
         ))
         .expect("test resource should pass provider preparation")
+    }
+
+    fn ready_data_source_for_test(resource: DataSource) -> ProviderReadyDataSource {
+        let bindings = crate::binding_index::ResolvedBindings::default();
+        let gate = crate::executor::ModuleConstraintGate::new(&[]);
+        crate::executor::prepare_provider_ready_data_source(
+            resource,
+            &bindings,
+            &gate,
+            &[],
+            &crate::schema::SchemaRegistry::new(),
+        )
+        .expect("test data source should pass provider preparation")
     }
 
     // Mock Provider for testing
@@ -1969,7 +2027,10 @@ mod tests {
             Box::pin(async move { Ok(State::not_found(id)) })
         }
 
-        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        fn read_data_source(
+            &self,
+            resource: &ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = resource.id.clone();
             Box::pin(async move { Ok(State::not_found(id)) })
         }
@@ -2153,7 +2214,10 @@ mod tests {
             })
         }
 
-        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        fn read_data_source(
+            &self,
+            resource: &ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
             // Echoes the resource's input attributes back into state so the
             // test can assert they were delivered.
             let id = resource.id.clone();
@@ -2202,7 +2266,7 @@ mod tests {
         // MockProvider's read_data_source delegates to read(&resource.id, None).
         // For MockProvider this returns not_found.
         let provider = MockProvider;
-        let resource = DataSource::new("test", "example");
+        let resource = ready_data_source_for_test(DataSource::new("test", "example"));
         let state = provider.read_data_source(&resource).await.unwrap();
         assert!(!state.exists);
     }
@@ -2223,6 +2287,7 @@ mod tests {
             "user_name".to_string(),
             Value::Concrete(ConcreteValue::String("gosukenator@gmail.com".to_string())),
         );
+        let resource = ready_data_source_for_test(resource);
 
         let state = provider.read_data_source(&resource).await.unwrap();
         assert!(state.exists);
@@ -2251,6 +2316,7 @@ mod tests {
             "user_name".to_string(),
             Value::Concrete(ConcreteValue::String("x".to_string())),
         );
+        let resource = ready_data_source_for_test(resource);
         let state = provider.read_data_source(&resource).await.unwrap();
         assert!(state.exists);
         assert_eq!(
@@ -2272,6 +2338,7 @@ mod tests {
             "user_name".to_string(),
             Value::Concrete(ConcreteValue::String("x".to_string())),
         );
+        let resource = ready_data_source_for_test(resource);
         let state = router.read_data_source(&resource).await.unwrap();
         assert!(state.exists);
         assert_eq!(
@@ -2775,10 +2842,11 @@ mod tests {
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let from = State::existing(id.clone(), HashMap::new());
         let ready = resolved_for_test(Resource::with_provider("mock", "test", "example", None));
-        let request = UpdateRequest {
+        let request = UpdateRequest::checked(
             from,
-            patch: build_update_patch(&[], &ready, &State::existing(id.clone(), HashMap::new())),
-        };
+            build_update_patch(&[], &ready, &State::existing(id.clone(), HashMap::new())),
+            &ready,
+        );
         let state = router
             .update(&id, "mock-id-123", request)
             .await
@@ -2832,7 +2900,10 @@ mod tests {
             let state = State::existing(id.clone(), attrs);
             Box::pin(async move { Ok(state) })
         }
-        fn read_data_source(&self, _resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        fn read_data_source(
+            &self,
+            _resource: &ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
             Box::pin(async { Err(ProviderError::internal("not supported")) })
         }
         fn create(
@@ -3172,7 +3243,7 @@ mod tests {
 
             fn read_data_source(
                 &self,
-                resource: &DataSource,
+                resource: &ProviderReadyDataSource,
             ) -> BoxFuture<'_, ProviderResult<State>> {
                 let id = resource.id.clone();
                 Box::pin(async move { Ok(State::not_found(id)) })

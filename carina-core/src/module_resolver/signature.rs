@@ -3,7 +3,7 @@ use std::path::Path;
 
 use indexmap::IndexMap;
 
-use crate::parser::{ArgumentParameter, File, ParsedFile, ProviderContext, TypeExpr};
+use crate::parser::{ArgumentParameter, File, ParsedFile, ProviderContext, RequireBlock, TypeExpr};
 
 /// The statically declared boundary of one imported module after dotted type
 /// expressions have been resolved against the caller's provider context.
@@ -11,6 +11,7 @@ use crate::parser::{ArgumentParameter, File, ParsedFile, ProviderContext, TypeEx
 pub struct ResolvedModuleSignature {
     pub arguments: Vec<ArgumentParameter>,
     pub attributes: IndexMap<String, Option<TypeExpr>>,
+    pub requires: Vec<RequireBlock>,
 }
 
 /// Imported module alias to its resolved argument/output signature.
@@ -50,6 +51,7 @@ fn resolved_signature(parsed: &ParsedFile, config: &ProviderContext) -> Resolved
     ResolvedModuleSignature {
         arguments,
         attributes,
+        requires: parsed.requires.clone(),
     }
 }
 

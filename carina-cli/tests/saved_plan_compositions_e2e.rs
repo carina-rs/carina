@@ -41,8 +41,12 @@ let with_outputs = use { source = "./with_outputs" }
 let without_outputs = use { source = "./without_outputs" }
 let outer = use { source = "./outer" }
 
-let published = with_outputs {
+let producer = mock.test.resource {
   name = "published"
+}
+
+let published = with_outputs {
+  name = producer.identifier
 }
 
 let silent = without_outputs {
@@ -67,7 +71,12 @@ let consumer = mock.test.resource {
         fs::write(
             with_outputs.join("main.crn"),
             r#"arguments {
-  name: String
+  name: String {
+    validation {
+      condition     = length(name) > 0
+      error_message = "name must not be empty"
+    }
+  }
 }
 
 let item = mock.test.resource {
@@ -203,6 +212,15 @@ fn saved_plan_round_trips_and_applies_every_composition_shape() {
     assert!(
         published.signature.attributes.contains_key("identifier"),
         "the output-bearing composition must retain its module attribute",
+    );
+    assert_eq!(
+        published.signature.pending_constraints.len(),
+        1,
+        "the reference-valued argument constraint must survive plan serialization",
+    );
+    assert_eq!(
+        published.signature.pending_constraints[0].message(),
+        "name must not be empty",
     );
     let silent = saved_plan
         .compositions

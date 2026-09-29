@@ -168,7 +168,7 @@ impl DiagnosticEngine {
             diagnostics.extend(self.duplicate_declaration_diagnostics(
                 doc,
                 current_file_name,
-                &result.duplicate_declarations,
+                &result.directory.duplicate_declarations,
             ));
         } else if let Some(parsed) = doc.parsed() {
             // An unrelated broken sibling makes the directory parse fail, but
@@ -190,9 +190,15 @@ impl DiagnosticEngine {
         if let (Some(base), Some(current_file), Some(result)) =
             (base_path, current_file_name, merged_result.as_ref())
         {
-            diagnostics.extend(self.check_mixed_tag_key_styles(current_file, base, result));
+            diagnostics.extend(self.check_mixed_tag_key_styles(
+                current_file,
+                base,
+                &result.directory,
+            ));
         }
-        let merged = merged_result.as_ref().map(|result| &result.parsed);
+        let merged = merged_result
+            .as_ref()
+            .map(|result| &result.directory.parsed);
         let upstream_resolution = match (base_path, merged) {
             (Some(base), Some(merged)) => Some(
                 carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
@@ -426,6 +432,23 @@ impl DiagnosticEngine {
                 .unwrap_or_default();
             if base_path.is_some() {
                 diagnostics.extend(self.check_module_calls(doc, parsed, &module_signatures));
+                if let Some(error) = merged_result
+                    .as_ref()
+                    .and_then(|result| result.module_error.as_ref())
+                    && let Some(diagnostic) = self.module_resolver_constraint_diagnostic(
+                        doc,
+                        parsed,
+                        error,
+                        merged_result
+                            .as_ref()
+                            .and_then(|result| result.module_error_owner.as_deref()),
+                    )
+                    && diagnostics
+                        .iter()
+                        .all(|existing| existing.message != diagnostic.message)
+                {
+                    diagnostics.push(diagnostic);
+                }
             }
             if let (Some(_), Some(expanded)) = (base_path, merged) {
                 diagnostics.extend(self.check_composition_ref_types(

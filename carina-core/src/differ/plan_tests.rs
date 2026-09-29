@@ -7,11 +7,15 @@ use crate::explicit::ExplicitFields;
 use crate::plan::{
     PlanErrorKind, PreventDestroyAction, ReplacementCannotCoexistError, SchemaNotRegisteredError,
 };
-use crate::resource::{ConcreteValue, DataSource, Resource, ResourceIdentity};
+use crate::resource::{ConcreteValue, Resource, ResourceIdentity};
 
 fn provider_ready(resource: Resource) -> crate::provider::ProviderReadyResource {
+    let bindings = crate::binding_index::ResolvedBindings::default();
+    let gate = crate::executor::ModuleConstraintGate::new(&[]);
     futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
         resource,
+        &bindings,
+        &gate,
         &[],
         &crate::provider::NoopNormalizer,
         &[],
@@ -53,7 +57,7 @@ impl crate::provider::Provider for HintProvider {
 
     fn read_data_source(
         &self,
-        _resource: &DataSource,
+        _resource: &crate::provider::ProviderReadyDataSource,
     ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<State>> {
         Box::pin(async { panic!("unexpected read_data_source") })
     }

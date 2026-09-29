@@ -96,7 +96,7 @@ impl Provider for MockProvider {
 
     fn read_data_source(
         &self,
-        resource: &carina_core::resource::DataSource,
+        resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = resource.id.clone();
         Box::pin(async move { Ok(State::existing(id, HashMap::new())) })

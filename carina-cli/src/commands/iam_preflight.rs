@@ -782,7 +782,10 @@ mod tests {
             Box::pin(async { Err(ProviderError::internal("unused")) })
         }
 
-        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        fn read_data_source(
+            &self,
+            resource: &carina_core::provider::ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = resource.id.clone();
             Box::pin(async move { Err(ProviderError::not_found(id.to_string())) })
         }

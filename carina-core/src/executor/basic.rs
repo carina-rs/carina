@@ -146,6 +146,8 @@ pub(super) async fn resolve_resource(
     }
     prepare_provider_ready_resource(
         resolved,
+        bindings,
+        pipeline.module_gate,
         pipeline.provider_configs,
         pipeline.normalizer,
         pipeline.factories,
@@ -207,6 +209,8 @@ async fn resolve_create_resource_with_source(
     }
     prepare_provider_ready_resource(
         resolved,
+        bindings,
+        pipeline.module_gate,
         pipeline.provider_configs,
         pipeline.normalizer,
         pipeline.factories,
@@ -235,6 +239,8 @@ pub(super) async fn resolve_resource_with_source(
     }
     prepare_provider_ready_resource(
         resolved,
+        bindings,
+        pipeline.module_gate,
         pipeline.provider_configs,
         pipeline.normalizer,
         pipeline.factories,
@@ -258,6 +264,7 @@ pub(super) fn resolved_resource(
 /// Bundled into one struct (rather than three separate args) so the
 /// resolve helpers and `BasicEffectCtx` carry a single field.
 pub(super) struct RenormalizePipeline<'a> {
+    pub(super) module_gate: &'a super::ModuleConstraintGate,
     pub(super) normalizer: &'a dyn ProviderNormalizer,
     pub(super) provider_configs: &'a [ProviderConfig],
     pub(super) factories: &'a [Box<dyn crate::provider::ProviderFactory>],
@@ -690,10 +697,7 @@ pub(super) async fn execute_basic_effect<'a>(
                 }
             }
             let patch = build_update_patch(&effective_changed, &resolved_to, from);
-            let request = UpdateRequest {
-                from: from.clone(),
-                patch,
-            };
+            let request = UpdateRequest::checked(from.clone(), patch, &resolved_to);
             match provider.update(id, identifier, request).await {
                 Ok(outcome) => {
                     let diagnostic = match &outcome {

@@ -32,8 +32,9 @@ use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overri
 use crate::error::AppError;
 use crate::wiring::{
     DataSourceRefreshResolution, WiringContext, build_factories_from_providers,
-    get_provider_with_ctx, read_data_source_with_retry, reconcile_anonymous_identifiers_with_ctx,
-    reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
+    data_source_refresh_bindings, get_provider_with_ctx, read_data_source_with_retry,
+    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
+    resolve_data_source_refs_for_refresh,
 };
 
 /// Convert a lock acquisition error into an `AppError`.
@@ -1230,12 +1231,23 @@ pub(crate) async fn run_state_refresh_locked(
             .iter()
             .map(carina_core::binding_index::WaitAliasSpec::from)
             .collect();
+        let empty_remote_bindings = HashMap::new();
+        let data_source_bindings = data_source_refresh_bindings(
+            &sorted_resources,
+            &parsed.compositions,
+            &parsed.data_sources,
+            &current_states,
+            &empty_remote_bindings,
+            ctx.schemas(),
+            &wait_aliases,
+        );
+        let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
         let data_source_refreshes = resolve_data_source_refs_for_refresh(
             &sorted_resources,
             &parsed.compositions,
             &parsed.data_sources,
             &current_states,
-            &HashMap::new(),
+            &empty_remote_bindings,
             ctx.schemas(),
             &wait_aliases,
         )?;
@@ -1259,9 +1271,16 @@ pub(crate) async fn run_state_refresh_locked(
                     return Err(AppError::Interrupted);
                 }
             }
-            let fresh_state = read_data_source_with_retry(&provider, &resource)
-                .await
-                .map_err(AppError::Provider)?;
+            let fresh_state = read_data_source_with_retry(
+                &provider,
+                &resource,
+                &data_source_bindings,
+                &module_gate,
+                ctx.factories(),
+                ctx.schemas(),
+            )
+            .await
+            .map_err(AppError::Provider)?;
             match cancel.phase() {
                 ShutdownPhase::Running => {}
                 ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
@@ -2026,7 +2045,7 @@ mod tests {
 
         fn read_data_source(
             &self,
-            resource: &carina_core::resource::DataSource,
+            resource: &carina_core::provider::ProviderReadyDataSource,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             self.read(&resource.id, None, ReadRequest)
         }

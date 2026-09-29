@@ -3413,6 +3413,7 @@ needs {
                 validations: Vec::new(),
             }],
             attributes: IndexMap::new(),
+            requires: Vec::new(),
         },
     )]);
     let bindings = BindingIndex::from_parsed(parsed, &engine.schemas);
@@ -3760,6 +3761,183 @@ let broken = needs_vpc {
     assert_eq!(mismatches.len(), 1);
     assert_eq!(mismatches[0].range.start.line, 7);
     assert_eq!(mismatches[0].range.start.character, 2);
+}
+
+#[test]
+fn reference_valued_module_constraint_stays_pending_without_internal_diagnostic() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("checked");
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        r#"arguments {
+  name: String {
+    validation {
+      condition     = length(name) > 0
+      error_message = "name must not be empty"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let source = r#"let checked = use { source = '../checked' }
+
+let producer = aws.logs.LogGroup {
+  name = "producer"
+}
+
+let instance = checked {
+  name = producer.arn
+}
+"#;
+    std::fs::write(root.join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", source);
+    for forbidden in [
+        "name must not be empty",
+        "Deferred(",
+        "ResourceRef {",
+        "length()",
+    ] {
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains(forbidden)),
+            "pending reference-valued validation leaked {forbidden:?}: {diagnostics:#?}",
+        );
+    }
+}
+
+#[test]
+fn concrete_invalid_module_argument_reports_authored_validation_at_argument() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("checked");
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        r#"arguments {
+  name: String {
+    validation {
+      condition     = length(name) > 0
+      error_message = "name must not be empty"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let source = r#"let checked = use { source = '../checked' }
+
+let instance = checked {
+  name = ""
+}
+"#;
+    std::fs::write(root.join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", source);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("name must not be empty"))
+        .unwrap_or_else(|| panic!("authored validation message missing: {diagnostics:#?}"));
+    assert_eq!(diagnostic.range.start.line, 3);
+    assert_eq!(diagnostic.range.start.character, 2);
+}
+
+#[test]
+fn concrete_invalid_module_require_reports_authored_message_at_call() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("checked");
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        r#"arguments {
+  left: String
+  right: String
+}
+
+require left == right, "left and right must match"
+"#,
+    )
+    .unwrap();
+    let source = r#"let checked = use { source = '../checked' }
+
+let instance = checked {
+  left  = "a"
+  right = "b"
+}
+"#;
+    std::fs::write(root.join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", source);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("left and right must match"))
+        .unwrap_or_else(|| panic!("authored require message missing: {diagnostics:#?}"));
+    assert_eq!(diagnostic.range.start.line, 2);
+    assert_eq!(diagnostic.range.start.character, 15);
+}
+
+#[test]
+fn nested_concrete_module_constraint_survives_merged_expansion_failure() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let checked = tmp.path().join("checked");
+    let outer = tmp.path().join("outer");
+    let root = tmp.path().join("root");
+    for directory in [&checked, &outer, &root] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    std::fs::write(
+        checked.join("main.crn"),
+        r#"arguments {
+  name: String {
+    validation {
+      condition     = length(name) > 0
+      error_message = "nested name must not be empty"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        outer.join("main.crn"),
+        r#"arguments {
+  enabled: Bool = true
+}
+
+let checked = use { source = '../checked' }
+
+let nested = checked {
+  name = ""
+}
+"#,
+    )
+    .unwrap();
+    let source = r#"let outer = use { source = '../outer' }
+
+let instance = outer {
+}
+"#;
+    std::fs::write(root.join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", source);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("nested name must not be empty"))
+        .unwrap_or_else(|| panic!("nested resolver failure was lost: {diagnostics:#?}"));
+    assert_eq!(diagnostic.range.start.line, 2);
+    assert_eq!(diagnostic.range.start.character, 15);
 }
 
 #[test]

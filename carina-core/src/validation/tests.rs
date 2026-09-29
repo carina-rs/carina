@@ -2620,6 +2620,7 @@ fn validate_module_calls_rejects_custom_type() {
                 validations: Vec::new(),
             }],
             attributes: IndexMap::new(),
+            requires: Vec::new(),
         },
     );
 
@@ -3135,6 +3136,7 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
                 validations: Vec::new(),
             }],
             attributes: IndexMap::new(),
+            requires: Vec::new(),
         },
     )]);
 

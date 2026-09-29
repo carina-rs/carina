@@ -121,8 +121,7 @@ mod tests {
         CreateRequest, DeleteRequest, Provider, ProviderResult, ReadRequest, UpdateRequest,
     };
     use carina_core::resource::{
-        ConcreteValue, DataSource, DeferredValue, InterpolationPart, ResourceId, State,
-        UnknownReason, Value,
+        ConcreteValue, DeferredValue, InterpolationPart, ResourceId, State, UnknownReason, Value,
     };
     use futures::future::BoxFuture;
     use std::collections::{HashMap, HashSet};
@@ -183,7 +182,10 @@ mod tests {
             Box::pin(async move { Ok(State::not_found(id)) })
         }
 
-        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        fn read_data_source(
+            &self,
+            resource: &carina_core::provider::ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
             self.read(&resource.id, None, ReadRequest)
         }
 

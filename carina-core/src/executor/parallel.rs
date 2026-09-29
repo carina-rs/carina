@@ -228,6 +228,7 @@ pub(super) async fn execute_effects_sequential(
     let permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
     let mut runtime_synthesized_resources: Vec<Resource> = Vec::new();
+    let module_gate = super::ModuleConstraintGate::new(input.compositions);
 
     let ExpandedEffects {
         effects: expanded_effects,
@@ -418,6 +419,7 @@ pub(super) async fn execute_effects_sequential(
             let wait_identifiers = wait_identifiers.clone();
             let unresolved = &input.unresolved_resources;
             let pipeline = RenormalizePipeline {
+                module_gate: &module_gate,
                 normalizer: input.normalizer,
                 provider_configs: input.provider_configs,
                 factories: input.factories,
@@ -476,20 +478,33 @@ pub(super) async fn execute_effects_sequential(
                                     &binding_snapshot,
                                 ) {
                                     Ok(()) => {
-                                        crate::value::canonicalize_data_sources_with_schemas(
-                                            resolved_slice,
-                                            pipeline.schemas,
-                                        );
                                         let unresolved = unresolved_data_source_inputs(&resolved);
                                         if unresolved.is_empty() {
-                                            super::read_data_source_with_retry(provider, &resolved)
-                                                .await
-                                                .map_err(|err| {
-                                                    format!(
-                                                        "data source read failed for {}: {err}",
-                                                        resolved.id
+                                            match super::prepare_provider_ready_data_source(
+                                                resolved.clone(),
+                                                &binding_snapshot,
+                                                pipeline.module_gate,
+                                                pipeline.factories,
+                                                pipeline.schemas,
+                                            ) {
+                                                Ok(ready) => {
+                                                    resolved = ready.as_data_source().clone();
+                                                    super::read_data_source_with_retry(
+                                                        provider, &ready,
                                                     )
-                                                })
+                                                    .await
+                                                    .map_err(|err| {
+                                                        format!(
+                                                            "data source read failed for {}: {err}",
+                                                            resolved.id
+                                                        )
+                                                    })
+                                                }
+                                                Err(err) => Err(format!(
+                                                    "data source preparation failed for {}: {err}",
+                                                    resolved.id
+                                                )),
+                                            }
                                         } else {
                                             Err(format!(
                                                 "data source inputs for {} still contain \
@@ -807,6 +822,14 @@ pub(super) async fn execute_effects_sequential(
     };
     cancelled |= refresh_cancelled;
 
+    if !cancelled && let Err(error) = module_gate.finish(&input.bindings) {
+        for failure in error.failures() {
+            let message = failure.to_string();
+            observer.on_event(&ExecutionEvent::ModuleConstraintFailed { error: &message });
+            failure_count += 1;
+        }
+    }
+
     let result = ExecutionResult {
         success_count,
         failure_count,
@@ -838,7 +861,7 @@ mod tests {
         ReadRequest, UpdateRequest,
     };
     use crate::resource::{
-        Composition, ConcreteValue, DataSource, ResolvedResource, ResourceIdentity, State, Value,
+        Composition, ConcreteValue, ResolvedResource, ResourceIdentity, State, Value,
     };
     use crate::schema::SchemaRegistry;
     use crate::wait::predicate::{AttrPath, WaitPredicate};
@@ -906,7 +929,10 @@ mod tests {
             Box::pin(async move { Ok(state) })
         }
 
-        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        fn read_data_source(
+            &self,
+            resource: &crate::provider::ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
             self.read(&resource.id, None, ReadRequest)
         }
 
@@ -1007,7 +1033,8 @@ mod tests {
                 | ExecutionEvent::RenameFailed { .. }
                 | ExecutionEvent::RefreshStarted
                 | ExecutionEvent::RefreshSucceeded { .. }
-                | ExecutionEvent::RefreshFailed { .. } => {}
+                | ExecutionEvent::RefreshFailed { .. }
+                | ExecutionEvent::ModuleConstraintFailed { .. } => {}
             }
         }
     }

@@ -40,7 +40,7 @@ use carina_core::parser::ProviderContext;
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
-use carina_core::resource::{DataSource, ResourceId, State, Value};
+use carina_core::resource::{ResourceId, State, Value};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 use indexmap::IndexMap;
 use std::sync::Mutex;
@@ -194,7 +194,7 @@ impl Provider for NoopProvider {
     }
     fn read_data_source(
         &self,
-        r: &DataSource,
+        r: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<carina_core::resource::State>> {
         let id = r.id.clone();
         Box::pin(async move { Ok(carina_core::resource::State::existing(id, HashMap::new())) })
