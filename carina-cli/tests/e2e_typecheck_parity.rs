@@ -1134,17 +1134,14 @@ awsccmock.ec2.subnet {
 }
 
 // ============================================================================
-// Scenario: generic-String → specific Custom downcast (#2358)
+// Scenario: directional generic/specific assignments (#2358)
 //
 // `vpc_id: String = main.vpc_id` declares a `String`-typed export of a
 // value whose actual type is `Custom { identity: VpcId }`. The
-// declaration drops the specific identity, so any downstream consumer
-// receives `String` and can no longer be type-checked against a
-// `Custom { VpcId }` receiver. Validation, LSP diagnostics, and
-// completion must all reject the unsafe direction (`TypeExpr::String`
-// against a Custom-with-`identity` receiver) while keeping the
-// safe direction (specific Custom export → same Custom receiver) and
-// literal-value assignment (`vpc_id = 'vpc-12345678'`) working.
+// declaration is a safe widening and therefore passes. A downstream
+// consumer sees only `String`, so the reverse flow into a specific
+// `Custom { VpcId }` sink remains rejected. Validation, LSP diagnostics,
+// and completion must agree on that directionality.
 // ============================================================================
 
 // `vpc-` prefix validator — mirrors how the awscc plugin attaches its
@@ -1210,11 +1207,10 @@ fn engine_2358() -> DiagnosticEngine {
 }
 
 #[test]
-fn export_string_annotation_of_custom_value_rejected_parity() {
+fn export_string_annotation_of_custom_value_widens_parity() {
     // The export declares `: String` but the rhs `main.vpc_id` carries
-    // type `Custom { VpcId }`. The export's narrowed declaration is the
-    // unsafe step — both validate and LSP diagnostics must surface a
-    // type-mismatch error here.
+    // type `Custom { VpcId }`. This is source-specific → sink-generic,
+    // so both validate and LSP diagnostics must accept the widening.
     let fixture = write_fixture(&[(
         "main.crn",
         r#"
@@ -1231,23 +1227,14 @@ exports {
     let lsp_diags = lsp_diagnostics(&engine_2358(), &fixture, "main.crn");
     let cli_diags = cli_diagnostics(factories_2358(), &fixture);
 
-    // Pin both that the export name (`vpc_id`) appears in the message
-    // *and* that the carina-core mismatch wording surfaces verbatim
-    // ("expected String, got VpcId"). The two surfaces share the same
-    // format string from carina-core, so case-insensitive `mismatch`
-    // catches both `"type mismatch"` and any future `"Type mismatch"`.
     assert!(
-        lsp_messages_contain(&lsp_diags, "vpc_id")
-            && lsp_messages_contain_ci(&lsp_diags, "mismatch")
-            && lsp_messages_contain(&lsp_diags, "VpcId"),
-        "LSP must diagnose generic-String export of Custom-typed value, got {:?}",
+        !lsp_messages_contain_ci(&lsp_diags, "mismatch"),
+        "LSP must accept Custom-to-String widening, got {:?}",
         lsp_diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
     );
     assert!(
-        cli_messages_contain(&cli_diags, "vpc_id")
-            && cli_messages_contain_ci(&cli_diags, "mismatch")
-            && cli_messages_contain(&cli_diags, "VpcId"),
-        "CLI must diagnose generic-String export of Custom-typed value, got {:?}",
+        !cli_messages_contain_ci(&cli_diags, "mismatch"),
+        "CLI must accept Custom-to-String widening, got {:?}",
         cli_diags,
     );
 }
@@ -1289,8 +1276,8 @@ fn literal_valid_string_assignment_to_custom_receiver_still_validates() {
     // Existing `awscc.ec2.SecurityGroup { vpc_id = 'vpc-12345678' }`
     // pattern remains valid: a literal string in source becomes
     // `Value::Concrete(ConcreteValue::String(...))`, which validation handles via the schema-
-    // attached `validate` closure on the Custom type — not via
-    // `is_type_expr_compatible_with_schema`. The strictness fix must
+    // attached `validate` closure on the Custom type — not via the
+    // lifted module-boundary relation. The strictness fix must
     // not regress this path.
     //
     // The fixture's validator requires a `vpc-` prefix; a well-formed

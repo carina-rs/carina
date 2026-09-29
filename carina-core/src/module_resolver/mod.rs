@@ -25,6 +25,7 @@ mod error;
 mod expander;
 mod loader;
 mod resolver;
+mod signature;
 mod typecheck;
 mod validation;
 
@@ -35,6 +36,9 @@ pub use loader::{
     load_module_from_directory, load_module_with_diagnostics,
 };
 pub use resolver::{ModuleResolver, resolve_modules, resolve_modules_with_config};
+pub use signature::{
+    ResolvedModuleSignature, ResolvedModuleSignatures, load_resolved_module_signatures,
+};
 
 // Bring `pub(super)` helpers into mod.rs scope so the `tests` submodule (which
 // uses `super::*`) can call them by their bare names. Production code never

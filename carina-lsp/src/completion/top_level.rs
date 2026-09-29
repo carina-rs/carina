@@ -444,7 +444,7 @@ impl CompletionProvider {
         // shared value-completion entry point so module-call values
         // get the same coverage as `exports {}` values (built-ins,
         // binding refs, and structural type candidates).
-        if let Some(attr_type) = type_expr_to_attribute_type(&arg.type_expr) {
+        if let Some(attr_type) = carina_core::validation::lift_type_expr(&arg.type_expr) {
             // Synthetic `attr_type` is built directly from a `TypeExpr`,
             // which never lowers to `AttributeType::Ref`; an empty map is
             // sufficient for compatibility checks that still accept defs.
@@ -974,63 +974,6 @@ fn literal_completions_from_type_expr(type_expr: &parser::TypeExpr) -> Vec<Compl
             })
             .collect(),
         _ => Vec::new(),
-    }
-}
-
-/// Lift a [`parser::TypeExpr`] from `arguments { ... }` into a
-/// schema-level [`carina_core::schema::AttributeType`] so the existing
-/// type-driven completion dispatcher (`completions_for_type`) can be
-/// reused without forking a parallel implementation.
-///
-/// `Simple(name)` (snake_case) is reified as
-/// refined String with a bare identity — same shape `parse_exports_type_text` produces for `exports`
-/// annotations. The other arms cover the structural cases the
-/// dispatcher recurses through. Returns `None` for shapes that have no
-/// useful default (e.g. resource refs, `<unknown>`).
-fn type_expr_to_attribute_type(
-    type_expr: &parser::TypeExpr,
-) -> Option<carina_core::schema::AttributeType> {
-    use carina_core::schema::{AttributeType, legacy_validator};
-    fn noop(_: &carina_core::resource::Value) -> Result<(), String> {
-        Ok(())
-    }
-    match type_expr {
-        parser::TypeExpr::String => Some(AttributeType::string()),
-        parser::TypeExpr::Bool => Some(AttributeType::bool()),
-        parser::TypeExpr::Int => Some(AttributeType::int()),
-        parser::TypeExpr::Float => Some(AttributeType::float()),
-        parser::TypeExpr::Duration => Some(AttributeType::duration()),
-        parser::TypeExpr::Simple(name) => Some(AttributeType::refined_string_with_validator(
-            Some(carina_core::schema::TypeIdentity::bare(
-                parser::snake_to_pascal(name),
-            )),
-            None,
-            None,
-            legacy_validator(noop),
-            None,
-        )),
-        parser::TypeExpr::List(inner) => {
-            type_expr_to_attribute_type(inner).map(AttributeType::list)
-        }
-        parser::TypeExpr::Map(inner) => type_expr_to_attribute_type(inner)
-            .map(|inner_ty| AttributeType::map_with_key(AttributeType::string(), inner_ty)),
-        parser::TypeExpr::Union(members) => {
-            let lifted: Vec<AttributeType> = members
-                .iter()
-                .filter_map(type_expr_to_attribute_type)
-                .collect();
-            if lifted.is_empty() {
-                None
-            } else {
-                Some(AttributeType::union(lifted))
-            }
-        }
-        parser::TypeExpr::StringLiteral(_)
-        | parser::TypeExpr::Ref(_)
-        | parser::TypeExpr::DottedUnresolved(_)
-        | parser::TypeExpr::SchemaType { .. }
-        | parser::TypeExpr::Struct { .. }
-        | parser::TypeExpr::Unknown => None,
     }
 }
 

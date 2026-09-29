@@ -3247,6 +3247,7 @@ let b = consumer {
         .iter()
         .filter(|diagnostic| {
             diagnostic.message.contains("target_group_ar")
+                && diagnostic.message.starts_with("module call 'b':")
                 && diagnostic
                     .message
                     .to_ascii_lowercase()
@@ -3257,7 +3258,7 @@ let b = consumer {
     assert_eq!(
         typo_diagnostics.len(),
         1,
-        "the LSP module-call argument walk should report the schema-backed typo once: {:?}",
+        "the shared module-call validator should report the schema-backed typo once: {:?}",
         diagnostics
             .iter()
             .map(|diagnostic| &diagnostic.message)
@@ -3266,9 +3267,988 @@ let b = consumer {
     assert!(
         typo_diagnostics[0]
             .message
-            .contains("on 'tg' (type 'elbv2.TargetGroup')"),
-        "the LSP diagnostic should resolve the argument ref through tg's schema: {:?}",
+            .contains("module call 'b': unknown attribute 'target_group_ar' on 'tg'"),
+        "the LSP diagnostic should come from the shared module-call validator: {:?}",
         typo_diagnostics[0].message,
+    );
+    assert_eq!(
+        typo_diagnostics[0].range.start.line, 7,
+        "the structured argument name should anchor the diagnostic on `arn`",
+    );
+    assert_eq!(typo_diagnostics[0].range.start.character, 2);
+    assert_eq!(typo_diagnostics[0].range.end.character, 5);
+}
+
+#[test]
+fn module_call_argument_attribute_typo_is_reported_without_a_base_path() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let target_group_schema = ResourceSchema::new("elbv2.TargetGroup")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new(
+            "target_group_arn",
+            AttributeType::string(),
+        ));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", target_group_schema);
+    let engine = custom_engine(schemas);
+    let source = r#"let consumer = use { source = '../consumer_module' }
+
+let tg = awscc.elbv2.TargetGroup {
+  name = "caller"
+}
+
+let b = consumer {
+  arn = tg.target_group_ar
+}
+"#;
+    let doc = create_document(source);
+
+    let diagnostics = engine.analyze(&doc, None);
+    let typo_diagnostics: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("target_group_ar")
+                && diagnostic
+                    .message
+                    .to_ascii_lowercase()
+                    .contains("unknown attribute")
+        })
+        .collect();
+
+    assert_eq!(
+        typo_diagnostics.len(),
+        1,
+        "module-call argument refs must retain existence checking without filesystem context: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(typo_diagnostics[0].range.start.line, 7);
+    assert_eq!(typo_diagnostics[0].range.start.character, 2);
+    assert_eq!(typo_diagnostics[0].range.end.character, 5);
+}
+
+fn module_boundary_identity_engine() -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+
+    let identity = |path: &str, kind: &str| {
+        AttributeType::refined_string(
+            Some(TypeIdentity::from_schema_type("aws", path, kind)),
+            None,
+            None,
+            None,
+        )
+    };
+    let vpc = ResourceSchema::new("ec2.Vpc")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("vpc_id", identity("ec2.Vpc", "Id")));
+    let security_group = ResourceSchema::new("ec2.SecurityGroup")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("vpc_id", identity("ec2.Vpc", "Id")))
+        .attribute(AttributeSchema::new(
+            "group_id",
+            identity("ec2.SecurityGroup", "Id"),
+        ));
+    let log_group = ResourceSchema::new("logs.LogGroup")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new(
+            "arn",
+            identity("logs.LogGroup", "Arn"),
+        ));
+    let hosted_zone = ResourceSchema::new("route53.HostedZone").attribute(AttributeSchema::new(
+        "name",
+        AttributeType::refined_string(None, None, Some((None, Some(1024))), None),
+    ));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("aws", vpc);
+    schemas.insert("aws", security_group);
+    schemas.insert("aws", log_group);
+    schemas.insert("aws", hosted_zone);
+    custom_engine(schemas)
+}
+
+#[test]
+fn module_call_ref_fallback_anchors_second_anonymous_call() {
+    use carina_core::binding_index::BindingIndex;
+    use carina_core::module_resolver::ResolvedModuleSignature;
+    use carina_core::parser::{ArgumentParameter, TypeExpr};
+    use indexmap::IndexMap;
+    use std::collections::HashMap;
+
+    let engine = module_boundary_identity_engine();
+    let source = r#"let needs = use { source = '../needs' }
+
+let vpc = aws.ec2.Vpc {
+  name = "vpc"
+}
+
+let sg = aws.ec2.SecurityGroup {
+  name = "sg"
+}
+
+needs {
+  vpc_id = vpc.vpc_id
+}
+
+needs {
+  vpc_id = sg.group_id
+}
+"#;
+    let doc = create_document(source);
+    let parsed = doc.parsed().expect("fixture must parse");
+    let imported_modules = HashMap::from([(
+        "needs".to_string(),
+        ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "vpc_id".to_string(),
+                type_expr: TypeExpr::SchemaType {
+                    provider: "aws".to_string(),
+                    path: "ec2.Vpc".to_string(),
+                    type_name: "Id".to_string(),
+                },
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+        },
+    )]);
+    let bindings = BindingIndex::from_parsed(parsed, &engine.schemas);
+
+    let diagnostics =
+        engine.check_module_call_ref_types(&doc, parsed, &imported_modules, &bindings);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].range.start.line, 15,
+        "only the second anonymous call is invalid: {diagnostics:?}",
+    );
+    assert_eq!(diagnostics[0].range.start.character, 2);
+}
+
+#[test]
+fn module_argument_types_are_sources_in_open_module_document() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    let source = r#"arguments {
+  vpc_id: String
+}
+
+attributes {
+  x: aws.ec2.Vpc.Id = vpc_id
+}
+
+let sg = aws.ec2.SecurityGroup {
+  name   = "module"
+  vpc_id = vpc_id
+}
+"#;
+    std::fs::write(module.join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &module, "main.crn", source);
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("attribute 'x': type mismatch")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got String")
+                && diagnostic.message.contains("from vpc_id")
+        }),
+        "the open module's attribute declaration must use its argument declaration as the source type: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("Type mismatch")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got String")
+                && diagnostic.message.contains("from vpc_id")
+        }),
+        "the open module's resource attribute must use its argument declaration as the source type: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
+    use carina_core::binding_index::BindingIndex;
+    use carina_core::parser::TypeExpr;
+    use carina_core::resource::{
+        Composition, CompositionArgument, CompositionAttribute, CompositionCall,
+        CompositionProvenance, ConcreteValue, ResourceId, Signature, Value,
+    };
+    use indexmap::IndexMap;
+
+    fn schema_type(path: &str) -> TypeExpr {
+        TypeExpr::SchemaType {
+            provider: "aws".to_string(),
+            path: path.to_string(),
+            type_name: "Id".to_string(),
+        }
+    }
+
+    fn composition(binding: &str, call_binding: &str) -> Composition {
+        let call = CompositionCall {
+            module_name: "missing".to_string(),
+            binding: Some(call_binding.to_string()),
+            instance: call_binding.to_string(),
+            module_source: Some("../missing".to_string()),
+            module_directory: None,
+        };
+        Composition {
+            id: ResourceId::with_identity("_virtual", binding),
+            signature: Signature {
+                arguments: IndexMap::new(),
+                attributes: IndexMap::new(),
+            },
+            binding: Some(binding.to_string()),
+            dependency_bindings: Default::default(),
+            module_name: "missing".to_string(),
+            instance: call_binding.to_string(),
+            provenance: Box::new(CompositionProvenance::expanded(call.clone(), call)),
+            quoted_string_attrs: Default::default(),
+        }
+    }
+
+    let engine = module_boundary_identity_engine();
+    let doc = create_document(
+        r#"let unrelated = use { source = '../unrelated' }
+let first = unrelated { }
+"#,
+    );
+    let parsed = doc.parsed().expect("fixture must parse");
+    let mut binding_input = parsed.clone();
+
+    let mut source = composition("source", "missing-source-call");
+    source.signature.attributes.insert(
+        "sg".to_string(),
+        CompositionAttribute::from_value(
+            Value::Concrete(ConcreteValue::String("sg-123".to_string())),
+            Some(schema_type("ec2.SecurityGroup")),
+        ),
+    );
+    let mut consumer = composition("consumer", "missing-consumer-call");
+    consumer.signature.arguments.insert(
+        "vpc_id".to_string(),
+        CompositionArgument::from_value(
+            Value::resource_ref("source", "sg", vec![]),
+            schema_type("ec2.Vpc"),
+        ),
+    );
+    binding_input.compositions.extend([source, consumer]);
+    let bindings = BindingIndex::from_parsed(&binding_input, &engine.schemas);
+
+    let diagnostics =
+        engine.check_composition_ref_types(&doc, parsed, &binding_input.compositions, &bindings);
+
+    assert!(
+        diagnostics.is_empty(),
+        "an error whose immediate and root calls are absent from this document must not attach to its first unrelated call: {diagnostics:?}",
+    );
+}
+
+#[test]
+fn module_attribute_schema_type_declaration_mismatch_matches_validate() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("module");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(
+        base.join("resources.crn"),
+        r#"let vpc = aws.ec2.Vpc {
+  name = "main"
+}
+
+let sg = aws.ec2.SecurityGroup {
+  name   = "sg"
+  vpc_id = vpc.vpc_id
+}
+"#,
+    )
+    .unwrap();
+    let attributes = r#"attributes {
+  bad: aws.ec2.Vpc.Id = sg.group_id
+}
+"#;
+    std::fs::write(base.join("attributes.crn"), attributes).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &base, "attributes.crn", attributes);
+
+    let mismatch = diagnostics.iter().find(|diagnostic| {
+        diagnostic
+            .message
+            .contains("attribute 'bad': type mismatch")
+            && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+            && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+            && diagnostic.message.contains("from sg.group_id")
+    });
+    assert!(
+        mismatch.is_some(),
+        "LSP must report the same declaration mismatch as validate: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    let mismatch = mismatch.unwrap();
+    assert_eq!(mismatch.range.start.line, 1);
+    assert_eq!(mismatch.range.start.character, 2);
+}
+
+#[test]
+fn declared_string_output_preserves_forwarded_evidence_in_lsp() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("module");
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        r#"attributes {
+  x: String = lg.arn
+}
+
+let lg = aws.logs.LogGroup {
+  name = "module"
+}
+"#,
+    )
+    .unwrap();
+    let source = r#"let component = use { source = '../module' }
+let m = component { }
+
+let zone = aws.route53.HostedZone {
+  name = m.x
+}
+"#;
+    std::fs::write(root.join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", source);
+    let mismatch = diagnostics.iter().find(|diagnostic| {
+        diagnostic.message.contains("Type mismatch")
+            && diagnostic.message.contains("expected String(len: ..=1024)")
+            && diagnostic.message.contains("got aws.logs.LogGroup.Arn")
+            && diagnostic.message.contains("from m.x, declared String")
+    });
+    assert!(
+        mismatch.is_some(),
+        "LSP must retain the same inferred evidence as validate: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn expanded_module_attribute_declaration_error_stays_in_module_document() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("bad_module");
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    let module_source = r#"arguments {
+  name: String
+}
+
+attributes {
+  bad: aws.ec2.Vpc.Id = sg.group_id
+}
+
+let sg = aws.ec2.SecurityGroup {
+  name = name
+}
+"#;
+    std::fs::write(module.join("main.crn"), module_source).unwrap();
+    let root_source = r#"let bad_module = use { source = '../bad_module' }
+
+let one = bad_module {
+  name = "one"
+}
+"#;
+    let sibling_source = r#"let unrelated = aws.ec2.SecurityGroup {
+  name = "unrelated"
+}
+"#;
+    std::fs::write(root.join("main.crn"), root_source).unwrap();
+    std::fs::write(root.join("other.crn"), sibling_source).unwrap();
+
+    let root_diagnostics = analyze_with_buffer(&engine, &root, "main.crn", root_source);
+    let sibling_diagnostics = analyze_with_buffer(&engine, &root, "other.crn", sibling_source);
+    for diagnostics in [&root_diagnostics, &sibling_diagnostics] {
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("attribute 'bad'")),
+            "an imported module declaration belongs to the module document: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| (&diagnostic.range, &diagnostic.message))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    let module_diagnostics = analyze_with_buffer(&engine, &module, "main.crn", module_source);
+    let declaration_diagnostics: Vec<_> = module_diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("attribute 'bad'"))
+        .collect();
+    assert_eq!(declaration_diagnostics.len(), 1);
+    assert_eq!(declaration_diagnostics[0].range.start.line, 5);
+    assert_eq!(declaration_diagnostics[0].range.start.character, 2);
+}
+
+#[test]
+fn expanded_call_boundary_diagnostic_is_owned_by_calling_sibling() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("needs_vpc");
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+    )
+    .unwrap();
+    let main_source = r#"let unrelated = aws.ec2.SecurityGroup {
+  name = "unrelated"
+}
+"#;
+    let calls_source = r#"let needs_vpc = use { source = '../needs_vpc' }
+
+let sg = aws.ec2.SecurityGroup {
+  name = "source"
+}
+
+let broken = needs_vpc {
+  vpc_id = sg.group_id
+}
+"#;
+    std::fs::write(root.join("main.crn"), main_source).unwrap();
+    std::fs::write(root.join("calls.crn"), calls_source).unwrap();
+
+    let main_diagnostics = analyze_with_buffer(&engine, &root, "main.crn", main_source);
+    assert!(
+        main_diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("module call 'broken'")),
+        "a sibling call diagnostic must not leak into the open document: {:?}",
+        main_diagnostics
+            .iter()
+            .map(|diagnostic| (&diagnostic.range, &diagnostic.message))
+            .collect::<Vec<_>>(),
+    );
+
+    let call_diagnostics = analyze_with_buffer(&engine, &root, "calls.crn", calls_source);
+    let mismatches: Vec<_> = call_diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("module call 'broken'"))
+        .collect();
+    assert_eq!(mismatches.len(), 1);
+    assert_eq!(mismatches[0].range.start.line, 7);
+    assert_eq!(mismatches[0].range.start.character, 2);
+}
+
+#[test]
+fn composition_consumer_identity_mismatch_matches_validate() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("module");
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        module.join("arguments.crn"),
+        "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("attributes.crn"),
+        "attributes {\n  security_group_id = sg.group_id\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("resources.crn"),
+        r#"let sg = aws.ec2.SecurityGroup {
+  name   = "module"
+  vpc_id = vpc_id
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("main.crn"),
+        r#"let component = use { source = '../module' }
+
+let vpc = aws.ec2.Vpc {
+  name = "main"
+}
+
+let instance = component {
+  vpc_id = vpc.vpc_id
+}
+"#,
+    )
+    .unwrap();
+    let resources = r#"let consumer = aws.ec2.SecurityGroup {
+  name   = "consumer"
+  vpc_id = instance.security_group_id
+}
+"#;
+    std::fs::write(root.join("resources.crn"), resources).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "resources.crn", resources);
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("Type mismatch")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic
+                    .message
+                    .contains("from instance.security_group_id")
+        }),
+        "LSP must report the same composition-consumer mismatch as validate: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn composition_argument_identity_mismatch_matches_validate_at_call_boundary() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("module");
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        module.join("arguments.crn"),
+        r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("resources.crn"),
+        r#"let sg = aws.ec2.SecurityGroup {
+  name   = "module-sg"
+  vpc_id = vpc_id
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("attributes.crn"),
+        r#"attributes {
+  security_group_id = sg.group_id
+}
+"#,
+    )
+    .unwrap();
+    let main = r#"let issue = use { source = '../module' }
+
+let vpc = aws.ec2.Vpc {
+  name = "root"
+}
+
+let web = issue {
+  vpc_id = vpc.vpc_id
+}
+
+let web2 = issue {
+  vpc_id = web.security_group_id
+}
+"#;
+    std::fs::write(root.join("main.crn"), main).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", main);
+
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("module call 'web2': argument 'vpc_id'")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic.message.contains("from web.security_group_id")
+        })
+        .collect();
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "LSP must report the root module-call boundary mismatch exactly once: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    let mismatch = mismatches[0];
+    assert_eq!(
+        mismatch.range.start.line, 11,
+        "the structured call label must anchor the second call, not the first",
+    );
+    assert_eq!(mismatch.range.start.character, 2);
+}
+
+#[test]
+fn nested_module_call_identity_mismatch_is_reported_when_outer_module_is_opened() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let web_tier = tmp.path().join("web_tier");
+    let needs_vpc = tmp.path().join("needs_vpc");
+    let outer = tmp.path().join("outer");
+    for directory in [&web_tier, &needs_vpc, &outer] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    std::fs::write(
+        web_tier.join("main.crn"),
+        r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let web_sg = aws.ec2.SecurityGroup {
+  name   = "web"
+  vpc_id = vpc_id
+}
+
+attributes {
+  sg_id: aws.ec2.SecurityGroup.Id = web_sg.group_id
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        needs_vpc.join("main.crn"),
+        "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+    )
+    .unwrap();
+    let outer_source = r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let web_tier = use { source = '../web_tier' }
+let needs_vpc = use { source = '../needs_vpc' }
+
+let a = web_tier {
+  vpc_id = vpc_id
+}
+
+let b = needs_vpc {
+  vpc_id = a.sg_id
+}
+"#;
+    std::fs::write(outer.join("main.crn"), outer_source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &outer, "main.crn", outer_source);
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("module call 'b': argument 'vpc_id'")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic.message.contains("from a.sg_id")
+        })
+        .collect();
+
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "the open outer module must report its nested call boundary once: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(mismatches[0].range.start.line, 12);
+    assert_eq!(mismatches[0].range.start.character, 2);
+}
+
+struct NestedModuleCallLspFixture {
+    _temp: tempfile::TempDir,
+    outer: std::path::PathBuf,
+    root: std::path::PathBuf,
+    outer_source: String,
+    root_source: String,
+}
+
+fn nested_module_call_lsp_fixture(attribute_declaration: &str) -> NestedModuleCallLspFixture {
+    let temp = tempfile::tempdir().unwrap();
+    let web_tier = temp.path().join("web_tier");
+    let needs_vpc = temp.path().join("needs_vpc");
+    let outer = temp.path().join("outer");
+    let root = temp.path().join("root");
+    for directory in [&web_tier, &needs_vpc, &outer, &root] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    std::fs::write(
+        web_tier.join("main.crn"),
+        format!(
+            r#"arguments {{
+  vpc_id: aws.ec2.Vpc.Id
+}}
+
+let web_sg = aws.ec2.SecurityGroup {{
+  name   = "web"
+  vpc_id = vpc_id
+}}
+
+attributes {{
+  sg_id{attribute_declaration} = web_sg.group_id
+}}
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        needs_vpc.join("main.crn"),
+        "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+    )
+    .unwrap();
+    let outer_source = r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let web_tier = use { source = '../web_tier' }
+let needs_vpc = use { source = '../needs_vpc' }
+
+let a = web_tier {
+  vpc_id = vpc_id
+}
+
+let b = needs_vpc {
+  vpc_id = a.sg_id
+}
+"#
+    .to_string();
+    std::fs::write(outer.join("main.crn"), &outer_source).unwrap();
+    let root_source = r#"let outer = use { source = '../outer' }
+
+let main_vpc = aws.ec2.Vpc {
+  name = "main"
+}
+
+let instance = outer {
+  vpc_id = main_vpc.vpc_id
+}
+"#
+    .to_string();
+    std::fs::write(root.join("main.crn"), &root_source).unwrap();
+
+    NestedModuleCallLspFixture {
+        _temp: temp,
+        outer,
+        root,
+        outer_source,
+        root_source,
+    }
+}
+
+fn assert_one_nested_lsp_mismatch(
+    diagnostics: &[tower_lsp::lsp_types::Diagnostic],
+    expected_call: &str,
+    expected_path: &str,
+) {
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains(&format!("module call '{expected_call}': argument 'vpc_id'"))
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic
+                    .message
+                    .contains(&format!("from {expected_path}"))
+        })
+        .collect();
+
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "the LSP must report the nested call boundary once: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn unannotated_nested_module_call_is_inferred_when_outer_module_is_opened() {
+    let engine = module_boundary_identity_engine();
+    let fixture = nested_module_call_lsp_fixture("");
+
+    let diagnostics =
+        analyze_with_buffer(&engine, &fixture.outer, "main.crn", &fixture.outer_source);
+
+    assert_one_nested_lsp_mismatch(&diagnostics, "b", "a.sg_id");
+}
+
+#[test]
+fn annotated_nested_module_call_is_reported_when_root_module_is_opened() {
+    let engine = module_boundary_identity_engine();
+    let fixture = nested_module_call_lsp_fixture(": aws.ec2.SecurityGroup.Id");
+
+    let diagnostics = analyze_with_buffer(&engine, &fixture.root, "main.crn", &fixture.root_source);
+
+    assert_one_nested_lsp_mismatch(&diagnostics, "instance.b", "instance.a.sg_id");
+    let mismatch = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("module call 'instance.b'"))
+        .unwrap();
+    assert_eq!(mismatch.range.start.line, 6);
+    assert_eq!(mismatch.range.start.character, 15);
+}
+
+#[test]
+fn unannotated_nested_module_call_is_inferred_when_root_module_is_opened() {
+    let engine = module_boundary_identity_engine();
+    let fixture = nested_module_call_lsp_fixture("");
+
+    let diagnostics = analyze_with_buffer(&engine, &fixture.root, "main.crn", &fixture.root_source);
+
+    assert_one_nested_lsp_mismatch(&diagnostics, "instance.b", "instance.a.sg_id");
+    let mismatch = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("module call 'instance.b'"))
+        .unwrap();
+    assert_eq!(mismatch.range.start.line, 6);
+    assert_eq!(mismatch.range.start.character, 15);
+
+    let sibling_source = "let sibling = aws.ec2.SecurityGroup { name = \"sibling\" }\n";
+    std::fs::write(fixture.root.join("other.crn"), sibling_source).unwrap();
+    let sibling_diagnostics =
+        analyze_with_buffer(&engine, &fixture.root, "other.crn", sibling_source);
+    assert!(
+        sibling_diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("module call 'instance.b'")),
+        "a transitive call diagnostic must remain owned by its root call document: {:?}",
+        sibling_diagnostics
+            .iter()
+            .map(|diagnostic| (&diagnostic.range, &diagnostic.message))
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn depth_three_unannotated_module_call_is_inferred_when_root_module_is_opened() {
+    let engine = module_boundary_identity_engine();
+    let temp = tempfile::tempdir().unwrap();
+    let web_tier = temp.path().join("web_tier");
+    let needs_vpc = temp.path().join("needs_vpc");
+    let middle = temp.path().join("middle");
+    let outer = temp.path().join("outer");
+    let root = temp.path().join("root");
+    for directory in [&web_tier, &needs_vpc, &middle, &outer, &root] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    std::fs::write(
+        web_tier.join("main.crn"),
+        r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let web_sg = aws.ec2.SecurityGroup {
+  name   = "web"
+  vpc_id = vpc_id
+}
+
+attributes {
+  sg_id = web_sg.group_id
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        needs_vpc.join("main.crn"),
+        "arguments {\n  vpc_id: aws.ec2.Vpc.Id\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        middle.join("main.crn"),
+        r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let web_tier = use { source = '../web_tier' }
+let needs_vpc = use { source = '../needs_vpc' }
+
+let a = web_tier {
+  vpc_id = vpc_id
+}
+
+let b = needs_vpc {
+  vpc_id = a.sg_id
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        outer.join("main.crn"),
+        r#"arguments {
+  vpc_id: aws.ec2.Vpc.Id
+}
+
+let middle = use { source = '../middle' }
+let m = middle {
+  vpc_id = vpc_id
+}
+"#,
+    )
+    .unwrap();
+    let root_source = r#"let outer = use { source = '../outer' }
+
+let main_vpc = aws.ec2.Vpc {
+  name = "main"
+}
+
+let instance = outer {
+  vpc_id = main_vpc.vpc_id
+}
+"#;
+    std::fs::write(root.join("main.crn"), root_source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", root_source);
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("module call 'instance.m.b': argument 'vpc_id'")
+                && diagnostic.message.contains("expected aws.ec2.Vpc.Id")
+                && diagnostic.message.contains("got aws.ec2.SecurityGroup.Id")
+                && diagnostic.message.contains("from instance.m.a.sg_id")
+        })
+        .collect();
+
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "the depth-three LSP boundary must be reported once: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
     );
 }
 
@@ -3491,6 +4471,34 @@ for name, _ in orgs.accounts {
         "known field should not be flagged, got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn upstream_state_typed_struct_missing_field_is_reported_once() {
+    let (_tmp, base, name) = set_up_project_with_upstream(
+        r#"let orgs = upstream_state { source = '../organizations' }
+let vpc = awscc.ec2.Vpc {
+    name = orgs.account.nope
+    cidr_block = '10.0.0.0/16'
+}
+"#,
+        Some(
+            r#"exports {
+    account: struct { id: String } = { id = "account-123" }
+}
+"#,
+        ),
+    );
+
+    let engine = test_engine();
+    let buffer = std::fs::read_to_string(base.join(&name)).unwrap();
+    let diagnostics = analyze_with_buffer(&engine, &base, &name, &buffer);
+    let missing: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("nope"))
+        .collect();
+
+    assert_eq!(missing.len(), 1, "{diagnostics:#?}");
 }
 
 #[test]
@@ -4986,7 +5994,7 @@ fn attributes_block_reports_unknown_attribute_on_sibling_binding() {
 }
 
 #[test]
-fn attributes_block_simple_annotation_uses_core_narrowed_snake_equality() {
+fn attributes_block_specific_identity_widens_to_simple_annotation() {
     let engine = attributes_sibling_resource_engine();
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().join("module");
@@ -5004,10 +6012,9 @@ fn attributes_block_simple_annotation_uses_core_narrowed_snake_equality() {
         })
         .collect();
 
-    assert_eq!(
-        mismatches.len(),
-        1,
-        "Simple annotations must use core's narrowed snake-name equality: {:?}",
+    assert!(
+        mismatches.is_empty(),
+        "a specific aws.iam.Policy.Arn source must widen into a bare Arn sink: {:?}",
         diagnostics
             .iter()
             .map(|diagnostic| &diagnostic.message)

@@ -15,7 +15,7 @@ use crate::position;
 use carina_core::parser::{ParseError, ParsedFile, ResourceRef, WarningKind};
 use carina_core::provider::ProviderFactory;
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
-use carina_core::schema::{ResourceSchema, SchemaRegistry, TypeInSchema};
+use carina_core::schema::{SchemaRegistry, TypeInSchema};
 
 /// Create a `Diagnostic` on a single line with the standard "carina" source.
 pub(crate) fn carina_diagnostic(
@@ -193,9 +193,27 @@ impl DiagnosticEngine {
             diagnostics.extend(self.check_mixed_tag_key_styles(current_file, base, result));
         }
         let merged = merged_result.as_ref().map(|result| &result.parsed);
+        let upstream_resolution = match (base_path, merged) {
+            (Some(base), Some(merged)) => Some(
+                carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
+                    base,
+                    &merged.upstream_states,
+                    &self.provider_context,
+                    Some(&self.schemas),
+                ),
+            ),
+            _ => None,
+        };
 
-        if let (Some(base), Some(merged)) = (base_path, merged) {
-            diagnostics.extend(self.check_upstream_state_field_references(doc, merged, base));
+        if let (Some(merged), Some((exports, resolve_errors))) =
+            (merged, upstream_resolution.as_ref())
+        {
+            diagnostics.extend(self.check_upstream_state_field_references(
+                doc,
+                merged,
+                exports,
+                resolve_errors,
+            ));
             diagnostics.extend(self.check_for_iterable_bindings(doc, merged, current_file_name));
         }
 
@@ -375,9 +393,7 @@ impl DiagnosticEngine {
             // Check for unloaded providers
             diagnostics.extend(self.check_unloaded_providers(doc, parsed));
 
-            // Check module calls
             if let Some(base) = base_path {
-                diagnostics.extend(self.check_module_calls(doc, parsed, base));
                 diagnostics.extend(self.check_upstream_state_sources(doc, parsed, base));
             }
             // Build the canonical validation-target index from the merged,
@@ -388,12 +404,48 @@ impl DiagnosticEngine {
             // deliberately gives both composition-attribute existence checks
             // and `check_resource_ref_type_mismatch` directory-wide targets.
             let binding_input = merged.unwrap_or(parsed);
+            let empty_upstream_exports = Default::default();
+            let upstream_exports = upstream_resolution
+                .as_ref()
+                .map(|(exports, _)| exports)
+                .unwrap_or(&empty_upstream_exports);
             let binding_index =
-                carina_core::binding_index::BindingIndex::from_parsed(binding_input, &self.schemas);
-            // Schema-only consumers retain the borrow-valued projection and
-            // avoid per-keystroke `ResourceSchema::clone()` work.
-            let binding_schema_map = binding_index.schemas_by_name();
-
+                carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports(
+                    binding_input,
+                    &self.schemas,
+                    upstream_exports,
+                );
+            let module_signatures = base_path
+                .map(|base| {
+                    carina_core::module_resolver::load_resolved_module_signatures(
+                        binding_input,
+                        base,
+                        &self.provider_context,
+                    )
+                })
+                .unwrap_or_default();
+            if base_path.is_some() {
+                diagnostics.extend(self.check_module_calls(doc, parsed, &module_signatures));
+            }
+            if let (Some(_), Some(expanded)) = (base_path, merged) {
+                diagnostics.extend(self.check_composition_ref_types(
+                    doc,
+                    parsed,
+                    &expanded.compositions,
+                    &binding_index,
+                ));
+            } else {
+                // Orphaned files and directory parses that did not produce an
+                // expanded view retain the source-local fallback. It can
+                // validate schema bindings, while composition inference is
+                // intentionally owned by the expanded pass above.
+                diagnostics.extend(self.check_module_call_ref_types(
+                    doc,
+                    parsed,
+                    &module_signatures,
+                    &binding_index,
+                ));
+            }
             // Check resource types — include for-body template resources so
             // attribute/type/enum validation fires inside `for` loops too.
             for rref in parsed.iter_all_resources() {
@@ -678,26 +730,23 @@ impl DiagnosticEngine {
                                     "Type mismatch: expected Float, got String \"{}\".",
                                     s
                                 )),
-                                // ResourceRef type check for Union, Enum, and Custom types
-                                (
-                                    carina_core::schema::Shape::Union
-                                    | carina_core::schema::Shape::Enum { .. }
-                                    | carina_core::schema::Shape::String {
-                                        identity: Some(_), ..
-                                    }
-                                    | carina_core::schema::Shape::Int {
-                                        identity: Some(_), ..
-                                    }
-                                    | carina_core::schema::Shape::Float {
-                                        identity: Some(_), ..
-                                    },
-                                    Value::Deferred(DeferredValue::ResourceRef { path }),
-                                ) => check_resource_ref_type_mismatch(
-                                    &binding_schema_map,
-                                    schema.type_in_schema(&attr_schema.attr_type),
-                                    path.binding(),
-                                    path.attribute(),
-                                ),
+                                // Every statically typed deferred reference is
+                                // checked through the same BindingIndex source
+                                // resolver, including bare module arguments.
+                                (_, Value::Deferred(DeferredValue::ResourceRef { path })) => {
+                                    check_resource_ref_type_mismatch(
+                                        &binding_index,
+                                        schema.type_in_schema(&attr_schema.attr_type),
+                                        path.into(),
+                                    )
+                                }
+                                (_, Value::Deferred(DeferredValue::BindingRef { binding })) => {
+                                    check_resource_ref_type_mismatch(
+                                        &binding_index,
+                                        schema.type_in_schema(&attr_schema.attr_type),
+                                        binding.as_str().into(),
+                                    )
+                                }
                                 // Enum: the structured-payload path
                                 // above handles `InvalidEnumVariant` /
                                 // `StringLiteralExpectedEnum` and
@@ -909,6 +958,18 @@ impl DiagnosticEngine {
                         &lookup,
                     ) {
                         for error in errors {
+                            if let carina_core::schema::TypeError::ResourceValidationFailed {
+                                attribute: Some(attribute),
+                                ..
+                            } = &error
+                                && matches!(
+                                    resource_attributes.get(attribute),
+                                    Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+                                        | Some(Value::Deferred(DeferredValue::BindingRef { .. }))
+                                )
+                            {
+                                continue;
+                            }
                             // Skip errors that are already reported with precise positions
                             // by the attribute-level checks above.
                             if matches!(
@@ -995,19 +1056,7 @@ impl DiagnosticEngine {
                 &known_bindings,
             ));
 
-            // Exports type check. When a merged parse is available the
-            // sibling-binding → resource-type map is built from it so
-            // `upstream_state` / `import` / module-call bindings are
-            // visible (#2134); otherwise fall back to an empty map and
-            // rely on the local-to-file checks that `check_exports_blocks`
-            // performs (e.g. type annotation sanity, literal-value shape).
-            // On that degraded path the legacy export pre-check gets no
-            // sibling projection; attributes instead builds its shared
-            // BindingIndex from the buffer parse.
-            let sibling_bindings = merged
-                .map(exports_sibling_bindings_from)
-                .unwrap_or_default();
-            diagnostics.extend(self.check_exports_blocks(doc, parsed, merged, &sibling_bindings));
+            diagnostics.extend(self.check_exports_blocks(doc, parsed, merged));
 
             // Unused `let` detection. When a merged parse is available,
             // run the core check against it (so references from sibling
@@ -1518,47 +1567,22 @@ fn build_enum_diagnostic(
 /// Returns `Some(message)` on mismatch, `None` when compatible or when the binding/attribute
 /// cannot be resolved (unknown bindings are not flagged here).
 fn check_resource_ref_type_mismatch(
-    binding_schema_map: &HashMap<&str, &ResourceSchema>,
+    binding_index: &carina_core::binding_index::BindingIndex<'_>,
     expected: TypeInSchema<'_>,
-    ref_binding: &str,
-    ref_attr: &str,
+    path: carina_core::resource::ReferencePathRef<'_>,
 ) -> Option<String> {
-    let ref_schema = binding_schema_map.get(ref_binding)?;
-    let ref_attr_schema = ref_schema.attributes.get(ref_attr)?;
-    let source = ref_schema.type_in_schema(&ref_attr_schema.attr_type);
+    let carina_core::binding_index::RefType::Typed(source) = binding_index.ref_type(path) else {
+        return None;
+    };
 
     // Directional: the ref (source) must be assignable to the expected (sink).
-    if source.is_assignable_to(expected) {
-        None
-    } else {
-        Some(format!(
-            "Type mismatch: expected {}, got {} (from {}.{})",
-            expected.resolved_type_name(),
-            source.resolved_type_name(),
-            ref_binding,
-            ref_attr
-        ))
-    }
-}
-
-/// Build the binding-name → resource-type map that
-/// [`check_exports_blocks`] uses to type-check cross-file references.
-/// Replaces the hand-rolled `Backend::scan_sibling_context` output —
-/// merged parse sees every managed resource in the directory, including
-/// those declared in sibling files (#2134).
-fn exports_sibling_bindings_from(merged: &ParsedFile) -> HashMap<String, String> {
-    merged
-        .resources
-        .iter()
-        .filter_map(|r| {
-            r.binding.as_ref().map(|b| {
-                (
-                    b.clone(),
-                    format!("{}.{}", r.id.provider, r.id.resource_type),
-                )
-            })
-        })
-        .collect()
+    let mismatch = source.is_assignable_to_sink(expected).err()?;
+    Some(format!(
+        "Type mismatch: expected {}, got {} ({})",
+        expected.resolved_type_name(),
+        mismatch.actual_type_name(),
+        mismatch.origin_description(path),
+    ))
 }
 
 fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {

@@ -729,6 +729,7 @@ pub async fn run_plan(
     if let Some(sf) = state_file.as_ref() {
         carina_core::module_resolver::reconcile_anonymous_module_instances(
             &mut parsed.resources,
+            &mut parsed.compositions,
             &|provider, resource_type| {
                 sf.resources_by_type(provider, resource_type)
                     .into_iter()

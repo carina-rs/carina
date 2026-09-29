@@ -1613,11 +1613,14 @@ mod tests {
             indexmap::IndexMap::new();
         virt_attrs.insert(
             "role_id".to_string(),
-            crate::resource::CompositionAttribute::from_value(Value::resource_ref(
-                "github_actions_carina.role".to_string(),
-                "vpc_id".to_string(),
-                vec![],
-            )),
+            crate::resource::CompositionAttribute::from_value(
+                Value::resource_ref(
+                    "github_actions_carina.role".to_string(),
+                    "vpc_id".to_string(),
+                    vec![],
+                ),
+                None,
+            ),
         );
         let virt = crate::resource::Composition {
             id: crate::resource::ResourceId::with_identity("_virtual", "github_actions_carina"),
@@ -1629,6 +1632,7 @@ mod tests {
             dependency_bindings: std::collections::BTreeSet::new(),
             module_name: "github_module".to_string(),
             instance: "github_actions_carina".to_string(),
+            provenance: Default::default(),
             quoted_string_attrs: std::collections::HashSet::new(),
         };
         parsed.compositions.push(virt); // allow: direct — fixture test inspection

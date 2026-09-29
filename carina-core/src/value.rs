@@ -985,24 +985,28 @@ pub fn redact_secrets_in_data_source(
 pub fn redact_secrets_in_virtual(
     resource: &crate::resource::Composition,
 ) -> Result<crate::resource::Composition, SerializationError> {
-    // Reify each `CompositionAttribute` to a `Value`, redact secrets,
-    // then re-classify with `CompositionAttribute::from_value` so
-    // single-hop alias structure is preserved across the round-trip.
+    let arguments: Result<indexmap::IndexMap<String, crate::resource::CompositionArgument>, _> =
+        resource
+            .signature
+            .arguments
+            .iter()
+            .map(|(k, argument)| {
+                redact_secrets_in_value(argument.value())
+                    .map(|rv| (k.clone(), argument.with_value(rv)))
+            })
+            .collect();
     let attributes: Result<indexmap::IndexMap<String, crate::resource::CompositionAttribute>, _> =
         resource
             .signature
             .attributes
             .iter()
             .map(|(k, attr)| {
-                redact_secrets_in_value(&attr.to_value()).map(|rv| {
-                    (
-                        k.clone(),
-                        crate::resource::CompositionAttribute::from_value(rv),
-                    )
-                })
+                redact_secrets_in_value(&attr.to_value())
+                    .map(|value| (k.clone(), attr.with_value(value)))
             })
             .collect();
     let mut out = resource.clone();
+    out.signature.arguments = arguments?;
     out.signature.attributes = attributes?;
     Ok(out)
 }
@@ -3404,15 +3408,19 @@ mod tests {
         let mut attrs: indexmap::IndexMap<String, CompositionAttribute> = indexmap::IndexMap::new();
         attrs.insert(
             "non_secret".to_string(),
-            CompositionAttribute::from_value(Value::Concrete(ConcreteValue::String(
-                "kept".to_string(),
-            ))),
+            CompositionAttribute::from_value(
+                Value::Concrete(ConcreteValue::String("kept".to_string())),
+                None,
+            ),
         );
         attrs.insert(
             "secret_field".to_string(),
-            CompositionAttribute::from_value(Value::Deferred(DeferredValue::Secret(Box::new(
-                Value::Concrete(ConcreteValue::String("plaintext-must-not-leak".to_string())),
-            )))),
+            CompositionAttribute::from_value(
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::String("plaintext-must-not-leak".to_string()),
+                )))),
+                None,
+            ),
         );
         let virt = Composition {
             id: ResourceId::with_identity("_virtual", "module_instance"),
@@ -3424,6 +3432,7 @@ mod tests {
             dependency_bindings: BTreeSet::new(),
             module_name: "m".to_string(),
             instance: "module_instance".to_string(),
+            provenance: Default::default(),
             quoted_string_attrs: HashSet::new(),
         };
 

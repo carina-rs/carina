@@ -225,10 +225,7 @@ pub fn resolve_virtual_refs_post_apply(
             // literal becomes a `Derived(Concrete(...))`; a one that
             // resolves into another `ResourceRef` stays `Forwarded`.
             let resolved = resolve_ref_value(&attr.to_value(), bindings)?;
-            resolved_attrs.insert(
-                key.clone(),
-                crate::resource::CompositionAttribute::from_value(resolved),
-            );
+            resolved_attrs.insert(key.clone(), attr.with_value(resolved));
         }
         v.signature.attributes = resolved_attrs;
     }

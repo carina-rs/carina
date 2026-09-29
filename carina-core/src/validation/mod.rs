@@ -4,184 +4,779 @@ pub mod deferred_populate;
 pub mod depends_on;
 pub mod wait;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::HashSet;
 
 use indexmap::IndexMap;
 
-use crate::binding_index::{BindingIndex, BindingTarget};
+use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
 use crate::deps::collect_dependencies;
 use crate::parser::{
-    ModuleCall, ProviderContext, ResourceRef, ResourceTypePath, TypeExpr, validate_custom_type,
+    ModuleCall, ProviderContext, ResourceContext, ResourceRef, ResourceTypePath, TypeExpr,
+    validate_custom_type,
 };
 use crate::provider::ProviderFactory;
-use crate::resource::{AccessPath, Composition, ConcreteValue, DeferredValue, Value};
-use crate::schema::{AttributeType, SchemaRegistry, Shape, TypeIdentity, suggest_similar_name};
+use crate::resource::{
+    CompositionCall, ConcreteValue, DeferredValue, ReferencePath, ReferencePathRef, Value,
+};
+use crate::schema::{AttributeType, SchemaRegistry, Shape, TypeIdentity};
 
-/// Render the trailing `" Did you mean 'X'?"` segment for an unknown
-/// name in a diagnostic, or an empty string when nothing close enough
-/// is found. The leading space is part of the convention so callers
-/// can concat unconditionally onto an already-punctuated message.
-fn did_you_mean(unknown: &str, known: &[&str]) -> String {
-    suggest_similar_name(unknown, known)
-        .map(|s| format!(" Did you mean '{}'?", s))
-        .unwrap_or_default()
-}
+/// Lift a module-boundary [`TypeExpr`] into the schema type system.
+///
+/// The returned type is definition-free and can therefore be paired with
+/// [`crate::schema::TypeInSchema::schemaless`]. Callers must still choose the
+/// direction of assignment explicitly: a declared input/output type used as a
+/// sink belongs on the right-hand side of `source.is_assignable_to(sink)`,
+/// while a declared upstream type used as a source belongs on the left.
+///
+/// Resource-handle annotations ([`TypeExpr::Ref`]) deliberately remain
+/// unchecked because a resource handle is not representable as an
+/// [`AttributeType`] yet (carina#3803). String literals, unresolved dotted
+/// paths, and failed-inference sentinels also remain unchecked rather than
+/// being widened to `String`; inventing a wider type would make identity sinks
+/// accept values without evidence.
+pub fn lift_type_expr(type_expr: &TypeExpr) -> Option<AttributeType> {
+    use crate::schema::StructField;
 
-/// Return the shared unknown-attribute diagnostic suffix for a statically
-/// known attribute surface, or `None` when the referenced attribute exists.
-fn unknown_attribute_error<'a>(
-    path: &AccessPath,
-    known_attribute_names: impl IntoIterator<Item = &'a String>,
-) -> Option<String> {
-    let known_attrs: Vec<&str> = known_attribute_names
-        .into_iter()
-        .map(String::as_str)
-        .collect();
-    let ref_attr = path.attribute();
-    if known_attrs.contains(&ref_attr) {
-        return None;
+    match type_expr {
+        TypeExpr::String => Some(AttributeType::string()),
+        TypeExpr::Bool => Some(AttributeType::bool()),
+        TypeExpr::Int => Some(AttributeType::int()),
+        TypeExpr::Float => Some(AttributeType::float()),
+        TypeExpr::Duration => Some(AttributeType::duration()),
+        TypeExpr::Simple(name) => Some(AttributeType::refined_string(
+            Some(TypeIdentity::bare(crate::parser::snake_to_pascal(name))),
+            None,
+            None,
+            None,
+        )),
+        TypeExpr::SchemaType {
+            provider,
+            path,
+            type_name,
+        } => Some(AttributeType::refined_string(
+            Some(TypeIdentity::from_schema_type(provider, path, type_name)),
+            None,
+            None,
+            None,
+        )),
+        TypeExpr::List(inner) => lift_type_expr(inner).map(AttributeType::list),
+        TypeExpr::Map(inner) => lift_type_expr(inner).map(AttributeType::map),
+        TypeExpr::Struct { fields } => fields
+            .iter()
+            .map(|(name, field_type)| {
+                lift_type_expr(field_type)
+                    .map(|field_type| StructField::new(name.clone(), field_type))
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|fields| AttributeType::struct_("anonymous", fields)),
+        TypeExpr::Union(members) => members
+            .iter()
+            .map(lift_type_expr)
+            .collect::<Option<Vec<_>>>()
+            .filter(|members| !members.is_empty())
+            .map(AttributeType::union),
+        // Ref denotes a resource handle, not an Id/Arn projection. See #3803.
+        TypeExpr::Ref(_)
+        // These forms have no conservative schema-level representation.
+        | TypeExpr::StringLiteral(_)
+        | TypeExpr::DottedUnresolved(_)
+        | TypeExpr::Unknown => None,
     }
-
-    let ref_binding = path.binding();
-    Some(format!(
-        "unknown attribute '{}' on '{}' in reference {}.{}{}",
-        ref_attr,
-        ref_binding,
-        ref_binding,
-        ref_attr,
-        did_you_mean(ref_attr, &known_attrs),
-    ))
 }
 
-/// Return the shared unknown-attribute diagnostic suffix for a reference to
-/// a composition's declared attribute surface, or `None` when it exists.
-fn composition_unknown_attribute_error(
-    composition: &Composition,
-    path: &AccessPath,
-) -> Option<String> {
-    unknown_attribute_error(path, composition.signature.attributes.keys())
+static STRING_REF_SINK: TypeExpr = TypeExpr::String;
+
+/// The declared type at one position in a [`Value`] tree.
+///
+/// Module boundaries use `TypeExpr`; provider resource attributes use
+/// `AttributeType` plus their definition map. `String` represents the inside
+/// of an interpolation, whose expression parts are rendered to text regardless
+/// of the outer container.
+#[derive(Clone, Copy)]
+pub(crate) enum RefSink<'a> {
+    TypeExpr(&'a TypeExpr),
+    AttributeType {
+        attr_type: &'a AttributeType,
+        defs: &'a std::collections::BTreeMap<String, AttributeType>,
+    },
+    String,
 }
 
-fn binding_target_unknown_attribute_error(
-    target: BindingTarget<'_>,
-    path: &AccessPath,
-) -> Option<String> {
-    match target {
-        BindingTarget::Schema(schema) => unknown_attribute_error(path, schema.attributes.keys()),
-        BindingTarget::Composition(composition) => {
-            composition_unknown_attribute_error(composition, path)
+impl<'a> RefSink<'a> {
+    fn as_type_expr(self) -> Option<&'a TypeExpr> {
+        match self {
+            Self::TypeExpr(type_expr) => Some(type_expr),
+            Self::String => Some(&STRING_REF_SINK),
+            Self::AttributeType { .. } => None,
         }
     }
-}
 
-fn check_resource_ref_existence<'a>(
-    resource_id: &crate::resource::ResourceId,
-    ref_path: &crate::resource::AccessPath,
-    argument_names: &HashSet<String>,
-    bindings: &BindingIndex<'a>,
-    all_errors: &mut Vec<String>,
-) -> Option<(
-    &'a crate::schema::ResourceSchema,
-    &'a crate::schema::AttributeSchema,
-)> {
-    let ref_binding = ref_path.binding();
-    let ref_attr = ref_path.attribute();
-
-    // Skip type checking for argument parameter references (resolved at call site)
-    if argument_names.contains(ref_binding) {
-        return None;
-    }
-
-    // Look up the referenced binding's typed validation target.
-    // `is_declared` distinguishes "unknown binding" from "known managed/data
-    // binding whose schema is absent", preserving the original diagnostic
-    // shape (only the former gets reported here).
-    let Some(ref_entry) = bindings.get(ref_binding) else {
-        if !bindings.is_declared(ref_binding) {
-            all_errors.push(format!(
-                "{}: unknown binding '{}' in reference {}.{}",
-                resource_id, ref_binding, ref_binding, ref_attr,
-            ));
-        }
-        return None;
-    };
-
-    let ref_schema = match ref_entry.target {
-        BindingTarget::Schema(schema) => schema,
-        BindingTarget::Composition(composition) => {
-            if let Some(error) = composition_unknown_attribute_error(composition, ref_path) {
-                all_errors.push(format!("{}: {}", resource_id, error));
+    fn list_element(self) -> Option<Self> {
+        match self {
+            Self::TypeExpr(TypeExpr::List(inner)) => Some(Self::TypeExpr(inner)),
+            Self::TypeExpr(TypeExpr::Union(members)) => {
+                exactly_one(members.iter().filter_map(|member| match member {
+                    TypeExpr::List(inner) => Some(inner.as_ref()),
+                    _ => None,
+                }))
+                .map(Self::TypeExpr)
             }
-            return None;
+            Self::AttributeType { attr_type, defs } => match attr_type.shape_with_defs(defs) {
+                Shape::List {
+                    element_type: inner,
+                    ..
+                } => Some(Self::AttributeType {
+                    attr_type: inner,
+                    defs,
+                }),
+                Shape::Union => {
+                    unique_union_list_element(attr_type, defs).map(|inner| Self::AttributeType {
+                        attr_type: inner,
+                        defs,
+                    })
+                }
+                _ => None,
+            },
+            Self::TypeExpr(_) | Self::String => None,
         }
-    };
-    let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
-        let error = unknown_attribute_error(ref_path, ref_schema.attributes.keys())
-            .expect("missing schema attribute must produce an existence error");
-        all_errors.push(format!("{}: {}", resource_id, error));
-        return None;
-    };
+    }
 
-    Some((ref_schema, ref_attr_schema))
+    fn map_entry(self, key: &str) -> Option<Self> {
+        match self {
+            Self::TypeExpr(TypeExpr::Map(inner)) => Some(Self::TypeExpr(inner)),
+            Self::TypeExpr(TypeExpr::Struct { fields }) => fields
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, field_type)| Self::TypeExpr(field_type)),
+            Self::TypeExpr(TypeExpr::Union(members)) => exactly_one(
+                members
+                    .iter()
+                    .filter(|member| matches!(member, TypeExpr::Map(_) | TypeExpr::Struct { .. })),
+            )
+            .and_then(|member| Self::TypeExpr(member).map_entry(key)),
+            Self::AttributeType { attr_type, defs } => match attr_type.shape_with_defs(defs) {
+                Shape::Map { value: inner, .. } => Some(Self::AttributeType {
+                    attr_type: inner,
+                    defs,
+                }),
+                Shape::Struct { .. } => {
+                    let fields = crate::schema::struct_fields_with_defs(attr_type, defs)
+                        .expect("Shape::Struct must expose struct fields internally");
+                    let accepted = crate::schema::build_accepted_field_map(fields);
+                    accepted.get(key).map(|field| Self::AttributeType {
+                        attr_type: &field.field_type,
+                        defs,
+                    })
+                }
+                Shape::Union => unique_union_map_member(attr_type, defs).and_then(|member| {
+                    Self::AttributeType {
+                        attr_type: member,
+                        defs,
+                    }
+                    .map_entry(key)
+                }),
+                _ => None,
+            },
+            Self::TypeExpr(_) | Self::String => None,
+        }
+    }
 }
 
-fn check_nested_resource_ref_existence(
+fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Option<T> {
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn unique_union_list_element<'a>(
+    attr_type: &'a AttributeType,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+) -> Option<&'a AttributeType> {
+    let members = crate::schema::union_members_with_defs(attr_type, defs)?;
+    exactly_one(members.iter().flatten().filter_map(|member| {
+        match member.as_attr().shape_with_defs(defs) {
+            Shape::List { element_type, .. } => Some(element_type),
+            _ => None,
+        }
+    }))
+}
+
+fn unique_union_map_member<'a>(
+    attr_type: &'a AttributeType,
+    defs: &'a std::collections::BTreeMap<String, AttributeType>,
+) -> Option<&'a AttributeType> {
+    let members = crate::schema::union_members_with_defs(attr_type, defs)?;
+    exactly_one(members.iter().flatten().filter_map(|member| {
+        matches!(
+            member.as_attr().shape_with_defs(defs),
+            Shape::Map { .. } | Shape::Struct { .. }
+        )
+        .then_some(member.as_attr())
+    }))
+}
+
+/// Visit every resource reference exactly once while carrying the declared
+/// sink type for its structural position.
+///
+/// Lists, maps, and structs descend in lockstep with their declared type.
+/// When a value shape has no corresponding declared position, descendants are
+/// still visited with `None` so existence diagnostics are never lost. A Union
+/// contributes a nested sink only when exactly one member matches the concrete
+/// List or Map value shape. Function arguments likewise have no locally
+/// available signature and deliberately receive `None`: the function's result
+/// sink says nothing sound about its input positions. Secrets preserve their
+/// enclosing sink and interpolation expressions use a string sink.
+pub(crate) fn visit_refs_with_sink<'a>(
+    value: &Value,
+    sink: Option<RefSink<'a>>,
+    f: &mut impl FnMut(ReferencePathRef<'_>, Option<RefSink<'a>>),
+) {
+    match value {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            f(ReferencePathRef::Access(path), sink)
+        }
+        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+            f(ReferencePathRef::Binding(binding), sink)
+        }
+        Value::Concrete(ConcreteValue::List(items)) => {
+            let child_sink = sink.and_then(RefSink::list_element);
+            for item in items {
+                visit_refs_with_sink(item, child_sink, f);
+            }
+        }
+        Value::Concrete(ConcreteValue::Map(entries)) => {
+            for (key, value) in entries {
+                let child_sink = sink.and_then(|sink| sink.map_entry(key));
+                visit_refs_with_sink(value, child_sink, f);
+            }
+        }
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            for part in parts {
+                if let crate::resource::InterpolationPart::Expr(value) = part {
+                    visit_refs_with_sink(value, Some(RefSink::String), f);
+                }
+            }
+        }
+        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+            // The enclosing sink constrains the function result, not its
+            // inputs. Parameter signatures are unavailable here, so carrying
+            // that sink into an argument would be unsound.
+            for argument in args {
+                visit_refs_with_sink(argument, None, f);
+            }
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => visit_refs_with_sink(inner, sink, f),
+        Value::Concrete(ConcreteValue::String(_))
+        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
+        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
+        | Value::Concrete(ConcreteValue::Int(_))
+        | Value::Concrete(ConcreteValue::Float(_))
+        | Value::Concrete(ConcreteValue::Bool(_))
+        | Value::Concrete(ConcreteValue::Duration(_))
+        | Value::Concrete(ConcreteValue::StringList(_))
+        | Value::Deferred(DeferredValue::Unknown(_)) => {}
+    }
+}
+
+fn resolve_resource_reference(
     resource_id: &crate::resource::ResourceId,
-    attr_value: &Value,
-    argument_names: &HashSet<String>,
+    reference: ReferencePathRef<'_>,
     bindings: &BindingIndex<'_>,
     all_errors: &mut Vec<String>,
-) {
-    attr_value.visit_resource_refs(&mut |ref_path| {
-        let _ = check_resource_ref_existence(
-            resource_id,
-            ref_path,
-            argument_names,
-            bindings,
-            all_errors,
-        );
-    });
+) -> Option<ResolvedRefType> {
+    match bindings.ref_type(reference) {
+        RefType::Typed(resolved) => Some(resolved),
+        RefType::Unchecked => None,
+        RefType::UnknownBinding { .. } => {
+            all_errors.push(format!(
+                "{}: unknown binding '{}' in reference {}",
+                resource_id,
+                reference.binding(),
+                reference.to_dot_string(),
+            ));
+            None
+        }
+        RefType::UnknownAttribute(error) => {
+            all_errors.push(format!("{}: {}", resource_id, error));
+            None
+        }
+    }
 }
 
-/// Validate references carried by module-call argument values against the
-/// post-expansion binding surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ModuleCallRefErrorKind {
+    TypeMismatch {
+        expected: String,
+        actual: String,
+        declared: Option<String>,
+    },
+    UnknownAttribute(RefTypeError),
+}
+
+/// Structured module-call reference error shared by CLI and LSP surfaces.
+///
+/// `Display` is the stable CLI message. The LSP consumes the named fields and
+/// never has to recover source identity by parsing that message.
+#[derive(Debug, Clone)]
+pub struct ModuleCallRefError {
+    /// Index into the `module_calls` slice passed to validation.
+    pub call_index: usize,
+    call_label: String,
+    pub argument: String,
+    pub path: ReferencePath,
+    pub kind: ModuleCallRefErrorKind,
+}
+
+fn format_module_call_ref_error(
+    f: &mut std::fmt::Formatter<'_>,
+    call_label: &str,
+    argument: &str,
+    path: &ReferencePath,
+    kind: &ModuleCallRefErrorKind,
+) -> std::fmt::Result {
+    match kind {
+        ModuleCallRefErrorKind::TypeMismatch {
+            expected,
+            actual,
+            declared,
+        } => write!(
+            f,
+            "module call '{}': argument '{}': cannot assign {} to '{}': expected {}, got {} ({})",
+            call_label,
+            argument,
+            actual,
+            argument,
+            expected,
+            actual,
+            match declared {
+                Some(declared) => format!("from {}, declared {}", path.to_dot_string(), declared),
+                None => format!("from {}", path.to_dot_string()),
+            },
+        ),
+        ModuleCallRefErrorKind::UnknownAttribute(error) => {
+            write!(f, "module call '{}': {}", call_label, error)
+        }
+    }
+}
+
+impl std::fmt::Display for ModuleCallRefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format_module_call_ref_error(f, &self.call_label, &self.argument, &self.path, &self.kind)
+    }
+}
+
+impl std::error::Error for ModuleCallRefError {}
+
+/// Validate references carried by module-call argument values against binding
+/// surfaces and the called module's declared argument types.
 ///
 /// Unknown bindings and enclosing-module argument names are intentionally
 /// ignored here: their resolution belongs to the existing scope/module-call
 /// passes. This walk only closes attribute-existence gaps for binding targets
-/// that have a statically known schema or composition signature.
-pub fn validate_module_call_argument_ref_existence_with_bindings(
+/// that have a statically known schema or module signature.
+pub fn validate_module_call_argument_ref_types_with_bindings(
     module_calls: &[ModuleCall],
-    argument_names: &HashSet<String>,
+    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
+    _argument_names: &HashSet<String>,
     bindings: &BindingIndex<'_>,
-) -> Result<(), String> {
+) -> Vec<ModuleCallRefError> {
+    validate_module_call_argument_ref_types_inner(module_calls, imported_modules, bindings, None)
+}
+
+/// Validate only references rooted in one of `source_bindings`.
+///
+/// This is used by the module-definition pre-expansion pass: argument-backed
+/// references must be checked in their declaring module, while all other
+/// references retain the established post-expansion diagnostics and source
+/// provenance.
+pub fn validate_module_call_argument_ref_types_for_bindings(
+    module_calls: &[ModuleCall],
+    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
+    source_bindings: &HashSet<String>,
+    bindings: &BindingIndex<'_>,
+) -> Vec<ModuleCallRefError> {
+    validate_module_call_argument_ref_types_inner(
+        module_calls,
+        imported_modules,
+        bindings,
+        Some(source_bindings),
+    )
+}
+
+fn validate_module_call_argument_ref_types_inner(
+    module_calls: &[ModuleCall],
+    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
+    bindings: &BindingIndex<'_>,
+    source_bindings: Option<&HashSet<String>>,
+) -> Vec<ModuleCallRefError> {
     let mut errors = Vec::new();
 
-    for call in module_calls {
+    for (call_index, call) in module_calls.iter().enumerate() {
         let call_name = call
             .binding_name
             .as_deref()
             .unwrap_or(call.module_name.as_str());
-        for value in call.arguments.values() {
-            value.visit_resource_refs(&mut |path| {
-                if argument_names.contains(path.binding()) {
-                    return;
-                }
-                let Some(entry) = bindings.get(path.binding()) else {
-                    return;
-                };
-                if let Some(error) = binding_target_unknown_attribute_error(entry.target, path) {
-                    errors.push(format!("module call '{}': {}", call_name, error));
-                }
-            });
+        for (argument_name, value) in &call.arguments {
+            let declared_sink = imported_modules
+                .get(&call.module_name)
+                .and_then(|signature| {
+                    signature
+                        .arguments
+                        .iter()
+                        .find(|argument| argument.name == *argument_name)
+                })
+                .map(|argument| &argument.type_expr);
+
+            visit_refs_with_sink(
+                value,
+                declared_sink.map(RefSink::TypeExpr),
+                &mut |path, sink| {
+                    if source_bindings.is_some_and(|bindings| !bindings.contains(path.binding())) {
+                        return;
+                    }
+                    let Some(kind) = composition_ref_error_kind(path, sink, bindings) else {
+                        return;
+                    };
+                    errors.push(ModuleCallRefError {
+                        call_index,
+                        call_label: call_name.to_string(),
+                        argument: argument_name.clone(),
+                        path: path.to_owned(),
+                        kind,
+                    });
+                },
+            );
         }
     }
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("\n"))
+    errors
+}
+
+#[derive(Debug, Clone)]
+pub struct AttributeParamRefError {
+    pub attribute: String,
+    pub path: ReferencePath,
+    pub kind: ModuleCallRefErrorKind,
+}
+
+impl std::fmt::Display for AttributeParamRefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            ModuleCallRefErrorKind::TypeMismatch {
+                expected,
+                actual,
+                declared,
+            } => write!(
+                f,
+                "attribute '{}': type mismatch: expected {}, got {} ({})",
+                self.attribute,
+                expected,
+                actual,
+                match declared {
+                    Some(declared) =>
+                        format!("from {}, declared {}", self.path.to_dot_string(), declared),
+                    None => format!("from {}", self.path.to_dot_string()),
+                },
+            ),
+            ModuleCallRefErrorKind::UnknownAttribute(error) => {
+                write!(f, "attribute '{}': {}", self.attribute, error)
+            }
+        }
     }
+}
+
+impl std::error::Error for AttributeParamRefError {}
+
+/// A reference-type failure found on one fully expanded composition boundary.
+#[derive(Debug, Clone)]
+pub enum CompositionRefError {
+    ModuleCall(CompositionModuleCallRefError),
+    Attribute(CompositionAttributeRefError),
+}
+
+/// A call-boundary failure together with structural expansion ancestry used
+/// by source-aware consumers such as the LSP.
+#[derive(Debug, Clone)]
+pub struct CompositionModuleCallRefError {
+    pub argument: String,
+    pub path: ReferencePath,
+    pub kind: ModuleCallRefErrorKind,
+    pub call: CompositionCall,
+    pub root_call: CompositionCall,
+    reference_position: usize,
+}
+
+impl std::fmt::Display for CompositionModuleCallRefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        format_module_call_ref_error(
+            f,
+            &self.call.display_label(),
+            &self.argument,
+            &self.path,
+            &self.kind,
+        )
+    }
+}
+
+/// A module-output declaration failure. The module identity remains attached
+/// after expansion so repeated instances collapse to one authored error and
+/// CLI output can identify the declaration's source.
+#[derive(Debug, Clone)]
+pub struct CompositionAttributeRefError {
+    pub error: AttributeParamRefError,
+    pub module_name: String,
+    pub module_source: Option<String>,
+    pub module_directory: Option<std::path::PathBuf>,
+    reference_position: usize,
+}
+
+impl CompositionAttributeRefError {
+    fn module_label(&self) -> &str {
+        self.module_source.as_deref().unwrap_or(&self.module_name)
+    }
+
+    fn module_identity(&self) -> String {
+        self.module_directory
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .or_else(|| self.module_source.clone())
+            .unwrap_or_else(|| self.module_name.clone())
+    }
+}
+
+impl std::fmt::Display for CompositionAttributeRefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "module '{}': {}", self.module_label(), self.error)
+    }
+}
+
+impl std::fmt::Display for CompositionRefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ModuleCall(error) => error.fmt(f),
+            Self::Attribute(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for CompositionRefError {}
+
+/// Hashable, instance-independent error identity used only for deduplication.
+/// Binding/path strings inside [`RefTypeError`] are deliberately omitted: the
+/// reference's stable value-walk position identifies the authored occurrence,
+/// while expanded bindings differ for every module instance.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CompositionRefErrorKindKey {
+    TypeMismatch {
+        expected: String,
+        actual: String,
+        declared: Option<String>,
+    },
+    UnknownAttribute {
+        attribute: String,
+        known_attributes: Vec<String>,
+        target: crate::binding_index::RefTargetKind,
+    },
+    UnknownStructField {
+        field: String,
+        struct_name: String,
+        known_fields: Vec<String>,
+    },
+    UnknownUpstreamExport {
+        export: String,
+        known_exports: Vec<String>,
+    },
+}
+
+impl From<&ModuleCallRefErrorKind> for CompositionRefErrorKindKey {
+    fn from(kind: &ModuleCallRefErrorKind) -> Self {
+        match kind {
+            ModuleCallRefErrorKind::TypeMismatch {
+                expected,
+                actual,
+                declared,
+            } => Self::TypeMismatch {
+                expected: expected.clone(),
+                actual: actual.clone(),
+                declared: declared.clone(),
+            },
+            ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::UnknownAttribute {
+                attribute,
+                known_attributes,
+                target,
+                ..
+            }) => Self::UnknownAttribute {
+                attribute: attribute.clone(),
+                known_attributes: known_attributes.clone(),
+                target: target.clone(),
+            },
+            ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::UnknownStructField {
+                field,
+                struct_name,
+                known_fields,
+                ..
+            }) => Self::UnknownStructField {
+                field: field.clone(),
+                struct_name: struct_name.clone(),
+                known_fields: known_fields.clone(),
+            },
+            ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::UnknownUpstreamExport {
+                export,
+                known_exports,
+                ..
+            }) => Self::UnknownUpstreamExport {
+                export: export.clone(),
+                known_exports: known_exports.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CompositionModuleCallErrorKey {
+    call_instance: String,
+    argument: String,
+    reference_position: usize,
+    kind: CompositionRefErrorKindKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CompositionAttributeErrorKey {
+    module_identity: String,
+    attribute: String,
+    reference_position: usize,
+    kind: CompositionRefErrorKindKey,
+}
+
+fn composition_ref_error_kind(
+    path: ReferencePathRef<'_>,
+    sink: Option<RefSink<'_>>,
+    bindings: &BindingIndex<'_>,
+) -> Option<ModuleCallRefErrorKind> {
+    match bindings.ref_type(path) {
+        RefType::Typed(source) => {
+            let sink = sink
+                .and_then(RefSink::as_type_expr)
+                .and_then(lift_type_expr)?;
+            let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
+            source
+                .is_assignable_to_sink(sink_type)
+                .err()
+                .map(|mismatch| ModuleCallRefErrorKind::TypeMismatch {
+                    expected: sink_type.resolved_type_name(),
+                    actual: mismatch.actual_type_name().to_string(),
+                    declared: mismatch.declared_type_name().map(str::to_string),
+                })
+        }
+        RefType::UnknownAttribute(error) => Some(ModuleCallRefErrorKind::UnknownAttribute(error)),
+        RefType::Unchecked | RefType::UnknownBinding { .. } => None,
+    }
+}
+
+/// Validate every fully expanded module-call boundary exactly once.
+///
+/// Both halves of the boundary live on [`crate::resource::Composition`]:
+/// typed call arguments and typed output attributes. The shared
+/// [`BindingIndex`] is built only after all nested compositions have been
+/// prefixed into the root parse, so unannotated forwarded outputs can inherit
+/// their resource-schema type through arbitrarily deep composition chains.
+pub fn validate_composition_ref_types_with_bindings(
+    compositions: &[crate::resource::Composition],
+    bindings: &BindingIndex<'_>,
+) -> Vec<CompositionRefError> {
+    let mut errors = Vec::new();
+
+    for composition in compositions {
+        let (Some(call), Some(root_call)) = (
+            composition.diagnostic_call(),
+            composition.diagnostic_root_call(),
+        ) else {
+            // Saved plans have already passed source validation and omit
+            // diagnostic provenance by design.
+            continue;
+        };
+        for (argument_name, argument) in &composition.signature.arguments {
+            let mut reference_position = 0;
+            visit_refs_with_sink(
+                argument.value(),
+                argument.declared_type().map(RefSink::TypeExpr),
+                &mut |path, sink| {
+                    let current_position = reference_position;
+                    reference_position += 1;
+                    let Some(kind) = composition_ref_error_kind(path, sink, bindings) else {
+                        return;
+                    };
+                    errors.push(CompositionRefError::ModuleCall(
+                        CompositionModuleCallRefError {
+                            argument: argument_name.clone(),
+                            path: path.to_owned(),
+                            kind,
+                            call: call.clone(),
+                            root_call: root_call.clone(),
+                            reference_position: current_position,
+                        },
+                    ));
+                },
+            );
+        }
+
+        for (attribute_name, attribute) in &composition.signature.attributes {
+            if attribute.source_argument().is_some() {
+                // The module-local declaration is checked against the
+                // argument's declared type before expansion. Re-checking the
+                // substituted caller value here duplicates call-boundary
+                // errors and incorrectly blames the module output.
+                continue;
+            }
+            let value = attribute.to_value();
+            let mut reference_position = 0;
+            visit_refs_with_sink(
+                &value,
+                attribute.declared_type().map(RefSink::TypeExpr),
+                &mut |path, sink| {
+                    let current_position = reference_position;
+                    reference_position += 1;
+                    let Some(kind) = composition_ref_error_kind(path, sink, bindings) else {
+                        return;
+                    };
+                    errors.push(CompositionRefError::Attribute(
+                        CompositionAttributeRefError {
+                            error: AttributeParamRefError {
+                                attribute: attribute_name.clone(),
+                                path: path.to_owned(),
+                                kind,
+                            },
+                            module_name: call.module_name.clone(),
+                            module_source: call.module_source.clone(),
+                            module_directory: call.module_directory.clone(),
+                            reference_position: current_position,
+                        },
+                    ));
+                },
+            );
+        }
+    }
+
+    let mut seen_calls = HashSet::new();
+    let mut seen_attributes = HashSet::new();
+    errors.retain(|error| match error {
+        CompositionRefError::ModuleCall(error) => {
+            seen_calls.insert(CompositionModuleCallErrorKey {
+                call_instance: error.call.instance.clone(),
+                argument: error.argument.clone(),
+                reference_position: error.reference_position,
+                kind: (&error.kind).into(),
+            })
+        }
+        CompositionRefError::Attribute(error) => {
+            seen_attributes.insert(CompositionAttributeErrorKey {
+                module_identity: error.module_identity(),
+                attribute: error.error.attribute.clone(),
+                reference_position: error.reference_position,
+                kind: (&error.error.kind).into(),
+            })
+        }
+    });
+    errors
 }
 
 /// Validate resources against their schemas.
@@ -292,8 +887,27 @@ pub fn validate_resources<E>(
 pub fn validate_resource_ref_types<E>(
     parsed: &crate::parser::File<E>,
     registry: &SchemaRegistry,
-    argument_names: &HashSet<String>,
+    _argument_names: &HashSet<String>,
     bindings: &BindingIndex<'_>,
+) -> Result<(), String> {
+    validate_resource_ref_types_inner(parsed, registry, bindings, None)
+}
+
+/// Validate resource-attribute references rooted in `source_bindings` only.
+pub fn validate_resource_ref_types_for_bindings<E>(
+    parsed: &crate::parser::File<E>,
+    registry: &SchemaRegistry,
+    source_bindings: &HashSet<String>,
+    bindings: &BindingIndex<'_>,
+) -> Result<(), String> {
+    validate_resource_ref_types_inner(parsed, registry, bindings, Some(source_bindings))
+}
+
+fn validate_resource_ref_types_inner<E>(
+    parsed: &crate::parser::File<E>,
+    registry: &SchemaRegistry,
+    bindings: &BindingIndex<'_>,
+    source_bindings: Option<&HashSet<String>>,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
 
@@ -310,6 +924,12 @@ pub fn validate_resource_ref_types<E>(
             continue;
         };
         let resource_id = rref.id();
+        let resource_location = match rref.context() {
+            ResourceContext::Direct => resource_id.to_string(),
+            ResourceContext::Deferred(deferred) => {
+                format!("for-body `{}` {}", deferred.header, resource_id)
+            }
+        };
 
         let attrs = rref.attributes();
         for (attr_name, attr_value) in attrs.iter() {
@@ -317,95 +937,49 @@ pub fn validate_resource_ref_types<E>(
                 continue;
             }
 
-            let Some(attr_schema) = schema.attributes.get(attr_name) else {
-                check_nested_resource_ref_existence(
-                    resource_id,
-                    attr_value,
-                    argument_names,
-                    bindings,
-                    &mut all_errors,
-                );
-                continue;
-            };
-
-            if let Value::Deferred(DeferredValue::ResourceRef { path: ref_path }) = attr_value {
-                let Some((ref_schema, ref_attr_schema)) = check_resource_ref_existence(
-                    resource_id,
-                    ref_path,
-                    argument_names,
-                    bindings,
-                    &mut all_errors,
-                ) else {
-                    continue;
-                };
-                // Narrow through the path's segments — `[idx]` peels one
-                // `List<T>` / `Map<_,V>` layer, `.field` descends a
-                // `Struct`. carina#3028. Unknown struct fields are a
-                // real typo (carina#3041) and get reported here with a
-                // suggestion; other shape mismatches stay silent because
-                // resolver-time evaluation catches them with full location
-                // context.
-                let narrowed = match narrow_attribute_type(
-                    &ref_attr_schema.attr_type,
-                    ref_path.segments(),
-                    &ref_schema.defs,
-                ) {
-                    Ok(t) => t,
-                    Err(NarrowError::UnknownStructField {
-                        field,
-                        struct_name,
-                        known_fields,
-                    }) => {
-                        let known: Vec<&str> = known_fields.iter().map(|s| s.as_str()).collect();
-                        all_errors.push(format!(
-                            "{}: unknown field '{}' on struct '{}' in reference {}; \
-                             known fields: {}.{}",
-                            resource_id,
-                            field,
-                            struct_name,
-                            ref_path.to_dot_string(),
-                            known.join(", "),
-                            did_you_mean(&field, &known),
-                        ));
-                        continue;
-                    }
-                    Err(NarrowError::ShapeMismatch) => continue,
-                };
-                let source_type = ref_schema.type_in_schema(narrowed);
-                let sink_type = schema.type_in_schema(&attr_schema.attr_type);
-                let ref_type_name = source_type.resolved_type_name();
-                let expected_type_name = sink_type.resolved_type_name();
-
-                // Directional check: source (the referenced attribute, post
-                // path narrowing) must be assignable to the sink (the
-                // current resource's attribute).
-                if source_type.is_assignable_to(sink_type) {
-                    continue;
+            let sink = schema
+                .attributes
+                .get(attr_name)
+                .map(|attribute| RefSink::AttributeType {
+                    attr_type: &attribute.attr_type,
+                    defs: &schema.defs,
+                });
+            let string_sink = AttributeType::string();
+            visit_refs_with_sink(attr_value, sink, &mut |reference, sink| {
+                if source_bindings.is_some_and(|bindings| !bindings.contains(reference.binding())) {
+                    return;
                 }
-
+                let Some(source) =
+                    resolve_resource_reference(resource_id, reference, bindings, &mut all_errors)
+                else {
+                    return;
+                };
+                let Some(sink_type) = (match sink {
+                    Some(RefSink::AttributeType { attr_type, defs }) => {
+                        Some(attr_type.in_schema(defs))
+                    }
+                    Some(RefSink::String) => {
+                        Some(crate::schema::TypeInSchema::schemaless(&string_sink))
+                    }
+                    Some(RefSink::TypeExpr(_)) | None => None,
+                }) else {
+                    return;
+                };
+                let Err(mismatch) = source.is_assignable_to_sink(sink_type) else {
+                    return;
+                };
+                let source_name = mismatch.actual_type_name();
+                let origin = mismatch.origin_description(reference);
                 all_errors.push(format!(
-                    "{}: cannot assign {} to '{}': expected {}, got {} (from {}.{})",
-                    resource_id,
-                    ref_type_name,
+                    "{}: cannot assign {} to '{}': expected {}, got {} ({})",
+                    resource_location,
+                    source_name,
                     attr_name,
-                    expected_type_name,
-                    ref_type_name,
-                    ref_path.binding(),
-                    ref_path.attribute(),
+                    sink_type.resolved_type_name(),
+                    source_name,
+                    origin,
                 ));
-            } else {
-                // Nested ResourceRefs are checked for binding/attribute
-                // existence only. Assignability for these refs needs the
-                // nested field type context from the surrounding Map/List/Struct
-                // shape and should be added where that context is threaded.
-                check_nested_resource_ref_existence(
-                    resource_id,
-                    attr_value,
-                    argument_names,
-                    bindings,
-                    &mut all_errors,
-                );
-            }
+            });
         }
     }
 
@@ -426,29 +1000,22 @@ pub fn validate_attribute_param_ref_types_with_bindings(
     attribute_params: &[crate::parser::AttributeParameter],
     bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
-    validate_attribute_param_ref_types_with_bindings_and_module_calls(
-        attribute_params,
-        bindings,
-        &HashMap::new(),
-    )
+    validate_attribute_param_ref_types_inner(attribute_params, bindings, None)
 }
 
-/// Pre-expansion module-call attribute surface used only while recursively
-/// validating an imported module's own `attributes {}` block.
-pub type PreExpansionModuleCallAttributes = HashMap<String, BTreeSet<String>>;
+/// Validate attribute-declaration references rooted in `source_bindings` only.
+pub fn validate_attribute_param_ref_types_for_bindings(
+    attribute_params: &[crate::parser::AttributeParameter],
+    source_bindings: &HashSet<String>,
+    bindings: &BindingIndex<'_>,
+) -> Result<(), String> {
+    validate_attribute_param_ref_types_inner(attribute_params, bindings, Some(source_bindings))
+}
 
-/// Validate module attribute parameters before nested module expansion.
-///
-/// [`BindingIndex`] remains the sole post-expansion authority. At this seam,
-/// however, `load_module` intentionally returns an unexpanded parse, so nested
-/// module calls have no [`BindingTarget::Composition`] entry yet. The second
-/// lookup contains only the declared `attributes {}` names loaded from those
-/// calls' imported modules; it is deliberately scoped to this pre-expansion
-/// walk and provides no runtime values or schema types.
-pub fn validate_attribute_param_ref_types_with_bindings_and_module_calls(
+fn validate_attribute_param_ref_types_inner(
     attribute_params: &[crate::parser::AttributeParameter],
     bindings: &BindingIndex<'_>,
-    module_call_attributes: &PreExpansionModuleCallAttributes,
+    source_bindings: Option<&HashSet<String>>,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
 
@@ -457,38 +1024,22 @@ pub fn validate_attribute_param_ref_types_with_bindings_and_module_calls(
             continue;
         };
 
-        // A plain ResourceRef with a Simple annotation takes the existing
-        // combined existence + compatibility path. Do not also send it
-        // through the generic existence walk or an unknown attribute would
-        // produce the same diagnostic twice.
-        if let (
-            Some(TypeExpr::Simple(expected_type)),
-            Value::Deferred(DeferredValue::ResourceRef { path }),
-        ) = (&param.type_expr, value)
-        {
-            check_attribute_param_ref_type(
-                &param.name,
-                expected_type,
-                path,
-                bindings,
-                module_call_attributes,
-                &mut errors,
-            );
-            continue;
-        }
-
-        // Attribute existence is independent of whether the module output has
-        // a type annotation. Compatibility remains gated on the direct
-        // Simple-annotated path above.
-        value.visit_resource_refs(&mut |path| {
-            check_attribute_param_ref_existence(
-                &param.name,
-                path,
-                bindings,
-                module_call_attributes,
-                &mut errors,
-            );
-        });
+        visit_refs_with_sink(
+            value,
+            param.type_expr.as_ref().map(RefSink::TypeExpr),
+            &mut |path, sink| {
+                if source_bindings.is_some_and(|bindings| !bindings.contains(path.binding())) {
+                    return;
+                }
+                check_attribute_param_ref(
+                    &param.name,
+                    sink.and_then(RefSink::as_type_expr),
+                    path,
+                    bindings,
+                    &mut errors,
+                );
+            },
+        );
     }
 
     if errors.is_empty() {
@@ -498,147 +1049,33 @@ pub fn validate_attribute_param_ref_types_with_bindings_and_module_calls(
     }
 }
 
-fn check_attribute_param_ref_type(
+fn check_attribute_param_ref(
     param_name: &str,
-    expected_type: &str,
-    path: &crate::resource::AccessPath,
+    expected_type: Option<&TypeExpr>,
+    path: ReferencePathRef<'_>,
     bindings: &BindingIndex<'_>,
-    module_call_attributes: &PreExpansionModuleCallAttributes,
     errors: &mut Vec<String>,
 ) {
-    let ref_binding = path.binding();
-    let ref_attr = path.attribute();
-
-    let Some(ref_entry) = bindings.get(ref_binding) else {
-        check_pre_expansion_module_call_attribute_ref(
-            param_name,
-            path,
-            module_call_attributes,
-            errors,
-        );
-        return;
-    };
-    let ref_schema = match ref_entry.target {
-        BindingTarget::Schema(schema) => schema,
-        BindingTarget::Composition(composition) => {
-            if let Some(error) = composition_unknown_attribute_error(composition, path) {
-                errors.push(format!("attribute '{}': {}", param_name, error));
+    match bindings.ref_type(path) {
+        RefType::Typed(source) => {
+            let Some(sink) = expected_type.and_then(lift_type_expr) else {
+                return;
+            };
+            let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
+            if let Err(mismatch) = source.is_assignable_to_sink(sink_type) {
+                errors.push(format!(
+                    "attribute '{}': type mismatch: expected {}, got {} ({})",
+                    param_name,
+                    expected_type.expect("lifted expected type exists"),
+                    mismatch.actual_type_name(),
+                    mismatch.origin_description(path),
+                ));
             }
-            return;
         }
-    };
-    let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
-        let error = unknown_attribute_error(path, ref_schema.attributes.keys())
-            .expect("missing schema attribute must produce an existence error");
-        errors.push(format!("attribute '{}': {}", param_name, error));
-        return;
-    };
-
-    let Some(ref_attr_type) =
-        narrow_attribute_param_ref_type(param_name, path, ref_schema, ref_attr_schema, errors)
-    else {
-        return;
-    };
-
-    let ref_type_name = ref_schema
-        .type_in_schema(ref_attr_type)
-        .resolved_type_name();
-    let ref_type_snake = crate::parser::pascal_to_snake(&ref_type_name);
-
-    if ref_type_snake == expected_type {
-        return;
-    }
-
-    errors.push(format!(
-        "attribute '{}': type mismatch: expected {}, got {} (from {}.{})",
-        param_name, expected_type, ref_type_snake, ref_binding, ref_attr
-    ));
-}
-
-fn check_attribute_param_ref_existence(
-    param_name: &str,
-    path: &crate::resource::AccessPath,
-    bindings: &BindingIndex<'_>,
-    module_call_attributes: &PreExpansionModuleCallAttributes,
-    errors: &mut Vec<String>,
-) {
-    let ref_binding = path.binding();
-    let ref_attr = path.attribute();
-
-    let Some(ref_entry) = bindings.get(ref_binding) else {
-        check_pre_expansion_module_call_attribute_ref(
-            param_name,
-            path,
-            module_call_attributes,
-            errors,
-        );
-        return;
-    };
-    let ref_schema = match ref_entry.target {
-        BindingTarget::Schema(schema) => schema,
-        BindingTarget::Composition(composition) => {
-            if let Some(error) = composition_unknown_attribute_error(composition, path) {
-                errors.push(format!("attribute '{}': {}", param_name, error));
-            }
-            return;
+        RefType::UnknownAttribute(error) => {
+            errors.push(format!("attribute '{}': {}", param_name, error));
         }
-    };
-    let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
-        let error = unknown_attribute_error(path, ref_schema.attributes.keys())
-            .expect("missing schema attribute must produce an existence error");
-        errors.push(format!("attribute '{}': {}", param_name, error));
-        return;
-    };
-
-    let _ = narrow_attribute_param_ref_type(param_name, path, ref_schema, ref_attr_schema, errors);
-}
-
-fn check_pre_expansion_module_call_attribute_ref(
-    param_name: &str,
-    path: &AccessPath,
-    module_call_attributes: &PreExpansionModuleCallAttributes,
-    errors: &mut Vec<String>,
-) {
-    let Some(known_attributes) = module_call_attributes.get(path.binding()) else {
-        return;
-    };
-    if let Some(error) = unknown_attribute_error(path, known_attributes) {
-        errors.push(format!("attribute '{}': {}", param_name, error));
-    }
-}
-
-fn narrow_attribute_param_ref_type<'a>(
-    param_name: &str,
-    path: &crate::resource::AccessPath,
-    ref_schema: &'a crate::schema::ResourceSchema,
-    ref_attr_schema: &'a crate::schema::AttributeSchema,
-    errors: &mut Vec<String>,
-) -> Option<&'a AttributeType> {
-    match narrow_attribute_type(
-        &ref_attr_schema.attr_type,
-        path.segments(),
-        &ref_schema.defs,
-    ) {
-        Ok(ref_attr_type) => Some(ref_attr_type),
-        Err(NarrowError::UnknownStructField {
-            field,
-            struct_name,
-            known_fields,
-        }) => {
-            let known: Vec<&str> = known_fields.iter().map(|name| name.as_str()).collect();
-            errors.push(format!(
-                "attribute '{}': unknown field '{}' on struct '{}' in reference {}; \
-                 known fields: {}.{}",
-                param_name,
-                field,
-                struct_name,
-                path.to_dot_string(),
-                known.join(", "),
-                did_you_mean(&field, &known),
-            ));
-            None
-        }
-        Err(NarrowError::ShapeMismatch) => None,
+        RefType::Unchecked | RefType::UnknownBinding { .. } => {}
     }
 }
 
@@ -658,24 +1095,25 @@ pub fn validate_export_param_ref_types_with_bindings(
         let Some(ref value) = param.value else {
             continue;
         };
-        // Existence is independent of type knowledge. Inference and this walk
-        // share one dedup rule: if inference has already reported this exact
-        // export-param index, skip its Unknown existence walk entirely;
-        // otherwise check every binding target. Names are display text, not
-        // identity, and can collide across sibling files. The LSP supplies
-        // indices from its post-expansion inference pass, while the CLI combines
-        // its load-time and schema-retry indices.
-        if matches!(&param.type_expr, crate::parser::TypeExpr::Unknown) {
-            if reported_inference_error_indices.contains(&index) {
-                continue;
-            }
-            value.visit_resource_refs(&mut |path| {
-                check_unknown_export_ref_existence(&param.name, path, bindings, &mut errors);
-            });
+        let unknown_type = matches!(&param.type_expr, crate::parser::TypeExpr::Unknown);
+        // Inference and this walk share one dedup rule: if inference has
+        // already reported this exact export-param index, skip its Unknown
+        // existence walk entirely. Names are display text, not identity, and
+        // can collide across sibling files.
+        if unknown_type && reported_inference_error_indices.contains(&index) {
             continue;
         }
 
-        collect_ref_type_errors(&param.type_expr, value, &param.name, bindings, &mut errors);
+        let sink = (!unknown_type).then_some(RefSink::TypeExpr(&param.type_expr));
+        visit_refs_with_sink(value, sink, &mut |path, sink| {
+            check_export_ref(
+                &param.name,
+                sink.and_then(RefSink::as_type_expr),
+                path,
+                bindings,
+                &mut errors,
+            );
+        });
     }
 
     if errors.is_empty() {
@@ -685,309 +1123,40 @@ pub fn validate_export_param_ref_types_with_bindings(
     }
 }
 
-fn check_unknown_export_ref_existence(
+fn check_export_ref(
     param_name: &str,
-    path: &crate::resource::AccessPath,
+    expected_type: Option<&TypeExpr>,
+    path: ReferencePathRef<'_>,
     bindings: &BindingIndex<'_>,
     errors: &mut Vec<String>,
 ) {
-    let ref_binding = path.binding();
-    let Some(ref_entry) = bindings.get(ref_binding) else {
-        return;
-    };
-
-    match ref_entry.target {
-        BindingTarget::Schema(schema) => {
-            let ref_attr = path.attribute();
-            if !schema.attributes.contains_key(ref_attr) {
-                let known_attrs: Vec<&str> =
-                    schema.attributes.keys().map(|name| name.as_str()).collect();
-                errors.push(format!(
-                    "export '{}': unknown attribute '{}' on '{}' in reference {}.{}{}",
-                    param_name,
-                    ref_attr,
-                    ref_binding,
-                    ref_binding,
-                    ref_attr,
-                    did_you_mean(ref_attr, &known_attrs),
-                ));
-            }
-        }
-        BindingTarget::Composition(composition) => {
-            if let Some(error) = composition_unknown_attribute_error(composition, path) {
-                errors.push(format!("export '{}': {}", param_name, error));
-            }
-        }
-    }
-}
-
-/// Recursively check ResourceRef values in a value tree against their declared TypeExpr.
-fn collect_ref_type_errors(
-    type_expr: &crate::parser::TypeExpr,
-    value: &Value,
-    param_name: &str,
-    bindings: &BindingIndex<'_>,
-    errors: &mut Vec<String>,
-) {
-    use crate::parser::TypeExpr;
-
-    match (type_expr, value) {
-        (_, Value::Deferred(DeferredValue::ResourceRef { path })) => {
-            let ref_binding = path.binding();
-            let ref_attr = path.attribute();
-
-            let Some(ref_entry) = bindings.get(ref_binding) else {
+    match bindings.ref_type(path) {
+        RefType::Typed(source) => {
+            let Some(type_expr) = expected_type else {
                 return;
             };
-            let ref_schema = match ref_entry.target {
-                BindingTarget::Schema(schema) => schema,
-                BindingTarget::Composition(composition) => {
-                    if let Some(error) = composition_unknown_attribute_error(composition, path) {
-                        errors.push(format!("export '{}': {}", param_name, error));
-                    }
-                    return;
-                }
-            };
-            let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr) else {
-                let known_attrs: Vec<&str> =
-                    ref_schema.attributes.keys().map(|s| s.as_str()).collect();
-                errors.push(format!(
-                    "export '{}': unknown attribute '{}' on '{}' in reference {}.{}{}",
-                    param_name,
-                    ref_attr,
-                    ref_binding,
-                    ref_binding,
-                    ref_attr,
-                    did_you_mean(ref_attr, &known_attrs),
-                ));
+            let Some(sink) = lift_type_expr(type_expr) else {
                 return;
             };
-
-            let ref_type = match narrow_attribute_type(
-                &ref_attr_schema.attr_type,
-                path.segments(),
-                &ref_schema.defs,
-            ) {
-                Ok(ref_type) => ref_type,
-                Err(NarrowError::UnknownStructField {
-                    field,
-                    known_fields,
-                    ..
-                }) => {
-                    let known_attrs: Vec<&str> = known_fields.iter().map(|s| s.as_str()).collect();
-                    errors.push(format!(
-                        "export '{}': unknown attribute '{}' on '{}' in reference {}{}",
-                        param_name,
-                        field,
-                        ref_binding,
-                        path.to_dot_string(),
-                        did_you_mean(&field, &known_attrs),
-                    ));
-                    return;
-                }
-                Err(NarrowError::ShapeMismatch) => return,
-            };
-            if !is_type_expr_compatible_with_schema(type_expr, ref_type, &ref_schema.defs) {
-                let ref_type_name = ref_schema.type_in_schema(ref_type).resolved_type_name();
+            let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
+            if let Err(mismatch) = source.is_assignable_to_sink(sink_type) {
+                let inferred_origin = mismatch
+                    .declared_type_name()
+                    .map(|_| format!(" ({})", mismatch.origin_description(path)));
                 errors.push(format!(
-                    "export '{}': type mismatch for '{}.{}': expected {}, got {}",
-                    param_name, ref_binding, ref_attr, type_expr, ref_type_name,
+                    "export '{}': type mismatch for '{}': expected {}, got {}{}",
+                    param_name,
+                    path.to_dot_string(),
+                    type_expr,
+                    mismatch.actual_type_name(),
+                    inferred_origin.as_deref().unwrap_or_default(),
                 ));
             }
         }
-        (TypeExpr::List(inner), Value::Concrete(ConcreteValue::List(items))) => {
-            for item in items {
-                collect_ref_type_errors(inner, item, param_name, bindings, errors);
-            }
+        RefType::UnknownAttribute(error) => {
+            errors.push(format!("export '{}': {}", param_name, error));
         }
-        (TypeExpr::Map(inner), Value::Concrete(ConcreteValue::Map(map))) => {
-            for value in map.values() {
-                collect_ref_type_errors(inner, value, param_name, bindings, errors);
-            }
-        }
-        (TypeExpr::Struct { fields }, Value::Concrete(ConcreteValue::Map(map))) => {
-            for (name, field_ty) in fields {
-                if let Some(value) = map.get(name) {
-                    collect_ref_type_errors(field_ty, value, param_name, bindings, errors);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Check if a TypeExpr is compatible with an AttributeType from a schema.
-///
-/// `defs` carries the schema's named definitions, used to peel any
-/// `AttributeType::ref_(name)` receiver via [`AttributeType::shape`]
-/// before shape-based dispatch. Pass [`crate::schema::empty_defs_for_schema_walks()`]
-/// when no resource schema is in scope.
-pub fn is_type_expr_compatible_with_schema(
-    type_expr: &crate::parser::TypeExpr,
-    attr_type: &AttributeType,
-    defs: &std::collections::BTreeMap<String, AttributeType>,
-) -> bool {
-    use crate::parser::TypeExpr;
-
-    match type_expr {
-        // A bare `TypeExpr::String` must not satisfy a receiver typed as
-        // `Custom { semantic_name: Some(_) }` — the receiver names a
-        // specific identity (e.g. `VpcId`) that a generic `String`
-        // cannot prove. Descends into `Union` members so a polymorphic
-        // receiver like `Union<[String, Custom{VpcId}]>` is rejected
-        // too: every alternative the value might end up satisfying
-        // must be reachable from `String`. The symmetric *narrowing*
-        // case — a specific `: VpcId` export against a less specific
-        // receiver — is handled by the `Simple(name)` arm below: it
-        // walks the receiver's `Custom` base chain looking for a
-        // matching identity, returning `true` only when the receiver
-        // is at least as specific as (or more general than) the
-        // declared type. Issue #2358.
-        TypeExpr::String => {
-            if attr_type_demands_specific_custom(attr_type, defs) {
-                return false;
-            }
-            is_string_compatible_type(attr_type, defs)
-        }
-        TypeExpr::Bool => matches!(attr_type.shape_with_defs(defs), Shape::Bool),
-        TypeExpr::Int => matches!(attr_type.shape_with_defs(defs), Shape::Int { .. }),
-        TypeExpr::Float => matches!(attr_type.shape_with_defs(defs), Shape::Float { .. }),
-        TypeExpr::Duration => matches!(attr_type.shape_with_defs(defs), Shape::Duration),
-        TypeExpr::Simple(name) => {
-            // Two compatibility directions both succeed:
-            //
-            // 1. Receiver more specific than value. Walk the
-            //    receiver's `Custom` chain looking for a level whose
-            //    `type_name()` matches `name`. `Simple("arn")` is
-            //    accepted by `Custom { KmsKeyArn → Arn }` because
-            //    the chain contains `Arn`. Sibling Customs
-            //    (`kms_key_arn` vs `IamRoleArn`) stay rejected
-            //    because no chain level matches. Issue #1874.
-            //
-            // 2. Value more specific than receiver (subtyping into
-            //    plain string). `Simple(name)` represents a
-            //    particular kind of string; flowing it into a plain
-            //    `String` receiver erases nothing. The reverse
-            //    direction (`String` value into a Custom-with-
-            //    semantic-name receiver) stays rejected by
-            //    `attr_type_demands_specific_custom`.
-            //
-            // The walk traverses post-Ref-peel shapes so a `Ref`
-            // pointing at a `Custom` chain is followed correctly.
-            let resolved = attr_type.resolve_refs_with_defs(defs);
-            let resolved_attr = resolved.as_attr();
-            let type_snake = crate::parser::pascal_to_snake(&resolved_attr.type_name());
-            if type_snake == *name {
-                return true;
-            }
-            match resolved_attr.shape_with_defs(defs) {
-                Shape::String {
-                    identity: Some(id), ..
-                }
-                | Shape::Int {
-                    identity: Some(id), ..
-                }
-                | Shape::Float {
-                    identity: Some(id), ..
-                } if crate::parser::pascal_to_snake(&id.kind) == *name => {
-                    return true;
-                }
-                _ => {}
-            }
-            if is_plain_string_or_string_union(attr_type, defs) {
-                return true;
-            }
-            // Issue #2663: a `Simple(name)` value is unambiguously
-            // string-shaped at runtime, so it can flow into a `Union`
-            // receiver as long as one member is plain `String` and
-            // every other member is shape-disjoint from a string —
-            // i.e. `List`/`Map`/`Struct`. The runtime dispatch on
-            // shape sends the value to the String branch with no
-            // ambiguity. Mixing in another scalar member (e.g.
-            // `Union<String, Int>`) keeps falling through here, so
-            // the existing `Simple → Union<String, Int>` rejection
-            // (`type_compat_simple_rejected_by_mixed_string_int_union_receiver`)
-            // is preserved.
-            if let Shape::Union = attr_type.shape_with_defs(defs) {
-                let members = crate::schema::union_members_with_defs(attr_type, defs)
-                    .expect("Shape::Union must expose union members internally");
-                let has_plain_string = members
-                    .iter()
-                    .flatten()
-                    .any(|m| is_plain_string_or_string_union(m.as_attr(), defs));
-                let others_shape_disjoint = members.iter().all(|member| {
-                    member.is_some_and(|member| {
-                        let member = member.as_attr();
-                        is_plain_string_or_string_union(member, defs)
-                            || matches!(
-                                member.shape_with_defs(defs),
-                                Shape::List { .. } | Shape::Map { .. } | Shape::Struct { .. }
-                            )
-                    })
-                });
-                if has_plain_string && others_shape_disjoint {
-                    return true;
-                }
-            }
-            false
-        }
-        TypeExpr::List(inner) => match attr_type.shape_with_defs(defs) {
-            Shape::List {
-                element_type: schema_inner,
-                ..
-            } => is_type_expr_compatible_with_schema(inner, schema_inner, defs),
-            _ => false,
-        },
-        TypeExpr::Map(inner) => match attr_type.shape_with_defs(defs) {
-            Shape::Map {
-                value: schema_inner,
-                ..
-            } => is_type_expr_compatible_with_schema(inner, schema_inner, defs),
-            _ => false,
-        },
-        TypeExpr::Struct {
-            fields: expr_fields,
-        } => match attr_type.shape_with_defs(defs) {
-            Shape::Struct { .. } => {
-                let schema_fields = crate::schema::struct_fields_with_defs(attr_type, defs)
-                    .expect("Shape::Struct must expose struct fields internally");
-                // Bijection: every schema field must match exactly one expr
-                // field. We check schema ⇒ expr membership with equal
-                // lengths; the parser's duplicate-name rejection keeps
-                // expr_fields unique, which together forces a one-to-one
-                // correspondence.
-                if expr_fields.len() != schema_fields.len() {
-                    return false;
-                }
-                schema_fields.iter().all(|sf| {
-                    expr_fields.iter().any(|(n, t)| {
-                        n == &sf.name
-                            && is_type_expr_compatible_with_schema(t, &sf.field_type, defs)
-                    })
-                })
-            }
-            // A consumer annotated as `map(T)` may receive a `struct { a: T,
-            // b: T }` value — the shape coerces as long as every field type
-            // satisfies T.
-            Shape::Map {
-                value: schema_inner,
-                ..
-            } => expr_fields
-                .iter()
-                .all(|(_, ty)| is_type_expr_compatible_with_schema(ty, schema_inner, defs)),
-            _ => false,
-        },
-        // StringLiteral and Union remain conservatively accepted here,
-        // preserving pre-#3368 behavior. Tightening them is out of scope.
-        TypeExpr::Ref(_)
-        | TypeExpr::DottedUnresolved(_)
-        | TypeExpr::SchemaType { .. }
-        | TypeExpr::StringLiteral(_)
-        | TypeExpr::Union(_) => true,
-        // Sentinel for failed inference (#2360 stage 2). Never matches a
-        // concrete receiver — the inference_errors channel reports the
-        // underlying "type annotation required" instead.
-        TypeExpr::Unknown => false,
+        RefType::Unchecked | RefType::UnknownBinding { .. } => {}
     }
 }
 
@@ -1046,120 +1215,6 @@ fn is_string_compatible_type_on_path<'a>(
         | Shape::Float { .. }
         | Shape::Bool
         | Shape::Duration
-        | Shape::List { .. }
-        | Shape::Map { .. }
-        | Shape::Struct { .. } => false,
-    }
-}
-
-/// Returns `true` only for receivers that name no specific identity:
-/// plain `String` or a `Union` of plain Strings. The wider sibling
-/// [`is_string_compatible_type`] also accepts `Custom` and `Enum`
-/// receivers, but those carry constraints (specific identity / fixed
-/// value set) that would be erased by accepting a `Simple(name)` value.
-fn is_plain_string_or_string_union(
-    attr_type: &AttributeType,
-    defs: &std::collections::BTreeMap<String, AttributeType>,
-) -> bool {
-    is_plain_string_or_string_union_on_path(attr_type, defs, &[])
-}
-
-fn is_plain_string_or_string_union_on_path<'a>(
-    attr_type: &'a AttributeType,
-    defs: &'a std::collections::BTreeMap<String, AttributeType>,
-    visited_refs: &[&'a str],
-) -> bool {
-    let mut current_path = visited_refs.to_vec();
-    let resolved = attr_type.resolve_refs_with_defs_on_path(defs, &mut current_path);
-    let resolved_attr = resolved.as_attr();
-    match resolved_attr
-        .shape_ref_free()
-        .expect("resolve_refs_with_defs_on_path must peel every top-level Ref")
-    {
-        Shape::String {
-            identity: None,
-            pattern: None,
-            length: None,
-            ..
-        } => true,
-        Shape::String { .. } => false,
-        Shape::Union => {
-            let members = crate::schema::union_members_with_defs(resolved_attr, defs)
-                .expect("Shape::Union must expose union members internally");
-            all_resolved_union_members_on_path(
-                &members,
-                &mut current_path,
-                |member, member_path| {
-                    is_plain_string_or_string_union_on_path(member.as_attr(), defs, member_path)
-                },
-            )
-        }
-        Shape::Int { .. }
-        | Shape::Float { .. }
-        | Shape::Bool
-        | Shape::Duration
-        | Shape::Enum { .. }
-        | Shape::List { .. }
-        | Shape::Map { .. }
-        | Shape::Struct { .. } => false,
-    }
-}
-
-/// Recursive check used by the `TypeExpr::String` arm of
-/// `is_type_expr_compatible_with_schema`: returns `true` when
-/// `attr_type` carries a `Custom { identity: Some(_) }` either at
-/// the top level or anywhere inside a `Union`. A schema attribute that
-/// names a specific identity (`VpcId`, `Arn`, …) cannot accept a value
-/// known only as `String`. Issue #2358.
-///
-/// Scope:
-/// - Looks at the outer `identity` only — does **not** walk
-///   `Custom.base` chains. Real provider schemas keep `identity`
-///   on the outer wrapper, so an anonymous `Custom` wrapping a
-///   specific `Custom` does not occur in practice. If a future schema
-///   introduces that shape, this helper would need to walk the base
-///   chain too.
-/// - Only `String`-shaped specifics are guarded today. Provider
-///   schemas currently express every named-identity Custom as a
-///   `String`-base wrapper, so `TypeExpr::Int/Bool/Float` arms have
-///   no analogous strictness. If a future schema adds e.g. a
-///   `Custom { identity: "Port", base: Int }`, those arms will
-///   also need to consult this helper (or a sibling).
-fn attr_type_demands_specific_custom(
-    attr_type: &AttributeType,
-    defs: &std::collections::BTreeMap<String, AttributeType>,
-) -> bool {
-    attr_type_demands_specific_custom_on_path(attr_type, defs, &[])
-}
-
-fn attr_type_demands_specific_custom_on_path<'a>(
-    attr_type: &'a AttributeType,
-    defs: &'a std::collections::BTreeMap<String, AttributeType>,
-    visited_refs: &[&'a str],
-) -> bool {
-    let mut current_path = visited_refs.to_vec();
-    let resolved = attr_type.resolve_refs_with_defs_on_path(defs, &mut current_path);
-    let resolved_attr = resolved.as_attr();
-    match resolved_attr
-        .shape_ref_free()
-        .expect("resolve_refs_with_defs_on_path must peel every top-level Ref")
-    {
-        Shape::String {
-            identity: Some(_), ..
-        } => true,
-        Shape::String { identity: None, .. } => false,
-        Shape::Union => {
-            let members = crate::schema::union_members_with_defs(resolved_attr, defs)
-                .expect("Shape::Union must expose union members internally");
-            members.any_on_path(&mut current_path, |member, member_path| {
-                attr_type_demands_specific_custom_on_path(member.as_attr(), defs, member_path)
-            })
-        }
-        Shape::Int { .. }
-        | Shape::Float { .. }
-        | Shape::Bool
-        | Shape::Duration
-        | Shape::Enum { .. }
         | Shape::List { .. }
         | Shape::Map { .. }
         | Shape::Struct { .. } => false,
@@ -1566,17 +1621,18 @@ pub fn validate_provider_config<E>(
 
 /// Validate module call arguments against module argument types.
 ///
-/// `imported_modules` maps module alias to its argument parameter definitions.
+/// `imported_modules` maps each module alias to its resolved boundary signature.
 /// `config` provides custom type validators from providers.
 pub fn validate_module_calls(
     module_calls: &[ModuleCall],
-    imported_modules: &HashMap<String, Vec<crate::parser::ArgumentParameter>>,
+    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
     config: &ProviderContext,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
 
     for call in module_calls {
-        if let Some(module_args) = imported_modules.get(&call.module_name) {
+        if let Some(signature) = imported_modules.get(&call.module_name) {
+            let module_args = &signature.arguments;
             for (arg_name, arg_value) in &call.arguments {
                 if let Some(arg_param) = module_args.iter().find(|a| &a.name == arg_name)
                     && let Some(error) =
@@ -1931,83 +1987,6 @@ pub(crate) fn narrow_type_expr(
         };
     }
     Some(current)
-}
-
-/// Narrow `start` (a schema [`AttributeType`]) through an
-/// [`AccessPath`](crate::resource::AccessPath)'s ordered segments — a
-/// free mix of `.field` (descend into a `Struct`) and `[idx]` (peel one
-/// `List<T>` / `Map<_, V>` layer) continuations (carina#3025).
-///
-/// Borrows so deep paths don't pay an O(depth) clone chain. The error
-/// variant ([`NarrowError`]) distinguishes a real field typo
-/// (actionable, suggest a sibling) from a structural shape mismatch
-/// (caller decides whether resolver-time location context is enough).
-pub(crate) fn narrow_attribute_type<'a>(
-    start: &'a AttributeType,
-    segments: &[crate::resource::PathSegment],
-    defs: &'a std::collections::BTreeMap<String, AttributeType>,
-) -> Result<&'a AttributeType, NarrowError> {
-    use crate::resource::{PathSegment, Subscript};
-    use crate::schema::Shape;
-    let mut current = start;
-    for seg in segments {
-        // Project onto `Shape` so any `Ref` chain is peeled at the
-        // type level (carina#3349). Without this, a `Ref`-typed
-        // attribute would fall into the wildcard arm below and
-        // every nested narrowing step would mis-report a shape
-        // mismatch.
-        let shape = current.shape_with_defs(defs);
-        current = match (seg, shape) {
-            (PathSegment::Field { name }, Shape::Struct { name: sn }) => {
-                let fields = crate::schema::struct_fields_with_defs(current, defs)
-                    .expect("Shape::Struct must expose struct fields internally");
-                let Some(field) = fields.iter().find(|f| f.name == *name) else {
-                    return Err(NarrowError::UnknownStructField {
-                        field: name.clone(),
-                        struct_name: sn.to_string(),
-                        known_fields: fields.iter().map(|f| f.name.clone()).collect(),
-                    });
-                };
-                &field.field_type
-            }
-            // Dot-form key access against a `map(_, V)` projects to
-            // `V`, mirroring the resolver's behaviour (carina#2447).
-            (PathSegment::Field { .. }, Shape::Map { value, .. }) => value,
-            (
-                PathSegment::Subscript {
-                    index: Subscript::Int { .. },
-                },
-                Shape::List {
-                    element_type: inner,
-                    ..
-                },
-            ) => inner,
-            (
-                PathSegment::Subscript {
-                    index: Subscript::Str { .. },
-                },
-                Shape::Map { value, .. },
-            ) => value,
-            _ => return Err(NarrowError::ShapeMismatch),
-        };
-    }
-    Ok(current)
-}
-
-/// Reason [`narrow_attribute_type`] rejected a path.
-#[derive(Debug)]
-pub(crate) enum NarrowError {
-    /// A `.field` segment named a field that doesn't exist on the
-    /// current `Struct`. Carries the struct's declared name and the
-    /// names of its fields so the caller can render a suggestion.
-    UnknownStructField {
-        field: String,
-        struct_name: String,
-        known_fields: Vec<String>,
-    },
-    /// A segment didn't fit the container at its position
-    /// (e.g. `.x` against a scalar, `[0]` against a struct).
-    ShapeMismatch,
 }
 
 pub mod inference;

@@ -1,10 +1,10 @@
 //! End-to-end validation regressions for carina#3710.
 //!
-//! Module output (`attributes {}`) references are validated before module
-//! expansion, while each module still has its own binding namespace. These
-//! fixtures are deliberately directory-scoped and split declarations across
-//! sibling `.crn` files so the test exercises the same loader boundary as a
-//! real configuration.
+//! Module output (`attributes {}`) references are validated on expanded
+//! compositions, with a source-local fallback when expansion itself fails.
+//! These fixtures are deliberately directory-scoped and split declarations
+//! across sibling `.crn` files so the test exercises the same loader boundary
+//! as a real configuration.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -231,8 +231,10 @@ fn unannotated_module_attribute_rejects_unknown_resource_attribute() {
 
     assert_unknown_arn(&diags);
     assert!(
-        diags.iter().any(|diag| diag.contains("../module")),
-        "diagnostic should identify the imported module: {diags:#?}",
+        diags
+            .iter()
+            .any(|diag| diag.contains("instance.target_group.arn")),
+        "diagnostic should identify the expanded module resource: {diags:#?}",
     );
 }
 
@@ -346,8 +348,10 @@ let outer_instance = outer_module { }
 
     assert_unknown_arn(&diags);
     assert!(
-        diags.iter().any(|diag| diag.contains("../outer/../inner")),
-        "nested diagnostic should identify the full import path: {diags:#?}",
+        diags
+            .iter()
+            .any(|diag| { diag.contains("outer_instance.inner_instance.target_group.arn") }),
+        "nested diagnostic should identify the fully expanded resource path: {diags:#?}",
     );
 }
 

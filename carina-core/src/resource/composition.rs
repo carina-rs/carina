@@ -16,9 +16,12 @@
 //! `module_name` + `instance` — those are always set for compositions.
 
 use std::collections::{BTreeSet, HashSet};
+use std::path::PathBuf;
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+
+use crate::parser::TypeExpr;
 
 use super::{AccessPath, DeferredValue, ResourceId, Value};
 
@@ -50,7 +53,7 @@ use super::{AccessPath, DeferredValue, ResourceId, Value};
 /// `Forwarded(NodeId, AttrPath)` once a name → `NodeId` index is
 /// available at expansion time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum CompositionAttribute {
+enum CompositionAttributeValue {
     /// Single-hop alias to another node's attribute, by path.
     Forwarded(AccessPath),
     /// Multi-source expression: a literal, interpolation, function
@@ -59,22 +62,78 @@ pub enum CompositionAttribute {
     Derived(Value),
 }
 
+/// One module output together with its declared boundary type.
+///
+/// Keeping the optional annotation in the same entry as the classified value
+/// makes it impossible for expansion or later value rewrites to create an
+/// output without deciding what happens to its declaration. The annotation is
+/// validation-only and is skipped during serialization so the saved-plan wire
+/// representation remains byte-shape compatible with the pre-#3798 enum.
+/// Compositions are never persisted in state files; saved-plan execution has
+/// already passed validation and therefore does not need this metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CompositionAttribute {
+    value: CompositionAttributeValue,
+    #[serde(skip)]
+    declared_type: Option<TypeExpr>,
+    /// The module argument directly forwarded by this output before call-site
+    /// substitution. Validation checks that declaration in the module's own
+    /// scope; retaining the provenance prevents an expanded caller value from
+    /// being checked again and blamed on the output declaration.
+    #[serde(skip)]
+    source_argument: Option<String>,
+}
+
 impl CompositionAttribute {
     /// Classify a `Value` into the appropriate
     /// [`CompositionAttribute`] variant.
     ///
     /// `Value::Deferred(DeferredValue::ResourceRef { path })` is a
-    /// single-hop alias and lifts into [`Forwarded`](Self::Forwarded).
+    /// single-hop alias and is classified as forwarded.
     /// Every other `Value` shape is multi-source (literal,
     /// interpolation, function call, etc.) and lifts into
-    /// [`Derived`](Self::Derived).
-    pub fn from_value(value: Value) -> Self {
-        match value {
+    /// classified as derived.
+    pub fn from_value(value: Value, declared_type: Option<TypeExpr>) -> Self {
+        let value = match value {
             Value::Deferred(DeferredValue::ResourceRef { path }) => {
-                CompositionAttribute::Forwarded(path)
+                CompositionAttributeValue::Forwarded(path)
             }
-            other => CompositionAttribute::Derived(other),
+            other => CompositionAttributeValue::Derived(other),
+        };
+        Self {
+            value,
+            declared_type,
+            source_argument: None,
         }
+    }
+
+    /// The module-boundary annotation carried from `attributes {}`.
+    pub fn declared_type(&self) -> Option<&TypeExpr> {
+        self.declared_type.as_ref()
+    }
+
+    /// The forwarded path when this output is a single-hop alias.
+    pub fn forwarded_path(&self) -> Option<&AccessPath> {
+        match &self.value {
+            CompositionAttributeValue::Forwarded(path) => Some(path),
+            CompositionAttributeValue::Derived(_) => None,
+        }
+    }
+
+    pub fn source_argument(&self) -> Option<&str> {
+        self.source_argument.as_deref()
+    }
+
+    pub(crate) fn with_source_argument(mut self, source_argument: Option<String>) -> Self {
+        self.source_argument = source_argument;
+        self
+    }
+
+    /// Reclassify a rewritten value while preserving its declaration.
+    pub fn with_value(&self, value: Value) -> Self {
+        Self::from_value(value, self.declared_type.clone())
+            .with_source_argument(self.source_argument.clone())
     }
 
     /// Reify back into a [`Value`] for callers that have not yet been
@@ -86,18 +145,53 @@ impl CompositionAttribute {
     /// commit. Each subsequent migration replaces a `.to_value()` site
     /// with a direct match on `CompositionAttribute`.
     pub fn to_value(&self) -> Value {
-        match self {
-            CompositionAttribute::Forwarded(path) => {
+        match &self.value {
+            CompositionAttributeValue::Forwarded(path) => {
                 Value::Deferred(DeferredValue::ResourceRef { path: path.clone() })
             }
-            CompositionAttribute::Derived(v) => v.clone(),
+            CompositionAttributeValue::Derived(v) => v.clone(),
         }
     }
 }
 
-impl From<Value> for CompositionAttribute {
-    fn from(v: Value) -> Self {
-        Self::from_value(v)
+/// One resolved module-call argument together with its declared boundary type.
+///
+/// The declaration is validation-only and deliberately travels with every
+/// value rewrite. Keeping both fields private means callers cannot insert a
+/// raw [`Value`] into [`Signature::arguments`]; every live construction site
+/// must supply the declared type. The optional storage only keeps saved-plan
+/// deserialization backward-compatible: skipped validation metadata
+/// deserializes as `None`, while [`Self::from_value`] always stores `Some`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CompositionArgument {
+    value: Value,
+    #[serde(skip)]
+    declared_type: Option<TypeExpr>,
+}
+
+impl CompositionArgument {
+    pub fn from_value(value: Value, declared_type: TypeExpr) -> Self {
+        Self {
+            value,
+            declared_type: Some(declared_type),
+        }
+    }
+
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
+
+    pub fn declared_type(&self) -> Option<&TypeExpr> {
+        self.declared_type.as_ref()
+    }
+
+    /// Rewrite a prefixed/substituted value without dropping its declaration.
+    pub fn with_value(&self, value: Value) -> Self {
+        Self {
+            value,
+            declared_type: self.declared_type.clone(),
+        }
     }
 }
 
@@ -129,15 +223,118 @@ pub struct Signature {
     /// produced by a module that does not declare any `argument`
     /// parameters, or when the call site passed no arguments.
     #[serde(default)]
-    pub arguments: IndexMap<String, Value>,
+    pub arguments: IndexMap<String, CompositionArgument>,
     /// Module-output values classified by how they are produced
-    /// (#3294): [`Forwarded`](CompositionAttribute::Forwarded) for
-    /// single-hop aliases, [`Derived`](CompositionAttribute::Derived)
-    /// for multi-source expressions. The resolver dispatches on the
-    /// variant at post-apply time.
+    /// (#3294): forwarded values are single-hop aliases and derived values are
+    /// multi-source expressions. Each entry also carries its optional declared
+    /// [`TypeExpr`] for validation.
     #[serde(default)]
     pub attributes: IndexMap<String, CompositionAttribute>,
 }
+
+/// Structural identity for one module call that produced a composition.
+///
+/// `instance` is retained for unambiguous internal identity, while
+/// `binding` and `module_name` are the authored names used by diagnostics.
+/// The optional source is the path from the corresponding `use` statement.
+/// This metadata is validation-only and is never persisted in saved plans.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CompositionCall {
+    pub module_name: String,
+    pub binding: Option<String>,
+    pub instance: String,
+    pub module_source: Option<String>,
+    pub module_directory: Option<PathBuf>,
+}
+
+impl CompositionCall {
+    /// User-facing call label. Anonymous calls deliberately hide their
+    /// content-derived synthetic instance identifier.
+    pub fn display_label(&self) -> String {
+        self.binding
+            .clone()
+            .unwrap_or_else(|| format!("{} (anonymous call)", self.module_name))
+    }
+}
+
+/// Diagnostic lineage recorded while nested module calls are expanded.
+///
+/// `call` identifies the immediate boundary represented by the composition;
+/// `root_call` identifies the root-level call whose expansion transitively
+/// produced it. LSP diagnostics use this relationship to select their owning
+/// document without parsing dot-separated instance strings.
+///
+/// This is diagnostic-only metadata, not part of a composition's identity.
+/// Live expansion can only construct the `Expanded` state through
+/// [`Self::expanded`], which requires both ends of the ancestry together.
+/// Serialization skips the whole value, so a saved-plan reload enters the
+/// explicitly named `Deserialized` state instead of a partially populated
+/// pair of `Option`s.
+#[derive(Debug, Clone)]
+pub struct CompositionProvenance {
+    state: CompositionProvenanceState,
+}
+
+#[derive(Debug, Clone)]
+enum CompositionProvenanceState {
+    Expanded(Box<ExpandedCompositionProvenance>),
+    Deserialized,
+}
+
+#[derive(Debug, Clone)]
+struct ExpandedCompositionProvenance {
+    call: CompositionCall,
+    root_call: CompositionCall,
+}
+
+impl CompositionProvenance {
+    pub fn expanded(call: CompositionCall, root_call: CompositionCall) -> Self {
+        Self {
+            state: CompositionProvenanceState::Expanded(Box::new(ExpandedCompositionProvenance {
+                call,
+                root_call,
+            })),
+        }
+    }
+
+    pub fn deserialized() -> Self {
+        Self {
+            state: CompositionProvenanceState::Deserialized,
+        }
+    }
+
+    fn calls(&self) -> Option<(&CompositionCall, &CompositionCall)> {
+        match &self.state {
+            CompositionProvenanceState::Expanded(expanded) => {
+                Some((&expanded.call, &expanded.root_call))
+            }
+            CompositionProvenanceState::Deserialized => None,
+        }
+    }
+
+    pub(crate) fn calls_mut(&mut self) -> Option<(&mut CompositionCall, &mut CompositionCall)> {
+        match &mut self.state {
+            CompositionProvenanceState::Expanded(expanded) => {
+                Some((&mut expanded.call, &mut expanded.root_call))
+            }
+            CompositionProvenanceState::Deserialized => None,
+        }
+    }
+}
+
+impl Default for CompositionProvenance {
+    fn default() -> Self {
+        Self::deserialized()
+    }
+}
+
+impl PartialEq for CompositionProvenance {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for CompositionProvenance {}
 
 /// A composition resource created by module-call expansion.
 ///
@@ -207,6 +404,9 @@ pub struct Composition {
     pub module_name: String,
     /// Module instance binding name (e.g. "web").
     pub instance: String,
+    /// Diagnostic-only call ancestry; see [`CompositionProvenance`].
+    #[serde(skip)]
+    pub provenance: Box<CompositionProvenance>,
     /// Parser-level: attributes whose value was written as a quoted
     /// string literal. Parse-time only; `#[serde(skip)]` keeps it out
     /// of state — mirrors [`Resource::quoted_string_attrs`](super::Resource).
@@ -224,6 +424,16 @@ impl Composition {
     pub fn ephemeral_id(&self) -> super::EphemeralId {
         super::EphemeralId::new(self.id.clone())
     }
+
+    /// Immediate call identity when this composition came from live expansion.
+    pub fn diagnostic_call(&self) -> Option<&CompositionCall> {
+        self.provenance.calls().map(|(call, _)| call)
+    }
+
+    /// Root-level ancestor call when this composition came from live expansion.
+    pub fn diagnostic_root_call(&self) -> Option<&CompositionCall> {
+        self.provenance.calls().map(|(_, root_call)| root_call)
+    }
 }
 
 #[cfg(test)]
@@ -232,24 +442,61 @@ mod tests {
     use crate::resource::ConcreteValue;
 
     #[test]
+    fn equality_ignores_provenance_but_compares_composition_fields() {
+        let provenance = |binding: &str| {
+            let call = CompositionCall {
+                module_name: "module".to_string(),
+                binding: Some(binding.to_string()),
+                instance: binding.to_string(),
+                module_source: Some(format!("../{binding}")),
+                module_directory: None,
+            };
+            Box::new(CompositionProvenance::expanded(call.clone(), call))
+        };
+        let left = Composition {
+            id: ResourceId::with_identity("_virtual", "call"),
+            signature: Signature {
+                arguments: IndexMap::new(),
+                attributes: IndexMap::new(),
+            },
+            binding: Some("call".to_string()),
+            dependency_bindings: BTreeSet::new(),
+            module_name: "module".to_string(),
+            instance: "call".to_string(),
+            provenance: provenance("first"),
+            quoted_string_attrs: HashSet::new(),
+        };
+        let mut right = left.clone();
+        right.provenance = provenance("second");
+
+        assert_eq!(left, right);
+        assert!(left.diagnostic_call().is_some());
+
+        let decoded: Composition = serde_json::from_value(
+            serde_json::to_value(&left).expect("serialize composition with provenance"),
+        )
+        .expect("deserialize composition without provenance");
+        assert!(decoded.diagnostic_call().is_none());
+        assert!(decoded.diagnostic_root_call().is_none());
+
+        right.binding = Some("different".to_string());
+        assert_ne!(left, right);
+    }
+
+    #[test]
     fn from_value_resource_ref_classifies_as_forwarded() {
         let path = AccessPath::new("role", "arn");
         let v = Value::Deferred(DeferredValue::ResourceRef { path: path.clone() });
-        let attr = CompositionAttribute::from_value(v);
-        match attr {
-            CompositionAttribute::Forwarded(p) => assert_eq!(p, path),
-            CompositionAttribute::Derived(_) => panic!("ResourceRef must lift to Forwarded"),
-        }
+        let attr = CompositionAttribute::from_value(v, None);
+        assert_eq!(attr.forwarded_path(), Some(&path));
     }
 
     #[test]
     fn from_value_concrete_string_classifies_as_derived() {
         let v = Value::Concrete(ConcreteValue::String("literal".to_string()));
-        let attr = CompositionAttribute::from_value(v.clone());
-        match attr {
-            CompositionAttribute::Derived(d) => assert_eq!(d, v),
-            CompositionAttribute::Forwarded(_) => panic!("literal must lift to Derived"),
-        }
+        let attr = CompositionAttribute::from_value(v.clone(), None);
+        assert_eq!(attr.forwarded_path(), None);
+        assert_eq!(attr.to_value(), v);
     }
 
     #[test]
@@ -261,19 +508,18 @@ mod tests {
                 path: AccessPath::new("svc", "id"),
             })),
         ]));
-        let attr = CompositionAttribute::from_value(v.clone());
-        match attr {
-            CompositionAttribute::Derived(d) => assert_eq!(d, v),
-            CompositionAttribute::Forwarded(_) => {
-                panic!("multi-source interpolation must lift to Derived")
-            }
-        }
+        let attr = CompositionAttribute::from_value(v.clone(), None);
+        assert_eq!(attr.forwarded_path(), None);
+        assert_eq!(attr.to_value(), v);
     }
 
     #[test]
     fn forwarded_to_value_is_resource_ref() {
         let path = AccessPath::new("svc", "endpoint");
-        let attr = CompositionAttribute::Forwarded(path.clone());
+        let attr = CompositionAttribute::from_value(
+            Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
+            None,
+        );
         let v = attr.to_value();
         assert_eq!(
             v,
@@ -284,7 +530,7 @@ mod tests {
     #[test]
     fn derived_to_value_returns_inner() {
         let inner = Value::Concrete(ConcreteValue::String("kept".to_string()));
-        let attr = CompositionAttribute::Derived(inner.clone());
+        let attr = CompositionAttribute::from_value(inner.clone(), None);
         assert_eq!(attr.to_value(), inner);
     }
 
@@ -302,8 +548,80 @@ mod tests {
             Value::Concrete(ConcreteValue::Int(42)),
         ];
         for original in cases {
-            let lifted = CompositionAttribute::from_value(original.clone());
+            let lifted = CompositionAttribute::from_value(original.clone(), None);
             assert_eq!(lifted.to_value(), original);
         }
+    }
+
+    #[test]
+    fn declared_type_is_carried_with_value_rewrites() {
+        let declared = TypeExpr::String;
+        let attr = CompositionAttribute::from_value(
+            Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new("svc", "endpoint"),
+            }),
+            Some(declared.clone()),
+        );
+
+        let rewritten = attr.with_value(Value::Concrete(ConcreteValue::String("x".to_string())));
+
+        assert_eq!(rewritten.declared_type(), Some(&declared));
+    }
+
+    #[test]
+    fn declared_type_is_validation_only_in_serde_round_trip() {
+        let value = Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("svc", "endpoint"),
+        });
+        let typed = CompositionAttribute::from_value(value.clone(), Some(TypeExpr::String));
+        let untyped = CompositionAttribute::from_value(value.clone(), None);
+
+        let typed_json = serde_json::to_value(&typed).expect("serialize typed attribute");
+        let untyped_json = serde_json::to_value(&untyped).expect("serialize untyped attribute");
+        assert_eq!(
+            typed_json, untyped_json,
+            "declared type must not alter the saved-plan wire shape"
+        );
+
+        let decoded: CompositionAttribute =
+            serde_json::from_value(typed_json).expect("deserialize legacy-compatible attribute");
+        assert_eq!(decoded.to_value(), value);
+        assert_eq!(decoded.declared_type(), None);
+    }
+
+    #[test]
+    fn argument_declared_type_is_carried_with_value_rewrites() {
+        let declared = TypeExpr::SchemaType {
+            provider: "aws".to_string(),
+            path: "ec2.Vpc".to_string(),
+            type_name: "Id".to_string(),
+        };
+        let argument = CompositionArgument::from_value(
+            Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new("vpc", "vpc_id"),
+            }),
+            declared.clone(),
+        );
+
+        let rewritten = argument.with_value(Value::Concrete(ConcreteValue::String("x".into())));
+
+        assert_eq!(rewritten.declared_type(), Some(&declared));
+    }
+
+    #[test]
+    fn argument_declared_type_is_validation_only_in_serde_round_trip() {
+        let value = Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("vpc", "vpc_id"),
+        });
+        let typed = CompositionArgument::from_value(value.clone(), TypeExpr::String);
+
+        let typed_json = serde_json::to_value(&typed).expect("serialize typed argument");
+        let value_json = serde_json::to_value(&value).expect("serialize argument value");
+        assert_eq!(typed_json, value_json);
+
+        let decoded: CompositionArgument =
+            serde_json::from_value(typed_json).expect("deserialize composition argument");
+        assert_eq!(decoded.value(), &value);
+        assert_eq!(decoded.declared_type(), None);
     }
 }

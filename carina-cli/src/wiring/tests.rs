@@ -3019,21 +3019,20 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
 fn module_and_provider_wrappers_return_vec_app_error() {
     let ctx = WiringContext::new(vec![]);
     let parsed = ParsedFile::default();
-    let base_dir = std::path::Path::new("/tmp/nonexistent-carina-pr3-test");
     let provider_ctx = carina_core::parser::ProviderContext::default();
 
     let errors = validate_provider_region_with_ctx(&ctx, &parsed);
     assert!(errors.is_empty(), "provider_region: got {errors:?}");
 
-    let errors = validate_module_calls(&parsed, base_dir, &provider_ctx);
+    let errors = validate_module_calls_with_imported(
+        &parsed,
+        &carina_core::module_resolver::ResolvedModuleSignatures::new(),
+        &provider_ctx,
+    );
     assert!(errors.is_empty(), "module_calls: got {errors:?}");
 
-    let module_walk = crate::module_walk::ModuleWalk::load(&parsed, base_dir);
-    let errors = validate_module_attribute_param_types(&ctx, &module_walk);
-    assert!(
-        errors.is_empty(),
-        "module_attribute_param_types: got {errors:?}",
-    );
+    let errors = validate_composition_ref_types_with_ctx(&ctx, &parsed);
+    assert!(errors.is_empty(), "composition_ref_types: got {errors:?}");
 }
 
 // =====================================================================

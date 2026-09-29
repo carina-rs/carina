@@ -10,8 +10,8 @@ use crate::parser::{
     ArgumentParameter, BindingName, DeferredForExpression, ModuleCall, ParsedFile, WaitBinding,
 };
 use crate::resource::{
-    Composition, ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, ResourceIdentity,
-    Value,
+    Composition, CompositionCall, CompositionProvenance, ConcreteValue, DataSource, DeferredValue,
+    Resource, ResourceId, ResourceIdentity, Value,
 };
 
 use super::error::ModuleError;
@@ -22,9 +22,10 @@ use super::validation::{evaluate_require_expr, evaluate_validate_expr, format_va
 impl ModuleResolver<'_> {
     /// Expand a module call into resources.
     ///
-    /// If the module defines `attributes` and the call has a `binding_name`,
-    /// a [`Composition`] is created to expose the module's attribute
-    /// values. Virtual resources are skipped by the differ.
+    /// Every module call creates a [`Composition`]. Bound calls expose module
+    /// outputs through it; all calls retain their typed argument boundary for
+    /// one post-expansion validation pass. Virtual resources are skipped by
+    /// the differ.
     ///
     /// `enclosing_args` is the argument signature of the module the call
     /// lives inside (`None` for a top-level call). When this call is being
@@ -227,6 +228,10 @@ impl ModuleResolver<'_> {
                     .iter()
                     .filter_map(|c| c.binding_name.clone()),
             )
+            // Nested compositions may already carry a multi-segment binding
+            // (`middle.inner`). When this module is itself expanded, refs to
+            // that exact binding must gain the new outer prefix as well.
+            .chain(module.compositions.iter().filter_map(|c| c.binding.clone()))
             .collect();
 
         // Expand managed resources with substituted values.
@@ -253,6 +258,24 @@ impl ModuleResolver<'_> {
             ));
         }
 
+        let module_source = self.module_paths.get(&call.module_name).cloned();
+        let module_directory = module_source.as_deref().map(|source| {
+            let source = std::path::Path::new(source);
+            let path = if source.is_absolute() {
+                source.to_path_buf()
+            } else {
+                self.base_dir.join(source)
+            };
+            path.canonicalize().unwrap_or(path)
+        });
+        let expanded_call = CompositionCall {
+            module_name: call.module_name.clone(),
+            binding: call.binding_name.clone(),
+            instance: instance_prefix.to_string(),
+            module_source: module_source.clone(),
+            module_directory,
+        };
+
         // Propagate the module's own composition resources (synthesized by
         // nested module-call expansion), instance-prefixed.
         let mut compositions: Vec<Composition> = Vec::new();
@@ -262,12 +285,13 @@ impl ModuleResolver<'_> {
                 instance_prefix,
                 &intra_module_bindings,
                 &argument_values,
+                &expanded_call,
             ));
         }
 
-        // Create a composition resource if the module has attributes and the call has a binding
-        if !module.attribute_params.is_empty()
-            && let Some(binding_name) = &call.binding_name
+        // Every call becomes a composition, including calls with no outputs
+        // and anonymous calls. Besides exposing outputs for bound calls, the
+        // node is the post-expansion record of the call boundary itself.
         {
             let mut composition_attrs: IndexMap<String, crate::resource::CompositionAttribute> =
                 IndexMap::new();
@@ -278,6 +302,28 @@ impl ModuleResolver<'_> {
             // `CompositionAttribute::from_value` (#3294).
             for attr_param in &module.attribute_params {
                 if let Some(value) = &attr_param.value {
+                    let source_argument = match value {
+                        Value::Deferred(DeferredValue::BindingRef { binding })
+                            if argument_values.contains_key(binding) =>
+                        {
+                            Some(binding.clone())
+                        }
+                        Value::Deferred(DeferredValue::ResourceRef { path })
+                            if argument_values.contains_key(path.binding()) =>
+                        {
+                            Some(path.binding().to_string())
+                        }
+                        _ => None,
+                    };
+                    let declared_type = attr_param.type_expr.clone().or_else(|| {
+                        source_argument.as_deref().and_then(|source_argument| {
+                            module
+                                .arguments
+                                .iter()
+                                .find(|argument| argument.name == source_argument)
+                                .map(|argument| argument.type_expr.clone())
+                        })
+                    });
                     // Rewrite intra-module refs and substitute arguments
                     let rewritten =
                         rewrite_intra_module_refs(value, instance_prefix, &intra_module_bindings);
@@ -287,7 +333,11 @@ impl ModuleResolver<'_> {
                     substituted.canonicalize_in_place();
                     composition_attrs.insert(
                         attr_param.name.clone(),
-                        crate::resource::CompositionAttribute::from_value(substituted),
+                        crate::resource::CompositionAttribute::from_value(
+                            substituted,
+                            declared_type,
+                        )
+                        .with_source_argument(source_argument),
                     );
                 }
             }
@@ -297,23 +347,34 @@ impl ModuleResolver<'_> {
             // is a HashMap (look-up keyed); we record them on the
             // composition in `module.arguments` declaration order so
             // the trace is stable across runs.
-            let mut signature_arguments: IndexMap<String, Value> = IndexMap::new();
+            let mut signature_arguments: IndexMap<String, crate::resource::CompositionArgument> =
+                IndexMap::new();
             for arg in &module.arguments {
                 if let Some(value) = argument_values.get(&arg.name) {
-                    signature_arguments.insert(arg.name.clone(), value.clone());
+                    signature_arguments.insert(
+                        arg.name.clone(),
+                        crate::resource::CompositionArgument::from_value(
+                            value.clone(),
+                            arg.type_expr.clone(),
+                        ),
+                    );
                 }
             }
 
             let composition = Composition {
-                id: ResourceId::with_identity("_virtual", binding_name),
+                id: ResourceId::with_identity("_virtual", instance_prefix),
                 signature: crate::resource::Signature {
                     arguments: signature_arguments,
                     attributes: composition_attrs,
                 },
-                binding: Some(binding_name.clone()),
+                binding: call.binding_name.clone(),
                 dependency_bindings: BTreeSet::new(),
                 module_name: call.module_name.clone(),
                 instance: instance_prefix.to_string(),
+                provenance: Box::new(CompositionProvenance::expanded(
+                    expanded_call.clone(),
+                    expanded_call.clone(),
+                )),
                 quoted_string_attrs: HashSet::new(),
             };
             compositions.push(composition);
@@ -364,8 +425,7 @@ impl ModuleResolver<'_> {
         // back to a path-less header — only relevant in test harnesses
         // that bypass `process_imports`; real expansions always have
         // a recorded path.
-        let source_path: Option<&str> =
-            self.module_paths.get(&call.module_name).map(String::as_str);
+        let source_path = module_source.as_deref();
         let expansion_trace = build_expansion_trace(
             instance_prefix,
             source_path,
@@ -713,18 +773,27 @@ fn prefix_module_data_source(
 }
 
 /// Instance-prefix one composition resource crossing a module boundary — the
-/// [`Composition`] analogue of [`prefix_module_resource`]. A
-/// `Composition` carries no `module_source` (it has the flattened
-/// `module_name` / `instance` fields, left unchanged as the synthetic
-/// node's own provenance) and no `prefixes` / `directives`, so only its
-/// assigned identity, `binding`, and attributes take the prefix treatment.
+/// [`Composition`] analogue of [`prefix_module_resource`]. The flattened
+/// identity/binding, diagnostic call provenance, arguments, and attributes all
+/// take the prefix treatment; compositions have no `prefixes` or `directives`.
 fn prefix_module_composition(
     composition: &Composition,
     instance_prefix: &str,
     intra_module_bindings: &HashSet<String>,
     argument_values: &HashMap<String, Value>,
+    root_call: &CompositionCall,
 ) -> Composition {
     let mut new_virtual = composition.clone();
+
+    let mut call = composition
+        .diagnostic_call()
+        .expect("nested compositions are produced by live expansion")
+        .clone();
+    call.instance = apply_instance_prefix(instance_prefix, &call.instance);
+    if let Some(binding) = &call.binding {
+        call.binding = Some(apply_instance_prefix(instance_prefix, binding));
+    }
+    *new_virtual.provenance = CompositionProvenance::expanded(call, root_call.clone());
 
     if let Some(identity) = &new_virtual.id.identity {
         let new_name = apply_instance_prefix(instance_prefix, identity.as_str());
@@ -734,6 +803,19 @@ fn prefix_module_composition(
     if let Some(ref binding) = new_virtual.binding {
         new_virtual.binding = Some(apply_instance_prefix(instance_prefix, binding));
     }
+
+    let mut substituted_arguments: IndexMap<String, crate::resource::CompositionArgument> =
+        IndexMap::new();
+    for (key, argument) in &new_virtual.signature.arguments {
+        let prefixed = prefix_attr_value(
+            argument.value(),
+            instance_prefix,
+            intra_module_bindings,
+            argument_values,
+        );
+        substituted_arguments.insert(key.clone(), argument.with_value(prefixed));
+    }
+    new_virtual.signature.arguments = substituted_arguments;
 
     let mut substituted_attrs: IndexMap<String, crate::resource::CompositionAttribute> =
         IndexMap::new();
@@ -747,10 +829,7 @@ fn prefix_module_composition(
         let v = attr.to_value();
         let prefixed =
             prefix_attr_value(&v, instance_prefix, intra_module_bindings, argument_values);
-        substituted_attrs.insert(
-            key.clone(),
-            crate::resource::CompositionAttribute::from_value(prefixed),
-        );
+        substituted_attrs.insert(key.clone(), attr.with_value(prefixed));
     }
     new_virtual.signature.attributes = substituted_attrs;
 
@@ -1060,13 +1139,15 @@ pub(super) fn split_instance_prefix(name: &str) -> Option<(&str, &str)> {
 /// case by Hamming-distance matching: for each current DSL instance prefix
 /// whose address is absent from state, find a state-only prefix for the same
 /// module within `SIMHASH_HAMMING_THRESHOLD` bits; if exactly one candidate
-/// qualifies, rewrite the current resources to use the state address.
+/// qualifies, rewrite the current resources and their retained compositions
+/// to use the state address.
 ///
 /// `find_state_names_by_type` returns every state resource name for a given
 /// `(provider, resource_type)` — the reconciler uses them to discover which
 /// instance prefixes already exist in state.
 pub fn reconcile_anonymous_module_instances(
     resources: &mut [Resource],
+    compositions: &mut [Composition],
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
     claims: &crate::identifier::StateBlockClaims,
 ) {
@@ -1220,8 +1301,11 @@ pub fn reconcile_anonymous_module_instances(
         }
     }
 
-    // After remapping resource names, intra-module ResourceRefs also point at
-    // bindings with the old prefix. Walk every value and rewrite those.
+    // After remapping resource names, every expanded surface that names the
+    // anonymous instance must move with it. That includes managed-resource
+    // references plus composition identities, bindings, arguments, and
+    // outputs retained for post-expansion validation and post-apply export
+    // resolution.
     for r in resources.iter_mut() {
         let mut replacements = Vec::new();
         for (key, value) in r.attributes.iter() {
@@ -1234,6 +1318,59 @@ pub fn reconcile_anonymous_module_instances(
             r.set_attr(key, new_value);
         }
     }
+
+    for composition in compositions {
+        if let Some(identity) =
+            rewrite_name_prefix(composition.id.identity_or_empty(), &prefix_remap)
+        {
+            composition.id.set_identity(ResourceIdentity::new(identity));
+        }
+        if let Some(binding) = composition.binding.as_deref()
+            && let Some(rewritten) = rewrite_name_prefix(binding, &prefix_remap)
+        {
+            composition.binding = Some(rewritten);
+        }
+        if let Some(rewritten) = rewrite_name_prefix(&composition.instance, &prefix_remap) {
+            composition.instance = rewritten;
+        }
+        if let Some((call, root_call)) = composition.provenance.calls_mut() {
+            for call in [call, root_call] {
+                if let Some(rewritten) = rewrite_name_prefix(&call.instance, &prefix_remap) {
+                    call.instance = rewritten;
+                }
+                if let Some(binding) = call.binding.as_deref()
+                    && let Some(rewritten) = rewrite_name_prefix(binding, &prefix_remap)
+                {
+                    call.binding = Some(rewritten);
+                }
+            }
+        }
+
+        for argument in composition.signature.arguments.values_mut() {
+            let rewritten = rewrite_ref_prefixes(argument.value(), &prefix_remap);
+            *argument = argument.with_value(rewritten);
+        }
+        for attribute in composition.signature.attributes.values_mut() {
+            let rewritten = rewrite_ref_prefixes(&attribute.to_value(), &prefix_remap);
+            *attribute = attribute.with_value(rewritten);
+        }
+    }
+}
+
+fn rewrite_name_prefix(
+    name: &str,
+    remap: &std::collections::HashMap<(String, SimHash), SimHash>,
+) -> Option<String> {
+    let (prefix, suffix) = name
+        .split_once('.')
+        .map_or((name, None), |(prefix, rest)| (prefix, Some(rest)));
+    let (module, simhash) = parse_synthetic_instance_prefix(prefix)?;
+    let target = remap.get(&(module.to_string(), simhash))?;
+    let new_prefix = format!("{}_{:016x}", module, target);
+    Some(match suffix {
+        Some(rest) => format!("{new_prefix}.{rest}"),
+        None => new_prefix,
+    })
 }
 
 fn rewrite_ref_prefixes(
@@ -1242,21 +1379,22 @@ fn rewrite_ref_prefixes(
 ) -> Value {
     match value {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            let binding = path.binding();
-            if let Some((prefix, rest)) = binding.split_once('.')
-                && let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix)
-                && let Some(&target) = remap.get(&(module.to_string(), simhash))
-            {
-                let new_binding = format!("{}_{:016x}.{}", module, target, rest);
+            if let Some(binding) = rewrite_name_prefix(path.binding(), remap) {
                 return Value::Deferred(DeferredValue::ResourceRef {
                     path: crate::resource::AccessPath::with_segments(
-                        new_binding,
+                        binding,
                         path.attribute().to_string(),
                         path.segments().to_vec(),
                     ),
                 });
             }
             value.clone()
+        }
+        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+            rewrite_name_prefix(binding, remap).map_or_else(
+                || value.clone(),
+                |binding| Value::Deferred(DeferredValue::BindingRef { binding }),
+            )
         }
         Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
             items
@@ -1292,6 +1430,9 @@ fn rewrite_ref_prefixes(
                     .collect(),
             })
         }
+        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
+            Box::new(rewrite_ref_prefixes(inner, remap)),
+        )),
         _ => value.clone(),
     }
 }
