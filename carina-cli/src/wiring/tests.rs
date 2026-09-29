@@ -5886,7 +5886,7 @@ mod resolved_value_constraint_gate {
     }
 
     #[tokio::test]
-    async fn satisfied_module_constraint_is_removed_from_prepared_composition() {
+    async fn satisfied_module_constraint_is_retained_for_apply_time_recheck() {
         let constraint = PendingModuleConstraint::ArgumentValidation {
             id: ModuleConstraintId::argument_validation("value", 0),
             argument: "value".to_string(),
@@ -5900,7 +5900,7 @@ mod resolved_value_constraint_gate {
             .await
             .expect("satisfied constraint must pass");
 
-        assert!(composition.signature.pending_constraints.is_empty());
+        assert_eq!(composition.signature.pending_constraints.len(), 1);
     }
 
     #[tokio::test]

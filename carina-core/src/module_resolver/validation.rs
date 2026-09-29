@@ -125,16 +125,18 @@ pub fn referenced_constraint_arguments(expr: &ValidateExpr) -> Vec<String> {
 ///
 /// Argument resolution is deliberately temporary: the authored source values
 /// stored in [`Composition::signature`] remain untouched so apply can resolve
-/// them again against newer bindings. Satisfied constraints are removed,
-/// unresolved constraints remain pending, and violations are returned with
-/// display-safe actual values.
+/// them again against newer bindings. Planning reports violations but keeps
+/// every constraint that was pending at expansion so apply can re-evaluate it
+/// against values published by upstream effects. This includes constraints
+/// satisfied by the pre-apply state: a replacement or update may publish a
+/// different value. Violations are returned with display-safe actual values.
 pub fn evaluate_pending_constraints(
     compositions: &mut [Composition],
     bindings: &ResolvedBindings,
 ) -> Vec<PendingModuleConstraintFailure> {
     let mut failures = Vec::new();
 
-    for composition in compositions {
+    for composition in compositions.iter() {
         let mut resolved_arguments = HashMap::new();
         let mut resolution_errors = HashMap::new();
         for (name, argument) in &composition.signature.arguments {
@@ -149,8 +151,7 @@ pub fn evaluate_pending_constraints(
             }
         }
 
-        let mut still_pending = Vec::new();
-        for constraint in std::mem::take(&mut composition.signature.pending_constraints) {
+        for constraint in &composition.signature.pending_constraints {
             let mut arguments = constraint.referenced_arguments().to_vec();
             arguments.sort();
             arguments.dedup();
@@ -177,8 +178,7 @@ pub fn evaluate_pending_constraints(
                 &resolved_arguments,
                 constraint.message(),
             ) {
-                Ok(ConstraintEvaluation::Satisfied) => {}
-                Ok(ConstraintEvaluation::Pending) => still_pending.push(constraint),
+                Ok(ConstraintEvaluation::Satisfied | ConstraintEvaluation::Pending) => {}
                 Ok(ConstraintEvaluation::Violated(violation)) => {
                     failures.push(PendingModuleConstraintFailure {
                         composition_id: composition.id.clone(),
@@ -201,7 +201,6 @@ pub fn evaluate_pending_constraints(
                 }
             }
         }
-        composition.signature.pending_constraints = still_pending;
     }
 
     failures
