@@ -425,14 +425,6 @@ impl ResolvedResource {
         }
     }
 
-    pub(crate) fn new_fully_resolved(
-        resource: Resource,
-        _token: crate::executor::basic::ResolvedResourceToken,
-    ) -> Result<Self, crate::value::SerializationError> {
-        assert_resource_fully_resolved(&resource)?;
-        Ok(Self::new(resource))
-    }
-
     /// Borrow the inner [`Resource`].
     pub fn as_inner(&self) -> &Resource {
         &self.0

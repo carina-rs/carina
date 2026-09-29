@@ -11,25 +11,18 @@ use crate::differ::{
 };
 use crate::effect::{BasicEffect, DeletedInstanceKey, Effect, EffectGeneration};
 use crate::executor::UnresolvedResource;
-use crate::executor::normalized::{NormalizedResource, apply_desired_normalization};
+use crate::executor::prepare_provider_ready_resource;
 use crate::parser::ProviderConfig;
 use crate::provider::{
-    CreateRequest, DeleteRequest, PartialReadDiagnostic, Provider, ProviderNormalizer, ReadRequest,
-    UpdateOutcome, UpdateRequest, build_update_patch,
+    CreateRequest, DeleteRequest, PartialReadDiagnostic, Provider, ProviderNormalizer,
+    ProviderReadyResource, ReadRequest, UpdateOutcome, UpdateRequest, build_update_patch,
 };
 use crate::resolver::resolve_ref_value;
-use crate::resource::{
-    ConcreteValue, DeferredValue, ResolvedResource, Resource, ResourceId, State, Value,
-};
+use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
 use crate::value::{SecretHashContext, SerializationContext, SerializationError};
 
 use super::wait::AppliedStates;
 use super::{ExecutionEvent, ExecutionObserver, ProgressInfo};
-
-/// Private capability token for constructing [`ResolvedResource`].
-/// Only this module can request the provider-dispatch constructor that
-/// also checks the resource for unresolved value placeholders.
-pub(crate) struct ResolvedResourceToken(());
 
 /// Result of executing a basic effect (Create, Update, or Delete).
 ///
@@ -144,22 +137,22 @@ pub(super) async fn resolve_resource(
     resource: &Resource,
     bindings: &ResolvedBindings,
     pipeline: &RenormalizePipeline<'_>,
-) -> Result<ResolvedResource, String> {
+) -> Result<ProviderReadyResource, String> {
     let mut resolved = resource.clone();
     for (key, expr) in &resource.attributes {
-        let resolved_value = unwrap_secret(resolve_ref_value(expr, bindings)?);
+        let resolved_value = resolve_ref_value(expr, bindings)?;
         assert_fully_resolved(&resolved_value, key, bindings)?;
         resolved.attributes.insert(key.clone(), resolved_value);
     }
-    let normalized = apply_desired_normalization(
+    prepare_provider_ready_resource(
         resolved,
         pipeline.provider_configs,
         pipeline.normalizer,
         pipeline.factories,
         pipeline.schemas,
     )
-    .await;
-    resolved_normalized_resource(normalized).map_err(|err| err.to_string())
+    .await
+    .map_err(|err| err.to_string())
 }
 
 fn needs_apply_resolution(value: &Value) -> bool {
@@ -192,7 +185,7 @@ async fn resolve_create_resource_with_source(
     source: &Resource,
     bindings: &ResolvedBindings,
     pipeline: &RenormalizePipeline<'_>,
-) -> Result<ResolvedResource, String> {
+) -> Result<ProviderReadyResource, String> {
     let mut resolved = target.clone();
     for (key, target_expr) in &target.attributes {
         let expr = source
@@ -200,7 +193,7 @@ async fn resolve_create_resource_with_source(
             .get(key)
             .filter(|source_expr| needs_apply_resolution(source_expr))
             .unwrap_or(target_expr);
-        let resolved_value = unwrap_secret(resolve_ref_value(expr, bindings)?);
+        let resolved_value = resolve_ref_value(expr, bindings)?;
         assert_fully_resolved(&resolved_value, key, bindings)?;
         resolved.attributes.insert(key.clone(), resolved_value);
     }
@@ -208,19 +201,19 @@ async fn resolve_create_resource_with_source(
         if target.attributes.contains_key(key) {
             continue;
         }
-        let resolved_value = unwrap_secret(resolve_ref_value(source_expr, bindings)?);
+        let resolved_value = resolve_ref_value(source_expr, bindings)?;
         assert_fully_resolved(&resolved_value, key, bindings)?;
         resolved.attributes.insert(key.clone(), resolved_value);
     }
-    let normalized = apply_desired_normalization(
+    prepare_provider_ready_resource(
         resolved,
         pipeline.provider_configs,
         pipeline.normalizer,
         pipeline.factories,
         pipeline.schemas,
     )
-    .await;
-    resolved_normalized_resource(normalized).map_err(|err| err.to_string())
+    .await
+    .map_err(|err| err.to_string())
 }
 
 /// Resolve a resource, preferring unresolved source for re-resolution.
@@ -233,35 +226,30 @@ pub(super) async fn resolve_resource_with_source(
     source: &Resource,
     bindings: &ResolvedBindings,
     pipeline: &RenormalizePipeline<'_>,
-) -> Result<ResolvedResource, String> {
+) -> Result<ProviderReadyResource, String> {
     let mut resolved = target.clone();
     for (key, expr) in &source.attributes {
-        let resolved_value = unwrap_secret(resolve_ref_value(expr, bindings)?);
+        let resolved_value = resolve_ref_value(expr, bindings)?;
         assert_fully_resolved(&resolved_value, key, bindings)?;
         resolved.attributes.insert(key.clone(), resolved_value);
     }
-    let normalized = apply_desired_normalization(
+    prepare_provider_ready_resource(
         resolved,
         pipeline.provider_configs,
         pipeline.normalizer,
         pipeline.factories,
         pipeline.schemas,
     )
-    .await;
-    resolved_normalized_resource(normalized).map_err(|err| err.to_string())
+    .await
+    .map_err(|err| err.to_string())
 }
 
 #[cfg(test)]
 pub(super) fn resolved_resource(
     resource: Resource,
-) -> Result<ResolvedResource, SerializationError> {
-    ResolvedResource::new_fully_resolved(resource, ResolvedResourceToken(()))
-}
-
-pub(super) fn resolved_normalized_resource(
-    resource: NormalizedResource,
-) -> Result<ResolvedResource, SerializationError> {
-    resource.into_resolved_resource(ResolvedResourceToken(()))
+) -> Result<crate::resource::ResolvedResource, SerializationError> {
+    crate::resource::assert_resource_fully_resolved(&resource)?;
+    Ok(crate::resource::ResolvedResource::new(resource))
 }
 
 /// The full plan-time normalization pipeline, threaded into the apply
@@ -450,23 +438,6 @@ fn pick_unresolved_binding_for_diagnostic<'a>(
             )
         })
         .or_else(|| names.first().copied())
-}
-
-/// Recursively unwrap `Value::Deferred(DeferredValue::Secret(inner))` to just the inner value.
-/// This ensures the provider never sees the Secret wrapper.
-fn unwrap_secret(value: Value) -> Value {
-    match value {
-        Value::Deferred(DeferredValue::Secret(inner)) => unwrap_secret(*inner),
-        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
-            items.into_iter().map(unwrap_secret).collect(),
-        )),
-        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
-            map.into_iter()
-                .map(|(k, v)| (k, unwrap_secret(v)))
-                .collect(),
-        )),
-        other => other,
-    }
 }
 
 /// Process a `BasicEffectResult` by updating shared execution state.

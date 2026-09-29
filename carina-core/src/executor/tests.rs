@@ -1353,6 +1353,187 @@ async fn execute_plan_returns_completed_when_not_cancelled() {
     }
 }
 
+fn provider_boundary_constraint_schemas() -> SchemaRegistry {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test").attribute(AttributeSchema::new(
+            "target",
+            AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+        )),
+    );
+    schemas
+}
+
+#[tokio::test]
+async fn invalid_resolved_create_value_never_reaches_provider() {
+    let provider = MockProvider::new();
+    let mut resource = make_resource("invalid-create", &[]);
+    resource.set_attr(
+        "target",
+        Value::Concrete(ConcreteValue::String("bad".to_string())),
+    );
+    let id = resource.id.clone();
+    let mut plan = Plan::new();
+    plan.add(create_effect(resource));
+    provider.push_create(Ok(ok_state(&id)));
+    let schemas = provider_boundary_constraint_schemas();
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 1);
+    assert!(provider.calls().is_empty());
+}
+
+#[tokio::test]
+async fn invalid_resolved_update_value_never_reaches_provider() {
+    let provider = MockProvider::new();
+    let mut resource = make_resource("invalid-update", &[]);
+    resource.set_attr(
+        "target",
+        Value::Concrete(ConcreteValue::String("bad".to_string())),
+    );
+    let id = resource.id.clone();
+    let from = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "target".to_string(),
+            Value::Concrete(ConcreteValue::String("good-before".to_string())),
+        )]),
+    )
+    .with_identifier("id-123");
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        from: Box::new(from),
+        to: resolved(resource),
+        changed_attributes: vec!["target".to_string()],
+    });
+    provider.push_update(Ok(ok_state(&id)));
+    let schemas = provider_boundary_constraint_schemas();
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 1);
+    assert!(provider.calls().is_empty());
+}
+
+#[tokio::test]
+async fn valid_checked_values_preserve_create_payload_and_update_patch() {
+    let provider = MockProvider::new();
+    let mut created = make_resource("valid-create", &[]);
+    let create_value = Value::Concrete(ConcreteValue::String("good-create".to_string()));
+    created.set_attr("target", create_value.clone());
+    let create_id = created.id.clone();
+
+    let mut updated = make_resource("valid-update", &[]);
+    let update_value = Value::Concrete(ConcreteValue::String("good-update".to_string()));
+    updated.set_attr("target", update_value.clone());
+    let update_id = updated.id.clone();
+    let from = State::existing(
+        update_id.clone(),
+        HashMap::from([(
+            "target".to_string(),
+            Value::Concrete(ConcreteValue::String("good-before".to_string())),
+        )]),
+    )
+    .with_identifier("id-123");
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(created));
+    plan.add(Effect::Update {
+        from: Box::new(from),
+        to: resolved(updated),
+        changed_attributes: vec!["target".to_string()],
+    });
+    provider.push_create(Ok(ok_state(&create_id)));
+    provider.push_update(Ok(ok_state(&update_id)));
+    let schemas = provider_boundary_constraint_schemas();
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert_eq!(result.success_count, 2);
+    assert_eq!(result.failure_count, 0);
+    assert_eq!(
+        provider.captured_create_resources()[0].get_attr("target"),
+        Some(&create_value)
+    );
+    let requests = provider.captured_update_requests();
+    let target = requests[0]
+        .patch
+        .ops
+        .iter()
+        .find(|op| op.key == "target")
+        .expect("valid target must remain in the update patch");
+    assert_eq!(target.value.as_ref(), Some(&update_value));
+}
+
 #[tokio::test]
 async fn execute_plan_with_pre_cancelled_token_returns_cancelled_at_t4_or_later() {
     let provider = MockProvider::new();

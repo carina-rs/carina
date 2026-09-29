@@ -17,11 +17,16 @@ pub mod normalized;
 #[cfg(test)]
 mod normalized_tests;
 mod parallel;
+pub mod provider_ready;
 mod replace;
 pub(super) mod scheduler;
 pub(crate) mod wait;
 
 pub use crate::effect::deps::UnresolvedResource;
+pub use provider_ready::{
+    ProviderPreparationError, prepare_create_request, prepare_provider_ready_resource,
+    prepare_update_request,
+};
 pub use replace::compute_full_diff_patch;
 
 use std::collections::{HashMap, HashSet};
@@ -33,10 +38,9 @@ use crate::effect::{DeletedInstanceKey, Effect};
 use crate::parser::ProviderConfig;
 use crate::provider::{PartialReadDiagnostic, Provider, ProviderError, ProviderNormalizer};
 use crate::resource::{
-    AccessPath, ConcreteValue, DataSource, DeferredValue, InterpolationPart, ResolvedResource,
-    Resource, ResourceId, State, UnknownReason, Value,
+    AccessPath, ConcreteValue, DataSource, DeferredValue, InterpolationPart, Resource, ResourceId,
+    State, UnknownReason, Value,
 };
-use crate::value::SerializationError;
 use crate::wait::WaitObservation;
 
 use crate::shutdown::ShutdownToken;
@@ -365,14 +369,6 @@ pub async fn execute_plan(
     } else {
         ExecutionOutcome::Completed(result)
     }
-}
-
-/// Prove an already-normalized desired resource is fully resolved before
-/// direct provider dispatch outside the normal plan executor.
-pub fn resolve_normalized_for_provider(
-    resource: normalized::NormalizedResource,
-) -> Result<ResolvedResource, SerializationError> {
-    basic::resolved_normalized_resource(resource)
 }
 
 #[cfg(test)]

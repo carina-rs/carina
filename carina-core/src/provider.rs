@@ -12,12 +12,13 @@ use std::pin::Pin;
 
 use crate::effect::PlanOp;
 use crate::resource::{
-    ConcreteValue, DataSource, Directives, PartialReadMarker, ResolvedResource, Resource,
-    ResourceId, State, Value,
+    ConcreteValue, DataSource, Directives, PartialReadMarker, Resource, ResourceId, State, Value,
 };
 use crate::schema::{SchemaRegistry, TypeIdentity};
 use crate::wait::BindingPattern;
 use crate::wait::predicate::AttrPath;
+
+pub use crate::executor::provider_ready::{ProviderReady, ProviderReadyResource};
 
 /// Contextual metadata attached to every [`ProviderError`] variant.
 ///
@@ -360,7 +361,7 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 #[derive(Debug, Clone)]
 pub struct CreateRequest {
     /// Full desired state for the new resource.
-    pub resource: ResolvedResource,
+    pub resource: ProviderReadyResource,
 }
 
 /// Per-operation request record for [`Provider::read`].
@@ -409,9 +410,56 @@ pub struct DeleteRequest {
 ///
 /// Providers MUST NOT modify any attribute that is not represented in
 /// `ops`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct UpdatePatch {
-    pub ops: Vec<PatchOp>,
+    /// Immutable operations produced from a checked desired resource.
+    pub ops: ProviderReadyPatchOps,
+}
+
+impl UpdatePatch {
+    fn checked(ops: Vec<PatchOp>) -> Self {
+        Self {
+            ops: ProviderReadyPatchOps(ops),
+        }
+    }
+
+    /// Borrow the checked patch operations.
+    pub fn ops(&self) -> &[PatchOp] {
+        &self.ops
+    }
+}
+
+/// Immutable operation storage for [`UpdatePatch`].
+///
+/// The field is private so callers can inspect a checked patch through normal
+/// slice operations but cannot replace or mutate its values after validation.
+#[derive(Debug, Clone)]
+pub struct ProviderReadyPatchOps(Vec<PatchOp>);
+
+impl std::ops::Deref for ProviderReadyPatchOps {
+    type Target = [PatchOp];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a ProviderReadyPatchOps {
+    type Item = &'a PatchOp;
+    type IntoIter = std::slice::Iter<'a, PatchOp>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl IntoIterator for ProviderReadyPatchOps {
+    type Item = PatchOp;
+    type IntoIter = std::vec::IntoIter<PatchOp>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
 }
 
 /// A single operation inside an [`UpdatePatch`].
@@ -452,7 +500,7 @@ pub enum PatchOpKind {
 /// value from `to`.
 pub fn build_update_patch(
     changed_attributes: &[String],
-    to: &ResolvedResource,
+    to: &ProviderReadyResource,
     from: &State,
 ) -> UpdatePatch {
     let to = to.as_resource();
@@ -482,7 +530,7 @@ pub fn build_update_patch(
             }
         })
         .collect();
-    UpdatePatch { ops }
+    UpdatePatch::checked(ops)
 }
 
 /// Return type for async operations
@@ -1892,17 +1940,15 @@ mod tests {
         );
     }
 
-    fn resolved_for_test(resource: Resource) -> ResolvedResource {
-        let normalized =
-            futures::executor::block_on(crate::executor::normalized::apply_desired_normalization(
-                resource,
-                &[],
-                &NoopNormalizer,
-                &[],
-                &crate::schema::SchemaRegistry::new(),
-            ));
-        crate::executor::resolve_normalized_for_provider(normalized)
-            .expect("test resource should be fully resolved")
+    fn resolved_for_test(resource: Resource) -> ProviderReadyResource {
+        futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
+            resource,
+            &[],
+            &NoopNormalizer,
+            &[],
+            &crate::schema::SchemaRegistry::new(),
+        ))
+        .expect("test resource should pass provider preparation")
     }
 
     // Mock Provider for testing
@@ -2728,9 +2774,10 @@ mod tests {
 
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let from = State::existing(id.clone(), HashMap::new());
+        let ready = resolved_for_test(Resource::with_provider("mock", "test", "example", None));
         let request = UpdateRequest {
             from,
-            patch: UpdatePatch::default(),
+            patch: build_update_patch(&[], &ready, &State::existing(id.clone(), HashMap::new())),
         };
         let state = router
             .update(&id, "mock-id-123", request)
