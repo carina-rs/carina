@@ -25,6 +25,7 @@ use colored::Colorize;
 use carina_state::LocalBackend;
 use carina_state::{BackendLock, StateBackend, StateFile, anchored_local_path, create_backend};
 
+use crate::commands::hint::ProjectCommand;
 use crate::error::AppError;
 
 /// What happened to the old (source) state after a committed migration.
@@ -73,6 +74,7 @@ async fn perform_state_migration(
     source: &dyn StateBackend,
     target: &dyn StateBackend,
     force: bool,
+    project_dir: &Path,
 ) -> Result<StateFile, AppError> {
     // `carina init --migrate-state` copies the source state into the
     // target backend verbatim. The pending-migration token is
@@ -87,12 +89,12 @@ async fn perform_state_migration(
         .map_err(AppError::Backend)?
         .map(|loaded| loaded.into_state())
         .ok_or_else(|| {
-            AppError::Config(
+            AppError::Config(format!(
                 "The locked backend holds no state. There is nothing to migrate; \
-                 re-run `carina init` (without --migrate-state) to adopt the new \
-                 backend, or revert the backend configuration."
-                    .to_string(),
-            )
+                 re-run `{}` (without --migrate-state) to adopt the new \
+                 backend, or revert the backend configuration.",
+                ProjectCommand::new("init", project_dir)
+            ))
         })?;
 
     // Target guard: refuse to clobber a populated, differently-lineaged
@@ -155,19 +157,19 @@ async fn perform_state_migration(
 /// then rewrites the lock. A no-op (returns [`MigrationOutcome::NotNeeded`])
 /// when they already match.
 pub async fn run_init_migrate_state(
-    base_dir: &Path,
+    project_dir: &Path,
     backend_config: Option<&carina_core::parser::BackendConfig>,
     force: bool,
 ) -> Result<MigrationOutcome, AppError> {
     let configured = BackendLock::for_config(backend_config)?;
-    let locked = BackendLock::load(base_dir)
+    let locked = BackendLock::load(project_dir)
         .map_err(AppError::Backend)?
         .ok_or_else(|| {
-            AppError::Config(
-                "No backend lock found. Run `carina init` (without \
-                 --migrate-state) to initialize the project first."
-                    .to_string(),
-            )
+            AppError::Config(format!(
+                "No backend lock found. Run `{}` (without \
+                 --migrate-state) to initialize the project first.",
+                ProjectCommand::new("init", project_dir)
+            ))
         })?;
 
     if locked == configured {
@@ -188,14 +190,15 @@ pub async fn run_init_migrate_state(
     // snapshots, so a relative local `path` must be anchored at the
     // project dir (not the binary's CWD) for `carina init <dir>` invoked
     // from elsewhere.
-    let source = create_backend(Some(&locked_config), base_dir)
+    let source = create_backend(Some(&locked_config), project_dir)
         .await
         .map_err(AppError::Backend)?;
-    let target = create_backend(Some(&configured.to_state_config()), base_dir)
+    let target = create_backend(Some(&configured.to_state_config()), project_dir)
         .await
         .map_err(AppError::Backend)?;
 
-    let state = perform_state_migration(source.as_ref(), target.as_ref(), force).await?;
+    let state =
+        perform_state_migration(source.as_ref(), target.as_ref(), force, project_dir).await?;
     println!(
         "  {} copied {} resource(s) to the configured backend",
         "✓".green(),
@@ -215,7 +218,7 @@ pub async fn run_init_migrate_state(
     // Deleting the source first, as an earlier revision did, could
     // instead strand the project: a crash between the delete and the
     // lock rewrite would point the lock at a now-missing source.)
-    configured.save(base_dir).map_err(AppError::Backend)?;
+    configured.save(project_dir).map_err(AppError::Backend)?;
     println!("  {} updated backend lock", "✓".green());
 
     // A local source is deleted after the commit (matches the retired
@@ -224,7 +227,7 @@ pub async fn run_init_migrate_state(
     // fatal: the migration already committed, so a leftover old file is
     // harmless and the next run is a no-op.
     let source = if locked.is_local() {
-        let path = anchored_local_path(&locked_config, base_dir);
+        let path = anchored_local_path(&locked_config, project_dir);
         if !path.exists() {
             SourceDisposition::Deleted
         } else {
@@ -289,7 +292,9 @@ mod tests {
         let dst = LocalBackend::with_path(dst_path.clone());
         src.write_state(&state_with("lin-1", 3)).await.unwrap();
 
-        let state = perform_state_migration(&src, &dst, false).await.unwrap();
+        let state = perform_state_migration(&src, &dst, false, tmp.path())
+            .await
+            .unwrap();
         assert_eq!(state.resources().len(), 3);
 
         let migrated = dst.read_state().await.unwrap().unwrap().into_state();
@@ -305,7 +310,7 @@ mod tests {
         src.write_state(&state_with("lin-src", 1)).await.unwrap();
         dst.write_state(&state_with("lin-dst", 2)).await.unwrap();
 
-        let err = perform_state_migration(&src, &dst, false)
+        let err = perform_state_migration(&src, &dst, false, tmp.path())
             .await
             .unwrap_err();
         assert!(
@@ -325,7 +330,9 @@ mod tests {
         src.write_state(&state_with("lin-src", 1)).await.unwrap();
         dst.write_state(&state_with("lin-dst", 2)).await.unwrap();
 
-        perform_state_migration(&src, &dst, true).await.unwrap();
+        perform_state_migration(&src, &dst, true, tmp.path())
+            .await
+            .unwrap();
         let dst_state = dst.read_state().await.unwrap().unwrap().into_state();
         assert_eq!(dst_state.lineage, "lin-src");
         assert_eq!(dst_state.resources().len(), 1);
@@ -337,7 +344,7 @@ mod tests {
         let src = LocalBackend::with_path(tmp.path().join("a.json"));
         let dst = LocalBackend::with_path(tmp.path().join("b.json"));
 
-        let err = perform_state_migration(&src, &dst, false)
+        let err = perform_state_migration(&src, &dst, false, tmp.path())
             .await
             .unwrap_err();
         assert!(

@@ -99,25 +99,18 @@ fn init_then_backend_change_blocks_without_flag_and_migrates_with_it() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
+    let expected_command = format!("carina init --migrate-state {project_str}");
     assert!(
-        stdout.contains("carina init --migrate-state"),
+        stdout.contains(&expected_command),
         "migration hint must contain copy-pasteable migration advice, got:\n{stdout}",
-    );
-    assert!(
-        !stdout.contains("carina init --migrate-state ."),
-        "migration hint must not include the redundant path argument, got:\n{stdout}",
     );
     assert!(
         stderr.contains("Backend configuration changed") && stderr.contains("--migrate-state"),
         "drift warning must name --migrate-state, got:\n{stderr}",
     );
     assert!(
-        stderr.contains("carina init --migrate-state"),
+        stderr.contains(&expected_command),
         "drift warning must contain copy-pasteable migration advice, got:\n{stderr}",
-    );
-    assert!(
-        !stderr.contains("carina init --migrate-state ."),
-        "drift warning must not include the redundant path argument, got:\n{stderr}",
     );
     assert_eq!(
         fs::read_to_string(project.join("carina-backend.lock")).unwrap(),

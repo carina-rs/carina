@@ -27,6 +27,7 @@ use carina_state::{
 };
 
 use super::{BackendDriftStatus, DriftCommand, inspect_backend_drift, verify_for_mutation};
+use crate::commands::hint::ProjectCommand;
 use crate::commands::shared::finalize::release_lock_after_execute;
 use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overrides};
 use crate::error::AppError;
@@ -40,7 +41,7 @@ use crate::wiring::{
 ///
 /// For `Locked` errors, includes a hint about `force-unlock`.
 /// All other backend errors are passed through as `AppError::Backend`.
-pub fn map_lock_error(e: BackendError) -> AppError {
+pub fn map_lock_error(e: BackendError, project_dir: &Path) -> AppError {
     match e {
         BackendError::Locked {
             who,
@@ -48,8 +49,11 @@ pub fn map_lock_error(e: BackendError) -> AppError {
             operation,
         } => AppError::Config(format!(
             "State is locked by {} (lock ID: {}, operation: {})\n\
-             If you believe this is stale, run: carina force-unlock {}",
-            who, lock_id, operation, lock_id
+             If you believe this is stale, run: `{}`",
+            who,
+            lock_id,
+            operation,
+            ProjectCommand::new("force-unlock", project_dir).with_argument(lock_id.as_str())
         )),
         other => AppError::Backend(other),
     }
@@ -965,11 +969,8 @@ pub async fn run_state_refresh(
         &duplicate_declarations,
     )?;
 
-    let verified_backend = verify_for_mutation(
-        base_dir,
-        parsed.backend.as_ref(),
-        DriftCommand::RefreshState,
-    )?;
+    let verified_backend =
+        verify_for_mutation(path, parsed.backend.as_ref(), DriftCommand::RefreshState)?;
 
     // Create backend
     let backend: Box<dyn StateBackend> = verified_backend
@@ -983,7 +984,7 @@ pub async fn run_state_refresh(
         let li = backend
             .acquire_lock("refresh")
             .await
-            .map_err(map_lock_error)?;
+            .map_err(|error| map_lock_error(error, path))?;
         println!("  {} Lock acquired", "✓".green());
         Some(li)
     } else {
@@ -1970,8 +1971,26 @@ mod tests {
     use carina_core::value::SECRET_PREFIX;
     use carina_state::{DeposedInstance, DeposedKey};
     use serde_json::json;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+
+    #[test]
+    fn map_lock_error_includes_non_default_project_dir_in_force_unlock_hint() {
+        let error = map_lock_error(
+            BackendError::Locked {
+                who: "another process".to_string(),
+                lock_id: "lock-123".to_string(),
+                operation: "apply".to_string(),
+            },
+            Path::new("infra/foo"),
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "State is locked by another process (lock ID: lock-123, operation: apply)\n\
+             If you believe this is stale, run: `carina force-unlock lock-123 infra/foo`"
+        );
+    }
 
     #[derive(Default)]
     struct DeposedRefreshTestProvider {
