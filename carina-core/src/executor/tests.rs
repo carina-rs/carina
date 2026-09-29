@@ -1460,6 +1460,66 @@ async fn invalid_resolved_create_value_never_reaches_provider() {
     assert!(provider.calls().is_empty());
 }
 
+#[tokio::test]
+async fn invalid_secret_create_value_is_masked_and_never_reaches_provider() {
+    use crate::binding_index::BindingValueSource;
+
+    let plaintext = "apply-time-plaintext";
+    let provider = MockProvider::new();
+    let mut resource = make_resource("invalid-secret-create", &[]);
+    resource.set_attr(
+        "target",
+        Value::resource_ref("secret-source", "value", vec![]),
+    );
+    let id = resource.id.clone();
+    let unresolved = HashMap::from([(
+        id.clone(),
+        UnresolvedResource::from_pre_resolve(resource.clone()),
+    )]);
+    let mut bindings = ResolvedBindings::default();
+    bindings.set(
+        "secret-source",
+        HashMap::from([(
+            "value".to_string(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String(plaintext.to_string()),
+            )))),
+        )]),
+        BindingValueSource::Local,
+    );
+    let mut plan = Plan::new();
+    plan.add(create_effect(resource));
+    provider.push_create(Ok(ok_state(&id)));
+    let schemas = provider_boundary_constraint_schemas();
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &unresolved,
+        compositions: &[],
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let events = observer.events().join("\n");
+
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 1);
+    assert!(provider.calls().is_empty());
+    assert!(events.contains("(secret)"), "events: {events}");
+    assert!(
+        !events.contains(plaintext),
+        "secret leaked in apply error: {events}"
+    );
+}
+
 struct MustNotNormalizeInvalidValue;
 
 impl crate::provider::ProviderNormalizer for MustNotNormalizeInvalidValue {

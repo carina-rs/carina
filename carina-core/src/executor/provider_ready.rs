@@ -229,7 +229,7 @@ pub enum ProviderPreparationError {
 /// normalization pipeline, and finally proves no deferred placeholder remains.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_provider_ready_resource(
-    mut resource: Resource,
+    resource: Resource,
     bindings: &ResolvedBindings,
     module_gate: &ModuleConstraintGate,
     provider_configs: &[ProviderConfig],
@@ -237,18 +237,97 @@ pub async fn prepare_provider_ready_resource(
     factories: &[Box<dyn ProviderFactory>],
     schemas: &SchemaRegistry,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
-    for value in resource.attributes.values_mut() {
-        *value = unwrap_secret(value.clone());
-    }
+    prepare_provider_ready_resource_with_value_check(
+        resource,
+        bindings,
+        module_gate,
+        provider_configs,
+        normalizer,
+        factories,
+        schemas,
+        ResourceValueCheck::All,
+    )
+    .await
+}
+
+/// Apply-path preparation when a pre-resolution source snapshot identifies
+/// exactly which attributes became known during this effect.
+///
+/// The complete `validation_attributes` map retains authored values for every
+/// other attribute. This prevents provider normalization performed during
+/// planning from being mistaken for user input while still rerunning
+/// cross-attribute validators when at least one input became known now.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn prepare_provider_ready_resource_after_resolution(
+    resource: Resource,
+    validation_attributes: &HashMap<String, Value>,
+    resolved_attributes: &HashSet<String>,
+    bindings: &ResolvedBindings,
+    module_gate: &ModuleConstraintGate,
+    provider_configs: &[ProviderConfig],
+    normalizer: &dyn ProviderNormalizer,
+    factories: &[Box<dyn ProviderFactory>],
+    schemas: &SchemaRegistry,
+) -> Result<ProviderReadyResource, ProviderPreparationError> {
+    prepare_provider_ready_resource_with_value_check(
+        resource,
+        bindings,
+        module_gate,
+        provider_configs,
+        normalizer,
+        factories,
+        schemas,
+        ResourceValueCheck::ApplyResolved {
+            attributes: validation_attributes,
+            names: resolved_attributes,
+        },
+    )
+    .await
+}
+
+enum ResourceValueCheck<'a> {
+    All,
+    ApplyResolved {
+        attributes: &'a HashMap<String, Value>,
+        names: &'a HashSet<String>,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_provider_ready_resource_with_value_check(
+    mut resource: Resource,
+    bindings: &ResolvedBindings,
+    module_gate: &ModuleConstraintGate,
+    provider_configs: &[ProviderConfig],
+    normalizer: &dyn ProviderNormalizer,
+    factories: &[Box<dyn ProviderFactory>],
+    schemas: &SchemaRegistry,
+    value_check: ResourceValueCheck<'_>,
+) -> Result<ProviderReadyResource, ProviderPreparationError> {
     module_gate.check(bindings)?;
     if let Some(schema) = schemas.get_for(&resource) {
-        validate_known_provider_values(
-            &resource.id,
-            schema,
-            &resource.resolved_attributes(),
-            &resource.quoted_string_attrs,
-            factories,
-        )?;
+        match value_check {
+            ResourceValueCheck::All => validate_known_provider_values(
+                &resource.id,
+                schema,
+                &resource.resolved_attributes(),
+                &resource.quoted_string_attrs,
+                factories,
+            )?,
+            ResourceValueCheck::ApplyResolved { attributes, names } => {
+                validate_selected_provider_values(
+                    &resource.id,
+                    schema,
+                    attributes,
+                    names,
+                    &resource.quoted_string_attrs,
+                    factories,
+                )?;
+            }
+        }
+    }
+    for value in resource.attributes.values_mut() {
+        *value = unwrap_secret(value.clone());
     }
     let normalized =
         apply_desired_normalization(resource, provider_configs, normalizer, factories, schemas)
@@ -271,9 +350,6 @@ pub fn prepare_provider_ready_data_source(
     factories: &[Box<dyn ProviderFactory>],
     schemas: &SchemaRegistry,
 ) -> Result<ProviderReadyDataSource, ProviderPreparationError> {
-    for value in resource.attributes.values_mut() {
-        *value = unwrap_secret(value.clone());
-    }
     module_gate.check(bindings)?;
     if let Some(schema) = schemas.get_for_data_source(&resource) {
         validate_known_provider_values(
@@ -283,6 +359,9 @@ pub fn prepare_provider_ready_data_source(
             &resource.quoted_string_attrs,
             factories,
         )?;
+    }
+    for value in resource.attributes.values_mut() {
+        *value = unwrap_secret(value.clone());
     }
     crate::value::canonicalize_data_sources_with_schemas(
         std::slice::from_mut(&mut resource),
@@ -376,6 +455,33 @@ fn validate_known_provider_values(
     let is_string_literal = |attribute: &str| quoted_string_attrs.contains(attribute);
     schema
         .validate_known_values_with_origins_and_lookup(attributes, &is_string_literal, &lookup)
+        .map_err(|errors| ProviderPreparationError::ValueConstraint {
+            resource: id.clone(),
+            message: errors
+                .into_iter()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("; "),
+        })
+}
+
+fn validate_selected_provider_values(
+    id: &ResourceId,
+    schema: &ResourceSchema,
+    attributes: &HashMap<String, Value>,
+    selected: &HashSet<String>,
+    quoted_string_attrs: &HashSet<String>,
+    factories: &[Box<dyn ProviderFactory>],
+) -> Result<(), ProviderPreparationError> {
+    let lookup = provider_custom_type_lookup(factories);
+    let is_string_literal = |attribute: &str| quoted_string_attrs.contains(attribute);
+    schema
+        .validate_selected_known_values_with_origins_and_lookup(
+            attributes,
+            selected,
+            &is_string_literal,
+            &lookup,
+        )
         .map_err(|errors| ProviderPreparationError::ValueConstraint {
             resource: id.clone(),
             message: errors

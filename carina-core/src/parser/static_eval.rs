@@ -51,6 +51,22 @@ pub(crate) fn evaluate_static_value(
     config: &ProviderContext,
 ) -> Result<Value, ParseError> {
     match value {
+        Value::Concrete(ConcreteValue::List(items)) => Ok(Value::Concrete(ConcreteValue::List(
+            items
+                .into_iter()
+                .map(|item| evaluate_static_value(item, config))
+                .collect::<Result<Vec<_>, _>>()?,
+        ))),
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            let mut evaluated = indexmap::IndexMap::with_capacity(map.len());
+            for (key, value) in map {
+                evaluated.insert(key, evaluate_static_value(value, config)?);
+            }
+            Ok(Value::Concrete(ConcreteValue::Map(evaluated)))
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => Ok(Value::Deferred(
+            DeferredValue::Secret(Box::new(evaluate_static_value(*inner, config)?)),
+        )),
         Value::Deferred(DeferredValue::FunctionCall { ref name, ref args }) => {
             if !is_static_value(&value) {
                 return Err(ParseError::InvalidExpression {
@@ -91,4 +107,19 @@ pub(crate) fn evaluate_static_value(
         }
         other => Ok(other),
     }
+}
+
+/// Resolve a statically-known function call for schema validation.
+///
+/// Editors retain the authored AST so reference diagnostics can inspect it,
+/// but schema checks still need the same known values as the CLI's resolved
+/// parse. Invalid or runtime-dependent calls remain deferred for their own
+/// diagnostics.
+pub fn evaluate_static_value_for_validation(
+    value: &Value,
+    config: &ProviderContext,
+) -> Option<Value> {
+    is_static_value(value)
+        .then(|| evaluate_static_value(value.clone(), config))
+        .and_then(Result::ok)
 }

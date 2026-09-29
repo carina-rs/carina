@@ -5442,6 +5442,75 @@ fn lsp_custom_string_pattern_mismatch_reports_required_pattern() {
     );
 }
 
+#[test]
+fn lsp_secret_value_constraint_diagnostic_is_masked() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let plaintext = "lsp-secret-plaintext";
+    let schema = ResourceSchema::new("test.SecretHolder").attribute(AttributeSchema::new(
+        "password",
+        AttributeType::refined_string(None, None, Some((Some(2), Some(4))), None),
+    ));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+    let engine = custom_engine(schemas);
+    let doc = create_document(&format!(
+        "test.test.SecretHolder {{\n  password = secret('{plaintext}')\n}}\n"
+    ));
+
+    let diagnostics = engine.analyze(&doc, None);
+    let rendered = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("outside allowed range"),
+        "diagnostics: {rendered}"
+    );
+    assert!(rendered.contains("(secret)"), "diagnostics: {rendered}");
+    assert!(
+        !rendered.contains(plaintext),
+        "secret leaked in LSP diagnostic: {rendered}"
+    );
+}
+
+#[test]
+fn lsp_nested_secret_value_constraint_diagnostic_is_masked() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let plaintext = "nested-lsp-secret-plaintext";
+    let schema = ResourceSchema::new("test.SecretHolder").attribute(AttributeSchema::new(
+        "passwords",
+        AttributeType::list(AttributeType::refined_string(
+            None,
+            None,
+            Some((Some(2), Some(4))),
+            None,
+        )),
+    ));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+    let engine = custom_engine(schemas);
+    let doc = create_document(&format!(
+        "test.test.SecretHolder {{\n  passwords = [secret('{plaintext}')]\n}}\n"
+    ));
+
+    let diagnostics = engine.analyze(&doc, None);
+    let rendered = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("(secret)"), "diagnostics: {rendered}");
+    assert!(
+        !rendered.contains(plaintext),
+        "nested secret leaked in LSP diagnostic: {rendered}"
+    );
+}
+
 // #2131 / #2132: a ResourceRef whose root is declared in a sibling `.crn`
 // must NOT be flagged `Undefined resource`. The LSP text-scan used to
 // feed on the current file's bindings plus a hand-rolled sibling scan

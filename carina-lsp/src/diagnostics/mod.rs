@@ -970,7 +970,17 @@ impl DiagnosticEngine {
                     }
 
                     // Run resource-level validator (e.g., mutually exclusive required fields)
-                    let resolved_attrs = rref.resolved_attributes();
+                    let mut resolved_attrs = rref.resolved_attributes();
+                    for value in resolved_attrs.values_mut() {
+                        if let Some(evaluated) =
+                            carina_core::parser::evaluate_static_value_for_validation(
+                                value,
+                                &self.provider_context,
+                            )
+                        {
+                            *value = evaluated;
+                        }
+                    }
                     let lookup =
                         carina_core::parser::provider_context_lookup(&self.provider_context);
                     let is_string_literal =
@@ -994,19 +1004,25 @@ impl DiagnosticEngine {
                                 continue;
                             }
                             // Skip errors that are already reported with precise positions
-                            // by the attribute-level checks above.
-                            if matches!(
-                                error,
-                                carina_core::schema::TypeError::BlockSyntaxNotAllowed { .. }
-                                    | carina_core::schema::TypeError::TypeMismatch { .. }
-                                    | carina_core::schema::TypeError::InvalidEnumVariant { .. }
-                                    | carina_core::schema::TypeError::ValidationFailed { .. }
-                                    | carina_core::schema::TypeError::UnknownStructField { .. }
-                                    | carina_core::schema::TypeError::UnionStructMismatch { .. }
-                                    | carina_core::schema::TypeError::StructFieldError { .. }
-                                    | carina_core::schema::TypeError::ListItemError { .. }
-                                    | carina_core::schema::TypeError::MapValueError { .. }
-                            ) {
+                            // by the attribute-level checks above. Static `secret(...)`
+                            // calls are materialized only for this shared schema pass,
+                            // so retain their masked nested errors: the authored AST
+                            // seen by the attribute pass was still a FunctionCall.
+                            let is_masked_secret_error = error.to_string().contains("(secret)");
+                            if !is_masked_secret_error
+                                && matches!(
+                                    &error,
+                                    carina_core::schema::TypeError::BlockSyntaxNotAllowed { .. }
+                                        | carina_core::schema::TypeError::TypeMismatch { .. }
+                                        | carina_core::schema::TypeError::InvalidEnumVariant { .. }
+                                        | carina_core::schema::TypeError::ValidationFailed { .. }
+                                        | carina_core::schema::TypeError::UnknownStructField { .. }
+                                        | carina_core::schema::TypeError::UnionStructMismatch { .. }
+                                        | carina_core::schema::TypeError::StructFieldError { .. }
+                                        | carina_core::schema::TypeError::ListItemError { .. }
+                                        | carina_core::schema::TypeError::MapValueError { .. }
+                                )
+                            {
                                 continue;
                             }
                             // Try attribute-level position first, fall back to resource position

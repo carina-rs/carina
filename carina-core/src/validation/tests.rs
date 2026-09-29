@@ -4492,6 +4492,34 @@ fn validate_resources_accepts_resource_ref_in_map_position() {
     );
 }
 
+#[test]
+fn validate_resources_checks_secret_literals_without_revealing_them() {
+    let plaintext = "validate-time-plaintext";
+    let schema = make_schema(
+        "test.SecretHolder",
+        vec![(
+            "password",
+            AttributeType::refined_string(None, None, Some((Some(2), Some(4))), None),
+        )],
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+    let parsed = crate::parser::parse_and_resolve(&format!(
+        "let holder = test.test.SecretHolder {{\n  password = secret('{plaintext}')\n}}"
+    ))
+    .unwrap();
+    let known = HashSet::from(["test".to_string()]);
+
+    let error = validate_resources(&parsed, &schemas, &known, &ProviderContext::default())
+        .expect_err("the known value inside secret() must be length-checked");
+
+    assert!(error.contains("(secret)"), "error: {error}");
+    assert!(
+        !error.contains(plaintext),
+        "secret leaked in error: {error}"
+    );
+}
+
 /// `validate_resources` must reject a resource whose schema declares an
 /// `exclusive_required` group that is not satisfied — mirrors
 /// `awscc.ec2.Vpc {}` with no cidr_block / ipam pool.

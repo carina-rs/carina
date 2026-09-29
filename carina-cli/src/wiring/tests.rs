@@ -5661,6 +5661,29 @@ mod resolved_value_constraint_gate {
     }
 
     #[tokio::test]
+    async fn resolved_secret_reference_constraint_fails_masked_before_normalization() {
+        let plaintext = "plan-time-plaintext";
+        let normalizer = RewritingNormalizer::default();
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(text(plaintext))));
+
+        let errors = prepare_managed("consumer.Pattern", secret, &normalizer)
+            .await
+            .expect_err("resolved secret must fail its authored-value constraint");
+        let rendered = errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("(secret)"), "errors: {rendered}");
+        assert!(
+            !rendered.contains(plaintext),
+            "secret leaked in plan error: {rendered}"
+        );
+        assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn still_unknown_reference_is_not_rejected() {
         let normalizer = RewritingNormalizer::default();
         let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
