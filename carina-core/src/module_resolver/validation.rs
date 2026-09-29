@@ -1,495 +1,435 @@
-//! Expression evaluator for module `validate` and `require` blocks.
-//!
-//! This module implements a mini-language interpreter for:
-//! - Per-argument `validate` expressions (single variable scope)
-//! - Cross-argument `require` constraints (full argument map scope, with null support)
+//! Expression evaluator for module `validation` and `require` blocks.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::parser::{CompareOp, ValidateExpr};
-use crate::resource::{ConcreteValue, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Value};
 
-/// Format a Value for use in error messages.
+/// A failed module value constraint with deterministic, display-safe actuals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleConstraintViolation {
+    pub arguments: Vec<String>,
+    pub message: String,
+    pub actuals: Vec<(String, String)>,
+}
+
+/// Result of evaluating a module value constraint at a resolution boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstraintEvaluation {
+    Satisfied,
+    Pending,
+    Violated(ModuleConstraintViolation),
+}
+
+/// Format a value for a constraint error without exposing secret contents.
 pub(super) fn format_value_for_error(value: &Value) -> String {
+    crate::value::format_value(value)
+}
+
+/// Evaluate a module `validation` or `require` expression.
+///
+/// Every referenced variable is collected before evaluation. If any referenced
+/// value still contains a deferred leaf, the whole constraint is pending; no
+/// expression branch may accidentally turn an unresolved value into an
+/// evaluation error. Concrete collections are ordinary expression values, so
+/// functions such as `length()` do not need a variable-only escape hatch.
+pub fn evaluate_constraint(
+    expr: &ValidateExpr,
+    arguments: &HashMap<String, Value>,
+    message: impl Into<String>,
+) -> Result<ConstraintEvaluation, String> {
+    let referenced = referenced_constraint_arguments(expr);
+    for name in &referenced {
+        let value = arguments
+            .get(name)
+            .ok_or_else(|| format!("unknown variable '{name}' in constraint expression"))?;
+        if !is_recursively_concrete(value) {
+            return Ok(ConstraintEvaluation::Pending);
+        }
+    }
+
+    let result = eval_expr(expr, arguments)?;
+    let EvalValue::Value(Value::Concrete(ConcreteValue::Bool(satisfied))) = result else {
+        return Err(format!(
+            "constraint expression must return a boolean, got {}",
+            result.kind_name()
+        ));
+    };
+    if satisfied {
+        return Ok(ConstraintEvaluation::Satisfied);
+    }
+
+    let actuals = referenced
+        .iter()
+        .map(|name| {
+            let value = arguments
+                .get(name)
+                .expect("referenced variables were checked above");
+            (name.clone(), crate::value::format_value(value))
+        })
+        .collect();
+    Ok(ConstraintEvaluation::Violated(ModuleConstraintViolation {
+        arguments: referenced,
+        message: message.into(),
+        actuals,
+    }))
+}
+
+/// Return the variables referenced by an expression in stable name order.
+pub fn referenced_constraint_arguments(expr: &ValidateExpr) -> Vec<String> {
+    fn collect(expr: &ValidateExpr, names: &mut BTreeSet<String>) {
+        match expr {
+            ValidateExpr::Var(name) => {
+                names.insert(name.clone());
+            }
+            ValidateExpr::Compare { lhs, rhs, .. }
+            | ValidateExpr::And(lhs, rhs)
+            | ValidateExpr::Or(lhs, rhs) => {
+                collect(lhs, names);
+                collect(rhs, names);
+            }
+            ValidateExpr::Not(inner) => collect(inner, names),
+            ValidateExpr::FunctionCall { args, .. } => {
+                for arg in args {
+                    collect(arg, names);
+                }
+            }
+            ValidateExpr::Bool(_)
+            | ValidateExpr::Int(_)
+            | ValidateExpr::Float(_)
+            | ValidateExpr::Duration(_)
+            | ValidateExpr::String(_)
+            | ValidateExpr::Null => {}
+        }
+    }
+
+    let mut names = BTreeSet::new();
+    collect(expr, &mut names);
+    names.into_iter().collect()
+}
+
+fn is_recursively_concrete(value: &Value) -> bool {
     match value {
-        Value::Concrete(ConcreteValue::String(s)) => format!("\"{}\"", s),
-        Value::Concrete(ConcreteValue::Int(n)) => n.to_string(),
-        Value::Concrete(ConcreteValue::Float(f)) => f.to_string(),
-        Value::Concrete(ConcreteValue::Bool(b)) => b.to_string(),
-        Value::Concrete(ConcreteValue::Duration(d)) => crate::value::render_duration(*d),
-        Value::Concrete(ConcreteValue::List(items)) => format!("[...] (length {})", items.len()),
-        Value::Concrete(ConcreteValue::Map(map)) => format!("{{...}} (length {})", map.len()),
-        _ => format!("{:?}", value),
+        Value::Concrete(ConcreteValue::List(items)) => items.iter().all(is_recursively_concrete),
+        Value::Concrete(ConcreteValue::Map(map)) => map.values().all(is_recursively_concrete),
+        Value::Deferred(DeferredValue::Secret(inner)) => is_recursively_concrete(inner),
+        Value::Concrete(_) => true,
+        Value::Deferred(_) => false,
     }
 }
 
-/// Evaluate a validate expression with the given argument name and value.
-/// Returns Ok(true) if validation passes, Ok(false) if it fails.
-pub(super) fn evaluate_validate_expr(
-    expr: &ValidateExpr,
-    arg_name: &str,
-    arg_value: &Value,
-) -> Result<bool, String> {
-    let result = eval_validate(expr, arg_name, arg_value)?;
-    match result {
-        ValidateValue::Bool(b) => Ok(b),
-        other => Err(format!(
-            "validate expression must return a boolean, got {:?}",
-            other
-        )),
-    }
-}
-
-/// Internal value type for validate expression evaluation
-#[derive(Debug, Clone)]
-enum ValidateValue {
-    Bool(bool),
-    Int(i64),
-    Float(f64),
-    /// Duration carried as `std::time::Duration`. Compared via its
-    /// native `PartialOrd` (total-ordered by elapsed time) — see the
-    /// matching arm in `compare_validate_values`. Cross-type comparison
-    /// against `Int` / `Float` is not supported; users who want to
-    /// compare a Duration to a number convert at the call site.
-    Duration(std::time::Duration),
-    String(String),
-}
-
-/// Evaluate a validate expression node, returning a ValidateValue
-fn eval_validate(
-    expr: &ValidateExpr,
-    arg_name: &str,
-    arg_value: &Value,
-) -> Result<ValidateValue, String> {
-    match expr {
-        ValidateExpr::Bool(b) => Ok(ValidateValue::Bool(*b)),
-        ValidateExpr::Int(n) => Ok(ValidateValue::Int(*n)),
-        ValidateExpr::Float(f) => Ok(ValidateValue::Float(*f)),
-        ValidateExpr::Duration(d) => Ok(ValidateValue::Duration(*d)),
-        ValidateExpr::String(s) => Ok(ValidateValue::String(s.clone())),
-        ValidateExpr::Null => {
-            Err("null is not supported in per-argument validation expressions".to_string())
-        }
-        ValidateExpr::Var(name) => {
-            if name == arg_name {
-                match arg_value {
-                    Value::Concrete(ConcreteValue::Int(n)) => Ok(ValidateValue::Int(*n)),
-                    Value::Concrete(ConcreteValue::Float(f)) => Ok(ValidateValue::Float(*f)),
-                    Value::Concrete(ConcreteValue::Bool(b)) => Ok(ValidateValue::Bool(*b)),
-                    Value::Concrete(ConcreteValue::Duration(d)) => Ok(ValidateValue::Duration(*d)),
-                    Value::Concrete(ConcreteValue::String(s)) => {
-                        Ok(ValidateValue::String(s.clone()))
-                    }
-                    other => Err(format!(
-                        "unsupported value type for validation: {:?}",
-                        other
-                    )),
-                }
-            } else {
-                Err(format!(
-                    "unknown variable '{}' in validate expression (expected '{}')",
-                    name, arg_name
-                ))
-            }
-        }
-        ValidateExpr::Compare { lhs, op, rhs } => {
-            let left = eval_validate(lhs, arg_name, arg_value)?;
-            let right = eval_validate(rhs, arg_name, arg_value)?;
-            let result = compare_validate_values(&left, op, &right)?;
-            Ok(ValidateValue::Bool(result))
-        }
-        ValidateExpr::And(lhs, rhs) => {
-            let left = eval_validate(lhs, arg_name, arg_value)?;
-            match left {
-                ValidateValue::Bool(false) => Ok(ValidateValue::Bool(false)),
-                ValidateValue::Bool(true) => {
-                    let right = eval_validate(rhs, arg_name, arg_value)?;
-                    match right {
-                        ValidateValue::Bool(b) => Ok(ValidateValue::Bool(b)),
-                        _ => Err("right operand of && must be boolean".to_string()),
-                    }
-                }
-                _ => Err("left operand of && must be boolean".to_string()),
-            }
-        }
-        ValidateExpr::Or(lhs, rhs) => {
-            let left = eval_validate(lhs, arg_name, arg_value)?;
-            match left {
-                ValidateValue::Bool(true) => Ok(ValidateValue::Bool(true)),
-                ValidateValue::Bool(false) => {
-                    let right = eval_validate(rhs, arg_name, arg_value)?;
-                    match right {
-                        ValidateValue::Bool(b) => Ok(ValidateValue::Bool(b)),
-                        _ => Err("right operand of || must be boolean".to_string()),
-                    }
-                }
-                _ => Err("left operand of || must be boolean".to_string()),
-            }
-        }
-        ValidateExpr::Not(inner) => {
-            let val = eval_validate(inner, arg_name, arg_value)?;
-            match val {
-                ValidateValue::Bool(b) => Ok(ValidateValue::Bool(!b)),
-                _ => Err("operand of ! must be boolean".to_string()),
-            }
-        }
-        ValidateExpr::FunctionCall { name, args } => {
-            eval_validate_function(name, args, arg_name, arg_value)
-        }
-    }
-}
-
-/// Compare two ValidateValues with the given operator
-fn compare_validate_values(
-    left: &ValidateValue,
-    op: &CompareOp,
-    right: &ValidateValue,
-) -> Result<bool, String> {
-    match (left, right) {
-        (ValidateValue::Int(a), ValidateValue::Int(b)) => Ok(match op {
-            CompareOp::Gte => a >= b,
-            CompareOp::Lte => a <= b,
-            CompareOp::Gt => a > b,
-            CompareOp::Lt => a < b,
-            CompareOp::Eq => a == b,
-            CompareOp::Ne => a != b,
-        }),
-        (ValidateValue::Float(a), ValidateValue::Float(b)) => Ok(match op {
-            CompareOp::Gte => a >= b,
-            CompareOp::Lte => a <= b,
-            CompareOp::Gt => a > b,
-            CompareOp::Lt => a < b,
-            CompareOp::Eq => a == b,
-            CompareOp::Ne => a != b,
-        }),
-        (ValidateValue::Int(a), ValidateValue::Float(b)) => {
-            let a = *a as f64;
-            Ok(match op {
-                CompareOp::Gte => a >= *b,
-                CompareOp::Lte => a <= *b,
-                CompareOp::Gt => a > *b,
-                CompareOp::Lt => a < *b,
-                CompareOp::Eq => a == *b,
-                CompareOp::Ne => a != *b,
-            })
-        }
-        (ValidateValue::Float(a), ValidateValue::Int(b)) => {
-            let b = *b as f64;
-            Ok(match op {
-                CompareOp::Gte => *a >= b,
-                CompareOp::Lte => *a <= b,
-                CompareOp::Gt => *a > b,
-                CompareOp::Lt => *a < b,
-                CompareOp::Eq => *a == b,
-                CompareOp::Ne => *a != b,
-            })
-        }
-        (ValidateValue::String(a), ValidateValue::String(b)) => Ok(match op {
-            CompareOp::Eq => a == b,
-            CompareOp::Ne => a != b,
-            _ => return Err("strings only support == and != comparisons".to_string()),
-        }),
-        (ValidateValue::Bool(a), ValidateValue::Bool(b)) => Ok(match op {
-            CompareOp::Eq => a == b,
-            CompareOp::Ne => a != b,
-            _ => return Err("booleans only support == and != comparisons".to_string()),
-        }),
-        // Durations compare by total seconds — same ordering semantic as
-        // `std::time::Duration`'s `PartialOrd`.
-        (ValidateValue::Duration(a), ValidateValue::Duration(b)) => Ok(match op {
-            CompareOp::Gte => a >= b,
-            CompareOp::Lte => a <= b,
-            CompareOp::Gt => a > b,
-            CompareOp::Lt => a < b,
-            CompareOp::Eq => a == b,
-            CompareOp::Ne => a != b,
-        }),
-        _ => Err(format!("cannot compare {:?} with {:?}", left, right)),
-    }
-}
-
-/// Evaluate a function call in a validate expression
-fn eval_validate_function(
-    name: &str,
-    args: &[ValidateExpr],
-    arg_name: &str,
-    arg_value: &Value,
-) -> Result<ValidateValue, String> {
-    match name {
-        "len" | "length" => {
-            if args.len() != 1 {
-                return Err(format!("{}() expects 1 argument, got {}", name, args.len()));
-            }
-            // For Var references, access the original Value directly to support
-            // List and Map types (which can't be represented as ValidateValue).
-            if let ValidateExpr::Var(var_name) = &args[0]
-                && var_name == arg_name
-            {
-                return match arg_value {
-                    Value::Concrete(ConcreteValue::String(s)) => {
-                        Ok(ValidateValue::Int(s.len() as i64))
-                    }
-                    Value::Concrete(ConcreteValue::List(items)) => {
-                        Ok(ValidateValue::Int(items.len() as i64))
-                    }
-                    Value::Concrete(ConcreteValue::Map(map)) => {
-                        Ok(ValidateValue::Int(map.len() as i64))
-                    }
-                    _ => Err(format!(
-                        "{}() argument must be a string, list, or map",
-                        name
-                    )),
-                };
-            }
-            // For non-Var expressions (e.g., string literals), evaluate normally
-            let val = eval_validate(&args[0], arg_name, arg_value)?;
-            match val {
-                ValidateValue::String(s) => Ok(ValidateValue::Int(s.len() as i64)),
-                _ => Err(format!(
-                    "{}() argument must be a string, list, or map",
-                    name
-                )),
-            }
-        }
-        _ => Err(format!(
-            "unknown function '{}' in validate expression",
-            name
-        )),
-    }
-}
-
-/// Evaluate a require expression with access to all argument values.
-/// Returns Ok(true) if the constraint is satisfied, Ok(false) if it fails.
-pub(super) fn evaluate_require_expr(
-    expr: &ValidateExpr,
-    args: &HashMap<String, Value>,
-) -> Result<bool, String> {
-    let result = eval_require(expr, args)?;
-    match result {
-        RequireValue::Bool(b) => Ok(b),
-        other => Err(format!(
-            "require expression must return a boolean, got {:?}",
-            other
-        )),
-    }
-}
-
-/// Internal value type for require expression evaluation
-#[derive(Debug, Clone)]
-enum RequireValue {
-    Bool(bool),
-    Int(i64),
-    Float(f64),
-    Duration(std::time::Duration),
-    String(String),
+#[derive(Clone)]
+enum EvalValue {
+    Value(Value),
     Null,
 }
 
-/// Evaluate a require expression node with access to all argument values
-fn eval_require(
-    expr: &ValidateExpr,
-    args: &HashMap<String, Value>,
-) -> Result<RequireValue, String> {
-    match expr {
-        ValidateExpr::Bool(b) => Ok(RequireValue::Bool(*b)),
-        ValidateExpr::Int(n) => Ok(RequireValue::Int(*n)),
-        ValidateExpr::Float(f) => Ok(RequireValue::Float(*f)),
-        ValidateExpr::Duration(d) => Ok(RequireValue::Duration(*d)),
-        ValidateExpr::String(s) => Ok(RequireValue::String(s.clone())),
-        ValidateExpr::Null => Ok(RequireValue::Null),
-        ValidateExpr::Var(name) => {
-            if let Some(value) = args.get(name) {
-                match value {
-                    Value::Concrete(ConcreteValue::Int(n)) => Ok(RequireValue::Int(*n)),
-                    Value::Concrete(ConcreteValue::Float(f)) => Ok(RequireValue::Float(*f)),
-                    Value::Concrete(ConcreteValue::Bool(b)) => Ok(RequireValue::Bool(*b)),
-                    Value::Concrete(ConcreteValue::Duration(d)) => Ok(RequireValue::Duration(*d)),
-                    Value::Concrete(ConcreteValue::String(s)) => {
-                        Ok(RequireValue::String(s.clone()))
-                    }
-                    other => Err(format!(
-                        "unsupported value type for require expression: {:?}",
-                        other
-                    )),
-                }
-            } else {
-                Err(format!("unknown variable '{}' in require expression", name))
-            }
+impl EvalValue {
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Value(Value::Concrete(value)) => match value {
+                ConcreteValue::String(_) => "string",
+                ConcreteValue::EnumIdentifier(_) => "enum identifier",
+                ConcreteValue::CanonicalEnum(_) => "canonical enum",
+                ConcreteValue::Int(_) => "int",
+                ConcreteValue::Float(_) => "float",
+                ConcreteValue::Bool(_) => "bool",
+                ConcreteValue::Duration(_) => "duration",
+                ConcreteValue::List(_) | ConcreteValue::StringList(_) => "list",
+                ConcreteValue::Map(_) => "map",
+            },
+            Self::Value(Value::Deferred(DeferredValue::Secret(_))) => "secret",
+            Self::Value(Value::Deferred(DeferredValue::ResourceRef { .. })) => "resource reference",
+            Self::Value(Value::Deferred(DeferredValue::BindingRef { .. })) => "binding reference",
+            Self::Value(Value::Deferred(DeferredValue::Interpolation(_))) => "interpolation",
+            Self::Value(Value::Deferred(DeferredValue::FunctionCall { .. })) => "function call",
+            Self::Value(Value::Deferred(DeferredValue::Unknown(_))) => "unknown",
         }
-        ValidateExpr::Compare { lhs, op, rhs } => {
-            let left = eval_require(lhs, args)?;
-            let right = eval_require(rhs, args)?;
-            let result = compare_require_values(&left, op, &right)?;
-            Ok(RequireValue::Bool(result))
+    }
+
+    fn bool(self, context: &str) -> Result<bool, String> {
+        match self {
+            Self::Value(Value::Concrete(ConcreteValue::Bool(value))) => Ok(value),
+            other => Err(format!(
+                "{context} must be boolean, got {}",
+                other.kind_name()
+            )),
         }
-        ValidateExpr::And(lhs, rhs) => {
-            let left = eval_require(lhs, args)?;
-            match left {
-                RequireValue::Bool(false) => Ok(RequireValue::Bool(false)),
-                RequireValue::Bool(true) => {
-                    let right = eval_require(rhs, args)?;
-                    match right {
-                        RequireValue::Bool(b) => Ok(RequireValue::Bool(b)),
-                        _ => Err("right operand of && must be boolean".to_string()),
-                    }
-                }
-                _ => Err("left operand of && must be boolean".to_string()),
-            }
-        }
-        ValidateExpr::Or(lhs, rhs) => {
-            let left = eval_require(lhs, args)?;
-            match left {
-                RequireValue::Bool(true) => Ok(RequireValue::Bool(true)),
-                RequireValue::Bool(false) => {
-                    let right = eval_require(rhs, args)?;
-                    match right {
-                        RequireValue::Bool(b) => Ok(RequireValue::Bool(b)),
-                        _ => Err("right operand of || must be boolean".to_string()),
-                    }
-                }
-                _ => Err("left operand of || must be boolean".to_string()),
-            }
-        }
-        ValidateExpr::Not(inner) => {
-            let val = eval_require(inner, args)?;
-            match val {
-                RequireValue::Bool(b) => Ok(RequireValue::Bool(!b)),
-                _ => Err("operand of ! must be boolean".to_string()),
-            }
-        }
-        ValidateExpr::FunctionCall {
-            name,
-            args: fn_args,
-        } => eval_require_function(name, fn_args, args),
     }
 }
 
-/// Compare two RequireValues with the given operator
-fn compare_require_values(
-    left: &RequireValue,
-    op: &CompareOp,
-    right: &RequireValue,
-) -> Result<bool, String> {
-    // Handle null comparisons
-    match (left, right) {
-        (RequireValue::Null, RequireValue::Null) => {
-            return Ok(matches!(op, CompareOp::Eq));
+fn eval_expr(expr: &ValidateExpr, arguments: &HashMap<String, Value>) -> Result<EvalValue, String> {
+    match expr {
+        ValidateExpr::Bool(value) => Ok(value_from(ConcreteValue::Bool(*value))),
+        ValidateExpr::Int(value) => Ok(value_from(ConcreteValue::Int(*value))),
+        ValidateExpr::Float(value) => Ok(value_from(ConcreteValue::Float(*value))),
+        ValidateExpr::Duration(value) => Ok(value_from(ConcreteValue::Duration(*value))),
+        ValidateExpr::String(value) => Ok(value_from(ConcreteValue::String(value.clone()))),
+        ValidateExpr::Null => Ok(EvalValue::Null),
+        ValidateExpr::Var(name) => arguments
+            .get(name)
+            .map(value_for_evaluation)
+            .ok_or_else(|| format!("unknown variable '{name}' in constraint expression")),
+        ValidateExpr::Compare { lhs, op, rhs } => {
+            let left = eval_expr(lhs, arguments)?;
+            let right = eval_expr(rhs, arguments)?;
+            Ok(value_from(ConcreteValue::Bool(compare_values(
+                &left, op, &right,
+            )?)))
         }
-        (RequireValue::Null, _) | (_, RequireValue::Null) => {
+        ValidateExpr::And(lhs, rhs) => {
+            if !eval_expr(lhs, arguments)?.bool("left operand of &&")? {
+                return Ok(value_from(ConcreteValue::Bool(false)));
+            }
+            let value = eval_expr(rhs, arguments)?.bool("right operand of &&")?;
+            Ok(value_from(ConcreteValue::Bool(value)))
+        }
+        ValidateExpr::Or(lhs, rhs) => {
+            if eval_expr(lhs, arguments)?.bool("left operand of ||")? {
+                return Ok(value_from(ConcreteValue::Bool(true)));
+            }
+            let value = eval_expr(rhs, arguments)?.bool("right operand of ||")?;
+            Ok(value_from(ConcreteValue::Bool(value)))
+        }
+        ValidateExpr::Not(inner) => {
+            let value = eval_expr(inner, arguments)?.bool("operand of !")?;
+            Ok(value_from(ConcreteValue::Bool(!value)))
+        }
+        ValidateExpr::FunctionCall { name, args } => eval_function(name, args, arguments),
+    }
+}
+
+fn value_from(value: ConcreteValue) -> EvalValue {
+    EvalValue::Value(Value::Concrete(value))
+}
+
+fn value_for_evaluation(value: &Value) -> EvalValue {
+    match value {
+        Value::Deferred(DeferredValue::Secret(inner)) => value_for_evaluation(inner),
+        other => EvalValue::Value(other.clone()),
+    }
+}
+
+fn compare_values(left: &EvalValue, op: &CompareOp, right: &EvalValue) -> Result<bool, String> {
+    match (left, right) {
+        (EvalValue::Null, EvalValue::Null) => return Ok(matches!(op, CompareOp::Eq)),
+        (EvalValue::Null, _) | (_, EvalValue::Null) => {
             return Ok(matches!(op, CompareOp::Ne));
         }
         _ => {}
     }
 
+    let (EvalValue::Value(left), EvalValue::Value(right)) = (left, right) else {
+        unreachable!("null values returned above");
+    };
     match (left, right) {
-        (RequireValue::Int(a), RequireValue::Int(b)) => Ok(match op {
-            CompareOp::Gte => a >= b,
-            CompareOp::Lte => a <= b,
-            CompareOp::Gt => a > b,
-            CompareOp::Lt => a < b,
-            CompareOp::Eq => a == b,
-            CompareOp::Ne => a != b,
-        }),
-        (RequireValue::Float(a), RequireValue::Float(b)) => Ok(match op {
-            CompareOp::Gte => a >= b,
-            CompareOp::Lte => a <= b,
-            CompareOp::Gt => a > b,
-            CompareOp::Lt => a < b,
-            CompareOp::Eq => a == b,
-            CompareOp::Ne => a != b,
-        }),
-        (RequireValue::Int(a), RequireValue::Float(b)) => {
-            let a = *a as f64;
-            Ok(match op {
-                CompareOp::Gte => a >= *b,
-                CompareOp::Lte => a <= *b,
-                CompareOp::Gt => a > *b,
-                CompareOp::Lt => a < *b,
-                CompareOp::Eq => a == *b,
-                CompareOp::Ne => a != *b,
-            })
+        (Value::Concrete(ConcreteValue::Int(left)), Value::Concrete(ConcreteValue::Int(right))) => {
+            compare_ordered(left, op, right)
         }
-        (RequireValue::Float(a), RequireValue::Int(b)) => {
-            let b = *b as f64;
-            Ok(match op {
-                CompareOp::Gte => *a >= b,
-                CompareOp::Lte => *a <= b,
-                CompareOp::Gt => *a > b,
-                CompareOp::Lt => *a < b,
-                CompareOp::Eq => *a == b,
-                CompareOp::Ne => *a != b,
-            })
+        (
+            Value::Concrete(ConcreteValue::Float(left)),
+            Value::Concrete(ConcreteValue::Float(right)),
+        ) => compare_ordered(left, op, right),
+        (
+            Value::Concrete(ConcreteValue::Int(left)),
+            Value::Concrete(ConcreteValue::Float(right)),
+        ) => compare_ordered(&(*left as f64), op, right),
+        (
+            Value::Concrete(ConcreteValue::Float(left)),
+            Value::Concrete(ConcreteValue::Int(right)),
+        ) => compare_ordered(left, op, &(*right as f64)),
+        (
+            Value::Concrete(ConcreteValue::Duration(left)),
+            Value::Concrete(ConcreteValue::Duration(right)),
+        ) => compare_ordered(left, op, right),
+        (
+            Value::Concrete(ConcreteValue::String(left)),
+            Value::Concrete(ConcreteValue::String(right)),
+        ) => compare_equality(left, op, right, "strings"),
+        (
+            Value::Concrete(ConcreteValue::Bool(left)),
+            Value::Concrete(ConcreteValue::Bool(right)),
+        ) => compare_equality(left, op, right, "booleans"),
+        (Value::Concrete(ConcreteValue::List(_)), Value::Concrete(ConcreteValue::List(_)))
+        | (
+            Value::Concrete(ConcreteValue::StringList(_)),
+            Value::Concrete(ConcreteValue::StringList(_)),
+        )
+        | (Value::Concrete(ConcreteValue::Map(_)), Value::Concrete(ConcreteValue::Map(_))) => {
+            compare_equality(left, op, right, "collections")
         }
-        (RequireValue::String(a), RequireValue::String(b)) => Ok(match op {
-            CompareOp::Eq => a == b,
-            CompareOp::Ne => a != b,
-            _ => return Err("strings only support == and != comparisons".to_string()),
-        }),
-        (RequireValue::Bool(a), RequireValue::Bool(b)) => Ok(match op {
-            CompareOp::Eq => a == b,
-            CompareOp::Ne => a != b,
-            _ => return Err("booleans only support == and != comparisons".to_string()),
-        }),
-        // Durations compare by total seconds — same ordering semantic as
-        // `std::time::Duration`'s `PartialOrd`.
-        (RequireValue::Duration(a), RequireValue::Duration(b)) => Ok(match op {
-            CompareOp::Gte => a >= b,
-            CompareOp::Lte => a <= b,
-            CompareOp::Gt => a > b,
-            CompareOp::Lt => a < b,
-            CompareOp::Eq => a == b,
-            CompareOp::Ne => a != b,
-        }),
-        _ => Err(format!("cannot compare {:?} with {:?}", left, right)),
+        _ => Err(format!(
+            "cannot compare {} with {}",
+            EvalValue::Value(left.clone()).kind_name(),
+            EvalValue::Value(right.clone()).kind_name()
+        )),
     }
 }
 
-/// Evaluate a function call in a require expression
-fn eval_require_function(
+fn compare_ordered<T: PartialOrd + PartialEq>(
+    left: &T,
+    op: &CompareOp,
+    right: &T,
+) -> Result<bool, String> {
+    Ok(match op {
+        CompareOp::Gte => left >= right,
+        CompareOp::Lte => left <= right,
+        CompareOp::Gt => left > right,
+        CompareOp::Lt => left < right,
+        CompareOp::Eq => left == right,
+        CompareOp::Ne => left != right,
+    })
+}
+
+fn compare_equality<T: PartialEq>(
+    left: &T,
+    op: &CompareOp,
+    right: &T,
+    kind: &str,
+) -> Result<bool, String> {
+    match op {
+        CompareOp::Eq => Ok(left == right),
+        CompareOp::Ne => Ok(left != right),
+        _ => Err(format!("{kind} only support == and != comparisons")),
+    }
+}
+
+fn eval_function(
     name: &str,
-    fn_args: &[ValidateExpr],
-    args: &HashMap<String, Value>,
-) -> Result<RequireValue, String> {
+    args: &[ValidateExpr],
+    arguments: &HashMap<String, Value>,
+) -> Result<EvalValue, String> {
     match name {
         "len" | "length" => {
-            if fn_args.len() != 1 {
-                return Err(format!(
-                    "{}() expects 1 argument, got {}",
-                    name,
-                    fn_args.len()
-                ));
+            if args.len() != 1 {
+                return Err(format!("{}() expects 1 argument, got {}", name, args.len()));
             }
-            // For Var references, access the original Value directly to support
-            // List and Map types (which can't be represented as RequireValue).
-            if let ValidateExpr::Var(var_name) = &fn_args[0]
-                && let Some(value) = args.get(var_name)
-            {
-                return match value {
-                    Value::Concrete(ConcreteValue::String(s)) => {
-                        Ok(RequireValue::Int(s.len() as i64))
-                    }
-                    Value::Concrete(ConcreteValue::List(items)) => {
-                        Ok(RequireValue::Int(items.len() as i64))
-                    }
-                    Value::Concrete(ConcreteValue::Map(map)) => {
-                        Ok(RequireValue::Int(map.len() as i64))
-                    }
-                    _ => Err(format!(
-                        "{}() argument must be a string, list, or map",
-                        name
-                    )),
-                };
-            }
-            // For non-Var expressions, evaluate normally
-            let val = eval_require(&fn_args[0], args)?;
-            match val {
-                RequireValue::String(s) => Ok(RequireValue::Int(s.len() as i64)),
-                _ => Err(format!(
-                    "{}() argument must be a string, list, or map",
-                    name
-                )),
-            }
+            let value = eval_expr(&args[0], arguments)?;
+            let length = match value {
+                EvalValue::Value(Value::Concrete(ConcreteValue::String(value))) => value.len(),
+                EvalValue::Value(Value::Concrete(ConcreteValue::List(value))) => value.len(),
+                EvalValue::Value(Value::Concrete(ConcreteValue::StringList(value))) => value.len(),
+                EvalValue::Value(Value::Concrete(ConcreteValue::Map(value))) => value.len(),
+                other => {
+                    return Err(format!(
+                        "{}() argument must be a string, list, or map, got {}",
+                        name,
+                        other.kind_name()
+                    ));
+                }
+            };
+            Ok(value_from(ConcreteValue::Int(length as i64)))
         }
-        _ => Err(format!("unknown function '{}' in require expression", name)),
+        _ => Err(format!(
+            "unknown function '{name}' in constraint expression"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use indexmap::IndexMap;
+
+    use super::*;
+
+    fn length_at_least(variable: &str, minimum: i64) -> ValidateExpr {
+        ValidateExpr::Compare {
+            lhs: Box::new(ValidateExpr::FunctionCall {
+                name: "length".to_string(),
+                args: vec![ValidateExpr::Var(variable.to_string())],
+            }),
+            op: CompareOp::Gte,
+            rhs: Box::new(ValidateExpr::Int(minimum)),
+        }
+    }
+
+    #[test]
+    fn referenced_deferred_value_is_pending_without_debug_rendering() {
+        let expression = ValidateExpr::Compare {
+            lhs: Box::new(ValidateExpr::Var("port".to_string())),
+            op: CompareOp::Gt,
+            rhs: Box::new(ValidateExpr::Int(0)),
+        };
+        let arguments = HashMap::from([(
+            "port".to_string(),
+            Value::resource_ref("producer", "port", Vec::new()),
+        )]);
+
+        assert_eq!(
+            evaluate_constraint(&expression, &arguments, "port must be positive").unwrap(),
+            ConstraintEvaluation::Pending
+        );
+    }
+
+    #[test]
+    fn length_accepts_string_list_string_list_and_map_variables() {
+        let cases = [
+            (
+                "string",
+                Value::Concrete(ConcreteValue::String("ab".to_string())),
+            ),
+            (
+                "list",
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::Concrete(ConcreteValue::Int(1)),
+                    Value::Concrete(ConcreteValue::Int(2)),
+                ])),
+            ),
+            (
+                "string_list",
+                Value::Concrete(ConcreteValue::StringList(vec![
+                    "a".to_string(),
+                    "b".to_string(),
+                ])),
+            ),
+            (
+                "map",
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    ("a".to_string(), Value::Concrete(ConcreteValue::Int(1))),
+                    ("b".to_string(), Value::Concrete(ConcreteValue::Int(2))),
+                ]))),
+            ),
+        ];
+
+        for (name, value) in cases {
+            let expression = length_at_least(name, 2);
+            let arguments = HashMap::from([(name.to_string(), value)]);
+            assert_eq!(
+                evaluate_constraint(&expression, &arguments, "too short").unwrap(),
+                ConstraintEvaluation::Satisfied,
+                "length() rejected {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn violation_contains_sorted_secret_masked_actuals() {
+        let expression = ValidateExpr::Compare {
+            lhs: Box::new(ValidateExpr::Var("password".to_string())),
+            op: CompareOp::Eq,
+            rhs: Box::new(ValidateExpr::String("expected".to_string())),
+        };
+        let arguments = HashMap::from([(
+            "password".to_string(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("plaintext".to_string()),
+            )))),
+        )]);
+
+        let result = evaluate_constraint(&expression, &arguments, "password is invalid").unwrap();
+        let ConstraintEvaluation::Violated(violation) = result else {
+            panic!("expected a violation");
+        };
+        assert_eq!(violation.arguments, vec!["password"]);
+        assert_eq!(violation.message, "password is invalid");
+        assert_eq!(
+            violation.actuals,
+            vec![("password".to_string(), "(secret)".to_string())]
+        );
+        let rendered = format!("{violation:?}");
+        assert!(!rendered.contains("plaintext"), "{rendered}");
+        assert!(!rendered.contains("Deferred("), "{rendered}");
+        assert!(!rendered.contains("ResourceRef"), "{rendered}");
     }
 }

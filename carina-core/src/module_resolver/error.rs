@@ -68,17 +68,26 @@ pub enum ModuleError {
     ExportsInModule,
 
     #[error(
-        "Validation failed for argument '{argument}' in module '{module}': {message} (got {actual})"
+        "Validation failed for argument '{argument}' in module '{module}' instance '{instance}': {message} (got {actual})"
     )]
     ArgumentValidationFailed {
         module: String,
+        instance: String,
         argument: String,
         message: String,
         actual: String,
     },
 
-    #[error("Require constraint failed in module '{module}': {message}")]
-    RequireConstraintFailed { module: String, message: String },
+    #[error(
+        "Require constraint failed in module '{module}' instance '{instance}' for arguments [{arguments}]: {message} (got {actuals})"
+    )]
+    RequireConstraintFailed {
+        module: String,
+        instance: String,
+        arguments: String,
+        message: String,
+        actuals: String,
+    },
 
     #[error(
         "Module path '{path}' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory."

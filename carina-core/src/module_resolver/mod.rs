@@ -39,6 +39,10 @@ pub use resolver::{ModuleResolver, resolve_modules, resolve_modules_with_config}
 pub use signature::{
     ResolvedModuleSignature, ResolvedModuleSignatures, load_resolved_module_signatures,
 };
+pub use validation::{
+    ConstraintEvaluation, ModuleConstraintViolation, evaluate_constraint,
+    referenced_constraint_arguments,
+};
 
 // Bring `pub(super)` helpers into mod.rs scope so the `tests` submodule (which
 // uses `super::*`) can call them by their bare names. Production code never

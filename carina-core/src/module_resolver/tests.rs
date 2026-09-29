@@ -2723,6 +2723,46 @@ fn test_argument_validation_passes_with_valid_value() {
 }
 
 #[test]
+fn test_argument_validation_with_resource_reference_is_pending() {
+    use crate::parser::{CompareOp, ValidateExpr, ValidationBlock};
+
+    let mut module = create_module_with_port_validation();
+    module.arguments[0].type_expr = TypeExpr::String;
+    module.arguments[0].validations = vec![ValidationBlock {
+        condition: ValidateExpr::Compare {
+            lhs: Box::new(ValidateExpr::FunctionCall {
+                name: "length".to_string(),
+                args: vec![ValidateExpr::Var("port".to_string())],
+            }),
+            op: CompareOp::Gt,
+            rhs: Box::new(ValidateExpr::Int(0)),
+        },
+        error_message: Some("port must not be empty".to_string()),
+    }];
+    let resolver = {
+        let mut resolver = ModuleResolver::new(".");
+        resolver
+            .imported_modules
+            .insert("web_server".to_string(), module);
+        resolver
+    };
+    let call = ModuleCall {
+        module_name: "web_server".to_string(),
+        binding_name: Some("web".to_string()),
+        arguments: HashMap::from([(
+            "port".to_string(),
+            Value::resource_ref("producer", "port", Vec::new()),
+        )]),
+    };
+
+    let expanded = resolver.expand_module_call(&call, "web", None);
+    assert!(
+        expanded.is_ok(),
+        "a reference-valued constraint must remain pending, got {expanded:?}"
+    );
+}
+
+#[test]
 fn test_argument_validation_passes_with_default_value() {
     let resolver = {
         let mut r = ModuleResolver::new(".");
@@ -2767,12 +2807,22 @@ fn test_argument_validation_fails_with_invalid_value() {
     let result = resolver.expand_module_call(&call, "web", None);
     assert!(result.is_err());
     let err = result.unwrap_err();
+    let rendered = err.to_string();
+    assert!(rendered.contains("module 'web_server'"), "{rendered}");
+    assert!(rendered.contains("instance 'web'"), "{rendered}");
+    assert!(rendered.contains("argument 'port'"), "{rendered}");
+    assert!(
+        rendered.contains("Port must be between 1 and 65535"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("got 0"), "{rendered}");
     match err {
         ModuleError::ArgumentValidationFailed {
             module,
             argument,
             message,
             actual,
+            ..
         } => {
             assert_eq!(module, "web_server");
             assert_eq!(argument, "port");
@@ -3342,7 +3392,19 @@ fn test_require_block_multiple_constraints() {
     };
     let result = resolver.expand_module_call(&call, "a", None);
     assert!(result.is_err());
-    match result.unwrap_err() {
+    let error = result.unwrap_err();
+    let rendered = error.to_string();
+    assert!(rendered.contains("module 'asg'"), "{rendered}");
+    assert!(rendered.contains("instance 'a'"), "{rendered}");
+    assert!(rendered.contains("max_size"), "{rendered}");
+    assert!(rendered.contains("min_size"), "{rendered}");
+    assert!(rendered.contains("max_size = 5"), "{rendered}");
+    assert!(rendered.contains("min_size = 10"), "{rendered}");
+    assert!(
+        rendered.contains("min_size must be <= max_size"),
+        "{rendered}"
+    );
+    match error {
         ModuleError::RequireConstraintFailed { message, .. } => {
             assert_eq!(message, "min_size must be <= max_size");
         }
