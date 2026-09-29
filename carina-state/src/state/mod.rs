@@ -800,8 +800,8 @@ impl MigratedStateFile {
 /// at the boundary. Lock-held call sites (`apply`, `destroy`,
 /// `state refresh`) bind the `Migrated { state, info }` arm and
 /// persist the upgraded shape before any short-circuit return, so the
-/// carina#3283 warning ("Disk state will be rewritten on the next
-/// `carina apply` or `carina state refresh`") matches reality —
+/// carina#3283 warning ("Disk state will be rewritten during the next
+/// apply or state refresh of that project") matches reality —
 /// carina#3315. Read-only call sites (`plan`, exports, `state
 /// list/show/lookup`, etc.) bind both arms identically and discard
 /// `info` explicitly — the discard is visible in the source rather
@@ -870,8 +870,7 @@ pub fn log_state_migration_once(
         eprintln!(
             "Warning: state file {} is v{} on disk; in-memory migration \
              to v{} applied for this run. Disk state will be rewritten \
-             on the next `carina apply` or `carina state refresh` in \
-             that directory.",
+             during the next apply or state refresh of that project.",
             display_target, info.from, info.to
         );
     }

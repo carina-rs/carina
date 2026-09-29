@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::{Component, Path};
 
-/// A copy-pasteable project-scoped `carina` command used in CLI hints.
+/// A copy-pasteable project-scoped `carina` command used in user-facing hints.
 ///
 /// The path is rendered as given by the caller rather than being resolved or
 /// canonicalized here. Project-scoped callers pass the user-supplied project
@@ -10,7 +10,7 @@ use std::path::{Component, Path};
 /// passes the user-supplied plan path. Default paths made only of `.`
 /// components are omitted; other paths appear after all subcommand arguments
 /// as required by the CLI's positional argument layout.
-pub(crate) struct ProjectCommand<'a> {
+pub struct ProjectCommand<'a> {
     subcommand: &'static str,
     argument: Option<CommandArgument<'a>>,
     project_dir: &'a Path,
@@ -27,7 +27,7 @@ enum CommandArgument<'a> {
 }
 
 impl<'a> ProjectCommand<'a> {
-    pub(crate) fn new(subcommand: &'static str, project_dir: &'a Path) -> Self {
+    pub fn new(subcommand: &'static str, project_dir: &'a Path) -> Self {
         Self {
             subcommand,
             argument: None,
@@ -37,14 +37,14 @@ impl<'a> ProjectCommand<'a> {
 
     /// Add a positional argument that must precede the project path, such as a
     /// lock ID. A leading `-` is protected with the `--` option terminator.
-    pub(crate) fn with_argument(mut self, argument: &'a str) -> Self {
+    pub fn with_argument(mut self, argument: &'a str) -> Self {
         self.argument = Some(CommandArgument::Positional(argument));
         self
     }
 
     /// Add a path argument that is the value of an option already included in
     /// the subcommand, such as the file following `plan --out`.
-    pub(crate) fn with_path_argument(mut self, argument: &'a Path) -> Self {
+    pub fn with_path_argument(mut self, argument: &'a Path) -> Self {
         self.argument = Some(CommandArgument::Path(argument));
         self
     }

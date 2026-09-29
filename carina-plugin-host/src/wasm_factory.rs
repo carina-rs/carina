@@ -67,7 +67,7 @@ fn provider_schema_decode_error(
     detail: wasm_convert::SchemaDecodeError,
 ) -> String {
     format!(
-        "provider '{provider_name}' {provider_version} emitted schema metadata this host cannot decode: {detail}; the provider revision may predate this host; bump the provider lock with `carina init --upgrade`"
+        "provider '{provider_name}' {provider_version} emitted schema metadata this host cannot decode: {detail}; the provider revision may predate this host"
     )
 }
 
@@ -3131,6 +3131,12 @@ mod tests {
         assert!(err.contains("provider 'bad-provider' 9.9.9"), "{err}");
         assert!(err.contains("schema JSON parse error"), "{err}");
         assert!(err.contains("missing field `value`"), "{err}");
+        assert!(
+            err.contains("provider revision may predate this host"),
+            "{err}"
+        );
+        assert!(!err.contains("carina init"), "{err}");
+        assert!(!err.contains("bump the provider lock"), "{err}");
     }
 
     #[test]

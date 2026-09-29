@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Enforce: project-scoped carina commands in production CLI hints must be
-# rendered through commands/hint.rs so the operated-on project path is kept.
+# Enforce: project-scoped carina commands in production hints must be rendered
+# through carina-core's ProjectCommand so the operated-on project path is kept.
 #
-# This intentionally uses a simple source scan. It skips hint.rs itself,
+# This intentionally uses a simple source scan. It skips the renderer itself,
 # standalone test files/directories, braced items marked #[cfg(test)], and
 # comment-only `//`/Rust doc lines. All other source lines are checked,
 # including lines with trailing comments and lines that continue a multi-line
-# string literal.
+# string literal. The carina-*/src glob covers every workspace crate and
+# automatically includes newly added Carina crates.
 
 set -euo pipefail
 
@@ -15,7 +16,7 @@ trap 'rm -f "$output_file"' EXIT
 
 while IFS= read -r file; do
   case "$file" in
-    carina-cli/src/commands/hint.rs|*/tests.rs|*/tests/*|*_tests.rs)
+    carina-core/src/hint.rs|*/tests.rs|*/tests/*|*_tests.rs)
       continue
       ;;
   esac
@@ -67,17 +68,19 @@ while IFS= read -r file; do
       }
 
       if (line ~ /carina[[:space:]]+(init|plan|apply|destroy|validate|state|providers|export|force-unlock|lint|fmt|module)([^A-Za-z0-9_-]|$)/ ||
-          line ~ /["`]carina[[:space:]]+[{]/) {
+          line ~ /carina[[:space:]]+[{]/) {
         printf "%s:%d:%s\n", file, FNR, line
       }
     }
   ' "$file" >> "$output_file"
-done < <(find carina-cli/src -type f -name '*.rs' | sort)
+done < <(
+  find carina-*/src -type f -name '*.rs' | sort
+)
 
 if [ -s "$output_file" ]; then
-  echo "Project-scoped CLI hint bypasses ProjectCommand:" >&2
+  echo "Project-scoped command hint bypasses ProjectCommand:" >&2
   sed 's/^/  /' "$output_file" >&2
   echo >&2
-  echo "Render the command with commands::hint::ProjectCommand so its project path is preserved." >&2
+  echo "Render the command with carina_core::hint::ProjectCommand so its project path is preserved." >&2
   exit 1
 fi

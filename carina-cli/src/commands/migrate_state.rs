@@ -25,8 +25,8 @@ use colored::Colorize;
 use carina_state::LocalBackend;
 use carina_state::{BackendLock, StateBackend, StateFile, anchored_local_path, create_backend};
 
-use crate::commands::hint::ProjectCommand;
 use crate::error::AppError;
+use carina_core::hint::ProjectCommand;
 
 /// What happened to the old (source) state after a committed migration.
 ///

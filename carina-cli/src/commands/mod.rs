@@ -3,7 +3,6 @@ pub mod destroy;
 pub mod docs;
 pub mod export;
 pub mod fmt;
-pub(crate) mod hint;
 pub(crate) mod iam_preflight;
 pub mod init;
 pub mod lint;
@@ -30,7 +29,6 @@ use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, BackendLock, StateBackend, create_backend,
 };
 
-use crate::commands::hint::ProjectCommand;
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
 use crate::wiring::{
@@ -43,6 +41,7 @@ use crate::wiring::{
     validate_no_upstream_states_in_modules, validate_provider_region_with_ctx,
     validate_resources_with_ctx, validate_wait_bindings_with_ctx,
 };
+use carina_core::hint::ProjectCommand;
 
 #[must_use = "Drifted must be handled before mutating state — apply/destroy must refuse, init/plan must warn"]
 #[derive(Debug, PartialEq)]
