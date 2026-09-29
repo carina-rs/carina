@@ -211,7 +211,7 @@ impl Provider for MockProvider {
         self.create_resources
             .lock()
             .unwrap()
-            .push(request.resource.as_resource().clone());
+            .push(request.resource().as_resource().clone());
         let result = self.create_results.lock().unwrap().remove(0);
         Box::pin(async move { result })
     }
@@ -1712,7 +1712,7 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
     );
     let requests = provider.captured_update_requests();
     let target = requests[0]
-        .patch
+        .patch()
         .ops
         .iter()
         .find(|op| op.key == "target")
@@ -3608,7 +3608,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
     let reqs = provider.captured_update_requests();
     assert_eq!(reqs.len(), 1);
     let op = reqs[0]
-        .patch
+        .patch()
         .ops
         .iter()
         .find(|op| op.key == "ip_protocol")
@@ -3725,7 +3725,7 @@ async fn test_apply_renormalizes_update_path() {
     let reqs = provider.captured_update_requests();
     assert_eq!(reqs.len(), 1);
     let marker_op = reqs[0]
-        .patch
+        .patch()
         .ops
         .iter()
         .find(|op| op.key == "marker")
@@ -3812,7 +3812,7 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
     let reqs = provider.captured_update_requests();
     assert_eq!(reqs.len(), 1);
     let tags_op = reqs[0]
-        .patch
+        .patch()
         .ops
         .iter()
         .find(|op| op.key == "tags")
@@ -3921,7 +3921,12 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
 
     let reqs = provider.captured_update_requests();
     assert_eq!(reqs.len(), 1);
-    let patched_keys: Vec<&str> = reqs[0].patch.ops.iter().map(|op| op.key.as_str()).collect();
+    let patched_keys: Vec<&str> = reqs[0]
+        .patch()
+        .ops
+        .iter()
+        .map(|op| op.key.as_str())
+        .collect();
     assert_eq!(patched_keys, vec!["description"]);
 }
 
@@ -3981,7 +3986,12 @@ async fn test_apply_effective_changed_skips_internal_and_write_only_attributes()
 
     let reqs = provider.captured_update_requests();
     assert_eq!(reqs.len(), 1);
-    let patched_keys: Vec<&str> = reqs[0].patch.ops.iter().map(|op| op.key.as_str()).collect();
+    let patched_keys: Vec<&str> = reqs[0]
+        .patch()
+        .ops
+        .iter()
+        .map(|op| op.key.as_str())
+        .collect();
     assert_eq!(patched_keys, vec!["description"]);
 }
 
@@ -4045,7 +4055,7 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
 
     let reqs = provider.captured_update_requests();
     assert_eq!(reqs.len(), 1);
-    assert!(reqs[0].patch.ops.is_empty());
+    assert!(reqs[0].patch().ops.is_empty());
 }
 
 #[tokio::test]
@@ -4115,7 +4125,7 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
     let reqs = provider.captured_update_requests();
     assert_eq!(reqs.len(), 1);
     assert!(
-        reqs[0].patch.ops.is_empty(),
+        reqs[0].patch().ops.is_empty(),
         "shape-divergent secret comparison must fail closed instead of patching plaintext"
     );
 }
@@ -4979,7 +4989,7 @@ impl Provider for YieldingUpdateProvider {
             tokio::task::yield_now().await;
             active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 
-            let mut attrs = request.from.attributes.clone();
+            let mut attrs = request.from().attributes.clone();
             attrs.insert(
                 "tags".to_string(),
                 Value::Concrete(ConcreteValue::String("new".to_string())),
@@ -5724,7 +5734,7 @@ impl Provider for RecordingMockProvider {
         request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
         let id_str = id.to_string();
-        let attrs = request.resource.as_resource().resolved_attributes();
+        let attrs = request.resource().as_resource().resolved_attributes();
         self.create_log.lock().unwrap().push((id_str, attrs));
         let result = self.create_results.lock().unwrap().remove(0);
         Box::pin(async move { result })
@@ -5802,7 +5812,7 @@ impl Provider for CascadeReplaceProvider {
         request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
         let id = id.clone();
-        let attrs = request.resource.as_resource().resolved_attributes();
+        let attrs = request.resource().as_resource().resolved_attributes();
         self.call_log
             .lock()
             .unwrap()

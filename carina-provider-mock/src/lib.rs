@@ -518,7 +518,7 @@ impl Provider for MockProvider {
         request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
         let id = id.clone();
-        let resource = request.resource.as_resource().clone();
+        let resource = request.resource().as_resource().clone();
         Box::pin(async move { self.create_resource(id, resource).await })
     }
 
@@ -547,12 +547,12 @@ impl Provider for MockProvider {
             // attribute map. The mock writes only what the user changed —
             // matching the Level 3 contract that providers MUST NOT touch
             // unspecified fields.
-            let mut attributes = request.from.attributes.clone();
-            for op in request.patch.ops {
+            let mut attributes = request.from().attributes.clone();
+            for op in &request.patch().ops {
                 match op.kind {
                     PatchOpKind::Add | PatchOpKind::Replace => {
-                        if let Some(value) = op.value {
-                            attributes.insert(op.key, value);
+                        if let Some(value) = &op.value {
+                            attributes.insert(op.key.clone(), value.clone());
                         }
                     }
                     PatchOpKind::Remove => {

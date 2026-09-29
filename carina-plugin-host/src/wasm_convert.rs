@@ -635,8 +635,8 @@ pub fn core_to_wit_update_request(
     request: &CoreUpdateRequest,
 ) -> Result<wit::UpdateRequest, SerializationError> {
     Ok(wit::UpdateRequest {
-        current: core_to_wit_state(&request.from)?,
-        patch: core_to_wit_update_patch(&request.patch)?,
+        current: core_to_wit_state(request.from())?,
+        patch: core_to_wit_update_patch(request.patch())?,
     })
 }
 
@@ -646,7 +646,7 @@ pub fn core_to_wit_create_request(
     request: &CoreCreateRequest,
 ) -> Result<wit::CreateRequest, SerializationError> {
     Ok(wit::CreateRequest {
-        res: core_to_wit_resource(request.resource.as_resource())?,
+        res: core_to_wit_resource(request.resource().as_resource())?,
     })
 }
 
@@ -2234,7 +2234,7 @@ mod tests {
         )
         .await
         .expect("checked request should be prepared");
-        let wit_patch = core_to_wit_update_patch(&request.patch).unwrap();
+        let wit_patch = core_to_wit_update_patch(request.patch()).unwrap();
         let back: Vec<_> = wit_patch.ops.iter().map(wit_to_core_patch_op).collect();
         assert_eq!(back.len(), 3);
         assert_eq!(back[0].kind, CorePatchOpKind::Add);

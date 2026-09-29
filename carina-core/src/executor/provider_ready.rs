@@ -17,9 +17,7 @@ use crate::executor::normalized::apply_desired_normalization;
 pub use crate::module_resolver::ModuleConstraintFailure;
 use crate::module_resolver::evaluate_pending_constraints;
 use crate::parser::ProviderConfig;
-use crate::provider::{
-    CreateRequest, ProviderFactory, ProviderNormalizer, UpdateRequest, build_update_patch,
-};
+use crate::provider::{CreateRequest, ProviderFactory, ProviderNormalizer, UpdateRequest};
 use crate::resource::{
     Composition, ConcreteValue, DataSource, DeferredValue, ResolvedDataSource, ResolvedResource,
     Resource, ResourceId, Value,
@@ -404,7 +402,7 @@ pub async fn prepare_create_request(
         schemas,
     )
     .await?;
-    Ok(CreateRequest { resource })
+    Ok(CreateRequest::checked(resource))
 }
 
 /// Prepare a checked update request through the provider-boundary gate.
@@ -430,8 +428,7 @@ pub async fn prepare_update_request(
         schemas,
     )
     .await?;
-    let patch = build_update_patch(changed_attributes, &resource, &from);
-    Ok(UpdateRequest::checked(from, patch, &resource))
+    Ok(UpdateRequest::checked(from, changed_attributes, &resource))
 }
 
 /// Build the schema lookup used for provider-defined custom value types.

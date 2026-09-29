@@ -131,7 +131,7 @@ impl Provider for CascadeCreateProvider {
         request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
         let id = id.clone();
-        let attrs = request.resource.as_resource().resolved_attributes();
+        let attrs = request.resource().as_resource().resolved_attributes();
         self.creates
             .lock()
             .unwrap()

@@ -150,7 +150,7 @@ impl Provider for FailBCreateProvider {
             if id.identity_or_empty() == "b" {
                 return Err(ProviderError::api_error("create failed").for_resource(id));
             }
-            let resource = request.resource.as_resource().clone();
+            let resource = request.resource().as_resource().clone();
             Ok(carina_core::provider::CreateOutcome::Success {
                 state: State::existing(id, resource.resolved_attributes())
                     .with_identifier("mock-id"),
@@ -423,7 +423,7 @@ impl Provider for ApplyCascadeProvider {
         request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
         let id = id.clone();
-        let attrs = request.resource.as_resource().resolved_attributes();
+        let attrs = request.resource().as_resource().resolved_attributes();
         self.shared
             .creates
             .lock()
@@ -785,7 +785,7 @@ impl Provider for ApplyTimeReadProvider {
         let id = id.clone();
         let shared = self.shared.clone();
         Box::pin(async move {
-            let mut attrs = request.resource.as_resource().resolved_attributes();
+            let mut attrs = request.resource().as_resource().resolved_attributes();
             if id.resource_type == "iam.Role" {
                 attrs
                     .entry("path".to_string())

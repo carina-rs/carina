@@ -16,7 +16,7 @@ use crate::executor::provider_ready::prepare_provider_ready_resource_after_resol
 use crate::parser::ProviderConfig;
 use crate::provider::{
     CreateRequest, DeleteRequest, PartialReadDiagnostic, Provider, ProviderNormalizer,
-    ProviderReadyResource, ReadRequest, UpdateOutcome, UpdateRequest, build_update_patch,
+    ProviderReadyResource, ReadRequest, UpdateOutcome, UpdateRequest,
 };
 use crate::resolver::resolve_ref_value;
 use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
@@ -598,7 +598,7 @@ pub(super) async fn execute_basic_effect<'a>(
             };
             let resolved_attrs = resolved.as_resource().resolved_attributes();
             match provider
-                .create(&resource.id, CreateRequest { resource: resolved })
+                .create(&resource.id, CreateRequest::checked(resolved))
                 .await
             {
                 Ok(outcome) => {
@@ -719,8 +719,7 @@ pub(super) async fn execute_basic_effect<'a>(
                     effective_changed.push(key.clone());
                 }
             }
-            let patch = build_update_patch(&effective_changed, &resolved_to, from);
-            let request = UpdateRequest::checked(from.clone(), patch, &resolved_to);
+            let request = UpdateRequest::checked(from.clone(), &effective_changed, &resolved_to);
             match provider.update(id, identifier, request).await {
                 Ok(outcome) => {
                     let diagnostic = match &outcome {

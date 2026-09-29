@@ -365,17 +365,27 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 /// A merely resolved resource is not sufficient to build this request:
 ///
 /// ```compile_fail
-/// use carina_core::provider::{CreateRequest, ProviderReady};
-/// use carina_core::resource::{ResolvedResource, Resource};
+/// use carina_core::provider::{CreateRequest, ProviderReadyResource};
 ///
-/// let resolved = ResolvedResource::new(Resource::new("test", "example"));
-/// let resource = ProviderReady(resolved); // private tuple field
-/// let _request = CreateRequest { resource };
+/// fn forge(resource: ProviderReadyResource) -> CreateRequest {
+///     CreateRequest { resource }
+/// }
 /// ```
 #[derive(Debug, Clone)]
 pub struct CreateRequest {
     /// Full desired state for the new resource.
-    pub resource: ProviderReadyResource,
+    resource: ProviderReadyResource,
+}
+
+impl CreateRequest {
+    pub(crate) fn checked(resource: ProviderReadyResource) -> Self {
+        Self { resource }
+    }
+
+    /// Full desired state after provider-boundary checks.
+    pub fn resource(&self) -> &ProviderReadyResource {
+        &self.resource
+    }
 }
 
 /// Per-operation request record for [`Provider::read`].
@@ -402,44 +412,53 @@ pub struct ReadRequest;
 /// preparation path:
 ///
 /// ```compile_fail
-/// use carina_core::provider::UpdateRequest;
+/// use carina_core::provider::{UpdatePatch, UpdateRequest};
+/// use carina_core::resource::State;
 ///
-/// let from = unimplemented!();
-/// let patch = unimplemented!();
-/// let _request = UpdateRequest {
-///     from,
-///     patch,
-///     ..unimplemented!()
-/// };
+/// fn forge(from: State, patch: UpdatePatch) -> UpdateRequest {
+///     UpdateRequest { from, patch }
+/// }
+/// ```
+///
+/// A checked patch cannot be replaced after construction either:
+///
+/// ```compile_fail
+/// use carina_core::provider::{UpdatePatch, UpdateRequest};
+///
+/// fn replace_patch(request: &mut UpdateRequest, replacement: UpdatePatch) {
+///     request.patch = replacement;
+/// }
 /// ```
 #[derive(Debug, Clone)]
 pub struct UpdateRequest {
     /// Current provider-side state. May be used for read-modify-write
     /// paths or for resolving server-assigned identifiers; MUST NOT be
     /// used to derive additional fields to write back.
-    pub from: State,
+    from: State,
     /// Structured description of the user's intended change.
-    pub patch: UpdatePatch,
-    /// Proof that the desired resource passed the provider-preparation gate.
-    _provider_ready: ProviderRequestWitness,
+    patch: UpdatePatch,
 }
 
 impl UpdateRequest {
     pub(crate) fn checked(
         from: State,
-        patch: UpdatePatch,
-        _resource: &ProviderReadyResource,
+        changed_attributes: &[String],
+        resource: &ProviderReadyResource,
     ) -> Self {
-        Self {
-            from,
-            patch,
-            _provider_ready: ProviderRequestWitness,
-        }
+        let patch = build_update_patch(changed_attributes, resource, &from);
+        Self { from, patch }
+    }
+
+    /// Current provider-side state.
+    pub fn from(&self) -> &State {
+        &self.from
+    }
+
+    /// Patch derived from the checked desired resource.
+    pub fn patch(&self) -> &UpdatePatch {
+        &self.patch
     }
 }
-
-#[derive(Debug, Clone, Copy)]
-struct ProviderRequestWitness;
 
 /// Per-operation request record for [`Provider::delete`].
 ///
@@ -853,7 +872,7 @@ pub trait Provider: Send + Sync {
         resource: &ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>>;
 
-    /// Create the resource described by `request.resource` and return
+    /// Create the resource described by `request.resource()` and return
     /// the resulting state (with `identifier` set to the cloud-side
     /// internal ID, e.g. `vpc-xxx`).
     fn create(
@@ -862,17 +881,17 @@ pub trait Provider: Send + Sync {
         request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<CreateOutcome>>;
 
-    /// Update an existing resource by applying `request.patch`.
+    /// Update an existing resource by applying `request.patch()`.
     ///
     /// Each [`PatchOp`] corresponds to a key the user explicitly
     /// specified or removed in the desired state. Fields the user has
     /// never specified do not appear in the patch.
     ///
     /// **Providers MUST NOT modify any attribute that is not
-    /// represented in `request.patch.ops`.** The patch is the sole
+    /// represented in `request.patch().ops`.** The patch is the sole
     /// source of truth for the update payload.
     ///
-    /// `request.from` is the current provider-side state and may be
+    /// `request.from()` is the current provider-side state and may be
     /// used for read-modify-write paths or for resolving
     /// server-assigned identifiers; it MUST NOT be used to derive
     /// additional fields to write back.
@@ -2034,7 +2053,7 @@ mod tests {
             request: CreateRequest,
         ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
             let id = id.clone();
-            let attrs = request.resource.as_resource().attributes.clone();
+            let attrs = request.resource().as_resource().attributes.clone();
             Box::pin(async move {
                 let state = State::existing(id, crate::resource::attrs_to_hashmap(&attrs))
                     .with_identifier("mock-id-123");
@@ -2051,12 +2070,12 @@ mod tests {
             let id = id.clone();
             // Apply the patch on top of `from` so the test sees the
             // user-specified changes round-tripped into State.
-            let mut attrs = request.from.attributes.clone();
-            for op in request.patch.ops {
+            let mut attrs = request.from().attributes.clone();
+            for op in &request.patch().ops {
                 match op.kind {
                     PatchOpKind::Add | PatchOpKind::Replace => {
-                        if let Some(v) = op.value {
-                            attrs.insert(op.key, v);
+                        if let Some(v) = &op.value {
+                            attrs.insert(op.key.clone(), v.clone());
                         }
                     }
                     PatchOpKind::Remove => {
@@ -2346,12 +2365,7 @@ mod tests {
         let resource = Resource::new("test", "example");
         let id = resource.id.clone();
         let state = provider
-            .create(
-                &id,
-                CreateRequest {
-                    resource: resolved_for_test(resource),
-                },
-            )
+            .create(&id, CreateRequest::checked(resolved_for_test(resource)))
             .await
             .unwrap()
             .into_state_for_writeback();
@@ -2377,12 +2391,7 @@ mod tests {
         let resource = Resource::with_provider("mock", "test", "example", None);
         let id = resource.id.clone();
         let state = router
-            .create(
-                &id,
-                CreateRequest {
-                    resource: resolved_for_test(resource),
-                },
-            )
+            .create(&id, CreateRequest::checked(resolved_for_test(resource)))
             .await
             .unwrap()
             .into_state_for_writeback();
@@ -2835,11 +2844,7 @@ mod tests {
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let from = State::existing(id.clone(), HashMap::new());
         let ready = resolved_for_test(Resource::with_provider("mock", "test", "example", None));
-        let request = UpdateRequest::checked(
-            from,
-            build_update_patch(&[], &ready, &State::existing(id.clone(), HashMap::new())),
-            &ready,
-        );
+        let request = UpdateRequest::checked(from, &[], &ready);
         let state = router
             .update(&id, "mock-id-123", request)
             .await
