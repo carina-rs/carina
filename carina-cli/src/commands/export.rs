@@ -7,8 +7,8 @@ use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::parser::ProviderContext;
 use carina_state::{StateBackend, resolve_backend_for_read};
 
-use crate::commands::hint::ProjectCommand;
 use crate::error::AppError;
+use carina_core::hint::ProjectCommand;
 
 /// Output format for the export command.
 pub enum OutputFormat {

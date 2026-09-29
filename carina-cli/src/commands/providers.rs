@@ -1,12 +1,10 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use carina_provider_resolver::{LockFile, LockFileMigration};
+use carina_provider_resolver::{LockFile, LockFileMigration, provider_lock_path};
 
-use crate::commands::hint::ProjectCommand;
 use crate::error::AppError;
-
-const PROVIDER_LOCK_FILE: &str = "carina-providers.lock";
+use carina_core::hint::ProjectCommand;
 
 #[derive(clap::Subcommand)]
 pub enum ProvidersCommands {
@@ -71,8 +69,8 @@ pub fn run_providers_command(command: ProvidersCommands) -> Result<(), AppError>
 }
 
 fn load_lock(base_dir: &Path) -> Result<(PathBuf, LockFile, Option<LockFileMigration>), AppError> {
-    let lock_path = base_dir.join(PROVIDER_LOCK_FILE);
-    let loaded = LockFile::load(&lock_path)
+    let lock_path = provider_lock_path(base_dir);
+    let loaded = LockFile::load(base_dir)
         .map_err(|error| AppError::Config(error.to_string()))?
         .ok_or_else(|| {
             AppError::Config(format!(

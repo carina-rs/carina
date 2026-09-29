@@ -17,7 +17,6 @@ use carina_state::{BackendConfig as StateBackendConfig, StateBackend, StateFile,
 
 use super::{BackendDriftStatus, drift_warning, inspect_backend_drift};
 use crate::DetailLevel;
-use crate::commands::hint::ProjectCommand;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::display::{print_plan, refresh_plan_separator};
 use crate::error::AppError;
@@ -25,6 +24,7 @@ use crate::wiring::{
     WiringContext, build_factories_from_providers, create_plan_from_parsed_with_upstream,
     reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
 };
+use carina_core::hint::ProjectCommand;
 
 /// Saved plan file for `plan --out` / `apply plan.json`
 #[derive(Debug, Serialize, Deserialize)]

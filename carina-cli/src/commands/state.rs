@@ -27,7 +27,6 @@ use carina_state::{
 };
 
 use super::{BackendDriftStatus, DriftCommand, inspect_backend_drift, verify_for_mutation};
-use crate::commands::hint::ProjectCommand;
 use crate::commands::shared::finalize::release_lock_after_execute;
 use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overrides};
 use crate::error::AppError;
@@ -36,6 +35,7 @@ use crate::wiring::{
     get_provider_with_ctx, read_data_source_with_retry, reconcile_anonymous_identifiers_with_ctx,
     reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
 };
+use carina_core::hint::ProjectCommand;
 
 /// Convert a lock acquisition error into an `AppError`.
 ///

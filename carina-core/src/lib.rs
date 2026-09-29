@@ -17,6 +17,7 @@ pub mod executor;
 pub mod explicit;
 pub mod formatter;
 pub mod heredoc;
+pub mod hint;
 pub mod identifier;
 pub mod keywords;
 pub mod lint;

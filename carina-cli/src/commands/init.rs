@@ -7,11 +7,11 @@ use carina_core::parser::ProviderContext;
 
 use carina_provider_resolver::{self, LockMode};
 
-use crate::commands::hint::ProjectCommand;
 use crate::commands::migrate_state::{MigrationOutcome, SourceDisposition, run_init_migrate_state};
 use crate::commands::{
     BackendDriftStatus, drift_warning, ensure_backend_lock, inspect_backend_drift,
 };
+use carina_core::hint::ProjectCommand;
 
 pub async fn run_init(
     path: &Path,

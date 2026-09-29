@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+use carina_core::hint::ProjectCommand;
 use carina_core::parser::ProviderConfig;
 use carina_provider_resolver::{LockMode, resolve_all};
 use indexmap::IndexMap;
@@ -279,6 +280,14 @@ fn init_reports_v2_lock_migration_once_before_authorization_error() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     let header = "Provider lock format migration: version 2 -> version 3";
     assert!(stderr.contains(header), "{stderr}");
+    let repin_command =
+        ProjectCommand::new("providers repin-discovery", dir.path()).with_argument(HOST);
+    assert!(stderr.contains(&format!("`{repin_command}`")), "{stderr}");
+    let lock_path = dir.path().join("carina-providers.lock");
+    assert!(
+        stderr.contains(&format!("Lock file: {}", lock_path.display())),
+        "{stderr}"
+    );
     assert_eq!(
         stderr.matches(header).count(),
         1,
@@ -360,7 +369,7 @@ fn repin_discovery_prints_and_clears_consumed_host_values_only() {
     assert!(!stdout.contains("Enter registry host"), "{stdout}");
 
     let lock_path = dir.path().join("carina-providers.lock");
-    carina_provider_resolver::LockFile::load(&lock_path)
+    carina_provider_resolver::LockFile::load(dir.path())
         .expect("re-pinned lock must remain parseable")
         .expect("re-pinned lock must remain present");
     let saved = fs::read_to_string(lock_path).unwrap();
@@ -465,7 +474,7 @@ fn repin_identity_prints_discarded_pin_and_preserves_other_lock_state() {
     assert!(!stdout.contains("Enter provider source"), "{stdout}");
 
     let lock_path = dir.path().join("carina-providers.lock");
-    carina_provider_resolver::LockFile::load(&lock_path)
+    carina_provider_resolver::LockFile::load(dir.path())
         .expect("repinned lock must remain parseable")
         .expect("repinned lock must remain present");
     let saved = fs::read_to_string(lock_path).unwrap();
@@ -502,7 +511,7 @@ fn rebootstrap_prints_and_clears_both_freshness_values_only() {
     assert!(!stdout.contains("Enter provider source"), "{stdout}");
 
     let lock_path = dir.path().join("carina-providers.lock");
-    carina_provider_resolver::LockFile::load(&lock_path)
+    carina_provider_resolver::LockFile::load(dir.path())
         .expect("re-bootstrapped lock must remain parseable")
         .expect("re-bootstrapped lock must remain present");
     let saved = fs::read_to_string(lock_path).unwrap();

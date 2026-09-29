@@ -31,7 +31,6 @@ use carina_core::parser::{ProviderConfig, ProviderContext};
 
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
-use crate::commands::hint::ProjectCommand;
 use crate::commands::plan::{PlanFile, collect_delete_attributes};
 use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
@@ -59,6 +58,7 @@ use crate::wiring::{
     reconcile_anonymous_identifiers_with_ctx, reconcile_late_anonymous_identities,
     reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
 };
+use carina_core::hint::ProjectCommand;
 
 /// Re-export ExecutionResult as the public API for apply results.
 pub type ApplyResult = ExecutionResult;
@@ -648,7 +648,7 @@ pub(crate) async fn save_state_unlocked_after_execute(
 /// would skip the writer entirely and leave the on-disk version
 /// stuck at the older schema — which is the bug reported in
 /// carina#3315 and which makes carina#3283's "Disk state will be
-/// rewritten on the next `carina apply` or `carina state refresh`"
+/// rewritten during the next apply or state refresh of that project."
 /// warning text a lie.
 ///
 /// Persistence happens exactly once per state file's schema lifetime:
@@ -1191,7 +1191,8 @@ async fn run_apply_locked(
     // lifted an older on-disk schema in memory, persist the upgrade
     // under the current lock before any short-circuit path can return
     // — otherwise the carina#3283 warning text ("Disk state will be
-    // rewritten on the next `carina apply`...") becomes a lie.
+    // rewritten during the next apply or state refresh of that project.")
+    // becomes a lie.
     let mut state_file = load_state_persist_if_migrated(backend, lock).await?;
     if let Some(state) = state_file.as_ref() {
         check_legacy_name_overrides(
@@ -2016,7 +2017,7 @@ async fn run_apply_from_plan_with_observer_factory(
         println!(
             "{}",
             format!(
-                "Warning: plan was created with carina {} but current version is {}",
+                "Warning: plan was created with carina version {} but current version is {}",
                 plan_file.carina_version, current_version
             )
             .yellow()

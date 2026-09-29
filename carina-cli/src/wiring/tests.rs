@@ -5051,7 +5051,10 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     assert!(rendered.contains("carina-providers.lock"));
     assert!(rendered.contains("revision main"));
     assert!(rendered.contains("resolved_sha deadbeefcafe1234567890"));
-    assert!(rendered.contains("carina init --upgrade"));
+    assert!(
+        rendered.contains(&format!("`carina init --upgrade {}`", base.display())),
+        "{rendered}"
+    );
 }
 
 #[test]
@@ -5096,7 +5099,10 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
     assert!(rendered.contains(&lock_path.display().to_string()));
     assert!(rendered.contains("revision main"));
     assert!(rendered.contains("resolved_sha deadbeefcafe1234567890"));
-    assert!(rendered.contains("Run `carina init`"));
+    assert!(
+        rendered.contains(&format!("Run `carina init {}`", base.display())),
+        "{rendered}"
+    );
     assert!(!rendered.contains("lock is stale"));
     assert!(!rendered.contains("carina init --upgrade"));
 }
@@ -5312,6 +5318,10 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
         Ok(_) => panic!("mismatched provider lock must be returned as an error"),
     };
 
-    assert!(error.to_string().contains("locked at version 1.0.0"));
-    assert!(error.to_string().contains("carina init --upgrade"));
+    let rendered = error.to_string();
+    assert!(rendered.contains("locked at version 1.0.0"));
+    assert!(
+        rendered.contains(&format!("`carina init --upgrade {}`", base.display())),
+        "{rendered}"
+    );
 }

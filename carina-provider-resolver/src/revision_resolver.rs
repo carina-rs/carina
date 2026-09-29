@@ -5,6 +5,8 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use carina_core::hint::ProjectCommand;
+
 /// GitHub Actions artifact metadata (subset used by the resolver).
 #[derive(Deserialize)]
 struct Artifact {
@@ -340,6 +342,25 @@ pub(crate) fn global_cache_path_revision(source: &str, sha: &str) -> Option<Path
     })
 }
 
+fn checksum_mismatch_error(
+    name: &str,
+    source: &str,
+    sha: &str,
+    expected: &str,
+    actual: &str,
+    project_dir: &Path,
+) -> String {
+    format!(
+        "SHA256 mismatch for provider '{}' ({}@{}). Expected: {}, got: {}. Re-run `{}` to re-download.",
+        name,
+        source,
+        &sha[..12],
+        expected,
+        actual,
+        ProjectCommand::new("init", project_dir)
+    )
+}
+
 /// Resolve a provider by revision: download from CI artifacts if not cached.
 pub fn resolve_provider_by_revision(
     base_dir: &Path,
@@ -378,13 +399,13 @@ pub fn resolve_provider_by_revision(
         if let Some(lock_entry) = lock_file.find_by_source_and_sha(source, &sha)
             && actual_hash != lock_entry.sha256
         {
-            return Err(format!(
-                "SHA256 mismatch for provider '{}' ({}@{}). Expected: {}, got: {}. Re-run `carina init` to re-download.",
+            return Err(checksum_mismatch_error(
                 name,
                 source,
-                &sha[..12],
-                lock_entry.sha256,
-                actual_hash
+                &sha,
+                &lock_entry.sha256,
+                &actual_hash,
+                base_dir,
             ));
         }
         // Record the entry so a caller that subsequently writes the lock
@@ -487,6 +508,8 @@ pub fn resolve_provider_by_revision(
 mod tests {
     use super::*;
 
+    static GITHUB_TOKEN_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_parse_source_valid() {
         let (owner, repo) = parse_source("github.com/carina-rs/carina-provider-awscc").unwrap();
@@ -527,12 +550,92 @@ mod tests {
     }
 
     #[test]
+    fn checksum_mismatch_hint_uses_project_dir_and_omits_dot() {
+        let nested = checksum_mismatch_error(
+            "aws",
+            TEST_SOURCE,
+            TEST_SHA,
+            "expected",
+            "actual",
+            Path::new("infra/foo"),
+        );
+        assert!(
+            nested.contains("Re-run `carina init infra/foo` to re-download"),
+            "{nested}"
+        );
+
+        let default = checksum_mismatch_error(
+            "aws",
+            TEST_SOURCE,
+            TEST_SHA,
+            "expected",
+            "actual",
+            Path::new("."),
+        );
+        assert!(
+            default.contains("Re-run `carina init` to re-download"),
+            "{default}"
+        );
+        assert!(!default.contains("carina init ."), "{default}");
+    }
+
+    #[test]
+    fn cached_revision_checksum_mismatch_uses_resolver_project_dir() {
+        let _env_guard = GITHUB_TOKEN_ENV.lock().unwrap();
+        let previous_token = std::env::var_os("GITHUB_TOKEN");
+        unsafe { std::env::set_var("GITHUB_TOKEN", "test-token") };
+
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = cache_path_revision(dir.path(), TEST_SOURCE, TEST_SHA);
+        std::fs::create_dir_all(wasm_path.parent().unwrap()).unwrap();
+        std::fs::write(&wasm_path, b"tampered provider").unwrap();
+        let mut lock_file = crate::provider_resolver::LockFile::default();
+        lock_file.upsert(crate::provider_resolver::LockEntry {
+            name: "aws".into(),
+            source: TEST_SOURCE.into(),
+            kind: crate::provider_resolver::LockEntryKind::Revision {
+                revision: "main".into(),
+                resolved_sha: TEST_SHA.into(),
+            },
+            sha256: "expected-sha256".into(),
+            registry: None,
+        });
+
+        let result = resolve_provider_by_revision(
+            dir.path(),
+            TEST_SOURCE,
+            "main",
+            "aws",
+            &mut lock_file,
+            false,
+        );
+        match previous_token {
+            Some(token) => unsafe { std::env::set_var("GITHUB_TOKEN", token) },
+            None => unsafe { std::env::remove_var("GITHUB_TOKEN") },
+        }
+        let error = result.expect_err("the cached artifact hash must not match its lock pin");
+
+        assert!(
+            error.contains(&format!(
+                "Re-run `carina init {}` to re-download",
+                dir.path().display()
+            )),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn test_get_github_token_from_env() {
         // This test only verifies the env var path; gh CLI path is harder to unit test
+        let _env_guard = GITHUB_TOKEN_ENV.lock().unwrap();
+        let previous_token = std::env::var_os("GITHUB_TOKEN");
         unsafe { std::env::set_var("GITHUB_TOKEN", "test-token-123") };
         let token = get_github_token().unwrap();
         assert_eq!(token, "test-token-123");
-        unsafe { std::env::remove_var("GITHUB_TOKEN") };
+        match previous_token {
+            Some(token) => unsafe { std::env::set_var("GITHUB_TOKEN", token) },
+            None => unsafe { std::env::remove_var("GITHUB_TOKEN") },
+        }
     }
 
     const TEST_SOURCE: &str = "github.com/carina-rs/carina-provider-aws";
