@@ -4226,7 +4226,97 @@ mod saved_plan_version_tests {
 
     use tempfile::TempDir;
 
-    use super::{ApplyTarget, saved_plan_replan_project_dir};
+    use super::{ApplyTarget, PlanFileHeader, saved_plan_replan_project_dir};
+
+    #[tokio::test]
+    async fn future_saved_plan_without_source_path_is_rejected_by_version() {
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("future-plan");
+        std::fs::write(&plan_path, r#"{"version":99,"timestamp":"x"}"#).expect("write future plan");
+
+        let result = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await;
+
+        let error = result.expect_err("future saved plan must be rejected by version");
+        let crate::error::AppError::UnsupportedPlanVersion {
+            path: error_path,
+            found,
+            expected,
+            replan_command,
+        } = &error
+        else {
+            panic!("expected typed unsupported-version error, got: {error}");
+        };
+        assert_eq!(error_path, &plan_path);
+        assert_eq!(*found, 99);
+        assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
+        assert_eq!(replan_command, &None);
+
+        let message = error.to_string();
+        assert!(
+            message.contains("Unsupported plan file version: 99"),
+            "version must be checked without requiring source_path: {message}",
+        );
+        assert!(
+            message
+                .contains("Re-create the plan with plan --out from the project that produced it"),
+            "missing source_path must use source-agnostic guidance: {message}",
+        );
+        assert!(
+            !message.contains("is not a Carina plan file") && !message.contains("`carina plan"),
+            "future plans without source_path must not be misclassified or use a guessed command: {message}",
+        );
+    }
+
+    #[tokio::test]
+    async fn current_saved_plan_without_source_path_is_corrupt_without_command() {
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("current-plan");
+        let malformed = serde_json::json!({
+            "version": crate::commands::plan::PlanFile::CURRENT_VERSION,
+            "timestamp": "x",
+            "foo": 1,
+        });
+        std::fs::write(
+            &plan_path,
+            serde_json::to_vec(&malformed).expect("serialize malformed plan"),
+        )
+        .expect("write malformed plan");
+
+        let result = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await;
+
+        let message = result
+            .expect_err("malformed current plan must be reported as corrupt")
+            .to_string();
+        assert!(
+            message.contains("The plan file may be corrupted")
+                && message.contains(
+                    "Re-create the plan with plan --out from the project that produced it"
+                ),
+            "missing source_path must use corruption guidance without a command: {message}",
+        );
+        assert!(
+            !message.contains("is not a Carina plan file") && !message.contains("`carina plan"),
+            "a recognized current-version plan must not be misclassified or use a guessed command: {message}",
+        );
+    }
 
     /// A `version: 3` saved plan must be rejected by
     /// `run_apply_from_plan` with a message that names the expected
@@ -4332,7 +4422,7 @@ mod saved_plan_version_tests {
             "version": 9,
             "carina_version": "0.4.0",
             "timestamp": "2026-07-02T00:00:00Z",
-            "source_path": "test.crn",
+            "source_path": "infra/nested",
             "state_lineage": null,
             "state_serial": null,
             "provider_configs": [],
@@ -4361,6 +4451,21 @@ mod saved_plan_version_tests {
         .await;
 
         let err = result.expect_err("v9 saved plan must be rejected after v10 bump");
+        let crate::error::AppError::UnsupportedPlanVersion {
+            path: error_path,
+            found,
+            expected,
+            replan_command,
+        } = &err
+        else {
+            panic!("expected typed unsupported-version error, got: {err}");
+        };
+        assert_eq!(error_path, &plan_path);
+        assert_eq!(*found, 9);
+        assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
+        let expected_replan = format!("carina plan --out {} infra/nested", plan_path.display());
+        assert_eq!(replan_command.as_deref(), Some(expected_replan.as_str()));
+
         let msg = err.to_string();
         assert!(
             msg.contains("Unsupported plan file version: 9"),
@@ -4369,6 +4474,143 @@ mod saved_plan_version_tests {
         assert!(
             msg.contains("expected 10"),
             "error must name the v10 expected version, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_plan_decode_rejects_legacy_import_shape_by_version() {
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("reviewed-plan");
+        let import_id = carina_core::resource::ResolvedResourceId::new(
+            carina_core::resource::ResourceId::with_identity("mock.test.resource", "legacy"),
+        );
+        let legacy_v4 = serde_json::json!({
+            "version": 4,
+            "carina_version": "0.4.0",
+            "timestamp": "2026-05-24T00:00:00Z",
+            "source_path": "infra/nested",
+            "state_lineage": null,
+            "state_serial": null,
+            "provider_configs": [],
+            "backend_config": null,
+            "plan": {
+                "effects": [{
+                    "Import": {
+                        "id": import_id,
+                        "identifier": "legacy-provider-id"
+                    }
+                }]
+            },
+            "sorted_resources": [],
+            "unresolved_resources": [],
+            "compositions": [],
+            "data_sources": [],
+            "current_states": [],
+            "upstream_snapshot": {},
+            "upstream_sources": [],
+            "wait_bindings": [],
+        });
+        std::fs::write(
+            &plan_path,
+            serde_json::to_string(&legacy_v4).expect("serialize legacy plan"),
+        )
+        .expect("write legacy plan");
+
+        let result = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await;
+
+        let message = result
+            .expect_err("legacy saved plan must be rejected by the version gate")
+            .to_string();
+        let current_version = crate::commands::plan::PlanFile::CURRENT_VERSION;
+        assert!(
+            message.contains(&format!(
+                "Unsupported plan file version: 4 (expected {current_version})"
+            )),
+            "legacy wire shapes must reach the version gate: {message}",
+        );
+        assert!(
+            message.contains(&format!(
+                "Re-run `carina plan --out {} infra/nested`",
+                plan_path.display()
+            )),
+            "version error must include the recorded source path: {message}",
+        );
+        assert!(
+            !message.contains("is not a Carina plan file"),
+            "a recognized older plan must not be called a non-plan file: {message}",
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_plan_decode_reports_malformed_current_version_as_corrupt() {
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("reviewed-plan");
+        let malformed = serde_json::json!({
+            "version": crate::commands::plan::PlanFile::CURRENT_VERSION,
+            "carina_version": "0.4.0",
+            "timestamp": "2026-07-02T00:00:00Z",
+            "source_path": "infra/nested",
+            "state_lineage": null,
+            "state_serial": null,
+            "provider_configs": [],
+            "backend_config": null,
+            "plan": { "effects": "not-an-array" },
+            "sorted_resources": [],
+            "unresolved_resources": [],
+            "compositions": [],
+            "data_sources": [],
+            "current_states": [],
+            "upstream_snapshot": {},
+            "upstream_sources": [],
+            "wait_bindings": [],
+        });
+        std::fs::write(
+            &plan_path,
+            serde_json::to_string(&malformed).expect("serialize malformed plan"),
+        )
+        .expect("write malformed plan");
+
+        let result = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await;
+
+        let message = result
+            .expect_err("malformed current-version plan must be rejected")
+            .to_string();
+        assert!(
+            message.contains("The plan file may be corrupted. Re-run"),
+            "current-version structural errors must be reported as corruption: {message}",
+        );
+        assert!(
+            message.contains("line") && message.contains("column"),
+            "body decode errors must retain their source location: {message}",
+        );
+        assert!(
+            message.contains(&format!(
+                "`carina plan --out {} infra/nested`",
+                plan_path.display()
+            )),
+            "corruption error must include the replan command: {message}",
+        );
+        assert!(
+            !message.contains("is not a Carina plan file"),
+            "a recognized current-version plan must not be called a non-plan file: {message}",
         );
     }
 
@@ -4445,6 +4687,27 @@ mod saved_plan_version_tests {
         };
         let json = serde_json::to_value(&plan_file).expect("plan file should serialize");
         (dir, plan_path, json)
+    }
+
+    #[test]
+    fn saved_plan_header_decodes_from_current_serialized_plan_file() {
+        let (_dir, _plan_path, json) = replacement_plan_json();
+        let serialized = serde_json::to_vec(&json).expect("real plan must serialize");
+
+        let header: PlanFileHeader =
+            serde_json::from_slice(&serialized).expect("real plan must decode as a header");
+
+        assert_eq!(
+            header.version,
+            crate::commands::plan::PlanFile::CURRENT_VERSION
+        );
+        assert_eq!(
+            header
+                .source_path
+                .as_ref()
+                .and_then(serde_json::Value::as_str),
+            json.get("source_path").and_then(serde_json::Value::as_str)
+        );
     }
 
     async fn rejected_saved_plan_message(

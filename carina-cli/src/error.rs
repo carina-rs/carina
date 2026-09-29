@@ -1,7 +1,34 @@
 //! Typed application error for carina-cli
 
+use std::path::{Path, PathBuf};
+
+use carina_core::hint::ProjectCommand;
 use carina_core::provider::ProviderError;
 use carina_state::BackendError;
+
+fn apply_input_expectation() -> String {
+    format!(
+        "`{}` expects a project directory or a plan file written by `{}`.",
+        ProjectCommand::new("apply", Path::new(".")),
+        ProjectCommand::new("plan --out", Path::new(".")),
+    )
+}
+
+fn unreadable_json_plan_guidance() -> String {
+    format!(
+        "If it is a saved plan, it may be truncated or corrupted; re-create it with `{}`.",
+        ProjectCommand::new("plan --out", Path::new(".")),
+    )
+}
+
+fn plan_file_recreation_guidance(replan_command: Option<&str>) -> String {
+    match replan_command {
+        Some(command) => {
+            format!("Re-run `{command}` to produce a plan in the current format.")
+        }
+        None => "Re-create the plan with plan --out from the project that produced it.".to_string(),
+    }
+}
 
 /// Render a provider initialization error as user-facing text.
 ///
@@ -137,6 +164,98 @@ pub enum AppError {
     #[error("{0}")]
     Config(String),
 
+    /// The path passed to `apply` does not exist, so its input kind is unknown.
+    #[error(
+        "Apply input '{}' does not exist.\n{}",
+        path.display(),
+        apply_input_expectation()
+    )]
+    ApplyInputNotFound {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The path passed to `apply` is a symlink whose target does not exist.
+    #[error(
+        "Apply input '{}' is a symbolic link whose target does not exist.\n{}",
+        path.display(),
+        apply_input_expectation()
+    )]
+    ApplyInputDanglingSymlink {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The path passed to `apply` could not be inspected before dispatch.
+    #[error("Failed to inspect apply input '{}': {source}", path.display())]
+    ApplyInputInspection {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// An existing file passed to `apply` was not a serialized Carina plan.
+    #[error(
+        "File '{}' is not a Carina plan file (or the plan file is corrupted).\n{}\n\
+         Detail: {source}",
+        path.display(),
+        apply_input_expectation()
+    )]
+    InvalidPlanFile {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// A file passed to `apply` was not syntactically valid JSON.
+    #[error(
+        "File '{}' could not be parsed as JSON, so it is not a readable Carina plan file.\n{}\n{}\n\
+         JSON error: {source}",
+        path.display(),
+        unreadable_json_plan_guidance(),
+        apply_input_expectation()
+    )]
+    UnreadableJsonPlanFile {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// A saved plan could not be read from the filesystem.
+    #[error("Failed to read plan file '{}': {source}", path.display())]
+    PlanFileRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A recognized saved plan uses a format version this binary cannot apply.
+    #[error(
+        "Unsupported plan file version: {found} (expected {expected}). {}",
+        plan_file_recreation_guidance(replan_command.as_deref())
+    )]
+    UnsupportedPlanVersion {
+        path: PathBuf,
+        found: u32,
+        expected: u32,
+        replan_command: Option<String>,
+    },
+
+    /// A recognized current-version plan had a malformed full body.
+    #[error(
+        "Failed to parse plan file '{}': {source}\nThe plan file may be corrupted. {}",
+        path.display(),
+        plan_file_recreation_guidance(replan_command.as_deref())
+    )]
+    CorruptPlanFile {
+        path: PathBuf,
+        replan_command: Option<String>,
+        #[source]
+        source: serde_json::Error,
+    },
+
     /// Apply completed with one or more partial create results.
     #[error("{0}")]
     PartialSuccess(String),
@@ -231,6 +350,87 @@ mod tests {
     fn interrupted_error() {
         let app_err = AppError::Interrupted;
         assert_eq!(app_err.to_string(), "Operation cancelled by user");
+    }
+
+    #[test]
+    fn invalid_plan_file_preserves_serde_error_as_source() {
+        let source = serde_json::from_value::<Vec<serde_json::Value>>(serde_json::json!({}))
+            .expect_err("fixture must not match the expected structure");
+        let source_detail = source.to_string();
+        let app_err = AppError::InvalidPlanFile {
+            path: PathBuf::from("reviewed-plan"),
+            source,
+        };
+
+        assert!(
+            std::error::Error::source(&app_err)
+                .is_some_and(|source| source.downcast_ref::<serde_json::Error>().is_some()),
+            "serde error must remain available through the error source chain"
+        );
+        assert!(app_err.to_string().contains(&source_detail));
+    }
+
+    #[test]
+    fn unreadable_json_plan_file_preserves_serde_error_as_source() {
+        let source = serde_json::from_str::<serde_json::Value>("not json")
+            .expect_err("fixture must not be valid JSON");
+        let source_detail = source.to_string();
+        let app_err = AppError::UnreadableJsonPlanFile {
+            path: PathBuf::from("truncated-plan"),
+            source,
+        };
+
+        assert!(
+            std::error::Error::source(&app_err)
+                .is_some_and(|source| source.downcast_ref::<serde_json::Error>().is_some()),
+            "serde error must remain available through the error source chain"
+        );
+        assert!(app_err.to_string().contains(&source_detail));
+    }
+
+    #[test]
+    fn dangling_apply_symlink_preserves_io_error_as_source() {
+        let app_err = AppError::ApplyInputDanglingSymlink {
+            path: PathBuf::from("dangling-plan"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing target"),
+        };
+
+        assert!(
+            std::error::Error::source(&app_err)
+                .is_some_and(|source| source.downcast_ref::<std::io::Error>().is_some()),
+            "I/O error must remain available through the error source chain"
+        );
+    }
+
+    #[test]
+    fn plan_file_read_preserves_io_error_as_source() {
+        let app_err = AppError::PlanFileRead {
+            path: PathBuf::from("reviewed-plan"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+
+        assert!(
+            std::error::Error::source(&app_err)
+                .is_some_and(|source| source.downcast_ref::<std::io::Error>().is_some()),
+            "I/O error must remain available through the error source chain"
+        );
+    }
+
+    #[test]
+    fn corrupt_plan_file_preserves_serde_error_as_source() {
+        let source = serde_json::from_value::<Vec<serde_json::Value>>(serde_json::json!({}))
+            .expect_err("fixture must not match the expected structure");
+        let app_err = AppError::CorruptPlanFile {
+            path: PathBuf::from("reviewed-plan"),
+            replan_command: Some("replan command".to_string()),
+            source,
+        };
+
+        assert!(
+            std::error::Error::source(&app_err)
+                .is_some_and(|source| source.downcast_ref::<serde_json::Error>().is_some()),
+            "serde error must remain available through the error source chain"
+        );
     }
 
     #[test]

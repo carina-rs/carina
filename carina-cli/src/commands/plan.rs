@@ -26,16 +26,27 @@ use crate::wiring::{
 };
 use carina_core::hint::ProjectCommand;
 
-/// Saved plan file for `plan --out` / `apply plan.json`
+/// Saved plan file for `plan --out` / `apply <plan-file>`
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PlanFile {
-    /// Plan file format version
+    /// Plan file format version.
+    ///
+    /// `PlanFileHeader` in `commands/apply/mod.rs` relies on this field and
+    /// `timestamp` to recognize saved plans before decoding format-specific
+    /// fields. Their serialized names must remain stable across plan formats;
+    /// the version must also remain a `u32` (guarded by a test).
     pub version: u32,
     /// Carina version that created this plan
     pub carina_version: String,
-    /// ISO 8601 timestamp
+    /// ISO 8601 timestamp.
+    ///
+    /// Its presence is the plan-only discriminator used by `PlanFileHeader`;
+    /// keep its serialized name stable across plan formats.
     pub timestamp: String,
-    /// Original .crn path (informational)
+    /// Original .crn path (informational).
+    ///
+    /// `PlanFileHeader` decodes this field on a best-effort basis to render
+    /// replan guidance when the format has a string value for it.
     pub source_path: String,
     /// State lineage for drift detection
     pub state_lineage: Option<String>,
