@@ -2186,6 +2186,193 @@ async fn nested_forwarded_module_constraint_blocks_provider_dispatch() {
 }
 
 #[tokio::test]
+async fn outer_module_constraint_blocks_nested_inner_consumer_provider_dispatch() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::resource::CompositionAttribute;
+
+    let provider = MockProvider::new();
+    let violating = Value::Concrete(ConcreteValue::String("bad".to_string()));
+    let mut outer = pending_module_composition(
+        "root.outer",
+        vec![("value", violating.clone())],
+        vec![module_not_bad_constraint("value")],
+    );
+    outer.binding = Some("outer_call".to_string());
+    outer.signature.attributes.insert(
+        "forwarded".to_string(),
+        CompositionAttribute::from_value(violating, None),
+    );
+
+    let mut inner_resource = make_resource("nested-inner-consumer", &[]);
+    inner_resource.set_attr(
+        "input",
+        Value::resource_ref("outer_call", "forwarded", vec![]),
+    );
+    mark_module_resource(&mut inner_resource, "root.outer.inner");
+    let resource_id = inner_resource.id.clone();
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: std::slice::from_ref(&inner_resource),
+        compositions: std::slice::from_ref(&outer),
+        data_sources: &[],
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+
+    provider.push_create(Ok(ok_state(&resource_id)));
+    let mut plan = Plan::new();
+    plan.add(create_effect(inner_resource));
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: std::slice::from_ref(&outer),
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert!(
+        provider.calls().is_empty(),
+        "the inner provider received the violating forwarded value: {:?}",
+        provider.captured_create_resources()
+    );
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 1);
+}
+
+#[tokio::test]
+async fn module_export_constraint_blocks_top_level_consumer_provider_dispatch() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::resource::CompositionAttribute;
+
+    let provider = MockProvider::new();
+    let violating = Value::Concrete(ConcreteValue::String("bad".to_string()));
+    let mut composition = pending_module_composition(
+        "root.exporter",
+        vec![("value", violating.clone())],
+        vec![module_not_bad_constraint("value")],
+    );
+    composition.binding = Some("exporter".to_string());
+    composition.signature.attributes.insert(
+        "forwarded".to_string(),
+        CompositionAttribute::from_value(violating, None),
+    );
+
+    let mut top_level = make_resource("top-level-consumer", &[]);
+    top_level.set_attr(
+        "input",
+        Value::resource_ref("exporter", "forwarded", vec![]),
+    );
+    assert!(top_level.module_source.is_none());
+    let resource_id = top_level.id.clone();
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: std::slice::from_ref(&top_level),
+        compositions: std::slice::from_ref(&composition),
+        data_sources: &[],
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+
+    provider.push_create(Ok(ok_state(&resource_id)));
+    let mut plan = Plan::new();
+    plan.add(create_effect(top_level));
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: std::slice::from_ref(&composition),
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert!(
+        provider.calls().is_empty(),
+        "the top-level provider received the violating module export: {:?}",
+        provider.captured_create_resources()
+    );
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 1);
+}
+
+#[tokio::test]
+async fn repeated_module_violation_blocks_every_dispatch_but_reports_once() {
+    let provider = MockProvider::new();
+    let composition = pending_module_composition(
+        "root.checked",
+        vec![(
+            "value",
+            Value::Concrete(ConcreteValue::String("bad".to_string())),
+        )],
+        vec![module_not_bad_constraint("value")],
+    );
+    let mut first = make_resource("first-blocked-consumer", &[]);
+    mark_module_resource(&mut first, "root.checked");
+    let mut second = make_resource("second-blocked-consumer", &[]);
+    mark_module_resource(&mut second, "root.checked");
+    let mut plan = Plan::new();
+    plan.add(create_effect(first));
+    plan.add(create_effect(second));
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: std::slice::from_ref(&composition),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+
+    assert!(provider.calls().is_empty());
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 2);
+    let events = observer.events().join("\n");
+    assert_eq!(
+        events.matches("value must not be bad").count(),
+        1,
+        "the authored violation should only be reported once: {events}"
+    );
+}
+
+#[tokio::test]
 async fn module_constraint_rechecks_after_binding_changes_in_same_apply() {
     use crate::binding_index::BindingValueSource;
 
@@ -2309,6 +2496,70 @@ async fn unresolved_instance_constraint_waits_for_terminal_sweep() {
     let events = observer.events().join("\n");
     assert!(
         events.contains("still unresolved at end of apply"),
+        "events: {events}"
+    );
+}
+
+#[tokio::test]
+async fn unapplied_module_argument_reference_stays_pending_at_early_gate() {
+    let provider = MockProvider::new();
+    let mut early = make_resource("early-independent-consumer", &[]);
+    mark_module_resource(&mut early, "root.checked");
+    let early_id = early.id.clone();
+    let producer = make_resource("future-producer", &[]);
+    let producer_id = producer.id.clone();
+    let composition = pending_module_composition(
+        "root.checked",
+        vec![(
+            "value",
+            Value::resource_ref("future-producer", "value", vec![]),
+        )],
+        vec![module_not_bad_constraint("value")],
+    );
+
+    provider.push_create(Ok(ok_state(&early_id)));
+    provider.push_create(Ok(State::existing(
+        producer_id.clone(),
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("good".to_string())),
+        )]),
+    )
+    .with_identifier("producer-id")));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(early));
+    plan.add(create_effect(producer));
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        unresolved_resources: &HashMap::new(),
+        compositions: std::slice::from_ref(&composition),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+
+    assert_eq!(result.success_count, 2);
+    assert_eq!(result.failure_count, 0);
+    assert_eq!(
+        provider.calls(),
+        vec![
+            ("create".to_string(), early_id.to_string()),
+            ("create".to_string(), producer_id.to_string()),
+        ]
+    );
+    let events = observer.events().join("\n");
+    assert!(
+        !events.contains("could not resolve argument"),
         "events: {events}"
     );
 }

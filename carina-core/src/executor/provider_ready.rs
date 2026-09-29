@@ -20,8 +20,8 @@ use crate::provider::{
     CreateRequest, ProviderFactory, ProviderNormalizer, UpdateRequest, build_update_patch,
 };
 use crate::resource::{
-    Composition, ConcreteValue, DataSource, DeferredValue, ModuleSource, ResolvedDataSource,
-    ResolvedResource, Resource, ResourceId, Value,
+    Composition, ConcreteValue, DataSource, DeferredValue, ResolvedDataSource, ResolvedResource,
+    Resource, ResourceId, Value,
 };
 use crate::schema::{SchemaRegistry, TypeError, TypeIdentity};
 use crate::value::SerializationError;
@@ -33,11 +33,11 @@ use crate::value::SerializationError;
 /// from [`prepare_provider_ready_resource`].
 ///
 /// ```compile_fail
-/// use carina_core::provider::ProviderReadyResource;
+/// use carina_core::provider::ProviderReady;
 /// use carina_core::resource::{ResolvedResource, Resource};
 ///
 /// let resolved = ResolvedResource::new(Resource::new("test", "example"));
-/// let _ready = ProviderReadyResource(resolved);
+/// let _ready = ProviderReady(resolved); // private tuple field
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderReady<T>(T);
@@ -120,6 +120,11 @@ impl ModuleConstraintGateError {
 
 impl fmt::Display for ModuleConstraintGateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.failures.is_empty() {
+            return f.write_str(
+                "provider dispatch blocked by an already reported module constraint violation",
+            );
+        }
         for (index, failure) in self.failures.iter().enumerate() {
             if index > 0 {
                 f.write_str("; ")?;
@@ -153,24 +158,41 @@ impl ModuleConstraintGate {
         }
     }
 
-    /// Re-evaluate constraints for the module instance that owns a managed
-    /// resource immediately before provider preparation.
-    pub fn check_resource(
-        &self,
-        resource: &Resource,
-        bindings: &ResolvedBindings,
-    ) -> Result<(), ModuleConstraintGateError> {
-        self.check_source(resource.module_source.as_ref(), bindings)
-    }
+    /// Re-evaluate every pending constraint whose inputs may now be known.
+    ///
+    /// This is deliberately global rather than scoped to the provider-bound
+    /// resource's module instance. A value can cross a nested module boundary
+    /// or leave a module through an attribute before reaching its provider
+    /// consumer, so the consumer's `module_source` does not identify every
+    /// constraint that governs its inputs.
+    ///
+    /// One ceiling remains: a cross-argument `require` over X and Y can still
+    /// be pending when a consumer of X runs if Y is unknown. It is evaluated
+    /// when Y becomes known at a later gate, or rejected by the terminal sweep.
+    pub fn check(&self, bindings: &ResolvedBindings) -> Result<(), ModuleConstraintGateError> {
+        let failures = self
+            .compositions
+            .iter()
+            .flat_map(|composition| evaluate_composition(composition, bindings, false))
+            .collect::<Vec<_>>();
+        if failures.is_empty() {
+            return Ok(());
+        }
 
-    /// Re-evaluate constraints for the module instance that owns a data source
-    /// immediately before provider preparation.
-    pub fn check_data_source(
-        &self,
-        resource: &DataSource,
-        bindings: &ResolvedBindings,
-    ) -> Result<(), ModuleConstraintGateError> {
-        self.check_source(resource.module_source.as_ref(), bindings)
+        let mut reported = self
+            .reported_failures
+            .lock()
+            .expect("module constraint reporting lock poisoned");
+        let new_failures = failures
+            .into_iter()
+            .filter(|failure| reported.insert(failure.clone()))
+            .collect();
+
+        // An empty diagnostic still returns Err: reporting suppression must
+        // never turn a known violation into permission to call a provider.
+        Err(ModuleConstraintGateError {
+            failures: new_failures,
+        })
     }
 
     /// Evaluate every remaining constraint at the end of apply.
@@ -186,32 +208,6 @@ impl ModuleConstraintGate {
             .flat_map(|composition| evaluate_composition(composition, bindings, true))
             .collect::<Vec<_>>();
         self.report_new(failures)
-    }
-
-    fn check_source(
-        &self,
-        source: Option<&ModuleSource>,
-        bindings: &ResolvedBindings,
-    ) -> Result<(), ModuleConstraintGateError> {
-        let Some(ModuleSource::Module { name, instance }) = source else {
-            return Ok(());
-        };
-        let failures = self
-            .compositions
-            .iter()
-            .filter(|composition| {
-                composition.instance == *instance && composition.module_name == *name
-            })
-            .flat_map(|composition| evaluate_composition(composition, bindings, false))
-            .collect::<Vec<_>>();
-        if failures.is_empty() {
-            return Ok(());
-        }
-        self.reported_failures
-            .lock()
-            .expect("module constraint reporting lock poisoned")
-            .extend(failures.iter().cloned());
-        Err(ModuleConstraintGateError { failures })
     }
 
     fn report_new(
@@ -247,6 +243,10 @@ fn evaluate_composition(
                 resolved_arguments.insert(name.clone(), value);
             }
             Err(error) => {
+                // Missing or not-yet-published local bindings resolve to the
+                // original deferred value and become `Pending` below. An Err
+                // here is therefore a genuine resolver failure (for example,
+                // an invalid fully-known builtin call or upstream path).
                 resolution_errors.insert(name.clone(), error);
                 resolved_arguments.insert(name.clone(), argument.value().clone());
             }
@@ -388,7 +388,7 @@ pub async fn prepare_provider_ready_resource(
     for value in resource.attributes.values_mut() {
         *value = unwrap_secret(value.clone());
     }
-    module_gate.check_resource(&resource, bindings)?;
+    module_gate.check(bindings)?;
     validate_known_resource_values(&resource, factories, schemas)?;
     let normalized =
         apply_desired_normalization(resource, provider_configs, normalizer, factories, schemas)
@@ -414,7 +414,7 @@ pub fn prepare_provider_ready_data_source(
     for value in resource.attributes.values_mut() {
         *value = unwrap_secret(value.clone());
     }
-    module_gate.check_data_source(&resource, bindings)?;
+    module_gate.check(bindings)?;
     validate_known_data_source_values(&resource, factories, schemas)?;
     crate::value::canonicalize_data_sources_with_schemas(
         std::slice::from_mut(&mut resource),

@@ -45,8 +45,7 @@
 //! use carina_core::provider::{ProviderReady, ProviderReadyResource};
 //! use carina_core::resource::{ResolvedResource, Resource};
 //! let resolved = ResolvedResource::new(Resource::new("test", "example"));
-//! let _ = ProviderReady::<ResolvedResource>(resolved.clone()); // private field
-//! let _: ProviderReadyResource = resolved.into(); // no unchecked conversion
+//! let _: ProviderReadyResource = ProviderReady(resolved); // private field
 //! ```
 //!
 //! ```compile_fail

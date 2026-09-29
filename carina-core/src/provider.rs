@@ -365,10 +365,11 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 /// A merely resolved resource is not sufficient to build this request:
 ///
 /// ```compile_fail
-/// use carina_core::provider::CreateRequest;
+/// use carina_core::provider::{CreateRequest, ProviderReady};
 /// use carina_core::resource::{ResolvedResource, Resource};
 ///
-/// let resource = ResolvedResource::new(Resource::new("test", "example"));
+/// let resolved = ResolvedResource::new(Resource::new("test", "example"));
+/// let resource = ProviderReady(resolved); // private tuple field
 /// let _request = CreateRequest { resource };
 /// ```
 #[derive(Debug, Clone)]
@@ -403,9 +404,12 @@ pub struct ReadRequest;
 /// ```compile_fail
 /// use carina_core::provider::UpdateRequest;
 ///
+/// let from = unimplemented!();
+/// let patch = unimplemented!();
 /// let _request = UpdateRequest {
-///     from: unimplemented!(),
-///     patch: unimplemented!(),
+///     from,
+///     patch,
+///     ..unimplemented!()
 /// };
 /// ```
 #[derive(Debug, Clone)]
