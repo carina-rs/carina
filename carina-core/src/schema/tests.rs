@@ -3441,6 +3441,563 @@ fn assignable(source: &AttributeType, sink: &AttributeType) -> bool {
     TypeInSchema::schemaless(source).is_assignable_to(TypeInSchema::schemaless(sink))
 }
 
+#[derive(Clone)]
+struct NamedAssignableType {
+    name: String,
+    attr: AttributeType,
+}
+
+impl NamedAssignableType {
+    fn new(name: impl Into<String>, attr: AttributeType) -> Self {
+        Self {
+            name: name.into(),
+            attr,
+        }
+    }
+}
+
+fn finite_assignability_universe() -> Vec<NamedAssignableType> {
+    let string = AttributeType::string();
+    let int = AttributeType::int();
+    let float = AttributeType::float();
+    let bool_ = AttributeType::bool();
+
+    let alpha = make_custom_anon_pattern_and_len(Some(r"^[a-z]+$"), None);
+    let digits = make_custom_anon_pattern_and_len(Some(r"^[0-9]+$"), None);
+    let len_1_64 = make_custom_anon_pattern_and_len(None, Some((Some(1), Some(64))));
+    let len_8_32 = make_custom_anon_pattern_and_len(None, Some((Some(8), Some(32))));
+    let alpha_len_1_64 =
+        make_custom_anon_pattern_and_len(Some(r"^[a-z]+$"), Some((Some(1), Some(64))));
+
+    let vpc_id = AttributeType::refined_string(
+        Some(TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id")),
+        None,
+        None,
+        None,
+    );
+    let security_group_id = AttributeType::refined_string(
+        Some(TypeIdentity::from_schema_type(
+            "aws",
+            "ec2.SecurityGroup",
+            "Id",
+        )),
+        None,
+        None,
+        None,
+    );
+    let aws_arn = AttributeType::refined_string(
+        Some(TypeIdentity::from_schema_type("aws", "", "Arn")),
+        None,
+        None,
+        None,
+    );
+    let role_arn = AttributeType::refined_string(
+        Some(TypeIdentity::from_schema_type("aws", "iam.Role", "Arn")),
+        None,
+        None,
+        None,
+    );
+    let int_0_100 = AttributeType::refined_int(None, Some((Some(0), Some(100))));
+    let int_25_75 = AttributeType::refined_int(None, Some((Some(25), Some(75))));
+    let float_0_100 = AttributeType::refined_float(None, Some((Some(0.0), Some(100.0))));
+    let float_25_75 = AttributeType::refined_float(None, Some((Some(25.0), Some(75.0))));
+    let status = AttributeType::enum_(
+        crate::schema::enum_identity("Status", Some("aws.test.Widget")),
+        Some(vec!["Enabled".to_string(), "Disabled".to_string()]),
+        vec![],
+        None,
+        None,
+    );
+
+    vec![
+        NamedAssignableType::new("String", string.clone()),
+        NamedAssignableType::new("Int", int.clone()),
+        NamedAssignableType::new("Float", float.clone()),
+        NamedAssignableType::new("Bool", bool_.clone()),
+        NamedAssignableType::new("String(pattern=alpha)", alpha.clone()),
+        NamedAssignableType::new("String(pattern=digits)", digits.clone()),
+        NamedAssignableType::new("String(length=1..64)", len_1_64.clone()),
+        NamedAssignableType::new("String(length=8..32)", len_8_32.clone()),
+        NamedAssignableType::new("String(pattern=alpha,length=1..64)", alpha_len_1_64.clone()),
+        NamedAssignableType::new("aws.ec2.Vpc.Id", vpc_id.clone()),
+        NamedAssignableType::new("aws.ec2.SecurityGroup.Id", security_group_id),
+        NamedAssignableType::new("aws.Arn", aws_arn),
+        NamedAssignableType::new("aws.iam.Role.Arn", role_arn),
+        NamedAssignableType::new("Int(range=0..100)", int_0_100.clone()),
+        NamedAssignableType::new("Int(range=25..75)", int_25_75),
+        NamedAssignableType::new("Float(range=0..100)", float_0_100.clone()),
+        NamedAssignableType::new("Float(range=25..75)", float_25_75),
+        NamedAssignableType::new("aws.test.Widget.Status", status.clone()),
+        NamedAssignableType::new("List<String>", AttributeType::list(string.clone())),
+        NamedAssignableType::new(
+            "List<String(pattern=alpha)>",
+            AttributeType::list(alpha.clone()),
+        ),
+        NamedAssignableType::new("List<aws.ec2.Vpc.Id>", AttributeType::list(vpc_id.clone())),
+        NamedAssignableType::new(
+            "List<aws.test.Widget.Status>",
+            AttributeType::list(status.clone()),
+        ),
+        NamedAssignableType::new("Map<String>", AttributeType::map(string.clone())),
+        NamedAssignableType::new("Map<String(length=1..64)>", AttributeType::map(len_1_64)),
+        NamedAssignableType::new("Map<aws.ec2.Vpc.Id>", AttributeType::map(vpc_id.clone())),
+        NamedAssignableType::new(
+            "Map<aws.test.Widget.Status>",
+            AttributeType::map(status.clone()),
+        ),
+        NamedAssignableType::new(
+            "Union<String | Bool>",
+            AttributeType::union(vec![string.clone(), bool_.clone()]),
+        ),
+        NamedAssignableType::new(
+            "Union<String(pattern=digits) | Bool>",
+            AttributeType::union(vec![digits, bool_.clone()]),
+        ),
+        NamedAssignableType::new(
+            "Union<aws.ec2.Vpc.Id | Bool>",
+            AttributeType::union(vec![vpc_id.clone(), bool_.clone()]),
+        ),
+        NamedAssignableType::new(
+            "Union<aws.test.Widget.Status | Bool>",
+            AttributeType::union(vec![status.clone(), bool_.clone()]),
+        ),
+        NamedAssignableType::new(
+            "List<Map<String>>",
+            AttributeType::list(AttributeType::map(string.clone())),
+        ),
+        NamedAssignableType::new(
+            "List<Map<aws.ec2.Vpc.Id>>",
+            AttributeType::list(AttributeType::map(vpc_id.clone())),
+        ),
+        NamedAssignableType::new(
+            "Map<List<Int>>",
+            AttributeType::map(AttributeType::list(int.clone())),
+        ),
+        NamedAssignableType::new(
+            "Map<List<Int(range=0..100)>>",
+            AttributeType::map(AttributeType::list(int_0_100)),
+        ),
+        NamedAssignableType::new(
+            "List<Union<String | Bool>>",
+            AttributeType::list(AttributeType::union(vec![string.clone(), bool_.clone()])),
+        ),
+        NamedAssignableType::new(
+            "Map<Union<String(pattern=alpha) | Int>>",
+            AttributeType::map(AttributeType::union(vec![alpha, int.clone()])),
+        ),
+        NamedAssignableType::new(
+            "Union<List<String> | Map<Int>>",
+            AttributeType::union(vec![AttributeType::list(string), AttributeType::map(int)]),
+        ),
+        NamedAssignableType::new(
+            "Union<List<aws.test.Widget.Status> | Map<Float>>",
+            AttributeType::union(vec![AttributeType::list(status), AttributeType::map(float)]),
+        ),
+    ]
+}
+
+#[test]
+fn assignability_finite_universe_is_reflexive() {
+    for member in finite_assignability_universe() {
+        assert!(
+            assignable(&member.attr, &member.attr),
+            "assignability must be reflexive; offending pair: {} -> {}",
+            member.name,
+            member.name,
+        );
+    }
+}
+
+#[test]
+fn assignability_identity_strictness_holds_through_depth_two() {
+    let identity_sinks = vec![
+        NamedAssignableType::new(
+            "aws.ec2.Vpc.Id",
+            AttributeType::refined_string(
+                Some(TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id")),
+                None,
+                None,
+                None,
+            ),
+        ),
+        NamedAssignableType::new(
+            "aws.ec2.SecurityGroup.Id",
+            AttributeType::refined_string(
+                Some(TypeIdentity::from_schema_type(
+                    "aws",
+                    "ec2.SecurityGroup",
+                    "Id",
+                )),
+                None,
+                None,
+                None,
+            ),
+        ),
+        NamedAssignableType::new(
+            "aws.Arn",
+            AttributeType::refined_string(
+                Some(TypeIdentity::from_schema_type("aws", "", "Arn")),
+                None,
+                None,
+                None,
+            ),
+        ),
+        NamedAssignableType::new(
+            "aws.iam.Role.Arn",
+            AttributeType::refined_string(
+                Some(TypeIdentity::from_schema_type("aws", "iam.Role", "Arn")),
+                None,
+                None,
+                None,
+            ),
+        ),
+        NamedAssignableType::new(
+            "aws.test.Widget.Status",
+            AttributeType::enum_(
+                crate::schema::enum_identity("Status", Some("aws.test.Widget")),
+                Some(vec!["Enabled".to_string(), "Disabled".to_string()]),
+                vec![],
+                None,
+                None,
+            ),
+        ),
+    ];
+
+    for sink in identity_sinks {
+        let source = AttributeType::string();
+        let bool_ = AttributeType::bool();
+        let pairs = vec![
+            (
+                "String".to_string(),
+                source.clone(),
+                sink.name.clone(),
+                sink.attr.clone(),
+            ),
+            (
+                "List<String>".to_string(),
+                AttributeType::list(source.clone()),
+                format!("List<{}>", sink.name),
+                AttributeType::list(sink.attr.clone()),
+            ),
+            (
+                "Map<String>".to_string(),
+                AttributeType::map(source.clone()),
+                format!("Map<{}>", sink.name),
+                AttributeType::map(sink.attr.clone()),
+            ),
+            (
+                "Union<String | Bool>".to_string(),
+                AttributeType::union(vec![source.clone(), bool_.clone()]),
+                format!("Union<{} | Bool>", sink.name),
+                AttributeType::union(vec![sink.attr.clone(), bool_.clone()]),
+            ),
+            (
+                "List<Map<String>>".to_string(),
+                AttributeType::list(AttributeType::map(source.clone())),
+                format!("List<Map<{}>>", sink.name),
+                AttributeType::list(AttributeType::map(sink.attr.clone())),
+            ),
+            (
+                "Map<List<String>>".to_string(),
+                AttributeType::map(AttributeType::list(source.clone())),
+                format!("Map<List<{}>>", sink.name),
+                AttributeType::map(AttributeType::list(sink.attr.clone())),
+            ),
+            (
+                "List<Union<String | Bool>>".to_string(),
+                AttributeType::list(AttributeType::union(vec![source.clone(), bool_.clone()])),
+                format!("List<Union<{} | Bool>>", sink.name),
+                AttributeType::list(AttributeType::union(vec![sink.attr.clone(), bool_.clone()])),
+            ),
+            (
+                "Union<List<String> | Bool>".to_string(),
+                AttributeType::union(vec![AttributeType::list(source), bool_.clone()]),
+                format!("Union<List<{}> | Bool>", sink.name),
+                AttributeType::union(vec![AttributeType::list(sink.attr), bool_]),
+            ),
+        ];
+
+        for (source_name, source, sink_name, sink) in pairs {
+            assert!(
+                !assignable(&source, &sink),
+                "unrefined primitives must not satisfy identified or Enum sinks; offending pair: {source_name} -> {sink_name}",
+            );
+        }
+    }
+}
+
+#[test]
+fn assignability_rule_10_accepts_all_identityless_refinement_sinks() {
+    let groups = vec![
+        (
+            NamedAssignableType::new("String", AttributeType::string()),
+            vec![
+                NamedAssignableType::new(
+                    "String(pattern=alpha)",
+                    make_custom_anon_pattern_and_len(Some(r"^[a-z]+$"), None),
+                ),
+                NamedAssignableType::new(
+                    "String(pattern=digits)",
+                    make_custom_anon_pattern_and_len(Some(r"^[0-9]+$"), None),
+                ),
+                NamedAssignableType::new(
+                    "String(length=1..64)",
+                    make_custom_anon_pattern_and_len(None, Some((Some(1), Some(64)))),
+                ),
+                NamedAssignableType::new(
+                    "String(length=8..32)",
+                    make_custom_anon_pattern_and_len(None, Some((Some(8), Some(32)))),
+                ),
+                NamedAssignableType::new(
+                    "String(pattern=alpha,length=1..64)",
+                    make_custom_anon_pattern_and_len(Some(r"^[a-z]+$"), Some((Some(1), Some(64)))),
+                ),
+            ],
+        ),
+        (
+            NamedAssignableType::new("Int", AttributeType::int()),
+            vec![
+                NamedAssignableType::new(
+                    "Int(range=0..100)",
+                    AttributeType::refined_int(None, Some((Some(0), Some(100)))),
+                ),
+                NamedAssignableType::new(
+                    "Int(range=25..75)",
+                    AttributeType::refined_int(None, Some((Some(25), Some(75)))),
+                ),
+            ],
+        ),
+        (
+            NamedAssignableType::new("Float", AttributeType::float()),
+            vec![
+                NamedAssignableType::new(
+                    "Float(range=0..100)",
+                    AttributeType::refined_float(None, Some((Some(0.0), Some(100.0)))),
+                ),
+                NamedAssignableType::new(
+                    "Float(range=25..75)",
+                    AttributeType::refined_float(None, Some((Some(25.0), Some(75.0)))),
+                ),
+            ],
+        ),
+    ];
+
+    for (source, sinks) in groups {
+        for sink in sinks {
+            assert!(
+                assignable(&source.attr, &sink.attr),
+                "rule 10 must accept an unrefined primitive into an identity-less refinement; offending pair: {} -> {}",
+                source.name,
+                sink.name,
+            );
+        }
+    }
+}
+
+#[test]
+fn assignability_rule_8_rejects_unproven_refined_sources() {
+    let pairs = vec![
+        (
+            NamedAssignableType::new(
+                "String(pattern=alpha)",
+                make_custom_anon_pattern_and_len(Some(r"^[a-z]+$"), None),
+            ),
+            NamedAssignableType::new(
+                "String(pattern=digits)",
+                make_custom_anon_pattern_and_len(Some(r"^[0-9]+$"), None),
+            ),
+        ),
+        (
+            NamedAssignableType::new(
+                "String(length=1..64)",
+                make_custom_anon_pattern_and_len(None, Some((Some(1), Some(64)))),
+            ),
+            NamedAssignableType::new(
+                "String(length=8..32)",
+                make_custom_anon_pattern_and_len(None, Some((Some(8), Some(32)))),
+            ),
+        ),
+        (
+            NamedAssignableType::new(
+                "Int(range=0..100)",
+                AttributeType::refined_int(None, Some((Some(0), Some(100)))),
+            ),
+            NamedAssignableType::new(
+                "Int(range=25..75)",
+                AttributeType::refined_int(None, Some((Some(25), Some(75)))),
+            ),
+        ),
+        (
+            NamedAssignableType::new(
+                "Float(range=0..100)",
+                AttributeType::refined_float(None, Some((Some(0.0), Some(100.0)))),
+            ),
+            NamedAssignableType::new(
+                "Float(range=25..75)",
+                AttributeType::refined_float(None, Some((Some(25.0), Some(75.0)))),
+            ),
+        ),
+    ];
+
+    for (source, sink) in pairs {
+        assert!(
+            !assignable(&source.attr, &sink.attr),
+            "rule 8 must reject wider or differently refined evidence; offending pair: {} -> {}",
+            source.name,
+            sink.name,
+        );
+    }
+}
+
+#[test]
+fn lifted_type_expr_finite_universe_is_reflexive() {
+    use crate::parser::{ResourceTypePath, TypeExpr};
+
+    let liftable = vec![
+        ("String", TypeExpr::String),
+        ("Int", TypeExpr::Int),
+        ("Float", TypeExpr::Float),
+        ("Bool", TypeExpr::Bool),
+        ("Simple(ipv4_cidr)", TypeExpr::Simple("ipv4_cidr".into())),
+        (
+            "SchemaType(aws.ec2.Vpc.Id)",
+            TypeExpr::SchemaType {
+                provider: "aws".into(),
+                path: "ec2.Vpc".into(),
+                type_name: "Id".into(),
+            },
+        ),
+        (
+            "List<Map<String>>",
+            TypeExpr::List(Box::new(TypeExpr::Map(Box::new(TypeExpr::String)))),
+        ),
+        (
+            "Struct{name:String,count:Int}",
+            TypeExpr::Struct {
+                fields: vec![
+                    ("name".into(), TypeExpr::String),
+                    ("count".into(), TypeExpr::Int),
+                ],
+            },
+        ),
+        (
+            "Union<String | Int>",
+            TypeExpr::Union(vec![TypeExpr::String, TypeExpr::Int]),
+        ),
+    ];
+
+    for (name, type_expr) in liftable {
+        let lifted = crate::validation::lift_type_expr(&type_expr)
+            .unwrap_or_else(|| panic!("liftable TypeExpr {name} unexpectedly lifted to None"));
+        assert!(
+            assignable(&lifted, &lifted),
+            "lifted TypeExpr must be assignable to itself; offending pair: lift({name}) -> lift({name})",
+        );
+    }
+
+    let resource_path = ResourceTypePath::new("aws".to_string(), "ec2.Vpc".to_string());
+    for (name, type_expr) in [
+        ("Ref(aws.ec2.Vpc)", TypeExpr::Ref(resource_path.clone())),
+        (
+            "StringLiteral(dev)",
+            TypeExpr::StringLiteral("dev".to_string()),
+        ),
+        (
+            "DottedUnresolved(aws.ec2.Vpc)",
+            TypeExpr::DottedUnresolved(resource_path),
+        ),
+        ("Unknown", TypeExpr::Unknown),
+    ] {
+        assert!(
+            crate::validation::lift_type_expr(&type_expr).is_none(),
+            "non-liftable TypeExpr {name} must lift to None",
+        );
+    }
+}
+
+fn contains_unrefined_primitive(attr: &AttributeType) -> bool {
+    match &attr.kind {
+        AttrTypeKind::String {
+            identity: None,
+            pattern: None,
+            length: None,
+            ..
+        }
+        | AttrTypeKind::Int {
+            identity: None,
+            range: None,
+            ..
+        }
+        | AttrTypeKind::Float {
+            identity: None,
+            range: None,
+            ..
+        } => true,
+        AttrTypeKind::List { element_type, .. } => contains_unrefined_primitive(element_type),
+        AttrTypeKind::Map { key, value } => {
+            contains_unrefined_primitive(key) || contains_unrefined_primitive(value)
+        }
+        AttrTypeKind::Union(members) => members
+            .as_raw_slice()
+            .iter()
+            .any(contains_unrefined_primitive),
+        AttrTypeKind::String { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. }
+        | AttrTypeKind::Struct { .. }
+        | AttrTypeKind::Ref(_) => false,
+    }
+}
+
+/// Assignability is transitive except when rule 10 uses a completely
+/// unrefined primitive as the intermediate evidence. For example,
+/// `pattern=alpha -> String -> pattern=digits` is accepted one edge at a time,
+/// while the direct refined comparison correctly fails under rule 8.
+///
+/// The settled #3798 decision keeps that value-validation escape in the
+/// relation and makes composition forwarding preserve both sides of the
+/// boundary instead. #3808 tracks an explicit user-authored escape hatch for
+/// intentionally discarding the original evidence.
+#[test]
+fn assignability_finite_universe_is_transitive_except_through_unrefined_primitives() {
+    let universe = finite_assignability_universe();
+    let mut exceptions = 0;
+
+    for source in &universe {
+        for middle in &universe {
+            if !assignable(&source.attr, &middle.attr) {
+                continue;
+            }
+            for sink in &universe {
+                if !assignable(&middle.attr, &sink.attr) {
+                    continue;
+                }
+                if !assignable(&source.attr, &sink.attr) {
+                    exceptions += 1;
+                    assert!(
+                        contains_unrefined_primitive(&middle.attr),
+                        "non-transitivity is allowed only through an unrefined primitive intermediate; counterexample: {} -> {} and {} -> {}, but {} -> {} is rejected",
+                        source.name,
+                        middle.name,
+                        middle.name,
+                        sink.name,
+                        source.name,
+                        sink.name,
+                    );
+                }
+            }
+        }
+    }
+
+    assert!(
+        exceptions > 0,
+        "the finite universe must retain rule 10's documented non-transitive case",
+    );
+}
+
 #[test]
 fn assignable_sink_ref_union_matches_inline_union() {
     let source = AttributeType::string();

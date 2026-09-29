@@ -1574,19 +1574,15 @@ fn check_resource_ref_type_mismatch(
     let carina_core::binding_index::RefType::Typed(source) = binding_index.ref_type(path) else {
         return None;
     };
-    let source = source.type_in_schema();
 
     // Directional: the ref (source) must be assignable to the expected (sink).
-    if source.is_assignable_to(expected) {
-        None
-    } else {
-        Some(format!(
-            "Type mismatch: expected {}, got {} (from {})",
-            expected.resolved_type_name(),
-            source.resolved_type_name(),
-            path.to_dot_string(),
-        ))
-    }
+    let mismatch = source.is_assignable_to_sink(expected).err()?;
+    Some(format!(
+        "Type mismatch: expected {}, got {} ({})",
+        expected.resolved_type_name(),
+        mismatch.actual_type_name(),
+        mismatch.origin_description(path),
+    ))
 }
 
 fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {

@@ -304,7 +304,11 @@ fn resolve_resource_reference(
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ModuleCallRefErrorKind {
-    TypeMismatch { expected: String, actual: String },
+    TypeMismatch {
+        expected: String,
+        actual: String,
+        declared: Option<String>,
+    },
     UnknownAttribute(RefTypeError),
 }
 
@@ -330,16 +334,23 @@ fn format_module_call_ref_error(
     kind: &ModuleCallRefErrorKind,
 ) -> std::fmt::Result {
     match kind {
-        ModuleCallRefErrorKind::TypeMismatch { expected, actual } => write!(
+        ModuleCallRefErrorKind::TypeMismatch {
+            expected,
+            actual,
+            declared,
+        } => write!(
             f,
-            "module call '{}': argument '{}': cannot assign {} to '{}': expected {}, got {} (from {})",
+            "module call '{}': argument '{}': cannot assign {} to '{}': expected {}, got {} ({})",
             call_label,
             argument,
             actual,
             argument,
             expected,
             actual,
-            path.to_dot_string(),
+            match declared {
+                Some(declared) => format!("from {}, declared {}", path.to_dot_string(), declared),
+                None => format!("from {}", path.to_dot_string()),
+            },
         ),
         ModuleCallRefErrorKind::UnknownAttribute(error) => {
             write!(f, "module call '{}': {}", call_label, error)
@@ -450,13 +461,21 @@ pub struct AttributeParamRefError {
 impl std::fmt::Display for AttributeParamRefError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.kind {
-            ModuleCallRefErrorKind::TypeMismatch { expected, actual } => write!(
+            ModuleCallRefErrorKind::TypeMismatch {
+                expected,
+                actual,
+                declared,
+            } => write!(
                 f,
-                "attribute '{}': type mismatch: expected {}, got {} (from {})",
+                "attribute '{}': type mismatch: expected {}, got {} ({})",
                 self.attribute,
                 expected,
                 actual,
-                self.path.to_dot_string(),
+                match declared {
+                    Some(declared) =>
+                        format!("from {}, declared {}", self.path.to_dot_string(), declared),
+                    None => format!("from {}", self.path.to_dot_string()),
+                },
             ),
             ModuleCallRefErrorKind::UnknownAttribute(error) => {
                 write!(f, "attribute '{}': {}", self.attribute, error)
@@ -550,6 +569,7 @@ enum CompositionRefErrorKindKey {
     TypeMismatch {
         expected: String,
         actual: String,
+        declared: Option<String>,
     },
     UnknownAttribute {
         attribute: String,
@@ -570,9 +590,14 @@ enum CompositionRefErrorKindKey {
 impl From<&ModuleCallRefErrorKind> for CompositionRefErrorKindKey {
     fn from(kind: &ModuleCallRefErrorKind) -> Self {
         match kind {
-            ModuleCallRefErrorKind::TypeMismatch { expected, actual } => Self::TypeMismatch {
+            ModuleCallRefErrorKind::TypeMismatch {
+                expected,
+                actual,
+                declared,
+            } => Self::TypeMismatch {
                 expected: expected.clone(),
                 actual: actual.clone(),
+                declared: declared.clone(),
             },
             ModuleCallRefErrorKind::UnknownAttribute(RefTypeError::UnknownAttribute {
                 attribute,
@@ -632,14 +657,15 @@ fn composition_ref_error_kind(
             let sink = sink
                 .and_then(RefSink::as_type_expr)
                 .and_then(lift_type_expr)?;
-            let source_type = source.type_in_schema();
             let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
-            (!source_type.is_assignable_to(sink_type)).then(|| {
-                ModuleCallRefErrorKind::TypeMismatch {
+            source
+                .is_assignable_to_sink(sink_type)
+                .err()
+                .map(|mismatch| ModuleCallRefErrorKind::TypeMismatch {
                     expected: sink_type.resolved_type_name(),
-                    actual: source_type.resolved_type_name(),
-                }
-            })
+                    actual: mismatch.actual_type_name().to_string(),
+                    declared: mismatch.declared_type_name().map(str::to_string),
+                })
         }
         RefType::UnknownAttribute(error) => Some(ModuleCallRefErrorKind::UnknownAttribute(error)),
         RefType::Unchecked | RefType::UnknownBinding { .. } => None,
@@ -939,19 +965,19 @@ fn validate_resource_ref_types_inner<E>(
                 }) else {
                     return;
                 };
-                let source_type = source.type_in_schema();
-                if source_type.is_assignable_to(sink_type) {
+                let Err(mismatch) = source.is_assignable_to_sink(sink_type) else {
                     return;
-                }
-                let source_name = source_type.resolved_type_name();
+                };
+                let source_name = mismatch.actual_type_name();
+                let origin = mismatch.origin_description(reference);
                 all_errors.push(format!(
-                    "{}: cannot assign {} to '{}': expected {}, got {} (from {})",
+                    "{}: cannot assign {} to '{}': expected {}, got {} ({})",
                     resource_location,
                     source_name,
                     attr_name,
                     sink_type.resolved_type_name(),
                     source_name,
-                    reference.to_dot_string(),
+                    origin,
                 ));
             });
         }
@@ -1035,15 +1061,14 @@ fn check_attribute_param_ref(
             let Some(sink) = expected_type.and_then(lift_type_expr) else {
                 return;
             };
-            let source_type = source.type_in_schema();
             let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
-            if !source_type.is_assignable_to(sink_type) {
+            if let Err(mismatch) = source.is_assignable_to_sink(sink_type) {
                 errors.push(format!(
-                    "attribute '{}': type mismatch: expected {}, got {} (from {})",
+                    "attribute '{}': type mismatch: expected {}, got {} ({})",
                     param_name,
                     expected_type.expect("lifted expected type exists"),
-                    source_type.resolved_type_name(),
-                    path.to_dot_string(),
+                    mismatch.actual_type_name(),
+                    mismatch.origin_description(path),
                 ));
             }
         }
@@ -1113,15 +1138,18 @@ fn check_export_ref(
             let Some(sink) = lift_type_expr(type_expr) else {
                 return;
             };
-            let source_type = source.type_in_schema();
             let sink_type = crate::schema::TypeInSchema::schemaless(&sink);
-            if !source_type.is_assignable_to(sink_type) {
+            if let Err(mismatch) = source.is_assignable_to_sink(sink_type) {
+                let inferred_origin = mismatch
+                    .declared_type_name()
+                    .map(|_| format!(" ({})", mismatch.origin_description(path)));
                 errors.push(format!(
-                    "export '{}': type mismatch for '{}': expected {}, got {}",
+                    "export '{}': type mismatch for '{}': expected {}, got {}{}",
                     param_name,
                     path.to_dot_string(),
                     type_expr,
-                    source_type.resolved_type_name(),
+                    mismatch.actual_type_name(),
+                    inferred_origin.as_deref().unwrap_or_default(),
                 ));
             }
         }

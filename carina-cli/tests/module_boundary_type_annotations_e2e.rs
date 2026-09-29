@@ -65,6 +65,7 @@ impl ProviderFactory for AwsTestFactory {
             vpc_schema(),
             subnet_schema(),
             security_group_schema(),
+            log_group_schema(),
             hosted_zone_schema(),
             domain_lookup_schema(),
             nested_domain_consumer_schema(),
@@ -172,6 +173,13 @@ fn security_group_schema() -> ResourceSchema {
         .attribute(
             AttributeSchema::new("group_id", identity("ec2.SecurityGroup", "Id")).read_only(),
         )
+        .with_unique_name_attribute("name")
+}
+
+fn log_group_schema() -> ResourceSchema {
+    ResourceSchema::new("logs.LogGroup")
+        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
+        .attribute(AttributeSchema::new("arn", identity("logs.LogGroup", "Arn")).read_only())
         .with_unique_name_attribute("name")
 }
 
@@ -575,6 +583,138 @@ let zone = hosted_zone {
     assert!(
         diagnostics.is_empty(),
         "plain module String should reach HostedZone.name's identity-less ..=1024 constraint: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn declared_string_output_preserves_forwarded_log_group_arn_evidence() {
+    let fixture = Fixture::module(
+        &[
+            ("attributes.crn", "attributes {\n  x: String = lg.arn\n}\n"),
+            (
+                "resources.crn",
+                r#"let lg = aws.logs.LogGroup {
+  name = "module"
+}
+"#,
+            ),
+        ],
+        &[(
+            "main.crn",
+            r#"let component = use { source = '../web_tier' }
+let m = component { }
+
+let zone = aws.route53.HostedZone {
+  name = m.x
+}
+"#,
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("cannot assign aws.logs.LogGroup.Arn to 'name'")
+                && diagnostic.contains("got aws.logs.LogGroup.Arn")
+                && diagnostic.contains("from m.x, declared String")
+        }),
+        "the declared String contract must not erase the forwarded Arn evidence: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn declared_string_output_accepts_forwarded_plain_string_evidence() {
+    let fixture = Fixture::module(
+        &[
+            (
+                "attributes.crn",
+                "attributes {\n  x: String = lookup.domain_name\n}\n",
+            ),
+            (
+                "resources.crn",
+                r#"let lookup = read aws.test.DomainLookup {
+  query = "example.com"
+}
+"#,
+            ),
+        ],
+        &[(
+            "main.crn",
+            r#"let component = use { source = '../web_tier' }
+let m = component { }
+
+let zone = aws.route53.HostedZone {
+  name = m.x
+}
+"#,
+        )],
+    );
+
+    let diagnostics = fixture.validate();
+    assert!(
+        diagnostics.is_empty(),
+        "rule 10 must still accept declared and forwarded plain String evidence: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn nested_declared_string_outputs_accumulate_forwarded_evidence() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let inner = temp.path().join("inner");
+    let outer = temp.path().join("outer");
+    let root = temp.path().join("root");
+    std::fs::create_dir(&inner).expect("inner directory");
+    std::fs::create_dir(&outer).expect("outer directory");
+    std::fs::create_dir(&root).expect("root directory");
+
+    std::fs::write(
+        inner.join("attributes.crn"),
+        "attributes {\n  x: String = lg.arn\n}\n",
+    )
+    .expect("inner attributes");
+    std::fs::write(
+        inner.join("resources.crn"),
+        r#"let lg = aws.logs.LogGroup {
+  name = "inner"
+}
+"#,
+    )
+    .expect("inner resources");
+
+    std::fs::write(
+        outer.join("module.crn"),
+        r#"let inner_component = use { source = '../inner' }
+let inner_instance = inner_component { }
+"#,
+    )
+    .expect("outer module call");
+    std::fs::write(
+        outer.join("attributes.crn"),
+        "attributes {\n  x: String = inner_instance.x\n}\n",
+    )
+    .expect("outer attributes");
+
+    write_provider(&root);
+    std::fs::write(
+        root.join("main.crn"),
+        r#"let outer_component = use { source = '../outer' }
+let outer_instance = outer_component { }
+
+let zone = aws.route53.HostedZone {
+  name = outer_instance.x
+}
+"#,
+    )
+    .expect("root resources");
+
+    let diagnostics = carina_cli::commands::validate::validate_with_factories(&root, factories());
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("cannot assign aws.logs.LogGroup.Arn to 'name'")
+                && diagnostic.contains("got aws.logs.LogGroup.Arn")
+                && diagnostic.contains("from outer_instance.x, declared String")
+        }),
+        "both declared String boundaries must retain the original Arn evidence: {diagnostics:#?}",
     );
 }
 

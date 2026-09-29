@@ -69,29 +69,200 @@ pub struct BindingEntry<'a> {
     pub target: BindingTarget<'a>,
 }
 
-/// A reference-path type paired with the definition context required to
-/// interpret any nested schema `Ref`s.
+/// One type constraint on a reference path, paired with the definition
+/// context required to interpret any nested schema `Ref`s.
 #[derive(Debug, Clone)]
-pub struct ResolvedRefType {
+struct ResolvedTypeConstraint {
     attr_type: AttributeType,
     defs: BTreeMap<String, AttributeType>,
 }
 
-impl ResolvedRefType {
+impl ResolvedTypeConstraint {
     fn new(attr_type: AttributeType, defs: BTreeMap<String, AttributeType>) -> Self {
         Self { attr_type, defs }
     }
 
-    pub fn type_in_schema(&self) -> TypeInSchema<'_> {
+    fn type_in_schema(&self) -> TypeInSchema<'_> {
         self.attr_type.in_schema(&self.defs)
     }
 
-    pub fn attr_type(&self) -> &AttributeType {
-        &self.attr_type
+    fn narrow(
+        self,
+        segments: &[PathSegment],
+        path: &AccessPath,
+    ) -> Result<Option<Self>, RefTypeError> {
+        let narrowed = narrow_type(&self.attr_type, segments, &self.defs, path)?.cloned();
+        Ok(narrowed.map(|attr_type| Self::new(attr_type, self.defs)))
+    }
+}
+
+/// How the type exposed at the current reference boundary was established.
+///
+/// The variant is part of the constraint itself so a declared composition
+/// boundary cannot lose (or accidentally gain) that provenance independently
+/// of its type.
+#[derive(Debug, Clone)]
+enum AuthoritativeTypeConstraint {
+    Direct(ResolvedTypeConstraint),
+    DeclaredCompositionAttribute(ResolvedTypeConstraint),
+}
+
+impl AuthoritativeTypeConstraint {
+    fn constraint(&self) -> &ResolvedTypeConstraint {
+        match self {
+            Self::Direct(constraint) | Self::DeclaredCompositionAttribute(constraint) => constraint,
+        }
     }
 
-    pub fn defs(&self) -> &BTreeMap<String, AttributeType> {
-        &self.defs
+    fn into_constraint(self) -> ResolvedTypeConstraint {
+        match self {
+            Self::Direct(constraint) | Self::DeclaredCompositionAttribute(constraint) => constraint,
+        }
+    }
+
+    fn narrow(
+        self,
+        segments: &[PathSegment],
+        path: &AccessPath,
+    ) -> Result<Option<Self>, RefTypeError> {
+        match self {
+            Self::Direct(constraint) => Ok(constraint
+                .narrow(segments, path)?
+                .map(AuthoritativeTypeConstraint::Direct)),
+            Self::DeclaredCompositionAttribute(constraint) => Ok(constraint
+                .narrow(segments, path)?
+                .map(AuthoritativeTypeConstraint::DeclaredCompositionAttribute)),
+        }
+    }
+
+    fn is_declared_composition_attribute(&self) -> bool {
+        matches!(self, Self::DeclaredCompositionAttribute(_))
+    }
+}
+
+/// A reference-path type together with every constraint preserved across
+/// composition boundaries.
+///
+/// `authoritative` is the source type exposed at the current boundary. For a
+/// declared composition attribute it is the lifted declaration; the forwarded
+/// source and all constraints accumulated by earlier composition attributes
+/// live in `evidence`. Assignability must check both. This prevents an
+/// unrefined declaration such as `String` from erasing incompatible refinement
+/// evidence while keeping the declaration authoritative for consumers.
+#[derive(Debug, Clone)]
+pub struct ResolvedRefType {
+    authoritative: AuthoritativeTypeConstraint,
+    evidence: Vec<ResolvedTypeConstraint>,
+}
+
+/// The first source constraint that failed assignment to a sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefTypeMismatch {
+    actual: String,
+    declared: Option<String>,
+}
+
+impl RefTypeMismatch {
+    pub fn actual_type_name(&self) -> &str {
+        &self.actual
+    }
+
+    /// Present only when forwarded/inferred evidence failed after the
+    /// authoritative declared type had already passed.
+    pub fn declared_type_name(&self) -> Option<&str> {
+        self.declared.as_deref()
+    }
+
+    pub fn origin_description(&self, path: ReferencePathRef<'_>) -> String {
+        match &self.declared {
+            Some(declared) => format!("from {}, declared {}", path.to_dot_string(), declared),
+            None => format!("from {}", path.to_dot_string()),
+        }
+    }
+}
+
+impl ResolvedRefType {
+    fn new(attr_type: AttributeType, defs: BTreeMap<String, AttributeType>) -> Self {
+        Self {
+            authoritative: AuthoritativeTypeConstraint::Direct(ResolvedTypeConstraint::new(
+                attr_type, defs,
+            )),
+            evidence: Vec::new(),
+        }
+    }
+
+    fn with_declared_type(declared: ResolvedTypeConstraint, inferred: Option<Self>) -> Self {
+        let mut evidence = Vec::new();
+        if let Some(inferred) = inferred {
+            evidence.push(inferred.authoritative.into_constraint());
+            evidence.extend(inferred.evidence);
+        }
+        Self {
+            authoritative: AuthoritativeTypeConstraint::DeclaredCompositionAttribute(declared),
+            evidence,
+        }
+    }
+
+    fn narrow(
+        self,
+        segments: &[PathSegment],
+        path: &AccessPath,
+    ) -> Result<Option<Self>, RefTypeError> {
+        let Some(authoritative) = self.authoritative.narrow(segments, path)? else {
+            return Ok(None);
+        };
+        let evidence = self
+            .evidence
+            .into_iter()
+            .map(|constraint| constraint.narrow(segments, path))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        Ok(Some(Self {
+            authoritative,
+            evidence,
+        }))
+    }
+
+    /// Human-readable name of the authoritative boundary type.
+    ///
+    /// This is for diagnostics only. Call [`Self::is_assignable_to_sink`] for
+    /// type compatibility so inferred evidence is not bypassed.
+    pub fn display_type_name(&self) -> String {
+        self.authoritative
+            .constraint()
+            .type_in_schema()
+            .resolved_type_name()
+    }
+
+    /// Require the authoritative boundary type and every inferred constraint
+    /// accumulated through forwarded composition attributes to satisfy
+    /// `sink`. The returned mismatch identifies the first failing constraint;
+    /// inferred failures also retain the current boundary's declaration for
+    /// diagnostics.
+    pub fn is_assignable_to_sink(&self, sink: TypeInSchema<'_>) -> Result<(), RefTypeMismatch> {
+        let authoritative = self.authoritative.constraint().type_in_schema();
+        if !authoritative.is_assignable_to(sink) {
+            return Err(RefTypeMismatch {
+                actual: authoritative.resolved_type_name(),
+                declared: None,
+            });
+        }
+
+        for evidence in &self.evidence {
+            let evidence = evidence.type_in_schema();
+            if !evidence.is_assignable_to(sink) {
+                return Err(RefTypeMismatch {
+                    actual: evidence.resolved_type_name(),
+                    declared: self
+                        .authoritative
+                        .is_declared_composition_attribute()
+                        .then(|| authoritative.resolved_type_name()),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -339,10 +510,11 @@ impl<'a> BindingIndex<'a> {
     /// Resolve the static type of one complete reference path.
     ///
     /// Schema bindings are narrowed through the path directly. Composition
-    /// bindings prefer a liftable declared boundary type; otherwise a
-    /// forwarded output recursively inherits the target path's type. Derived
-    /// values and non-representable annotations remain unchecked. The active
-    /// path set bounds malformed/cyclic forwarded chains.
+    /// bindings preserve a liftable declared boundary type together with all
+    /// inferable forwarded-source constraints; otherwise a forwarded output
+    /// recursively inherits the target path's type. Derived values and
+    /// non-representable annotations remain unchecked. The active path set
+    /// bounds malformed/cyclic forwarded chains.
     pub fn ref_type<'p>(&self, path: impl Into<ReferencePathRef<'p>>) -> RefType {
         self.ref_type_inner(path.into(), &mut HashSet::new())
     }
@@ -406,15 +578,31 @@ impl<'a> BindingIndex<'a> {
                         ));
                     };
 
-                    if let Some(declared_type) = attribute.declared_type()
-                        && let Some(declared) = crate::validation::lift_type_expr(declared_type)
+                    if let Some(declared) = attribute
+                        .declared_type()
+                        .and_then(crate::validation::lift_type_expr)
                     {
                         let defs = crate::schema::empty_defs_for_schema_walks();
                         match narrow_type(&declared, path.segments(), defs, path) {
-                            Ok(Some(attr_type)) => RefType::Typed(ResolvedRefType::new(
-                                attr_type.clone(),
-                                defs.clone(),
-                            )),
+                            Ok(Some(attr_type)) => {
+                                let inferred = attribute.forwarded_path().and_then(|forwarded| {
+                                    match self.ref_type_inner(
+                                        ReferencePathRef::Access(forwarded),
+                                        visiting,
+                                    ) {
+                                        RefType::Typed(resolved) => {
+                                            resolved.narrow(path.segments(), path).ok().flatten()
+                                        }
+                                        RefType::Unchecked
+                                        | RefType::UnknownBinding { .. }
+                                        | RefType::UnknownAttribute(_) => None,
+                                    }
+                                });
+                                RefType::Typed(ResolvedRefType::with_declared_type(
+                                    ResolvedTypeConstraint::new(attr_type.clone(), defs.clone()),
+                                    inferred,
+                                ))
+                            }
                             Ok(None) => RefType::Unchecked,
                             Err(error) => RefType::UnknownAttribute(error),
                         }
@@ -428,19 +616,13 @@ impl<'a> BindingIndex<'a> {
                         RefType::Unchecked
                     } else if let Some(forwarded) = attribute.forwarded_path() {
                         match self.ref_type_inner(ReferencePathRef::Access(forwarded), visiting) {
-                            RefType::Typed(resolved) => match narrow_type(
-                                &resolved.attr_type,
-                                path.segments(),
-                                &resolved.defs,
-                                path,
-                            ) {
-                                Ok(Some(attr_type)) => RefType::Typed(ResolvedRefType::new(
-                                    attr_type.clone(),
-                                    resolved.defs,
-                                )),
-                                Ok(None) => RefType::Unchecked,
-                                Err(error) => RefType::UnknownAttribute(error),
-                            },
+                            RefType::Typed(resolved) => {
+                                match resolved.narrow(path.segments(), path) {
+                                    Ok(Some(resolved)) => RefType::Typed(resolved),
+                                    Ok(None) => RefType::Unchecked,
+                                    Err(error) => RefType::UnknownAttribute(error),
+                                }
+                            }
                             other => other,
                         }
                     } else {
@@ -1283,7 +1465,9 @@ mod tests {
         UpstreamState, WaitBinding, parse,
     };
     use crate::resource::{CompositionAttribute, Signature};
-    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    use crate::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, TypeInSchema,
+    };
 
     fn vpc_schema() -> ResourceSchema {
         ResourceSchema::new("ec2.Vpc")
@@ -1580,7 +1764,169 @@ let vpc = aws.ec2.Vpc {
         let RefType::Typed(resolved) = index.ref_type(&AccessPath::new("instance", "cidr")) else {
             panic!("forwarded composition attribute must inherit its source type");
         };
-        assert_eq!(resolved.type_in_schema().resolved_type_name(), "String");
+        assert_eq!(resolved.display_type_name(), "String");
+    }
+
+    #[derive(Clone)]
+    struct ChainType {
+        name: &'static str,
+        attr: AttributeType,
+        declaration: Option<TypeExpr>,
+    }
+
+    fn composition_chain_type_universe() -> Vec<ChainType> {
+        let string = AttributeType::string();
+        let bool_ = AttributeType::bool();
+        let vpc_id = AttributeType::refined_string(
+            Some(TypeIdentity::from_schema_type("aws", "ec2.Vpc", "Id")),
+            None,
+            None,
+            None,
+        );
+        let security_group_id = AttributeType::refined_string(
+            Some(TypeIdentity::from_schema_type(
+                "aws",
+                "ec2.SecurityGroup",
+                "Id",
+            )),
+            None,
+            None,
+            None,
+        );
+
+        vec![
+            ChainType {
+                name: "String",
+                attr: string.clone(),
+                declaration: Some(TypeExpr::String),
+            },
+            ChainType {
+                name: "Bool",
+                attr: bool_.clone(),
+                declaration: Some(TypeExpr::Bool),
+            },
+            ChainType {
+                name: "String(pattern=alpha)",
+                attr: AttributeType::refined_string(None, Some("^[a-z]+$".to_string()), None, None),
+                declaration: None,
+            },
+            ChainType {
+                name: "String(pattern=digits)",
+                attr: AttributeType::refined_string(None, Some("^[0-9]+$".to_string()), None, None),
+                declaration: None,
+            },
+            ChainType {
+                name: "String(length=..1024)",
+                attr: AttributeType::refined_string(None, None, Some((None, Some(1024))), None),
+                declaration: None,
+            },
+            ChainType {
+                name: "aws.ec2.Vpc.Id",
+                attr: vpc_id.clone(),
+                declaration: Some(TypeExpr::SchemaType {
+                    provider: "aws".to_string(),
+                    path: "ec2.Vpc".to_string(),
+                    type_name: "Id".to_string(),
+                }),
+            },
+            ChainType {
+                name: "aws.ec2.SecurityGroup.Id",
+                attr: security_group_id.clone(),
+                declaration: Some(TypeExpr::SchemaType {
+                    provider: "aws".to_string(),
+                    path: "ec2.SecurityGroup".to_string(),
+                    type_name: "Id".to_string(),
+                }),
+            },
+            ChainType {
+                name: "List<String>",
+                attr: AttributeType::list(string.clone()),
+                declaration: Some(TypeExpr::List(Box::new(TypeExpr::String))),
+            },
+            ChainType {
+                name: "List<String(pattern=alpha)>",
+                attr: AttributeType::list(AttributeType::refined_string(
+                    None,
+                    Some("^[a-z]+$".to_string()),
+                    None,
+                    None,
+                )),
+                declaration: None,
+            },
+            ChainType {
+                name: "Map<String>",
+                attr: AttributeType::map(string.clone()),
+                declaration: Some(TypeExpr::Map(Box::new(TypeExpr::String))),
+            },
+            ChainType {
+                name: "Union<String | Bool>",
+                attr: AttributeType::union(vec![string, bool_]),
+                declaration: Some(TypeExpr::Union(vec![TypeExpr::String, TypeExpr::Bool])),
+            },
+        ]
+    }
+
+    /// A composition declaration is a contract, not a cast. For every actual
+    /// source A, liftable declared boundary B, and sink C in this finite
+    /// universe, the checker may accept A ->(declared B)-> C only when both
+    /// A -> C and B -> C hold in the directional relation.
+    #[test]
+    fn composition_attribute_chain_requires_declared_and_inferred_types() {
+        let universe = composition_chain_type_universe();
+
+        for actual in &universe {
+            for declared in &universe {
+                let Some(declaration) = &declared.declaration else {
+                    continue;
+                };
+                let mut parsed = parse("let source = test.source.Node { }", &Default::default())
+                    .expect("source fixture must parse");
+                let mut middle = composition("middle");
+                middle.signature.attributes.clear();
+                middle.signature.attributes.insert(
+                    "value".to_string(),
+                    CompositionAttribute::from_value(
+                        Value::resource_ref("source".to_string(), "value", vec![]),
+                        Some(declaration.clone()),
+                    ),
+                );
+                parsed.compositions.push(middle);
+
+                let mut registry = SchemaRegistry::new();
+                registry.insert(
+                    "test",
+                    ResourceSchema::new("source.Node")
+                        .attribute(AttributeSchema::new("value", actual.attr.clone())),
+                );
+                let index = BindingIndex::from_parsed(&parsed, &registry);
+                let RefType::Typed(chain) = index.ref_type(&AccessPath::new("middle", "value"))
+                else {
+                    panic!(
+                        "composition chain must be typed: {} ->(declared {})",
+                        actual.name, declared.name,
+                    );
+                };
+
+                for sink in &universe {
+                    let accepted = chain
+                        .is_assignable_to_sink(TypeInSchema::schemaless(&sink.attr))
+                        .is_ok();
+                    let actual_accepts = TypeInSchema::schemaless(&actual.attr)
+                        .is_assignable_to(TypeInSchema::schemaless(&sink.attr));
+                    let declared_accepts = TypeInSchema::schemaless(&declared.attr)
+                        .is_assignable_to(TypeInSchema::schemaless(&sink.attr));
+                    assert!(
+                        !accepted || (actual_accepts && declared_accepts),
+                        "checker accepted {} ->(declared {})→ {}, but direct constraints were actual={} declared={}",
+                        actual.name,
+                        declared.name,
+                        sink.name,
+                        actual_accepts,
+                        declared_accepts,
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1610,12 +1956,12 @@ let vpc = aws.ec2.Vpc {
         let RefType::Typed(name) = index.ref_type("name") else {
             panic!("bare module argument must resolve to its declared type");
         };
-        assert_eq!(name.type_in_schema().resolved_type_name(), "String");
+        assert_eq!(name.display_type_name(), "String");
 
         let RefType::Typed(enabled) = index.ref_type(&AccessPath::new("cfg", "enabled")) else {
             panic!("field access into a struct argument must narrow its declared type");
         };
-        assert_eq!(enabled.type_in_schema().resolved_type_name(), "Bool");
+        assert_eq!(enabled.display_type_name(), "Bool");
     }
 
     #[test]
@@ -1662,7 +2008,7 @@ let vpc = aws.ec2.Vpc {
         let RefType::Typed(vpc) = index.ref_type(&AccessPath::new("up", "vpc")) else {
             panic!("annotated upstream export must resolve to its declared type");
         };
-        assert_eq!(vpc.type_in_schema().resolved_type_name(), "aws.ec2.Vpc.Id");
+        assert_eq!(vpc.display_type_name(), "aws.ec2.Vpc.Id");
 
         assert!(matches!(
             index.ref_type(&AccessPath::new("up", "missing")),

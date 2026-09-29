@@ -3351,9 +3351,21 @@ fn module_boundary_identity_engine() -> DiagnosticEngine {
             "group_id",
             identity("ec2.SecurityGroup", "Id"),
         ));
+    let log_group = ResourceSchema::new("logs.LogGroup")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new(
+            "arn",
+            identity("logs.LogGroup", "Arn"),
+        ));
+    let hosted_zone = ResourceSchema::new("route53.HostedZone").attribute(AttributeSchema::new(
+        "name",
+        AttributeType::refined_string(None, None, Some((None, Some(1024))), None),
+    ));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("aws", vpc);
     schemas.insert("aws", security_group);
+    schemas.insert("aws", log_group);
+    schemas.insert("aws", hosted_zone);
     custom_engine(schemas)
 }
 
@@ -3590,6 +3602,52 @@ let sg = aws.ec2.SecurityGroup {
     let mismatch = mismatch.unwrap();
     assert_eq!(mismatch.range.start.line, 1);
     assert_eq!(mismatch.range.start.character, 2);
+}
+
+#[test]
+fn declared_string_output_preserves_forwarded_evidence_in_lsp() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("module");
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        r#"attributes {
+  x: String = lg.arn
+}
+
+let lg = aws.logs.LogGroup {
+  name = "module"
+}
+"#,
+    )
+    .unwrap();
+    let source = r#"let component = use { source = '../module' }
+let m = component { }
+
+let zone = aws.route53.HostedZone {
+  name = m.x
+}
+"#;
+    std::fs::write(root.join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", source);
+    let mismatch = diagnostics.iter().find(|diagnostic| {
+        diagnostic.message.contains("Type mismatch")
+            && diagnostic.message.contains("expected String(len: ..=1024)")
+            && diagnostic.message.contains("got aws.logs.LogGroup.Arn")
+            && diagnostic.message.contains("from m.x, declared String")
+    });
+    assert!(
+        mismatch.is_some(),
+        "LSP must retain the same inferred evidence as validate: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>(),
+    );
 }
 
 #[test]
