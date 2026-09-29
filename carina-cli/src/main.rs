@@ -732,6 +732,78 @@ mod error_format_tests {
     }
 
     #[test]
+    fn plan_out_before_project_path_parses() {
+        let cli =
+            Cli::try_parse_from(["carina", "plan", "--out", "reviewed-plan.json", "infra/foo"])
+                .expect("plan --out <file> <dir> should parse");
+
+        match cli.command {
+            Commands::Plan { path, out, .. } => {
+                assert_eq!(path, PathBuf::from("infra/foo"));
+                assert_eq!(out, Some(PathBuf::from("reviewed-plan.json")));
+            }
+            _ => panic!("expected plan command"),
+        }
+    }
+
+    #[test]
+    fn plan_out_path_prefixed_to_protect_leading_dash_parses() {
+        let cli = Cli::try_parse_from([
+            "carina",
+            "plan",
+            "--out",
+            "./-reviewed-plan.json",
+            "infra/foo",
+        ])
+        .expect("a leading-dash --out value protected with ./ should parse");
+
+        match cli.command {
+            Commands::Plan { path, out, .. } => {
+                assert_eq!(path, PathBuf::from("infra/foo"));
+                assert_eq!(out, Some(PathBuf::from("./-reviewed-plan.json")));
+            }
+            _ => panic!("expected plan command"),
+        }
+    }
+
+    #[test]
+    fn force_unlock_accepts_leading_dash_lock_id_after_option_terminator() {
+        let cli = Cli::try_parse_from(["carina", "force-unlock", "--", "-lock-id", "infra/foo"])
+            .expect("force-unlock should accept a leading-dash lock ID after --");
+
+        match cli.command {
+            Commands::ForceUnlock { lock_id, path } => {
+                assert_eq!(lock_id, "-lock-id");
+                assert_eq!(path, PathBuf::from("infra/foo"));
+            }
+            _ => panic!("expected force-unlock command"),
+        }
+    }
+
+    #[test]
+    fn saved_plan_apply_accepts_legacy_override_flag_after_plan_path() {
+        let cli = Cli::try_parse_from([
+            "carina",
+            "apply",
+            "reviewed-plan.json",
+            "--accept-legacy-name-overrides",
+        ])
+        .expect("saved-plan apply should accept the legacy override flag");
+
+        match cli.command {
+            Commands::Apply {
+                path,
+                accept_legacy_name_overrides,
+                ..
+            } => {
+                assert_eq!(path, PathBuf::from("reviewed-plan.json"));
+                assert!(accept_legacy_name_overrides);
+            }
+            _ => panic!("expected apply command"),
+        }
+    }
+
+    #[test]
     fn plan_iam_flags_have_help_text() {
         let command = Cli::command();
         let plan = command

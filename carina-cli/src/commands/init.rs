@@ -7,10 +7,10 @@ use carina_core::parser::ProviderContext;
 
 use carina_provider_resolver::{self, LockMode};
 
+use crate::commands::hint::ProjectCommand;
 use crate::commands::migrate_state::{MigrationOutcome, SourceDisposition, run_init_migrate_state};
 use crate::commands::{
-    BackendDriftStatus, MIGRATE_STATE_COMMAND, drift_warning, ensure_backend_lock,
-    inspect_backend_drift,
+    BackendDriftStatus, drift_warning, ensure_backend_lock, inspect_backend_drift,
 };
 
 pub async fn run_init(
@@ -117,10 +117,10 @@ pub async fn run_init(
             configured,
         } => {
             if !migrate_state {
-                eprintln!("{}", drift_warning(&existing, &configured).yellow());
+                eprintln!("{}", drift_warning(&existing, &configured, path).yellow());
                 migration_pending = true;
             } else {
-                match run_init_migrate_state(base_dir, backend_config, force)
+                match run_init_migrate_state(path, backend_config, force)
                     .await
                     .map_err(|e| e.to_string())?
                 {
@@ -153,7 +153,8 @@ pub async fn run_init(
         println!(
             "{}",
             format!(
-                "Backend migration pending. Provider plugins resolved; run `{MIGRATE_STATE_COMMAND}` to complete initialization."
+                "Backend migration pending. Provider plugins resolved; run `{}` to complete initialization.",
+                ProjectCommand::new("init --migrate-state", path)
             )
             .yellow()
         );

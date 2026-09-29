@@ -1009,7 +1009,7 @@ async fn apply_reads_module_data_source_and_resolves_consumer_interpolation() {
         true,
         fixture.backend(),
         None,
-        get_base_dir(fixture.config_path()),
+        fixture.config_path(),
         fixture.provider_context(),
         fixture.cancel_token(),
         &observer_factory,
@@ -1257,7 +1257,10 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         true,
         fixture.backend(),
         None,
-        tmp.path(),
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: tmp.path(),
+        },
         fixture.cancel_token(),
         &observer_factory,
         NonZeroUsize::new(4).unwrap(),
@@ -1286,21 +1289,87 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
 fn apply_refuses_v7_state_without_accept_flag() {
     let state = legacy_override_state();
 
-    let err =
-        check_legacy_name_overrides(&state, false).expect_err("legacy state must require opt-in");
+    let err = check_legacy_name_overrides(&state, false, ApplyTarget::Project(Path::new(".")))
+        .expect_err("legacy state must require opt-in");
 
     assert!(matches!(err, AppError::Validation(_)));
     let msg = err.to_string();
     assert!(msg.contains("mock.test.resource.legacy"));
     assert!(msg.contains("carina plan"));
-    assert!(msg.contains("--accept-legacy-name-overrides"));
+    assert!(msg.contains("carina apply --accept-legacy-name-overrides"));
+}
+
+#[test]
+fn legacy_override_hint_names_live_project_apply_target() {
+    let state = legacy_override_state();
+    let project_dir = Path::new("infra/foo");
+
+    let err = check_legacy_name_overrides(&state, false, ApplyTarget::Project(project_dir))
+        .expect_err("legacy state must require opt-in");
+    let msg = err.to_string();
+
+    assert!(msg.contains("Run `carina plan infra/foo` first"), "{msg}");
+    assert!(!msg.contains("--out"), "{msg}");
+    assert!(
+        msg.contains("re-run `carina apply infra/foo --accept-legacy-name-overrides`"),
+        "{msg}",
+    );
+}
+
+#[test]
+fn legacy_override_hint_names_saved_plan_apply_target() {
+    let state = legacy_override_state();
+
+    let err = check_legacy_name_overrides(
+        &state,
+        false,
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("reviewed-plan.json"),
+            source_dir: Path::new("/canonical/project"),
+        },
+    )
+    .expect_err("legacy state must require opt-in");
+    let msg = err.to_string();
+
+    assert!(
+        msg.contains("Run `carina plan --out reviewed-plan.json /canonical/project` first"),
+        "{msg}",
+    );
+    assert!(
+        msg.contains("re-run `carina apply reviewed-plan.json --accept-legacy-name-overrides`"),
+        "{msg}",
+    );
+    assert!(!msg.contains("carina apply /canonical/project"), "{msg}");
+}
+
+#[test]
+fn saved_plan_drift_hint_regenerates_the_applied_plan_file() {
+    assert_eq!(
+        drift_replan_hint(ApplyTarget::SavedPlan {
+            plan_file: Path::new("reviewed-plan.json"),
+            source_dir: Path::new("infra/foo"),
+        }),
+        "Please re-run `carina plan --out reviewed-plan.json infra/foo` to create a new plan that reflects the current state."
+    );
+}
+
+#[test]
+fn live_apply_drift_hint_does_not_add_saved_plan_output() {
+    let hint = drift_replan_hint(ApplyTarget::Project(Path::new("infra/foo")));
+
+    assert_eq!(
+        hint,
+        "Please re-run `carina plan infra/foo` to create a new plan that reflects the current state."
+    );
+    assert!(!hint.contains("--out"));
 }
 
 #[test]
 fn apply_proceeds_with_accept_flag_against_legacy_state() {
     let state = legacy_override_state();
 
-    check_legacy_name_overrides(&state, true).expect("accept flag should permit legacy state");
+    check_legacy_name_overrides(&state, true, ApplyTarget::Project(Path::new(".")))
+        .expect("accept flag should permit legacy state");
 }
 
 #[test]
@@ -1376,7 +1445,7 @@ fn apply_does_not_require_flag_after_v7_to_v8_migration() {
     .expect("writeback should migrate legacy override");
 
     assert!(!migrated.has_legacy_name_overrides());
-    check_legacy_name_overrides(&migrated, false)
+    check_legacy_name_overrides(&migrated, false, ApplyTarget::Project(Path::new(".")))
         .expect("second apply should not require the legacy accept flag");
 }
 
@@ -2299,13 +2368,20 @@ fn saved_plan_backend_cross_check_rejects_non_addressing_attribute_change() {
     let planned = s3_backend_config_with_encrypt(false);
     let current = s3_backend_config_with_encrypt(true);
 
-    let err = ensure_saved_plan_backend_matches_current(Some(&planned), Some(&current))
-        .expect_err("any backend attribute change should invalidate a saved plan");
+    let err = ensure_saved_plan_backend_matches_current(
+        Some(&planned),
+        Some(&current),
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("reviewed-plan.json"),
+            source_dir: Path::new("infra/foo"),
+        },
+    )
+    .expect_err("any backend attribute change should invalidate a saved plan");
     let msg = err.to_string();
 
     assert!(msg.contains("Saved plan backend does not match the current `backend.crn`"));
     assert!(msg.contains("The plan file recorded one backend"));
-    assert!(msg.contains("Re-run `carina plan`"));
+    assert!(msg.contains("Re-run `carina plan --out reviewed-plan.json infra/foo`"));
 }
 
 #[test]
@@ -4146,7 +4222,11 @@ mod saved_plan_version_tests {
     //! no-backward-compat policy — re-running `carina plan` is the
     //! supported migration path.
 
+    use std::path::Path;
+
     use tempfile::TempDir;
+
+    use super::{ApplyTarget, saved_plan_replan_project_dir};
 
     /// A `version: 3` saved plan must be rejected by
     /// `run_apply_from_plan` with a message that names the expected
@@ -4166,7 +4246,7 @@ mod saved_plan_version_tests {
             "version": 3,
             "carina_version": "0.4.0",
             "timestamp": "2026-05-24T00:00:00Z",
-            "source_path": "test.crn",
+            "source_path": "infra/nested/main.crn",
             "state_lineage": null,
             "state_serial": null,
             "provider_configs": [],
@@ -4206,9 +4286,41 @@ mod saved_plan_version_tests {
             msg.contains(&expected),
             "error must name the expected version, got: {msg}",
         );
+        let expected_replan = format!(
+            "Re-run `carina plan --out {} infra/nested`",
+            plan_path.display()
+        );
         assert!(
-            msg.contains("Re-run 'carina plan'"),
-            "error must point the user at the supported migration path, got: {msg}",
+            msg.contains(&expected_replan),
+            "version-mismatch hint must regenerate the same saved plan, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn old_recorded_crn_source_uses_parent_directory_for_replan_hint() {
+        let source_path = Path::new("infra/nested/main.crn");
+
+        assert_eq!(
+            ApplyTarget::SavedPlan {
+                plan_file: Path::new("reviewed-plan.json"),
+                source_dir: saved_plan_replan_project_dir(source_path),
+            }
+            .replan_command()
+            .to_string(),
+            "carina plan --out reviewed-plan.json infra/nested"
+        );
+    }
+
+    #[test]
+    fn current_saved_plan_replan_hint_keeps_recorded_source_path() {
+        assert_eq!(
+            ApplyTarget::SavedPlan {
+                plan_file: Path::new("reviewed-plan.json"),
+                source_dir: Path::new("infra/nested/main.crn"),
+            }
+            .replan_command()
+            .to_string(),
+            "carina plan --out reviewed-plan.json infra/nested/main.crn"
         );
     }
 

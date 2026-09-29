@@ -15,8 +15,9 @@ use carina_core::value::{
 };
 use carina_state::{BackendConfig as StateBackendConfig, StateBackend, StateFile, create_backend};
 
-use super::{BackendDriftStatus, MIGRATE_STATE_COMMAND, drift_warning, inspect_backend_drift};
+use super::{BackendDriftStatus, drift_warning, inspect_backend_drift};
 use crate::DetailLevel;
+use crate::commands::hint::ProjectCommand;
 use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::display::{print_plan, refresh_plan_separator};
 use crate::error::AppError;
@@ -454,7 +455,7 @@ pub(crate) enum StateDrift {
 
 impl StateDrift {
     /// User-facing warning line explaining the plan may be stale.
-    pub(crate) fn warning(&self) -> String {
+    pub(crate) fn warning(&self, project_dir: &Path) -> String {
         let detail = match self {
             StateDrift::SerialAdvanced { from, to } => {
                 format!("state serial advanced {from} -> {to}")
@@ -467,7 +468,8 @@ impl StateDrift {
         format!(
             "Warning: state changed during plan ({detail}); a concurrent \
              apply/destroy ran while this plan was being computed. The \
-             plan output may be stale — re-run `carina plan`."
+             plan output may be stale — re-run `{}`.",
+            ProjectCommand::new("plan", project_dir)
         )
     }
 }
@@ -572,17 +574,17 @@ pub async fn run_plan(
     let mut use_locked_backend = false;
     let drift_note = match inspect_backend_drift(base_dir, parsed.backend.as_ref())? {
         BackendDriftStatus::Fresh => {
-            return Err(AppError::Config(
-                "Backend lock file not found. Run 'carina init' to initialize the project."
-                    .to_string(),
-            ));
+            return Err(AppError::Config(format!(
+                "Backend lock file not found. Run `{}` to initialize the project.",
+                ProjectCommand::new("init", path)
+            )));
         }
         BackendDriftStatus::Unchanged => None,
         BackendDriftStatus::Drifted {
             existing,
             configured,
         } => {
-            let warning = drift_warning(&existing, &configured);
+            let warning = drift_warning(&existing, &configured, path);
             eprintln!("{}", warning.yellow());
             let locked_config = existing.to_state_config();
             plan_file_backend_config = Some(parser_backend_config_from_state(&locked_config));
@@ -590,7 +592,8 @@ pub async fn run_plan(
             use_locked_backend = true;
             Some(format!(
                 "Backend migration pending: plan read state from the OLD backend recorded in \
-                 carina-backend.lock. Run `{MIGRATE_STATE_COMMAND}` before apply."
+                 carina-backend.lock. Run `{}` before apply.",
+                ProjectCommand::new("init --migrate-state", path)
             ))
         }
     };
@@ -809,7 +812,7 @@ pub async fn run_plan(
             Ok(state_t1) => {
                 let state_t1 = state_t1.map(|loaded| loaded.into_state());
                 if let Some(drift) = detect_state_drift(Some(snapshot_t0), state_t1.as_ref()) {
-                    eprintln!("{}", drift.warning().yellow());
+                    eprintln!("{}", drift.warning(path).yellow());
                 }
             }
             // A failed re-read is not fatal: the plan already computed
@@ -955,8 +958,8 @@ pub async fn run_plan(
         println!(
             "{}",
             format!(
-                "To apply this plan, run: carina apply {}",
-                out_path.display()
+                "To apply this plan, run: `{}`",
+                ProjectCommand::new("apply", out_path)
             )
             .cyan()
         );
@@ -2094,7 +2097,7 @@ mod state_drift_tests {
     fn warning_message_names_the_drift_kind() {
         assert!(
             StateDrift::SerialAdvanced { from: 1, to: 2 }
-                .warning()
+                .warning(Path::new("."))
                 .contains("serial advanced 1 -> 2")
         );
         assert!(
@@ -2102,18 +2105,18 @@ mod state_drift_tests {
                 from: "a".into(),
                 to: "b".into()
             }
-            .warning()
+            .warning(Path::new("."))
             .contains("lineage changed a -> b")
         );
         assert!(
             StateDrift::StateRemoved
-                .warning()
+                .warning(Path::new("."))
                 .contains("state was removed")
         );
         // Every variant must steer the user to re-run plan.
         assert!(
             StateDrift::StateRemoved
-                .warning()
+                .warning(Path::new("."))
                 .contains("re-run `carina plan`")
         );
     }

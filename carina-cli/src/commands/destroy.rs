@@ -81,7 +81,7 @@ pub async fn run_destroy(
     )?;
 
     let verified_backend =
-        verify_for_mutation(base_dir, parsed.backend.as_ref(), DriftCommand::Destroy)?;
+        verify_for_mutation(path, parsed.backend.as_ref(), DriftCommand::Destroy)?;
 
     // Don't exit early when resources are empty -- orphaned resources in the
     // state file may still need to be destroyed.
@@ -103,7 +103,7 @@ pub async fn run_destroy(
         let li = backend
             .acquire_lock("destroy")
             .await
-            .map_err(map_lock_error)?;
+            .map_err(|error| map_lock_error(error, path))?;
         println!("  {} Lock acquired", "✓".green());
         Some(li)
     } else {
