@@ -1907,7 +1907,6 @@ awscc.ec2.SecurityGroup {
                 revision: None,
                 unresolved_attributes: IndexMap::new(),
                 binding: Some("shared".to_string()),
-                is_default: false,
             }],
             ..ParsedFile::default()
         };

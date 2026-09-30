@@ -5819,7 +5819,6 @@ transparency_log_present = false
             default_tags: IndexMap::new(),
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
         }
     }
 
@@ -9246,7 +9245,6 @@ transparency_log_present = true
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         }];
@@ -9274,7 +9272,6 @@ transparency_log_present = true
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         }];
@@ -11655,7 +11652,6 @@ transparency_log_present = false
             default_tags: IndexMap::new(),
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
         };
 
         let path = resolve_single_config_with_http(dir.path(), &config, &http).unwrap();
@@ -11739,7 +11735,6 @@ transparency_log_present = false
             default_tags: IndexMap::new(),
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
         };
 
         let resolved =
@@ -11816,7 +11811,6 @@ transparency_log_present = false
             default_tags: IndexMap::new(),
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
         };
 
         let resolved =
@@ -11838,7 +11832,6 @@ transparency_log_present = false
             default_tags: IndexMap::new(),
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
         };
 
         assert_eq!(
@@ -13044,7 +13037,6 @@ transparency_log_present = false
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         }
@@ -13296,7 +13288,6 @@ transparency_log_present = false
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         };

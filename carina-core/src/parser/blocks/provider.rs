@@ -106,7 +106,6 @@ pub(in crate::parser) fn parse_provider_block(
         revision,
         unresolved_attributes,
         binding: None,
-        is_default: true,
     })
 }
 
@@ -135,7 +134,6 @@ pub(in crate::parser) fn parse_provider_expr(
     }
 
     config.binding = Some(binding_name.to_string());
-    config.is_default = false;
     Ok(config)
 }
 

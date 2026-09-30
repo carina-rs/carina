@@ -1253,7 +1253,6 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
     }];
     let plan_file = PlanFile {
         version: PlanFile::CURRENT_VERSION,

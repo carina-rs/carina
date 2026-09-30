@@ -1115,7 +1115,6 @@ mod tests {
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
             attributes,
             default_tags: IndexMap::new(),
         };
@@ -1150,7 +1149,6 @@ mod tests {
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
         };
@@ -1181,7 +1179,6 @@ mod reload_skip_tests {
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
         }
     }
 

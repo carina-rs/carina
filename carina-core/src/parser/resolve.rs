@@ -524,7 +524,7 @@ pub fn check_provider_instance_routing(parsed: &ParsedFile) -> Vec<ParseError> {
                         .iter()
                         .fold((false, false), |(any, def), p| {
                             let matches = p.name == id.provider;
-                            (any || matches, def || (matches && p.is_default))
+                            (any || matches, def || (matches && p.is_default()))
                         });
                 if !kind_has_any {
                     continue;

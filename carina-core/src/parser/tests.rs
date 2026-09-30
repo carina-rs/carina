@@ -2799,7 +2799,6 @@ fn provider_config_carries_unresolved_attributes_field() {
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
     };
     assert!(pc.unresolved_attributes.is_empty());
 }
@@ -10729,7 +10728,7 @@ fn parse_provider_expr_named_instance_in_let_binding() {
     let default = parsed
         .providers
         .iter()
-        .find(|p| p.is_default)
+        .find(|p| p.is_default())
         .expect("default instance from top-level block");
     assert_eq!(default.name, "aws");
     assert!(default.binding.is_none());
@@ -10741,7 +10740,7 @@ fn parse_provider_expr_named_instance_in_let_binding() {
     let named = parsed
         .providers
         .iter()
-        .find(|p| !p.is_default)
+        .find(|p| !p.is_default())
         .expect("named instance from let binding");
     assert_eq!(named.name, "aws", "named instance carries the kind");
     assert_eq!(named.binding.as_deref(), Some("us"));
@@ -10823,9 +10822,9 @@ fn parse_provider_expr_rejects_revision_on_named_instance() {
 }
 
 #[test]
-fn parse_top_level_provider_block_keeps_default_instance_flags() {
+fn parse_top_level_provider_block_is_default_without_a_binding() {
     // The existing top-level `provider <kind> { ... }` shape continues to
-    // parse and now carries the default-instance metadata.
+    // parse as the default instance because it has no binding.
     let input = r#"
         provider mock {
             source = "github.com/carina-rs/carina-provider-mock"
@@ -10837,10 +10836,9 @@ fn parse_top_level_provider_block_keeps_default_instance_flags() {
     let p = &parsed.providers[0];
     assert_eq!(p.name, "mock");
     assert!(
-        p.is_default,
+        p.is_default(),
         "top-level provider block is the kind's default instance"
     );
-    assert!(p.binding.is_none(), "default instance has no binding name");
 }
 
 #[test]
@@ -10910,11 +10908,11 @@ fn parse_provider_expr_named_instance_visible_across_files() {
     let has_default = parsed
         .providers
         .iter()
-        .any(|p| p.name == "aws" && p.is_default && p.binding.is_none());
+        .any(|p| p.name == "aws" && p.is_default());
     let has_named = parsed
         .providers
         .iter()
-        .any(|p| p.name == "aws" && !p.is_default && p.binding.as_deref() == Some("us"));
+        .any(|p| p.name == "aws" && p.binding.as_deref() == Some("us"));
     assert!(has_default, "default instance from providers.crn missing");
     assert!(has_named, "named instance from main.crn missing");
 }
@@ -10996,13 +10994,43 @@ fn provider_config_named_instance_serde_round_trip() {
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: Some("us".to_string()),
-        is_default: false,
     };
     let json = serde_json::to_string(&original).expect("serialize");
+    assert!(
+        !json.contains("\"is_default\""),
+        "the legacy duplicate field must not be serialized, got: {json}"
+    );
     let decoded: ProviderConfig = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(decoded.name, "aws");
     assert_eq!(decoded.binding.as_deref(), Some("us"));
-    assert!(!decoded.is_default);
+    assert!(!decoded.is_default());
+}
+
+#[test]
+fn provider_config_deserializes_legacy_plan_instance_shapes() {
+    use crate::parser::ast::ProviderConfig;
+
+    let named: ProviderConfig = serde_json::from_str(
+        r#"{
+            "name": "aws",
+            "attributes": {},
+            "binding": "east",
+            "is_default": false
+        }"#,
+    )
+    .expect("deserialize named provider from an existing plan");
+    assert_eq!(named.binding.as_deref(), Some("east"));
+    assert!(!named.is_default());
+
+    let default: ProviderConfig = serde_json::from_str(
+        r#"{
+            "name": "aws",
+            "attributes": {}
+        }"#,
+    )
+    .expect("deserialize default provider from an existing plan");
+    assert!(default.binding.is_none());
+    assert!(default.is_default());
 }
 
 #[test]
@@ -11017,7 +11045,6 @@ fn provider_config_default_instance_serde_round_trip() {
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
     };
     let json = serde_json::to_string(&original).expect("serialize");
     // Defaults skipped from the JSON to keep state files small.
@@ -11027,12 +11054,12 @@ fn provider_config_default_instance_serde_round_trip() {
     );
     assert!(
         !json.contains("\"is_default\""),
-        "is_default: true should be skipped, got: {json}"
+        "the legacy duplicate field must not be serialized, got: {json}"
     );
     // Deserialising omitted fields must still produce the default-instance shape.
     let decoded: ProviderConfig = serde_json::from_str(&json).expect("deserialize");
     assert!(decoded.binding.is_none());
-    assert!(decoded.is_default);
+    assert!(decoded.is_default());
 }
 
 #[test]
@@ -11459,7 +11486,7 @@ fn parse_directory_named_instance_region_is_enum_identifier_namespaced() {
     let default = parsed
         .providers
         .iter()
-        .find(|p| p.is_default && p.name == "aws")
+        .find(|p| p.is_default() && p.name == "aws")
         .expect("default instance must exist");
     let default_region_text = match default.attributes.get("region") {
         Some(Value::Concrete(ConcreteValue::EnumIdentifier(s))) => Some(s.as_str()),

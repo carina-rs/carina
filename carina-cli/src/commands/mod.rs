@@ -404,7 +404,7 @@ pub fn validate_and_resolve_errors_with_factories(
     }
 
     // Check for declared providers whose plugins failed to load.
-    // Named instances (`!is_default`) deliberately omit `source` —
+    // Named instances (`binding.is_some()`) deliberately omit `source` —
     // the parser enforces that `source` is a kind-level property
     // (carina#3023). They inherit the kind default's plugin, so
     // they only matter to this check when the *kind default* could
@@ -418,7 +418,8 @@ pub fn validate_and_resolve_errors_with_factories(
             }
             if let Some(reason) = load_errors.get(&provider.name) {
                 errors.push(AppError::Validation(reason.clone()));
-            } else if provider.is_default && provider.source.is_none() && provider.name != "mock" {
+            } else if provider.is_default() && provider.source.is_none() && provider.name != "mock"
+            {
                 errors.push(AppError::Validation(missing_provider_source_message(
                     &provider.name,
                 )));
@@ -901,7 +902,6 @@ mod tests {
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
         });
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
         let result = validate_and_resolve_with_config(&mut parsed, base_dir, false, &[], &[]);
@@ -935,7 +935,6 @@ mod tests {
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
         });
         let base_dir = std::path::Path::new("/tmp/nonexistent-carina-test");
         let result = validate_and_resolve_with_config(&mut parsed, base_dir, false, &[], &[]);

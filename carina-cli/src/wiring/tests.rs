@@ -2963,7 +2963,6 @@ fn region_provider_config(raw_region: &str) -> ProviderConfig {
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
     }
 }
 
@@ -4657,7 +4656,7 @@ mod kind_default_source_tests {
     use carina_core::parser::ProviderConfig;
     use indexmap::IndexMap;
 
-    fn config(name: &str, is_default: bool, source: Option<&str>) -> ProviderConfig {
+    fn config(name: &str, binding: Option<&str>, source: Option<&str>) -> ProviderConfig {
         ProviderConfig {
             name: name.to_string(),
             attributes: IndexMap::new(),
@@ -4666,12 +4665,7 @@ mod kind_default_source_tests {
             version: None,
             revision: None,
             unresolved_attributes: IndexMap::new(),
-            binding: if is_default {
-                None
-            } else {
-                Some("named".to_string())
-            },
-            is_default,
+            binding: binding.map(str::to_string),
         }
     }
 
@@ -4680,10 +4674,10 @@ mod kind_default_source_tests {
         let configs = vec![
             config(
                 "aws",
-                true,
+                None,
                 Some("github.com/carina-rs/carina-provider-aws"),
             ),
-            config("aws", false, None),
+            config("aws", Some("named"), None),
         ];
         assert_eq!(
             kind_default_source(&configs, "aws"),
@@ -4697,10 +4691,10 @@ mod kind_default_source_tests {
         // still pick the default, not the named — otherwise it would
         // return the named instance's (always-None) source.
         let configs = vec![
-            config("aws", false, None),
+            config("aws", Some("named"), None),
             config(
                 "aws",
-                true,
+                None,
                 Some("github.com/carina-rs/carina-provider-aws"),
             ),
         ];
@@ -4717,12 +4711,12 @@ mod kind_default_source_tests {
         let configs = vec![
             config(
                 "aws",
-                true,
+                None,
                 Some("github.com/carina-rs/carina-provider-aws"),
             ),
             config(
                 "awscc",
-                true,
+                None,
                 Some("github.com/carina-rs/carina-provider-awscc"),
             ),
         ];
@@ -4738,7 +4732,7 @@ mod kind_default_source_tests {
 
     #[test]
     fn returns_none_when_kind_default_has_no_source() {
-        let configs = vec![config("mock", true, None)];
+        let configs = vec![config("mock", None, None)];
         assert_eq!(kind_default_source(&configs, "mock"), None);
     }
 
@@ -4746,7 +4740,7 @@ mod kind_default_source_tests {
     fn returns_none_when_kind_is_absent() {
         let configs = vec![config(
             "aws",
-            true,
+            None,
             Some("github.com/carina-rs/carina-provider-aws"),
         )];
         assert_eq!(kind_default_source(&configs, "awscc"), None);
@@ -5096,7 +5090,6 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
         revision: Some(revision.into()),
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     };
@@ -5153,7 +5146,6 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
         revision: Some(revision.into()),
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     };
@@ -5188,7 +5180,6 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     };
@@ -5237,7 +5228,6 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     };
@@ -5276,7 +5266,6 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
         revision: Some("main".into()),
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     };
@@ -5376,7 +5365,6 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     };

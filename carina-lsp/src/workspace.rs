@@ -333,13 +333,13 @@ mod tests {
                 "default and named instances must both survive when default={default_file}, named={named_file}"
             );
             assert!(providers.iter().any(|provider| {
-                provider.is_default
-                    && provider.binding.is_none()
-                    && provider.source.as_deref() == Some("file:///x.wasm")
+                provider.is_default() && provider.source.as_deref() == Some("file:///x.wasm")
             }));
-            assert!(providers.iter().any(|provider| {
-                !provider.is_default && provider.binding.as_deref() == Some("east")
-            }));
+            assert!(
+                providers
+                    .iter()
+                    .any(|provider| provider.binding.as_deref() == Some("east"))
+            );
         }
     }
 
@@ -378,11 +378,7 @@ mod tests {
         assert_eq!(providers.len(), 2);
         assert_eq!(providers[0].name, "aws");
         assert_eq!(providers[1].name, "awscc");
-        assert!(
-            providers
-                .iter()
-                .all(|provider| provider.is_default && provider.binding.is_none())
-        );
+        assert!(providers.iter().all(|provider| provider.is_default()));
     }
 
     #[test]

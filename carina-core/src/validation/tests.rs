@@ -1381,7 +1381,6 @@ fn provider_in_module_with_arguments_errors() {
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
     });
     parsed.arguments.push(crate::parser::ArgumentParameter {
         name: "vpc_cidr".to_string(),
@@ -1411,7 +1410,6 @@ fn provider_in_module_with_attributes_errors() {
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
     });
     parsed
         .attribute_params
@@ -1437,7 +1435,6 @@ fn provider_without_module_markers_ok() {
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
     });
 
     let result = validate_no_provider_in_module(&parsed);
@@ -1754,7 +1751,6 @@ fn provider(name: &str) -> crate::parser::ProviderConfig {
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
     }
 }
 
@@ -5148,7 +5144,6 @@ fn validate_provider_config_skips_attributes_with_deferred_refs() {
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
     };
     let mut parsed = empty_parsed();
     parsed.providers.push(pc);

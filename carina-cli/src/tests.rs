@@ -360,7 +360,6 @@ fn plan_file_serde_round_trip() {
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
         }],
         backend_config: Some(BackendConfig {
             backend_type: "s3".to_string(),
@@ -657,7 +656,6 @@ fn make_awscc_provider(region_dsl: &str) -> ProviderConfig {
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
     }
 }
 

@@ -223,7 +223,6 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
         }],
         backend_config: Some(BackendConfig {
             backend_type: "local".to_string(),
@@ -344,7 +343,6 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
         }],
         backend_config: Some(BackendConfig {
             backend_type: "local".to_string(),
