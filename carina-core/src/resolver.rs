@@ -535,7 +535,10 @@ mod tests {
     use crate::resource::ResourceId;
 
     fn make_resource(name: &str, binding: Option<&str>, attrs: Vec<(&str, Value)>) -> Resource {
-        let mut r = Resource::new("test.resource", name);
+        let mut r = Resource::new(
+            "test.resource",
+            crate::resource::ResourceIdentity::try_from(name.to_string()).unwrap(),
+        );
         r.attributes = attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         r.binding = binding.map(|b| b.to_string());
         r

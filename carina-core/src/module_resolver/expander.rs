@@ -378,7 +378,7 @@ impl ModuleResolver<'_> {
             let composition = Composition {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "_virtual",
-                    instance_prefix,
+                    crate::resource::ResourceIdentity::new(instance_prefix.to_string()),
                 )),
                 signature: crate::resource::Signature {
                     arguments: signature_arguments,
@@ -528,7 +528,10 @@ pub(crate) fn build_expansion_trace(
     leaf_data_sources: &[DataSource],
 ) -> crate::resource::ExpansionTrace {
     let id = crate::resource::EphemeralId::new(crate::resource::ResolvedResourceId::new(
-        crate::resource::ResourceId::with_identity("_virtual", instance_prefix),
+        crate::resource::ResourceId::with_identity(
+            "_virtual",
+            crate::resource::ResourceIdentity::new(instance_prefix.to_string()),
+        ),
     ));
     let this_call_site = match source_path {
         Some(p) => crate::resource::CallSite::new(id, p),

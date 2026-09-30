@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use carina_core::differ::{Diff, diff};
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, Schema, StructField};
 
 /// Build a minimal WAFv2-WebACL-shaped cyclic schema.
@@ -154,7 +154,13 @@ fn differ_treats_equal_cyclic_values_as_unchanged() {
     current_attrs.insert("rules".to_string(), rules_value);
     let current = State::existing(id.clone(), current_attrs);
 
-    let d = diff(&desired, &current, None, None, Some(&schema));
+    let d = diff(
+        &ResolvedResource::new(desired),
+        &current,
+        None,
+        None,
+        Some(&schema),
+    );
     assert!(
         matches!(d, Diff::NoChange(_)),
         "equal cyclic values must produce NoChange, got: {d:?}"
@@ -180,7 +186,13 @@ fn differ_surfaces_a_real_change_inside_a_cyclic_value() {
     );
     let current = State::existing(id.clone(), current_attrs);
 
-    let d = diff(&desired, &current, None, None, Some(&schema));
+    let d = diff(
+        &ResolvedResource::new(desired),
+        &current,
+        None,
+        None,
+        Some(&schema),
+    );
     match d {
         Diff::Update {
             changed_attributes, ..
@@ -415,11 +427,7 @@ fn build_resource(id: &ResourceId, attrs: &[(&str, Value)]) -> Resource {
     // touch the private `id` field, but immediately overwrite the
     // synthesized id with the one our test owns (same shape, plus an
     // explicit provider).
-    let mut r = Resource::new(
-        id.resource_type.clone(),
-        id.identity_str().expect("resolved identity").to_string(),
-    );
-    r.id = id.clone();
+    let mut r = Resource::from_id(id.clone());
     for (k, v) in attrs {
         r = r.with_attribute(k.to_string(), v.clone());
     }

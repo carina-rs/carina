@@ -13,7 +13,9 @@ use indexmap::IndexMap;
 
 use super::*;
 use crate::parser::{ArgumentParameter, ModuleCall, ParsedFile, ProviderContext, TypeExpr};
-use crate::resource::{ConcreteValue, DeferredValue, Directives, Resource, ResourceId, Value};
+use crate::resource::{
+    ConcreteValue, DeferredValue, Directives, Resource, ResourceId, ResourceIdentity, Value,
+};
 use crate::schema::TypeIdentity;
 
 fn reconcile_anonymous_module_instances(
@@ -447,7 +449,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
         id: ResourceId::with_provider_identity(
             "aws",
             "iam.Role",
-            format!("{}.role", current_prefix),
+            ResourceIdentity::try_from(format!("{}.role", current_prefix)).unwrap(),
             Some("us".to_string()),
         ),
         attributes: {
@@ -1463,7 +1465,7 @@ thing { name = 'after-edit' }
         [crate::parser::StateBlockAddress::new(
             "awscc",
             "iam.Role",
-            &state_name,
+            ResourceIdentity::try_from(state_name.clone()).unwrap(),
         )]
         .into_iter()
         .collect(),
@@ -1515,7 +1517,7 @@ thing { name = 'after-edit' }
         [crate::parser::StateBlockAddress::new(
             "awscc",
             "iam.Role",
-            &before_name,
+            ResourceIdentity::try_from(before_name.clone()).unwrap(),
         )]
         .into_iter()
         .collect(),

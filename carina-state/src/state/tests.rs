@@ -1199,7 +1199,7 @@ fn bodyless_refresh_demotes_reordered_list_elements_and_merge_stays_conservative
         );
     assert!(matches!(
         diff(
-            &reauthored,
+            &resolved(&reauthored),
             &reordered_provider,
             saved.get(&resource.id),
             Some(&row.explicit),
@@ -3366,7 +3366,7 @@ fn v9_legacy_list_survives_v10_lift_stays_conservative_and_self_heals_on_writeba
         .with_identifier("listener-id");
     assert!(matches!(
         diff(
-            &desired,
+            &resolved(&desired),
             &current,
             Some(&current_attributes),
             Some(&legacy_explicit),
@@ -3450,7 +3450,7 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
             ])),
         );
     let removal = diff(
-        &removed,
+        &resolved(&removed),
         &first_provider,
         saved.get(&authored.id),
         Some(&first_row.explicit),
@@ -3498,7 +3498,7 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
     );
     assert!(matches!(
         diff(
-            &removed,
+            &resolved(&removed),
             &expected_effective,
             saved.get(&authored.id),
             Some(&first_row.explicit),

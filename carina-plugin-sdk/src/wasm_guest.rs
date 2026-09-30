@@ -62,7 +62,36 @@ pub fn proto_value_to_json(v: &proto::Value) -> serde_json::Value {
 ///
 /// Delegates to `crate::parse_resource_id_string` which is available on all targets.
 pub fn parse_resource_id_string(key: &str) -> crate::types::ResourceId {
-    crate::parse_resource_id_string(key)
+    let mut id = crate::parse_resource_id_string(key);
+    id.identity = canonical_wire_resource_identity(&id.identity);
+    id
+}
+
+struct ResolvedWireResourceIdentity(String);
+
+enum WireResourceIdentityError {
+    Empty,
+}
+
+impl TryFrom<String> for ResolvedWireResourceIdentity {
+    type Error = WireResourceIdentityError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.is_empty() {
+            Err(WireResourceIdentityError::Empty)
+        } else {
+            Ok(Self(value))
+        }
+    }
+}
+
+/// Preserve the WIT contract's empty-string representation for a pending id.
+#[doc(hidden)]
+pub fn canonical_wire_resource_identity(identity: &str) -> String {
+    match ResolvedWireResourceIdentity::try_from(identity.to_string()) {
+        Ok(identity) => identity.0,
+        Err(WireResourceIdentityError::Empty) => String::new(),
+    }
 }
 
 /// Macro to export a `CarinaProvider` implementation as a WASM component.
@@ -117,7 +146,7 @@ macro_rules! export_provider {
                 proto::ResourceId {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
-                    identity: id.identity.clone(),
+                    identity: helpers::canonical_wire_resource_identity(&id.identity),
                 }
             }
 
@@ -135,7 +164,7 @@ macro_rules! export_provider {
                 wit_types::ResourceId {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
-                    identity: id.identity.clone(),
+                    identity: helpers::canonical_wire_resource_identity(&id.identity),
                 }
             }
 
@@ -719,7 +748,7 @@ macro_rules! export_provider {
                 proto::ResourceId {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
-                    identity: id.identity.clone(),
+                    identity: helpers::canonical_wire_resource_identity(&id.identity),
                 }
             }
 
@@ -737,7 +766,7 @@ macro_rules! export_provider {
                 wit_types::ResourceId {
                     provider: id.provider.clone(),
                     resource_type: id.resource_type.clone(),
-                    identity: id.identity.clone(),
+                    identity: helpers::canonical_wire_resource_identity(&id.identity),
                 }
             }
 

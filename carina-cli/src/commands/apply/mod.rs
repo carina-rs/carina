@@ -1574,7 +1574,10 @@ async fn run_apply_locked(
     // apply and refresh paths cannot diverge on these phases. The
     // constructor is the only way to obtain an `ExpandedRefreshState`
     // — leaving a phase out becomes a compile error.
-    let moved_targets: HashSet<ResourceId> = moved_pairs.iter().map(|(_, to)| to.clone()).collect();
+    let moved_targets: HashSet<ResourceId> = moved_pairs
+        .iter()
+        .map(|(_, to)| to.as_inner().clone())
+        .collect();
     let crate::wiring::ExpandedRefreshState {
         sorted_resources: resorted,
         residual_deferred_for,
@@ -1871,7 +1874,7 @@ async fn run_apply_locked(
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
         .iter()
-        .map(|(from, to)| (to.clone(), from.clone()))
+        .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
         .collect();
 
     let resolved_exports = crate::commands::plan::resolve_export_values_for_display(

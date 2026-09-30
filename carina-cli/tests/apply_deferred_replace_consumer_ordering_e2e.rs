@@ -151,7 +151,13 @@ provider mock {}
 }
 
 fn mock_resource(name: &str, binding: &str) -> Resource {
-    Resource::with_provider("mock", "test.resource", name, None).with_binding(binding)
+    Resource::with_provider(
+        "mock",
+        "test.resource",
+        ResourceIdentity::try_from(name.to_string()).unwrap(),
+        None,
+    )
+    .with_binding(binding)
 }
 
 fn string(value: &str) -> Value {
@@ -159,13 +165,7 @@ fn string(value: &str) -> Value {
 }
 
 fn identity(value: &str) -> ResourceIdentity {
-    let id = ResourceId::with_identity("test.resource", value);
-    match id.identity_state() {
-        carina_core::resource::ResourceIdentityState::Pending(_) => {
-            unreachable!("fixture identity is resolved")
-        }
-        carina_core::resource::ResourceIdentityState::Resolved(identity) => identity.clone(),
-    }
+    ResourceIdentity::try_from(value.to_string()).unwrap()
 }
 
 fn state_not_found(resource: &Resource) -> CurrentStateEntry {

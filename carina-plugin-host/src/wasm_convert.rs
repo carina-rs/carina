@@ -13,8 +13,8 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives,
-    Resource as CoreResource, ResourceId as CoreResourceId, ResourceIdentityState,
-    State as CoreState, Value as CoreValue,
+    Resource as CoreResource, ResourceId as CoreResourceId, ResourceIdentity,
+    ResourceIdentityError, ResourceIdentityState, State as CoreState, Value as CoreValue,
 };
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
@@ -466,10 +466,18 @@ pub fn wit_to_core_resource_id(id: &wit::ResourceId) -> CoreResourceId {
     // Tracked as a follow-up to extend the WIT contract; until then,
     // callers that need routing must thread it through alongside the
     // converted id.
-    if id.identity.is_empty() {
-        CoreResourceId::pending_with_provider(&id.provider, &id.resource_type, None)
-    } else {
-        CoreResourceId::with_provider_identity(&id.provider, &id.resource_type, &id.identity, None)
+    match ResourceIdentity::try_from(id.identity.clone()) {
+        Ok(identity) => CoreResourceId::with_provider_identity(
+            id.provider.clone(),
+            id.resource_type.clone(),
+            identity,
+            None,
+        ),
+        Err(ResourceIdentityError::Empty) => CoreResourceId::pending_with_provider(
+            id.provider.clone(),
+            id.resource_type.clone(),
+            None,
+        ),
     }
 }
 

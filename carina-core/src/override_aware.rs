@@ -396,7 +396,7 @@ mod tests {
         Value::Concrete(ConcreteValue::String(value.into()))
     }
 
-    fn resource(binding: &str, name: Value) -> Resource {
+    fn resource(binding: &'static str, name: Value) -> Resource {
         let mut resource = Resource::new("mock.thing", binding);
         resource.binding = Some(binding.to_string());
         resource.attributes.insert("name".to_string(), name);

@@ -110,10 +110,16 @@ pub(crate) fn parse_state_block_address(
     // invariant holds for every constructor, not just this parser
     // path. A future programmatic caller can't bypass it.
     let (provider, resource_type) = split_namespaced_id(&namespaced);
+    let name = crate::resource::ResourceIdentity::try_from(raw_name).map_err(|error| {
+        ParseError::InvalidExpression {
+            line: 0,
+            message: error.to_string(),
+        }
+    })?;
     Ok(crate::parser::ast::StateBlockAddress::new(
         provider,
         resource_type,
-        raw_name,
+        name,
     ))
 }
 

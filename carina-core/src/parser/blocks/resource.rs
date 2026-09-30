@@ -11,7 +11,7 @@ use crate::parser::context::{ParseContext, extract_key_string, first_inner, next
 use crate::parser::error::ParseError;
 use crate::parser::parse_expression;
 use crate::parser::util::expression_is_plain_string_literal;
-use crate::resource::{ConcreteValue, DataSource, Resource, ResourceId, Value};
+use crate::resource::{ConcreteValue, DataSource, Resource, ResourceId, ResourceIdentity, Value};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -221,7 +221,7 @@ pub(crate) fn parse_resource_expr(
     let id = ResourceId::with_provider_identity(
         provider,
         resource_type,
-        resource_name,
+        ResourceIdentity::new(resource_name),
         directives.provider_instance.clone(),
     );
 
@@ -277,7 +277,7 @@ pub(crate) fn parse_read_resource_expr(
     let id = ResourceId::with_provider_identity(
         provider,
         resource_type,
-        resource_name,
+        ResourceIdentity::new(resource_name),
         directives.provider_instance.clone(),
     );
 

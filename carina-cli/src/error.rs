@@ -193,6 +193,10 @@ fn parse_account_guard_clause(msg: &str, kind: &str) -> Option<AccountGuardClaus
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    /// A runtime string was not a valid resource identity.
+    #[error(transparent)]
+    ResourceIdentity(#[from] carina_core::resource::ResourceIdentityError),
+
     /// State backend errors (lock contention, I/O, serialization, etc.)
     #[error(transparent)]
     Backend(#[from] BackendError),

@@ -8,7 +8,7 @@ mod plan;
 
 use std::collections::HashMap;
 
-use crate::resource::{ResolvedResourceId, Resource, ResourceId, State, Value};
+use crate::resource::{ResolvedResource, Resource, ResourceId, State, Value};
 use crate::schema::ResourceSchema;
 
 pub use plan::{block_deletes_on_prior_consumer_updates, create_plan, create_plan_with_cascades};
@@ -85,18 +85,29 @@ impl Diff {
 /// previously wrote but no longer mentions.
 /// If `schema` is provided, type-aware comparison is used (e.g., Int/Float coercion,
 /// case-insensitive enum matching).
+///
+/// Pending resources cannot enter the differ:
+///
+/// ```compile_fail
+/// use carina_core::differ::diff;
+/// use carina_core::resource::{Resource, State};
+///
+/// let resource = Resource::pending("test.Resource");
+/// let state = State::not_found(resource.id.clone());
+/// let _ = diff(&resource, &state, None, None, None);
+/// ```
 pub fn diff(
-    desired: &Resource,
+    desired: &ResolvedResource,
     current: &State,
     saved: Option<&HashMap<String, Value>>,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> Diff {
     if !current.exists {
-        return Diff::Create(desired.clone());
+        return Diff::Create(desired.as_resource().clone());
     }
 
-    let desired_id = ResolvedResourceId::new(desired.id.clone());
+    let desired_id = desired.resolved_id();
     let changed = comparison::find_changed_attributes(
         &desired.resolved_attributes(),
         &current.attributes,
@@ -112,10 +123,27 @@ pub fn diff(
         Diff::Update {
             id: desired.id.clone(),
             from: Box::new(current.clone()),
-            to: desired.clone(),
+            to: desired.as_resource().clone(),
             changed_attributes: changed,
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn diff_test(
+    desired: &Resource,
+    current: &State,
+    saved: Option<&HashMap<String, Value>>,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+) -> Diff {
+    diff(
+        &ResolvedResource::new(desired.clone()),
+        current,
+        saved,
+        prev_explicit,
+        schema,
+    )
 }
 
 #[cfg(test)]

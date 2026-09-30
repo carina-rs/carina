@@ -14,8 +14,8 @@ use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, RawSavedAttrs};
 use carina_core::resource::{
-    ConcreteValue, DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceId, State,
-    Value,
+    ConcreteValue, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource,
+    ResourceId, ResourceIdentity, ResourceIdentityError, State, Value,
 };
 use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
@@ -704,11 +704,15 @@ async fn run_state_lookup(
 fn build_plan_from_state(state: &StateFile) -> Plan {
     let mut plan = Plan::new();
     for rs in state.resources() {
+        let identity = match ResourceIdentity::try_from(rs.identity.clone()) {
+            Ok(identity) => identity,
+            Err(ResourceIdentityError::Empty) => continue,
+        };
         // carina#3181 PR D: `Effect::Read` carries a `DataSource`.
         let mut resource = carina_core::resource::DataSource::with_provider(
             &rs.provider,
             &rs.resource_type,
-            &rs.identity,
+            identity,
             rs.directives.provider_instance.clone(),
         );
         resource.directives = rs.directives.clone();
@@ -919,10 +923,11 @@ async fn run_state_bucket_delete(
     // Delete the bucket resource (identifier is the bucket name)
     // Backend bucket is provider-default; named-instance routing is
     // a DSL concern that doesn't apply to the implicit state bucket.
+    let bucket_identity = ResourceIdentity::try_from(bucket_name.to_string())?;
     let bucket_id = ResourceId::with_provider_identity(
         backend_provider_name,
         backend_resource_type,
-        bucket_name,
+        bucket_identity,
         None,
     );
     match bucket_provider
@@ -1200,10 +1205,14 @@ async fn run_state_refresh_locked_with_ctx(
             sf.resources()
                 .iter()
                 .filter_map(|rs| {
+                    let identity = match ResourceIdentity::try_from(rs.identity.clone()) {
+                        Ok(identity) => identity,
+                        Err(ResourceIdentityError::Empty) => return None,
+                    };
                     let id = ResourceId::with_provider_identity(
-                        &rs.provider,
-                        &rs.resource_type,
-                        &rs.identity,
+                        rs.provider.clone(),
+                        rs.resource_type.clone(),
+                        identity,
                         rs.directives.provider_instance.clone(),
                     );
                     if desired_ids.contains(&id) {
@@ -1571,9 +1580,9 @@ async fn refresh_existing_resources_until_cancelled(
 struct DeposedRefreshTarget {
     row_provider: String,
     row_resource_type: String,
-    row_identity: String,
+    row_identity: ResourceIdentity,
     row_provider_instance: Option<String>,
-    id: ResourceId,
+    id: ResolvedResourceId,
     key: DeposedKey,
     identifier: String,
     provider_instance: Option<String>,
@@ -1660,7 +1669,7 @@ where
             state.remove_deposed_generation(
                 &target.row_provider,
                 &target.row_resource_type,
-                &target.row_identity,
+                target.row_identity.as_str(),
                 &target.key,
             );
             summary.removed_generations += 1;
@@ -1717,7 +1726,7 @@ where
         state.upsert_deposed_generation(
             &target.row_provider,
             &target.row_resource_type,
-            &target.row_identity,
+            target.row_identity.as_str(),
             target.row_provider_instance.clone(),
             updated,
         )?;
@@ -1739,17 +1748,21 @@ fn collect_deposed_refresh_targets(state: &carina_state::StateFile) -> Vec<Depos
         .resources()
         .iter()
         .flat_map(|row| {
-            row.deposed.iter().map(|deposed| {
-                let id = ResourceId::with_provider_identity(
-                    &row.provider,
-                    &row.resource_type,
-                    &row.identity,
+            row.deposed.iter().filter_map(|deposed| {
+                let identity = match ResourceIdentity::try_from(row.identity.clone()) {
+                    Ok(identity) => identity,
+                    Err(ResourceIdentityError::Empty) => return None,
+                };
+                let id = ResolvedResourceId::with_provider_identity(
+                    row.provider.clone(),
+                    row.resource_type.clone(),
+                    identity.clone(),
                     deposed.provider_instance.clone(),
                 );
-                DeposedRefreshTarget {
+                Some(DeposedRefreshTarget {
                     row_provider: row.provider.clone(),
                     row_resource_type: row.resource_type.clone(),
-                    row_identity: row.identity.clone(),
+                    row_identity: identity,
                     row_provider_instance: row.directives.provider_instance.clone(),
                     id,
                     key: deposed.key.clone(),
@@ -1757,7 +1770,7 @@ fn collect_deposed_refresh_targets(state: &carina_state::StateFile) -> Vec<Depos
                     provider_instance: deposed.provider_instance.clone(),
                     attributes: deposed.attributes.clone(),
                     dependency_bindings: deposed.dependency_bindings.clone(),
-                }
+                })
             })
         })
         .collect()
@@ -1776,12 +1789,7 @@ fn desired_resource_for_deposed<'a>(
 }
 
 fn synthetic_deposed_resource(target: &DeposedRefreshTarget) -> Resource {
-    let mut resource = Resource::with_provider(
-        &target.row_provider,
-        &target.row_resource_type,
-        &target.row_identity,
-        target.provider_instance.clone(),
-    );
+    let mut resource = Resource::from_id(target.id.as_inner().clone());
     for (key, value) in &target.attributes {
         if let Some(dsl_value) = json_to_dsl_value(value) {
             resource.set_attr(key.clone(), dsl_value);
@@ -1799,7 +1807,7 @@ async fn normalize_deposed_read_state<P>(
 ) where
     P: ProviderNormalizer + ?Sized,
 {
-    let mut states = HashMap::from([(target.id.clone(), fresh_state.clone())]);
+    let mut states = HashMap::from([(target.id.as_inner().clone(), fresh_state.clone())]);
     let resources = std::slice::from_ref(resource);
     let saved_attrs = deposed_saved_attrs(target).lift(schemas);
     provider
@@ -1807,7 +1815,7 @@ async fn normalize_deposed_read_state<P>(
         .await;
     carina_core::utils::lift_current_state_enum_leaves(&mut states, resources, schemas);
 
-    if let Some(normalized) = states.remove(&target.id) {
+    if let Some(normalized) = states.remove(target.id.as_inner()) {
         *fresh_state = normalized;
     }
 }
@@ -1818,7 +1826,7 @@ fn deposed_saved_attrs(target: &DeposedRefreshTarget) -> RawSavedAttrs {
         .iter()
         .filter_map(|(key, value)| json_to_dsl_value(value).map(|dsl| (key.clone(), dsl)))
         .collect();
-    RawSavedAttrs::from_persisted(HashMap::from([(target.id.clone(), attrs)]))
+    RawSavedAttrs::from_persisted(HashMap::from([(target.id.as_inner().clone(), attrs)]))
 }
 
 /// Compare old state with fresh provider state for a single resource,
@@ -1844,10 +1852,10 @@ fn diff_display_update_resource(
     label_suffix: &str,
     counts: &mut StateRefreshCounts,
 ) -> Result<(), AppError> {
-    let Some(identity) = id.identity_str() else {
+    let Some(identity) = id.identity() else {
         return Ok(());
     };
-    let existing = state.find_resource(&id.provider, &id.resource_type, identity);
+    let existing = state.find_resource(&id.provider, &id.resource_type, identity.as_str());
     let existing_rs = match existing {
         Some(rs) => rs,
         None => return Ok(()),
@@ -1859,9 +1867,9 @@ fn diff_display_update_resource(
             Some(r) => r,
             None => {
                 owned_resource = Resource::with_provider(
-                    &id.provider,
-                    &id.resource_type,
-                    identity,
+                    id.provider.clone(),
+                    id.resource_type.clone(),
+                    identity.clone(),
                     id.provider_instance.clone(),
                 );
                 &owned_resource
@@ -1985,7 +1993,7 @@ fn diff_display_update_resource(
     if let Some(resource_state) = refreshed_resource_state {
         state.upsert_resource(resource_state)?;
     } else {
-        state.remove_resource(&id.provider, &id.resource_type, identity);
+        state.remove_resource(&id.provider, &id.resource_type, identity.as_str());
     }
 
     Ok(())

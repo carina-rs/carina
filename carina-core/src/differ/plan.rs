@@ -405,6 +405,7 @@ fn create_plan_parts(
     }
 
     for resource in managed {
+        let resolved_resource = ResolvedResource::new(resource.clone());
         let current = current_states
             .get(&resource.id)
             .cloned()
@@ -418,7 +419,7 @@ fn create_plan_parts(
             SchemaKind::Resource,
         );
         let d = diff(
-            resource,
+            &resolved_resource,
             current.as_state(),
             saved,
             prev_explicit_for_resource,
@@ -475,7 +476,7 @@ fn create_plan_parts(
                         registry,
                     ) {
                         Ok(pending) => {
-                            pending_replaces.insert(resource_identity(&pending.create.id), pending);
+                            pending_replaces.insert(resource_identity(&pending.create), pending);
                         }
                         Err(err) => plan.add_error(PlanError::new(id.clone(), err.into())),
                     }
@@ -596,7 +597,7 @@ fn create_plan_parts(
             });
         let Some(target_id_resolved) = resolved else {
             plan.add_error(PlanError::new(
-                ResourceId::with_identity("__wait", wb.binding.as_str()),
+                ResourceId::with_identity("__wait", ResourceIdentity::new(wb.binding.to_string())),
                 PlanErrorKind::WaitTargetMissing {
                     wait_binding: wb.binding.to_string(),
                     target: wb.target.to_string(),
@@ -763,7 +764,7 @@ pub fn block_deletes_on_prior_consumer_updates(
         .iter()
         .filter_map(|effect| match effect {
             Effect::Update { from, to, .. } => Some((
-                resource_identity(&to.id),
+                resource_identity(to),
                 dependencies_from_prior_state(
                     from,
                     prior_directives.get(&from.id).cloned().unwrap_or_default(),
@@ -814,13 +815,8 @@ fn dependencies_from_prior_state(state: &State, directives: Directives) -> HashS
     get_resource_dependencies(&prior_resource)
 }
 
-fn resource_identity(id: &ResourceId) -> ResourceIdentity {
-    match id.identity_state() {
-        crate::resource::ResourceIdentityState::Pending(_) => {
-            panic!("differ only receives resources after identity resolution")
-        }
-        crate::resource::ResourceIdentityState::Resolved(identity) => identity.clone(),
-    }
+fn resource_identity(resource: &ResolvedResource) -> ResourceIdentity {
+    resource.identity().clone()
 }
 
 fn pending_replace_from_parts(
@@ -1044,7 +1040,8 @@ fn promote_pending_replaces_for_dependents(
     let mut promoted = false;
 
     for resource in unresolved_managed {
-        let consumer_identity = resource_identity(&resource.id);
+        let resolved_resource = ResolvedResource::new(resource.clone());
+        let consumer_identity = resource_identity(&resolved_resource);
         let deps = get_resource_dependencies(resource);
 
         for dep in &deps {

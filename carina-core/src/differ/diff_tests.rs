@@ -18,7 +18,7 @@ fn diff_create_when_not_exists() {
     let desired = Resource::new("bucket", "test");
     let current = State::not_found(ResourceId::with_identity("bucket", "test"));
 
-    let result = diff(&desired, &current, None, None, None);
+    let result = diff_test(&desired, &current, None, None, None);
     assert!(matches!(result, Diff::Create(_)));
 }
 
@@ -36,7 +36,7 @@ fn diff_no_change_when_same() {
     );
     let current = State::existing(ResourceId::with_identity("bucket", "test"), attrs);
 
-    let result = diff(&desired, &current, None, None, None);
+    let result = diff_test(&desired, &current, None, None, None);
     assert!(matches!(result, Diff::NoChange(_)));
 }
 
@@ -54,7 +54,7 @@ fn diff_update_when_different() {
     );
     let current = State::existing(ResourceId::with_identity("bucket", "test"), attrs);
 
-    let result = diff(&desired, &current, None, None, None);
+    let result = diff_test(&desired, &current, None, None, None);
     match result {
         Diff::Update {
             changed_attributes, ..
@@ -99,7 +99,7 @@ fn diff_reports_string_list_vs_generic_string_list_shape_mismatch() {
         HashMap::from([("policy_document".to_string(), current_policy)]),
     );
 
-    let result = diff(&desired, &current, None, None, None);
+    let result = diff_test(&desired, &current, None, None, None);
 
     match result {
         Diff::Update {
@@ -239,7 +239,7 @@ fn diff_update_when_list_of_maps_changed() {
         current_attrs,
     );
 
-    let result = diff(&desired, &current, None, None, None);
+    let result = diff_test(&desired, &current, None, None, None);
     match result {
         Diff::Update {
             changed_attributes, ..
@@ -382,7 +382,7 @@ fn no_false_update_without_unique_name_attribute() {
     );
     let current = State::existing(ResourceId::with_identity("ec2.Vpc", "vpc"), attrs);
 
-    let result = diff(&desired, &current, None, None, None);
+    let result = diff_test(&desired, &current, None, None, None);
     assert!(
         matches!(result, Diff::NoChange(_)),
         "Expected NoChange when neither side has 'name', got {:?}",
@@ -687,7 +687,7 @@ fn diff_no_change_when_list_of_maps_reordered() {
         current_attrs,
     );
 
-    let result = diff(&desired, &current, None, None, None);
+    let result = diff_test(&desired, &current, None, None, None);
     assert!(
         matches!(result, Diff::NoChange(_)),
         "Expected NoChange when list-of-maps has same content in different order, got {:?}",
@@ -814,7 +814,7 @@ fn diff_no_change_when_struct_has_extra_fields_with_saved() {
         Value::Concrete(ConcreteValue::Map(saved)),
     )]);
 
-    let result = diff(&desired, &current, Some(&saved_map), None, None);
+    let result = diff_test(&desired, &current, Some(&saved_map), None, None);
     assert!(
         matches!(result, Diff::NoChange(_)),
         "Expected NoChange when saved fills extra struct fields, got {:?}",
@@ -881,7 +881,7 @@ fn diff_detects_drift_on_unmanaged_field() {
         Value::Concrete(ConcreteValue::Map(saved)),
     )]);
 
-    let result = diff(&desired, &current, Some(&saved_map), None, None);
+    let result = diff_test(&desired, &current, Some(&saved_map), None, None);
     assert!(
         matches!(result, Diff::Update { .. }),
         "Expected Update when unmanaged field drifted, got {:?}",
@@ -950,7 +950,7 @@ fn diff_no_change_when_bare_struct_with_extra_fields() {
         ]))),
     )]);
 
-    let result = diff(&desired, &current, Some(&saved_map), None, None);
+    let result = diff_test(&desired, &current, Some(&saved_map), None, None);
     assert!(
         matches!(result, Diff::NoChange(_)),
         "Expected NoChange for bare struct with extra fields from saved, got {:?}",
@@ -988,7 +988,7 @@ fn diff_works_without_saved_state() {
     // Without saved state, the map comparison uses semantically_equal which
     // checks both key count AND values. Since desired map has 2 keys and current
     // has 3, this will show as Update (which is the existing behavior).
-    let result = diff(&desired, &current, None, None, None);
+    let result = diff_test(&desired, &current, None, None, None);
     assert!(
         matches!(result, Diff::Update { .. }),
         "Expected Update without saved state when maps have different sizes, got {:?}",
@@ -1276,7 +1276,7 @@ fn diff_no_change_for_struct_list_with_saved_state_egress_rules() {
         ])),
     )]);
 
-    let result = diff(&desired, &current, Some(&saved), None, Some(&schema));
+    let result = diff_test(&desired, &current, Some(&saved), None, Some(&schema));
     assert!(
         matches!(result, Diff::NoChange(_)),
         "Expected NoChange for idempotent egress rules, got: {:?}",
@@ -1373,7 +1373,7 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
     );
 
     // With ordered: true, differ falsely detects changes (reordered items)
-    let result = diff(&desired, &current, None, None, Some(&schema_ordered));
+    let result = diff_test(&desired, &current, None, None, Some(&schema_ordered));
     assert!(
         matches!(result, Diff::Update { .. }),
         "Expected false positive Update with ordered:true, got: {:?}",
@@ -1387,7 +1387,7 @@ fn diff_false_positive_when_ordered_true_for_struct_list() {
             AttributeType::unordered_list(egress_struct),
         ),
     );
-    let result = diff(&desired, &current, None, None, Some(&schema_unordered));
+    let result = diff_test(&desired, &current, None, None, Some(&schema_unordered));
     assert!(
         matches!(result, Diff::NoChange(_)),
         "Expected NoChange with ordered:false, got: {:?}",
@@ -1460,7 +1460,7 @@ fn diff_no_change_for_compound_word_dsl_alias() {
         attrs,
     );
 
-    let result = diff(&desired, &current, None, None, Some(&schema));
+    let result = diff_test(&desired, &current, None, None, Some(&schema));
     assert!(
         matches!(result, Diff::NoChange(_)),
         "Expected NoChange (DSL alias must equal API canonical), got: {:?}",

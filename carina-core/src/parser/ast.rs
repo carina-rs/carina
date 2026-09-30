@@ -609,10 +609,10 @@ impl StateBlockAddress {
     pub fn new(
         provider: impl Into<String>,
         resource_type: impl Into<String>,
-        name: impl Into<String>,
+        name: impl Into<crate::resource::ResourceIdentity>,
     ) -> Self {
         let raw_name = name.into();
-        let canonical = crate::utils::canonicalize_map_key_address(&raw_name);
+        let canonical = crate::utils::canonicalize_map_key_address(raw_name.as_str());
         Self {
             provider: provider.into(),
             resource_type: resource_type.into(),
@@ -649,11 +649,11 @@ impl StateBlockAddress {
     /// matched plan Create or state row — they should never call this
     /// method as a shortcut. Doing so re-introduces the carina#3324
     /// bug class.
-    pub fn to_unrouted_resource_id(&self) -> crate::resource::ResourceId {
-        crate::resource::ResourceId::with_provider_identity(
-            &self.provider,
-            &self.resource_type,
-            self.name_str(),
+    pub fn to_unrouted_resource_id(&self) -> crate::resource::ResolvedResourceId {
+        crate::resource::ResolvedResourceId::with_provider_identity(
+            self.provider.clone(),
+            self.resource_type.clone(),
+            self.name.clone(),
             None,
         )
     }
@@ -687,8 +687,8 @@ impl MovedAddresses {
     pub fn new(
         provider: impl Into<String>,
         resource_type: impl Into<String>,
-        from_name: impl Into<String>,
-        to_name: impl Into<String>,
+        from_name: impl Into<crate::resource::ResourceIdentity>,
+        to_name: impl Into<crate::resource::ResourceIdentity>,
     ) -> Self {
         let from_name = from_name.into();
         let to_name = to_name.into();
@@ -696,10 +696,10 @@ impl MovedAddresses {
             provider: provider.into(),
             resource_type: resource_type.into(),
             from_name: crate::resource::ResourceIdentity::new(
-                crate::utils::canonicalize_map_key_address(&from_name),
+                crate::utils::canonicalize_map_key_address(from_name.as_str()),
             ),
             to_name: crate::resource::ResourceIdentity::new(
-                crate::utils::canonicalize_map_key_address(&to_name),
+                crate::utils::canonicalize_map_key_address(to_name.as_str()),
             ),
         }
     }

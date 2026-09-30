@@ -3169,7 +3169,7 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
     };
 
     let d = diff(
-        &resource,
+        &ResolvedResource::new(resource),
         &current,
         Some(&saved),
         Some(&prev_explicit),
@@ -3992,37 +3992,38 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
     role_resource.binding = Some("outer.inner.role".to_string());
 
     // carina#3181: compositions are a distinct typestate.
-    let make_virtual = |id_name: &str, binding: &str, attr: &str, ref_b: &str, ref_a: &str| {
-        let mut attributes: indexmap::IndexMap<
-            String,
-            carina_core::resource::CompositionAttribute,
-        > = indexmap::IndexMap::new();
-        attributes.insert(
-            attr.to_string(),
-            carina_core::resource::CompositionAttribute::from_value(
-                Value::Deferred(DeferredValue::ResourceRef {
-                    path: AccessPath::new(ref_b, ref_a),
-                }),
-                None,
-            ),
-        );
-        Composition {
-            id: carina_core::resource::ResolvedResourceId::new(
-                carina_core::resource::ResourceId::with_identity("_virtual", id_name),
-            ),
-            signature: carina_core::resource::Signature {
-                arguments: indexmap::IndexMap::new(),
-                attributes,
-                pending_constraints: Vec::new(),
-            },
-            binding: Some(binding.to_string()),
-            dependency_bindings: std::collections::BTreeSet::new(),
-            module_name: "mod".to_string(),
-            instance: binding.to_string(),
-            provenance: Default::default(),
-            quoted_string_attrs: std::collections::HashSet::new(),
-        }
-    };
+    let make_virtual =
+        |id_name: &'static str, binding: &str, attr: &str, ref_b: &str, ref_a: &str| {
+            let mut attributes: indexmap::IndexMap<
+                String,
+                carina_core::resource::CompositionAttribute,
+            > = indexmap::IndexMap::new();
+            attributes.insert(
+                attr.to_string(),
+                carina_core::resource::CompositionAttribute::from_value(
+                    Value::Deferred(DeferredValue::ResourceRef {
+                        path: AccessPath::new(ref_b, ref_a),
+                    }),
+                    None,
+                ),
+            );
+            Composition {
+                id: carina_core::resource::ResolvedResourceId::new(
+                    carina_core::resource::ResourceId::with_identity("_virtual", id_name),
+                ),
+                signature: carina_core::resource::Signature {
+                    arguments: indexmap::IndexMap::new(),
+                    attributes,
+                    pending_constraints: Vec::new(),
+                },
+                binding: Some(binding.to_string()),
+                dependency_bindings: std::collections::BTreeSet::new(),
+                module_name: "mod".to_string(),
+                instance: binding.to_string(),
+                provenance: Default::default(),
+                quoted_string_attrs: std::collections::HashSet::new(),
+            }
+        };
     let inner_virtual = make_virtual(
         "outer.inner",
         "outer.inner",

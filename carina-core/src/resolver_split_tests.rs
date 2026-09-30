@@ -33,7 +33,7 @@ fn ref_to(binding: &str, attr: &str) -> Value {
     })
 }
 
-fn make_managed(binding: &str, attrs: &[(&str, Value)]) -> Resource {
+fn make_managed(binding: &'static str, attrs: &[(&str, Value)]) -> Resource {
     let mut attributes = IndexMap::new();
     for (k, v) in attrs {
         attributes.insert((*k).into(), v.clone());
@@ -50,7 +50,7 @@ fn make_managed(binding: &str, attrs: &[(&str, Value)]) -> Resource {
     }
 }
 
-fn make_virtual(binding: &str, attrs: &[(&str, Value)]) -> Composition {
+fn make_virtual(binding: &'static str, attrs: &[(&str, Value)]) -> Composition {
     let mut attributes: IndexMap<String, crate::resource::CompositionAttribute> = IndexMap::new();
     for (k, v) in attrs {
         attributes.insert(

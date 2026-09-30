@@ -2,13 +2,14 @@
 
 use carina_core::deps::get_resource_dependencies;
 use carina_core::explicit::{self, ExplicitFields};
+use carina_core::hint::ProjectCommand;
 pub use carina_core::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use carina_core::override_aware::NameOverrideSource;
 use carina_core::provider::RawSavedAttrs;
 pub use carina_core::resource::DeposedKey;
 use carina_core::resource::{
     ConcreteValue, DeferredValue, Directives, PartialReadMarker, ResolvedResource, Resource,
-    ResourceId, State, Value,
+    ResourceId, ResourceIdentity, ResourceIdentityError, State, Value,
 };
 use carina_core::schema::ResourceSchema;
 use carina_core::value::{
@@ -17,6 +18,7 @@ use carina_core::value::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::Path;
 
 use crate::backend::BackendError;
 
@@ -364,12 +366,19 @@ impl StateFile {
     }
 
     fn id_for_resource_state(rs: &ResourceState) -> ResourceId {
-        ResourceId::with_provider_identity(
-            &rs.provider,
-            &rs.resource_type,
-            &rs.identity,
-            rs.directives.provider_instance.clone(),
-        )
+        match ResourceIdentity::try_from(rs.identity.clone()) {
+            Ok(identity) => ResourceId::with_provider_identity(
+                rs.provider.clone(),
+                rs.resource_type.clone(),
+                identity,
+                rs.directives.provider_instance.clone(),
+            ),
+            Err(ResourceIdentityError::Empty) => ResourceId::pending_with_provider(
+                rs.provider.clone(),
+                rs.resource_type.clone(),
+                rs.directives.provider_instance.clone(),
+            ),
+        }
     }
 
     /// Build a map of saved attributes, converting JSON values to DSL values.
@@ -623,6 +632,7 @@ fn validate_resource_identities(resources: &[ResourceState]) -> Result<(), Strin
     let mut resource_identities = HashSet::new();
     for (index, resource) in resources.iter().enumerate() {
         if resource.identity.is_empty() {
+            let plan_command = ProjectCommand::new("plan", Path::new("."));
             let identifier = resource
                 .identifier
                 .as_ref()
@@ -633,7 +643,7 @@ fn validate_resource_identities(resources: &[ResourceState]) -> Result<(), Strin
                  (provider={:?}, resource_type={:?}{identifier}). This row was written by an \
                  older Carina version and is rejected because empty identity rows can no longer \
                  be matched to a resource. Back up the state file, then remove this row from it. \
-                 Run `carina plan`; the resource that owned the row appears as a create with the \
+                 Run `{plan_command}`; the resource that owned the row appears as a create with the \
                  identity Carina now assigns to it. Put the row back with `identity` set to that \
                  value, keeping its `identifier` and attributes, or leave it removed if the \
                  resource is no longer managed.",

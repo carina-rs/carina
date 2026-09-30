@@ -449,7 +449,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
         .iter()
-        .map(|(from, to)| (to.clone(), from.clone()))
+        .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
         .collect();
     let export_wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
         .wait_bindings

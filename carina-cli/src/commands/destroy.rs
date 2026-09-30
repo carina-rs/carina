@@ -19,7 +19,9 @@ use carina_core::effect::{Effect, EffectGeneration};
 use carina_core::parser::WaitBinding;
 use carina_core::plan::Plan;
 use carina_core::provider::Provider;
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use carina_core::resource::{
+    ConcreteValue, ResolvedResourceId, Resource, ResourceId, State, Value,
+};
 #[cfg(test)]
 use carina_core::shutdown::testing::TestShutdownTrigger;
 use carina_core::shutdown::{
@@ -410,8 +412,10 @@ async fn run_destroy_locked(
                 let (id, refreshed) = result?;
                 if refreshed.exists {
                     current_states.insert(id.clone(), refreshed);
-                    let orphan_resource = build_orphan_resource(sf, &id);
-                    all_resources.push(orphan_resource);
+                    if let Some(resolved_id) = ResolvedResourceId::try_new(id) {
+                        let orphan_resource = build_orphan_resource(sf, &resolved_id);
+                        all_resources.push(orphan_resource);
+                    }
                 }
             }
             if refresh_cancelled {
@@ -430,8 +434,10 @@ async fn run_destroy_locked(
         let desired_ids: HashSet<ResourceId> = all_resources.iter().map(|r| r.id.clone()).collect();
         for (id, state) in sf.build_orphan_states(&desired_ids) {
             current_states.insert(id.clone(), state);
-            let orphan_resource = build_orphan_resource(sf, &id);
-            all_resources.push(orphan_resource);
+            if let Some(resolved_id) = ResolvedResourceId::try_new(id) {
+                let orphan_resource = build_orphan_resource(sf, &resolved_id);
+                all_resources.push(orphan_resource);
+            }
         }
     }
 
@@ -487,7 +493,8 @@ async fn run_destroy_locked(
     // a replacement path that approved deleting the old instance.
     let protected_row_keys: HashSet<StateRowKey> = protected_resources
         .iter()
-        .map(|resource| state_row_key_from_id(&resource.id))
+        .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone()))
+        .map(|id| state_row_key_from_id(&id))
         .collect();
     let delete_effects = build_destroy_delete_effects(
         &resources_to_destroy,
@@ -665,8 +672,8 @@ async fn run_destroy_locked(
     let mut destroyed_instances: Vec<DestroyedInstance> = Vec::new();
     let mut failed_indices: HashSet<usize> = HashSet::new();
     let mut cancelled = false;
-    // timed_out_resources: delete index -> (ResourceId, identifier, generation)
-    let mut timed_out_resources: HashMap<usize, (ResourceId, String, EffectGeneration)> =
+    // timed_out_resources: delete index -> (resolved id, identifier, generation)
+    let mut timed_out_resources: HashMap<usize, (ResolvedResourceId, String, EffectGeneration)> =
         HashMap::new();
 
     let destroy_total = delete_effects.len();
@@ -900,7 +907,7 @@ async fn run_destroy_locked(
                 else {
                     unreachable!("destroy dispatch only contains delete effects");
                 };
-                let resource_id = id.clone().into_inner();
+                let resource_id = id.clone();
                 let identifier = identifier.clone();
                 let generation = generation.clone();
                 let directives = directives.clone();
@@ -911,7 +918,7 @@ async fn run_destroy_locked(
                     let started = Instant::now();
                     let delete_result = provider_ref
                         .delete(
-                            &resource_id,
+                            resource_id.as_inner(),
                             &identifier,
                             carina_core::provider::DeleteRequest {
                                 directives: directives.clone(),
@@ -1489,13 +1496,8 @@ fn should_skip_destroy_execution(delete_effect_count: usize) -> bool {
     delete_effect_count == 0
 }
 
-fn state_row_key_from_id(id: &ResourceId) -> StateRowKey {
-    state_row_key_from_parts(
-        &id.provider,
-        &id.resource_type,
-        id.identity_str()
-            .expect("state-backed destroy identity must be resolved"),
-    )
+fn state_row_key_from_id(id: &ResolvedResourceId) -> StateRowKey {
+    state_row_key_from_parts(&id.provider, &id.resource_type, id.identity_str())
 }
 
 fn state_row_key_from_parts(provider: &str, resource_type: &str, identity: &str) -> StateRowKey {
@@ -2271,7 +2273,9 @@ mod tests {
         state_file
             .upsert_resource(row)
             .expect("test state setup must be valid");
-        let protected = HashSet::from([state_row_key_from_id(&resource.id)]);
+        let protected = HashSet::from([state_row_key_from_id(&ResolvedResourceId::new(
+            resource.id.clone(),
+        ))]);
 
         let effects =
             build_destroy_delete_effects(&[], &HashMap::new(), Some(&state_file), &protected);
@@ -2373,7 +2377,7 @@ mod tests {
             .insert("vpc_id".to_string(), serde_json::json!("vpc-12345"));
 
         let destroyed = vec![DestroyedInstance {
-            id: ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None),
+            id: ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None),
             generation: EffectGeneration::Current,
         }];
         apply_destroy_to_state(&mut state, &destroyed);
@@ -2409,7 +2413,7 @@ mod tests {
             .insert("vpc_id".to_string(), serde_json::json!("vpc-new"));
 
         let destroyed = vec![DestroyedInstance {
-            id: ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None),
+            id: ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None),
             generation: EffectGeneration::Current,
         }];
         apply_destroy_to_state(&mut state, &destroyed);
@@ -2460,7 +2464,7 @@ mod tests {
             .expect("test state setup must be valid");
 
         let destroyed = vec![DestroyedInstance {
-            id: ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None),
+            id: ResolvedResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None),
             generation: EffectGeneration::Deposed(removed_key),
         }];
         apply_destroy_to_state(&mut state, &destroyed);
@@ -2501,11 +2505,11 @@ mod tests {
         let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let destroyed = vec![
             DestroyedInstance {
-                id: id.clone(),
+                id: ResolvedResourceId::new(id.clone()),
                 generation: EffectGeneration::Current,
             },
             DestroyedInstance {
-                id,
+                id: ResolvedResourceId::new(id),
                 generation: EffectGeneration::Deposed(deposed_key),
             },
         ];

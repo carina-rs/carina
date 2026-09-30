@@ -27,7 +27,7 @@ fn detect_anonymous_to_named_renames_for_test(
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
     providers: &[ProviderConfig],
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
-) -> Vec<(ResourceId, ResourceId)> {
+) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
     super::detect_anonymous_to_named_renames_for_test(
         resources,
         registry,
@@ -1589,7 +1589,7 @@ fn subnet_route_table_association_schema() -> ResourceSchema {
 }
 
 fn subnet_route_table_association_resource(
-    name: &str,
+    name: &'static str,
     route_table_binding: &str,
     subnet_binding: &str,
 ) -> Resource {
@@ -1645,7 +1645,7 @@ fn association_state_entry(
     }
 }
 
-fn route_with_deferred_route_table(name: &str, route_table_binding: &str) -> Resource {
+fn route_with_deferred_route_table(name: &'static str, route_table_binding: &str) -> Resource {
     use crate::resource::{AccessPath, ModuleSource};
 
     let mut resource = Resource::with_provider("awscc", "ec2.Route", name, None);
@@ -3601,14 +3601,8 @@ fn test_detect_rename_unique_match_by_create_only_attrs() {
     );
 
     assert_eq!(renames.len(), 1);
-    assert_eq!(
-        renames[0].0.identity_str().expect("resolved identity"),
-        "sso_instance_0ac0620303071530"
-    );
-    assert_eq!(
-        renames[0].1.identity_str().expect("resolved identity"),
-        "sso"
-    );
+    assert_eq!(renames[0].0.identity_str(), "sso_instance_0ac0620303071530");
+    assert_eq!(renames[0].1.identity_str(), "sso");
 }
 
 #[test]
@@ -3927,14 +3921,8 @@ fn test_detect_rename_no_create_only_matches_by_simhash() {
     );
 
     assert_eq!(renames.len(), 1, "expected one rename, got {:?}", renames);
-    assert_eq!(
-        renames[0].0.identity_str().expect("resolved identity"),
-        anonymous_name
-    );
-    assert_eq!(
-        renames[0].1.identity_str().expect("resolved identity"),
-        "sso"
-    );
+    assert_eq!(renames[0].0.identity_str(), anonymous_name);
+    assert_eq!(renames[0].1.identity_str(), "sso");
 }
 
 #[test]
@@ -4084,7 +4072,7 @@ fn test_detect_rename_no_create_only_picks_closest_among_multiple_candidates() {
 
     assert_eq!(renames.len(), 1);
     assert_eq!(
-        renames[0].0.identity_str().expect("resolved identity"),
+        renames[0].0.identity_str(),
         exact_name,
         "should prefer the exact SimHash match over the nearby one"
     );

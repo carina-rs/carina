@@ -69,7 +69,7 @@ impl DataSource {
     }
 
     /// Create a resolved data source with an empty attribute map.
-    pub fn new(resource_type: impl Into<String>, identity: impl Into<String>) -> Self {
+    pub fn new(resource_type: impl Into<String>, identity: impl Into<ResourceIdentity>) -> Self {
         Self {
             id: ResourceId::with_identity(resource_type, identity),
             attributes: IndexMap::new(),
@@ -94,7 +94,7 @@ impl DataSource {
     pub fn with_provider(
         provider: impl Into<String>,
         resource_type: impl Into<String>,
-        identity: impl Into<String>,
+        identity: impl Into<ResourceIdentity>,
         provider_instance: Option<String>,
     ) -> Self {
         Self {

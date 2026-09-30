@@ -172,11 +172,11 @@ mod tests {
     use super::*;
     use crate::resource::{ResolvedResourceId, ResourceId};
 
-    fn pid(name: &str) -> PersistentId {
+    fn pid(name: &'static str) -> PersistentId {
         PersistentId::new(ResourceId::with_identity("aws.s3.Bucket", name))
     }
 
-    fn site(name: &str, source_path: &str) -> CallSite {
+    fn site(name: &'static str, source_path: &str) -> CallSite {
         CallSite::new(
             EphemeralId::new(ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", name,

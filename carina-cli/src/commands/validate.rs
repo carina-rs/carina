@@ -556,7 +556,7 @@ mod tests {
         use carina_core::parser::ParsedFile;
         use carina_core::resource::{Composition, ResourceId, Signature};
 
-        let composition = |instance: &str, binding: Option<&str>| Composition {
+        let composition = |instance: &'static str, binding: Option<&str>| Composition {
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", instance,
             )),

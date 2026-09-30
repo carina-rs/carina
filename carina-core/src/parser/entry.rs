@@ -486,7 +486,10 @@ fn parse_with_seeded_bindings_inner(
                                         // so a placeholder managed binding stands in
                                         // for resolution purposes — same shape as the
                                         // `_module_binding` / `_wait` placeholders.
-                                        let placeholder = Resource::new("_data_source", &name);
+                                        let placeholder = Resource::new(
+                                            "_data_source",
+                                            crate::resource::ResourceIdentity::new(name.clone()),
+                                        );
                                         ctx.set_resource_binding(name.clone(), placeholder);
                                     }
                                     data_sources.extend(expanded_data_sources);
@@ -501,12 +504,18 @@ fn parse_with_seeded_bindings_inner(
                                     if !is_discard {
                                         // Register as a resource binding so that
                                         // `name.attr` resolves as ResourceRef
-                                        let placeholder = Resource::new("_module_binding", &name);
+                                        let placeholder = Resource::new(
+                                            "_module_binding",
+                                            crate::resource::ResourceIdentity::new(name.clone()),
+                                        );
                                         ctx.set_resource_binding(name.clone(), placeholder);
                                     }
                                 }
                                 if is_upstream_state && !is_discard {
-                                    let placeholder = Resource::new("_upstream_state", &name);
+                                    let placeholder = Resource::new(
+                                        "_upstream_state",
+                                        crate::resource::ResourceIdentity::new(name.clone()),
+                                    );
                                     ctx.set_resource_binding(name.clone(), placeholder);
                                     upstream_states.push(ctx.upstream_states[&name].clone());
                                 }
@@ -516,7 +525,10 @@ fn parse_with_seeded_bindings_inner(
                                     // `<wait-binding>.<attr>` parses as `ResourceRef`.
                                     // Downstream resolution (Phase 4 of #2825) treats
                                     // it as passthrough of the target's snapshot.
-                                    let placeholder = Resource::new("_wait", &name);
+                                    let placeholder = Resource::new(
+                                        "_wait",
+                                        crate::resource::ResourceIdentity::new(name.clone()),
+                                    );
                                     ctx.set_resource_binding(name.clone(), placeholder);
                                     wait_bindings.push(ctx.wait_bindings[&name].clone());
                                 }
@@ -740,7 +752,10 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
                     binding: seed.name().to_string(),
                 });
                 ctx.set_variable(seed.name().to_string(), placeholder_ref);
-                let placeholder = Resource::new("_seeded", seed.name());
+                let placeholder = Resource::new(
+                    "_seeded",
+                    crate::resource::ResourceIdentity::new(seed.name().to_string()),
+                );
                 ctx.set_resource_binding(seed.name().to_string(), placeholder);
             }
         }

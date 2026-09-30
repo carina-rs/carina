@@ -3497,7 +3497,7 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
         }
     }
 
-    fn composition(binding: &str, call_binding: &str) -> Composition {
+    fn composition(binding: &'static str, call_binding: &str) -> Composition {
         let call = CompositionCall {
             module_name: "missing".to_string(),
             binding: Some(call_binding.to_string()),

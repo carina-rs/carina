@@ -726,7 +726,10 @@ impl ProviderFactory for AliasFactory {
 // -----------------------------------------------------------------------
 
 fn make_resource(binding: &str, deps: &[&str]) -> Resource {
-    let mut r = Resource::new("test", binding);
+    let mut r = Resource::new(
+        "test",
+        crate::resource::ResourceIdentity::try_from(binding.to_string()).unwrap(),
+    );
     r.binding = Some(binding.to_string());
     for dep in deps {
         r.set_attr(
@@ -2137,7 +2140,7 @@ async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read
 }
 
 fn pending_module_composition(
-    instance: &str,
+    instance: &'static str,
     arguments: Vec<(&str, Value)>,
     constraints: Vec<crate::resource::PendingModuleConstraint>,
 ) -> crate::resource::Composition {
@@ -5445,7 +5448,10 @@ impl Provider for YieldingUpdateProvider {
 }
 
 fn tag_update_resource(binding: &str, parent_ref: Option<&str>) -> Resource {
-    let mut resource = Resource::new("test", binding);
+    let mut resource = Resource::new(
+        "test",
+        crate::resource::ResourceIdentity::try_from(binding.to_string()).unwrap(),
+    );
     resource.binding = Some(binding.to_string());
     resource.set_attr(
         "id",
@@ -7952,7 +7958,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
     );
 }
 
-fn resource_with_binding(name: &str, binding: &str) -> Resource {
+fn resource_with_binding(name: &'static str, binding: &str) -> Resource {
     let mut resource = Resource::new("test", name);
     resource.binding = Some(binding.to_string());
     resource

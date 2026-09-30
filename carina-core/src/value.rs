@@ -5174,7 +5174,7 @@ mod tests {
 
     #[test]
     fn canonicalize_pipeline_dynamic_az_enum_state_api_spelling_has_no_diff() {
-        use crate::differ::{Diff, diff};
+        use crate::differ::{Diff, diff_test};
         use crate::resource::{Resource, ResourceId, State};
         use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
         use std::collections::HashMap;
@@ -5211,7 +5211,7 @@ mod tests {
         states.insert(id.clone(), State::existing(id, attrs));
         canonicalize_states_with_schemas(&mut states, &registry);
 
-        let result = diff(
+        let result = diff_test(
             &desired[0],
             states.values().next().expect("state exists"),
             None,

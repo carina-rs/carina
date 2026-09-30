@@ -975,7 +975,7 @@ impl Effect {
     pub fn writeback_cleanup_ids(
         &self,
         successfully_deleted: &HashSet<DeletedInstanceKey>,
-    ) -> Vec<ResourceId> {
+    ) -> Vec<ResolvedResourceId> {
         match self {
             Effect::Read { .. } => Vec::new(),
             Effect::Create(_) => Vec::new(),
@@ -990,7 +990,7 @@ impl Effect {
                     id.clone().into_inner(),
                     identifier.clone(),
                 )) {
-                    vec![id.clone().into_inner()]
+                    vec![id.clone()]
                 } else {
                     Vec::new()
                 }
@@ -1000,8 +1000,8 @@ impl Effect {
                 ..
             } => Vec::new(),
             Effect::Import { .. } => Vec::new(),
-            Effect::Remove { id } => vec![id.clone().into_inner()],
-            Effect::Move { from, .. } => vec![from.clone().into_inner()],
+            Effect::Remove { id } => vec![id.clone()],
+            Effect::Move { from, .. } => vec![from.clone()],
             Effect::Wait { .. } => Vec::new(),
             Effect::DeferredCreate { .. } => Vec::new(),
             // Absorbed deletes are replacement outcomes, not ordinary

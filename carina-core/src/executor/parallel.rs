@@ -8,7 +8,7 @@ use std::time::Instant;
 use crate::effect::deps::UnresolvedResource;
 use crate::effect::{DeletedInstanceKey, Effect};
 use crate::provider::Provider;
-use crate::resource::{Resource, ResourceId, Value};
+use crate::resource::{Resource, ResourceId, ResourceIdentity, Value};
 use crate::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
 #[cfg(test)]
@@ -764,7 +764,8 @@ pub(super) async fn execute_effects_sequential(
                     // resolve_refs sees the same attribute map. Wait
                     // effects do not persist to the state file
                     // (handled by `state_writeback_should_skip`).
-                    let synthetic = ResourceId::with_identity("__wait", &binding);
+                    let synthetic =
+                        ResourceId::with_identity("__wait", ResourceIdentity::new(binding.clone()));
                     let attrs: HashMap<String, Value> = state
                         .attributes
                         .iter()
@@ -896,7 +897,7 @@ mod tests {
         ResolvedResource::new(resource)
     }
 
-    fn update_effect(binding: &str, reads: &[(&str, &str)], writes: &[&str]) -> Effect {
+    fn update_effect(binding: &'static str, reads: &[(&str, &str)], writes: &[&str]) -> Effect {
         let id = ResourceId::with_identity("test", binding);
         let mut to = Resource::new("test", binding);
         to.binding = Some(binding.to_string());

@@ -11,7 +11,9 @@ use carina_core::provider::{
     BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, ProviderResult, ReadRequest,
     UpdateOutcome, UpdateRequest,
 };
-use carina_core::resource::{Directives, ResolvedResource, Resource, Value};
+use carina_core::resource::{
+    Directives, ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
+};
 use carina_core::value::canonicalize_resources_with_schemas;
 
 enum ReadBehavior {
@@ -22,6 +24,10 @@ enum ReadBehavior {
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
+}
+
+fn test_identity(value: impl Into<String>) -> ResourceIdentity {
+    ResourceIdentity::try_from(value.into()).unwrap()
 }
 
 struct ReadWithRetryProvider {
@@ -837,7 +843,13 @@ fn same_type_moved_block_parses_and_materializes_state() {
         &Some(state_file),
     );
 
-    assert_eq!(moved_pairs, vec![(from.clone(), to.clone())]);
+    assert_eq!(
+        moved_pairs,
+        vec![(
+            ResolvedResourceId::new(from.clone()),
+            ResolvedResourceId::new(to.clone())
+        )]
+    );
     assert!(!current_states.contains_key(&from));
     let moved = current_states
         .get(&to)
@@ -1205,12 +1217,12 @@ fn test_materialize_moved_states_warns_on_missing_from() {
     );
 }
 
-fn bucket_id(name: &str) -> ResourceId {
-    ResourceId::with_provider_identity("awscc", "s3.Bucket", name, None)
+fn bucket_id(name: &str) -> ResolvedResourceId {
+    ResolvedResourceId::with_provider_identity("awscc", "s3.Bucket", test_identity(name), None)
 }
 
 fn bucket_resource(name: &str) -> Resource {
-    Resource::with_provider("awscc", "s3.Bucket", name, None)
+    Resource::with_provider("awscc", "s3.Bucket", test_identity(name), None)
 }
 
 fn bucket_state_file(names: &[&str]) -> carina_state::state::StateFile {
@@ -1647,8 +1659,12 @@ fn association_state(
 fn desired_association(name: &str, route_table_binding: &str, subnet_id: &str) -> Resource {
     use carina_core::resource::AccessPath;
 
-    let mut resource =
-        Resource::with_provider("awscc", "ec2.SubnetRouteTableAssociation", name, None);
+    let mut resource = Resource::with_provider(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        test_identity(name),
+        None,
+    );
     resource.set_attr(
         "route_table_id".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
@@ -1877,15 +1893,15 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
             addresses: MovedAddresses::new(
                 "awscc",
                 "ec2.SubnetRouteTableAssociation",
-                &old_name,
-                &desired_name,
+                test_identity(old_name.clone()),
+                test_identity(desired_name.clone()),
             ),
         });
 
         let old_id = ResourceId::with_provider_identity(
             "awscc",
             "ec2.SubnetRouteTableAssociation",
-            &old_name,
+            test_identity(old_name.clone()),
             None,
         );
         current_states.insert(old_id.clone(), State::not_found(old_id));
@@ -1923,20 +1939,14 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
     );
     assert_eq!(moved_pairs.len(), 5);
     for (idx, (from, to)) in moved_pairs.iter().enumerate() {
-        assert_eq!(
-            from.identity_str().expect("resolved identity"),
-            old_names[idx]
-        );
-        assert_eq!(
-            to.identity_str().expect("resolved identity"),
-            desired_names[idx]
-        );
+        assert_eq!(from.identity_str(), old_names[idx]);
+        assert_eq!(to.identity_str(), desired_names[idx]);
     }
     for name in old_names {
         let id = ResourceId::with_provider_identity(
             "awscc",
             "ec2.SubnetRouteTableAssociation",
-            name,
+            test_identity(name),
             None,
         );
         assert!(
@@ -1948,7 +1958,7 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
         let id = ResourceId::with_provider_identity(
             "awscc",
             "ec2.SubnetRouteTableAssociation",
-            name,
+            test_identity(name),
             None,
         );
         assert!(
@@ -3094,8 +3104,13 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
     assert_eq!(
         renames,
         vec![(
-            ResourceId::with_provider_identity("awscc", "ec2.Route", old_name, None),
-            named.id
+            ResolvedResourceId::with_provider_identity(
+                "awscc",
+                "ec2.Route",
+                test_identity(old_name),
+                None,
+            ),
+            ResolvedResourceId::new(named.id)
         )],
         "provider config region spelling must canonicalize before rename simhash"
     );
@@ -3546,7 +3561,12 @@ fn deferred_replace_test_template() -> carina_core::parser::DeferredForExpressio
 
 fn deferred_replace_test_target() -> DeferredCreateTarget {
     DeferredCreateTarget {
-        id: ResourceId::with_provider_identity("aws", "__deferred_for", "validation_records", None),
+        id: ResolvedResourceId::with_provider_identity(
+            "aws",
+            "__deferred_for",
+            "validation_records",
+            None,
+        ),
         upstream_binding: "cert".to_string(),
         template: deferred_replace_test_template(),
     }
@@ -3554,12 +3574,12 @@ fn deferred_replace_test_target() -> DeferredCreateTarget {
 
 fn delete_effect_for_binding(binding: &str) -> Effect {
     Effect::Delete {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+        id: ResolvedResourceId::with_provider_identity(
             "aws",
             "route53.Record",
-            binding,
+            test_identity(binding),
             None,
-        )),
+        ),
         identifier: format!("{binding}-old-id"),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),

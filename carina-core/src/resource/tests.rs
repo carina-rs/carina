@@ -74,9 +74,21 @@ fn resource_identity_rejects_empty_string() {
 }
 
 #[test]
-#[should_panic(expected = "resource identity cannot be empty")]
-fn resource_identity_new_rejects_empty() {
-    ResourceIdentity::new("");
+fn resource_identity_try_from_rejects_empty_runtime_string() {
+    let error = ResourceIdentity::try_from(String::new()).unwrap_err();
+    assert_eq!(error.to_string(), "resource identity cannot be empty");
+}
+
+#[test]
+fn resource_identity_try_from_accepts_nonempty_runtime_string() {
+    let identity = ResourceIdentity::try_from("runtime-identity".to_string()).unwrap();
+    assert_eq!(identity.as_str(), "runtime-identity");
+}
+
+#[test]
+fn resource_identity_accepts_nonempty_literal() {
+    let identity = ResourceIdentity::from("literal-identity");
+    assert_eq!(identity.as_str(), "literal-identity");
 }
 
 #[test]
@@ -108,12 +120,6 @@ fn resolved_resource_id_equality_is_unchanged() {
     let first = ResourceId::with_provider_identity("aws", "s3.Bucket", "logs", None);
     let second = ResourceId::with_provider_identity("aws", "s3.Bucket", "logs", None);
     assert_eq!(first, second);
-}
-
-#[test]
-#[should_panic(expected = "resource identity cannot be empty")]
-fn with_provider_identity_rejects_empty() {
-    ResourceId::with_provider_identity("aws", "s3.Bucket", "", None);
 }
 
 #[test]

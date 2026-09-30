@@ -245,7 +245,7 @@ mod tests {
         }
     }
 
-    fn make_resource(binding: &str, deps: &[&str]) -> Resource {
+    fn make_resource(binding: &'static str, deps: &[&str]) -> Resource {
         let mut r = Resource::new("test", binding);
         r.binding = Some(binding.to_string());
         for dep in deps {

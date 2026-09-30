@@ -160,7 +160,7 @@ fn type_aware_diff_no_change_with_schema() {
     );
 
     // Without schema: detects a change (Int != Float)
-    let result = diff(&desired, &current, None, None, None);
+    let result = diff_test(&desired, &current, None, None, None);
     assert!(
         matches!(result, Diff::Update { .. }),
         "Without schema, Int(443) != Float(443.0) should be Update, got {:?}",
@@ -168,7 +168,7 @@ fn type_aware_diff_no_change_with_schema() {
     );
 
     // With schema: no change (type-aware coercion)
-    let result = diff(&desired, &current, None, None, Some(&schema));
+    let result = diff_test(&desired, &current, None, None, Some(&schema));
     assert!(
         matches!(result, Diff::NoChange(_)),
         "With schema, Int(443) and Float(443.0) should be NoChange, got {:?}",
@@ -1566,7 +1566,7 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
     canonicalize_states_with_schemas(&mut states, &registry);
 
     let current = states.into_values().next().unwrap();
-    let result = diff(&resources[0], &current, None, None, Some(&schema));
+    let result = diff_test(&resources[0], &current, None, None, Some(&schema));
     assert!(
         matches!(result, Diff::NoChange(_)),
         "carina#3080: scalar (desired) vs singleton-list (state) under \
@@ -1650,7 +1650,7 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
     )]))
     .lift(&registry);
 
-    let result = diff(
+    let result = diff_test(
         &resources[0],
         states.get(&id).unwrap(),
         saved_attrs.get(&id),
@@ -1732,7 +1732,7 @@ fn carina3740_saved_nested_secret_hash_union_scalar_is_no_change() {
     )]))
     .lift(&registry);
 
-    let result = diff(
+    let result = diff_test(
         &desired,
         &current,
         saved_attrs.get(&desired.id),
@@ -1996,7 +1996,7 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     let prev_explicit = crate::explicit::build_from_resource(&resources[0]);
 
     let current = states.into_values().next().unwrap();
-    let result = diff(
+    let result = diff_test(
         &resources[0],
         &current,
         None,
@@ -2114,7 +2114,7 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
 
     let prev_explicit = crate::explicit::build_from_resource(&resources[0]);
     let current = states.into_values().next().unwrap();
-    let result = diff(
+    let result = diff_test(
         &resources[0],
         &current,
         None,

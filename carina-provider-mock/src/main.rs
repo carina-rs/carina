@@ -1,3 +1,6 @@
+use carina_core::resource::{
+    ResourceIdentity as CoreResourceIdentity, ResourceIdentityError as CoreResourceIdentityError,
+};
 use carina_plugin_sdk::CarinaProvider;
 use carina_plugin_sdk::types::*;
 use std::collections::HashMap;
@@ -21,12 +24,17 @@ impl MockProcessProvider {
     }
 
     fn resource_id_wire_key(id: &ResourceId) -> String {
-        match (id.provider.is_empty(), id.identity.is_empty()) {
-            (true, true) => id.resource_type.clone(),
-            (true, false) => format!("{}.{}", id.resource_type, id.identity),
-            (false, true) => format!("{}.{}", id.provider, id.resource_type),
-            (false, false) => {
-                format!("{}.{}.{}", id.provider, id.resource_type, id.identity)
+        match (
+            id.provider.is_empty(),
+            CoreResourceIdentity::try_from(id.identity.clone()),
+        ) {
+            (true, Err(CoreResourceIdentityError::Empty)) => id.resource_type.clone(),
+            (true, Ok(identity)) => format!("{}.{}", id.resource_type, identity.as_str()),
+            (false, Err(CoreResourceIdentityError::Empty)) => {
+                format!("{}.{}", id.provider, id.resource_type)
+            }
+            (false, Ok(identity)) => {
+                format!("{}.{}.{}", id.provider, id.resource_type, identity.as_str())
             }
         }
     }

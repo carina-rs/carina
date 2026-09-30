@@ -1137,7 +1137,10 @@ mod tests {
             .map(|idx| DeferredReplaceDelete {
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.RecordSet",
-                    format!("validation_records[{idx}]"),
+                    crate::resource::ResourceIdentity::try_from(format!(
+                        "validation_records[{idx}]"
+                    ))
+                    .unwrap(),
                 )),
                 identifier: format!("record-{idx}"),
                 directives: Directives::default(),

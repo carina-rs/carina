@@ -1481,7 +1481,7 @@ mod tests {
         r
     }
 
-    fn composition(binding: &str) -> Composition {
+    fn composition(binding: &'static str) -> Composition {
         Composition {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", binding,
@@ -2069,7 +2069,7 @@ let vpc = aws.ec2.Vpc {
 
     #[test]
     fn ref_type_forwarded_composition_cycle_is_unchecked() {
-        let make_forwarder = |binding: &str, target: &str| Composition {
+        let make_forwarder = |binding: &'static str, target: &str| Composition {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                 "_virtual", binding,
             )),
@@ -2112,7 +2112,11 @@ mod resolved_bindings_tests {
     };
     use std::collections::BTreeSet;
 
-    fn make_resource(name: &str, binding: Option<&str>, attrs: Vec<(&str, Value)>) -> Resource {
+    fn make_resource(
+        name: &'static str,
+        binding: Option<&str>,
+        attrs: Vec<(&str, Value)>,
+    ) -> Resource {
         let mut r = Resource::new("test.resource", name);
         r.attributes = attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         r.binding = binding.map(|b| b.to_string());

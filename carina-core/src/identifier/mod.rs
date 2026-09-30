@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(test)]
 use crate::parser::ProviderConfig;
 use crate::parser::StateBlockAddress;
-use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, Value};
+use crate::resource::{
+    ConcreteValue, DeferredValue, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
+};
 use crate::schema::SchemaRegistry;
 use crate::validation::is_string_compatible_type;
 use crate::value::CanonicalizedProviderConfigs;
@@ -39,19 +41,19 @@ impl StateBlockClaims {
     }
 
     pub fn claims_from(&self, provider: &str, resource_type: &str, name: &str) -> bool {
-        if self.from.is_empty() {
-            return false;
-        }
-        self.from
-            .contains(&StateBlockAddress::new(provider, resource_type, name))
+        self.from.iter().any(|address| {
+            address.provider == provider
+                && address.resource_type == resource_type
+                && address.name_str() == name
+        })
     }
 
     pub fn claims_to(&self, provider: &str, resource_type: &str, name: &str) -> bool {
-        if self.to.is_empty() {
-            return false;
-        }
-        self.to
-            .contains(&StateBlockAddress::new(provider, resource_type, name))
+        self.to.iter().any(|address| {
+            address.provider == provider
+                && address.resource_type == resource_type
+                && address.name_str() == name
+        })
     }
 }
 
@@ -721,7 +723,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
         resources[idx].id = ResourceId::with_provider_identity(
             &provider,
             &resource_type,
-            identifier,
+            ResourceIdentity::new(identifier),
             provider_instance,
         );
     }
@@ -1007,7 +1009,7 @@ pub fn reconcile_anonymous_identifiers(
             resource.id = ResourceId::with_provider_identity(
                 &resource.id.provider,
                 &resource.id.resource_type,
-                matched_name,
+                ResourceIdentity::new(matched_name.to_string()),
                 resource.id.provider_instance.clone(),
             );
             claimed_names
@@ -1052,7 +1054,7 @@ pub fn detect_anonymous_to_named_renames(
     providers: &CanonicalizedProviderConfigs,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
-) -> Vec<(ResourceId, ResourceId)> {
+) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
     // Collect the set of resource names currently used in the DSL per
     // (provider, resource_type). Any state entry not in this set is an orphan.
     let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
@@ -1070,7 +1072,7 @@ pub fn detect_anonymous_to_named_renames(
             .insert(identity.to_string());
     }
 
-    let mut renames: Vec<(ResourceId, ResourceId)> = Vec::new();
+    let mut renames: Vec<(ResolvedResourceId, ResolvedResourceId)> = Vec::new();
 
     for resource in resources {
         // Only rename let-bound resources whose binding was previously anonymous.
@@ -1170,13 +1172,16 @@ pub fn detect_anonymous_to_named_renames(
         };
 
         if let Some(name) = matched_name {
-            let from = ResourceId::with_provider_identity(
+            let from = ResolvedResourceId::with_provider_identity(
                 &resource.id.provider,
                 &resource.id.resource_type,
-                name,
+                ResourceIdentity::new(name.to_string()),
                 resource.id.provider_instance.clone(),
             );
-            renames.push((from, resource.id.clone()));
+            let Some(to) = ResolvedResourceId::try_new(resource.id.clone()) else {
+                continue;
+            };
+            renames.push((from, to));
         }
     }
 
@@ -1191,7 +1196,7 @@ pub fn detect_anonymous_to_named_renames_for_test(
     providers: &[ProviderConfig],
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
-) -> Vec<(ResourceId, ResourceId)> {
+) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
     let providers = CanonicalizedProviderConfigs::from_configs_for_test(providers.to_vec());
     detect_anonymous_to_named_renames(
         resources,

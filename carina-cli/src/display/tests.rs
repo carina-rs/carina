@@ -13,7 +13,12 @@ fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
 }
 
-fn make_resource(resource_type: &str, name: &str, binding: &str, deps: &[&str]) -> Resource {
+fn make_resource(
+    resource_type: &str,
+    name: &'static str,
+    binding: &str,
+    deps: &[&str],
+) -> Resource {
     let mut r = Resource::new(resource_type, name);
     r.binding = Some(binding.to_string());
     for dep in deps {
@@ -841,7 +846,7 @@ fn deferred_validation_records_effect() -> Effect {
     }
 }
 
-fn delete_record_effect(binding: &str) -> Effect {
+fn delete_record_effect(binding: &'static str) -> Effect {
     Effect::Delete {
         id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
             "route53.Record",
