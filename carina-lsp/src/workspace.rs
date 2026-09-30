@@ -1,61 +1,32 @@
 //! Workspace scanning: discover provider configurations from .crn files.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use carina_core::parser::{self, ProviderConfig, ProviderContext};
 
-/// Discover all provider configurations from .crn files in a workspace directory.
-///
-/// Recursively scans the directory for files ending in `.crn`,
-/// parses each one, and collects all `provider` blocks. Each provider is
-/// returned with the directory containing the `.crn` file it was found in.
-/// Duplicate provider names are deduplicated (first occurrence wins).
-/// Unreadable or unparseable files are silently skipped.
-pub fn discover_providers(workspace_root: &Path) -> Vec<(PathBuf, ProviderConfig)> {
-    let mut seen_names = std::collections::HashSet::new();
-    let mut providers = Vec::new();
-    discover_providers_recursive(workspace_root, &mut seen_names, &mut providers);
-    providers
+#[derive(PartialEq, Eq, Hash)]
+struct ProviderInstanceKey {
+    kind: String,
+    binding: Option<String>,
 }
 
-fn discover_providers_recursive(
-    dir: &Path,
-    seen_names: &mut std::collections::HashSet<String>,
-    providers: &mut Vec<(PathBuf, ProviderConfig)>,
-) {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            discover_providers_recursive(&path, seen_names, providers);
-        } else if path.extension().is_some_and(|ext| ext == "crn")
-            && let Ok(content) = fs::read_to_string(&path)
-        {
-            let ctx = ProviderContext::default();
-            if let Ok(parsed) = parser::parse(&content, &ctx) {
-                let source_dir = path.parent().unwrap_or(dir);
-                for provider in parsed.providers {
-                    if seen_names.insert(provider.name.clone()) {
-                        providers.push((source_dir.to_path_buf(), provider));
-                    }
-                }
-            }
+impl From<&ProviderConfig> for ProviderInstanceKey {
+    fn from(config: &ProviderConfig) -> Self {
+        Self {
+            kind: config.name.clone(),
+            binding: config.binding.clone(),
         }
     }
 }
 
 /// Discover provider configurations grouped by directory.
 ///
-/// Unlike `discover_providers` which deduplicates globally, this groups
-/// providers by their source directory. Each directory is an independent
-/// Carina configuration with its own set of providers.
-/// Within a single directory, duplicate provider names are deduplicated.
+/// Each directory is an independent Carina configuration with its own set of
+/// providers. Within a directory, duplicate provider instances are identified
+/// by provider kind and optional binding; the first declaration in sorted path
+/// order wins.
 pub fn discover_providers_by_dir(workspace_root: &Path) -> HashMap<PathBuf, Vec<ProviderConfig>> {
     let mut result: HashMap<PathBuf, Vec<ProviderConfig>> = HashMap::new();
     discover_by_dir_recursive(workspace_root, &mut result);
@@ -67,9 +38,10 @@ fn discover_by_dir_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<Provi
         Ok(entries) => entries,
         Err(_) => return,
     };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in paths {
         if path.is_dir() {
             discover_by_dir_recursive(&path, result);
         } else if path.extension().is_some_and(|ext| ext == "crn")
@@ -81,10 +53,12 @@ fn discover_by_dir_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<Provi
             {
                 let source_dir = path.parent().unwrap_or(dir).to_path_buf();
                 let dir_providers = result.entry(source_dir).or_default();
-                let seen: std::collections::HashSet<String> =
-                    dir_providers.iter().map(|p| p.name.clone()).collect();
+                let mut seen: HashSet<ProviderInstanceKey> = dir_providers
+                    .iter()
+                    .map(ProviderInstanceKey::from)
+                    .collect();
                 for provider in parsed.providers {
-                    if !seen.contains(&provider.name) {
+                    if seen.insert(ProviderInstanceKey::from(&provider)) {
                         dir_providers.push(provider);
                     }
                 }
@@ -99,20 +73,21 @@ fn discover_by_dir_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<Provi
 /// the relative paths to absolute module directories, and maps each module
 /// to the directories that import it. This allows module files to inherit
 /// their callers' provider schemas.
-pub fn discover_import_map(workspace_root: &Path) -> HashMap<PathBuf, Vec<PathBuf>> {
-    let mut result: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+pub fn discover_import_map(workspace_root: &Path) -> HashMap<PathBuf, BTreeSet<PathBuf>> {
+    let mut result: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
     discover_imports_recursive(workspace_root, &mut result);
     result
 }
 
-fn discover_imports_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<PathBuf>>) {
+fn discover_imports_recursive(dir: &Path, result: &mut HashMap<PathBuf, BTreeSet<PathBuf>>) {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return,
     };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in paths {
         if path.is_dir() {
             discover_imports_recursive(&path, result);
         } else if path.extension().is_some_and(|ext| ext == "crn")
@@ -143,7 +118,7 @@ fn discover_imports_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<Path
                     let caller_dir = caller_dir
                         .canonicalize()
                         .unwrap_or(caller_dir.to_path_buf());
-                    result.entry(module_dir).or_default().push(caller_dir);
+                    result.entry(module_dir).or_default().insert(caller_dir);
                 }
             }
         }
@@ -153,10 +128,11 @@ fn discover_imports_recursive(dir: &Path, result: &mut HashMap<PathBuf, Vec<Path
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use tempfile::TempDir;
 
     #[test]
-    fn discover_providers_from_crn_files() {
+    fn discover_by_dir_from_crn_files() {
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join("main.crn"),
@@ -164,14 +140,14 @@ mod tests {
         )
         .unwrap();
 
-        let providers = discover_providers(dir.path());
+        let by_dir = discover_providers_by_dir(dir.path());
+        let providers = &by_dir[dir.path()];
         assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0].1.name, "aws");
-        assert_eq!(providers[0].0, dir.path());
+        assert_eq!(providers[0].name, "aws");
     }
 
     #[test]
-    fn discover_providers_multiple_files() {
+    fn discover_by_dir_multiple_files() {
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join("a.crn"),
@@ -184,41 +160,15 @@ mod tests {
         )
         .unwrap();
 
-        let providers = discover_providers(dir.path());
+        let by_dir = discover_providers_by_dir(dir.path());
+        let providers = &by_dir[dir.path()];
         assert_eq!(providers.len(), 2);
-        let names: Vec<&str> = providers.iter().map(|p| p.1.name.as_str()).collect();
-        assert!(names.contains(&"aws"));
-        assert!(names.contains(&"awscc"));
+        assert_eq!(providers[0].name, "aws");
+        assert_eq!(providers[1].name, "awscc");
     }
 
     #[test]
-    fn discover_providers_deduplicates() {
-        let dir = TempDir::new().unwrap();
-        fs::write(
-            dir.path().join("a.crn"),
-            "provider aws {\n  region = 'us-east-1'\n}\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("b.crn"),
-            "provider aws {\n  region = 'ap-northeast-1'\n}\n",
-        )
-        .unwrap();
-
-        let providers = discover_providers(dir.path());
-        assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0].1.name, "aws");
-    }
-
-    #[test]
-    fn discover_providers_empty_directory() {
-        let dir = TempDir::new().unwrap();
-        let providers = discover_providers(dir.path());
-        assert!(providers.is_empty());
-    }
-
-    #[test]
-    fn discover_providers_no_provider_blocks() {
+    fn discover_by_dir_no_provider_blocks() {
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join("main.crn"),
@@ -226,12 +176,12 @@ mod tests {
         )
         .unwrap();
 
-        let providers = discover_providers(dir.path());
-        assert!(providers.is_empty());
+        let by_dir = discover_providers_by_dir(dir.path());
+        assert!(by_dir.is_empty());
     }
 
     #[test]
-    fn discover_providers_skips_unparseable_files() {
+    fn discover_by_dir_skips_unparseable_files() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("bad.crn"), "this is not valid crn {{{").unwrap();
         fs::write(
@@ -240,13 +190,14 @@ mod tests {
         )
         .unwrap();
 
-        let providers = discover_providers(dir.path());
+        let by_dir = discover_providers_by_dir(dir.path());
+        let providers = &by_dir[dir.path()];
         assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0].1.name, "awscc");
+        assert_eq!(providers[0].name, "awscc");
     }
 
     #[test]
-    fn discover_providers_skips_non_crn_files() {
+    fn discover_by_dir_skips_non_crn_files() {
         let dir = TempDir::new().unwrap();
         fs::write(
             dir.path().join("readme.md"),
@@ -254,12 +205,12 @@ mod tests {
         )
         .unwrap();
 
-        let providers = discover_providers(dir.path());
-        assert!(providers.is_empty());
+        let by_dir = discover_providers_by_dir(dir.path());
+        assert!(by_dir.is_empty());
     }
 
     #[test]
-    fn discover_providers_recursive_nested_directories() {
+    fn discover_by_dir_recurses_into_nested_directories() {
         let dir = TempDir::new().unwrap();
         let nested = dir.path().join("modules").join("web");
         fs::create_dir_all(&nested).unwrap();
@@ -269,77 +220,16 @@ mod tests {
         )
         .unwrap();
 
-        let providers = discover_providers(dir.path());
+        let by_dir = discover_providers_by_dir(dir.path());
+        let providers = &by_dir[&nested];
         assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0].1.name, "awscc");
-        assert_eq!(providers[0].0, nested);
+        assert_eq!(providers[0].name, "awscc");
     }
 
     #[test]
-    fn discover_providers_nonexistent_directory() {
-        let providers = discover_providers(Path::new("/nonexistent/path"));
-        assert!(providers.is_empty());
-    }
-
-    #[test]
-    fn discover_providers_returns_source_directory() {
-        let dir = TempDir::new().unwrap();
-        let sub_a = dir.path().join("env_a");
-        let sub_b = dir.path().join("env_b");
-        fs::create_dir_all(&sub_a).unwrap();
-        fs::create_dir_all(&sub_b).unwrap();
-
-        fs::write(
-            sub_a.join("providers.crn"),
-            "provider aws {\n  region = 'us-east-1'\n}\n",
-        )
-        .unwrap();
-        fs::write(
-            sub_b.join("providers.crn"),
-            "provider awscc {\n  region = 'ap-northeast-1'\n}\n",
-        )
-        .unwrap();
-
-        let providers = discover_providers(dir.path());
-        assert_eq!(providers.len(), 2);
-
-        for (source_dir, config) in &providers {
-            match config.name.as_str() {
-                "aws" => assert_eq!(source_dir, &sub_a),
-                "awscc" => assert_eq!(source_dir, &sub_b),
-                other => panic!("unexpected provider: {}", other),
-            }
-        }
-    }
-
-    #[test]
-    fn discover_providers_dedup_preserves_source_directory() {
-        let dir = TempDir::new().unwrap();
-        let sub_a = dir.path().join("env_a");
-        let sub_b = dir.path().join("env_b");
-        fs::create_dir_all(&sub_a).unwrap();
-        fs::create_dir_all(&sub_b).unwrap();
-
-        fs::write(
-            sub_a.join("providers.crn"),
-            "provider aws {\n  region = 'us-east-1'\n}\n",
-        )
-        .unwrap();
-        fs::write(
-            sub_b.join("providers.crn"),
-            "provider aws {\n  region = 'ap-northeast-1'\n}\n",
-        )
-        .unwrap();
-
-        let providers = discover_providers(dir.path());
-        assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0].1.name, "aws");
-        // Source directory should be one of the two (readdir order is not guaranteed)
-        assert!(
-            providers[0].0 == sub_a || providers[0].0 == sub_b,
-            "source_dir should be one of the subdirectories, got: {:?}",
-            providers[0].0
-        );
+    fn discover_by_dir_nonexistent_directory() {
+        let by_dir = discover_providers_by_dir(Path::new("/nonexistent/path"));
+        assert!(by_dir.is_empty());
     }
 
     #[test]
@@ -417,6 +307,103 @@ mod tests {
     }
 
     #[test]
+    fn discover_by_dir_keeps_default_and_named_instance_in_both_file_orders() {
+        for (default_file, named_file) in [
+            ("a_default.crn", "z_named.crn"),
+            ("z_default.crn", "a_named.crn"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            fs::write(
+                dir.path().join(default_file),
+                "provider aws {\n  source = 'file:///x.wasm'\n}\n",
+            )
+            .unwrap();
+            fs::write(
+                dir.path().join(named_file),
+                "let east = provider aws {\n  region = 'us-east-1'\n}\n",
+            )
+            .unwrap();
+
+            let by_dir = discover_providers_by_dir(dir.path());
+            let providers = &by_dir[dir.path()];
+
+            assert_eq!(
+                providers.len(),
+                2,
+                "default and named instances must both survive when default={default_file}, named={named_file}"
+            );
+            assert!(providers.iter().any(|provider| {
+                provider.is_default
+                    && provider.binding.is_none()
+                    && provider.source.as_deref() == Some("file:///x.wasm")
+            }));
+            assert!(providers.iter().any(|provider| {
+                !provider.is_default && provider.binding.as_deref() == Some("east")
+            }));
+        }
+    }
+
+    #[test]
+    fn discover_by_dir_keeps_multiple_named_instances_of_same_kind() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("a_east.crn"),
+            "let east = provider aws {\n  region = 'us-east-1'\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("z_west.crn"),
+            "let west = provider aws {\n  region = 'us-west-2'\n}\n",
+        )
+        .unwrap();
+
+        let by_dir = discover_providers_by_dir(dir.path());
+        let bindings: Vec<&str> = by_dir[dir.path()]
+            .iter()
+            .filter_map(|provider| provider.binding.as_deref())
+            .collect();
+
+        assert_eq!(bindings, ["east", "west"]);
+    }
+
+    #[test]
+    fn discover_by_dir_keeps_defaults_of_different_kinds() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a_aws.crn"), "provider aws {}\n").unwrap();
+        fs::write(dir.path().join("z_awscc.crn"), "provider awscc {}\n").unwrap();
+
+        let by_dir = discover_providers_by_dir(dir.path());
+        let providers = &by_dir[dir.path()];
+
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].name, "aws");
+        assert_eq!(providers[1].name, "awscc");
+        assert!(
+            providers
+                .iter()
+                .all(|provider| provider.is_default && provider.binding.is_none())
+        );
+    }
+
+    #[test]
+    fn discover_by_dir_duplicate_defaults_keep_first_sorted_file() {
+        let dir = TempDir::new().unwrap();
+        for index in (0..10).rev() {
+            fs::write(
+                dir.path().join(format!("{index:02}_default.crn")),
+                format!("provider aws {{\n  source = 'file:///{index:02}.wasm'\n}}\n"),
+            )
+            .unwrap();
+        }
+
+        let by_dir = discover_providers_by_dir(dir.path());
+        let providers = &by_dir[dir.path()];
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].source.as_deref(), Some("file:///00.wasm"));
+    }
+
+    #[test]
     fn discover_by_dir_empty_workspace() {
         let dir = TempDir::new().unwrap();
         let by_dir = discover_providers_by_dir(dir.path());
@@ -456,6 +443,32 @@ mod tests {
             "callers should contain the caller dir. Got: {:?}",
             callers
         );
+    }
+
+    #[test]
+    fn discover_import_map_sorts_and_deduplicates_callers() {
+        let dir = TempDir::new().unwrap();
+        let module = dir.path().join("modules").join("shared");
+        fs::create_dir_all(&module).unwrap();
+        fs::write(module.join("main.crn"), "arguments {\n  value: String\n}\n").unwrap();
+
+        let callers_root = dir.path().join("callers");
+        for name in ["zeta", "middle", "alpha"] {
+            let caller = callers_root.join(name);
+            fs::create_dir_all(&caller).unwrap();
+            let import = "let shared = use { source = '../../modules/shared' }\n";
+            fs::write(caller.join("z_import.crn"), import).unwrap();
+            fs::write(caller.join("a_import.crn"), import).unwrap();
+        }
+
+        let import_map: HashMap<PathBuf, BTreeSet<PathBuf>> = discover_import_map(dir.path());
+        let module = module.canonicalize().unwrap();
+        let expected: BTreeSet<PathBuf> = ["alpha", "middle", "zeta"]
+            .into_iter()
+            .map(|name| callers_root.join(name).canonicalize().unwrap())
+            .collect();
+
+        assert_eq!(import_map[&module], expected);
     }
 
     #[test]
