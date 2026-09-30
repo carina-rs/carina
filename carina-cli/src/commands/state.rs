@@ -2258,8 +2258,10 @@ mod tests {
 
         assert!(matches!(error, AppError::ModuleConstraint(_)), "{error:?}");
         let rendered = error.to_string();
-        assert!(rendered.contains("checked_module"), "{rendered}");
-        assert!(rendered.contains("root.checked"), "{rendered}");
+        assert!(
+            rendered.contains("module 'checked_module' (call 'checked')"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("unrelated"), "{rendered}");
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
     }

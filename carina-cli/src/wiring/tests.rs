@@ -5901,8 +5901,7 @@ mod resolved_value_constraint_gate {
         }
         let rendered = errors[0].to_string();
         for expected in [
-            "checked_module",
-            "root.checked",
+            "module 'checked_module' (call 'checked')",
             "value",
             "value must not be bad",
             "\"bad\"",

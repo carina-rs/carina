@@ -1479,8 +1479,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
 
     let message = error.to_string();
     for expected in [
-        "checked_module",
-        "root.checked",
+        "module 'checked_module' (call 'checked')",
         "value must not be bad",
         "\"bad\"",
     ] {
