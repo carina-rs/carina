@@ -28,7 +28,7 @@ fn plan_error_summary(errors: &[PlanError]) -> String {
             | PlanErrorKind::WaitTargetMissing { .. }
             | PlanErrorKind::WaitPredicateInvalid { .. }
             | PlanErrorKind::ResolvedValueConstraint { .. }
-            | PlanErrorKind::ModuleConstraint { .. } => other_count += 1,
+            | PlanErrorKind::ModuleConstraint(_) => other_count += 1,
         }
     }
 

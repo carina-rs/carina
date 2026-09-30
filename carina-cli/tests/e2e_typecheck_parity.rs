@@ -147,16 +147,12 @@ let instance = checked {
     let cli_diags = cli_diagnostics(Vec::new(), &fixture);
     let lsp_constraint_messages = lsp_diags
         .iter()
-        .filter(|diagnostic| {
-            diagnostic
-                .message
-                .contains("Validation failed for argument 'x'")
-        })
+        .filter(|diagnostic| diagnostic.message.contains("x must be greater than five"))
         .map(|diagnostic| diagnostic.message.as_str())
         .collect::<Vec<_>>();
     let cli_constraint_messages = cli_diags
         .iter()
-        .filter(|diagnostic| diagnostic.contains("Validation failed for argument 'x'"))
+        .filter(|diagnostic| diagnostic.contains("x must be greater than five"))
         .map(String::as_str)
         .collect::<Vec<_>>();
 
@@ -171,6 +167,12 @@ let instance = checked {
         "CLI must report the evaluator error once: {cli_constraint_messages:#?}; all diagnostics: {cli_diags:#?}"
     );
     assert_eq!(lsp_constraint_messages, cli_constraint_messages);
+    assert_eq!(
+        lsp_constraint_messages,
+        [
+            "module 'checked' (call 'instance'): argument 'x': x must be greater than five (got \"abc\"); error evaluating constraint: cannot compare string with int"
+        ]
+    );
 }
 
 fn reference_valued_module_scope_fixture(module_source: &str) -> (TempDir, SchemaRegistry) {

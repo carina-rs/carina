@@ -5887,18 +5887,15 @@ mod resolved_value_constraint_gate {
 
         assert_eq!(errors.len(), 1, "{errors:#?}");
         match &errors[0].kind {
-            PlanErrorKind::ModuleConstraint {
-                module,
-                instance,
-                arguments,
-                message,
-                actuals,
-            } => {
-                assert_eq!(module, "checked_module");
-                assert_eq!(instance, "root.checked");
-                assert_eq!(arguments, &["value"]);
-                assert_eq!(message, "value must not be bad");
-                assert_eq!(actuals, &[("value".to_string(), "\"bad\"".to_string())]);
+            PlanErrorKind::ModuleConstraint(diagnostic) => {
+                assert_eq!(diagnostic.module, "checked_module");
+                assert_eq!(diagnostic.instance, "root.checked");
+                assert_eq!(diagnostic.arguments, ["value"]);
+                assert_eq!(diagnostic.message, "value must not be bad");
+                assert_eq!(
+                    diagnostic.actuals,
+                    [("value".to_string(), "\"bad\"".to_string())]
+                );
             }
             other => panic!("unexpected plan error: {other:?}"),
         }
@@ -5968,14 +5965,10 @@ mod resolved_value_constraint_gate {
         assert_eq!(plan.plan.errors().len(), 1, "{:#?}", plan.plan.errors());
         assert!(matches!(
             &plan.plan.errors()[0].kind,
-            PlanErrorKind::ModuleConstraint {
-                module,
-                instance,
-                message,
-                ..
-            } if module == "checked_module"
-                && instance == "root.checked"
-                && message == "value must not be bad"
+            PlanErrorKind::ModuleConstraint(diagnostic)
+                if diagnostic.module == "checked_module"
+                    && diagnostic.instance == "root.checked"
+                    && diagnostic.message == "value must not be bad"
         ));
     }
 
@@ -6011,17 +6004,12 @@ mod resolved_value_constraint_gate {
         .expect_err("resolved invalid require must fail planning");
 
         match &errors[0].kind {
-            PlanErrorKind::ModuleConstraint {
-                arguments,
-                message,
-                actuals,
-                ..
-            } => {
-                assert_eq!(arguments, &["left", "right"]);
-                assert_eq!(message, "left and right must match");
+            PlanErrorKind::ModuleConstraint(diagnostic) => {
+                assert_eq!(diagnostic.arguments, ["left", "right"]);
+                assert_eq!(diagnostic.message, "left and right must match");
                 assert_eq!(
-                    actuals,
-                    &[
+                    diagnostic.actuals,
+                    [
                         ("left".to_string(), "\"left\"".to_string()),
                         ("right".to_string(), "\"right\"".to_string()),
                     ]

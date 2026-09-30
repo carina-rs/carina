@@ -706,13 +706,9 @@ impl DiagnosticEngine {
         owner: Option<&str>,
     ) -> Option<Diagnostic> {
         let instance = match error {
-            carina_core::module_resolver::ModuleError::ArgumentValidationFailed {
-                instance,
-                ..
-            } => instance.as_str(),
-            carina_core::module_resolver::ModuleError::RequireConstraintFailed {
-                instance, ..
-            } => instance.as_str(),
+            carina_core::module_resolver::ModuleError::Constraint(diagnostic) => {
+                diagnostic.instance.as_str()
+            }
             _ => return None,
         };
 

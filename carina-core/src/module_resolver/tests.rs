@@ -2942,7 +2942,7 @@ fn test_argument_validation_fails_with_invalid_value() {
     let err = result.unwrap_err();
     let rendered = err.to_string();
     assert!(rendered.contains("module 'web_server'"), "{rendered}");
-    assert!(rendered.contains("instance 'web'"), "{rendered}");
+    assert!(rendered.contains("call 'web'"), "{rendered}");
     assert!(rendered.contains("argument 'port'"), "{rendered}");
     assert!(
         rendered.contains("Port must be between 1 and 65535"),
@@ -2950,19 +2950,13 @@ fn test_argument_validation_fails_with_invalid_value() {
     );
     assert!(rendered.contains("got 0"), "{rendered}");
     match err {
-        ModuleError::ArgumentValidationFailed {
-            module,
-            argument,
-            message,
-            actual,
-            ..
-        } => {
-            assert_eq!(module, "web_server");
-            assert_eq!(argument, "port");
-            assert_eq!(message, "Port must be between 1 and 65535");
-            assert_eq!(actual, "0");
+        ModuleError::Constraint(diagnostic) => {
+            assert_eq!(diagnostic.module, "web_server");
+            assert_eq!(diagnostic.arguments, ["port"]);
+            assert_eq!(diagnostic.message, "Port must be between 1 and 65535");
+            assert_eq!(diagnostic.actuals, [("port".to_string(), "0".to_string())]);
         }
-        other => panic!("Expected ArgumentValidationFailed, got {:?}", other),
+        other => panic!("Expected module constraint failure, got {other:?}"),
     }
 }
 
@@ -3078,10 +3072,10 @@ fn test_argument_validation_no_message_uses_default() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     match err {
-        ModuleError::ArgumentValidationFailed { message, .. } => {
-            assert_eq!(message, "validation failed for argument 'count'");
+        ModuleError::Constraint(diagnostic) => {
+            assert_eq!(diagnostic.message, "validation failed for argument 'count'");
         }
-        other => panic!("Expected ArgumentValidationFailed, got {:?}", other),
+        other => panic!("Expected module constraint failure, got {other:?}"),
     }
 }
 
@@ -3166,10 +3160,10 @@ fn test_argument_validation_len_with_list() {
     let result = resolver.expand_module_call(&call, "t", None);
     assert!(result.is_err());
     match result.unwrap_err() {
-        ModuleError::ArgumentValidationFailed { message, .. } => {
-            assert_eq!(message, "At least one tag is required");
+        ModuleError::Constraint(diagnostic) => {
+            assert_eq!(diagnostic.message, "At least one tag is required");
         }
-        other => panic!("Expected ArgumentValidationFailed, got {:?}", other),
+        other => panic!("Expected module constraint failure, got {other:?}"),
     }
 }
 
@@ -3333,10 +3327,10 @@ fn test_require_block_fails_with_not_expr() {
     let result = resolver.expand_module_call(&call, "w", None);
     assert!(result.is_err());
     match result.unwrap_err() {
-        ModuleError::RequireConstraintFailed { message, .. } => {
-            assert_eq!(message, "cert is required when HTTPS is enabled");
+        ModuleError::Constraint(diagnostic) => {
+            assert_eq!(diagnostic.message, "cert is required when HTTPS is enabled");
         }
-        other => panic!("Expected RequireConstraintFailed, got {:?}", other),
+        other => panic!("Expected module constraint failure, got {other:?}"),
     }
 }
 
@@ -3425,10 +3419,10 @@ fn test_require_block_len_function() {
     let result = resolver.expand_module_call(&call, "lb", None);
     assert!(result.is_err());
     match result.unwrap_err() {
-        ModuleError::RequireConstraintFailed { message, .. } => {
-            assert_eq!(message, "ALB requires at least two subnets");
+        ModuleError::Constraint(diagnostic) => {
+            assert_eq!(diagnostic.message, "ALB requires at least two subnets");
         }
-        other => panic!("Expected RequireConstraintFailed, got {:?}", other),
+        other => panic!("Expected module constraint failure, got {other:?}"),
     }
 }
 
@@ -3528,7 +3522,7 @@ fn test_require_block_multiple_constraints() {
     let error = result.unwrap_err();
     let rendered = error.to_string();
     assert!(rendered.contains("module 'asg'"), "{rendered}");
-    assert!(rendered.contains("instance 'a'"), "{rendered}");
+    assert!(rendered.contains("call 'a'"), "{rendered}");
     assert!(rendered.contains("max_size"), "{rendered}");
     assert!(rendered.contains("min_size"), "{rendered}");
     assert!(rendered.contains("max_size = 5"), "{rendered}");
@@ -3538,10 +3532,10 @@ fn test_require_block_multiple_constraints() {
         "{rendered}"
     );
     match error {
-        ModuleError::RequireConstraintFailed { message, .. } => {
-            assert_eq!(message, "min_size must be <= max_size");
+        ModuleError::Constraint(diagnostic) => {
+            assert_eq!(diagnostic.message, "min_size must be <= max_size");
         }
-        other => panic!("Expected RequireConstraintFailed, got {:?}", other),
+        other => panic!("Expected module constraint failure, got {other:?}"),
     }
 }
 

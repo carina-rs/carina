@@ -1217,16 +1217,9 @@ fn module_constraint_plan_errors(
         .iter()
         .cloned()
         .map(|failure| {
-            let message = failure.message_with_detail();
             PlanError::new(
                 failure.composition_id,
-                PlanErrorKind::ModuleConstraint {
-                    module: failure.module,
-                    instance: failure.instance,
-                    arguments: failure.arguments,
-                    message,
-                    actuals: failure.actuals,
-                },
+                PlanErrorKind::ModuleConstraint(failure.diagnostic),
             )
         })
         .collect()

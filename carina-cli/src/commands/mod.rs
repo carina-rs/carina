@@ -501,8 +501,7 @@ pub fn validate_and_resolve_errors_with_factories(
             &enriched_context,
         ));
         let message = match &e {
-            module_resolver::ModuleError::ArgumentValidationFailed { .. }
-            | module_resolver::ModuleError::RequireConstraintFailed { .. } => e.to_string(),
+            module_resolver::ModuleError::Constraint(_) => e.to_string(),
             _ => format!("Module resolution error: {e}"),
         };
         errors.push(AppError::Config(message));

@@ -9,7 +9,8 @@ use std::path::PathBuf;
 
 use carina_core::config_loader::load_configuration;
 use carina_core::effect::{DeletedInstanceKey, Effect};
-use carina_core::plan::Plan;
+use carina_core::module_resolver::{ModuleConstraintDiagnostic, ModuleConstraintKind};
+use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::resource::{
     DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceId, State, Value,
 };
@@ -196,6 +197,26 @@ fn snapshot_resolved_value_constraint_multifile() {
         .join("\n");
 
     insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_module_constraint_plan_error() {
+    let error = PlanError::new(
+        ResourceId::with_identity("_virtual", "c"),
+        PlanErrorKind::ModuleConstraint(ModuleConstraintDiagnostic {
+            module: "mod".to_string(),
+            instance: "c".to_string(),
+            kind: ModuleConstraintKind::ArgumentValidation {
+                argument: "name".to_string(),
+            },
+            arguments: vec!["name".to_string()],
+            message: "too long".to_string(),
+            actuals: vec![("name".to_string(), "\"abcd\"".to_string())],
+            detail: None,
+        }),
+    );
+
+    insta::assert_snapshot!(error.to_string());
 }
 
 #[test]

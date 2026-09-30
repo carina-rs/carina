@@ -29,49 +29,76 @@ pub struct ModuleConstraintViolation {
 pub struct ModuleConstraintFailure {
     pub composition_id: ResourceId,
     constraint_id: ModuleConstraintId,
+    pub diagnostic: ModuleConstraintDiagnostic,
+}
+
+impl fmt::Display for ModuleConstraintFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.diagnostic.fmt(f)
+    }
+}
+
+/// User-facing module-constraint diagnostic shared by validation, planning,
+/// apply, and editor diagnostics.
+///
+/// Actual values are rendered eagerly with the secret-aware value formatter;
+/// this type never retains a [`Value`] and is therefore safe to display or
+/// debug-log.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ModuleConstraintDiagnostic {
     pub module: String,
     pub instance: String,
+    pub kind: ModuleConstraintKind,
     pub arguments: Vec<String>,
     pub message: String,
     pub actuals: Vec<(String, String)>,
     pub detail: Option<String>,
 }
 
-impl ModuleConstraintFailure {
-    /// The authored message plus any evaluator or resolution detail.
-    pub fn message_with_detail(&self) -> String {
-        match &self.detail {
-            Some(detail) => format!("{} ({detail})", self.message),
-            None => self.message.clone(),
-        }
-    }
-}
-
-impl fmt::Display for ModuleConstraintFailure {
+impl fmt::Display for ModuleConstraintDiagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let arguments = self
-            .arguments
-            .iter()
-            .map(|argument| format!("`{argument}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let actuals = self
-            .actuals
-            .iter()
-            .map(|(argument, value)| format!("{argument} = {value}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        write!(
-            f,
-            "module `{}` instance `{}` constraint failed for argument(s) {}: {}; values: {}",
-            self.module, self.instance, arguments, self.message, actuals
-        )?;
+        write!(f, "module '{}' (call '{}'): ", self.module, self.instance)?;
+        match &self.kind {
+            ModuleConstraintKind::ArgumentValidation { argument } => {
+                write!(f, "argument '{argument}'")?;
+            }
+            ModuleConstraintKind::Require => {
+                let arguments = self
+                    .arguments
+                    .iter()
+                    .map(|argument| format!("'{argument}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "arguments {arguments}")?;
+            }
+        }
+        write!(f, ": {}", self.message)?;
+        if !self.actuals.is_empty() {
+            let actuals = match &self.kind {
+                ModuleConstraintKind::ArgumentValidation { argument } => self
+                    .actuals
+                    .iter()
+                    .find(|(name, _)| name == argument)
+                    .or_else(|| self.actuals.first())
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default(),
+                ModuleConstraintKind::Require => self
+                    .actuals
+                    .iter()
+                    .map(|(argument, value)| format!("{argument} = {value}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            };
+            write!(f, " (got {actuals})")?;
+        }
         if let Some(detail) = &self.detail {
-            write!(f, " ({detail})")?;
+            write!(f, "; {detail}")?;
         }
         Ok(())
     }
 }
+
+impl std::error::Error for ModuleConstraintDiagnostic {}
 
 /// Result of evaluating a module value constraint at a resolution boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +111,7 @@ pub enum ConstraintEvaluation {
 
 /// Where a module constraint is declared, and therefore which arguments are
 /// visible while it is evaluated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ModuleConstraintKind {
     /// A `validation` block nested in one argument declaration. Only that
     /// argument is in scope, even when the module declares other arguments.
@@ -160,42 +187,28 @@ impl EvaluatedModuleConstraint {
     /// Expansion and LSP diagnostics both use this renderer, so their text
     /// cannot drift independently.
     pub fn module_error(&self, module: &str, instance: &str) -> Option<ModuleError> {
-        let message = match &self.evaluation {
-            ConstraintEvaluation::Violated(violation) => violation.message.clone(),
-            ConstraintEvaluation::EvalError(error) => format!(
-                "{} (error evaluating constraint: {error})",
-                self.constraint.message()
+        let (message, actuals, detail) = match &self.evaluation {
+            ConstraintEvaluation::Violated(violation) => {
+                (violation.message.clone(), violation.actuals.clone(), None)
+            }
+            ConstraintEvaluation::EvalError(error) => (
+                self.constraint.message().to_string(),
+                self.actuals.clone(),
+                Some(format!("error evaluating constraint: {error}")),
             ),
             ConstraintEvaluation::Satisfied | ConstraintEvaluation::Pending => return None,
         };
-        match &self.kind {
-            ModuleConstraintKind::ArgumentValidation { argument } => {
-                let actual = self
-                    .actuals
-                    .first()
-                    .map(|(_, value)| value.clone())
-                    .unwrap_or_else(|| "<missing>".to_string());
-                Some(ModuleError::ArgumentValidationFailed {
-                    module: module.to_string(),
-                    instance: instance.to_string(),
-                    argument: argument.clone(),
-                    message,
-                    actual,
-                })
-            }
-            ModuleConstraintKind::Require => Some(ModuleError::RequireConstraintFailed {
+        Some(ModuleError::Constraint(Box::new(
+            ModuleConstraintDiagnostic {
                 module: module.to_string(),
                 instance: instance.to_string(),
-                arguments: self.arguments.join(", "),
+                kind: self.kind.clone(),
+                arguments: self.arguments.clone(),
                 message,
-                actuals: self
-                    .actuals
-                    .iter()
-                    .map(|(name, value)| format!("{name} = {value}"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            }),
-        }
+                actuals,
+                detail,
+            },
+        )))
     }
 }
 
@@ -465,12 +478,15 @@ pub fn evaluate_pending_constraints(
                     ModuleConstraintFailure {
                         composition_id: composition.id.clone(),
                         constraint_id: constraint.id().clone(),
-                        module: composition.module_name.clone(),
-                        instance: composition.instance.clone(),
-                        arguments: arguments.clone(),
-                        message,
-                        actuals,
-                        detail,
+                        diagnostic: ModuleConstraintDiagnostic {
+                            module: composition.module_name.clone(),
+                            instance: composition.instance.clone(),
+                            kind: evaluated.kind().clone(),
+                            arguments: arguments.clone(),
+                            message,
+                            actuals,
+                            detail,
+                        },
                     }
                 };
             let actuals = || evaluated.actuals().to_vec();
@@ -900,5 +916,77 @@ mod tests {
                 "unknown variable 'y' in constraint expression".to_string()
             )
         );
+    }
+
+    #[test]
+    fn module_constraint_evaluation_error_has_one_renderer_at_every_boundary() {
+        use crate::parser::{TypeExpr, ValidationBlock};
+        use crate::plan::PlanErrorKind;
+
+        let declarations = vec![ArgumentParameter {
+            name: "name".to_string(),
+            type_expr: TypeExpr::String,
+            default: None,
+            description: None,
+            validations: vec![ValidationBlock {
+                condition: ValidateExpr::Compare {
+                    lhs: Box::new(ValidateExpr::Var("name".to_string())),
+                    op: CompareOp::Gt,
+                    rhs: Box::new(ValidateExpr::Int(5)),
+                },
+                error_message: Some("bad name".to_string()),
+            }],
+        }];
+        let values = HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("abc".to_string())),
+        )]);
+        let evaluated = evaluate_module_constraints(
+            ModuleConstraints::declarations(&declarations, &[]),
+            &values,
+        )
+        .into_iter()
+        .next()
+        .expect("one validation");
+        let ConstraintEvaluation::EvalError(detail) = evaluated.evaluation() else {
+            panic!("expected evaluation error");
+        };
+        let detail = format!("error evaluating constraint: {detail}");
+        let actuals = vec![("name".to_string(), "\"abc\"".to_string())];
+        let resolver_error = evaluated
+            .module_error("mod", "c")
+            .expect("evaluation error must render");
+        let apply_failure = ModuleConstraintFailure {
+            composition_id: ResourceId::with_identity("_virtual", "c"),
+            constraint_id: ModuleConstraintId::argument_validation("name", 0),
+            diagnostic: ModuleConstraintDiagnostic {
+                module: "mod".to_string(),
+                instance: "c".to_string(),
+                kind: ModuleConstraintKind::ArgumentValidation {
+                    argument: "name".to_string(),
+                },
+                arguments: vec!["name".to_string()],
+                message: "bad name".to_string(),
+                actuals: actuals.clone(),
+                detail: Some(detail.clone()),
+            },
+        };
+        let plan_error = PlanErrorKind::ModuleConstraint(ModuleConstraintDiagnostic {
+            module: "mod".to_string(),
+            instance: "c".to_string(),
+            kind: ModuleConstraintKind::ArgumentValidation {
+                argument: "name".to_string(),
+            },
+            arguments: vec!["name".to_string()],
+            message: "bad name".to_string(),
+            actuals,
+            detail: Some(detail.clone()),
+        });
+        let expected =
+            format!("module 'mod' (call 'c'): argument 'name': bad name (got \"abc\"); {detail}");
+
+        assert_eq!(resolver_error.to_string(), expected);
+        assert_eq!(apply_failure.to_string(), expected);
+        assert_eq!(plan_error.to_string(), expected);
     }
 }
