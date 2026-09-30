@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use carina_core::effect::PlanOp;
 use carina_core::executor::{
     DeferredDataSourceReads, ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionOutcome,
-    UnresolvedResource, execute_plan,
+    ProviderCheckInputs, UnresolvedResource, execute_plan,
 };
 use carina_core::provider::{
     BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, ProviderResult, ReadRequest,
@@ -120,7 +120,7 @@ impl Provider for CascadeCreateProvider {
 
     fn read_data_source(
         &self,
-        _resource: &carina_core::resource::DataSource,
+        _resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
@@ -131,7 +131,7 @@ impl Provider for CascadeCreateProvider {
         request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
         let id = id.clone();
-        let attrs = request.resource.as_resource().resolved_attributes();
+        let attrs = request.resource().as_resource().resolved_attributes();
         self.creates
             .lock()
             .unwrap()
@@ -238,7 +238,7 @@ impl Provider for ReadWithRetryProvider {
 
     fn read_data_source(
         &self,
-        resource: &carina_core::resource::DataSource,
+        resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         self.data_source_read_calls.fetch_add(1, Ordering::SeqCst);
         let id = resource.id.clone();
@@ -2101,7 +2101,10 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     let provider = CascadeCreateProvider::default();
     let input = ExecutionInput {
         plan: &plan_ctx.plan,
-        unresolved_resources: &unresolved_resources,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved_resources,
+            data_source_origins: &plan_ctx.data_sources,
+        },
         compositions: &[],
         bindings,
         current_states: plan_ctx.current_states,
@@ -2733,12 +2736,21 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
     .expect("literal inputs should be refreshable");
 
     let provider = ReadWithRetryProvider::new(ReadBehavior::NotFound);
+    let bindings = ResolvedBindings::default();
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
     for resolution in resolved {
         match resolution {
             DataSourceRefreshResolution::Resolved(resource) => {
-                read_data_source_with_retry(&provider, &resource)
-                    .await
-                    .expect("literal input read should succeed");
+                read_data_source_with_retry(
+                    &provider,
+                    &resource,
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &empty_registry,
+                )
+                .await
+                .expect("literal input read should succeed");
             }
             DataSourceRefreshResolution::DeferredToApply { .. } => {
                 panic!("literal input read must not be deferred");
@@ -2751,6 +2763,60 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
         1,
         "literal-input data source should be read exactly once during refresh",
     );
+}
+
+#[tokio::test]
+async fn invalid_data_source_preparation_keeps_typed_error_chain() {
+    use carina_core::resource::DataSource;
+
+    let lookup = DataSource::with_provider("test", "Lookup", "roles", None).with_attribute(
+        "filter",
+        Value::Concrete(ConcreteValue::String("bad".to_string())),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("Lookup")
+            .attribute(AttributeSchema::new(
+                "filter",
+                AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+            ))
+            .as_data_source(),
+    );
+    let provider = ReadWithRetryProvider::new(ReadBehavior::NotFound);
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+
+    let error = read_data_source_with_retry(
+        &provider,
+        &lookup,
+        &ResolvedBindings::default(),
+        &module_gate,
+        &[],
+        &schemas,
+    )
+    .await
+    .expect_err("invalid data-source input must fail preparation");
+
+    assert_eq!(
+        error.to_string(),
+        "[Lookup.roles] test.Lookup.roles: value constraint failed before provider dispatch: Invalid value 'bad' for 'filter': does not match required pattern /^good-/"
+    );
+    let mut source = std::error::Error::source(&error);
+    let mut saw_preparation = false;
+    let mut saw_type_error = false;
+    while let Some(error) = source {
+        saw_preparation |= error
+            .downcast_ref::<carina_core::executor::ProviderPreparationError>()
+            .is_some();
+        saw_type_error |= error.downcast_ref::<TypeError>().is_some();
+        source = error.source();
+    }
+    assert!(
+        saw_preparation,
+        "typed preparation error was erased: {error:?}"
+    );
+    assert!(saw_type_error, "typed schema error was erased: {error:?}");
+    assert_eq!(provider.data_source_read_calls(), 0);
 }
 
 // Two resources with unknown types must surface as two distinct
@@ -3270,7 +3336,7 @@ fn validate_passes_when_no_empty_interpolation() {
 mod read_with_retry_identifier_tests {
     use super::*;
     use carina_core::provider::{ProviderResult, ReadRequest};
-    use carina_core::resource::{DataSource, State};
+    use carina_core::resource::State;
     use futures::future::BoxFuture;
     use std::sync::Mutex;
 
@@ -3308,7 +3374,10 @@ mod read_with_retry_identifier_tests {
             Box::pin(async move { Ok(State::existing(id, std::collections::HashMap::new())) })
         }
 
-        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        fn read_data_source(
+            &self,
+            resource: &carina_core::provider::ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = resource.id.clone();
             Box::pin(async move { Ok(State::not_found(id)) })
         }
@@ -4792,7 +4861,7 @@ mod wait_until_enum_alias {
         }
         fn read_data_source(
             &self,
-            r: &carina_core::resource::DataSource,
+            r: &carina_core::provider::ProviderReadyDataSource,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = r.id.clone();
             Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
@@ -5324,4 +5393,767 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
         rendered.contains(&format!("`carina init --upgrade {}`", base.display())),
         "{rendered}"
     );
+}
+
+mod resolved_value_constraint_gate {
+    use super::super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use carina_core::binding_index::PreApplyInputs;
+    use carina_core::effect::PlanOp;
+    use carina_core::parser::{CompareOp, TypeExpr, ValidateExpr};
+    use carina_core::plan::PlanErrorKind;
+    use carina_core::provider::{
+        BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, ProviderFactory,
+        ProviderNormalizer, ProviderResult, ReadRequest, UpdateOutcome, UpdateRequest, ready_noop,
+    };
+    use carina_core::resource::{
+        AccessPath, Composition, CompositionArgument, DataSource, ModuleConstraintId,
+        PendingModuleConstraint, Signature, UnknownReason,
+    };
+    use carina_core::schema::{TypeError, TypeIdentity};
+
+    fn text(value: &str) -> Value {
+        Value::Concrete(ConcreteValue::String(value.to_string()))
+    }
+
+    fn reject_bad_target(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+        if attributes.get("target") == Some(&text("bad")) {
+            Err(vec![TypeError::ResourceValidationFailed {
+                message: "target pair rejected".to_string(),
+                attribute: Some("target".to_string()),
+            }])
+        } else {
+            Ok(())
+        }
+    }
+
+    struct ConstraintFactory;
+
+    impl ProviderFactory for ConstraintFactory {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn display_name(&self) -> &str {
+            "resolved constraint test provider"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn validate_custom_type(&self, identity: &TypeIdentity, value: &str) -> Result<(), String> {
+            if identity.kind == "ExternalId" && value == "bad" {
+                Err("external id rejected".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "local".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _attributes: &IndexMap<String, Value>,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            Box::pin(async { Ok(Box::new(MockProvider::new()) as Box<dyn Provider>) })
+        }
+
+        fn create_normalizer(
+            &self,
+            _binding: Option<&str>,
+            _attributes: &IndexMap<String, Value>,
+        ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
+            Box::pin(async {
+                Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>
+            })
+        }
+
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            let pattern_type =
+                AttributeType::refined_string(None, Some("^good-".to_string()), None, None);
+            let custom_type = AttributeType::refined_string(
+                Some(TypeIdentity::bare("ExternalId")),
+                None,
+                None,
+                None,
+            );
+            vec![
+                ResourceSchema::new("source")
+                    .attribute(AttributeSchema::new("value", AttributeType::string())),
+                ResourceSchema::new("consumer.Pattern")
+                    .attribute(AttributeSchema::new("target", pattern_type.clone())),
+                ResourceSchema::new("consumer.Custom")
+                    .attribute(AttributeSchema::new("target", custom_type)),
+                ResourceSchema::new("consumer.Validated")
+                    .attribute(AttributeSchema::new("target", AttributeType::string()))
+                    .with_validator(reject_bad_target),
+                ResourceSchema::new("lookup.Pattern")
+                    .attribute(AttributeSchema::new("target", pattern_type))
+                    .as_data_source(),
+            ]
+        }
+    }
+
+    struct RecordingDataSourceFactory {
+        reads: Arc<AtomicUsize>,
+    }
+
+    struct RecordingDataSourceProvider {
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl ProviderFactory for RecordingDataSourceFactory {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn display_name(&self) -> &str {
+            "module constraint refresh test provider"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "local".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _attributes: &IndexMap<String, Value>,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            let reads = self.reads.clone();
+            Box::pin(async move {
+                Ok(Box::new(RecordingDataSourceProvider { reads }) as Box<dyn Provider>)
+            })
+        }
+
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            vec![ResourceSchema::new("lookup").as_data_source()]
+        }
+    }
+
+    impl Provider for RecordingDataSourceProvider {
+        fn name(&self) -> &str {
+            "recording-data-source"
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            _identifier: Option<&str>,
+            _request: ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(State::not_found(id)) })
+        }
+
+        fn read_data_source(
+            &self,
+            resource: &carina_core::provider::ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let id = resource.id.clone();
+            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+        }
+
+        fn create(
+            &self,
+            _id: &ResourceId,
+            _request: CreateRequest,
+        ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
+            Box::pin(async { Err(ProviderError::internal("unexpected create")) })
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: UpdateRequest,
+        ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
+            Box::pin(async { Err(ProviderError::internal("unexpected update")) })
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: DeleteRequest,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
+        }
+
+        fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[derive(Default)]
+    struct RewritingNormalizer {
+        desired_calls: AtomicUsize,
+    }
+
+    impl ProviderNormalizer for RewritingNormalizer {
+        fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+            self.desired_calls.fetch_add(1, Ordering::SeqCst);
+            for resource in resources {
+                if resource.attributes.contains_key("target") {
+                    resource.set_attr("target", text("good-normalized"));
+                }
+            }
+            ready_noop()
+        }
+
+        fn normalize_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+        ) -> BoxFuture<'a, ()> {
+            ready_noop()
+        }
+
+        fn hydrate_read_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+            _saved_attrs: &'a carina_core::provider::SavedAttrs,
+        ) -> BoxFuture<'a, ()> {
+            ready_noop()
+        }
+
+        fn merge_default_tags<'a>(
+            &'a self,
+            _resources: &'a mut [Resource],
+            _default_tags: &'a IndexMap<String, Value>,
+            _registry: &'a SchemaRegistry,
+        ) -> BoxFuture<'a, ()> {
+            ready_noop()
+        }
+    }
+
+    fn ref_value() -> Value {
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("producer", "value"),
+        })
+    }
+
+    fn managed_resources(
+        consumer_type: &str,
+        producer_value: Value,
+    ) -> (OverrideAwareResources, Vec<Resource>) {
+        let producer = Resource::with_provider("test", "source", "producer", None)
+            .with_binding("producer")
+            .with_attribute("value", producer_value);
+        let consumer = Resource::with_provider("test", consumer_type, "consumer", None)
+            .with_binding("consumer")
+            .with_attribute("target", ref_value());
+        let source = vec![producer, consumer];
+        let compositions = Vec::<Composition>::new();
+        let data_sources = Vec::<DataSource>::new();
+        let current_states = HashMap::new();
+        let remote_bindings = HashMap::new();
+        let wait_aliases = Vec::new();
+        let resources = OverrideAwareResources::build(
+            source,
+            None::<&carina_state::StateFile>,
+            PreApplyInputs {
+                managed: &[],
+                compositions: &compositions,
+                data_sources: &data_sources,
+                current_states: &current_states,
+                remote_bindings: &remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+        )
+        .expect("test references resolve");
+        let origins = resources.paired_unresolved_resources();
+        (resources, origins)
+    }
+
+    async fn prepare_managed(
+        consumer_type: &str,
+        producer_value: Value,
+        normalizer: &RewritingNormalizer,
+    ) -> Result<(), Vec<carina_core::plan::PlanError>> {
+        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)]);
+        let (mut resources, origins) = managed_resources(consumer_type, producer_value);
+        let compositions = Vec::new();
+        let module_gate = carina_core::executor::ModuleConstraintGate::new(&compositions);
+        let mut current_states = HashMap::new();
+        let mut data_sources = Vec::new();
+        let data_source_origins = Vec::new();
+        let mut wait_bindings = Vec::new();
+
+        PlanPreprocessor::new(normalizer, &ctx)
+            .prepare(
+                &mut resources,
+                &origins,
+                &module_gate,
+                &mut current_states,
+                &[],
+                &mut data_sources,
+                &data_source_origins,
+                &mut wait_bindings,
+            )
+            .await
+    }
+
+    fn pending_composition(
+        arguments: Vec<(&str, Value)>,
+        constraint: PendingModuleConstraint,
+    ) -> Composition {
+        Composition {
+            id: ResourceId::with_identity("_virtual", "checked"),
+            signature: Signature {
+                arguments: arguments
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (
+                            name.to_string(),
+                            CompositionArgument::from_value(value, TypeExpr::String),
+                        )
+                    })
+                    .collect(),
+                attributes: IndexMap::new(),
+                pending_constraints: vec![constraint],
+            },
+            binding: Some("checked".to_string()),
+            dependency_bindings: BTreeSet::new(),
+            module_name: "checked_module".to_string(),
+            instance: "root.checked".to_string(),
+            provenance: Default::default(),
+            quoted_string_attrs: HashSet::new(),
+        }
+    }
+
+    fn not_bad(variable: &str) -> ValidateExpr {
+        ValidateExpr::Compare {
+            lhs: Box::new(ValidateExpr::Var(variable.to_string())),
+            op: CompareOp::Ne,
+            rhs: Box::new(ValidateExpr::String("bad".to_string())),
+        }
+    }
+
+    async fn prepare_composition(
+        producer_values: Vec<(&str, Value)>,
+        composition: &mut Composition,
+    ) -> Result<(), Vec<carina_core::plan::PlanError>> {
+        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)]);
+        let mut producer =
+            Resource::with_provider("test", "source", "producer", None).with_binding("producer");
+        for (name, value) in producer_values {
+            producer.set_attr(name, value);
+        }
+        let compositions = std::slice::from_ref(composition);
+        let empty_data_sources = Vec::<DataSource>::new();
+        let current_states = HashMap::new();
+        let remote_bindings = HashMap::new();
+        let wait_aliases = Vec::new();
+        let mut resources = OverrideAwareResources::build(
+            vec![producer],
+            None::<&carina_state::StateFile>,
+            PreApplyInputs {
+                managed: &[],
+                compositions,
+                data_sources: &empty_data_sources,
+                current_states: &current_states,
+                remote_bindings: &remote_bindings,
+                wait_aliases: &wait_aliases,
+            },
+        )
+        .unwrap();
+        let origins = resources.paired_unresolved_resources();
+        let mut states = HashMap::new();
+        let mut data_sources = Vec::new();
+        let mut waits = Vec::new();
+        let module_gate =
+            carina_core::executor::ModuleConstraintGate::new(std::slice::from_ref(composition));
+
+        PlanPreprocessor::new(&carina_core::provider::NoopNormalizer, &ctx)
+            .prepare(
+                &mut resources,
+                &origins,
+                &module_gate,
+                &mut states,
+                &[],
+                &mut data_sources,
+                &[],
+                &mut waits,
+            )
+            .await
+    }
+
+    fn assert_resolved_error(
+        errors: &[carina_core::plan::PlanError],
+        expected_type: &str,
+        expected_message: &str,
+    ) {
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert_eq!(errors[0].resource_id.resource_type, expected_type);
+        match &errors[0].kind {
+            PlanErrorKind::ResolvedValueConstraint {
+                attributes,
+                origins,
+                message,
+            } => {
+                assert_eq!(attributes, &["target"]);
+                assert_eq!(origins, &["producer.value"]);
+                assert!(message.contains(expected_message), "{message}");
+            }
+            other => panic!("unexpected plan error: {other:?}"),
+        }
+        let rendered = errors[0].to_string();
+        assert!(rendered.contains(expected_type), "{rendered}");
+        assert!(rendered.contains("target"), "{rendered}");
+        assert!(rendered.contains("producer.value"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn resolved_reference_constraint_fails_before_normalization() {
+        let normalizer = RewritingNormalizer::default();
+        let errors = prepare_managed("consumer.Pattern", text("bad"), &normalizer)
+            .await
+            .expect_err("resolved invalid pattern must fail planning");
+
+        assert_resolved_error(&errors, "consumer.Pattern", "required pattern");
+        assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn resolved_secret_reference_constraint_fails_masked_before_normalization() {
+        let plaintext = "plan-time-plaintext";
+        let normalizer = RewritingNormalizer::default();
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(text(plaintext))));
+
+        let errors = prepare_managed("consumer.Pattern", secret, &normalizer)
+            .await
+            .expect_err("resolved secret must fail its authored-value constraint");
+        let rendered = errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("(secret)"), "errors: {rendered}");
+        assert!(
+            !rendered.contains(plaintext),
+            "secret leaked in plan error: {rendered}"
+        );
+        assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn still_unknown_reference_is_not_rejected() {
+        let normalizer = RewritingNormalizer::default();
+        let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+            path: AccessPath::new("producer", "value"),
+        }));
+
+        prepare_managed("consumer.Pattern", unknown, &normalizer)
+            .await
+            .expect("unknown value must remain pending");
+        assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn resolved_reference_runs_provider_custom_type_lookup() {
+        let normalizer = RewritingNormalizer::default();
+        let errors = prepare_managed("consumer.Custom", text("bad"), &normalizer)
+            .await
+            .expect_err("provider custom type must run at the resolution gate");
+
+        assert_resolved_error(&errors, "consumer.Custom", "external id rejected");
+        assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn resolved_reference_runs_resource_validator() {
+        let normalizer = RewritingNormalizer::default();
+        let errors = prepare_managed("consumer.Validated", text("bad"), &normalizer)
+            .await
+            .expect_err("resource validator must run at the resolution gate");
+
+        assert_resolved_error(&errors, "consumer.Validated", "target pair rejected");
+        assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn resolved_data_source_input_uses_the_same_gate() {
+        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)]);
+        let normalizer = RewritingNormalizer::default();
+        let mut resources = OverrideAwareResources::build(
+            Vec::new(),
+            None::<&carina_state::StateFile>,
+            PreApplyInputs {
+                managed: &[],
+                compositions: &[],
+                data_sources: &[],
+                current_states: &HashMap::new(),
+                remote_bindings: &HashMap::new(),
+                wait_aliases: &[],
+            },
+        )
+        .unwrap();
+        let mut data_sources = vec![
+            DataSource::with_provider("test", "lookup.Pattern", "lookup", None)
+                .with_attribute("target", text("bad")),
+        ];
+        let data_source_origins = vec![
+            DataSource::with_provider("test", "lookup.Pattern", "lookup", None)
+                .with_attribute("target", ref_value()),
+        ];
+        let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+
+        let errors = PlanPreprocessor::new(&normalizer, &ctx)
+            .prepare(
+                &mut resources,
+                &[],
+                &module_gate,
+                &mut HashMap::new(),
+                &[],
+                &mut data_sources,
+                &data_source_origins,
+                &mut [],
+            )
+            .await
+            .expect_err("invalid resolved data-source input must fail planning");
+
+        assert_resolved_error(&errors, "lookup.Pattern", "required pattern");
+        assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn resolved_module_argument_validation_is_a_structured_plan_error() {
+        let source = ref_value();
+        let constraint = PendingModuleConstraint {
+            id: ModuleConstraintId::argument_validation("value", 0),
+            expression: not_bad("value"),
+            message: "value must not be bad".to_string(),
+        };
+        let mut composition = pending_composition(vec![("value", source.clone())], constraint);
+
+        let errors = prepare_composition(vec![("value", text("bad"))], &mut composition)
+            .await
+            .expect_err("resolved invalid module argument must fail planning");
+
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        match &errors[0].kind {
+            PlanErrorKind::ModuleConstraint(diagnostic) => {
+                assert_eq!(diagnostic.module, "checked_module");
+                assert_eq!(diagnostic.instance, "root.checked");
+                assert_eq!(diagnostic.arguments, ["value"]);
+                assert_eq!(diagnostic.message, "value must not be bad");
+                assert_eq!(
+                    diagnostic.actuals,
+                    [("value".to_string(), "\"bad\"".to_string())]
+                );
+            }
+            other => panic!("unexpected plan error: {other:?}"),
+        }
+        let rendered = errors[0].to_string();
+        for expected in [
+            "module 'checked_module' (call 'checked')",
+            "value",
+            "value must not be bad",
+            "\"bad\"",
+        ] {
+            assert!(rendered.contains(expected), "{rendered}");
+        }
+        assert_eq!(
+            composition.signature.arguments["value"].value(),
+            &source,
+            "plan evaluation must not replace the stored source expression"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_refresh_reports_module_constraint_without_dispatching_data_source() {
+        let constraint = PendingModuleConstraint {
+            id: ModuleConstraintId::argument_validation("value", 0),
+            expression: not_bad("value"),
+            message: "value must not be bad".to_string(),
+        };
+        let composition = pending_composition(vec![("value", text("bad"))], constraint);
+        let data_source = DataSource::with_provider("test", "lookup", "unrelated", None)
+            .with_attribute("query", text("literal"));
+        let provider_config = ProviderConfig {
+            name: "test".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+            is_default: true,
+        };
+        let mut parsed = carina_core::parser::InferredFile::default();
+        parsed.providers.push(provider_config);
+        parsed.compositions.push(composition);
+        parsed.data_sources.push(data_source);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let ctx = WiringContext::new(vec![Box::new(RecordingDataSourceFactory {
+            reads: reads.clone(),
+        })]);
+        let temp = tempfile::tempdir().unwrap();
+
+        let plan = create_plan_from_parsed_with_upstream_with_ctx(
+            &ctx,
+            &parsed,
+            &[],
+            &None,
+            true,
+            &HashMap::new(),
+            &StateBlockClaims::default(),
+            &ResolvedStateBlockTargets::default(),
+            temp.path(),
+        )
+        .await
+        .expect("module violations must be represented by the plan");
+
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert_eq!(plan.plan.errors().len(), 1, "{:#?}", plan.plan.errors());
+        assert!(matches!(
+            &plan.plan.errors()[0].kind,
+            PlanErrorKind::ModuleConstraint(diagnostic)
+                if diagnostic.module == "checked_module"
+                    && diagnostic.instance == "root.checked"
+                    && diagnostic.message == "value must not be bad"
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolved_cross_argument_require_is_a_structured_plan_error() {
+        let constraint = PendingModuleConstraint {
+            id: ModuleConstraintId::require(0),
+            expression: ValidateExpr::Compare {
+                lhs: Box::new(ValidateExpr::Var("left".to_string())),
+                op: CompareOp::Eq,
+                rhs: Box::new(ValidateExpr::Var("right".to_string())),
+            },
+            message: "left and right must match".to_string(),
+        };
+        let mut composition = pending_composition(
+            vec![
+                ("left", ref_value()),
+                (
+                    "right",
+                    Value::Deferred(DeferredValue::ResourceRef {
+                        path: AccessPath::new("producer", "other"),
+                    }),
+                ),
+            ],
+            constraint,
+        );
+
+        let errors = prepare_composition(
+            vec![("value", text("left")), ("other", text("right"))],
+            &mut composition,
+        )
+        .await
+        .expect_err("resolved invalid require must fail planning");
+
+        match &errors[0].kind {
+            PlanErrorKind::ModuleConstraint(diagnostic) => {
+                assert_eq!(diagnostic.arguments, ["left", "right"]);
+                assert_eq!(diagnostic.message, "left and right must match");
+                assert_eq!(
+                    diagnostic.actuals,
+                    [
+                        ("left".to_string(), "\"left\"".to_string()),
+                        ("right".to_string(), "\"right\"".to_string()),
+                    ]
+                );
+            }
+            other => panic!("unexpected plan error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_module_argument_stays_pending_without_rewriting_source() {
+        let source = ref_value();
+        let constraint = PendingModuleConstraint {
+            id: ModuleConstraintId::argument_validation("value", 0),
+            expression: not_bad("value"),
+            message: "value must not be bad".to_string(),
+        };
+        let mut composition = pending_composition(vec![("value", source.clone())], constraint);
+        let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+            path: AccessPath::new("producer", "value"),
+        }));
+
+        prepare_composition(vec![("value", unknown)], &mut composition)
+            .await
+            .expect("unknown module argument must remain pending");
+
+        assert_eq!(composition.signature.pending_constraints.len(), 1);
+        assert_eq!(composition.signature.arguments["value"].value(), &source);
+    }
+
+    #[tokio::test]
+    async fn unpublished_module_argument_stays_pending_without_plan_error() {
+        let source = ref_value();
+        let constraint = PendingModuleConstraint {
+            id: ModuleConstraintId::argument_validation("value", 0),
+            expression: not_bad("value"),
+            message: "value must not be bad".to_string(),
+        };
+        let mut composition = pending_composition(vec![("value", source.clone())], constraint);
+
+        prepare_composition(Vec::new(), &mut composition)
+            .await
+            .expect("an unpublished argument must remain pending during planning");
+
+        assert_eq!(composition.signature.pending_constraints.len(), 1);
+        assert_eq!(composition.signature.arguments["value"].value(), &source);
+    }
+
+    #[tokio::test]
+    async fn satisfied_module_constraint_is_retained_for_apply_time_recheck() {
+        let constraint = PendingModuleConstraint {
+            id: ModuleConstraintId::argument_validation("value", 0),
+            expression: not_bad("value"),
+            message: "value must not be bad".to_string(),
+        };
+        let mut composition = pending_composition(vec![("value", ref_value())], constraint);
+
+        prepare_composition(vec![("value", text("good"))], &mut composition)
+            .await
+            .expect("satisfied constraint must pass");
+
+        assert_eq!(composition.signature.pending_constraints.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn module_constraint_actuals_mask_secret_values() {
+        let constraint = PendingModuleConstraint {
+            id: ModuleConstraintId::argument_validation("value", 0),
+            expression: not_bad("value"),
+            message: "value must not be bad".to_string(),
+        };
+        let mut composition = pending_composition(vec![("value", ref_value())], constraint);
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(text("bad"))));
+
+        let errors = prepare_composition(vec![("value", secret)], &mut composition)
+            .await
+            .expect_err("invalid secret value must fail without disclosure");
+        let rendered = errors[0].to_string();
+
+        assert!(rendered.contains("(secret)"), "{rendered}");
+        assert!(!rendered.contains("\"bad\""), "{rendered}");
+        assert!(!rendered.contains("Secret("), "{rendered}");
+    }
 }

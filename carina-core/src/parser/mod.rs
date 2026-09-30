@@ -19,10 +19,11 @@ mod util;
 pub use ast::{
     ArgumentParameter, AttributeParameter, BackendConfig, BindingName, DeferredForExpression,
     ExportParamLike, ExportParameter, File, FnParam, InferredExportParam, InferredFile, ModuleCall,
-    MovedAddresses, ParsedExportParam, ParsedFile, ProviderConfig, RequireBlock, ResourceContext,
-    ResourceRef, ResourceTypePath, ShapeMismatch, StateBlock, StateBlockAddress, TypeExpr,
-    UntilPredicateAst, UpstreamState, UseStatement, UserFunction, UserFunctionBody, ValidateExpr,
-    ValidationBlock, WaitBinding, expand_deferred_children,
+    ModuleCallDiagnosticSource, ModuleCallSourceSpan, MovedAddresses, ParsedExportParam,
+    ParsedFile, ProviderConfig, RequireBlock, ResourceContext, ResourceRef, ResourceTypePath,
+    ShapeMismatch, StateBlock, StateBlockAddress, TypeExpr, UntilPredicateAst, UpstreamState,
+    UseStatement, UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding,
+    expand_deferred_children,
 };
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
 pub(crate) use entry::{
@@ -48,6 +49,7 @@ pub use resolve::{
 pub(crate) use resolve::{
     collect_seed_bindings_from_parts, reject_cyclic_let_bindings_in_variables,
 };
+pub use static_eval::evaluate_static_value_for_validation;
 pub use types::BUILTIN_BARE_CUSTOM_TYPES;
 pub use types::parse_type_expr_str;
 pub(crate) use types::{is_known_bare_custom_type, unknown_custom_type_message};

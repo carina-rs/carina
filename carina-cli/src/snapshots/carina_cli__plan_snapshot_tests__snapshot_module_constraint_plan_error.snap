@@ -1,0 +1,6 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+assertion_line: 219
+expression: error.to_string()
+---
+module 'mod' (call 'c'): argument 'name': too long (got "abcd")

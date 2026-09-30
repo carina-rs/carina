@@ -87,7 +87,10 @@ impl Provider for TestProvider {
         Box::pin(async move { result.map_err(ProviderError::internal) })
     }
 
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        resource: &carina_core::provider::ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         self.read(&resource.id, None, carina_core::provider::ReadRequest)
     }
 
@@ -378,6 +381,7 @@ fn plan_file_serde_round_trip() {
         current_states,
         compositions: vec![],
         data_sources: vec![],
+        data_source_origins: vec![],
         upstream_snapshot: HashMap::new(),
         upstream_sources: Vec::new(),
         wait_bindings: vec![],
@@ -2722,6 +2726,7 @@ fn plan_file_serialization_redacts_secrets() {
         unresolved_resources: vec![redact_secrets_in_resource(&resource_with_secret).unwrap()],
         compositions: vec![],
         data_sources: vec![],
+        data_source_origins: vec![],
         current_states: vec![CurrentStateEntry {
             id: ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None),
             state: redact_secrets_in_state(&state_with_secret).unwrap(),

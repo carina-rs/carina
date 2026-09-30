@@ -502,7 +502,7 @@ mod tests {
     use crate::provider::{
         BoxFuture, CreateRequest, DeleteRequest, ProviderResult, ReadRequest, UpdateRequest,
     };
-    use crate::resource::{ConcreteValue, DataSource, DeferredValue, UnknownReason, Value};
+    use crate::resource::{ConcreteValue, DeferredValue, UnknownReason, Value};
     use crate::wait::predicate::{AttrPath, WaitPredicate};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -576,7 +576,10 @@ mod tests {
             })
         }
 
-        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        fn read_data_source(
+            &self,
+            resource: &crate::provider::ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = resource.id.clone();
             Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
         }

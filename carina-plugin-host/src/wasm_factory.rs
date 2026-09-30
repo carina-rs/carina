@@ -29,7 +29,7 @@ use carina_core::provider::{
     ProviderFactory, ProviderNormalizer, ProviderResult, ReadRequest, SavedAttrs, UpdateOutcome,
     UpdateRequest,
 };
-use carina_core::resource::{DataSource, Resource, ResourceId, State, Value};
+use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::schema::{CompletionValue, ResourceSchema, TypeIdentity};
 use carina_core::value::SerializationError;
 use carina_core::wait::BindingPattern;
@@ -2582,7 +2582,10 @@ impl Provider for WasmProvider {
         }))
     }
 
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        resource: &carina_core::provider::ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         let wit_resource = match wasm_convert::core_data_source_to_wit_resource(resource) {
             Ok(v) => v,
             Err(e) => return early_provider_err(e),

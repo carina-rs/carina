@@ -608,9 +608,11 @@ pub fn parse_directory_with_overrides_and_diagnostics(
     let duplicate_declarations = find_duplicate_declarations(dir, &parsed_files);
 
     let mut merged = ParsedFile::default();
-
     for (file, resolved) in parsed_files {
         let mut parsed = resolved.into_inner();
+        for call in &mut parsed.module_calls {
+            call.set_source_file(file.clone());
+        }
         let file_path = Some(file.display().to_string());
         for w in &mut parsed.warnings {
             w.file = file_path.clone();
@@ -625,7 +627,6 @@ pub fn parse_directory_with_overrides_and_diagnostics(
     if let Err(e) = parser::resolve_resource_refs_with_config(&mut merged, config) {
         return Err(e.to_string());
     }
-
     // `finalize_provider_configs` is intentionally NOT called here. The
     // merged result is pre-module-expansion; deferred provider
     // attributes that reference module-call bindings cannot be resolved
@@ -1856,6 +1857,7 @@ awscc.ec2.SecurityGroup {
             module_calls: vec![crate::parser::ModuleCall {
                 module_name: "module".to_string(),
                 binding_name: Some("shared".to_string()),
+                source: Default::default(),
                 arguments: HashMap::new(),
             }],
             ..ParsedFile::default()

@@ -264,11 +264,7 @@ mod tests {
                 .collect(),
             module_calls: calls
                 .into_iter()
-                .map(|name| ModuleCall {
-                    module_name: name.to_string(),
-                    binding_name: None,
-                    arguments: HashMap::new(),
-                })
+                .map(|name| ModuleCall::synthetic(name, None, HashMap::new()))
                 .collect(),
             ..ParsedFile::default()
         }

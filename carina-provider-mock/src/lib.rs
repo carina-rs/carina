@@ -11,7 +11,7 @@ use carina_core::provider::{
     BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, PatchOpKind, Provider, ProviderError,
     ProviderResult, ReadRequest, UpdateOutcome, UpdateRequest,
 };
-use carina_core::resource::{ConcreteValue, DataSource, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::value::{json_to_dsl_value, value_to_json};
 
 pub struct MockProvider {
@@ -505,7 +505,10 @@ impl Provider for MockProvider {
         })
     }
 
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        resource: &carina_core::provider::ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         self.read(&resource.id, None, ReadRequest)
     }
 
@@ -515,7 +518,7 @@ impl Provider for MockProvider {
         request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<CreateOutcome>> {
         let id = id.clone();
-        let resource = request.resource.as_resource().clone();
+        let resource = request.resource().as_resource().clone();
         Box::pin(async move { self.create_resource(id, resource).await })
     }
 
@@ -544,12 +547,12 @@ impl Provider for MockProvider {
             // attribute map. The mock writes only what the user changed —
             // matching the Level 3 contract that providers MUST NOT touch
             // unspecified fields.
-            let mut attributes = request.from.attributes.clone();
-            for op in request.patch.ops {
+            let mut attributes = request.from().attributes.clone();
+            for op in &request.patch().ops {
                 match op.kind {
                     PatchOpKind::Add | PatchOpKind::Replace => {
-                        if let Some(value) = op.value {
-                            attributes.insert(op.key, value);
+                        if let Some(value) = &op.value {
+                            attributes.insert(op.key.clone(), value.clone());
                         }
                     }
                     PatchOpKind::Remove => {
@@ -756,6 +759,9 @@ mod tests {
         let resource = Resource::with_provider("mock", "test.resource", "web-acl-new", None)
             .with_attribute("name", string_value("web-acl-new"))
             .with_attribute("comment", string_value("v1"));
+        let update_resource = resource
+            .clone()
+            .with_attribute("comment", string_value("v2"));
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -771,21 +777,27 @@ mod tests {
             from_attrs.insert("name".to_string(), string_value("web-acl-new"));
             from_attrs.insert("comment".to_string(), string_value("v1"));
             let from = State::existing(id.clone(), from_attrs).with_identifier("mock-id");
+            let bindings = carina_core::binding_index::ResolvedBindings::default();
+            let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+            let schemas = carina_core::schema::SchemaRegistry::new();
+            let preparation = carina_core::executor::ProviderPreparationContext::new(
+                &bindings,
+                &module_gate,
+                &[],
+                &carina_core::provider::NoopNormalizer,
+                &[],
+                &schemas,
+            );
+            let request = carina_core::executor::prepare_update_request(
+                update_resource,
+                from,
+                &["comment".to_string()],
+                &preparation,
+            )
+            .await
+            .expect("update request should pass checked preparation");
             provider
-                .update(
-                    &id,
-                    "mock-id",
-                    UpdateRequest {
-                        from,
-                        patch: carina_core::provider::UpdatePatch {
-                            ops: vec![carina_core::provider::PatchOp {
-                                kind: PatchOpKind::Replace,
-                                key: "comment".to_string(),
-                                value: Some(string_value("v2")),
-                            }],
-                        },
-                    },
-                )
+                .update(&id, "mock-id", request)
                 .await
                 .expect("update should succeed");
 

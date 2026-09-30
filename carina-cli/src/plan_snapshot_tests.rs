@@ -9,7 +9,10 @@ use std::path::PathBuf;
 
 use carina_core::config_loader::load_configuration;
 use carina_core::effect::{DeletedInstanceKey, Effect};
-use carina_core::plan::Plan;
+use carina_core::module_resolver::{
+    ModuleConstraintCall, ModuleConstraintDiagnostic, ModuleConstraintKind,
+};
+use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::resource::{
     DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceId, State, Value,
 };
@@ -178,6 +181,50 @@ fn snapshot_all_create() {
         None,
     ));
     insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_resolved_value_constraint_multifile() {
+    let fp = build_plan_from_fixture_name("resolved_value_constraint_multifile");
+    assert!(
+        !fp.plan.errors().is_empty(),
+        "the fixture planner must run the resolved-value constraint gate"
+    );
+    let output = fp
+        .plan
+        .errors()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_module_constraint_plan_error() {
+    let error = PlanError::new(
+        ResourceId::with_identity("_virtual", "c"),
+        PlanErrorKind::ModuleConstraint(ModuleConstraintDiagnostic {
+            module: "mod".to_string(),
+            instance: "c".to_string(),
+            call: ModuleConstraintCall::Named("c".to_string()),
+            kind: ModuleConstraintKind::ArgumentValidation {
+                argument: "name".to_string(),
+            },
+            arguments: vec!["name".to_string()],
+            message: "too long".to_string(),
+            actuals: vec![("name".to_string(), "\"abcd\"".to_string())],
+            detail: None,
+        }),
+    );
+
+    let rendered = error.to_string();
+    assert_eq!(
+        rendered,
+        "module 'mod' (call 'c'): argument 'name': too long (got \"abcd\")"
+    );
+    insta::assert_snapshot!(rendered);
 }
 
 #[test]

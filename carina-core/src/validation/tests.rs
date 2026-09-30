@@ -395,6 +395,7 @@ fn binding_referenced_in_module_call() {
     parsed.module_calls.push(ModuleCall {
         module_name: "web_tier".to_string(),
         binding_name: None,
+        source: Default::default(),
         arguments: args,
     });
 
@@ -705,6 +706,7 @@ fn make_composition(binding: &str, attributes: &[&str]) -> Composition {
                     )
                 })
                 .collect(),
+            pending_constraints: Vec::new(),
         },
         binding: Some(binding.to_string()),
         dependency_bindings: Default::default(),
@@ -2604,6 +2606,7 @@ fn validate_module_calls_rejects_custom_type() {
     let module_calls = vec![ModuleCall {
         module_name: "github".to_string(),
         binding_name: None,
+        source: Default::default(),
         arguments: args,
     }];
 
@@ -2619,6 +2622,7 @@ fn validate_module_calls_rejects_custom_type() {
                 validations: Vec::new(),
             }],
             attributes: IndexMap::new(),
+            requires: Vec::new(),
         },
     );
 
@@ -3111,6 +3115,7 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
     let call = ModuleCall {
         module_name: "consumer".to_string(),
         binding_name: Some("instance".to_string()),
+        source: Default::default(),
         arguments: HashMap::from([(
             "subnet_ids".to_string(),
             Value::Concrete(ConcreteValue::List(vec![
@@ -3134,6 +3139,7 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
                 validations: Vec::new(),
             }],
             attributes: IndexMap::new(),
+            requires: Vec::new(),
         },
     )]);
 
@@ -4486,6 +4492,34 @@ fn validate_resources_accepts_resource_ref_in_map_position() {
         "ResourceRef in Map position must not produce a schema-level type mismatch \
          (#2954), got: {:?}",
         result
+    );
+}
+
+#[test]
+fn validate_resources_checks_secret_literals_without_revealing_them() {
+    let plaintext = "validate-time-plaintext";
+    let schema = make_schema(
+        "test.SecretHolder",
+        vec![(
+            "password",
+            AttributeType::refined_string(None, None, Some((Some(2), Some(4))), None),
+        )],
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+    let parsed = crate::parser::parse_and_resolve(&format!(
+        "let holder = test.test.SecretHolder {{\n  password = secret('{plaintext}')\n}}"
+    ))
+    .unwrap();
+    let known = HashSet::from(["test".to_string()]);
+
+    let error = validate_resources(&parsed, &schemas, &known, &ProviderContext::default())
+        .expect_err("the known value inside secret() must be length-checked");
+
+    assert!(error.contains("(secret)"), "error: {error}");
+    assert!(
+        !error.contains(plaintext),
+        "secret leaked in error: {error}"
     );
 }
 

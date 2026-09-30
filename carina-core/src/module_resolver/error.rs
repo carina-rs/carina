@@ -2,6 +2,8 @@
 
 use crate::parser::ParseError;
 
+use super::validation::ModuleConstraintDiagnostic;
+
 /// Module resolution error
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleError {
@@ -67,18 +69,8 @@ pub enum ModuleError {
     )]
     ExportsInModule,
 
-    #[error(
-        "Validation failed for argument '{argument}' in module '{module}': {message} (got {actual})"
-    )]
-    ArgumentValidationFailed {
-        module: String,
-        argument: String,
-        message: String,
-        actual: String,
-    },
-
-    #[error("Require constraint failed in module '{module}': {message}")]
-    RequireConstraintFailed { module: String, message: String },
+    #[error(transparent)]
+    Constraint(Box<ModuleConstraintDiagnostic>),
 
     #[error(
         "Module path '{path}' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory."

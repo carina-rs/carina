@@ -425,14 +425,6 @@ impl ResolvedResource {
         }
     }
 
-    pub(crate) fn new_fully_resolved(
-        resource: Resource,
-        _token: crate::executor::basic::ResolvedResourceToken,
-    ) -> Result<Self, crate::value::SerializationError> {
-        assert_resource_fully_resolved(&resource)?;
-        Ok(Self::new(resource))
-    }
-
     /// Borrow the inner [`Resource`].
     pub fn as_inner(&self) -> &Resource {
         &self.0
@@ -3355,7 +3347,7 @@ pub mod persistent_id;
 
 pub use composition::{
     Composition, CompositionArgument, CompositionAttribute, CompositionCall, CompositionProvenance,
-    Signature,
+    ModuleConstraintId, PendingModuleConstraint, Signature,
 };
 pub use data_source::{DataSource, ResolvedDataSource};
 pub use expansion_trace::{CallSite, ExpansionTrace};

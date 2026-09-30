@@ -72,6 +72,8 @@ plan-default-tags:
 	$(PLAN_FIXTURE) default_tags
 plan-depends-on:
 	$(PLAN_FIXTURE) depends_on
+plan-resolved-value-constraint-multifile:
+	$(PLAN_FIXTURE) resolved_value_constraint_multifile
 plan-wait-cert:
 	$(PLAN_FIXTURE) wait_cert
 plan-secret-values:

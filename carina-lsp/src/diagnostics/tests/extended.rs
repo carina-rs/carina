@@ -3413,6 +3413,7 @@ needs {
                 validations: Vec::new(),
             }],
             attributes: IndexMap::new(),
+            requires: Vec::new(),
         },
     )]);
     let bindings = BindingIndex::from_parsed(parsed, &engine.schemas);
@@ -3509,6 +3510,7 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
             signature: Signature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),
+                pending_constraints: Vec::new(),
             },
             binding: Some(binding.to_string()),
             dependency_bindings: Default::default(),
@@ -3759,6 +3761,418 @@ let broken = needs_vpc {
     assert_eq!(mismatches.len(), 1);
     assert_eq!(mismatches[0].range.start.line, 7);
     assert_eq!(mismatches[0].range.start.character, 2);
+}
+
+#[test]
+fn reference_valued_module_constraint_stays_pending_without_internal_diagnostic() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("checked");
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        r#"arguments {
+  name: String {
+    validation {
+      condition     = length(name) > 0
+      error_message = "name must not be empty"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let source = r#"let checked = use { source = '../checked' }
+
+let producer = aws.logs.LogGroup {
+  name = "producer"
+}
+
+let instance = checked {
+  name = producer.arn
+}
+"#;
+    std::fs::write(root.join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", source);
+    for forbidden in [
+        "name must not be empty",
+        "Deferred(",
+        "ResourceRef {",
+        "length()",
+    ] {
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains(forbidden)),
+            "pending reference-valued validation leaked {forbidden:?}: {diagnostics:#?}",
+        );
+    }
+}
+
+#[test]
+fn concrete_invalid_module_argument_reports_authored_validation_at_argument() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("checked");
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        r#"arguments {
+  name: String {
+    validation {
+      condition     = length(name) > 0
+      error_message = "name must not be empty"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    let source = r#"let checked = use { source = '../checked' }
+
+let instance = checked {
+  name = ""
+}
+"#;
+    std::fs::write(root.join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", source);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("name must not be empty"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "authored validation must be reported exactly once: {diagnostics:#?}"
+    );
+    let diagnostic = matching[0];
+    assert_eq!(diagnostic.range.start.line, 3);
+    assert_eq!(diagnostic.range.start.character, 2);
+}
+
+#[test]
+fn concrete_invalid_module_require_reports_authored_message_at_call() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("checked");
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        r#"arguments {
+  left: String
+  right: String
+}
+
+require left == right, "left and right must match"
+"#,
+    )
+    .unwrap();
+    let source = r#"let checked = use { source = '../checked' }
+
+let instance = checked {
+  left  = "a"
+  right = "b"
+}
+"#;
+    std::fs::write(root.join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", source);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("left and right must match"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "authored require must be reported exactly once: {diagnostics:#?}"
+    );
+    let diagnostic = matching[0];
+    assert_eq!(diagnostic.range.start.line, 2);
+    assert_eq!(diagnostic.range.start.character, 15);
+}
+
+fn multifile_sibling_let_module_constraint_diagnostics(
+    name: &str,
+) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("checked");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(
+        module.join("arguments.crn"),
+        r#"arguments {
+  name: String {
+    validation {
+      condition     = length(name) <= 3
+      error_message = "name must be at most three characters"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("attributes.crn"),
+        "attributes {\n  name = name\n}\n",
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("providers.crn"), "provider aws {}\n").unwrap();
+    std::fs::write(
+        tmp.path().join("consts.crn"),
+        format!("let n = \"{name}\"\n"),
+    )
+    .unwrap();
+    let main = r#"let checked = use { source = './checked' }
+
+checked {
+  name = n
+}
+"#;
+    std::fs::write(tmp.path().join("main.crn"), main).unwrap();
+
+    analyze_with_buffer(&engine, tmp.path(), "main.crn", main)
+}
+
+#[test]
+fn multifile_sibling_let_satisfying_module_constraint_has_no_lsp_diagnostic() {
+    let diagnostics = multifile_sibling_let_module_constraint_diagnostics("ab");
+
+    assert!(
+        diagnostics.is_empty(),
+        "the LSP must evaluate the expanded sibling let value: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn multifile_sibling_let_violating_module_constraint_has_one_lsp_diagnostic() {
+    let diagnostics = multifile_sibling_let_module_constraint_diagnostics("abcd");
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("name must be at most three characters")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        matching.len(),
+        1,
+        "the expanded sibling let violation must be reported once: {diagnostics:#?}"
+    );
+    assert!(
+        matching[0].message.contains("\"abcd\"")
+            && !matching[0].message.contains("enum identifier"),
+        "the diagnostic must render the expanded value: {diagnostics:#?}"
+    );
+}
+
+fn multifile_for_before_checked_constraint_diagnostics(
+    name: &str,
+) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let checked = tmp.path().join("checked");
+    let other = tmp.path().join("other");
+    std::fs::create_dir_all(&checked).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        checked.join("arguments.crn"),
+        r#"arguments {
+  name: String {
+    validation {
+      condition     = length(name) <= 3
+      error_message = "name must be at most three characters"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        checked.join("attributes.crn"),
+        "attributes {\n  name = name\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        other.join("arguments.crn"),
+        "arguments {\n  label: String\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        other.join("attributes.crn"),
+        "attributes {\n  label = label\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("consts.crn"),
+        format!("let labels = [\"one\", \"two\"]\nlet n = \"{name}\"\n"),
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("providers.crn"), "provider aws {}\n").unwrap();
+    let main = r#"let other = use { source = './other' }
+let checked = use { source = './checked' }
+
+let many = for x in labels { other { label = x } }
+
+checked {
+  name = n
+}
+"#;
+    std::fs::write(tmp.path().join("main.crn"), main).unwrap();
+
+    analyze_with_buffer(&engine, tmp.path(), "main.crn", main)
+}
+
+#[test]
+fn multifile_expanded_for_does_not_shift_checked_constraint_diagnostic() {
+    let diagnostics = multifile_for_before_checked_constraint_diagnostics("abcd");
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("name must be at most three characters")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        matching.len(),
+        1,
+        "the resolver-owned checked-call failure must be emitted once: {diagnostics:#?}"
+    );
+    assert_eq!(
+        matching[0].message,
+        "anonymous call to module 'checked': argument 'name': name must be at most three characters (got \"abcd\")"
+    );
+    assert_eq!(matching[0].range.start.line, 6);
+}
+
+#[test]
+fn multifile_expanded_for_before_valid_checked_call_has_no_constraint_diagnostic() {
+    let diagnostics = multifile_for_before_checked_constraint_diagnostics("ab");
+
+    assert!(
+        diagnostics.is_empty(),
+        "a valid checked call must not inherit another expanded call's values: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn multifile_forward_reference_default_uses_resolver_constraint_outcome() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let checked = tmp.path().join("checked");
+    std::fs::create_dir_all(&checked).unwrap();
+    std::fs::write(
+        checked.join("arguments.crn"),
+        r#"arguments {
+  prefix: String {
+    default = later
+    validation {
+      condition     = length(prefix) <= 3
+      error_message = "prefix must be at most three characters"
+    }
+  }
+  later: String = "abcdef"
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        checked.join("attributes.crn"),
+        "attributes {\n  prefix = prefix\n}\n",
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("consts.crn"), "let unrelated = true\n").unwrap();
+    std::fs::write(tmp.path().join("providers.crn"), "provider aws {}\n").unwrap();
+    let main = r#"let checked = use { source = './checked' }
+
+checked {}
+"#;
+    std::fs::write(tmp.path().join("main.crn"), main).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, tmp.path(), "main.crn", main);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("prefix must be at most three characters")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        matching.len(),
+        1,
+        "the LSP must consume the expander's fixed-point result: {diagnostics:#?}"
+    );
+    assert_eq!(
+        matching[0].message,
+        "anonymous call to module 'checked': argument 'prefix': prefix must be at most three characters (got \"abcdef\")"
+    );
+    assert_eq!(matching[0].range.start.line, 2);
+}
+
+#[test]
+fn nested_concrete_module_constraint_survives_merged_expansion_failure() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let checked = tmp.path().join("checked");
+    let outer = tmp.path().join("outer");
+    let root = tmp.path().join("root");
+    for directory in [&checked, &outer, &root] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    std::fs::write(
+        checked.join("main.crn"),
+        r#"arguments {
+  name: String {
+    validation {
+      condition     = length(name) > 0
+      error_message = "nested name must not be empty"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        outer.join("main.crn"),
+        r#"arguments {
+  enabled: Bool = true
+}
+
+let checked = use { source = '../checked' }
+
+let nested = checked {
+  name = ""
+}
+"#,
+    )
+    .unwrap();
+    let source = r#"let outer = use { source = '../outer' }
+
+let instance = outer {
+}
+"#;
+    std::fs::write(root.join("main.crn"), source).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", source);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("nested name must not be empty"))
+        .unwrap_or_else(|| panic!("nested resolver failure was lost: {diagnostics:#?}"));
+    assert_eq!(diagnostic.range.start.line, 2);
+    assert_eq!(diagnostic.range.start.character, 15);
 }
 
 #[test]
@@ -5260,6 +5674,75 @@ fn lsp_custom_string_pattern_mismatch_reports_required_pattern() {
         pattern_mismatch.message.contains("^prod-[a-z0-9]+$"),
         "diagnostic must include the schema pattern, got: {}",
         pattern_mismatch.message
+    );
+}
+
+#[test]
+fn lsp_secret_value_constraint_diagnostic_is_masked() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let plaintext = "lsp-secret-plaintext";
+    let schema = ResourceSchema::new("test.SecretHolder").attribute(AttributeSchema::new(
+        "password",
+        AttributeType::refined_string(None, None, Some((Some(2), Some(4))), None),
+    ));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+    let engine = custom_engine(schemas);
+    let doc = create_document(&format!(
+        "test.test.SecretHolder {{\n  password = secret('{plaintext}')\n}}\n"
+    ));
+
+    let diagnostics = engine.analyze(&doc, None);
+    let rendered = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        rendered.contains("outside allowed range"),
+        "diagnostics: {rendered}"
+    );
+    assert!(rendered.contains("(secret)"), "diagnostics: {rendered}");
+    assert!(
+        !rendered.contains(plaintext),
+        "secret leaked in LSP diagnostic: {rendered}"
+    );
+}
+
+#[test]
+fn lsp_nested_secret_value_constraint_diagnostic_is_masked() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let plaintext = "nested-lsp-secret-plaintext";
+    let schema = ResourceSchema::new("test.SecretHolder").attribute(AttributeSchema::new(
+        "passwords",
+        AttributeType::list(AttributeType::refined_string(
+            None,
+            None,
+            Some((Some(2), Some(4))),
+            None,
+        )),
+    ));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema);
+    let engine = custom_engine(schemas);
+    let doc = create_document(&format!(
+        "test.test.SecretHolder {{\n  passwords = [secret('{plaintext}')]\n}}\n"
+    ));
+
+    let diagnostics = engine.analyze(&doc, None);
+    let rendered = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("(secret)"), "diagnostics: {rendered}");
+    assert!(
+        !rendered.contains(plaintext),
+        "nested secret leaked in LSP diagnostic: {rendered}"
     );
 }
 

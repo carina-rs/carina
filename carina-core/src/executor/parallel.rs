@@ -11,11 +11,14 @@ use crate::provider::Provider;
 use crate::resource::{Resource, ResourceId, Value};
 use crate::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
+#[cfg(test)]
+use super::ProviderCheckInputs;
 use super::basic::{
-    BasicEffectCtx, ExecutionState, RenormalizePipeline, count_actionable_effects,
-    execute_basic_effect, process_basic_result, refresh_pending_states,
+    BasicEffectCtx, ExecutionState, count_actionable_effects, execute_basic_effect,
+    process_basic_result, refresh_pending_states, resolve_data_source,
 };
 use super::deferred_dispatch::PureMetaCtx;
+use super::provider_ready::ProviderPreparationContext;
 use super::replace::SingleEffectResult;
 use super::scheduler::{
     FailureView, PureMetaOutcome, build_scheduler_deps, dependency_failed_reason,
@@ -228,6 +231,8 @@ pub(super) async fn execute_effects_sequential(
     let permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
     let mut runtime_synthesized_resources: Vec<Resource> = Vec::new();
+    let mut runtime_authored_resource_ids: HashSet<ResourceId> = HashSet::new();
+    let module_gate = super::ModuleConstraintGate::new(input.compositions);
 
     let ExpandedEffects {
         effects: expanded_effects,
@@ -237,9 +242,14 @@ pub(super) async fn execute_effects_sequential(
     let mut total = count_runtime_effects(&effects, &input.deferred_data_source_reads);
     let completed = AtomicUsize::new(0);
 
+    let empty_resource_origins = HashMap::new();
+    let resource_origins = input
+        .provider_check_inputs
+        .resource_origins()
+        .unwrap_or(&empty_resource_origins);
     let mut deps_of = build_scheduler_deps(
         &effects,
-        input.unresolved_resources,
+        resource_origins,
         input.compositions,
         &deferred_replace_delete_deps,
     );
@@ -392,6 +402,7 @@ pub(super) async fn execute_effects_sequential(
                         for child in children {
                             let child_idx = effects.len();
                             if let Effect::Create(resource) = &child {
+                                runtime_authored_resource_ids.insert(resource.id.clone());
                                 runtime_synthesized_resources.push(resource.clone().into_inner());
                             }
                             if let Some(binding) = failure_binding_name(&child) {
@@ -402,7 +413,7 @@ pub(super) async fn execute_effects_sequential(
                         }
                         deps_of = build_scheduler_deps(
                             &effects,
-                            input.unresolved_resources,
+                            resource_origins,
                             input.compositions,
                             &deferred_replace_delete_deps,
                         );
@@ -416,18 +427,26 @@ pub(super) async fn execute_effects_sequential(
             // Snapshot bindings for this effect's resolution.
             let binding_snapshot = input.bindings.clone();
             let wait_identifiers = wait_identifiers.clone();
-            let unresolved = &input.unresolved_resources;
-            let pipeline = RenormalizePipeline {
-                normalizer: input.normalizer,
-                provider_configs: input.provider_configs,
-                factories: input.factories,
-                schemas: input.schemas,
-            };
+            let provider_check_inputs = &input.provider_check_inputs;
+            let runtime_authored = runtime_authored_resource_ids.contains(effect.resource_id());
+            let module_gate = &module_gate;
+            let normalizer = input.normalizer;
+            let provider_configs = input.provider_configs;
+            let factories = input.factories;
+            let schemas = input.schemas;
             let completed_ref = &completed;
             let effect_for_future = effect.clone();
             let make_future = move |wait_cancel_rx: Option<
                 tokio::sync::watch::Receiver<WaitSignal>,
             >| async move {
+                let preparation = ProviderPreparationContext::new(
+                    &binding_snapshot,
+                    module_gate,
+                    provider_configs,
+                    normalizer,
+                    factories,
+                    schemas,
+                );
                 let result = match effect_for_future.as_basic() {
                     // `BasicEffect` is the type-level contract for
                     // `execute_basic_effect`: any Create/Update/Delete
@@ -441,9 +460,9 @@ pub(super) async fn execute_effects_sequential(
                             basic,
                             &BasicEffectCtx {
                                 provider,
-                                bindings: &binding_snapshot,
-                                unresolved,
-                                pipeline: &pipeline,
+                                provider_check_inputs,
+                                runtime_authored,
+                                preparation: &preparation,
                                 completed: completed_ref,
                                 total,
                             },
@@ -470,26 +489,35 @@ pub(super) async fn execute_effects_sequential(
                             };
                             let mut resolved = resource.as_inner().clone();
                             let outcome = {
-                                let resolved_slice = std::slice::from_mut(&mut resolved);
-                                match crate::resolver::resolve_data_source_refs(
-                                    resolved_slice,
-                                    &binding_snapshot,
-                                ) {
-                                    Ok(()) => {
-                                        crate::value::canonicalize_data_sources_with_schemas(
-                                            resolved_slice,
-                                            pipeline.schemas,
-                                        );
-                                        let unresolved = unresolved_data_source_inputs(&resolved);
+                                let check_input =
+                                    provider_check_inputs.data_source_input(resource.as_inner());
+                                match resolve_data_source(check_input, &binding_snapshot) {
+                                    Ok(resolved_input) => {
+                                        let unresolved =
+                                            unresolved_data_source_inputs(resolved_input.value());
                                         if unresolved.is_empty() {
-                                            super::read_data_source_with_retry(provider, &resolved)
-                                                .await
-                                                .map_err(|err| {
-                                                    format!(
-                                                        "data source read failed for {}: {err}",
-                                                        resolved.id
+                                            match super::provider_ready::prepare_provider_ready_data_source_after_resolution(
+                                                resolved_input,
+                                                &preparation,
+                                            ) {
+                                                Ok(ready) => {
+                                                    resolved = ready.as_data_source().clone();
+                                                    super::read_data_source_with_retry(
+                                                        provider, &ready,
                                                     )
-                                                })
+                                                    .await
+                                                    .map_err(|err| {
+                                                        format!(
+                                                            "data source read failed for {}: {err}",
+                                                            resolved.id
+                                                        )
+                                                    })
+                                                }
+                                                Err(err) => Err(format!(
+                                                    "data source preparation failed for {}: {err}",
+                                                    resolved.id
+                                                )),
+                                            }
                                         } else {
                                             Err(format!(
                                                 "data source inputs for {} still contain \
@@ -807,6 +835,17 @@ pub(super) async fn execute_effects_sequential(
     };
     cancelled |= refresh_cancelled;
 
+    let report_unresolved_constraints = failure_count == 0 && skip_count == 0;
+    if !cancelled
+        && let Err(error) = module_gate.finish(&input.bindings, report_unresolved_constraints)
+    {
+        for failure in error.failures() {
+            let message = failure.to_string();
+            observer.on_event(&ExecutionEvent::ModuleConstraintFailed { error: &message });
+            failure_count += 1;
+        }
+    }
+
     let result = ExecutionResult {
         success_count,
         failure_count,
@@ -838,7 +877,7 @@ mod tests {
         ReadRequest, UpdateRequest,
     };
     use crate::resource::{
-        Composition, ConcreteValue, DataSource, ResolvedResource, ResourceIdentity, State, Value,
+        Composition, ConcreteValue, ResolvedResource, ResourceIdentity, State, Value,
     };
     use crate::schema::SchemaRegistry;
     use crate::wait::predicate::{AttrPath, WaitPredicate};
@@ -906,7 +945,10 @@ mod tests {
             Box::pin(async move { Ok(state) })
         }
 
-        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        fn read_data_source(
+            &self,
+            resource: &crate::provider::ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
             self.read(&resource.id, None, ReadRequest)
         }
 
@@ -1007,7 +1049,8 @@ mod tests {
                 | ExecutionEvent::RenameFailed { .. }
                 | ExecutionEvent::RefreshStarted
                 | ExecutionEvent::RefreshSucceeded { .. }
-                | ExecutionEvent::RefreshFailed { .. } => {}
+                | ExecutionEvent::RefreshFailed { .. }
+                | ExecutionEvent::ModuleConstraintFailed { .. } => {}
             }
         }
     }
@@ -1071,7 +1114,10 @@ mod tests {
         let schemas = SchemaRegistry::new();
         let mut input = ExecutionInput {
             plan: &plan,
-            unresolved_resources: &unresolved,
+            provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+                resource_origins: &unresolved,
+                data_source_origins: &[],
+            },
             compositions: &[],
             bindings: Default::default(),
             current_states: HashMap::new(),
@@ -1181,7 +1227,10 @@ mod tests {
         let schemas = SchemaRegistry::new();
         let mut input = ExecutionInput {
             plan: &plan,
-            unresolved_resources: &unresolved,
+            provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+                resource_origins: &unresolved,
+                data_source_origins: &[],
+            },
             compositions: &[],
             bindings: Default::default(),
             current_states: HashMap::new(),
@@ -1393,6 +1442,7 @@ mod tests {
             signature: crate::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: virt_attrs,
+                pending_constraints: Vec::new(),
             },
             binding: Some("module".to_string()),
             dependency_bindings: std::collections::BTreeSet::new(),
@@ -1487,6 +1537,7 @@ mod tests {
             signature: crate::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: virt_attrs,
+                pending_constraints: Vec::new(),
             },
             binding: Some("bootstrap".to_string()),
             dependency_bindings: std::collections::BTreeSet::new(),

@@ -563,6 +563,7 @@ mod tests {
             signature: Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: indexmap::IndexMap::new(),
+                pending_constraints: Vec::new(),
             },
             binding: binding.map(str::to_string),
             dependency_bindings: Default::default(),

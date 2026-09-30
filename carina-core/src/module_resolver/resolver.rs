@@ -1,14 +1,83 @@
 //! `ModuleResolver` driver: import processing, nested-module resolution,
 //! and the top-level `resolve_modules*` entry points.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::parser::{ArgumentParameter, ParseError, ParsedFile, ProviderContext, UseStatement};
+use indexmap::IndexMap;
+
+use crate::parser::{
+    ArgumentParameter, ModuleCallDiagnosticSource, ParseError, ParsedFile, ProviderContext,
+    UseStatement,
+};
+use crate::resource::ModuleConstraintId;
 
 use super::error::ModuleError;
 use super::expander::instance_prefix_for_call;
 use super::loader::sorted_crn_paths_in;
+use super::validation::ModuleConstraintDiagnostic;
+
+/// Parser-assigned identity of one concrete module call expansion.
+///
+/// The source path and byte offset identify the authored call independently
+/// of its user-visible binding or argument values. `expansion_key`
+/// distinguishes iterations produced from one authored `for` body.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModuleCallSystemIdentity {
+    source_file: PathBuf,
+    start_byte: usize,
+    expansion_key: Option<String>,
+}
+
+/// Resolver-owned result of evaluating one authored module constraint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModuleConstraintOutcome {
+    pub id: ModuleConstraintId,
+    pub status: ResolvedModuleConstraintStatus,
+}
+
+/// Value-time state observed by the resolver after its fixed-point argument
+/// substitution has completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedModuleConstraintStatus {
+    Satisfied,
+    Pending,
+    Failed(ModuleConstraintDiagnostic),
+}
+
+/// Constraint outcomes and authored location for one expanded module call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleCallConstraintReport {
+    pub source: ModuleCallDiagnosticSource,
+    pub outcomes: Vec<ResolvedModuleConstraintOutcome>,
+}
+
+impl ModuleCallConstraintReport {
+    pub(crate) fn new(
+        source: ModuleCallDiagnosticSource,
+        outcomes: Vec<ResolvedModuleConstraintOutcome>,
+    ) -> (ModuleCallSystemIdentity, Self) {
+        let identity = ModuleCallSystemIdentity {
+            source_file: source.file.clone(),
+            start_byte: source.call_span.start_byte,
+            expansion_key: source.expansion_key.clone(),
+        };
+        (identity, Self { source, outcomes })
+    }
+}
+
+pub type ModuleCallConstraintReports =
+    IndexMap<ModuleCallSystemIdentity, ModuleCallConstraintReport>;
+
+/// Module resolution result for editor diagnostics.
+///
+/// Normal CLI resolution uses [`resolve_modules_with_config`] and never
+/// allocates or clones `constraint_reports`.
+pub struct ModuleResolutionDiagnosticReport {
+    pub constraint_reports: ModuleCallConstraintReports,
+    pub error: Option<ModuleError>,
+}
 
 /// Context for module resolution
 pub struct ModuleResolver<'cfg> {
@@ -27,6 +96,9 @@ pub struct ModuleResolver<'cfg> {
     pub(super) module_paths: HashMap<String, String>,
     /// Parser configuration (decryptor, custom validators)
     pub(super) config: &'cfg ProviderContext,
+    /// Present only for the editor-facing resolution entry point. Expansion
+    /// records into it at the same seam that evaluates fixed-point arguments.
+    pub(super) constraint_reports: RefCell<Option<ModuleCallConstraintReports>>,
 }
 
 impl<'cfg> ModuleResolver<'cfg> {
@@ -46,7 +118,28 @@ impl<'cfg> ModuleResolver<'cfg> {
             imported_modules: HashMap::new(),
             module_paths: HashMap::new(),
             config,
+            constraint_reports: RefCell::new(None),
         }
+    }
+
+    fn with_constraint_reports(base_dir: impl AsRef<Path>, config: &'cfg ProviderContext) -> Self {
+        let resolver = Self::with_config(base_dir, config);
+        *resolver.constraint_reports.borrow_mut() = Some(IndexMap::new());
+        resolver
+    }
+
+    pub(super) fn record_constraint_report(
+        &self,
+        identity: ModuleCallSystemIdentity,
+        report: ModuleCallConstraintReport,
+    ) {
+        if let Some(reports) = self.constraint_reports.borrow_mut().as_mut() {
+            reports.insert(identity, report);
+        }
+    }
+
+    pub(super) fn records_constraint_reports(&self) -> bool {
+        self.constraint_reports.borrow().is_some()
     }
 
     /// Load and cache a module from a directory path.
@@ -161,6 +254,9 @@ impl<'cfg> ModuleResolver<'cfg> {
         let mut merged = ParsedFile::default();
         for (file, parsed) in parsed_files {
             let mut parsed = parsed.into_inner();
+            for call in &mut parsed.module_calls {
+                call.set_source_file(file.clone());
+            }
             let file_path = Some(file.display().to_string());
             for w in &mut parsed.warnings {
                 w.file = file_path.clone();
@@ -308,6 +404,32 @@ pub fn resolve_modules_with_config<E>(
 ) -> Result<(), ModuleError> {
     let mut resolver = ModuleResolver::with_config(base_dir, config);
 
+    resolve_modules_with_resolver(parsed, &mut resolver)
+}
+
+/// Resolve modules while retaining the expander's own per-call constraint
+/// outcomes and source locations for editor diagnostics.
+pub fn resolve_modules_with_diagnostics<E>(
+    parsed: &mut crate::parser::File<E>,
+    base_dir: &Path,
+    config: &ProviderContext,
+) -> ModuleResolutionDiagnosticReport {
+    let mut resolver = ModuleResolver::with_constraint_reports(base_dir, config);
+    let error = resolve_modules_with_resolver(parsed, &mut resolver).err();
+    let constraint_reports = resolver
+        .constraint_reports
+        .into_inner()
+        .expect("diagnostic resolver always records constraint reports");
+    ModuleResolutionDiagnosticReport {
+        constraint_reports,
+        error,
+    }
+}
+
+fn resolve_modules_with_resolver<E>(
+    parsed: &mut crate::parser::File<E>,
+    resolver: &mut ModuleResolver<'_>,
+) -> Result<(), ModuleError> {
     // Process imports
     resolver.process_imports(&parsed.uses)?;
 

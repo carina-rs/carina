@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::effect::{ChangedCreateOnly, Effect, TemporaryName};
 use crate::module::DependencyGraph;
+use crate::module_resolver::ModuleConstraintDiagnostic;
 use crate::name_override::NameOverride;
 pub use crate::resource::ModuleSource;
 use crate::resource::{
@@ -77,6 +78,18 @@ pub enum PlanErrorKind {
         wait_binding: String,
         reason: String,
     },
+    /// A schema value constraint failed after one or more authored
+    /// references became known.
+    ResolvedValueConstraint {
+        /// Top-level resource attributes implicated by the failure.
+        attributes: Vec<String>,
+        /// Authored reference paths that supplied the newly known values.
+        origins: Vec<String>,
+        /// Schema or provider-validator diagnostic.
+        message: String,
+    },
+    /// A module argument constraint failed after its inputs became known.
+    ModuleConstraint(ModuleConstraintDiagnostic),
 }
 
 impl PlanError {
@@ -139,13 +152,51 @@ impl std::fmt::Display for PlanErrorKind {
                 f,
                 "wait `{wait_binding}`: invalid predicate attribute path: {reason}"
             ),
+            Self::ResolvedValueConstraint {
+                attributes,
+                origins,
+                message,
+            } => {
+                let attributes = attributes
+                    .iter()
+                    .map(|attribute| format!("`{attribute}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let origins = origins
+                    .iter()
+                    .map(|origin| format!("`{origin}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match (attributes.is_empty(), origins.is_empty()) {
+                    (false, false) => write!(
+                        f,
+                        "resolved value constraint failed for attribute(s) {attributes} from reference(s) {origins}: {message}"
+                    ),
+                    (false, true) => write!(
+                        f,
+                        "resolved value constraint failed for attribute(s) {attributes}: {message}"
+                    ),
+                    (true, false) => write!(
+                        f,
+                        "resolved value constraint failed for reference(s) {origins}: {message}"
+                    ),
+                    (true, true) => write!(f, "resolved value constraint failed: {message}"),
+                }
+            }
+            Self::ModuleConstraint(diagnostic) => diagnostic.fmt(f),
         }
     }
 }
 
 impl std::fmt::Display for PlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.resource_id, self.kind)
+        match &self.kind {
+            // A module constraint already names its module and authored call.
+            // The synthetic `_virtual` id is internal correlation metadata,
+            // not a second user-facing resource identity.
+            PlanErrorKind::ModuleConstraint(diagnostic) => write!(f, "{diagnostic}"),
+            kind => write!(f, "{}: {kind}", self.resource_id),
+        }
     }
 }
 

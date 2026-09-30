@@ -63,6 +63,7 @@ fn make_virtual(binding: &str, attrs: &[(&str, Value)]) -> Composition {
         signature: Signature {
             arguments: IndexMap::new(),
             attributes,
+            pending_constraints: Vec::new(),
         },
         binding: Some(binding.into()),
         dependency_bindings: BTreeSet::new(),

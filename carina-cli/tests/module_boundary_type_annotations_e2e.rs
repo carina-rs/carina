@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
-use carina_core::resource::{DataSource, Value};
+use carina_core::resource::Value;
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
 };
@@ -92,7 +92,7 @@ impl Provider for NoopProvider {
 
     fn read_data_source(
         &self,
-        resource: &DataSource,
+        resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<carina_core::resource::State>> {
         let id = resource.id.clone();
         Box::pin(async move { Ok(carina_core::resource::State::existing(id, HashMap::new())) })

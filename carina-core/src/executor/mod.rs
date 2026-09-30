@@ -17,11 +17,18 @@ pub mod normalized;
 #[cfg(test)]
 mod normalized_tests;
 mod parallel;
+pub mod provider_ready;
 mod replace;
 pub(super) mod scheduler;
 pub(crate) mod wait;
 
 pub use crate::effect::deps::UnresolvedResource;
+pub use provider_ready::{
+    ModuleConstraintFailure, ModuleConstraintGate, ModuleConstraintGateError,
+    ProviderPreparationContext, ProviderPreparationError, ProviderValueConstraintErrors,
+    prepare_create_request, prepare_provider_ready_data_source, prepare_provider_ready_resource,
+    prepare_update_request, provider_custom_type_lookup,
+};
 pub use replace::compute_full_diff_patch;
 
 use std::collections::{HashMap, HashSet};
@@ -31,12 +38,13 @@ use std::time::Duration;
 use crate::binding_index::ResolvedBindings;
 use crate::effect::{DeletedInstanceKey, Effect};
 use crate::parser::ProviderConfig;
-use crate::provider::{PartialReadDiagnostic, Provider, ProviderError, ProviderNormalizer};
-use crate::resource::{
-    AccessPath, ConcreteValue, DataSource, DeferredValue, InterpolationPart, ResolvedResource,
-    Resource, ResourceId, State, UnknownReason, Value,
+use crate::provider::{
+    PartialReadDiagnostic, Provider, ProviderError, ProviderNormalizer, ProviderReadyDataSource,
 };
-use crate::value::SerializationError;
+use crate::resource::{
+    AccessPath, ConcreteValue, DataSource, DeferredValue, InterpolationPart, Resource, ResourceId,
+    State, UnknownReason, Value,
+};
 use crate::wait::WaitObservation;
 
 use crate::shutdown::ShutdownToken;
@@ -47,7 +55,10 @@ pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
 /// Input data required to execute a plan.
 pub struct ExecutionInput<'a> {
     pub plan: &'a crate::plan::Plan,
-    pub unresolved_resources: &'a HashMap<ResourceId, UnresolvedResource>,
+    /// Explicitly identifies whether provider-bound effects contain authored
+    /// values or plan-normalized values paired with their authored origins.
+    /// The executor never infers this from a missing map entry.
+    pub provider_check_inputs: ProviderCheckInputs<'a>,
     /// Virtual resources (module attribute containers). carina#3181:
     /// compositions are a distinct typestate from managed resources, so the
     /// executor's dependency walk receives them as their own slice. A
@@ -86,6 +97,94 @@ pub struct ExecutionInput<'a> {
     pub schemas: &'a crate::schema::SchemaRegistry,
     /// Maximum concurrent provider operations.
     pub parallelism: NonZeroUsize,
+}
+
+/// Value provenance for provider-bound effects in one execution.
+///
+/// Runtime-synthesized deferred-for children are authored values and are
+/// classified explicitly by the scheduler. Every resource or data-source
+/// effect already present in a normalized plan must have an entry in the
+/// corresponding origin map; a missing entry is an executor invariant error.
+/// A raw origin map cannot implicitly select a validation mode:
+///
+/// ```compile_fail
+/// use std::collections::HashMap;
+/// use carina_core::executor::{ProviderCheckInputs, UnresolvedResource};
+/// use carina_core::resource::ResourceId;
+///
+/// let origins: HashMap<ResourceId, UnresolvedResource> = HashMap::new();
+/// let _: ProviderCheckInputs<'_> = (&origins).into();
+/// ```
+pub enum ProviderCheckInputs<'a> {
+    Authored,
+    PlanNormalized {
+        resource_origins: &'a HashMap<ResourceId, UnresolvedResource>,
+        data_source_origins: &'a [DataSource],
+    },
+}
+
+impl ProviderCheckInputs<'_> {
+    fn resource_origins(&self) -> Option<&HashMap<ResourceId, UnresolvedResource>> {
+        match self {
+            Self::Authored => None,
+            Self::PlanNormalized {
+                resource_origins, ..
+            } => Some(resource_origins),
+        }
+    }
+
+    pub(in crate::executor) fn resource_input(
+        &self,
+        resolved: &Resource,
+        runtime_authored: bool,
+    ) -> Result<provider_ready::CheckInput<Resource>, String> {
+        if runtime_authored || matches!(self, Self::Authored) {
+            return Ok(provider_ready::CheckInput::Authored(resolved.clone()));
+        }
+        let Self::PlanNormalized {
+            resource_origins, ..
+        } = self
+        else {
+            unreachable!("authored inputs returned above")
+        };
+        let authored = resource_origins.get(&resolved.id).ok_or_else(|| {
+            format!(
+                "executor invariant violated: missing authored value origin for plan-normalized resource {}",
+                resolved.id
+            )
+        })?;
+        Ok(provider_ready::CheckInput::PlanNormalized {
+            resolved: resolved.clone(),
+            authored: authored.as_resource().clone(),
+        })
+    }
+
+    pub(in crate::executor) fn data_source_input(
+        &self,
+        resolved: &DataSource,
+    ) -> Result<provider_ready::CheckInput<DataSource>, String> {
+        match self {
+            Self::Authored => Ok(provider_ready::CheckInput::Authored(resolved.clone())),
+            Self::PlanNormalized {
+                data_source_origins,
+                ..
+            } => {
+                let authored = data_source_origins
+                    .iter()
+                    .find(|origin| origin.id == resolved.id)
+                    .ok_or_else(|| {
+                    format!(
+                        "executor invariant violated: missing authored value origin for plan-normalized data source {}",
+                        resolved.id
+                    )
+                })?;
+                Ok(provider_ready::CheckInput::PlanNormalized {
+                    resolved: resolved.clone(),
+                    authored: authored.clone(),
+                })
+            }
+        }
+    }
 }
 
 /// A data-source input attribute whose unresolved value shapes make the read
@@ -189,7 +288,7 @@ fn is_throttling_error(err: &ProviderError) -> bool {
 /// policy the CLI refresh path uses.
 pub async fn read_data_source_with_retry(
     provider: &dyn Provider,
-    resource: &DataSource,
+    resource: &ProviderReadyDataSource,
 ) -> Result<State, ProviderError> {
     let max_retries = 3;
     for attempt in 0..=max_retries {
@@ -334,6 +433,10 @@ pub enum ExecutionEvent<'a> {
         id: &'a ResourceId,
         error: &'a str,
     },
+    /// A terminal module constraint failed without an owning provider effect.
+    ModuleConstraintFailed {
+        error: &'a str,
+    },
 }
 
 /// Observer trait for UI separation during plan execution.
@@ -365,14 +468,6 @@ pub async fn execute_plan(
     } else {
         ExecutionOutcome::Completed(result)
     }
-}
-
-/// Prove an already-normalized desired resource is fully resolved before
-/// direct provider dispatch outside the normal plan executor.
-pub fn resolve_normalized_for_provider(
-    resource: normalized::NormalizedResource,
-) -> Result<ResolvedResource, SerializationError> {
-    basic::resolved_normalized_resource(resource)
 }
 
 #[cfg(test)]

@@ -16,8 +16,11 @@ use crate::resource::{
 
 use super::error::ModuleError;
 use super::resolver::ModuleResolver;
+use super::resolver::{
+    ModuleCallConstraintReport, ResolvedModuleConstraintOutcome, ResolvedModuleConstraintStatus,
+};
 use super::typecheck::check_module_arg_type;
-use super::validation::{evaluate_require_expr, evaluate_validate_expr, format_value_for_error};
+use super::validation::{ConstraintEvaluation, ModuleConstraints, evaluate_module_constraints};
 
 impl ModuleResolver<'_> {
     /// Expand a module call into resources.
@@ -153,50 +156,61 @@ impl ModuleResolver<'_> {
             )?;
         }
 
-        // Validate argument values against validate blocks
-        for arg in &module.arguments {
-            let value = argument_values.get(&arg.name).unwrap();
-            for validation_block in &arg.validations {
-                match evaluate_validate_expr(&validation_block.condition, &arg.name, value) {
-                    Ok(true) => {} // Validation passed
-                    Ok(false) => {
-                        let message = validation_block.error_message.clone().unwrap_or_else(|| {
-                            format!("validation failed for argument '{}'", arg.name)
-                        });
-                        return Err(ModuleError::ArgumentValidationFailed {
-                            module: call.module_name.clone(),
-                            argument: arg.name.clone(),
-                            message,
-                            actual: format_value_for_error(value),
-                        });
+        // Collect and evaluate argument-local validations and module-level
+        // requirements through the single constraint seam shared by the LSP,
+        // planning, and apply.
+        let evaluated_constraints = evaluate_module_constraints(
+            ModuleConstraints::declarations(&module.arguments, &module.requires),
+            &argument_values,
+        );
+        if self.records_constraint_reports()
+            && let Some(source) = call.diagnostic_source()
+        {
+            let outcomes = evaluated_constraints
+                .iter()
+                .map(|evaluated| {
+                    let status = match evaluated.evaluation() {
+                        ConstraintEvaluation::Satisfied => {
+                            ResolvedModuleConstraintStatus::Satisfied
+                        }
+                        ConstraintEvaluation::Pending => ResolvedModuleConstraintStatus::Pending,
+                        ConstraintEvaluation::Violated(_) | ConstraintEvaluation::EvalError(_) => {
+                            ResolvedModuleConstraintStatus::Failed(
+                                evaluated
+                                    .module_diagnostic(
+                                        &call.module_name,
+                                        instance_prefix,
+                                        call.binding_name.as_deref(),
+                                    )
+                                    .expect("concrete outcome has a diagnostic"),
+                            )
+                        }
+                    };
+                    ResolvedModuleConstraintOutcome {
+                        id: evaluated.constraint().id().clone(),
+                        status,
                     }
-                    Err(e) => {
-                        return Err(ModuleError::ArgumentValidationFailed {
-                            module: call.module_name.clone(),
-                            argument: arg.name.clone(),
-                            message: format!("error evaluating validate expression: {}", e),
-                            actual: format_value_for_error(value),
-                        });
-                    }
-                }
-            }
+                })
+                .collect();
+            let (identity, report) = ModuleCallConstraintReport::new(source, outcomes);
+            self.record_constraint_report(identity, report);
         }
 
-        // Evaluate require blocks (cross-argument constraints)
-        for require in &module.requires {
-            match evaluate_require_expr(&require.condition, &argument_values) {
-                Ok(true) => {} // Constraint satisfied
-                Ok(false) => {
-                    return Err(ModuleError::RequireConstraintFailed {
-                        module: call.module_name.clone(),
-                        message: require.error_message.clone(),
-                    });
+        let mut pending_constraints = Vec::new();
+        for evaluated in evaluated_constraints {
+            match evaluated.evaluation() {
+                ConstraintEvaluation::Satisfied => {}
+                ConstraintEvaluation::Pending => {
+                    pending_constraints.push(evaluated.into_constraint());
                 }
-                Err(e) => {
-                    return Err(ModuleError::RequireConstraintFailed {
-                        module: call.module_name.clone(),
-                        message: format!("error evaluating require expression: {}", e),
-                    });
+                ConstraintEvaluation::Violated(_) | ConstraintEvaluation::EvalError(_) => {
+                    return Err(evaluated
+                        .module_error(
+                            &call.module_name,
+                            instance_prefix,
+                            call.binding_name.as_deref(),
+                        )
+                        .expect("concrete constraint failure has a resolver error"));
                 }
             }
         }
@@ -366,6 +380,7 @@ impl ModuleResolver<'_> {
                 signature: crate::resource::Signature {
                     arguments: signature_arguments,
                     attributes: composition_attrs,
+                    pending_constraints,
                 },
                 binding: call.binding_name.clone(),
                 dependency_bindings: BTreeSet::new(),
@@ -803,6 +818,7 @@ fn prefix_module_composition(
     if let Some(ref binding) = new_virtual.binding {
         new_virtual.binding = Some(apply_instance_prefix(instance_prefix, binding));
     }
+    new_virtual.instance = apply_instance_prefix(instance_prefix, &new_virtual.instance);
 
     let mut substituted_arguments: IndexMap<String, crate::resource::CompositionArgument> =
         IndexMap::new();

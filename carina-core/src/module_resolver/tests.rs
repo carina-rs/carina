@@ -201,6 +201,7 @@ fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
     let call = ModuleCall {
         module_name: "policy_module".to_string(),
         binding_name: Some("bootstrap".to_string()),
+        source: Default::default(),
         arguments: HashMap::new(),
     };
 
@@ -240,6 +241,7 @@ fn test_expand_module_call() {
     let call = ModuleCall {
         module_name: "test_module".to_string(),
         binding_name: Some("my_instance".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -351,6 +353,7 @@ fn test_expand_module_call_preserves_provider_instance_on_id() {
     let call = ModuleCall {
         module_name: "registry".to_string(),
         binding_name: Some("acme".to_string()),
+        source: Default::default(),
         arguments: HashMap::new(),
     };
 
@@ -518,6 +521,7 @@ fn test_multiple_module_instances_no_collision() {
     let call_a = ModuleCall {
         module_name: "net".to_string(),
         binding_name: Some("prod".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -530,6 +534,7 @@ fn test_multiple_module_instances_no_collision() {
     let call_b = ModuleCall {
         module_name: "net".to_string(),
         binding_name: Some("staging".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -664,6 +669,7 @@ fn test_expand_module_call_creates_composition() {
     let call = ModuleCall {
         module_name: "web_tier".to_string(),
         binding_name: Some("web".to_string()),
+        source: Default::default(),
         arguments: HashMap::new(),
     };
 
@@ -717,6 +723,7 @@ fn test_expand_module_call_populates_compositions_slice() {
     let call = ModuleCall {
         module_name: "web_tier".to_string(),
         binding_name: Some("web".to_string()),
+        source: Default::default(),
         arguments: HashMap::new(),
     };
 
@@ -750,6 +757,7 @@ fn test_expand_module_call_populates_expansion_trace_single_level() {
     let call = ModuleCall {
         module_name: "web_tier".to_string(),
         binding_name: Some("web".to_string()),
+        source: Default::default(),
         arguments: HashMap::new(),
     };
 
@@ -799,6 +807,7 @@ fn test_expand_module_call_records_use_source_path_on_call_site() {
     let call = ModuleCall {
         module_name: "web_tier".to_string(),
         binding_name: Some("web".to_string()),
+        source: Default::default(),
         arguments: HashMap::new(),
     };
 
@@ -835,6 +844,7 @@ fn test_expand_module_call_call_site_source_path_none_when_unmapped() {
     let call = ModuleCall {
         module_name: "web_tier".to_string(),
         binding_name: Some("web".to_string()),
+        source: Default::default(),
         arguments: HashMap::new(),
     };
 
@@ -974,6 +984,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
     let call = ModuleCall {
         module_name: "svc".to_string(),
         binding_name: Some("api".to_string()),
+        source: Default::default(),
         arguments: call_arguments,
     };
 
@@ -1044,6 +1055,7 @@ fn test_expand_module_call_without_binding_still_records_boundary_composition() 
     let call = ModuleCall {
         module_name: "web_tier".to_string(),
         binding_name: None,
+        source: Default::default(),
         arguments: HashMap::new(),
     };
 
@@ -1105,6 +1117,7 @@ fn test_anonymous_module_calls_get_distinct_prefixes() {
     let call_a = ModuleCall {
         module_name: "github".to_string(),
         binding_name: None,
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -1117,6 +1130,7 @@ fn test_anonymous_module_calls_get_distinct_prefixes() {
     let call_b = ModuleCall {
         module_name: "github".to_string(),
         binding_name: None,
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -1149,6 +1163,7 @@ fn test_anonymous_module_call_prefix_is_locality_sensitive() {
     let make = |repo: &str| ModuleCall {
         module_name: "github".to_string(),
         binding_name: None,
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -1186,6 +1201,7 @@ fn test_named_module_call_uses_binding_name() {
     let call = ModuleCall {
         module_name: "github".to_string(),
         binding_name: Some("prod".to_string()),
+        source: Default::default(),
         arguments: HashMap::new(),
     };
     assert_eq!(instance_prefix_for_call(&call), "prod");
@@ -1734,6 +1750,7 @@ fn test_missing_required_argument() {
     let call = ModuleCall {
         module_name: "test_module".to_string(),
         binding_name: Some("my_instance".to_string()),
+        source: Default::default(),
         arguments: HashMap::new(), // Missing vpc_id
     };
 
@@ -1753,6 +1770,7 @@ fn test_expand_module_call_uses_dot_path_addressing() {
     let call = ModuleCall {
         module_name: "test_module".to_string(),
         binding_name: Some("my_instance".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -1786,6 +1804,7 @@ fn test_module_dot_path_bindings_and_refs() {
     let call = ModuleCall {
         module_name: "net".to_string(),
         binding_name: Some("prod".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -1877,6 +1896,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
     let call = ModuleCall {
         module_name: "net".to_string(),
         binding_name: Some("prod".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -1938,6 +1958,7 @@ fn test_module_composition_dot_path_refs() {
     let call = ModuleCall {
         module_name: "web_tier".to_string(),
         binding_name: Some("web".to_string()),
+        source: Default::default(),
         arguments: HashMap::new(),
     };
 
@@ -2007,6 +2028,7 @@ fn test_unknown_argument_rejected() {
     let call = ModuleCall {
         module_name: "test_module".to_string(),
         binding_name: Some("my_instance".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -2152,6 +2174,7 @@ fn test_expand_module_call_with_interpolation() {
     let call = ModuleCall {
         module_name: "vpc_mod".to_string(),
         binding_name: Some("dev_vpc".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -2361,6 +2384,7 @@ fn test_expand_module_call_with_function_call_argument() {
     let call = ModuleCall {
         module_name: "vpc_mod".to_string(),
         binding_name: Some("dev_vpc".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -2711,6 +2735,7 @@ fn test_argument_validation_passes_with_valid_value() {
     let call = ModuleCall {
         module_name: "web_server".to_string(),
         binding_name: Some("web".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(443)));
@@ -2718,8 +2743,183 @@ fn test_argument_validation_passes_with_valid_value() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "web", None);
-    assert!(result.is_ok());
+    let result = resolver.expand_module_call(&call, "web", None).unwrap();
+    assert!(
+        result.compositions[0]
+            .signature
+            .pending_constraints
+            .is_empty(),
+        "satisfied constraints must not be persisted"
+    );
+}
+
+#[test]
+fn test_argument_validation_with_resource_reference_is_pending() {
+    use crate::parser::{CompareOp, ValidateExpr, ValidationBlock};
+
+    let mut module = create_module_with_port_validation();
+    module.arguments[0].type_expr = TypeExpr::String;
+    module.arguments[0].validations = vec![ValidationBlock {
+        condition: ValidateExpr::Compare {
+            lhs: Box::new(ValidateExpr::FunctionCall {
+                name: "length".to_string(),
+                args: vec![ValidateExpr::Var("port".to_string())],
+            }),
+            op: CompareOp::Gt,
+            rhs: Box::new(ValidateExpr::Int(0)),
+        },
+        error_message: Some("port must not be empty".to_string()),
+    }];
+    let resolver = {
+        let mut resolver = ModuleResolver::new(".");
+        resolver
+            .imported_modules
+            .insert("web_server".to_string(), module);
+        resolver
+    };
+    let call = ModuleCall {
+        module_name: "web_server".to_string(),
+        binding_name: Some("web".to_string()),
+        source: Default::default(),
+        arguments: HashMap::from([(
+            "port".to_string(),
+            Value::resource_ref("producer", "port", Vec::new()),
+        )]),
+    };
+
+    let expanded = resolver
+        .expand_module_call(&call, "web", None)
+        .expect("a reference-valued constraint must remain pending");
+    let constraints = &expanded.compositions[0].signature.pending_constraints;
+    assert_eq!(constraints.len(), 1);
+    assert_eq!(
+        constraints[0].id,
+        crate::resource::ModuleConstraintId::argument_validation("port", 0)
+    );
+    assert_eq!(
+        referenced_constraint_arguments(&constraints[0].expression),
+        ["port"]
+    );
+}
+
+#[test]
+fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
+    use crate::parser::{CompareOp, ValidateExpr};
+    use crate::resource::{
+        Composition, CompositionArgument, CompositionCall, CompositionProvenance,
+        ModuleConstraintId, PendingModuleConstraint, Signature,
+    };
+
+    let inner_call = CompositionCall {
+        module_name: "inner".to_string(),
+        binding: Some("inner".to_string()),
+        instance: "inner".to_string(),
+        module_source: None,
+        module_directory: None,
+    };
+    let inner = Composition {
+        id: ResourceId::with_identity("_virtual", "inner"),
+        signature: Signature {
+            arguments: IndexMap::from([(
+                "port".to_string(),
+                CompositionArgument::from_value(
+                    Value::Deferred(DeferredValue::BindingRef {
+                        binding: "outer_port".to_string(),
+                    }),
+                    TypeExpr::String,
+                ),
+            )]),
+            attributes: IndexMap::new(),
+            pending_constraints: vec![PendingModuleConstraint {
+                id: ModuleConstraintId::argument_validation("port", 0),
+                expression: ValidateExpr::Compare {
+                    lhs: Box::new(ValidateExpr::FunctionCall {
+                        name: "length".to_string(),
+                        args: vec![ValidateExpr::Var("port".to_string())],
+                    }),
+                    op: CompareOp::Gt,
+                    rhs: Box::new(ValidateExpr::Int(0)),
+                },
+                message: "port must not be empty".to_string(),
+            }],
+        },
+        binding: Some("inner".to_string()),
+        dependency_bindings: BTreeSet::new(),
+        module_name: "inner".to_string(),
+        instance: "inner".to_string(),
+        provenance: Box::new(CompositionProvenance::expanded(
+            inner_call.clone(),
+            inner_call,
+        )),
+        quoted_string_attrs: HashSet::new(),
+    };
+    let outer = ParsedFile {
+        providers: vec![],
+        data_sources: vec![],
+        compositions: vec![inner],
+        resources: vec![],
+        variables: IndexMap::new(),
+        uses: vec![],
+        module_calls: vec![],
+        arguments: vec![ArgumentParameter {
+            name: "outer_port".to_string(),
+            type_expr: TypeExpr::String,
+            default: None,
+            description: None,
+            validations: vec![],
+        }],
+        attribute_params: vec![],
+        export_params: vec![],
+        backend: None,
+        state_blocks: vec![],
+        user_functions: HashMap::new(),
+        upstream_states: vec![],
+        wait_bindings: vec![],
+        requires: vec![],
+        structural_bindings: HashSet::new(),
+        warnings: vec![],
+        deferred_for_expressions: vec![],
+        expansion_trace: crate::resource::ExpansionTrace::new(),
+    };
+    let resolver = {
+        let mut resolver = ModuleResolver::new(".");
+        resolver.imported_modules.insert("outer".to_string(), outer);
+        resolver
+    };
+    let call = ModuleCall {
+        module_name: "outer".to_string(),
+        binding_name: Some("root".to_string()),
+        source: Default::default(),
+        arguments: HashMap::from([(
+            "outer_port".to_string(),
+            Value::resource_ref("producer", "port", Vec::new()),
+        )]),
+    };
+
+    let expanded = resolver.expand_module_call(&call, "root", None).unwrap();
+    let nested = expanded
+        .compositions
+        .iter()
+        .find(|composition| composition.module_name == "inner")
+        .expect("nested composition");
+    assert_eq!(nested.instance, "root.inner");
+    assert_eq!(
+        nested
+            .signature
+            .arguments
+            .get("port")
+            .map(CompositionArgument::value),
+        Some(&Value::resource_ref("producer", "port", Vec::new()))
+    );
+    let constraint = &nested.signature.pending_constraints[0];
+    assert_eq!(
+        constraint.id,
+        ModuleConstraintId::argument_validation("port", 0)
+    );
+    assert_eq!(
+        referenced_constraint_arguments(&constraint.expression),
+        ["port"]
+    );
 }
 
 #[test]
@@ -2736,6 +2936,7 @@ fn test_argument_validation_passes_with_default_value() {
     let call = ModuleCall {
         module_name: "web_server".to_string(),
         binding_name: Some("web".to_string()),
+        source: Default::default(),
         arguments: HashMap::new(), // Uses default 8080
     };
 
@@ -2757,6 +2958,7 @@ fn test_argument_validation_fails_with_invalid_value() {
     let call = ModuleCall {
         module_name: "web_server".to_string(),
         binding_name: Some("web".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(0)));
@@ -2767,19 +2969,23 @@ fn test_argument_validation_fails_with_invalid_value() {
     let result = resolver.expand_module_call(&call, "web", None);
     assert!(result.is_err());
     let err = result.unwrap_err();
+    let rendered = err.to_string();
+    assert!(rendered.contains("module 'web_server'"), "{rendered}");
+    assert!(rendered.contains("call 'web'"), "{rendered}");
+    assert!(rendered.contains("argument 'port'"), "{rendered}");
+    assert!(
+        rendered.contains("Port must be between 1 and 65535"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("got 0"), "{rendered}");
     match err {
-        ModuleError::ArgumentValidationFailed {
-            module,
-            argument,
-            message,
-            actual,
-        } => {
-            assert_eq!(module, "web_server");
-            assert_eq!(argument, "port");
-            assert_eq!(message, "Port must be between 1 and 65535");
-            assert_eq!(actual, "0");
+        ModuleError::Constraint(diagnostic) => {
+            assert_eq!(diagnostic.module, "web_server");
+            assert_eq!(diagnostic.arguments, ["port"]);
+            assert_eq!(diagnostic.message, "Port must be between 1 and 65535");
+            assert_eq!(diagnostic.actuals, [("port".to_string(), "0".to_string())]);
         }
-        other => panic!("Expected ArgumentValidationFailed, got {:?}", other),
+        other => panic!("Expected module constraint failure, got {other:?}"),
     }
 }
 
@@ -2797,6 +3003,7 @@ fn test_argument_validation_fails_with_negative_value() {
     let call = ModuleCall {
         module_name: "web_server".to_string(),
         binding_name: Some("web".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(-1)));
@@ -2822,6 +3029,7 @@ fn test_argument_validation_fails_too_large() {
     let call = ModuleCall {
         module_name: "web_server".to_string(),
         binding_name: Some("web".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -2884,6 +3092,7 @@ fn test_argument_validation_no_message_uses_default() {
     let call = ModuleCall {
         module_name: "counter".to_string(),
         binding_name: Some("c".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert("count".to_string(), Value::Concrete(ConcreteValue::Int(0)));
@@ -2895,10 +3104,10 @@ fn test_argument_validation_no_message_uses_default() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     match err {
-        ModuleError::ArgumentValidationFailed { message, .. } => {
-            assert_eq!(message, "validation failed for argument 'count'");
+        ModuleError::Constraint(diagnostic) => {
+            assert_eq!(diagnostic.message, "validation failed for argument 'count'");
         }
-        other => panic!("Expected ArgumentValidationFailed, got {:?}", other),
+        other => panic!("Expected module constraint failure, got {other:?}"),
     }
 }
 
@@ -2954,6 +3163,7 @@ fn test_argument_validation_len_with_list() {
     let call = ModuleCall {
         module_name: "tagged".to_string(),
         binding_name: Some("t".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -2971,6 +3181,7 @@ fn test_argument_validation_len_with_list() {
     let call = ModuleCall {
         module_name: "tagged".to_string(),
         binding_name: Some("t".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -2983,10 +3194,10 @@ fn test_argument_validation_len_with_list() {
     let result = resolver.expand_module_call(&call, "t", None);
     assert!(result.is_err());
     match result.unwrap_err() {
-        ModuleError::ArgumentValidationFailed { message, .. } => {
-            assert_eq!(message, "At least one tag is required");
+        ModuleError::Constraint(diagnostic) => {
+            assert_eq!(diagnostic.message, "At least one tag is required");
         }
-        other => panic!("Expected ArgumentValidationFailed, got {:?}", other),
+        other => panic!("Expected module constraint failure, got {other:?}"),
     }
 }
 
@@ -3056,6 +3267,7 @@ fn test_require_block_passes() {
     let call = ModuleCall {
         module_name: "web".to_string(),
         binding_name: Some("w".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -3134,6 +3346,7 @@ fn test_require_block_fails_with_not_expr() {
     let call = ModuleCall {
         module_name: "web".to_string(),
         binding_name: Some("w".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -3150,10 +3363,10 @@ fn test_require_block_fails_with_not_expr() {
     let result = resolver.expand_module_call(&call, "w", None);
     assert!(result.is_err());
     match result.unwrap_err() {
-        ModuleError::RequireConstraintFailed { message, .. } => {
-            assert_eq!(message, "cert is required when HTTPS is enabled");
+        ModuleError::Constraint(diagnostic) => {
+            assert_eq!(diagnostic.message, "cert is required when HTTPS is enabled");
         }
-        other => panic!("Expected RequireConstraintFailed, got {:?}", other),
+        other => panic!("Expected module constraint failure, got {other:?}"),
     }
 }
 
@@ -3210,6 +3423,7 @@ fn test_require_block_len_function() {
     let call = ModuleCall {
         module_name: "alb".to_string(),
         binding_name: Some("lb".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -3228,6 +3442,7 @@ fn test_require_block_len_function() {
     let call = ModuleCall {
         module_name: "alb".to_string(),
         binding_name: Some("lb".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -3242,10 +3457,10 @@ fn test_require_block_len_function() {
     let result = resolver.expand_module_call(&call, "lb", None);
     assert!(result.is_err());
     match result.unwrap_err() {
-        ModuleError::RequireConstraintFailed { message, .. } => {
-            assert_eq!(message, "ALB requires at least two subnets");
+        ModuleError::Constraint(diagnostic) => {
+            assert_eq!(diagnostic.message, "ALB requires at least two subnets");
         }
-        other => panic!("Expected RequireConstraintFailed, got {:?}", other),
+        other => panic!("Expected module constraint failure, got {other:?}"),
     }
 }
 
@@ -3308,6 +3523,7 @@ fn test_require_block_multiple_constraints() {
     let call = ModuleCall {
         module_name: "asg".to_string(),
         binding_name: Some("a".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -3327,6 +3543,7 @@ fn test_require_block_multiple_constraints() {
     let call = ModuleCall {
         module_name: "asg".to_string(),
         binding_name: Some("a".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -3342,11 +3559,23 @@ fn test_require_block_multiple_constraints() {
     };
     let result = resolver.expand_module_call(&call, "a", None);
     assert!(result.is_err());
-    match result.unwrap_err() {
-        ModuleError::RequireConstraintFailed { message, .. } => {
-            assert_eq!(message, "min_size must be <= max_size");
+    let error = result.unwrap_err();
+    let rendered = error.to_string();
+    assert!(rendered.contains("module 'asg'"), "{rendered}");
+    assert!(rendered.contains("call 'a'"), "{rendered}");
+    assert!(rendered.contains("max_size"), "{rendered}");
+    assert!(rendered.contains("min_size"), "{rendered}");
+    assert!(rendered.contains("max_size = 5"), "{rendered}");
+    assert!(rendered.contains("min_size = 10"), "{rendered}");
+    assert!(
+        rendered.contains("min_size must be <= max_size"),
+        "{rendered}"
+    );
+    match error {
+        ModuleError::Constraint(diagnostic) => {
+            assert_eq!(diagnostic.message, "min_size must be <= max_size");
         }
-        other => panic!("Expected RequireConstraintFailed, got {:?}", other),
+        other => panic!("Expected module constraint failure, got {other:?}"),
     }
 }
 
@@ -3362,6 +3591,7 @@ fn test_argument_type_mismatch_int_for_string() {
     let call = ModuleCall {
         module_name: "test_module".to_string(),
         binding_name: Some("my_instance".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             // vpc_id expects string, pass int
@@ -3393,6 +3623,7 @@ fn test_argument_type_mismatch_string_for_bool() {
     let call = ModuleCall {
         module_name: "test_module".to_string(),
         binding_name: Some("my_instance".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -3459,6 +3690,7 @@ fn test_argument_type_custom_validator() {
     let call = ModuleCall {
         module_name: "test_module".to_string(),
         binding_name: Some("a".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -3476,6 +3708,7 @@ fn test_argument_type_custom_validator() {
     let call_bad = ModuleCall {
         module_name: "test_module".to_string(),
         binding_name: Some("b".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -3535,6 +3768,7 @@ fn test_argument_type_list_of_custom_type() {
     let call = ModuleCall {
         module_name: "test_module".to_string(),
         binding_name: Some("a".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -3557,6 +3791,7 @@ fn test_argument_type_list_of_custom_type() {
     let call_bad = ModuleCall {
         module_name: "test_module".to_string(),
         binding_name: Some("b".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -4606,6 +4841,7 @@ fn caller_side_typo_against_string_literal_union_is_rejected() {
     let call = ModuleCall {
         module_name: "env_module".to_string(),
         binding_name: Some("my_env".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             // Typo: 'dpv' is outside the declared 'dev' | 'prod' union.
@@ -4640,6 +4876,7 @@ fn caller_side_value_in_string_literal_union_is_accepted() {
     let call = ModuleCall {
         module_name: "env_module".to_string(),
         binding_name: Some("my_env".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -4855,6 +5092,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     let call = ModuleCall {
         module_name: "registry".to_string(),
         binding_name: Some("r".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -4980,6 +5218,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
     let call = ModuleCall {
         module_name: "net".to_string(),
         binding_name: Some("prod".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -5364,6 +5603,7 @@ fn argument_type_list_accepts_resource_ref() {
     let call = ModuleCall {
         module_name: "test_module".to_string(),
         binding_name: Some("a".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -5406,6 +5646,7 @@ fn argument_type_map_accepts_resource_ref() {
     let call = ModuleCall {
         module_name: "test_module".to_string(),
         binding_name: Some("a".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -5449,6 +5690,7 @@ fn argument_type_struct_accepts_resource_ref() {
     let call = ModuleCall {
         module_name: "test_module".to_string(),
         binding_name: Some("a".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             args.insert(
@@ -5566,6 +5808,7 @@ fn argument_type_mismatch_error_shows_actual_value_shape() {
     let call = ModuleCall {
         module_name: "test_module".to_string(),
         binding_name: Some("a".to_string()),
+        source: Default::default(),
         arguments: {
             let mut args = HashMap::new();
             // Pass a plain string where list is expected.

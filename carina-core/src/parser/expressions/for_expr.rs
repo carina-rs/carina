@@ -169,13 +169,17 @@ pub(crate) fn parse_for_expr(
     let mut module_calls = Vec::new();
 
     let collect = |result: ForBodyResult,
+                   expansion_key: String,
                    resources: &mut Vec<Resource>,
                    data_sources: &mut Vec<DataSource>,
                    module_calls: &mut Vec<ModuleCall>| {
         match result {
             ForBodyResult::Resource(r) => resources.push(*r),
             ForBodyResult::DataSource(d) => data_sources.push(*d),
-            ForBodyResult::ModuleCall(c) => module_calls.push(c),
+            ForBodyResult::ModuleCall(mut c) => {
+                c.set_expansion_key(expansion_key);
+                module_calls.push(c);
+            }
         }
     };
 
@@ -194,7 +198,13 @@ pub(crate) fn parse_for_expr(
                 let mut iter_ctx = ctx.clone();
                 bind(&mut iter_ctx, var, item.clone());
                 let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
-                collect(result, &mut resources, &mut data_sources, &mut module_calls);
+                collect(
+                    result,
+                    address,
+                    &mut resources,
+                    &mut data_sources,
+                    &mut module_calls,
+                );
             }
         }
         (ForBinding::Indexed(idx_var, val_var), Value::Concrete(ConcreteValue::List(items))) => {
@@ -208,7 +218,13 @@ pub(crate) fn parse_for_expr(
                 );
                 bind(&mut iter_ctx, val_var, item.clone());
                 let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
-                collect(result, &mut resources, &mut data_sources, &mut module_calls);
+                collect(
+                    result,
+                    address,
+                    &mut resources,
+                    &mut data_sources,
+                    &mut module_calls,
+                );
             }
         }
         (ForBinding::Map(key_var, val_var), Value::Concrete(ConcreteValue::Map(map))) => {
@@ -226,7 +242,13 @@ pub(crate) fn parse_for_expr(
                 );
                 bind(&mut iter_ctx, val_var, val.clone());
                 let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
-                collect(result, &mut resources, &mut data_sources, &mut module_calls);
+                collect(
+                    result,
+                    address,
+                    &mut resources,
+                    &mut data_sources,
+                    &mut module_calls,
+                );
             }
         }
         // Unresolved reference — defer expansion to plan/apply when the

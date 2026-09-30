@@ -255,6 +255,16 @@ fn handle_tty(
                 .println(format!("  {} Refresh {} - {}", "!".yellow(), id, error))
                 .ok();
         }
+        ExecutionEvent::ModuleConstraintFailed { error } => {
+            multi
+                .println(format!(
+                    "  {} Module constraint\n      {} {}",
+                    "✗".red(),
+                    "→".red(),
+                    error.red()
+                ))
+                .ok();
+        }
     }
 }
 
@@ -364,6 +374,10 @@ fn format_plain(event: &ExecutionEvent) -> Vec<String> {
         ExecutionEvent::RefreshFailed { id, error } => {
             vec![format!("  ! Refresh {} - {}", id, error)]
         }
+        ExecutionEvent::ModuleConstraintFailed { error } => vec![
+            "  ✗ Module constraint".to_string(),
+            format!("      → {error}"),
+        ],
     }
 }
 

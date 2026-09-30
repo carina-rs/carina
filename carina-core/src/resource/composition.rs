@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::parser::TypeExpr;
+use crate::parser::{TypeExpr, ValidateExpr};
 
 use super::{AccessPath, DeferredValue, ResourceId, Value};
 
@@ -195,6 +195,64 @@ impl CompositionArgument {
     }
 }
 
+/// Stable identity of one authored module constraint within its module.
+///
+/// The module instance is deliberately not part of this identifier: the same
+/// declaration may be instantiated many times. Execution code pairs this ID
+/// with [`Composition::instance`] when it needs an instance-wide identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ModuleConstraintId(String);
+
+impl ModuleConstraintId {
+    pub fn argument_validation(argument: &str, ordinal: usize) -> Self {
+        Self(format!("argument:{argument}:{ordinal}"))
+    }
+
+    pub fn require(ordinal: usize) -> Self {
+        Self(format!("require:{ordinal}"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The argument owned by an argument-local validation constraint.
+    ///
+    /// `validation` blocks are nested in an argument declaration and may
+    /// evaluate only against that argument. Keeping that scope encoded in the
+    /// stable constraint ID lets saved plans preserve the language rule
+    /// without adding a second, independently maintained discriminator.
+    pub fn validation_argument(&self) -> Option<&str> {
+        self.0
+            .strip_prefix("argument:")
+            .and_then(|rest| rest.rsplit_once(':').map(|(argument, _)| argument))
+    }
+}
+
+/// A module constraint whose referenced arguments were not fully known at
+/// expansion time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingModuleConstraint {
+    pub id: ModuleConstraintId,
+    pub expression: ValidateExpr,
+    pub message: String,
+}
+
+impl PendingModuleConstraint {
+    pub fn id(&self) -> &ModuleConstraintId {
+        &self.id
+    }
+
+    pub fn expression(&self) -> &ValidateExpr {
+        &self.expression
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 /// The function-shaped I/O surface of a [`Composition`].
 ///
 /// Carries both halves of the module-call boundary on the expanded
@@ -230,6 +288,9 @@ pub struct Signature {
     /// [`TypeExpr`] for validation.
     #[serde(default)]
     pub attributes: IndexMap<String, CompositionAttribute>,
+    /// Constraints deferred until all referenced argument values are known.
+    #[serde(default)]
+    pub pending_constraints: Vec<PendingModuleConstraint>,
 }
 
 /// Structural identity for one module call that produced a composition.
@@ -439,6 +500,7 @@ impl Composition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::{CompareOp, ValidateExpr};
     use crate::resource::ConcreteValue;
 
     #[test]
@@ -458,6 +520,7 @@ mod tests {
             signature: Signature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),
+                pending_constraints: Vec::new(),
             },
             binding: Some("call".to_string()),
             dependency_bindings: BTreeSet::new(),
@@ -623,5 +686,50 @@ mod tests {
             serde_json::from_value(typed_json).expect("deserialize composition argument");
         assert_eq!(decoded.value(), &value);
         assert_eq!(decoded.declared_type(), None);
+    }
+
+    #[test]
+    fn pending_constraints_survive_serde_round_trip_and_secret_redaction() {
+        let constraint = PendingModuleConstraint {
+            id: ModuleConstraintId::argument_validation("password", 0),
+            expression: ValidateExpr::Compare {
+                lhs: Box::new(ValidateExpr::FunctionCall {
+                    name: "length".to_string(),
+                    args: vec![ValidateExpr::Var("password".to_string())],
+                }),
+                op: CompareOp::Gte,
+                rhs: Box::new(ValidateExpr::Int(12)),
+            },
+            message: "password must contain at least 12 characters".to_string(),
+        };
+        let composition = Composition {
+            id: ResourceId::with_identity("_virtual", "secure"),
+            signature: Signature {
+                arguments: IndexMap::from([(
+                    "password".to_string(),
+                    CompositionArgument::from_value(
+                        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                            ConcreteValue::String("plaintext-secret".to_string()),
+                        )))),
+                        TypeExpr::String,
+                    ),
+                )]),
+                attributes: IndexMap::new(),
+                pending_constraints: vec![constraint.clone()],
+            },
+            binding: Some("secure".to_string()),
+            dependency_bindings: BTreeSet::new(),
+            module_name: "secure_module".to_string(),
+            instance: "secure".to_string(),
+            provenance: Default::default(),
+            quoted_string_attrs: HashSet::new(),
+        };
+
+        let redacted = crate::value::redact_secrets_in_virtual(&composition)
+            .expect("composition redaction must succeed");
+        let json = serde_json::to_string(&redacted).expect("serialize redacted composition");
+        assert!(!json.contains("plaintext-secret"), "{json}");
+        let decoded: Composition = serde_json::from_str(&json).expect("round-trip composition");
+        assert_eq!(decoded.signature.pending_constraints, vec![constraint]);
     }
 }

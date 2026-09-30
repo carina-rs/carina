@@ -8,14 +8,13 @@ use colored::Colorize;
 
 use futures::stream::{self, StreamExt};
 
-use carina_core::binding_index::{ResolvedBindings, WaitAliasSpec};
+use carina_core::binding_index::{PreApplyInputs, ResolvedBindings, WaitAliasSpec};
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
-use carina_core::executor::normalized::apply_desired_normalization;
 use carina_core::executor::{
     DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
-    UnresolvedResource,
+    ProviderCheckInputs, UnresolvedResource,
 };
 use carina_core::override_aware::OverrideAwareResources;
 use carina_core::plan::Plan;
@@ -53,9 +52,9 @@ use crate::display::print_plan;
 use crate::error::AppError;
 use crate::wiring::{
     DataSourceRefreshResolution, LateAnonymousIdentityInputs, WiringContext,
-    build_factories_from_providers, create_providers_from_configs, get_provider_with_ctx,
-    prepare_data_sources_for_plan, read_data_source_with_retry, read_with_retry,
-    reconcile_anonymous_identifiers_with_ctx, reconcile_late_anonymous_identities,
+    build_factories_from_providers, create_providers_from_configs, data_source_refresh_bindings,
+    get_provider_with_ctx, prepare_data_sources_for_plan, read_data_source_with_retry,
+    read_with_retry, reconcile_anonymous_identifiers_with_ctx, reconcile_late_anonymous_identities,
     reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
 };
 use carina_core::hint::ProjectCommand;
@@ -82,11 +81,67 @@ fn format_total_apply_line(elapsed: Duration) -> String {
     format!("Done in {}.", format_duration(elapsed))
 }
 
+async fn create_checked_bootstrap_resource(
+    provider: &dyn Provider,
+    resource: Resource,
+    parsed: &carina_core::parser::InferredFile,
+    normalizer: &dyn ProviderNormalizer,
+    factories: &[Box<dyn carina_core::provider::ProviderFactory>],
+    schemas: &carina_core::schema::SchemaRegistry,
+) -> Result<(), AppError> {
+    let id = resource.id.clone();
+    let bindings = bootstrap_resolved_bindings(parsed);
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
+    let preparation = carina_core::executor::ProviderPreparationContext::new(
+        &bindings,
+        &module_gate,
+        &parsed.providers,
+        normalizer,
+        factories,
+        schemas,
+    );
+    let request = carina_core::executor::prepare_create_request(resource, &preparation)
+        .await
+        .map_err(AppError::from_state_bucket_preparation)?;
+    provider
+        .create(&id, request)
+        .await
+        .map_err(|source| AppError::StateBucketCreate { source })?;
+    Ok(())
+}
+
+fn bootstrap_resolved_bindings(parsed: &carina_core::parser::InferredFile) -> ResolvedBindings {
+    let current_states = HashMap::new();
+    let remote_bindings = HashMap::new();
+    let wait_aliases: Vec<WaitAliasSpec> = parsed
+        .wait_bindings
+        .iter()
+        .map(WaitAliasSpec::from)
+        .collect();
+    ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: &parsed.resources,
+        compositions: &parsed.compositions,
+        data_sources: &parsed.data_sources,
+        current_states: &current_states,
+        remote_bindings: &remote_bindings,
+        wait_aliases: &wait_aliases,
+    })
+}
+
 fn split_execution_outcome(outcome: ExecutionOutcome) -> (ExecutionResult, bool) {
     match outcome {
         ExecutionOutcome::Completed(result) => (result, false),
         ExecutionOutcome::Cancelled(result) => (result, true),
     }
+}
+
+fn finalize_module_constraints(
+    compositions: &[carina_core::resource::Composition],
+    bindings: &ResolvedBindings,
+) -> Result<(), AppError> {
+    carina_core::executor::ModuleConstraintGate::new(compositions)
+        .finish(bindings, true)
+        .map_err(AppError::from)
 }
 
 fn deferred_data_source_reads_from_data_sources(
@@ -265,6 +320,7 @@ pub async fn execute_effects(
     bindings: &mut ResolvedBindings,
     current_states: &mut HashMap<ResourceId, State>,
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
+    data_source_origins: &[DataSource],
     compositions: &[carina_core::resource::Composition],
     cancel: ShutdownToken,
     parallelism: NonZeroUsize,
@@ -280,6 +336,7 @@ pub async fn execute_effects(
         bindings,
         current_states,
         unresolved_resources,
+        data_source_origins,
         compositions,
         DeferredDataSourceReads::none(),
         cancel.clone(),
@@ -300,6 +357,7 @@ async fn execute_effects_with_observer(
     bindings: &mut ResolvedBindings,
     current_states: &mut HashMap<ResourceId, State>,
     unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
+    data_source_origins: &[DataSource],
     compositions: &[carina_core::resource::Composition],
     deferred_data_source_reads: DeferredDataSourceReads,
     cancel: ShutdownToken,
@@ -308,7 +366,10 @@ async fn execute_effects_with_observer(
 ) -> ExecutionOutcome {
     let input = ExecutionInput {
         plan,
-        unresolved_resources,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: unresolved_resources,
+            data_source_origins,
+        },
         compositions,
         bindings: bindings.clone(),
         current_states: std::mem::take(current_states),
@@ -976,41 +1037,21 @@ async fn run_apply_with_observer_factory(
                 let bucket_normalizer = factory
                     .create_normalizer(None, &provider_config_attrs)
                     .await;
-                let normalized_bucket = apply_desired_normalization(
+                // Module expansion can place a module-owned state-bucket
+                // resource in `parsed.resources`; `find_resource_by_attr`
+                // does not imply top-level ownership. Gate bootstrap with
+                // the same expanded compositions and resolved config values
+                // that are available before any provider effect runs.
+                create_checked_bootstrap_resource(
+                    bucket_provider.as_ref(),
                     bucket_resource.clone(),
-                    &parsed.providers,
+                    &parsed,
                     bucket_normalizer.as_ref(),
                     ctx.factories(),
                     ctx.schemas(),
                 )
-                .await;
-                let resolved_bucket =
-                    carina_core::executor::resolve_normalized_for_provider(normalized_bucket)
-                        .map_err(|err| {
-                            AppError::Config(format!(
-                                "Failed to resolve state bucket before create: {err}"
-                            ))
-                        })?;
-
-                match bucket_provider
-                    .create(
-                        &bucket_resource.id,
-                        carina_core::provider::CreateRequest {
-                            resource: resolved_bucket,
-                        },
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        println!("  {} Created state bucket: {}", "✓".green(), bucket_name);
-                    }
-                    Err(e) => {
-                        return Err(AppError::Config(format!(
-                            "Failed to create state bucket: {}",
-                            e
-                        )));
-                    }
-                }
+                .await?;
+                println!("  {} Created state bucket: {}", "✓".green(), bucket_name);
             } else {
                 // Auto-create the bucket if auto_create is enabled
                 let auto_create = verified_backend
@@ -1462,6 +1503,16 @@ async fn run_apply_locked(
 
     // Phase 2: resolve data source inputs against the consolidated state
     // and refresh them via `read_data_source` (#1683, #1685).
+    let data_source_bindings = data_source_refresh_bindings(
+        &sorted_resources,
+        &parsed.compositions,
+        &data_sources,
+        &current_states,
+        &remote_bindings,
+        ctx.schemas(),
+        &wait_aliases,
+    );
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
     let data_source_refreshes = resolve_data_source_refs_for_refresh(
         &sorted_resources,
         &parsed.compositions,
@@ -1491,10 +1542,18 @@ async fn run_apply_locked(
             .map(|resource| {
                 let progress = RefreshProgress::begin_multi(&multi, &resource.id);
                 let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
+                let data_source_bindings = &data_source_bindings;
+                let module_gate = &module_gate;
                 async move {
-                    let mut state = read_data_source_with_retry(provider_ref, resource)
-                        .await
-                        .map_err(AppError::Provider)?;
+                    let mut state = read_data_source_with_retry(
+                        provider_ref,
+                        resource,
+                        data_source_bindings,
+                        module_gate,
+                        ctx.factories(),
+                        ctx.schemas(),
+                    )
+                    .await?;
                     if let Some(deps) = dep_bindings {
                         state.dependency_bindings = deps;
                     }
@@ -1632,28 +1691,40 @@ async fn run_apply_locked(
         .filter(|resource| deferred_data_source_reads.contains(&resource.id))
         .map(|resource| resource.id.clone())
         .collect();
-    let data_sources_for_plan = prepare_data_sources_for_plan(
+    let mut data_sources_for_plan = prepare_data_sources_for_plan(
         &data_sources,
         &deferred_data_source_ids,
         override_aware_resources.bindings(),
         None,
-        ctx.schemas(),
     )?;
+    let constraint_origin_resources = override_aware_resources
+        .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
     // Run the normalization pipeline (same as plan path in wiring.rs).
     // `prepare` also canonicalizes the wait `until` predicate enum
     // aliases (carina#3358); the apply path is a separate pipeline that
     // calls `create_plan` directly, so it relies on the same shared seam.
     let mut wait_bindings = parsed.wait_bindings.clone();
     let preprocessor = crate::wiring::PlanPreprocessor::new(&provider, ctx);
-    preprocessor
+    let preparation = preprocessor
         .prepare(
-            override_aware_resources.resources_mut(),
+            &mut override_aware_resources,
+            &constraint_origin_resources,
+            &module_gate,
             &mut current_states,
             &parsed.providers,
-            &data_sources_for_plan,
+            &mut data_sources_for_plan,
+            &data_sources,
             &mut wait_bindings,
         )
         .await;
+    if let Err(errors) = preparation {
+        let mut plan = Plan::new();
+        for error in errors {
+            plan.add_error(error);
+        }
+        render_plan_errors_and_abort(&plan)?;
+        unreachable!("render_plan_errors_and_abort returns an error for an invalid plan");
+    }
     reconcile_late_anonymous_identities(
         ctx,
         LateAnonymousIdentityInputs {
@@ -1730,6 +1801,10 @@ async fn run_apply_locked(
         // mutation does) silently falls through into the
         // resource-apply pipeline and the `Persisting N export
         // change(s) to state.` banner never prints (carina#3270).
+        finalize_module_constraints(
+            &pre_resolve_compositions,
+            override_aware_resources.bindings(),
+        )?;
         let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
             &parsed.export_params,
             &paired_unresolved_resources,
@@ -1865,7 +1940,8 @@ async fn run_apply_locked(
         &mut bindings,
         &mut current_states,
         &unresolved_resources,
-        &parsed.compositions,
+        &data_sources,
+        &pre_resolve_compositions,
         deferred_data_source_reads,
         cancel.clone(),
         parallelism,
@@ -2245,6 +2321,8 @@ async fn run_apply_from_plan_locked(
     let sorted_resources = &plan_file.sorted_resources;
     let plan_compositions: &[carina_core::resource::Composition] = &plan_file.compositions;
     let plan_data_sources: &[carina_core::resource::DataSource] = &plan_file.data_sources;
+    let plan_data_source_origins: &[carina_core::resource::DataSource] =
+        &plan_file.data_source_origins;
 
     // Rebuild planned current_states HashMap from plan file
     let planned_states: HashMap<ResourceId, State> = plan_file
@@ -2253,7 +2331,7 @@ async fn run_apply_from_plan_locked(
         .map(|entry| (entry.id, entry.state))
         .collect();
     let deferred_data_source_reads = deferred_data_source_reads_from_data_sources(
-        plan_data_sources,
+        plan_data_source_origins,
         sorted_resources,
         &planned_states,
     );
@@ -2300,6 +2378,29 @@ async fn run_apply_from_plan_locked(
         // resource-apply pipeline. Mirrors the source-driven apply
         // path's gate (carina#3270 → run_apply_locked).
         // carina#3275.
+        let terminal_wait_aliases: Vec<WaitAliasSpec> = plan_file
+            .wait_bindings
+            .iter()
+            .map(|wb| WaitAliasSpec {
+                binding: carina_core::parser::BindingName::new(wb.binding.clone()),
+                target: carina_core::parser::BindingName::new(wb.target.clone()),
+            })
+            .collect();
+        let terminal_input_states = carina_core::resource::into_plan_input_map(
+            current_states.clone(),
+            ctx.schemas(),
+            sorted_resources,
+        );
+        let terminal_bindings =
+            ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
+                managed: sorted_resources,
+                compositions: plan_compositions,
+                data_sources: plan_data_sources,
+                current_states: &terminal_input_states,
+                remote_bindings: &plan_file.upstream_snapshot,
+                wait_aliases: &terminal_wait_aliases,
+            });
+        finalize_module_constraints(plan_compositions, &terminal_bindings)?;
         println!("{}", "No changes needed.".green());
         return Ok(None);
     }
@@ -2400,6 +2501,7 @@ async fn run_apply_from_plan_locked(
         &mut bindings,
         &mut current_states,
         &unresolved_resources,
+        plan_data_source_origins,
         plan_compositions,
         deferred_data_source_reads,
         cancel.clone(),

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer,
 };
-use carina_core::resource::{ConcreteValue, DataSource, State, Value};
+use carina_core::resource::{ConcreteValue, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField, legacy_validator,
 };
@@ -108,6 +108,228 @@ fn lsp_diagnostics(
 fn cli_diagnostics(factories: Vec<Box<dyn ProviderFactory>>, fixture: &TempDir) -> Vec<String> {
     let path = fixture.path().to_path_buf();
     carina_cli::commands::validate::validate_with_factories(&path, factories)
+}
+
+#[test]
+fn module_validation_evaluation_error_is_reported_once_with_cli_lsp_parity() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let module = fixture.path().join("checked");
+    std::fs::create_dir_all(&module).expect("create module directory");
+    std::fs::write(
+        module.join("main.crn"),
+        r#"arguments {
+  x: String {
+    validation {
+      condition     = x > 5
+      error_message = "x must be greater than five"
+    }
+  }
+}
+"#,
+    )
+    .expect("write module");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"let checked = use { source = './checked' }
+
+let instance = checked {
+  x = "abc"
+}
+"#,
+    )
+    .expect("write root configuration");
+
+    let lsp_diags = lsp_diagnostics(
+        &engine_with_schemas(SchemaRegistry::new()),
+        &fixture,
+        "main.crn",
+    );
+    let cli_diags = cli_diagnostics(Vec::new(), &fixture);
+    let lsp_constraint_messages = lsp_diags
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("x must be greater than five"))
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    let cli_constraint_messages = cli_diags
+        .iter()
+        .filter(|diagnostic| diagnostic.contains("x must be greater than five"))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        lsp_constraint_messages.len(),
+        1,
+        "LSP must report the evaluator error once: {lsp_constraint_messages:#?}; all diagnostics: {lsp_diags:#?}"
+    );
+    assert_eq!(
+        cli_constraint_messages.len(),
+        1,
+        "CLI must report the evaluator error once: {cli_constraint_messages:#?}; all diagnostics: {cli_diags:#?}"
+    );
+    assert_eq!(lsp_constraint_messages, cli_constraint_messages);
+    assert_eq!(
+        lsp_constraint_messages,
+        [
+            "module 'checked' (call 'instance'): argument 'x': x must be greater than five (got \"abc\"); error evaluating constraint: cannot compare string with int"
+        ]
+    );
+}
+
+fn reference_valued_module_scope_fixture(module_source: &str) -> (TempDir, SchemaRegistry) {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let module = fixture.path().join("checked");
+    std::fs::create_dir_all(&module).expect("create module directory");
+    std::fs::write(module.join("main.crn"), module_source).expect("write module");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"provider test {}
+
+let checked = use { source = './checked' }
+
+let name_source = test.r.producer {
+  name = "name"
+}
+
+let peer_source = test.r.producer {
+  name = "peer"
+}
+
+let instance = checked {
+  name = name_source.id
+  peer = peer_source.id
+}
+"#,
+    )
+    .expect("write root configuration");
+
+    let producer = ResourceSchema::new("r.producer")
+        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
+        .attribute(AttributeSchema::new("id", AttributeType::string()).read_only());
+    (fixture, single_schema_map(producer))
+}
+
+fn assert_single_cli_lsp_constraint_scope_error(
+    fixture: &TempDir,
+    schemas: &SchemaRegistry,
+    expected: &str,
+) {
+    let lsp_diags = lsp_diagnostics(&engine_with_schemas(schemas.clone()), fixture, "main.crn");
+    let cli_diags = cli_diagnostics(factories_for(schemas), fixture);
+    let lsp_matching = lsp_diags
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains(expected))
+        .collect::<Vec<_>>();
+    let cli_matching = cli_diags
+        .iter()
+        .filter(|diagnostic| diagnostic.contains(expected))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        lsp_matching.len(),
+        1,
+        "LSP must report the static constraint scope error once: {lsp_diags:#?}"
+    );
+    assert_eq!(
+        cli_matching.len(),
+        1,
+        "CLI validate must report the static constraint scope error once: {cli_diags:#?}"
+    );
+}
+
+#[test]
+fn reference_valued_require_rejects_undeclared_variable_during_validation() {
+    let (fixture, schemas) = reference_valued_module_scope_fixture(
+        r#"arguments {
+  name: String
+  peer: String
+}
+
+require nmae != peer, "names must differ"
+"#,
+    );
+
+    assert_single_cli_lsp_constraint_scope_error(
+        &fixture,
+        &schemas,
+        "unknown variable 'nmae' in constraint expression",
+    );
+}
+
+#[test]
+fn reference_valued_argument_validation_rejects_sibling_variable_during_validation() {
+    let (fixture, schemas) = reference_valued_module_scope_fixture(
+        r#"arguments {
+  name: String {
+    validation {
+      condition     = name != peer
+      error_message = "names must differ"
+    }
+  }
+  peer: String
+}
+"#,
+    );
+
+    assert_single_cli_lsp_constraint_scope_error(
+        &fixture,
+        &schemas,
+        "unknown variable 'peer' in constraint expression",
+    );
+}
+
+#[test]
+fn anonymous_module_constraint_hides_synthetic_instance_with_cli_lsp_parity() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let module = fixture.path().join("checked");
+    std::fs::create_dir_all(&module).expect("create module directory");
+    std::fs::write(
+        module.join("main.crn"),
+        r#"arguments {
+  name: String {
+    validation {
+      condition     = length(name) > 0
+      error_message = "name must not be empty"
+    }
+  }
+}
+"#,
+    )
+    .expect("write module");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"let checked = use { source = './checked' }
+
+checked {
+  name = ""
+}
+"#,
+    )
+    .expect("write root configuration");
+
+    let lsp_diags = lsp_diagnostics(
+        &engine_with_schemas(SchemaRegistry::new()),
+        &fixture,
+        "main.crn",
+    );
+    let cli_diags = cli_diagnostics(Vec::new(), &fixture);
+    let lsp_messages = lsp_diags
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("name must not be empty"))
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    let cli_messages = cli_diags
+        .iter()
+        .filter(|diagnostic| diagnostic.contains("name must not be empty"))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+
+    assert_eq!(lsp_messages.len(), 1, "LSP diagnostics: {lsp_diags:#?}");
+    assert_eq!(cli_messages.len(), 1, "CLI diagnostics: {cli_diags:#?}");
+    assert_eq!(lsp_messages, cli_messages);
+    assert_eq!(
+        lsp_messages,
+        ["anonymous call to module 'checked': argument 'name': name must not be empty (got \"\")"]
+    );
 }
 
 // NOTE: case-sensitive `contains`. LSP and CLI surfaces sometimes
@@ -222,7 +444,7 @@ impl Provider for NoopProvider {
     }
     fn read_data_source(
         &self,
-        _r: &DataSource,
+        _r: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, carina_core::provider::ProviderResult<State>> {
         Box::pin(async { unimplemented!("e2e parity tests do not exercise apply") })
     }

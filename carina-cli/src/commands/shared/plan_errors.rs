@@ -26,7 +26,9 @@ fn plan_error_summary(errors: &[PlanError]) -> String {
             PlanErrorKind::SchemaNotRegistered(_)
             | PlanErrorKind::ReplacementCannotCoexist(_)
             | PlanErrorKind::WaitTargetMissing { .. }
-            | PlanErrorKind::WaitPredicateInvalid { .. } => other_count += 1,
+            | PlanErrorKind::WaitPredicateInvalid { .. }
+            | PlanErrorKind::ResolvedValueConstraint { .. }
+            | PlanErrorKind::ModuleConstraint(_) => other_count += 1,
         }
     }
 

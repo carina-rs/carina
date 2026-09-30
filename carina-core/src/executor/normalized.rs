@@ -16,6 +16,46 @@
 //! ```
 //!
 //! ```compile_fail
+//! use carina_core::provider::CreateRequest;
+//! use carina_core::resource::{ResolvedResource, Resource};
+//! let resource = Resource::new("test", "example");
+//! let resolved = ResolvedResource::new(resource);
+//! let _ = CreateRequest { resource: resolved }; // checked witness required
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::provider::build_update_patch;
+//! use carina_core::resource::{ResolvedResource, Resource, State};
+//! let resource = Resource::new("test", "example");
+//! let resolved = ResolvedResource::new(resource);
+//! let state: State = unimplemented!();
+//! let _ = build_update_patch(&[], &resolved, &state); // checked witness required
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::executor::normalized::NormalizedResource;
+//! use carina_core::provider::ProviderReadyResource;
+//!
+//! fn bypass_value_checks(normalized: NormalizedResource) -> ProviderReadyResource {
+//!     normalized.into() // no unchecked normalization-to-provider conversion
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::provider::{ProviderReady, ProviderReadyResource};
+//! use carina_core::resource::{ResolvedResource, Resource};
+//! let resolved = ResolvedResource::new(Resource::new("test", "example"));
+//! let _: ProviderReadyResource = ProviderReady(resolved); // private field
+//! ```
+//!
+//! ```compile_fail
+//! use carina_core::provider::ProviderReadyResource;
+//! use carina_core::resource::{ResolvedResource, Resource};
+//! let resolved = ResolvedResource::new(Resource::new("test", "example"));
+//! let _: ProviderReadyResource = resolved.into(); // no unchecked conversion
+//! ```
+//!
+//! ```compile_fail
 //! use carina_core::executor::compute_full_diff_patch;
 //! use carina_core::resource::{Resource, State};
 //! let from: State = unimplemented!();
@@ -28,8 +68,8 @@ use std::collections::HashMap;
 use crate::parser::ProviderConfig;
 use crate::provider::{ProviderFactory, ProviderNormalizer};
 use crate::resource::{
-    ConcreteValue, DeferredValue, InterpolationPart, ResolvedResource, Resource, ResourceId, State,
-    Value, contains_resource_ref,
+    ConcreteValue, DeferredValue, InterpolationPart, Resource, ResourceId, State, Value,
+    contains_resource_ref,
 };
 use crate::schema::SchemaRegistry;
 
@@ -44,13 +84,8 @@ impl NormalizedResource {
         &self.0
     }
 
-    /// Consume this normalized desired resource and prove it is free
-    /// of deferred placeholders before provider dispatch.
-    pub(crate) fn into_resolved_resource(
-        self,
-        token: crate::executor::basic::ResolvedResourceToken,
-    ) -> Result<ResolvedResource, crate::value::SerializationError> {
-        ResolvedResource::new_fully_resolved(self.0, token)
+    pub(super) fn into_resource(self) -> Resource {
+        self.0
     }
 }
 

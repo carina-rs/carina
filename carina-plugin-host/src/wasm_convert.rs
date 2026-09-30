@@ -635,8 +635,8 @@ pub fn core_to_wit_update_request(
     request: &CoreUpdateRequest,
 ) -> Result<wit::UpdateRequest, SerializationError> {
     Ok(wit::UpdateRequest {
-        current: core_to_wit_state(&request.from)?,
-        patch: core_to_wit_update_patch(&request.patch)?,
+        current: core_to_wit_state(request.from())?,
+        patch: core_to_wit_update_patch(request.patch())?,
     })
 }
 
@@ -646,7 +646,7 @@ pub fn core_to_wit_create_request(
     request: &CoreCreateRequest,
 ) -> Result<wit::CreateRequest, SerializationError> {
     Ok(wit::CreateRequest {
-        res: core_to_wit_resource(request.resource.as_resource())?,
+        res: core_to_wit_resource(request.resource().as_resource())?,
     })
 }
 
@@ -706,14 +706,6 @@ pub fn core_to_wit_patch_op(op: &CorePatchOp) -> Result<wit::PatchOp, Serializat
         key: op.key.clone(),
         value,
     })
-}
-
-/// Convert a [`wit::UpdatePatch`] back to a host-side
-/// [`CoreUpdatePatch`]. Used by tests and round-trip verification.
-pub fn wit_to_core_update_patch(patch: &wit::UpdatePatch) -> CoreUpdatePatch {
-    CoreUpdatePatch {
-        ops: patch.ops.iter().map(wit_to_core_patch_op).collect(),
-    }
 }
 
 /// Convert a [`wit::PatchOp`] to a host-side [`CorePatchOp`].
@@ -2211,38 +2203,51 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_update_patch_round_trip_preserves_op_order_and_kinds() {
+    #[tokio::test]
+    async fn test_update_patch_round_trip_preserves_op_order_and_kinds() {
         use carina_core::resource::Value as CV;
-        let patch = CoreUpdatePatch {
-            ops: vec![
-                CorePatchOp {
-                    kind: CorePatchOpKind::Add,
-                    key: "a".to_string(),
-                    value: Some(CV::Concrete(ConcreteValue::String("alpha".into()))),
-                },
-                CorePatchOp {
-                    kind: CorePatchOpKind::Replace,
-                    key: "b".to_string(),
-                    value: Some(CV::Concrete(ConcreteValue::Int(42))),
-                },
-                CorePatchOp {
-                    kind: CorePatchOpKind::Remove,
-                    key: "c".to_string(),
-                    value: None,
-                },
-            ],
-        };
-        let wit_patch = core_to_wit_update_patch(&patch).unwrap();
-        let back = wit_to_core_update_patch(&wit_patch);
-        assert_eq!(back.ops.len(), 3);
-        assert_eq!(back.ops[0].kind, CorePatchOpKind::Add);
-        assert_eq!(back.ops[0].key, "a");
-        assert_eq!(back.ops[1].kind, CorePatchOpKind::Replace);
-        assert_eq!(back.ops[1].key, "b");
-        assert_eq!(back.ops[2].kind, CorePatchOpKind::Remove);
-        assert_eq!(back.ops[2].key, "c");
-        assert!(back.ops[2].value.is_none(), "Remove must carry None");
+        let resource = CoreResource::new("test", "patch-round-trip")
+            .with_attribute("a", CV::Concrete(ConcreteValue::String("alpha".into())))
+            .with_attribute("b", CV::Concrete(ConcreteValue::Int(42)));
+        let from = CoreState::existing(
+            resource.id.clone(),
+            HashMap::from([
+                ("b".to_string(), CV::Concrete(ConcreteValue::Int(1))),
+                (
+                    "c".to_string(),
+                    CV::Concrete(ConcreteValue::String("removed".into())),
+                ),
+            ]),
+        );
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+        let schemas = carina_core::schema::SchemaRegistry::new();
+        let preparation = carina_core::executor::ProviderPreparationContext::new(
+            &bindings,
+            &module_gate,
+            &[],
+            &carina_core::provider::NoopNormalizer,
+            &[],
+            &schemas,
+        );
+        let request = carina_core::executor::prepare_update_request(
+            resource,
+            from,
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            &preparation,
+        )
+        .await
+        .expect("checked request should be prepared");
+        let wit_patch = core_to_wit_update_patch(request.patch()).unwrap();
+        let back: Vec<_> = wit_patch.ops.iter().map(wit_to_core_patch_op).collect();
+        assert_eq!(back.len(), 3);
+        assert_eq!(back[0].kind, CorePatchOpKind::Add);
+        assert_eq!(back[0].key, "a");
+        assert_eq!(back[1].kind, CorePatchOpKind::Replace);
+        assert_eq!(back[1].key, "b");
+        assert_eq!(back[2].kind, CorePatchOpKind::Remove);
+        assert_eq!(back[2].key, "c");
+        assert!(back[2].value.is_none(), "Remove must carry None");
     }
 
     #[test]

@@ -7,7 +7,25 @@ use crate::explicit::ExplicitFields;
 use crate::plan::{
     PlanErrorKind, PreventDestroyAction, ReplacementCannotCoexistError, SchemaNotRegisteredError,
 };
-use crate::resource::{ConcreteValue, DataSource, ResolvedResource, ResourceIdentity};
+use crate::resource::{ConcreteValue, Resource, ResourceIdentity};
+
+fn provider_ready(resource: Resource) -> crate::provider::ProviderReadyResource {
+    let bindings = crate::binding_index::ResolvedBindings::default();
+    let gate = crate::executor::ModuleConstraintGate::new(&[]);
+    let schemas = crate::schema::SchemaRegistry::new();
+    let context = crate::executor::ProviderPreparationContext::new(
+        &bindings,
+        &gate,
+        &[],
+        &crate::provider::NoopNormalizer,
+        &[],
+        &schemas,
+    );
+    futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
+        resource, &context,
+    ))
+    .expect("test resource should pass provider preparation")
+}
 
 /// Build an `ExplicitFields::Struct` whose children are all `Leaf` —
 /// the shape `state v5 → v6` reads produce, and a convenient way to
@@ -42,7 +60,7 @@ impl crate::provider::Provider for HintProvider {
 
     fn read_data_source(
         &self,
-        _resource: &DataSource,
+        _resource: &crate::provider::ProviderReadyDataSource,
     ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<State>> {
         Box::pin(async { panic!("unexpected read_data_source") })
     }
@@ -854,7 +872,7 @@ fn nested_authored_field_removal_produces_update_patch_without_removed_field() {
 
     assert_eq!(changed_attributes, vec!["distribution_config".to_string()]);
     let patch =
-        crate::provider::build_update_patch(&changed_attributes, &ResolvedResource::new(to), &from);
+        crate::provider::build_update_patch(&changed_attributes, &provider_ready(to), &from);
     assert_eq!(patch.ops.len(), 1);
     assert_eq!(patch.ops[0].kind, crate::provider::PatchOpKind::Replace);
     let Some(Value::Concrete(ConcreteValue::Map(patch_config))) = &patch.ops[0].value else {
@@ -1258,7 +1276,8 @@ fn nested_reference_removal_updates_consumer_before_deleting_orphan() {
         unreachable!();
     };
     assert_eq!(changed_attributes, &["distribution_config".to_string()]);
-    let patch = crate::provider::build_update_patch(changed_attributes, to, from);
+    let ready = provider_ready(to.as_resource().clone());
+    let patch = crate::provider::build_update_patch(changed_attributes, &ready, from);
     let Some(Value::Concrete(ConcreteValue::Map(patch_config))) = &patch.ops[0].value else {
         panic!("Expected distribution_config replacement value");
     };

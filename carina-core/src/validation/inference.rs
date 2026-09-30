@@ -1627,6 +1627,7 @@ mod tests {
             signature: crate::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: virt_attrs,
+                pending_constraints: Vec::new(),
             },
             binding: Some("github_actions_carina".to_string()),
             dependency_bindings: std::collections::BTreeSet::new(),
@@ -1675,6 +1676,7 @@ mod tests {
         parsed.module_calls.push(crate::parser::ModuleCall {
             module_name: "github_module".to_string(),
             binding_name: Some("github_actions_carina".to_string()),
+            source: Default::default(),
             arguments: std::collections::HashMap::new(),
         });
         parsed.export_params.push(crate::parser::ParsedExportParam {

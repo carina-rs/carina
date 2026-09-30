@@ -1756,6 +1756,560 @@ fn resource_validator_called() {
 }
 
 #[test]
+fn validate_known_values_defers_constraints_until_values_are_concrete() {
+    use crate::resource::UnknownReason;
+
+    let schema = ResourceSchema::new("test.KnownValues")
+        .attribute(AttributeSchema::new(
+            "pattern",
+            AttributeType::refined_string(None, Some("^[a-z]+$".to_string()), None, None),
+        ))
+        .attribute(AttributeSchema::new(
+            "length",
+            AttributeType::refined_string(None, None, Some((Some(2), Some(4))), None),
+        ))
+        .attribute(AttributeSchema::new(
+            "range",
+            AttributeType::refined_int(None, Some((Some(1), Some(10)))),
+        ))
+        .attribute(AttributeSchema::new(
+            "custom",
+            AttributeType::refined_string(Some(TypeIdentity::bare("CheckedId")), None, None, None),
+        ));
+    let unknown = || Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
+    let mut attributes = HashMap::from([
+        ("pattern".to_string(), unknown()),
+        ("length".to_string(), unknown()),
+        ("range".to_string(), unknown()),
+        ("custom".to_string(), unknown()),
+    ]);
+    let lookup = |identity: &TypeIdentity, value: &Value| {
+        if identity.kind == "CheckedId"
+            && matches!(value, Value::Concrete(ConcreteValue::String(value)) if value == "invalid")
+        {
+            Err(TypeError::ValidationFailed {
+                message: "custom value rejected".to_string(),
+            })
+        } else {
+            Ok(())
+        }
+    };
+
+    assert_eq!(
+        schema.validate_known_values_with_origins_and_lookup(&attributes, &|_| false, &lookup,),
+        Ok(())
+    );
+
+    attributes.insert(
+        "pattern".to_string(),
+        Value::Concrete(ConcreteValue::String("INVALID".to_string())),
+    );
+    attributes.insert(
+        "length".to_string(),
+        Value::Concrete(ConcreteValue::String("x".to_string())),
+    );
+    attributes.insert("range".to_string(), Value::Concrete(ConcreteValue::Int(11)));
+    attributes.insert(
+        "custom".to_string(),
+        Value::Concrete(ConcreteValue::String("invalid".to_string())),
+    );
+
+    let errors = schema
+        .validate_known_values_with_origins_and_lookup(&attributes, &|_| false, &lookup)
+        .expect_err("concrete invalid values must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, TypeError::PatternMismatch { attribute: Some(name), .. } if name == "pattern")),
+        "missing pattern error: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, TypeError::LengthOutOfRange { attribute: Some(name), .. } if name == "length")),
+        "missing length error: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(
+            |error| matches!(error, TypeError::ValidationFailed { message } if message.contains("outside allowed range"))
+        ),
+        "missing range error: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            TypeError::ResourceValidationFailed {
+                message,
+                attribute: Some(name),
+            } if message == "custom value rejected" && name == "custom"
+        )),
+        "missing custom lookup error: {errors:?}"
+    );
+}
+
+#[test]
+fn validate_known_values_checks_concrete_siblings_beside_deferred_leaves() {
+    use crate::resource::UnknownReason;
+
+    let schema = ResourceSchema::new("test.NestedKnownValues").attribute(AttributeSchema::new(
+        "names",
+        AttributeType::list(AttributeType::refined_string(
+            None,
+            Some("^[a-z]+$".to_string()),
+            None,
+            None,
+        )),
+    ));
+    let attributes = HashMap::from([(
+        "names".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![
+            Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue)),
+            Value::Concrete(ConcreteValue::String("INVALID".to_string())),
+        ])),
+    )]);
+
+    let errors = schema
+        .validate_known_values_with_origins_and_lookup(&attributes, &|_| false, no_lookup())
+        .expect_err("the concrete sibling must still be checked");
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            TypeError::ListItemError { index: 1, inner }
+                if matches!(inner.as_ref(), TypeError::PatternMismatch { .. })
+        )),
+        "unexpected errors: {errors:?}"
+    );
+}
+
+#[test]
+fn secret_values_are_validated_and_every_rendered_error_is_masked() {
+    use indexmap::IndexMap;
+
+    fn reject_resource_secret(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+        match attributes.get("resource_custom") {
+            Some(Value::Concrete(ConcreteValue::String(value))) => {
+                Err(vec![TypeError::ValidationFailed {
+                    message: format!("resource validator rejected {value}"),
+                }])
+            }
+            _ => Ok(()),
+        }
+    }
+
+    let constrained = || {
+        AttributeType::refined_string(
+            None,
+            Some("^allowed$".to_string()),
+            Some((Some(7), Some(7))),
+            None,
+        )
+    };
+    let custom = AttributeType::refined_string_with_validator(
+        Some(TypeIdentity::bare("SecretCustom")),
+        None,
+        None,
+        legacy_validator(|value| match value {
+            Value::Concrete(ConcreteValue::String(value)) => {
+                Err(format!("schema validator rejected {value}"))
+            }
+            _ => Ok(()),
+        }),
+        None,
+    );
+    let schema = ResourceSchema::new("test.SecretValues")
+        .attribute(AttributeSchema::new("length", constrained()))
+        .attribute(AttributeSchema::new(
+            "enum_value",
+            AttributeType::enum_(
+                TypeIdentity::bare("Mode"),
+                Some(vec!["allowed".to_string()]),
+                vec![],
+                None,
+                None,
+            ),
+        ))
+        .attribute(AttributeSchema::new("custom", custom.clone()))
+        .attribute(AttributeSchema::new("lookup", custom))
+        .attribute(AttributeSchema::new(
+            "list",
+            AttributeType::list(constrained()),
+        ))
+        .attribute(AttributeSchema::new(
+            "map",
+            AttributeType::map(constrained()),
+        ))
+        .attribute(AttributeSchema::new(
+            "struct",
+            AttributeType::struct_(
+                "SecretStruct".to_string(),
+                vec![StructField::new("field", constrained())],
+            ),
+        ))
+        .attribute(AttributeSchema::new(
+            "resource_custom",
+            AttributeType::string(),
+        ))
+        .with_validator(reject_resource_secret);
+    let secret = |value: &str| {
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String(value.to_string()),
+        ))))
+    };
+    let mut map = IndexMap::new();
+    map.insert("key".to_string(), secret("map-plaintext"));
+    let mut structure = IndexMap::new();
+    structure.insert("field".to_string(), secret("struct-plaintext"));
+    let attributes = HashMap::from([
+        ("length".to_string(), secret("length-plaintext")),
+        (
+            "enum_value".to_string(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::enum_identifier("enum-plaintext"),
+            )))),
+        ),
+        ("custom".to_string(), secret("schema-custom-plaintext")),
+        ("lookup".to_string(), secret("lookup-plaintext")),
+        (
+            "list".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![secret("list-plaintext")])),
+        ),
+        ("map".to_string(), Value::Concrete(ConcreteValue::Map(map))),
+        (
+            "struct".to_string(),
+            Value::Concrete(ConcreteValue::Map(structure)),
+        ),
+        (
+            "resource_custom".to_string(),
+            secret("resource-custom-plaintext"),
+        ),
+    ]);
+    let lookup = |_identity: &TypeIdentity, value: &Value| match value {
+        Value::Concrete(ConcreteValue::String(value)) => Err(TypeError::ValidationFailed {
+            message: format!("provider lookup rejected {value}"),
+        }),
+        _ => Ok(()),
+    };
+
+    let errors = schema
+        .validate_known_values_with_origins_and_lookup(&attributes, &|_| false, &lookup)
+        .expect_err("secret values must be checked once their inner values are known");
+    let rendered = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("(secret)"), "errors: {rendered}");
+    for plaintext in [
+        "length-plaintext",
+        "enum-plaintext",
+        "schema-custom-plaintext",
+        "lookup-plaintext",
+        "list-plaintext",
+        "map-plaintext",
+        "struct-plaintext",
+        "resource-custom-plaintext",
+    ] {
+        assert!(
+            !rendered.contains(plaintext),
+            "secret leaked in validation error: {rendered}"
+        );
+    }
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, TypeError::ListItemError { .. })),
+        "nested list error lost its path: {errors:#?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, TypeError::MapValueError { .. })),
+        "nested map error lost its path: {errors:#?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, TypeError::StructFieldError { .. })),
+        "nested struct error lost its path: {errors:#?}"
+    );
+}
+
+#[test]
+fn secret_enum_literal_masks_typed_value_and_validator_message() {
+    let enumerated_plaintext = "enumerated-secret-literal";
+    let validator_plaintext = "validator-secret-literal";
+    let schema = ResourceSchema::new("test.SecretEnums")
+        .attribute(AttributeSchema::new(
+            "enumerated",
+            AttributeType::enum_(
+                TypeIdentity::bare("Mode"),
+                Some(vec!["allowed".to_string()]),
+                vec![],
+                None,
+                None,
+            ),
+        ))
+        .attribute(AttributeSchema::new(
+            "validated",
+            AttributeType::enum_with_base(
+                enum_identity("DynamicMode", Some("test.SecretEnums")),
+                AttributeType::string(),
+                None,
+                vec![],
+                Some(legacy_validator(|value| match value {
+                    Value::Concrete(ConcreteValue::String(value)) => {
+                        Err(format!("provider rejected {value}"))
+                    }
+                    _ => Err("expected a string".to_string()),
+                })),
+                None,
+            ),
+        ));
+    let secret = |plaintext: &str| {
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String(plaintext.to_string()),
+        ))))
+    };
+    let attributes = HashMap::from([
+        ("enumerated".to_string(), secret(enumerated_plaintext)),
+        ("validated".to_string(), secret(validator_plaintext)),
+    ]);
+
+    let errors = schema
+        .validate_with_origins(&attributes, &|_| true)
+        .expect_err("both secret enum literals must be rejected");
+
+    let enumerated = errors
+        .iter()
+        .find(|error| {
+            matches!(
+                error,
+                TypeError::StringLiteralExpectedEnum {
+                    attribute: Some(attribute),
+                    ..
+                } if attribute == "enumerated"
+            )
+        })
+        .expect("enumerated secret must retain its enum diagnostic shape");
+    let TypeError::StringLiteralExpectedEnum { user_typed, .. } = enumerated else {
+        unreachable!()
+    };
+    assert_eq!(
+        user_typed, "(secret)",
+        "StringLiteralExpectedEnum.user_typed leaked {enumerated_plaintext}"
+    );
+
+    let validated = errors
+        .iter()
+        .find(|error| {
+            matches!(
+                error,
+                TypeError::StringLiteralExpectedEnum {
+                    attribute: Some(attribute),
+                    ..
+                } if attribute == "validated"
+            )
+        })
+        .expect("validated secret must retain its enum diagnostic shape");
+    let TypeError::StringLiteralExpectedEnum {
+        user_typed,
+        extra_message,
+        ..
+    } = validated
+    else {
+        unreachable!()
+    };
+    assert_eq!(user_typed, "(secret)");
+    assert_eq!(
+        extra_message.as_deref(),
+        Some("(secret) failed validation"),
+        "StringLiteralExpectedEnum.extra_message leaked {validator_plaintext}"
+    );
+
+    let rendered = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for plaintext in [enumerated_plaintext, validator_plaintext] {
+        assert!(
+            !rendered.contains(plaintext),
+            "secret enum plaintext leaked: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn secret_wrapped_containers_mask_user_derived_error_paths() {
+    use indexmap::IndexMap;
+
+    fn secret_map(entries: impl IntoIterator<Item = (String, Value)>) -> Value {
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::Map(entries.into_iter().collect::<IndexMap<_, _>>()),
+        ))))
+    }
+
+    let constrained =
+        || AttributeType::refined_string(None, Some("^allowed$".to_string()), None, None);
+
+    let unknown_field = "unknown-struct-field-secret";
+    let error = AttributeType::struct_(
+        "SecretStruct",
+        vec![StructField::new("allowed", AttributeType::string())],
+    )
+    .validate(&secret_map([(
+        unknown_field.to_string(),
+        Value::Concrete(ConcreteValue::String("value".to_string())),
+    )]))
+    .expect_err("unknown secret-wrapped struct field must fail");
+    assert!(matches!(error, TypeError::UnknownStructField { .. }));
+    assert!(
+        !error.to_string().contains(unknown_field),
+        "UnknownStructField.field leaked secret content: {error}"
+    );
+
+    let union_field = "union-unrecognized-field-secret";
+    let error = AttributeType::union(vec![
+        AttributeType::struct_(
+            "LeftAlternative",
+            vec![StructField::new("left", AttributeType::string())],
+        ),
+        AttributeType::struct_(
+            "RightAlternative",
+            vec![StructField::new("right", AttributeType::string())],
+        ),
+    ])
+    .validate(&secret_map([(
+        union_field.to_string(),
+        Value::Concrete(ConcreteValue::String("value".to_string())),
+    )]))
+    .expect_err("unrecognized secret-wrapped union field must fail");
+    assert!(matches!(error, TypeError::UnionStructMismatch { .. }));
+    assert!(
+        !error.to_string().contains(union_field),
+        "UnionStructMismatch.unrecognized_fields leaked secret content: {error}"
+    );
+
+    let map_key = "map-key-secret";
+    let error = AttributeType::map_with_key(constrained(), AttributeType::string())
+        .validate(&secret_map([(
+            map_key.to_string(),
+            Value::Concrete(ConcreteValue::String("value".to_string())),
+        )]))
+        .expect_err("invalid secret-wrapped map key must fail");
+    assert!(matches!(error, TypeError::MapKeyError { .. }));
+    assert!(
+        !error.to_string().contains(map_key),
+        "MapKeyError.key leaked secret content: {error}"
+    );
+
+    let map_value_key = "map-value-key-secret";
+    let error = AttributeType::map(constrained())
+        .validate(&secret_map([(
+            map_value_key.to_string(),
+            Value::Concrete(ConcreteValue::String("invalid".to_string())),
+        )]))
+        .expect_err("invalid secret-wrapped map value must fail");
+    assert!(matches!(error, TypeError::MapValueError { .. }));
+    assert!(
+        !error.to_string().contains(map_value_key),
+        "MapValueError.key leaked secret content: {error}"
+    );
+
+    let struct_field = "struct-field-secret";
+    let error = AttributeType::struct_(
+        "SecretValueStruct",
+        vec![StructField::new(struct_field, constrained())],
+    )
+    .validate(&secret_map([(
+        struct_field.to_string(),
+        Value::Concrete(ConcreteValue::String("invalid".to_string())),
+    )]))
+    .expect_err("invalid secret-wrapped struct value must fail");
+    assert!(matches!(error, TypeError::StructFieldError { .. }));
+    assert!(
+        !error.to_string().contains(struct_field),
+        "StructFieldError.field leaked secret content: {error}"
+    );
+}
+
+#[test]
+fn secret_length_out_of_range_is_masked_without_pattern_error() {
+    let plaintext = "short";
+    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String(plaintext.to_string()),
+    ))));
+    let error = AttributeType::refined_string(None, None, Some((Some(8), None)), None)
+        .validate(&value)
+        .expect_err("short secret must fail the length constraint");
+
+    assert!(matches!(error, TypeError::LengthOutOfRange { .. }));
+    let rendered = error.to_string();
+    assert!(rendered.contains("(secret)"), "error: {rendered}");
+    assert!(
+        !rendered.contains(plaintext),
+        "LengthOutOfRange.value leaked secret content: {rendered}"
+    );
+}
+
+#[test]
+fn validate_known_values_runs_resource_validator_without_structural_errors() {
+    fn reject_forbidden(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+        if attributes.contains_key("forbidden") {
+            Err(vec![TypeError::ValidationFailed {
+                message: "resource validator rejected value".to_string(),
+            }])
+        } else {
+            Ok(())
+        }
+    }
+
+    let schema = ResourceSchema::new("test.KnownValues")
+        .attribute(AttributeSchema::new("required", AttributeType::string()).required())
+        .attribute(AttributeSchema::new("read_only", AttributeType::string()).read_only())
+        .attribute(AttributeSchema::new("choice_a", AttributeType::string()))
+        .attribute(AttributeSchema::new("choice_b", AttributeType::string()))
+        .attribute(AttributeSchema::new("forbidden", AttributeType::string()))
+        .exclusive_required(&["choice_a", "choice_b"])
+        .with_validator(reject_forbidden);
+    let structurally_invalid = HashMap::from([
+        (
+            "unknown".to_string(),
+            Value::Concrete(ConcreteValue::String("ignored".to_string())),
+        ),
+        (
+            "read_only".to_string(),
+            Value::Concrete(ConcreteValue::String("provider value".to_string())),
+        ),
+    ]);
+
+    assert_eq!(
+        schema.validate_known_values_with_origins_and_lookup(
+            &structurally_invalid,
+            &|_| false,
+            no_lookup(),
+        ),
+        Ok(()),
+        "missing, unknown, read-only, and exclusive-required checks belong to structural validation"
+    );
+
+    let forbidden = HashMap::from([(
+        "forbidden".to_string(),
+        Value::Concrete(ConcreteValue::String("present".to_string())),
+    )]);
+    let errors = schema
+        .validate_known_values_with_origins_and_lookup(&forbidden, &|_| false, no_lookup())
+        .expect_err("resource validators must run at the known-value gate");
+    assert_eq!(
+        errors,
+        vec![TypeError::ValidationFailed {
+            message: "resource validator rejected value".to_string(),
+        }]
+    );
+}
+
+#[test]
 fn validate_exclusive_required_helper() {
     use validators::validate_exclusive_required;
 

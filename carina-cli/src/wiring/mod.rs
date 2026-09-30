@@ -5,7 +5,6 @@ use std::hash::{Hash, Hasher};
 use std::io::IsTerminal;
 use std::path::Path;
 
-#[cfg(test)]
 use indexmap::IndexMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,17 +32,17 @@ use carina_core::override_aware::OverrideAwareResources;
 #[cfg(test)]
 use carina_core::parser::MovedAddresses;
 use carina_core::parser::{ProviderConfig, StateBlock, StateBlockAddress, WarningKind};
-use carina_core::plan::Plan;
+use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::provider::{
     self as provider_mod, LiftedSavedAttrs, Provider, ProviderError, ProviderFactory,
     ProviderNormalizer, ProviderRouter,
 };
 use carina_core::resource::{
-    ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, State, Value,
+    Composition, ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
-    resolve_block_names,
+    AttributeSchema, AttributeType, CustomTypeLookup, ResourceSchema, SchemaRegistry, StructField,
+    TypeError, resolve_block_names,
 };
 use carina_core::validation;
 use carina_provider_mock::MockProvider;
@@ -59,6 +58,9 @@ pub struct PlanContext {
     pub provider: ProviderRouter,
     pub sorted_resources: Vec<Resource>,
     pub unresolved_resources: Vec<Resource>,
+    /// Module compositions after plan-time constraint evaluation. Pending
+    /// constraints must survive in saved plans for apply-time re-evaluation.
+    pub compositions: Vec<Composition>,
     /// Data sources exactly as supplied to the differ. Refresh-time reads
     /// have concrete inputs; apply-time deferred reads keep structural refs so
     /// saved-plan apply can reconstruct the same deferred-read set.
@@ -1055,6 +1057,174 @@ pub struct PlanPreprocessor<'a> {
     ctx: &'a WiringContext,
 }
 
+fn type_error_attribute(error: &TypeError) -> Option<&str> {
+    match error {
+        TypeError::InvalidEnumVariant { attribute, .. }
+        | TypeError::PatternMismatch { attribute, .. }
+        | TypeError::LengthOutOfRange { attribute, .. }
+        | TypeError::StringLiteralExpectedEnum { attribute, .. }
+        | TypeError::ResourceValidationFailed { attribute, .. } => attribute.as_deref(),
+        TypeError::BlockSyntaxNotAllowed { attribute } => Some(attribute),
+        TypeError::ListItemError { inner, .. }
+        | TypeError::MapKeyError { inner, .. }
+        | TypeError::MapValueError { inner, .. }
+        | TypeError::StructFieldError { inner, .. } => type_error_attribute(inner),
+        TypeError::TypeMismatch { .. }
+        | TypeError::ValidationFailed { .. }
+        | TypeError::MissingRequired { .. }
+        | TypeError::ReadOnlyAttribute { .. }
+        | TypeError::UnknownAttribute { .. }
+        | TypeError::UnknownStructField { .. }
+        | TypeError::UnionStructMismatch { .. } => None,
+    }
+}
+
+fn resolved_constraint_context(
+    error: &TypeError,
+    origin_attributes: &IndexMap<String, Value>,
+    schema: &ResourceSchema,
+) -> (Vec<String>, Vec<String>) {
+    let mut origins_by_attribute: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (attribute, value) in origin_attributes {
+        if !schema.attributes.contains_key(attribute) {
+            continue;
+        }
+        value.visit_resource_refs(&mut |path| {
+            origins_by_attribute
+                .entry(attribute.clone())
+                .or_default()
+                .insert(path.to_dot_string());
+        });
+    }
+
+    let explicit_attribute = type_error_attribute(error).map(str::to_string);
+    let attributes = if let Some(attribute) = explicit_attribute {
+        vec![attribute]
+    } else if origins_by_attribute.is_empty() {
+        let mut known = origin_attributes
+            .keys()
+            .filter(|attribute| schema.attributes.contains_key(*attribute))
+            .cloned()
+            .collect::<Vec<_>>();
+        known.sort();
+        known
+    } else {
+        origins_by_attribute.keys().cloned().collect()
+    };
+
+    let mut origins = BTreeSet::new();
+    for attribute in &attributes {
+        if let Some(paths) = origins_by_attribute.get(attribute) {
+            origins.extend(paths.iter().cloned());
+        }
+    }
+    if origins.is_empty() {
+        origins.extend(origins_by_attribute.into_values().flatten());
+    }
+
+    (attributes, origins.into_iter().collect())
+}
+
+fn validate_resolved_value_constraints(
+    ctx: &WiringContext,
+    resources: &[Resource],
+    resource_origins: &[Resource],
+    data_sources: &[DataSource],
+    data_source_origins: &[DataSource],
+) -> Vec<PlanError> {
+    assert_eq!(
+        resources.len(),
+        resource_origins.len(),
+        "plan value checking requires paired managed resources"
+    );
+    assert_eq!(
+        data_sources.len(),
+        data_source_origins.len(),
+        "plan value checking requires paired data sources"
+    );
+
+    let lookup = carina_core::executor::provider_custom_type_lookup(ctx.factories());
+    let mut plan_errors = Vec::new();
+    for (resource, origin) in resources.iter().zip(resource_origins) {
+        let Some(schema) = ctx.schemas().get_for(resource) else {
+            continue;
+        };
+        append_resolved_value_constraint_errors(
+            &mut plan_errors,
+            &resource.id,
+            schema,
+            &resource.resolved_attributes(),
+            &resource.quoted_string_attrs,
+            &origin.attributes,
+            &lookup,
+        );
+    }
+
+    for (resource, origin) in data_sources.iter().zip(data_source_origins) {
+        let Some(schema) = ctx.schemas().get_for_data_source(resource) else {
+            continue;
+        };
+        append_resolved_value_constraint_errors(
+            &mut plan_errors,
+            &resource.id,
+            schema,
+            &carina_core::resource::attrs_to_hashmap(&resource.attributes),
+            &resource.quoted_string_attrs,
+            &origin.attributes,
+            &lookup,
+        );
+    }
+
+    plan_errors
+}
+
+fn append_resolved_value_constraint_errors(
+    plan_errors: &mut Vec<PlanError>,
+    id: &ResourceId,
+    schema: &ResourceSchema,
+    attributes: &HashMap<String, Value>,
+    quoted_string_attrs: &HashSet<String>,
+    origin_attributes: &IndexMap<String, Value>,
+    lookup: CustomTypeLookup<'_>,
+) {
+    let is_string_literal = |attribute: &str| quoted_string_attrs.contains(attribute);
+    let Err(errors) = schema.validate_known_values_with_origins_and_lookup(
+        attributes,
+        &is_string_literal,
+        lookup,
+    ) else {
+        return;
+    };
+
+    for error in errors {
+        let (attributes, origins) = resolved_constraint_context(&error, origin_attributes, schema);
+        plan_errors.push(PlanError::new(
+            id.clone(),
+            PlanErrorKind::ResolvedValueConstraint {
+                attributes,
+                origins,
+                message: error.to_string(),
+            },
+        ));
+    }
+}
+
+fn module_constraint_plan_errors(
+    error: carina_core::executor::ModuleConstraintGateError,
+) -> Vec<PlanError> {
+    error
+        .failures()
+        .iter()
+        .cloned()
+        .map(|failure| {
+            PlanError::new(
+                failure.composition_id,
+                PlanErrorKind::ModuleConstraint(failure.diagnostic),
+            )
+        })
+        .collect()
+}
+
 impl<'a> PlanPreprocessor<'a> {
     pub fn new(normalizer: &'a dyn ProviderNormalizer, ctx: &'a WiringContext) -> Self {
         Self { normalizer, ctx }
@@ -1071,16 +1241,36 @@ impl<'a> PlanPreprocessor<'a> {
     /// cannot canonicalize resources/states while silently skipping
     /// waits. `wait_bindings` is mutated in place; pass the same slice
     /// on to `create_plan`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn prepare(
         &self,
-        resources: &mut [Resource],
+        resources: &mut OverrideAwareResources,
+        resource_origins: &[Resource],
+        module_gate: &carina_core::executor::ModuleConstraintGate,
         current_states: &mut HashMap<ResourceId, State>,
         provider_configs: &[ProviderConfig],
-        data_sources: &[carina_core::resource::DataSource],
+        data_sources: &mut [DataSource],
+        data_source_origins: &[DataSource],
         wait_bindings: &mut [carina_core::parser::WaitBinding],
-    ) {
+    ) -> Result<(), Vec<PlanError>> {
         let schemas = self.ctx.schemas();
+        let mut errors = validate_resolved_value_constraints(
+            self.ctx,
+            resources.resources(),
+            resource_origins,
+            data_sources,
+            data_source_origins,
+        );
+        if let Err(error) = module_gate.check(resources.bindings()) {
+            errors.extend(module_constraint_plan_errors(error));
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        let resources = resources.resources_mut();
         carina_core::value::canonicalize_resources_with_schemas(resources, schemas);
+        carina_core::value::canonicalize_data_sources_with_schemas(data_sources, schemas);
 
         // RFC #2371 stage 2 + #2387: strip every attribute the WASM
         // provider boundary refuses to serialize — `Value::Deferred(DeferredValue::Unknown)`
@@ -1116,6 +1306,7 @@ impl<'a> PlanPreprocessor<'a> {
         // so target lookup is valid at this point.
         resolve_enum_aliases_in_wait_bindings(self.ctx, wait_bindings, resources, data_sources);
         restore_stripped_attributes(resources, stripped);
+        Ok(())
     }
 }
 
@@ -2352,6 +2543,8 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // resets it (Round-4 finding — see the reset after expansion below).
     let mut refresh_printed_bars = false;
     let mut deferred_data_source_ids: HashSet<ResourceId> = HashSet::new();
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
+    let mut refresh_module_constraint_errors = Vec::new();
 
     if refresh {
         RefreshProgress::start_header();
@@ -2485,6 +2678,15 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             .iter()
             .map(WaitAliasSpec::from)
             .collect();
+        let data_source_bindings = data_source_refresh_bindings(
+            &sorted_resources,
+            &parsed.compositions,
+            &data_sources,
+            &current_states,
+            remote_bindings,
+            ctx.schemas(),
+            &ds_wait_aliases,
+        );
         let data_source_refreshes = resolve_data_source_refs_for_refresh(
             &sorted_resources,
             &parsed.compositions,
@@ -2505,26 +2707,42 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 }
             }
         }
-        refresh_printed_bars |= !resolved_data_sources.is_empty();
+        if let Err(error) = module_gate.check(&data_source_bindings) {
+            refresh_module_constraint_errors.extend(module_constraint_plan_errors(error));
+        }
+        refresh_printed_bars |=
+            !resolved_data_sources.is_empty() && refresh_module_constraint_errors.is_empty();
         let phase2_results: Vec<Result<(ResourceId, State), AppError>> =
-            stream::iter(resolved_data_sources.iter())
-                .map(|resource| {
-                    let progress = RefreshProgress::begin_multi(&multi, &resource.id);
-                    let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
-                    async move {
-                        let mut state = read_data_source_with_retry(provider_ref, resource)
-                            .await
-                            .map_err(AppError::Provider)?;
-                        if let Some(deps) = dep_bindings {
-                            state.dependency_bindings = deps;
+            if refresh_module_constraint_errors.is_empty() {
+                stream::iter(resolved_data_sources.iter())
+                    .map(|resource| {
+                        let progress = RefreshProgress::begin_multi(&multi, &resource.id);
+                        let dep_bindings = saved_dep_bindings.get(&resource.id).cloned();
+                        let data_source_bindings = &data_source_bindings;
+                        let module_gate = &module_gate;
+                        async move {
+                            let mut state = read_data_source_with_retry(
+                                provider_ref,
+                                resource,
+                                data_source_bindings,
+                                module_gate,
+                                ctx.factories(),
+                                ctx.schemas(),
+                            )
+                            .await?;
+                            if let Some(deps) = dep_bindings {
+                                state.dependency_bindings = deps;
+                            }
+                            progress.finish();
+                            Ok((resource.id.clone(), state))
                         }
-                        progress.finish();
-                        Ok((resource.id.clone(), state))
-                    }
-                })
-                .buffer_unordered(5)
-                .collect()
-                .await;
+                    })
+                    .buffer_unordered(5)
+                    .collect()
+                    .await
+            } else {
+                Vec::new()
+            };
         for result in phase2_results {
             let (id, state) = result?;
             current_states.insert(id, state);
@@ -2730,28 +2948,61 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // Resolve and canonicalize only refresh-time data sources. Deferred
     // reads keep their original input refs so the plan/executor dependency
     // graph still contains the upstream create edge.
-    let data_sources_for_plan = prepare_data_sources_for_plan(
+    let mut data_sources_for_plan = prepare_data_sources_for_plan(
         &data_sources,
         &deferred_data_source_ids,
         override_aware_resources.bindings(),
         Some(&upstream_binding_names),
-        ctx.schemas(),
     )?;
+    let constraint_origin_resources = override_aware_resources
+        .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
+    let prepared_compositions = parsed.compositions.clone();
 
     // Run the normalization pipeline: normalize_desired → normalize_state →
     // merge_default_tags → resolve_enum_aliases (resources, states, and
     // wait `until` predicates — carina#3358). Order matters.
     let mut wait_bindings = parsed.wait_bindings.clone();
     let preprocessor = PlanPreprocessor::new(&provider, ctx);
-    preprocessor
-        .prepare(
-            override_aware_resources.resources_mut(),
-            &mut current_states,
-            &parsed.providers,
-            &data_sources_for_plan,
-            &mut wait_bindings,
-        )
-        .await;
+    let preparation = if refresh_module_constraint_errors.is_empty() {
+        preprocessor
+            .prepare(
+                &mut override_aware_resources,
+                &constraint_origin_resources,
+                &module_gate,
+                &mut current_states,
+                &parsed.providers,
+                &mut data_sources_for_plan,
+                &data_sources,
+                &mut wait_bindings,
+            )
+            .await
+    } else {
+        Err(refresh_module_constraint_errors)
+    };
+    if let Err(errors) = preparation {
+        let mut plan = Plan::new();
+        for error in errors {
+            plan.add_error(error);
+        }
+        let moved_origins = moved_pairs
+            .iter()
+            .map(|(from, to)| (to.clone(), from.clone()))
+            .collect();
+        return Ok(PlanContext {
+            plan,
+            provider,
+            sorted_resources: constraint_origin_resources.clone(),
+            unresolved_resources: constraint_origin_resources,
+            compositions: prepared_compositions,
+            data_sources: data_sources_for_plan,
+            current_states,
+            moved_origins,
+            upstream_snapshot: remote_bindings.clone(),
+            prev_explicit,
+            residual_deferred_for,
+            expansion_trace: parsed.expansion_trace.clone(),
+        });
+    }
 
     // Anonymous resources whose identity attributes include ResourceRefs can
     // only be named and matched after plan-time refs and provider normalization
@@ -2836,12 +3087,12 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         .collect();
     let paired_unresolved_resources = override_aware_resources
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
-
     Ok(PlanContext {
         plan,
         provider,
         sorted_resources: paired_unresolved_resources.clone(),
         unresolved_resources: paired_unresolved_resources,
+        compositions: prepared_compositions,
         data_sources: data_sources_for_plan,
         current_states,
         moved_origins,
@@ -3661,8 +3912,25 @@ pub(crate) fn finish_refresh_bar_region(started_bar: bool) {
 pub async fn read_data_source_with_retry(
     provider: &dyn Provider,
     resource: &carina_core::resource::DataSource,
-) -> Result<State, ProviderError> {
-    carina_core::executor::read_data_source_with_retry(provider, resource).await
+    bindings: &ResolvedBindings,
+    module_gate: &carina_core::executor::ModuleConstraintGate,
+    factories: &[Box<dyn carina_core::provider::ProviderFactory>],
+    schemas: &carina_core::schema::SchemaRegistry,
+) -> Result<State, AppError> {
+    let preparation = carina_core::executor::ProviderPreparationContext::new(
+        bindings,
+        module_gate,
+        &[],
+        &carina_core::provider::NoopNormalizer,
+        factories,
+        schemas,
+    );
+    let ready =
+        carina_core::executor::prepare_provider_ready_data_source(resource.clone(), &preparation)
+            .map_err(|source| AppError::from_resource_preparation(resource.id.clone(), source))?;
+    carina_core::executor::read_data_source_with_retry(provider, &ready)
+        .await
+        .map_err(AppError::Provider)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3693,18 +3961,15 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
     // carina#3248: unified pre-apply bindings include compositions so a
     // data-source input referencing `<module_instance>.<attr>` chains
     // through the composition layer to the managed sibling literal.
-    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+    let bindings = data_source_refresh_bindings(
         managed,
         compositions,
         data_sources,
-        current_states: &carina_core::resource::into_plan_input_map(
-            current_states.clone(),
-            schemas,
-            managed,
-        ),
+        current_states,
         remote_bindings,
+        schemas,
         wait_aliases,
-    });
+    );
     let deferred =
         classify_apply_time_data_source_read_inputs(data_sources, managed, current_states);
 
@@ -3740,6 +4005,29 @@ pub(crate) fn resolve_data_source_refs_for_refresh(
     }
 
     Ok(resolutions)
+}
+
+pub(crate) fn data_source_refresh_bindings(
+    managed: &[Resource],
+    compositions: &[carina_core::resource::Composition],
+    data_sources: &[DataSource],
+    current_states: &HashMap<ResourceId, State>,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    schemas: &carina_core::schema::SchemaRegistry,
+    wait_aliases: &[WaitAliasSpec],
+) -> ResolvedBindings {
+    ResolvedBindings::pre_apply(PreApplyInputs {
+        managed,
+        compositions,
+        data_sources,
+        current_states: &carina_core::resource::into_plan_input_map(
+            current_states.clone(),
+            schemas,
+            managed,
+        ),
+        remote_bindings,
+        wait_aliases,
+    })
 }
 
 /// Classify data-source reads that must run after apply-time publication.
@@ -3904,7 +4192,6 @@ pub(crate) fn prepare_data_sources_for_plan(
     deferred_data_source_ids: &HashSet<ResourceId>,
     bindings: &ResolvedBindings,
     unresolved_upstream_bindings: Option<&std::collections::HashSet<&str>>,
-    schemas: &SchemaRegistry,
 ) -> Result<Vec<DataSource>, AppError> {
     let mut prepared = Vec::with_capacity(data_sources.len());
     for resource in data_sources {
@@ -3924,10 +4211,6 @@ pub(crate) fn prepare_data_sources_for_plan(
                 )
                 .map_err(AppError::Validation)?;
             }
-            carina_core::value::canonicalize_data_sources_with_schemas(
-                std::slice::from_mut(&mut resource),
-                schemas,
-            );
         }
         prepared.push(resource);
     }

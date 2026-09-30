@@ -348,3 +348,24 @@ arguments {
   }
 }
 ```
+
+The condition in an argument's `validation` block may reference only that
+argument. To compare two or more module arguments, use a module-level
+`require` statement:
+
+```crn
+arguments {
+  min_size: Int
+  max_size: Int
+}
+
+require min_size <= max_size, 'min_size must not exceed max_size'
+```
+
+Validate expressions are evaluated when their referenced values become known.
+Literal arguments are checked during validation; reference values are checked
+during planning or, for values produced by an upstream effect, during apply
+before a provider operation consumes the known value. Inputs that remain
+unresolved at the end of an otherwise successful apply are reported as an
+error. See [Modules: When Constraints Run](/reference/dsl/modules/#when-constraints-run)
+for the complete module and resource-schema timing rules.

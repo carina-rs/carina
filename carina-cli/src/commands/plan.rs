@@ -105,6 +105,12 @@ pub struct PlanFile {
     /// bindings.
     #[serde(default)]
     pub data_sources: Vec<carina_core::resource::DataSource>,
+    /// Authored, pre-normalization counterparts of `data_sources`, paired by
+    /// index and rewritten to the resolved IDs above. Apply uses these to
+    /// derive which input attributes became known at runtime without
+    /// rechecking canonicalized literals as authored values.
+    #[serde(default)]
+    pub data_source_origins: Vec<carina_core::resource::DataSource>,
     /// Current states (for binding_map + state saving)
     pub current_states: Vec<CurrentStateEntry>,
     /// `upstream_state` bindings as resolved at plan time (#2303).
@@ -138,7 +144,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 10;
+    pub const CURRENT_VERSION: u32 = 11;
 
     pub(crate) fn validate_replace_display(&self) -> Result<(), String> {
         let effects = self.plan.effects();
@@ -303,6 +309,11 @@ fn build_plan_file<E>(
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
 ) -> Result<PlanFile, carina_core::value::SerializationError> {
+    assert_eq!(
+        ctx.data_sources.len(),
+        parsed.data_sources.len(),
+        "plan data sources must stay paired with their authored origins"
+    );
     let source_path = path
         .canonicalize()
         .unwrap_or_else(|_| path.to_path_buf())
@@ -310,6 +321,12 @@ fn build_plan_file<E>(
         .to_string();
 
     Ok(PlanFile {
+        // carina#3805: bumped 10→11 — `compositions` stores the pending module
+        // constraints required by apply, and `data_source_origins` preserves
+        // the authored input paired with each canonical plan-time data source
+        // so apply can validate only values that become known at runtime. A
+        // v10 plan can enforce neither provider-boundary guarantee.
+        //
         // Phase 9: bumped 8→9 — `data_sources` now stores the exact
         // differ/executor view: resolved refresh-time reads and unresolved
         // apply-time reads. Older v8 files may have serialized deferred reads
@@ -354,7 +371,7 @@ fn build_plan_file<E>(
             .iter()
             .map(redact_secrets_in_resource)
             .collect::<Result<Vec<_>, _>>()?,
-        compositions: parsed
+        compositions: ctx
             .compositions
             .iter()
             .map(carina_core::value::redact_secrets_in_virtual)
@@ -363,6 +380,16 @@ fn build_plan_file<E>(
             .data_sources
             .iter()
             .map(carina_core::value::redact_secrets_in_data_source)
+            .collect::<Result<Vec<_>, _>>()?,
+        data_source_origins: ctx
+            .data_sources
+            .iter()
+            .zip(&parsed.data_sources)
+            .map(|(resolved, authored)| {
+                let mut authored = authored.clone();
+                authored.id = resolved.id.clone();
+                carina_core::value::redact_secrets_in_data_source(&authored)
+            })
             .collect::<Result<Vec<_>, _>>()?,
         current_states: ctx
             .current_states
@@ -1772,8 +1799,12 @@ exports { region: String = "ap-northeast-1" }"#,
 #[cfg(test)]
 mod run_plan_out_tests {
     use super::*;
+    use carina_core::parser::{CompareOp, TypeExpr, ValidateExpr};
     use carina_core::provider::ProviderRouter;
-    use carina_core::resource::{AccessPath, DataSource, DeferredValue, Value};
+    use carina_core::resource::{
+        AccessPath, Composition, CompositionArgument, DataSource, DeferredValue,
+        ModuleConstraintId, PendingModuleConstraint, ResourceId, Signature, Value,
+    };
     use std::fs;
 
     // Pin the byte-level shape so plan files written by `plan --out`
@@ -1849,6 +1880,7 @@ mod run_plan_out_tests {
             provider: ProviderRouter::new(),
             sorted_resources: Vec::new(),
             unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
             data_sources: vec![deferred_data_source],
             current_states: HashMap::new(),
             moved_origins: HashMap::new(),
@@ -1867,6 +1899,79 @@ mod run_plan_out_tests {
         assert!(
             matches!(saved, Value::Deferred(DeferredValue::ResourceRef { .. })),
             "saved plans must preserve deferred data-source refs for apply --plan, got {saved:?}"
+        );
+        assert_eq!(
+            plan_file.data_source_origins[0].get_attr("name_regex"),
+            Some(&Value::Concrete(
+                carina_core::resource::ConcreteValue::String("^target$".to_string())
+            )),
+            "saved plans must separately preserve the authored pre-normalization input"
+        );
+    }
+
+    #[test]
+    fn saved_plan_file_persists_prepared_pending_module_constraints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("main.crn");
+        fs::write(&path, "provider mock {}\n").unwrap();
+
+        let mut arguments = indexmap::IndexMap::new();
+        arguments.insert(
+            "name".to_string(),
+            CompositionArgument::from_value(
+                Value::resource_ref("producer", "name", vec![]),
+                TypeExpr::String,
+            ),
+        );
+        let prepared = Composition {
+            id: ResourceId::with_identity("_virtual", "checked"),
+            signature: Signature {
+                arguments,
+                attributes: indexmap::IndexMap::new(),
+                pending_constraints: vec![PendingModuleConstraint {
+                    id: ModuleConstraintId::argument_validation("name", 0),
+                    expression: ValidateExpr::Compare {
+                        lhs: Box::new(ValidateExpr::Var("name".to_string())),
+                        op: CompareOp::Ne,
+                        rhs: Box::new(ValidateExpr::String("bad".to_string())),
+                    },
+                    message: "name must not be bad".to_string(),
+                }],
+            },
+            binding: Some("checked".to_string()),
+            dependency_bindings: Default::default(),
+            module_name: "checked_module".to_string(),
+            instance: "root.checked".to_string(),
+            provenance: Default::default(),
+            quoted_string_attrs: Default::default(),
+        };
+        let parsed = carina_core::parser::ParsedFile::default();
+        let ctx = crate::wiring::PlanContext {
+            plan: Plan::new(),
+            provider: ProviderRouter::new(),
+            sorted_resources: Vec::new(),
+            unresolved_resources: Vec::new(),
+            compositions: vec![prepared],
+            data_sources: Vec::new(),
+            current_states: HashMap::new(),
+            moved_origins: HashMap::new(),
+            upstream_snapshot: HashMap::new(),
+            prev_explicit: HashMap::new(),
+            residual_deferred_for: Vec::new(),
+            expansion_trace: carina_core::resource::ExpansionTrace::new(),
+        };
+
+        let plan_file = build_plan_file(&path, &parsed, None, &None, &ctx)
+            .expect("saved plan should serialize prepared compositions");
+
+        assert_eq!(plan_file.compositions.len(), 1);
+        assert_eq!(
+            plan_file.compositions[0]
+                .signature
+                .pending_constraints
+                .len(),
+            1,
+            "the prepared pending constraint must survive into the plan file"
         );
     }
 }

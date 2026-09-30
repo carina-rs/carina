@@ -5,25 +5,47 @@ use std::path::PathBuf;
 
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
-    CreateRequest, DeleteRequest, PatchOp, PatchOpKind, Provider, ProviderFactory, ReadRequest,
-    UpdatePatch, UpdateRequest,
+    CreateRequest, DeleteRequest, Provider, ProviderFactory, ReadRequest, UpdateRequest,
 };
-use carina_core::resource::{
-    ConcreteValue, DataSource, ResolvedResource, Resource, ResourceId, Value,
-};
+use carina_core::resource::{ConcreteValue, DataSource, Resource, ResourceId, State, Value};
 use carina_plugin_host::WasmProviderFactory;
 
-async fn normalized_for_test(resource: Resource) -> ResolvedResource {
-    let normalized = carina_core::executor::normalized::apply_desired_normalization(
-        resource,
+async fn create_request_for_test(resource: Resource) -> CreateRequest {
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+    let schemas = carina_core::schema::SchemaRegistry::new();
+    let preparation = carina_core::executor::ProviderPreparationContext::new(
+        &bindings,
+        &module_gate,
         &[],
         &carina_core::provider::NoopNormalizer,
         &[],
-        &carina_core::schema::SchemaRegistry::new(),
-    )
-    .await;
-    carina_core::executor::resolve_normalized_for_provider(normalized)
-        .expect("test resource should be fully resolved")
+        &schemas,
+    );
+    carina_core::executor::prepare_create_request(resource, &preparation)
+        .await
+        .expect("test resource should pass checked create preparation")
+}
+
+async fn update_request_for_test(
+    resource: Resource,
+    from: State,
+    changed_attributes: &[String],
+) -> UpdateRequest {
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+    let schemas = carina_core::schema::SchemaRegistry::new();
+    let preparation = carina_core::executor::ProviderPreparationContext::new(
+        &bindings,
+        &module_gate,
+        &[],
+        &carina_core::provider::NoopNormalizer,
+        &[],
+        &schemas,
+    );
+    carina_core::executor::prepare_update_request(resource, from, changed_attributes, &preparation)
+        .await
+        .expect("test resource should pass checked update preparation")
 }
 
 fn wasm_path() -> Option<PathBuf> {
@@ -116,12 +138,7 @@ async fn test_wasm_mock_provider_create_and_read() {
     ]);
 
     let created = provider
-        .create(
-            &id,
-            CreateRequest {
-                resource: normalized_for_test(resource.clone()).await,
-            },
-        )
+        .create(&id, create_request_for_test(resource.clone()).await)
         .await
         .expect("create should succeed")
         .into_state_for_writeback();
@@ -185,12 +202,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     ]);
 
     let created = provider
-        .create(
-            &id,
-            CreateRequest {
-                resource: normalized_for_test(resource.clone()).await,
-            },
-        )
+        .create(&id, create_request_for_test(resource.clone()).await)
         .await
         .expect("create should succeed")
         .into_state_for_writeback();
@@ -199,33 +211,22 @@ async fn test_wasm_mock_provider_update_and_delete() {
         Some(&Value::Concrete(ConcreteValue::String("red".into())))
     );
 
-    // Build an UpdatePatch describing the user's intended changes
-    // (color: red→blue, size: 10→20). Both ops are Replace because
-    // they exist in `from`.
-    let patch = UpdatePatch {
-        ops: vec![
-            PatchOp {
-                kind: PatchOpKind::Replace,
-                key: "color".to_string(),
-                value: Some(Value::Concrete(ConcreteValue::String("blue".into()))),
-            },
-            PatchOp {
-                kind: PatchOpKind::Replace,
-                key: "size".to_string(),
-                value: Some(Value::Concrete(ConcreteValue::Int(20))),
-            },
-        ],
-    };
+    // Prepare the desired resource through the checked core seam. Both ops
+    // become Replace because the attributes exist in `from`.
+    resource.set_attr(
+        "color",
+        Value::Concrete(ConcreteValue::String("blue".into())),
+    );
+    resource.set_attr("size", Value::Concrete(ConcreteValue::Int(20)));
+    let request = update_request_for_test(
+        resource,
+        created.clone(),
+        &["color".to_string(), "size".to_string()],
+    )
+    .await;
 
     let updated = provider
-        .update(
-            &id,
-            "mock-id",
-            UpdateRequest {
-                from: created.clone(),
-                patch,
-            },
-        )
+        .update(&id, "mock-id", request)
         .await
         .expect("update should succeed")
         .into_state_for_writeback();
@@ -459,6 +460,20 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
             Value::Concrete(ConcreteValue::String("alice@example.com".into())),
         ),
     ]);
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+    let schemas = carina_core::schema::SchemaRegistry::new();
+    let preparation = carina_core::executor::ProviderPreparationContext::new(
+        &bindings,
+        &module_gate,
+        &[],
+        &carina_core::provider::NoopNormalizer,
+        &[],
+        &schemas,
+    );
+    let resource =
+        carina_core::executor::prepare_provider_ready_data_source(resource, &preparation)
+            .expect("data-source request should pass the checked host boundary");
 
     let state = provider
         .read_data_source(&resource)

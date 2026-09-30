@@ -8,7 +8,7 @@
 use crate::parser::{ParseError, Rule, ValidateExpr, first_inner, next_pair};
 
 /// Comparison operator used inside [`ValidateExpr::Compare`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CompareOp {
     Gte,
     Lte,

@@ -275,6 +275,7 @@ mod tests {
             signature: Signature {
                 arguments: IndexMap::new(),
                 attributes,
+                pending_constraints: Vec::new(),
             },
             binding: Some("v".to_string()),
             dependency_bindings: dep_bindings,

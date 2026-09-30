@@ -1,0 +1,5 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+fixture.test.Consumer.consumer: resolved value constraint failed for attribute(s) `target` from reference(s) `producer.value`: Invalid value 'bad-value' for 'target': does not match required pattern /^good-/

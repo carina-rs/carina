@@ -32,7 +32,7 @@ use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::create_plan;
 use carina_core::executor::{
     DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
-    UnresolvedResource, execute_plan,
+    ProviderCheckInputs, UnresolvedResource, execute_plan,
 };
 use carina_core::module_resolver::resolve_modules;
 use carina_core::parser::ProviderContext;
@@ -96,7 +96,7 @@ impl Provider for MockProvider {
 
     fn read_data_source(
         &self,
-        resource: &carina_core::resource::DataSource,
+        resource: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = resource.id.clone();
         Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
@@ -310,7 +310,10 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let schemas = carina_core::schema::SchemaRegistry::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &unresolved_resources,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved_resources,
+            data_source_origins: &[],
+        },
         compositions: &[],
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         current_states,
@@ -475,7 +478,10 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let schemas = carina_core::schema::SchemaRegistry::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &unresolved_resources,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved_resources,
+            data_source_origins: &[],
+        },
         compositions: &[],
         bindings: carina_core::binding_index::ResolvedBindings::default(),
         current_states,

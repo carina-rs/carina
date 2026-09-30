@@ -189,13 +189,29 @@ fn walk_custom_lookup_on_path<'a>(
     errors: &mut Vec<TypeError>,
     visited_refs: &mut Vec<&'a str>,
 ) {
+    // `Secret` is a sensitivity wrapper, not an unresolved value. Providers
+    // may validate the plaintext, but diagnostics crossing back out of this
+    // boundary must discard every user-derived value/message.
+    if let Value::Deferred(DeferredValue::Secret(inner)) = value {
+        let mut secret_errors = Vec::new();
+        walk_custom_lookup_on_path(
+            attr_type,
+            inner,
+            attr_name,
+            lookup,
+            defs,
+            &mut secret_errors,
+            visited_refs,
+        );
+        errors.extend(secret_errors.into_iter().map(TypeError::masked_for_secret));
+        return;
+    }
     // Skip deferred-resolution values — same convention as
     // `AttrTypeKind::validate`, plus `ResourceRef` / `Interpolation`
     // which only resolve to a concrete string at apply time.
     if matches!(
         value,
         Value::Deferred(DeferredValue::FunctionCall { .. })
-            | Value::Deferred(DeferredValue::Secret(_))
             | Value::Deferred(DeferredValue::ResourceRef { .. })
             | Value::Deferred(DeferredValue::Interpolation(_))
             | Value::Deferred(DeferredValue::Unknown(_))
@@ -1221,6 +1237,16 @@ impl Schema {
         out: &mut Vec<(FieldPath, TypeError)>,
         visited_refs: &mut Vec<&'a str>,
     ) {
+        if let Value::Deferred(DeferredValue::Secret(inner)) = value {
+            let mut secret_errors = Vec::new();
+            self.collect_attr_into_on_path(attr, path, inner, &mut secret_errors, visited_refs);
+            out.extend(
+                secret_errors
+                    .into_iter()
+                    .map(|(path, error)| (path, error.masked_for_secret())),
+            );
+            return;
+        }
         // Peel Ref so the downstream arms never have to think about it.
         if matches!(&attr.kind, AttrTypeKind::Ref(_)) {
             match resolve_refs_on_path(attr, &self.defs, visited_refs) {
@@ -1366,6 +1392,11 @@ impl Schema {
         value: &Value,
         visited_refs: &mut Vec<&'a str>,
     ) -> Result<(), TypeError> {
+        if let Value::Deferred(DeferredValue::Secret(inner)) = value {
+            return self
+                .validate_attr_on_path(attr, inner, visited_refs)
+                .map_err(TypeError::masked_for_secret);
+        }
         match &attr.kind {
             AttrTypeKind::Ref(_) => {
                 let resolution = resolve_refs_on_path(attr, &self.defs, visited_refs)
@@ -2331,10 +2362,12 @@ impl AttributeType {
     /// Top-level dispatcher (Phase 2 of RFC #2972):
     /// 1. Project `value` through `Value::as_concrete()`. Deferred-axis
     ///    values (`ResourceRef`, `BindingRef`, `Interpolation`,
-    ///    `FunctionCall`, `Secret`, `Unknown`) return `None` and are
-    ///    accepted unconditionally — type fitness for those is the
-    ///    unified deferred-reference validation's job
-    ///    (`BindingIndex::ref_type`, `validate_resource_ref_types`).
+    ///    `FunctionCall`, `Unknown`) return `None` and are accepted
+    ///    unconditionally — type fitness for those is the unified
+    ///    deferred-reference validation's job (`BindingIndex::ref_type`,
+    ///    `validate_resource_ref_types`). `Secret` is peeled first: it is a
+    ///    sensitivity wrapper whose known inner value is validated here, with
+    ///    any resulting diagnostic masked.
     /// 2. Dispatch the projected `ConcreteValueRef<'_>` to the
     ///    per-variant helper. Helpers cannot receive deferred values by
     ///    construction — the projection is the single place that filter
@@ -2345,6 +2378,9 @@ impl AttributeType {
     /// independently re-projected. Lists may legitimately mix concrete
     /// and deferred elements (e.g. `[vpc.id, "literal"]`).
     pub(crate) fn validate(&self, value: &Value) -> Result<(), TypeError> {
+        if let Value::Deferred(DeferredValue::Secret(inner)) = value {
+            return self.validate(inner).map_err(TypeError::masked_for_secret);
+        }
         // `Ref` cannot be resolved without a `Schema` context. Callers
         // who hold a schema that contains `Ref` must go through
         // `Schema::validate` / `Schema::validate_attr`; falling through
@@ -4694,6 +4730,125 @@ pub enum TypeError {
 }
 
 impl TypeError {
+    /// Remove user-authored data from an error produced while validating the
+    /// contents of a [`DeferredValue::Secret`]. Structured schema context is
+    /// retained, while free-form validator messages are replaced wholesale
+    /// because providers and custom validators may echo the plaintext.
+    #[must_use]
+    fn masked_for_secret(self) -> Self {
+        const MASK: &str = "(secret)";
+        const MASKED_MESSAGE: &str = "(secret) failed validation";
+
+        match self {
+            TypeError::InvalidEnumVariant {
+                attribute,
+                type_name,
+                expected,
+                ..
+            } => TypeError::InvalidEnumVariant {
+                value: MASK.to_string(),
+                attribute,
+                type_name,
+                expected,
+            },
+            TypeError::PatternMismatch {
+                pattern,
+                attribute,
+                type_name,
+                ..
+            } => TypeError::PatternMismatch {
+                value: MASK.to_string(),
+                pattern,
+                attribute,
+                type_name,
+            },
+            TypeError::LengthOutOfRange {
+                length,
+                min,
+                max,
+                attribute,
+                type_name,
+                ..
+            } => TypeError::LengthOutOfRange {
+                value: MASK.to_string(),
+                length,
+                min,
+                max,
+                attribute,
+                type_name,
+            },
+            TypeError::StringLiteralExpectedEnum {
+                attribute,
+                type_name,
+                expected,
+                extra_message,
+                ..
+            } => TypeError::StringLiteralExpectedEnum {
+                user_typed: MASK.to_string(),
+                attribute,
+                type_name,
+                expected,
+                extra_message: extra_message.map(|_| MASKED_MESSAGE.to_string()),
+            },
+            TypeError::ValidationFailed { .. } => TypeError::ValidationFailed {
+                message: MASKED_MESSAGE.to_string(),
+            },
+            TypeError::ResourceValidationFailed { attribute, .. } => {
+                TypeError::ResourceValidationFailed {
+                    message: MASKED_MESSAGE.to_string(),
+                    attribute,
+                }
+            }
+            TypeError::UnknownAttribute { .. } => TypeError::UnknownAttribute {
+                name: MASK.to_string(),
+                suggestion: None,
+            },
+            TypeError::UnknownStructField { struct_name, .. } => TypeError::UnknownStructField {
+                struct_name,
+                field: MASK.to_string(),
+                suggestion: None,
+            },
+            TypeError::UnionStructMismatch {
+                reason,
+                alternatives,
+                ..
+            } => TypeError::UnionStructMismatch {
+                reason: match reason {
+                    UnionStructMismatchReason::ConflictingAlternatives => {
+                        UnionStructMismatchReason::ConflictingAlternatives
+                    }
+                    UnionStructMismatchReason::NoAlternativeSatisfied { .. } => {
+                        UnionStructMismatchReason::NoAlternativeSatisfied {
+                            unrecognized_fields: vec![MASK.to_string()],
+                        }
+                    }
+                },
+                supplied_fields: Vec::new(),
+                alternatives,
+            },
+            TypeError::ListItemError { index, inner } => TypeError::ListItemError {
+                index,
+                inner: Box::new(inner.masked_for_secret()),
+            },
+            TypeError::MapKeyError { inner, .. } => TypeError::MapKeyError {
+                key: MASK.to_string(),
+                inner: Box::new(inner.masked_for_secret()),
+            },
+            TypeError::MapValueError { inner, .. } => TypeError::MapValueError {
+                key: MASK.to_string(),
+                inner: Box::new(inner.masked_for_secret()),
+            },
+            TypeError::StructFieldError { inner, .. } => TypeError::StructFieldError {
+                field: MASK.to_string(),
+                inner: Box::new(inner.masked_for_secret()),
+            },
+            TypeError::TypeMismatch { .. }
+            | TypeError::MissingRequired { .. }
+            | TypeError::ReadOnlyAttribute { .. }
+            | TypeError::BlockSyntaxNotAllowed { .. } => self,
+        }
+    }
+
     /// Attach an attribute name to errors whose diagnostics include an
     /// attribute context; other variants return `self` unchanged.
     ///
@@ -5205,6 +5360,44 @@ pub const WAIT_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// for `aws_acm_certificate_validation`.
 pub const WAIT_DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
+fn reveal_secret_value_for_validation(value: &Value) -> Value {
+    match value {
+        Value::Deferred(DeferredValue::Secret(inner)) => reveal_secret_value_for_validation(inner),
+        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
+            items
+                .iter()
+                .map(reveal_secret_value_for_validation)
+                .collect(),
+        )),
+        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
+            map.iter()
+                .map(|(key, value)| (key.clone(), reveal_secret_value_for_validation(value)))
+                .collect(),
+        )),
+        other => other.clone(),
+    }
+}
+
+fn run_resource_validator(
+    validator: ResourceValidator,
+    attributes: &HashMap<String, Value>,
+) -> Result<(), Vec<TypeError>> {
+    if attributes.values().any(crate::value::contains_secret) {
+        let revealed = attributes
+            .iter()
+            .map(|(name, value)| (name.clone(), reveal_secret_value_for_validation(value)))
+            .collect();
+        validator(&revealed).map_err(|errors| {
+            errors
+                .into_iter()
+                .map(TypeError::masked_for_secret)
+                .collect()
+        })
+    } else {
+        validator(attributes)
+    }
+}
+
 impl ResourceSchema {
     pub fn new(resource_type: impl Into<String>) -> Self {
         Self {
@@ -5565,6 +5758,82 @@ impl ResourceSchema {
         self.validate_inner(attributes, is_string_literal, lookup)
     }
 
+    /// Validate constraints on values that are currently known.
+    ///
+    /// Unlike [`Self::validate_with_origins_and_lookup`], this entry point
+    /// deliberately omits shape-of-resource checks that were already made
+    /// when the source was expanded: required attributes, unknown
+    /// attributes, provider-populated attributes, and exclusive-required
+    /// groups. It is intended for a later resolution boundary, where a value
+    /// that was deferred during expansion may have become concrete.
+    ///
+    /// Deferred leaves are ignored while concrete siblings in the same
+    /// collection are still checked. The resource validator is re-run because
+    /// it may express cross-attribute value constraints.
+    pub fn validate_known_values_with_origins_and_lookup(
+        &self,
+        attributes: &HashMap<String, Value>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+    ) -> Result<(), Vec<TypeError>> {
+        let mut errors = self.validate_value_entries(
+            attributes,
+            is_string_literal,
+            lookup,
+            ValueEntryValidation::KnownWritableOnly,
+            None,
+        );
+
+        if let Some(validator) = self.validator
+            && let Err(mut validation_errors) = run_resource_validator(validator, attributes)
+        {
+            errors.append(&mut validation_errors);
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Validate only the attributes whose values became known at the current
+    /// resolution boundary.
+    ///
+    /// `attributes` is still the complete authored-value view so a resource
+    /// validator can evaluate cross-attribute rules. Per-attribute schema and
+    /// provider custom-type checks are restricted to `selected`; every other
+    /// value was checked at an earlier boundary and may now be in a normalized
+    /// representation that intentionally differs from the authored form.
+    pub(crate) fn validate_selected_known_values_with_origins_and_lookup(
+        &self,
+        attributes: &HashMap<String, Value>,
+        selected: &HashSet<String>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+    ) -> Result<(), Vec<TypeError>> {
+        let mut errors = self.validate_value_entries(
+            attributes,
+            is_string_literal,
+            lookup,
+            ValueEntryValidation::KnownWritableOnly,
+            Some(selected),
+        );
+
+        if !selected.is_empty()
+            && let Some(validator) = self.validator
+            && let Err(mut validation_errors) = run_resource_validator(validator, attributes)
+        {
+            errors.append(&mut validation_errors);
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     fn validate_inner(
         &self,
         attributes: &HashMap<String, Value>,
@@ -5579,6 +5848,46 @@ impl ResourceSchema {
                 errors.push(TypeError::MissingRequired { name: name.clone() });
             }
         }
+
+        errors.extend(self.validate_value_entries(
+            attributes,
+            is_string_literal,
+            lookup,
+            ValueEntryValidation::FullInput,
+            None,
+        ));
+
+        // Evaluate declarative exclusive-required groups (WASM-safe).
+        for group in &self.exclusive_required {
+            let refs: Vec<&str> = group.iter().map(|s| s.as_str()).collect();
+            if let Err(mut e) = validators::validate_exclusive_required(attributes, &refs) {
+                errors.append(&mut e);
+            }
+        }
+
+        // Run custom validator if present
+        if let Some(validator) = self.validator
+            && let Err(mut validation_errors) = run_resource_validator(validator, attributes)
+        {
+            errors.append(&mut validation_errors);
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    fn validate_value_entries(
+        &self,
+        attributes: &HashMap<String, Value>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+        mode: ValueEntryValidation,
+        selected: Option<&HashSet<String>>,
+    ) -> Vec<TypeError> {
+        let mut errors = Vec::new();
 
         // Build block_name -> canonical_name map for alias resolution
         let bn_map = self.block_name_map();
@@ -5609,6 +5918,10 @@ impl ResourceSchema {
                 continue;
             }
 
+            if selected.is_some_and(|selected| !selected.contains(name)) {
+                continue;
+            }
+
             // Resolve block_name alias to canonical name
             let canonical = bn_map.get(name).map(|s| s.as_str()).unwrap_or(name);
 
@@ -5616,7 +5929,7 @@ impl ResourceSchema {
                 // `read_only` attributes are provider-populated, so accepting a user
                 // value would silently drop it. Reject before type checking so the
                 // diagnostic reports writability instead of a confusing type error.
-                if schema.is_read_only() {
+                if schema.is_read_only() && mode == ValueEntryValidation::FullInput {
                     errors.push(TypeError::ReadOnlyAttribute { name: name.clone() });
                     continue;
                 }
@@ -5641,7 +5954,7 @@ impl ResourceSchema {
                     &self.defs,
                     &mut errors,
                 );
-            } else {
+            } else if mode == ValueEntryValidation::FullInput {
                 let suggestion = suggest_similar_name(name, &known);
                 errors.push(TypeError::UnknownAttribute {
                     name: name.clone(),
@@ -5650,27 +5963,14 @@ impl ResourceSchema {
             }
         }
 
-        // Evaluate declarative exclusive-required groups (WASM-safe).
-        for group in &self.exclusive_required {
-            let refs: Vec<&str> = group.iter().map(|s| s.as_str()).collect();
-            if let Err(mut e) = validators::validate_exclusive_required(attributes, &refs) {
-                errors.append(&mut e);
-            }
-        }
-
-        // Run custom validator if present
-        if let Some(validator) = self.validator
-            && let Err(mut validation_errors) = validator(attributes)
-        {
-            errors.append(&mut validation_errors);
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        errors
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ValueEntryValidation {
+    FullInput,
+    KnownWritableOnly,
 }
 
 /// Collect all attribute_name -> block_name mappings from all schemas.

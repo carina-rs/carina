@@ -6,8 +6,8 @@ use std::time::Duration;
 use crate::differ::{
     AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
 };
-use crate::provider::{PatchOp, PatchOpKind, UpdatePatch, build_update_patch};
-use crate::resource::{DataSource, ResolvedResource, Resource, ResourceId, State, Value};
+use crate::provider::{ProviderReadyResource, UpdatePatch, build_update_patch};
+use crate::resource::{DataSource, Resource, ResourceId, State, Value};
 use crate::schema::SchemaRegistry;
 use crate::value::SecretHashContext;
 
@@ -20,7 +20,7 @@ use super::wait::WaitOutcome;
 /// `changed_attributes` list is available.
 pub fn compute_full_diff_patch(
     from: &State,
-    to: &ResolvedResource,
+    to: &ProviderReadyResource,
     to_source: &Resource,
     schemas: &SchemaRegistry,
     resource_id: &ResourceId,
@@ -69,19 +69,6 @@ pub fn compute_full_diff_patch(
         })
         .collect();
     build_update_patch(&changed, to, from)
-}
-
-/// Build a single-attribute [`UpdatePatch`] when exactly one
-/// attribute should be patched.
-#[allow(dead_code)]
-pub(super) fn single_attribute_patch(key: String, value: Value) -> UpdatePatch {
-    UpdatePatch {
-        ops: vec![PatchOp {
-            kind: PatchOpKind::Replace,
-            key,
-            value: Some(value),
-        }],
-    }
 }
 
 /// Result of executing a single effect.

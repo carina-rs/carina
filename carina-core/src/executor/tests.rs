@@ -8,8 +8,8 @@ use crate::effect::{
 };
 use crate::plan::Plan;
 use crate::provider::{
-    BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError, ProviderResult,
-    ReadRequest, UpdateRequest,
+    BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError,
+    ProviderReadyDataSource, ProviderResult, ReadRequest, UpdateRequest,
 };
 use crate::resource::{
     AccessPath, ConcreteValue, DataSource, DeferredValue, Directives, ResolvedDataSource,
@@ -187,11 +187,14 @@ impl Provider for MockProvider {
         Box::pin(async move { result })
     }
 
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         self.data_source_reads
             .lock()
             .unwrap()
-            .push(resource.clone());
+            .push(resource.as_data_source().clone());
         self.read(&resource.id, None, ReadRequest)
     }
 
@@ -208,7 +211,7 @@ impl Provider for MockProvider {
         self.create_resources
             .lock()
             .unwrap()
-            .push(request.resource.as_resource().clone());
+            .push(request.resource().as_resource().clone());
         let result = self.create_results.lock().unwrap().remove(0);
         Box::pin(async move { result })
     }
@@ -316,6 +319,9 @@ fn format_execution_event(event: &ExecutionEvent<'_>) -> String {
         }
         ExecutionEvent::RefreshFailed { id, error } => {
             format!("refresh_fail:{}:{}", id, error)
+        }
+        ExecutionEvent::ModuleConstraintFailed { error } => {
+            format!("module_constraint_failed:{error}")
         }
     }
 }
@@ -652,7 +658,10 @@ static AUGMENT_COMPARISON_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
         .attribute(AttributeSchema::new("write_only_token", AttributeType::string()).write_only())
         .attribute(AttributeSchema::new(
             "master_password",
-            AttributeType::string(),
+            AttributeType::union(vec![
+                AttributeType::string(),
+                AttributeType::list(AttributeType::string()),
+            ]),
         ));
     reg.insert("test", schema);
     reg
@@ -833,7 +842,10 @@ impl Provider for DelayedCountingProvider {
         Box::pin(async { Err(ProviderError::internal("read not used")) })
     }
 
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         self.read(&resource.id, None, ReadRequest)
     }
 
@@ -942,7 +954,10 @@ impl Provider for PendingWaitProvider {
         })
     }
 
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         self.read(&resource.id, None, ReadRequest)
     }
 
@@ -1155,7 +1170,10 @@ impl Provider for PendingRefreshProvider {
         Box::pin(std::future::pending())
     }
 
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         self.read(&resource.id, None, ReadRequest)
     }
 
@@ -1239,7 +1257,10 @@ impl Provider for ControlledReadyCreateProvider {
         Box::pin(async { Err(ProviderError::internal("read not used")) })
     }
 
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         self.read(&resource.id, None, ReadRequest)
     }
 
@@ -1327,7 +1348,7 @@ async fn execute_plan_returns_completed_when_not_cancelled() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1353,6 +1374,1733 @@ async fn execute_plan_returns_completed_when_not_cancelled() {
     }
 }
 
+fn provider_boundary_constraint_schemas() -> SchemaRegistry {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test").attribute(AttributeSchema::new(
+            "target",
+            AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+        )),
+    );
+    schemas
+}
+
+fn deferred_child_constraint_schemas() -> SchemaRegistry {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test").attribute(AttributeSchema::new(
+            "value",
+            AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+        )),
+    );
+    schemas
+}
+
+fn deferred_data_source_constraint_schemas() -> SchemaRegistry {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("Lookup")
+            .as_data_source()
+            .attribute(AttributeSchema::new(
+                "filter",
+                AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+            )),
+    );
+    schemas
+}
+
+#[tokio::test]
+async fn invalid_resolved_create_value_never_reaches_provider() {
+    let provider = MockProvider::new();
+    let mut resource = make_resource("invalid-create", &[]);
+    resource.set_attr(
+        "target",
+        Value::Concrete(ConcreteValue::String("bad".to_string())),
+    );
+    let id = resource.id.clone();
+    let mut plan = Plan::new();
+    plan.add(create_effect(resource));
+    provider.push_create(Ok(ok_state(&id)));
+    let schemas = provider_boundary_constraint_schemas();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 1);
+    assert!(provider.calls().is_empty());
+}
+
+#[tokio::test]
+async fn invalid_secret_create_value_is_masked_and_never_reaches_provider() {
+    use crate::binding_index::BindingValueSource;
+
+    let plaintext = "apply-time-plaintext";
+    let provider = MockProvider::new();
+    let mut resource = make_resource("invalid-secret-create", &[]);
+    resource.set_attr(
+        "target",
+        Value::resource_ref("secret-source", "value", vec![]),
+    );
+    let id = resource.id.clone();
+    let unresolved = HashMap::from([(
+        id.clone(),
+        UnresolvedResource::from_pre_resolve(resource.clone()),
+    )]);
+    let mut bindings = ResolvedBindings::default();
+    bindings.set(
+        "secret-source",
+        HashMap::from([(
+            "value".to_string(),
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String(plaintext.to_string()),
+            )))),
+        )]),
+        BindingValueSource::Local,
+    );
+    let mut plan = Plan::new();
+    plan.add(create_effect(resource));
+    provider.push_create(Ok(ok_state(&id)));
+    let schemas = provider_boundary_constraint_schemas();
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved,
+            data_source_origins: &[],
+        },
+        compositions: &[],
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let events = observer.events().join("\n");
+
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 1);
+    assert!(provider.calls().is_empty());
+    assert!(events.contains("(secret)"), "events: {events}");
+    assert!(
+        !events.contains(plaintext),
+        "secret leaked in apply error: {events}"
+    );
+}
+
+struct MustNotNormalizeInvalidValue;
+
+impl crate::provider::ProviderNormalizer for MustNotNormalizeInvalidValue {
+    fn normalize_desired<'a>(
+        &'a self,
+        _resources: &'a mut [Resource],
+    ) -> crate::provider::BoxFuture<'a, ()> {
+        Box::pin(async { panic!("normalizer ran before the value-constraint gate") })
+    }
+
+    fn normalize_state<'a>(
+        &'a self,
+        _current_states: &'a mut HashMap<ResourceId, State>,
+    ) -> crate::provider::BoxFuture<'a, ()> {
+        crate::provider::ready_noop()
+    }
+
+    fn hydrate_read_state<'a>(
+        &'a self,
+        _current_states: &'a mut HashMap<ResourceId, State>,
+        _saved_attrs: &'a crate::provider::SavedAttrs,
+    ) -> crate::provider::BoxFuture<'a, ()> {
+        crate::provider::ready_noop()
+    }
+
+    fn merge_default_tags<'a>(
+        &'a self,
+        _resources: &'a mut [Resource],
+        _default_tags: &'a indexmap::IndexMap<String, Value>,
+        _registry: &'a crate::schema::SchemaRegistry,
+    ) -> crate::provider::BoxFuture<'a, ()> {
+        crate::provider::ready_noop()
+    }
+}
+
+#[tokio::test]
+async fn invalid_resolved_value_is_rejected_before_provider_normalization() {
+    let provider = MockProvider::new();
+    let mut resource = make_resource("invalid-before-normalize", &[]);
+    resource.set_attr(
+        "target",
+        Value::Concrete(ConcreteValue::String("bad".to_string())),
+    );
+    let mut plan = Plan::new();
+    plan.add(create_effect(resource));
+    let schemas = provider_boundary_constraint_schemas();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &MustNotNormalizeInvalidValue,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 1);
+    assert!(provider.calls().is_empty());
+}
+
+#[tokio::test]
+async fn invalid_resolved_update_value_never_reaches_provider() {
+    let provider = MockProvider::new();
+    let mut resource = make_resource("invalid-update", &[]);
+    resource.set_attr(
+        "target",
+        Value::Concrete(ConcreteValue::String("bad".to_string())),
+    );
+    let id = resource.id.clone();
+    let from = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "target".to_string(),
+            Value::Concrete(ConcreteValue::String("good-before".to_string())),
+        )]),
+    )
+    .with_identifier("id-123");
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        from: Box::new(from),
+        to: resolved(resource),
+        changed_attributes: vec!["target".to_string()],
+    });
+    provider.push_update(Ok(ok_state(&id)));
+    let schemas = provider_boundary_constraint_schemas();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 1);
+    assert!(provider.calls().is_empty());
+}
+
+#[tokio::test]
+async fn valid_checked_values_preserve_create_payload_and_update_patch() {
+    let provider = MockProvider::new();
+    let mut created = make_resource("valid-create", &[]);
+    let create_value = Value::Concrete(ConcreteValue::String("good-create".to_string()));
+    created.set_attr("target", create_value.clone());
+    let create_id = created.id.clone();
+
+    let mut updated = make_resource("valid-update", &[]);
+    let update_value = Value::Concrete(ConcreteValue::String("good-update".to_string()));
+    updated.set_attr("target", update_value.clone());
+    let update_id = updated.id.clone();
+    let from = State::existing(
+        update_id.clone(),
+        HashMap::from([(
+            "target".to_string(),
+            Value::Concrete(ConcreteValue::String("good-before".to_string())),
+        )]),
+    )
+    .with_identifier("id-123");
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(created));
+    plan.add(Effect::Update {
+        from: Box::new(from),
+        to: resolved(updated),
+        changed_attributes: vec!["target".to_string()],
+    });
+    provider.push_create(Ok(ok_state(&create_id)));
+    provider.push_update(Ok(ok_state(&update_id)));
+    let schemas = provider_boundary_constraint_schemas();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert_eq!(result.success_count, 2);
+    assert_eq!(result.failure_count, 0);
+    assert_eq!(
+        provider.captured_create_resources()[0].get_attr("target"),
+        Some(&create_value)
+    );
+    let requests = provider.captured_update_requests();
+    let target = requests[0]
+        .patch()
+        .ops
+        .iter()
+        .find(|op| op.key == "target")
+        .expect("valid target must remain in the update patch");
+    assert_eq!(target.value.as_ref(), Some(&update_value));
+}
+
+#[tokio::test]
+async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+
+    let provider = MockProvider::new();
+    let producer = make_resource("producer", &[]);
+    let producer_id = producer.id.clone();
+    let mut consumer = make_resource("consumer", &[]);
+    consumer.set_attr("target", Value::resource_ref("producer", "value", vec![]));
+    consumer.dependency_bindings.insert("producer".to_string());
+
+    provider.push_create(Ok(State::existing(
+        producer_id.clone(),
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("bad".to_string())),
+        )]),
+    )
+    .with_identifier("producer-id")));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(producer.clone()));
+    plan.add(create_effect(consumer.clone()));
+    let unresolved = HashMap::from([
+        (
+            producer.id.clone(),
+            UnresolvedResource::from_pre_resolve(producer.clone()),
+        ),
+        (
+            consumer.id.clone(),
+            UnresolvedResource::from_pre_resolve(consumer.clone()),
+        ),
+    ]);
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: &[producer, consumer],
+        compositions: &[],
+        data_sources: &[],
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+    let schemas = provider_boundary_constraint_schemas();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved,
+            data_source_origins: &[],
+        },
+        compositions: &[],
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert_eq!(result.success_count, 1);
+    assert_eq!(result.failure_count, 1);
+    assert_eq!(
+        provider.calls(),
+        vec![("create".to_string(), producer_id.to_string())]
+    );
+}
+
+#[tokio::test]
+async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+
+    let provider = MockProvider::new();
+    let producer = make_resource("producer-update", &[]);
+    let producer_id = producer.id.clone();
+    let mut unresolved_consumer = make_resource("consumer-update", &[]);
+    unresolved_consumer.set_attr(
+        "target",
+        Value::resource_ref("producer-update", "value", vec![]),
+    );
+    unresolved_consumer
+        .dependency_bindings
+        .insert("producer-update".to_string());
+    let mut planned_consumer = unresolved_consumer.clone();
+    planned_consumer.set_attr(
+        "target",
+        Value::Concrete(ConcreteValue::String("good-before".to_string())),
+    );
+    let consumer_id = planned_consumer.id.clone();
+    let from = State::existing(
+        consumer_id.clone(),
+        HashMap::from([(
+            "target".to_string(),
+            Value::Concrete(ConcreteValue::String("good-before".to_string())),
+        )]),
+    )
+    .with_identifier("consumer-id");
+
+    provider.push_create(Ok(State::existing(
+        producer_id.clone(),
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("bad".to_string())),
+        )]),
+    )
+    .with_identifier("producer-id")));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(producer.clone()));
+    plan.add(Effect::Update {
+        from: Box::new(from),
+        to: resolved(planned_consumer.clone()),
+        changed_attributes: vec!["target".to_string()],
+    });
+    let unresolved = HashMap::from([
+        (
+            producer.id.clone(),
+            UnresolvedResource::from_pre_resolve(producer.clone()),
+        ),
+        (
+            consumer_id,
+            UnresolvedResource::from_pre_resolve(unresolved_consumer.clone()),
+        ),
+    ]);
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: &[producer, unresolved_consumer],
+        compositions: &[],
+        data_sources: &[],
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+    let schemas = provider_boundary_constraint_schemas();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved,
+            data_source_origins: &[],
+        },
+        compositions: &[],
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert_eq!(result.success_count, 1);
+    assert_eq!(result.failure_count, 1);
+    assert_eq!(
+        provider.calls(),
+        vec![("create".to_string(), producer_id.to_string())]
+    );
+}
+
+#[tokio::test]
+async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
+    let provider = MockProvider::new();
+    let mut cert = Resource::new("test", "cert-constraint");
+    cert.binding = Some("cert".to_string());
+    let cert_id = cert.id.clone();
+    provider.push_create(Ok(State::existing(
+        cert_id.clone(),
+        HashMap::from([(
+            "domain_validation_options".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(indexmap::IndexMap::from([(
+                    "resource_record".to_string(),
+                    Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                        (
+                            "name".to_string(),
+                            Value::Concrete(ConcreteValue::String("good-name".to_string())),
+                        ),
+                        (
+                            "value".to_string(),
+                            Value::Concrete(ConcreteValue::String("bad".to_string())),
+                        ),
+                    ]))),
+                )])),
+            )])),
+        )]),
+    )
+    .with_identifier("cert-id")));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(cert));
+    plan.add(Effect::DeferredCreate {
+        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "__deferred_for",
+            "validation_records",
+        )),
+        upstream_binding: "cert".to_string(),
+        template: Box::new(validation_deferred_for_expression()),
+    });
+    let schemas = deferred_child_constraint_schemas();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert_eq!(result.success_count, 1);
+    assert_eq!(result.failure_count, 1);
+    assert_eq!(
+        provider.calls(),
+        vec![("create".to_string(), cert_id.to_string())]
+    );
+}
+
+#[tokio::test]
+async fn invalid_deferred_data_source_input_never_reaches_provider() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+
+    let provider = MockProvider::new();
+    let upstream = make_resource("data-source-producer", &[]);
+    let upstream_id = upstream.id.clone();
+    let mut data_source = DataSource::with_provider("test", "Lookup", "lookup", None);
+    data_source.binding = Some("lookup".to_string());
+    data_source.attributes.insert(
+        "filter".to_string(),
+        Value::resource_ref("data-source-producer", "value", vec![]),
+    );
+    let data_source_id = data_source.id.clone();
+
+    provider.push_create(Ok(State::existing(
+        upstream_id.clone(),
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("bad".to_string())),
+        )]),
+    )
+    .with_identifier("producer-id")));
+    provider.push_read(Ok(State::existing(data_source_id.clone(), HashMap::new())));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(upstream.clone()));
+    plan.add(Effect::Read {
+        resource: resolved_data_source(data_source.clone()),
+    });
+    let mut deferred_reads = DeferredDataSourceReads::none();
+    deferred_reads.insert(
+        data_source_id.clone(),
+        unresolved_data_source_inputs(&data_source),
+    );
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: &[upstream],
+        compositions: &[],
+        data_sources: &[data_source],
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+    let schemas = deferred_data_source_constraint_schemas();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: deferred_reads,
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert_eq!(result.success_count, 1);
+    assert_eq!(result.failure_count, 1);
+    assert!(provider.captured_data_source_reads().is_empty());
+    assert_eq!(
+        provider.calls(),
+        vec![("create".to_string(), upstream_id.to_string())]
+    );
+}
+
+#[tokio::test]
+async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+
+    let provider = MockProvider::new();
+    let upstream = make_resource("plan-data-source-producer", &[]);
+    let upstream_id = upstream.id.clone();
+    let mut data_source = DataSource::with_provider("test", "Lookup", "plan-lookup", None);
+    data_source.binding = Some("plan-lookup".to_string());
+    data_source.attributes.insert(
+        "filter".to_string(),
+        Value::resource_ref("plan-data-source-producer", "value", vec![]),
+    );
+    let data_source_id = data_source.id.clone();
+
+    provider.push_create(Ok(State::existing(
+        upstream_id.clone(),
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("bad".to_string())),
+        )]),
+    )
+    .with_identifier("producer-id")));
+    provider.push_read(Ok(State::existing(data_source_id.clone(), HashMap::new())));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(upstream.clone()));
+    plan.add(Effect::Read {
+        resource: resolved_data_source(data_source.clone()),
+    });
+    let mut deferred_reads = DeferredDataSourceReads::none();
+    deferred_reads.insert(data_source_id, unresolved_data_source_inputs(&data_source));
+    let resource_origins = HashMap::from([(
+        upstream.id.clone(),
+        UnresolvedResource::from_pre_resolve(upstream.clone()),
+    )]);
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: std::slice::from_ref(&upstream),
+        compositions: &[],
+        data_sources: std::slice::from_ref(&data_source),
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+    let schemas = deferred_data_source_constraint_schemas();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &resource_origins,
+            data_source_origins: std::slice::from_ref(&data_source),
+        },
+        compositions: &[],
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: deferred_reads,
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert!(
+        provider.captured_data_source_reads().is_empty(),
+        "schema-invalid apply-resolved data source reached the provider"
+    );
+    assert_eq!(result.success_count, 1);
+    assert_eq!(result.failure_count, 1);
+    assert_eq!(
+        provider.calls(),
+        vec![("create".to_string(), upstream_id.to_string())]
+    );
+}
+
+fn pending_module_composition(
+    instance: &str,
+    arguments: Vec<(&str, Value)>,
+    constraints: Vec<crate::resource::PendingModuleConstraint>,
+) -> crate::resource::Composition {
+    use crate::parser::TypeExpr;
+    use crate::resource::{Composition, CompositionArgument, Signature};
+
+    Composition {
+        id: ResourceId::with_identity("_virtual", instance),
+        signature: Signature {
+            arguments: arguments
+                .into_iter()
+                .map(|(name, value)| {
+                    (
+                        name.to_string(),
+                        CompositionArgument::from_value(value, TypeExpr::String),
+                    )
+                })
+                .collect(),
+            attributes: indexmap::IndexMap::new(),
+            pending_constraints: constraints,
+        },
+        binding: Some(instance.to_string()),
+        dependency_bindings: std::collections::BTreeSet::new(),
+        module_name: "checked_module".to_string(),
+        instance: instance.to_string(),
+        provenance: Default::default(),
+        quoted_string_attrs: HashSet::new(),
+    }
+}
+
+fn module_not_bad_constraint(argument: &str) -> crate::resource::PendingModuleConstraint {
+    use crate::parser::{CompareOp, ValidateExpr};
+    use crate::resource::{ModuleConstraintId, PendingModuleConstraint};
+
+    PendingModuleConstraint {
+        id: ModuleConstraintId::argument_validation(argument, 0),
+        expression: ValidateExpr::Compare {
+            lhs: Box::new(ValidateExpr::Var(argument.to_string())),
+            op: CompareOp::Ne,
+            rhs: Box::new(ValidateExpr::String("bad".to_string())),
+        },
+        message: format!("{argument} must not be bad"),
+    }
+}
+
+fn module_require_equal_constraint(
+    left: &str,
+    right: &str,
+) -> crate::resource::PendingModuleConstraint {
+    use crate::parser::{CompareOp, ValidateExpr};
+    use crate::resource::{ModuleConstraintId, PendingModuleConstraint};
+
+    PendingModuleConstraint {
+        id: ModuleConstraintId::require(0),
+        expression: ValidateExpr::Compare {
+            lhs: Box::new(ValidateExpr::Var(left.to_string())),
+            op: CompareOp::Eq,
+            rhs: Box::new(ValidateExpr::Var(right.to_string())),
+        },
+        message: format!("{left} and {right} must match"),
+    }
+}
+
+#[tokio::test]
+async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::resource::CompositionAttribute;
+
+    let provider = MockProvider::new();
+    let upstream = make_resource("module-data-source-producer", &[]);
+    let upstream_id = upstream.id.clone();
+    let mut data_source = DataSource::with_provider("test", "Lookup", "module-lookup", None);
+    data_source.binding = Some("module-lookup".to_string());
+    data_source.attributes.insert(
+        "filter".to_string(),
+        Value::resource_ref("checked", "value", vec![]),
+    );
+    let data_source_id = data_source.id.clone();
+    let mut composition = pending_module_composition(
+        "root.checked",
+        vec![(
+            "value",
+            Value::resource_ref("module-data-source-producer", "value", vec![]),
+        )],
+        vec![module_not_bad_constraint("value")],
+    );
+    composition.binding = Some("checked".to_string());
+    composition.signature.attributes.insert(
+        "value".to_string(),
+        CompositionAttribute::from_value(
+            Value::resource_ref("module-data-source-producer", "value", vec![]),
+            None,
+        ),
+    );
+
+    provider.push_create(Ok(State::existing(
+        upstream_id.clone(),
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("bad".to_string())),
+        )]),
+    )
+    .with_identifier("producer-id")));
+    provider.push_read(Ok(State::existing(data_source_id.clone(), HashMap::new())));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(upstream.clone()));
+    plan.add(Effect::Read {
+        resource: resolved_data_source(data_source.clone()),
+    });
+    let mut deferred_reads = DeferredDataSourceReads::none();
+    deferred_reads.insert(data_source_id, unresolved_data_source_inputs(&data_source));
+    let resource_origins = HashMap::from([(
+        upstream.id.clone(),
+        UnresolvedResource::from_pre_resolve(upstream.clone()),
+    )]);
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: std::slice::from_ref(&upstream),
+        compositions: std::slice::from_ref(&composition),
+        data_sources: std::slice::from_ref(&data_source),
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+    let schemas = SchemaRegistry::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &resource_origins,
+            data_source_origins: std::slice::from_ref(&data_source),
+        },
+        compositions: std::slice::from_ref(&composition),
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: deferred_reads,
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert!(
+        provider.captured_data_source_reads().is_empty(),
+        "module-invalid apply-resolved data source reached the provider"
+    );
+    assert_eq!(result.success_count, 1);
+    assert_eq!(result.failure_count, 1);
+    assert_eq!(
+        provider.calls(),
+        vec![("create".to_string(), upstream_id.to_string())]
+    );
+}
+
+fn mark_module_resource(resource: &mut Resource, instance: &str) {
+    resource.module_source = Some(crate::resource::ModuleSource::module(
+        "checked_module",
+        instance,
+    ));
+}
+
+#[tokio::test]
+async fn pending_module_validation_and_require_block_first_consuming_effect() {
+    let provider = MockProvider::new();
+    let producer = make_resource("module-producer", &[]);
+    let producer_id = producer.id.clone();
+    let mut consumer = make_resource("module-consumer", &[]);
+    consumer.set_attr(
+        "input",
+        Value::resource_ref("module-producer", "value", vec![]),
+    );
+    consumer
+        .dependency_bindings
+        .insert("module-producer".to_string());
+    mark_module_resource(&mut consumer, "root.checked");
+    let consumer_id = consumer.id.clone();
+    let composition = pending_module_composition(
+        "root.checked",
+        vec![
+            (
+                "value",
+                Value::resource_ref("module-producer", "value", vec![]),
+            ),
+            (
+                "other",
+                Value::resource_ref("module-producer", "other", vec![]),
+            ),
+        ],
+        vec![
+            module_not_bad_constraint("value"),
+            module_require_equal_constraint("value", "other"),
+        ],
+    );
+
+    provider.push_create(Ok(State::existing(
+        producer_id.clone(),
+        HashMap::from([
+            (
+                "value".to_string(),
+                Value::Concrete(ConcreteValue::String("bad".to_string())),
+            ),
+            (
+                "other".to_string(),
+                Value::Concrete(ConcreteValue::String("different".to_string())),
+            ),
+        ]),
+    )
+    .with_identifier("producer-id")));
+    provider.push_create(Ok(ok_state(&consumer_id)));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(producer));
+    plan.add(create_effect(consumer));
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: std::slice::from_ref(&composition),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+
+    assert_eq!(result.success_count, 1);
+    assert_eq!(result.failure_count, 1);
+    assert_eq!(
+        provider.calls(),
+        vec![("create".to_string(), producer_id.to_string())]
+    );
+    let events = observer.events().join("\n");
+    for expected in [
+        "checked_module",
+        "root.checked",
+        "value must not be bad",
+        "value and other must match",
+        "\"bad\"",
+        "\"different\"",
+    ] {
+        assert!(events.contains(expected), "events: {events}");
+    }
+    assert!(!events.contains("Deferred("), "events: {events}");
+    assert!(!events.contains("ResourceRef {"), "events: {events}");
+}
+
+#[tokio::test]
+async fn nested_forwarded_module_constraint_blocks_provider_dispatch() {
+    use crate::binding_index::BindingValueSource;
+
+    let provider = MockProvider::new();
+    let mut resource = make_resource("nested-module-consumer", &[]);
+    mark_module_resource(&mut resource, "root.outer.inner");
+    let id = resource.id.clone();
+    provider.push_create(Ok(ok_state(&id)));
+
+    let composition = pending_module_composition(
+        "root.outer.inner",
+        vec![("value", Value::resource_ref("forwarded", "value", vec![]))],
+        vec![module_not_bad_constraint("value")],
+    );
+    let mut bindings = ResolvedBindings::default();
+    bindings.set(
+        "forwarded",
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("bad".to_string())),
+        )]),
+        BindingValueSource::Local,
+    );
+    let mut plan = Plan::new();
+    plan.add(create_effect(resource));
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: std::slice::from_ref(&composition),
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+
+    assert_eq!(result.failure_count, 1);
+    assert!(provider.calls().is_empty());
+    let events = observer.events().join("\n");
+    assert!(events.contains("root.outer.inner"), "events: {events}");
+    assert!(events.contains("value must not be bad"), "events: {events}");
+}
+
+#[tokio::test]
+async fn outer_module_constraint_blocks_nested_inner_consumer_provider_dispatch() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::resource::CompositionAttribute;
+
+    let provider = MockProvider::new();
+    let violating = Value::Concrete(ConcreteValue::String("bad".to_string()));
+    let mut outer = pending_module_composition(
+        "root.outer",
+        vec![("value", violating.clone())],
+        vec![module_not_bad_constraint("value")],
+    );
+    outer.binding = Some("outer_call".to_string());
+    outer.signature.attributes.insert(
+        "forwarded".to_string(),
+        CompositionAttribute::from_value(violating, None),
+    );
+
+    let mut inner_resource = make_resource("nested-inner-consumer", &[]);
+    inner_resource.set_attr(
+        "input",
+        Value::resource_ref("outer_call", "forwarded", vec![]),
+    );
+    mark_module_resource(&mut inner_resource, "root.outer.inner");
+    let resource_id = inner_resource.id.clone();
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: std::slice::from_ref(&inner_resource),
+        compositions: std::slice::from_ref(&outer),
+        data_sources: &[],
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+
+    provider.push_create(Ok(ok_state(&resource_id)));
+    let mut plan = Plan::new();
+    plan.add(create_effect(inner_resource));
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: std::slice::from_ref(&outer),
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert!(
+        provider.calls().is_empty(),
+        "the inner provider received the violating forwarded value: {:?}",
+        provider.captured_create_resources()
+    );
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 1);
+}
+
+#[tokio::test]
+async fn module_export_constraint_blocks_top_level_consumer_provider_dispatch() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::resource::CompositionAttribute;
+
+    let provider = MockProvider::new();
+    let violating = Value::Concrete(ConcreteValue::String("bad".to_string()));
+    let mut composition = pending_module_composition(
+        "root.exporter",
+        vec![("value", violating.clone())],
+        vec![module_not_bad_constraint("value")],
+    );
+    composition.binding = Some("exporter".to_string());
+    composition.signature.attributes.insert(
+        "forwarded".to_string(),
+        CompositionAttribute::from_value(violating, None),
+    );
+
+    let mut top_level = make_resource("top-level-consumer", &[]);
+    top_level.set_attr(
+        "input",
+        Value::resource_ref("exporter", "forwarded", vec![]),
+    );
+    assert!(top_level.module_source.is_none());
+    let resource_id = top_level.id.clone();
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: std::slice::from_ref(&top_level),
+        compositions: std::slice::from_ref(&composition),
+        data_sources: &[],
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+
+    provider.push_create(Ok(ok_state(&resource_id)));
+    let mut plan = Plan::new();
+    plan.add(create_effect(top_level));
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: std::slice::from_ref(&composition),
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert!(
+        provider.calls().is_empty(),
+        "the top-level provider received the violating module export: {:?}",
+        provider.captured_create_resources()
+    );
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 1);
+}
+
+#[tokio::test]
+async fn repeated_module_violation_blocks_every_dispatch_but_reports_once() {
+    let provider = MockProvider::new();
+    let composition = pending_module_composition(
+        "root.checked",
+        vec![(
+            "value",
+            Value::Concrete(ConcreteValue::String("bad".to_string())),
+        )],
+        vec![module_not_bad_constraint("value")],
+    );
+    let mut first = make_resource("first-blocked-consumer", &[]);
+    mark_module_resource(&mut first, "root.checked");
+    let mut second = make_resource("second-blocked-consumer", &[]);
+    mark_module_resource(&mut second, "root.checked");
+    let mut plan = Plan::new();
+    plan.add(create_effect(first));
+    plan.add(create_effect(second));
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: std::slice::from_ref(&composition),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+
+    assert!(provider.calls().is_empty());
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 2);
+    let events = observer.events().join("\n");
+    assert_eq!(
+        events.matches("value must not be bad").count(),
+        1,
+        "the authored violation should only be reported once: {events}"
+    );
+}
+
+#[tokio::test]
+async fn module_constraint_rechecks_after_binding_changes_in_same_apply() {
+    use crate::binding_index::BindingValueSource;
+
+    let provider = MockProvider::new();
+    let mut first = make_resource("first-module-consumer", &[]);
+    mark_module_resource(&mut first, "root.checked");
+    let first_id = first.id.clone();
+    let updater = make_resource("source", &["first-module-consumer"]);
+    let updater_id = updater.id.clone();
+    let mut second = make_resource("second-module-consumer", &[]);
+    second.set_attr("input", Value::resource_ref("source", "value", vec![]));
+    second.dependency_bindings.insert("source".to_string());
+    mark_module_resource(&mut second, "root.checked");
+    let second_id = second.id.clone();
+
+    let composition = pending_module_composition(
+        "root.checked",
+        vec![("value", Value::resource_ref("source", "value", vec![]))],
+        vec![module_not_bad_constraint("value")],
+    );
+    let mut bindings = ResolvedBindings::default();
+    bindings.set(
+        "source",
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("good".to_string())),
+        )]),
+        BindingValueSource::Local,
+    );
+    provider.push_create(Ok(ok_state(&first_id)));
+    provider.push_create(Ok(State::existing(
+        updater_id.clone(),
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("bad".to_string())),
+        )]),
+    )
+    .with_identifier("source-id")));
+    provider.push_create(Ok(ok_state(&second_id)));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(first));
+    plan.add(create_effect(updater));
+    plan.add(create_effect(second));
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: std::slice::from_ref(&composition),
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert_eq!(result.success_count, 2);
+    assert_eq!(result.failure_count, 1);
+    assert_eq!(
+        provider.calls(),
+        vec![
+            ("create".to_string(), first_id.to_string()),
+            ("create".to_string(), updater_id.to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn unresolved_instance_constraint_waits_for_terminal_sweep() {
+    let provider = MockProvider::new();
+    let mut resource = make_resource("independent-module-resource", &[]);
+    mark_module_resource(&mut resource, "root.checked");
+    let resource_id = resource.id.clone();
+    let composition = pending_module_composition(
+        "root.checked",
+        vec![(
+            "value",
+            Value::resource_ref("not-published", "value", vec![]),
+        )],
+        vec![module_not_bad_constraint("value")],
+    );
+    let mut plan = Plan::new();
+    plan.add(create_effect(resource));
+    provider.push_create(Ok(ok_state(&resource_id)));
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: std::slice::from_ref(&composition),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+
+    assert_eq!(result.success_count, 1);
+    assert_eq!(result.failure_count, 1);
+    assert_eq!(
+        provider.calls(),
+        vec![("create".to_string(), resource_id.to_string())]
+    );
+    let events = observer.events().join("\n");
+    assert!(
+        events.contains("still unresolved at end of apply"),
+        "events: {events}"
+    );
+}
+
+#[tokio::test]
+async fn unapplied_module_argument_reference_stays_pending_at_early_gate() {
+    let provider = MockProvider::new();
+    let mut early = make_resource("early-independent-consumer", &[]);
+    mark_module_resource(&mut early, "root.checked");
+    let early_id = early.id.clone();
+    let producer = make_resource("future-producer", &[]);
+    let producer_id = producer.id.clone();
+    let composition = pending_module_composition(
+        "root.checked",
+        vec![(
+            "value",
+            Value::resource_ref("future-producer", "value", vec![]),
+        )],
+        vec![module_not_bad_constraint("value")],
+    );
+
+    provider.push_create(Ok(ok_state(&early_id)));
+    provider.push_create(Ok(State::existing(
+        producer_id.clone(),
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("good".to_string())),
+        )]),
+    )
+    .with_identifier("producer-id")));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(early));
+    plan.add(create_effect(producer));
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: std::slice::from_ref(&composition),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+
+    assert_eq!(result.success_count, 2);
+    assert_eq!(result.failure_count, 0);
+    assert_eq!(
+        provider.calls(),
+        vec![
+            ("create".to_string(), early_id.to_string()),
+            ("create".to_string(), producer_id.to_string()),
+        ]
+    );
+    let events = observer.events().join("\n");
+    assert!(
+        !events.contains("could not resolve argument"),
+        "events: {events}"
+    );
+}
+
+#[tokio::test]
+async fn terminal_module_constraint_sweep_rejects_unconsumed_violation() {
+    use crate::binding_index::BindingValueSource;
+
+    let provider = MockProvider::new();
+    let composition = pending_module_composition(
+        "root.export_only",
+        vec![("value", Value::resource_ref("exported", "value", vec![]))],
+        vec![module_not_bad_constraint("value")],
+    );
+    let mut bindings = ResolvedBindings::default();
+    bindings.set(
+        "exported",
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("bad".to_string())),
+        )]),
+        BindingValueSource::Local,
+    );
+    let plan = Plan::new();
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: std::slice::from_ref(&composition),
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count, 1);
+    let events = observer.events().join("\n");
+    for expected in [
+        "checked_module",
+        "root.export_only",
+        "value must not be bad",
+        "\"bad\"",
+    ] {
+        assert!(events.contains(expected), "events: {events}");
+    }
+}
+
+#[tokio::test]
+async fn terminal_module_constraint_sweep_rejects_still_pending_input() {
+    let provider = MockProvider::new();
+    let composition = pending_module_composition(
+        "root.unused",
+        vec![("value", Value::resource_ref("missing", "value", vec![]))],
+        vec![module_not_bad_constraint("value")],
+    );
+    let plan = Plan::new();
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: std::slice::from_ref(&composition),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+
+    assert_eq!(result.failure_count, 1);
+    let events = observer.events().join("\n");
+    for expected in [
+        "checked_module",
+        "root.unused",
+        "value must not be bad",
+        "still unresolved",
+        "missing.value",
+    ] {
+        assert!(events.contains(expected), "events: {events}");
+    }
+    assert!(!events.contains("ResourceRef {"), "events: {events}");
+}
+
+#[tokio::test]
+async fn terminal_pending_constraint_is_silent_after_failed_and_skipped_effects() {
+    let provider = MockProvider::new();
+    let failed = make_resource("failed", &[]);
+    let skipped = make_resource("skipped", &["failed"]);
+    provider.push_create(Err(ProviderError::api_error("upstream create failed")));
+    let composition = pending_module_composition(
+        "root.unused",
+        vec![("value", Value::resource_ref("missing", "value", vec![]))],
+        vec![module_not_bad_constraint("value")],
+    );
+    let mut plan = Plan::new();
+    plan.add(create_effect(failed));
+    plan.add(create_effect(skipped));
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: std::slice::from_ref(&composition),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let events = observer.events().join("\n");
+
+    assert_eq!(result.failure_count, 1, "events: {events}");
+    assert_eq!(result.skip_count, 1, "events: {events}");
+    assert!(
+        events.contains("upstream create failed"),
+        "events: {events}"
+    );
+    assert!(
+        !events.contains("still unresolved at end of apply"),
+        "the upstream failure already explains the pending input: {events}"
+    );
+    assert!(
+        !events.contains("module_constraint_failed"),
+        "pending constraint was double-counted: {events}"
+    );
+}
+
+#[tokio::test]
+async fn terminal_pending_constraint_is_silent_after_failure_without_skips() {
+    let provider = MockProvider::new();
+    let failed = make_resource("failed-without-dependent", &[]);
+    provider.push_create(Err(ProviderError::api_error("standalone create failed")));
+    let composition = pending_module_composition(
+        "root.unused",
+        vec![("value", Value::resource_ref("missing", "value", vec![]))],
+        vec![module_not_bad_constraint("value")],
+    );
+    let mut plan = Plan::new();
+    plan.add(create_effect(failed));
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: std::slice::from_ref(&composition),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let events = observer.events().join("\n");
+
+    assert_eq!(result.failure_count, 1, "events: {events}");
+    assert_eq!(result.skip_count, 0, "events: {events}");
+    assert!(
+        events.contains("standalone create failed"),
+        "events: {events}"
+    );
+    assert!(
+        !events.contains("still unresolved at end of apply"),
+        "the provider failure already explains the pending input: {events}"
+    );
+    assert!(
+        !events.contains("module_constraint_failed"),
+        "pending constraint was double-counted: {events}"
+    );
+}
+
+#[tokio::test]
+async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
+    use crate::wait::predicate::{AttrPath, WaitPredicate};
+
+    let provider = MockProvider::new();
+    let target_id = ResourceId::with_identity("test", "wait-target");
+    let pending_state = State::existing(
+        target_id.clone(),
+        HashMap::from([(
+            "status".to_string(),
+            Value::Concrete(ConcreteValue::String("PENDING".to_string())),
+        )]),
+    )
+    .with_identifier("target-id");
+    provider.push_read(Ok(pending_state.clone()));
+    let composition = pending_module_composition(
+        "root.unused",
+        vec![("value", Value::resource_ref("missing", "value", vec![]))],
+        vec![module_not_bad_constraint("value")],
+    );
+    let mut plan = Plan::new();
+    plan.add(Effect::Wait {
+        identity: ResourceIdentity::new("target_ready"),
+        target_id: crate::resource::ResolvedResourceId::new(target_id.clone()),
+        until: WaitPredicate::Equals {
+            attr: AttrPath::single("status"),
+            value: Value::Concrete(ConcreteValue::String("READY".to_string())),
+        },
+        until_surface: "wait-target.status == READY".to_string(),
+        timeout: std::time::Duration::from_secs(60),
+        interval: std::time::Duration::from_millis(1),
+        explicit_dependencies: HashSet::new(),
+    });
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: std::slice::from_ref(&composition),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::from([(target_id, pending_state)]),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let events = observer.events().join("\n");
+
+    assert_eq!(result.failure_count, 0, "events: {events}");
+    assert_eq!(result.skip_count, 1, "events: {events}");
+    assert!(events.contains("no mutator remaining"), "events: {events}");
+    assert!(
+        !events.contains("still unresolved at end of apply"),
+        "the skipped effect already explains the pending input: {events}"
+    );
+    assert!(
+        !events.contains("module_constraint_failed"),
+        "pending constraint was double-counted: {events}"
+    );
+}
+
+#[test]
+fn terminal_gate_still_reports_decidable_violations_when_pending_is_suppressed() {
+    let composition = pending_module_composition(
+        "root.known",
+        vec![(
+            "value",
+            Value::Concrete(ConcreteValue::String("bad".to_string())),
+        )],
+        vec![module_not_bad_constraint("value")],
+    );
+    let gate = ModuleConstraintGate::new(std::slice::from_ref(&composition));
+
+    let error = gate
+        .finish(&ResolvedBindings::default(), false)
+        .expect_err("a known violation must not be suppressed with pending inputs");
+
+    assert_eq!(error.failures().len(), 1);
+    assert!(error.to_string().contains("value must not be bad"));
+    assert!(!error.to_string().contains("still unresolved"));
+}
+
 #[tokio::test]
 async fn execute_plan_with_pre_cancelled_token_returns_cancelled_at_t4_or_later() {
     let provider = MockProvider::new();
@@ -1363,7 +3111,7 @@ async fn execute_plan_with_pre_cancelled_token_returns_cancelled_at_t4_or_later(
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1397,7 +3145,7 @@ async fn execute_plan_with_empty_plan_and_pre_cancelled_token_returns_completed(
     let plan = Plan::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1431,7 +3179,7 @@ async fn execute_plan_cancelled_after_three_completed_keeps_in_flight_and_drops_
     let plan = create_independent_create_plan(["r1", "r2", "r3", "r4", "r5"]);
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1487,7 +3235,7 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1551,7 +3299,7 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1610,7 +3358,7 @@ async fn execute_plan_cancelled_while_effect_in_flight_records_that_effect() {
     let plan = create_independent_create_plan(["r1", "r2", "r3"]);
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1645,7 +3393,7 @@ async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_ef
     let plan = create_independent_create_plan(["r1", "r2", "r3"]);
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1689,7 +3437,7 @@ async fn execute_plan_harvests_ready_effect_before_cleanup_priority() {
     let observer = MockObserver::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1744,7 +3492,7 @@ async fn execute_plan_cleanup_priority_abandons_a_pending_failure_refresh() {
     let observer = PrioritizeCleanupOnRefresh { trigger };
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1779,7 +3527,7 @@ async fn test_simple_create() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1827,7 +3575,7 @@ async fn partial_create_records_state_and_diagnostic() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1879,7 +3627,7 @@ async fn test_apply_renormalizes_after_resolution() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -1906,6 +3654,264 @@ async fn test_apply_renormalizes_after_resolution() {
         "apply path must re-run normalize_desired so the provider \
          receives the canonical value, not the raw DSL spelling"
     );
+}
+
+/// Plan-time normalization may deliberately transform a literal into a form
+/// that does not satisfy a constraint written for the authored DSL spelling.
+/// The literal already passed the plan-time gate in authored form, so apply
+/// must not re-check the normalized plan value merely because another
+/// attribute on the resource needs apply-time resolution.
+#[tokio::test]
+async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
+    use crate::binding_index::BindingValueSource;
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let provider = MockProvider::new();
+    let mut source = make_resource("normalized-literal", &[]);
+    source.set_attr(
+        "marker",
+        Value::Concrete(ConcreteValue::String("raw_dsl".to_string())),
+    );
+    source.set_attr(
+        "runtime",
+        Value::resource_ref("runtime-value", "value", vec![]),
+    );
+    let id = source.id.clone();
+
+    // This is the resource persisted in the plan after normalize_desired.
+    let mut planned = source.clone();
+    planned.set_attr(
+        "marker",
+        Value::Concrete(ConcreteValue::String("CANONICAL".to_string())),
+    );
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(planned));
+    provider.push_create(Ok(ok_state(&id)));
+
+    let unresolved = HashMap::from([(id.clone(), UnresolvedResource::from_pre_resolve(source))]);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test")
+            .attribute(AttributeSchema::new(
+                "marker",
+                AttributeType::refined_string(None, Some("^raw_dsl$".to_string()), None, None),
+            ))
+            .attribute(AttributeSchema::new("runtime", AttributeType::string())),
+    );
+    let mut bindings = ResolvedBindings::default();
+    bindings.set(
+        "runtime-value",
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("known-at-apply".to_string())),
+        )]),
+        BindingValueSource::Local,
+    );
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved,
+            data_source_origins: &[],
+        },
+        compositions: &[],
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &CanonicalizingNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let events = observer.events().join("\n");
+
+    assert!(
+        !events.contains("Invalid value 'CANONICAL'"),
+        "apply revalidated the plan-normalized literal instead of only the runtime value: {events}"
+    );
+    assert_eq!(
+        result.failure_count, 0,
+        "normalized literals were checked in authored form during planning"
+    );
+    assert_eq!(result.success_count, 1);
+    let captured = provider.captured_create_resources();
+    assert_eq!(captured.len(), 1, "the provider must be called once");
+    assert_eq!(
+        captured[0].get_attr("marker"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "CANONICAL".to_string()
+        ))),
+        "the provider still receives the normalized representation"
+    );
+}
+
+/// A plan-normalized effect is invalid executor input unless its authored
+/// pre-normalization snapshot accompanies it. Treating a missing snapshot as
+/// authored silently turns the apply gate back into a full check of normalized
+/// values.
+#[tokio::test]
+async fn plan_normalized_resource_without_authored_origin_is_an_invariant_error() {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let provider = MockProvider::new();
+    let mut planned = make_resource("missing-origin", &[]);
+    planned.set_attr(
+        "marker",
+        Value::Concrete(ConcreteValue::String("CANONICAL".to_string())),
+    );
+    let id = planned.id.clone();
+    provider.push_create(Ok(ok_state(&id)));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(planned));
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        ResourceSchema::new("test").attribute(AttributeSchema::new(
+            "marker",
+            AttributeType::refined_string(None, Some("^raw_dsl$".to_string()), None, None),
+        )),
+    );
+    let resource_origins = HashMap::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &resource_origins,
+            data_source_origins: &[],
+        },
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let events = observer.events().join("\n");
+
+    assert_eq!(result.failure_count, 1);
+    assert!(
+        events.contains("missing authored value origin for plan-normalized resource"),
+        "expected an executor invariant error, got: {events}"
+    );
+    assert!(provider.captured_create_resources().is_empty());
+}
+
+/// Saved plans carry canonical provider input plus the authored source used to
+/// identify which attributes became known at apply. A literal canonicalized at
+/// plan time must not be rechecked merely because a sibling reference resolves.
+#[tokio::test]
+async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let provider = MockProvider::new();
+    let producer = make_resource("data-source-origin-producer", &[]);
+    let producer_id = producer.id.clone();
+
+    let mut authored = DataSource::with_provider("test", "Lookup", "origin-check", None);
+    authored.binding = Some("origin-check".to_string());
+    authored.set_attr(
+        "marker",
+        Value::Concrete(ConcreteValue::String("raw_dsl".to_string())),
+    );
+    authored.set_attr(
+        "runtime",
+        Value::resource_ref("data-source-origin-producer", "value", vec![]),
+    );
+    let data_source_id = authored.id.clone();
+
+    let mut planned = authored.clone();
+    planned.set_attr(
+        "marker",
+        Value::Concrete(ConcreteValue::String("CANONICAL".to_string())),
+    );
+
+    provider.push_create(Ok(State::existing(
+        producer_id.clone(),
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("known-at-apply".to_string())),
+        )]),
+    )
+    .with_identifier("producer-id")));
+    provider.push_read(Ok(
+        State::existing(data_source_id.clone(), HashMap::new()).with_identifier("lookup-id")
+    ));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(producer.clone()));
+    plan.add(Effect::Read {
+        resource: resolved_data_source(planned),
+    });
+
+    let mut deferred_reads = DeferredDataSourceReads::none();
+    deferred_reads.insert(
+        data_source_id.clone(),
+        unresolved_data_source_inputs(&authored),
+    );
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: std::slice::from_ref(&producer),
+        compositions: &[],
+        data_sources: std::slice::from_ref(&authored),
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+    let resource_origins = HashMap::from([(
+        producer_id.clone(),
+        UnresolvedResource::from_pre_resolve(producer.clone()),
+    )]);
+    let data_source_origins = [authored];
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("Lookup")
+            .as_data_source()
+            .attribute(AttributeSchema::new(
+                "marker",
+                AttributeType::refined_string(None, Some("^raw_dsl$".to_string()), None, None),
+            ))
+            .attribute(AttributeSchema::new("runtime", AttributeType::string())),
+    );
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &resource_origins,
+            data_source_origins: &data_source_origins,
+        },
+        compositions: &[],
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: deferred_reads,
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let events = observer.events().join("\n");
+
+    assert_eq!(result.failure_count, 0, "{events}");
+    assert_eq!(result.success_count, 2, "{events}");
+    assert_eq!(provider.captured_data_source_reads().len(), 1);
 }
 
 /// carina#3063: the apply path must also re-apply plan-time stage 3
@@ -1938,7 +3944,7 @@ async fn test_apply_reapplies_enum_alias_stage() {
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AliasFactory)];
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2001,7 +4007,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(AliasFactory)];
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2021,7 +4027,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
     let reqs = provider.captured_update_requests();
     assert_eq!(reqs.len(), 1);
     let op = reqs[0]
-        .patch
+        .patch()
         .ops
         .iter()
         .find(|op| op.key == "ip_protocol")
@@ -2057,7 +4063,7 @@ async fn test_apply_reapplies_canonicalize_stage() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2118,7 +4124,7 @@ async fn test_apply_renormalizes_update_path() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2138,7 +4144,7 @@ async fn test_apply_renormalizes_update_path() {
     let reqs = provider.captured_update_requests();
     assert_eq!(reqs.len(), 1);
     let marker_op = reqs[0]
-        .patch
+        .patch()
         .ops
         .iter()
         .find(|op| op.key == "marker")
@@ -2205,7 +4211,7 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2225,7 +4231,7 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
     let reqs = provider.captured_update_requests();
     assert_eq!(reqs.len(), 1);
     let tags_op = reqs[0]
-        .patch
+        .patch()
         .ops
         .iter()
         .find(|op| op.key == "tags")
@@ -2315,7 +4321,7 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2334,7 +4340,12 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
 
     let reqs = provider.captured_update_requests();
     assert_eq!(reqs.len(), 1);
-    let patched_keys: Vec<&str> = reqs[0].patch.ops.iter().map(|op| op.key.as_str()).collect();
+    let patched_keys: Vec<&str> = reqs[0]
+        .patch()
+        .ops
+        .iter()
+        .map(|op| op.key.as_str())
+        .collect();
     assert_eq!(patched_keys, vec!["description"]);
 }
 
@@ -2375,7 +4386,7 @@ async fn test_apply_effective_changed_skips_internal_and_write_only_attributes()
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2394,7 +4405,12 @@ async fn test_apply_effective_changed_skips_internal_and_write_only_attributes()
 
     let reqs = provider.captured_update_requests();
     assert_eq!(reqs.len(), 1);
-    let patched_keys: Vec<&str> = reqs[0].patch.ops.iter().map(|op| op.key.as_str()).collect();
+    let patched_keys: Vec<&str> = reqs[0]
+        .patch()
+        .ops
+        .iter()
+        .map(|op| op.key.as_str())
+        .collect();
     assert_eq!(patched_keys, vec!["description"]);
 }
 
@@ -2439,7 +4455,7 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2458,7 +4474,7 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
 
     let reqs = provider.captured_update_requests();
     assert_eq!(reqs.len(), 1);
-    assert!(reqs[0].patch.ops.is_empty());
+    assert!(reqs[0].patch().ops.is_empty());
 }
 
 #[tokio::test]
@@ -2508,7 +4524,7 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2528,7 +4544,7 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
     let reqs = provider.captured_update_requests();
     assert_eq!(reqs.len(), 1);
     assert!(
-        reqs[0].patch.ops.is_empty(),
+        reqs[0].patch().ops.is_empty(),
         "shape-divergent secret comparison must fail closed instead of patching plaintext"
     );
 }
@@ -2566,7 +4582,7 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2706,7 +4722,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
     };
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2774,7 +4790,7 @@ async fn test_simple_delete() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2814,7 +4830,7 @@ async fn test_failed_effect_propagates_to_dependent() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2854,7 +4870,7 @@ async fn test_observer_events_emitted_correctly() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2888,7 +4904,7 @@ async fn test_read_effect_is_no_op() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2933,7 +4949,7 @@ async fn test_independent_effects_run_in_parallel() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -2988,7 +5004,7 @@ async fn test_parallel_failure_skips_dependents() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3040,7 +5056,7 @@ async fn test_dependency_levels_sequential_chain() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3199,7 +5215,10 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
             Box::pin(async { Err(ProviderError::internal("not implemented")) })
         }
 
-        fn read_data_source(&self, _resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        fn read_data_source(
+            &self,
+            _resource: &ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
             Box::pin(async { Err(ProviderError::internal("not implemented")) })
         }
 
@@ -3281,7 +5300,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3357,7 +5376,10 @@ impl Provider for YieldingUpdateProvider {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 
-    fn read_data_source(&self, _resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        _resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 
@@ -3386,7 +5408,7 @@ impl Provider for YieldingUpdateProvider {
             tokio::task::yield_now().await;
             active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 
-            let mut attrs = request.from.attributes.clone();
+            let mut attrs = request.from().attributes.clone();
             attrs.insert(
                 "tags".to_string(),
                 Value::Concrete(ConcreteValue::String("new".to_string())),
@@ -3496,7 +5518,10 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> usize {
     let provider = YieldingUpdateProvider::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &unresolved_resources,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved_resources,
+            data_source_origins: &[],
+        },
         compositions: &[],
         bindings,
         current_states,
@@ -3567,7 +5592,10 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
     let provider = YieldingUpdateProvider::violates_unrelated_id();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &unresolved_resources,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved_resources,
+            data_source_origins: &[],
+        },
         compositions: &[],
         bindings,
         current_states,
@@ -3637,7 +5665,7 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -3904,7 +5932,7 @@ async fn test_update_effect_binding_map_propagation() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4036,7 +6064,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4118,7 +6146,10 @@ impl Provider for RecordingMockProvider {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 
-    fn read_data_source(&self, _resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        _resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 
@@ -4128,7 +6159,7 @@ impl Provider for RecordingMockProvider {
         request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
         let id_str = id.to_string();
-        let attrs = request.resource.as_resource().resolved_attributes();
+        let attrs = request.resource().as_resource().resolved_attributes();
         self.create_log.lock().unwrap().push((id_str, attrs));
         let result = self.create_results.lock().unwrap().remove(0);
         Box::pin(async move { result })
@@ -4193,7 +6224,10 @@ impl Provider for CascadeReplaceProvider {
         Box::pin(async { Err(ProviderError::internal("read not used")) })
     }
 
-    fn read_data_source(&self, _resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        _resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         Box::pin(async { Err(ProviderError::internal("read_data_source not used")) })
     }
 
@@ -4203,7 +6237,7 @@ impl Provider for CascadeReplaceProvider {
         request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
         let id = id.clone();
-        let attrs = request.resource.as_resource().resolved_attributes();
+        let attrs = request.resource().as_resource().resolved_attributes();
         self.call_log
             .lock()
             .unwrap()
@@ -4416,7 +6450,10 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
     let provider = CascadeReplaceProvider::new();
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &unresolved_resources,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved_resources,
+            data_source_origins: &[],
+        },
         compositions: &[],
         bindings,
         current_states,
@@ -4522,7 +6559,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4673,7 +6710,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4755,7 +6792,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -4876,7 +6913,7 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -5060,7 +7097,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -5185,7 +7222,10 @@ impl Provider for IdentifierAwareProvider {
         })
     }
 
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         self.read(&resource.id, None, ReadRequest)
     }
 
@@ -5270,7 +7310,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -5320,7 +7360,7 @@ async fn deferred_create_returns_error_when_upstream_binding_missing() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -5363,7 +7403,7 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -5414,7 +7454,7 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -5512,7 +7552,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -5606,7 +7646,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -5772,7 +7812,10 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
         }
 
-        fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+        fn read_data_source(
+            &self,
+            resource: &ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
             self.read(&resource.id, None, ReadRequest)
         }
 
@@ -5823,8 +7866,9 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
     let mut plan = Plan::new();
     let cert = resource_with_binding("cert", "cert");
     let cert_id = cert.id.clone();
+    let alb = resource_with_binding("alb", "alb");
     plan.add(create_effect(cert.clone()));
-    plan.add(create_effect(resource_with_binding("alb", "alb")));
+    plan.add(create_effect(alb.clone()));
     plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
         deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
             id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -5847,10 +7891,16 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
         template: Box::new(validation_deferred_for_expression()),
     })));
 
-    let unresolved = HashMap::from([(cert_id, UnresolvedResource::from_pre_resolve(cert.clone()))]);
+    let unresolved = HashMap::from([
+        (cert_id, UnresolvedResource::from_pre_resolve(cert.clone())),
+        (alb.id.clone(), UnresolvedResource::from_pre_resolve(alb)),
+    ]);
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &unresolved,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved,
+            data_source_origins: &[],
+        },
         compositions: &[],
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
@@ -6039,7 +8089,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
         current_states,
@@ -6181,7 +8231,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
         current_states,
@@ -6317,7 +8367,7 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
         current_states,
@@ -6400,7 +8450,7 @@ async fn test_apply_time_data_source_read_retries_throttling_errors() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
         current_states,
@@ -6496,7 +8546,7 @@ async fn test_pre_apply_data_source_read_remains_noop_in_executor() {
 
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &HashMap::new(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
         current_states,

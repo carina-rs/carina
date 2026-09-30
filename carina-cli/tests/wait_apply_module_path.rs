@@ -34,13 +34,13 @@ use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::create_plan;
 use carina_core::executor::{
     DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
-    UnresolvedResource, execute_plan,
+    ProviderCheckInputs, UnresolvedResource, execute_plan,
 };
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
-use carina_core::resource::{DataSource, ResourceId, State, Value};
+use carina_core::resource::{ResourceId, State, Value};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 use indexmap::IndexMap;
 use std::sync::Mutex;
@@ -194,7 +194,7 @@ impl Provider for NoopProvider {
     }
     fn read_data_source(
         &self,
-        r: &DataSource,
+        r: &carina_core::provider::ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<carina_core::resource::State>> {
         let id = r.id.clone();
         Box::pin(async move { Ok(carina_core::resource::State::existing(id, HashMap::new())) })
@@ -493,20 +493,45 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     carina_core::resolver::resolve_refs_with_state_and_remote(&mut resources_for_plan, &bindings)
         .expect("resolve_refs");
 
-    carina_core::value::canonicalize_resources_with_schemas(&mut resources_for_plan, ctx.schemas());
+    let resource_origins = sorted_resources.clone();
+    let mut override_aware_resources = carina_core::override_aware::OverrideAwareResources::build(
+        resources_for_plan,
+        None::<&carina_state::StateFile>,
+        carina_core::binding_index::PreApplyInputs {
+            managed: &[],
+            compositions: &parsed.compositions,
+            data_sources: &parsed.data_sources,
+            current_states: &carina_core::resource::into_plan_input_map(
+                current_states.clone(),
+                ctx.schemas(),
+                &resource_origins,
+            ),
+            remote_bindings: &remote_bindings,
+            wait_aliases: &wait_aliases,
+        },
+    )
+    .expect("override-aware resolve");
 
     let provider = NoopProvider { cert_publishes_arn };
     let mut wait_bindings = parsed.wait_bindings.clone();
+    let compositions = parsed.compositions.clone();
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&compositions);
+    let mut data_sources = parsed.data_sources.clone();
     let preprocessor = PlanPreprocessor::new(&NoopNormalizer, &ctx);
     preprocessor
         .prepare(
-            &mut resources_for_plan,
+            &mut override_aware_resources,
+            &resource_origins,
+            &module_gate,
             &mut current_states,
             &parsed.providers,
+            &mut data_sources,
             &parsed.data_sources,
             &mut wait_bindings,
         )
-        .await;
+        .await
+        .expect("plan preprocessing");
+    let resources_for_plan = override_aware_resources.resources().to_vec();
 
     let saved_attrs = carina_core::provider::RawSavedAttrs::default().lift(ctx.schemas());
     let plan = create_plan(
@@ -549,7 +574,10 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     };
     let input = ExecutionInput {
         plan: &plan,
-        unresolved_resources: &unresolved_resources,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved_resources,
+            data_source_origins: &parsed.data_sources,
+        },
         compositions: &parsed.compositions,
         bindings: ResolvedBindings::default(),
         current_states,

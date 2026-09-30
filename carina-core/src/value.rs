@@ -3427,6 +3427,7 @@ mod tests {
             signature: Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: attrs,
+                pending_constraints: Vec::new(),
             },
             binding: Some("module_instance".to_string()),
             dependency_bindings: BTreeSet::new(),

@@ -32,8 +32,9 @@ use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overri
 use crate::error::AppError;
 use crate::wiring::{
     DataSourceRefreshResolution, WiringContext, build_factories_from_providers,
-    get_provider_with_ctx, read_data_source_with_retry, reconcile_anonymous_identifiers_with_ctx,
-    reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
+    data_source_refresh_bindings, get_provider_with_ctx, read_data_source_with_retry,
+    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
+    resolve_data_source_refs_for_refresh,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -1031,6 +1032,17 @@ pub(crate) async fn run_state_refresh_locked(
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
     let ctx = WiringContext::new(factories);
 
+    run_state_refresh_locked_with_ctx(parsed, backend, lock, base_dir, cancel, &ctx).await
+}
+
+async fn run_state_refresh_locked_with_ctx(
+    parsed: &mut carina_core::parser::InferredFile,
+    backend: &dyn StateBackend,
+    lock: Option<&LockInfo>,
+    base_dir: &std::path::Path,
+    cancel: ShutdownToken,
+    ctx: &WiringContext,
+) -> Result<(), AppError> {
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the refresh lock before the "no
     // resources" short-circuit returns — see
@@ -1058,7 +1070,7 @@ pub(crate) async fn run_state_refresh_locked(
     );
     if let Some(sf) = state_file.as_mut() {
         reconcile_anonymous_identifiers_with_ctx(
-            &ctx,
+            ctx,
             &mut parsed.resources,
             sf,
             &state_block_claims,
@@ -1075,7 +1087,7 @@ pub(crate) async fn run_state_refresh_locked(
     let mut sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select provider
-    let provider = get_provider_with_ctx(&ctx, parsed, base_dir).await?;
+    let provider = get_provider_with_ctx(ctx, parsed, base_dir).await?;
 
     println!();
     println!("{}", "Refreshing state...".cyan().bold());
@@ -1231,12 +1243,27 @@ pub(crate) async fn run_state_refresh_locked(
             .iter()
             .map(carina_core::binding_index::WaitAliasSpec::from)
             .collect();
+        let empty_remote_bindings = HashMap::new();
+        let data_source_bindings = data_source_refresh_bindings(
+            &sorted_resources,
+            &parsed.compositions,
+            &parsed.data_sources,
+            &current_states,
+            &empty_remote_bindings,
+            ctx.schemas(),
+            &wait_aliases,
+        );
+        let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
+        // Check the shared module gate before any data-source dispatch so a
+        // violation remains attributed to its composition instead of being
+        // wrapped as a provider failure on whichever read happened to expose it.
+        module_gate.check(&data_source_bindings)?;
         let data_source_refreshes = resolve_data_source_refs_for_refresh(
             &sorted_resources,
             &parsed.compositions,
             &parsed.data_sources,
             &current_states,
-            &HashMap::new(),
+            &empty_remote_bindings,
             ctx.schemas(),
             &wait_aliases,
         )?;
@@ -1260,9 +1287,15 @@ pub(crate) async fn run_state_refresh_locked(
                     return Err(AppError::Interrupted);
                 }
             }
-            let fresh_state = read_data_source_with_retry(&provider, &resource)
-                .await
-                .map_err(AppError::Provider)?;
+            let fresh_state = read_data_source_with_retry(
+                &provider,
+                &resource,
+                &data_source_bindings,
+                &module_gate,
+                ctx.factories(),
+                ctx.schemas(),
+            )
+            .await?;
             match cancel.phase() {
                 ShutdownPhase::Running => {}
                 ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
@@ -1962,17 +1995,276 @@ mod tests {
         CancellationFixtureBase, MOCK_PROVIDER_ENV_LOCK, ScopedEnv, install_refresh_drain_barrier,
     };
     use carina_core::parser::parse;
+    use carina_core::parser::{CompareOp, TypeExpr, ValidateExpr};
     use carina_core::provider::{
         BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
         UpdateRequest,
     };
-    use carina_core::resource::DeferredValue;
+    use carina_core::resource::{
+        Composition, CompositionArgument, DeferredValue, ModuleConstraintId,
+        PendingModuleConstraint, Signature,
+    };
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
     use carina_core::value::SECRET_PREFIX;
     use carina_state::{DeposedInstance, DeposedKey};
+    use indexmap::IndexMap;
     use serde_json::json;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+
+    struct ModuleConstraintRefreshBackend {
+        state: StateFile,
+    }
+
+    #[async_trait::async_trait]
+    impl StateBackend for ModuleConstraintRefreshBackend {
+        async fn read_state(
+            &self,
+        ) -> carina_state::BackendResult<Option<carina_state::LoadedState>> {
+            Ok(Some(carina_state::LoadedState::Pristine(
+                self.state.clone(),
+            )))
+        }
+
+        async fn write_state(&self, _state: &StateFile) -> carina_state::BackendResult<()> {
+            Ok(())
+        }
+
+        async fn acquire_lock(&self, operation: &str) -> carina_state::BackendResult<LockInfo> {
+            Ok(LockInfo::new(operation))
+        }
+
+        async fn release_lock(&self, _lock: &LockInfo) -> carina_state::BackendResult<()> {
+            Ok(())
+        }
+
+        async fn renew_lock(&self, lock: &LockInfo) -> carina_state::BackendResult<LockInfo> {
+            Ok(lock.renewed())
+        }
+
+        async fn write_state_locked(
+            &self,
+            state: &StateFile,
+            _lock: &LockInfo,
+        ) -> carina_state::BackendResult<()> {
+            self.write_state(state).await
+        }
+
+        async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
+            Ok(())
+        }
+
+        async fn init(&self) -> carina_state::BackendResult<()> {
+            Ok(())
+        }
+
+        async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
+            Ok(true)
+        }
+
+        async fn create_bucket(&self) -> carina_state::BackendResult<()> {
+            Ok(())
+        }
+
+        fn resource_type(&self) -> Option<&str> {
+            None
+        }
+
+        fn provider_name(&self) -> Option<&str> {
+            None
+        }
+
+        fn resource_definition(&self, _bucket_name: &str) -> Option<String> {
+            None
+        }
+    }
+
+    struct ModuleConstraintRefreshFactory {
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct ModuleConstraintRefreshProvider {
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl carina_core::provider::ProviderFactory for ModuleConstraintRefreshFactory {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn display_name(&self) -> &str {
+            "state refresh module constraint provider"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "local".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _attributes: &IndexMap<String, Value>,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            let reads = self.reads.clone();
+            Box::pin(async move {
+                Ok(Box::new(ModuleConstraintRefreshProvider { reads }) as Box<dyn Provider>)
+            })
+        }
+
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            vec![ResourceSchema::new("lookup").as_data_source()]
+        }
+    }
+
+    impl Provider for ModuleConstraintRefreshProvider {
+        fn name(&self) -> &str {
+            "state-refresh-module-constraint"
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            _identifier: Option<&str>,
+            _request: ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(State::not_found(id)) })
+        }
+
+        fn read_data_source(
+            &self,
+            resource: &carina_core::provider::ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let id = resource.id.clone();
+            Box::pin(async move { Ok(State::existing(id, HashMap::new())) })
+        }
+
+        fn create(
+            &self,
+            _id: &ResourceId,
+            _request: CreateRequest,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
+            Box::pin(async { Err(ProviderError::internal("unexpected create")) })
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: UpdateRequest,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
+            Box::pin(async { Err(ProviderError::internal("unexpected update")) })
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _request: DeleteRequest,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
+        }
+
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: carina_core::effect::PlanOp,
+        ) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn state_refresh_reports_module_constraint_without_dispatching_data_source() {
+        let composition = Composition {
+            id: ResourceId::with_identity("_virtual", "checked"),
+            signature: Signature {
+                arguments: IndexMap::from([(
+                    "value".to_string(),
+                    CompositionArgument::from_value(
+                        Value::Concrete(ConcreteValue::String("bad".to_string())),
+                        TypeExpr::String,
+                    ),
+                )]),
+                attributes: IndexMap::new(),
+                pending_constraints: vec![PendingModuleConstraint {
+                    id: ModuleConstraintId::argument_validation("value", 0),
+                    expression: ValidateExpr::Compare {
+                        lhs: Box::new(ValidateExpr::Var("value".to_string())),
+                        op: CompareOp::Ne,
+                        rhs: Box::new(ValidateExpr::String("bad".to_string())),
+                    },
+                    message: "value must not be bad".to_string(),
+                }],
+            },
+            binding: Some("checked".to_string()),
+            dependency_bindings: BTreeSet::new(),
+            module_name: "checked_module".to_string(),
+            instance: "root.checked".to_string(),
+            provenance: Default::default(),
+            quoted_string_attrs: HashSet::new(),
+        };
+        let data_source = DataSource::with_provider("test", "lookup", "unrelated", None)
+            .with_attribute(
+                "query",
+                Value::Concrete(ConcreteValue::String("literal".to_string())),
+            );
+        let provider_config = carina_core::parser::ProviderConfig {
+            name: "test".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+            is_default: true,
+        };
+        let mut parsed = carina_core::parser::InferredFile::default();
+        parsed.providers.push(provider_config);
+        parsed.compositions.push(composition);
+        parsed.data_sources.push(data_source);
+
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(ResourceState::new("orphan", "old", "test").with_identifier("old-id"))
+            .unwrap();
+        let backend = ModuleConstraintRefreshBackend { state };
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ctx = WiringContext::new(vec![Box::new(ModuleConstraintRefreshFactory {
+            reads: reads.clone(),
+        })]);
+        let temp = tempfile::tempdir().unwrap();
+
+        let error = run_state_refresh_locked_with_ctx(
+            &mut parsed,
+            &backend,
+            None,
+            temp.path(),
+            ShutdownToken::running(),
+            &ctx,
+        )
+        .await
+        .expect_err("state refresh must reject the module constraint");
+
+        assert!(matches!(error, AppError::ModuleConstraint(_)), "{error:?}");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("module 'checked_module' (call 'checked')"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("unrelated"), "{rendered}");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn map_lock_error_includes_non_default_project_dir_in_force_unlock_hint() {
@@ -2045,7 +2337,7 @@ mod tests {
 
         fn read_data_source(
             &self,
-            resource: &carina_core::resource::DataSource,
+            resource: &carina_core::provider::ProviderReadyDataSource,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             self.read(&resource.id, None, ReadRequest)
         }

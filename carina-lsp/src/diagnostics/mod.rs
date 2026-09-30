@@ -168,7 +168,7 @@ impl DiagnosticEngine {
             diagnostics.extend(self.duplicate_declaration_diagnostics(
                 doc,
                 current_file_name,
-                &result.duplicate_declarations,
+                &result.directory.duplicate_declarations,
             ));
         } else if let Some(parsed) = doc.parsed() {
             // An unrelated broken sibling makes the directory parse fail, but
@@ -190,9 +190,15 @@ impl DiagnosticEngine {
         if let (Some(base), Some(current_file), Some(result)) =
             (base_path, current_file_name, merged_result.as_ref())
         {
-            diagnostics.extend(self.check_mixed_tag_key_styles(current_file, base, result));
+            diagnostics.extend(self.check_mixed_tag_key_styles(
+                current_file,
+                base,
+                &result.directory,
+            ));
         }
-        let merged = merged_result.as_ref().map(|result| &result.parsed);
+        let merged = merged_result
+            .as_ref()
+            .map(|result| &result.directory.parsed);
         let upstream_resolution = match (base_path, merged) {
             (Some(base), Some(merged)) => Some(
                 carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
@@ -426,6 +432,33 @@ impl DiagnosticEngine {
                 .unwrap_or_default();
             if base_path.is_some() {
                 diagnostics.extend(self.check_module_calls(doc, parsed, &module_signatures));
+                let constraint_diagnostics = base_path
+                    .zip(current_file_name)
+                    .zip(merged_result.as_ref())
+                    .map(|((base_path, file_name), result)| {
+                        self.module_constraint_diagnostics(
+                            &base_path.join(file_name),
+                            &result.module_constraint_reports,
+                        )
+                    })
+                    .unwrap_or_default();
+                let has_source_owned_constraint_diagnostic = !constraint_diagnostics.is_empty();
+                diagnostics.extend(constraint_diagnostics);
+                if !has_source_owned_constraint_diagnostic
+                    && let Some(error) = merged_result
+                        .as_ref()
+                        .and_then(|result| result.module_error.as_ref())
+                    && let Some(diagnostic) = self.module_resolver_constraint_diagnostic(
+                        doc,
+                        parsed,
+                        error,
+                        merged_result
+                            .as_ref()
+                            .and_then(|result| result.module_error_owner.as_deref()),
+                    )
+                {
+                    diagnostics.push(diagnostic);
+                }
             }
             if let (Some(_), Some(expanded)) = (base_path, merged) {
                 diagnostics.extend(self.check_composition_ref_types(
@@ -950,7 +983,17 @@ impl DiagnosticEngine {
                     }
 
                     // Run resource-level validator (e.g., mutually exclusive required fields)
-                    let resolved_attrs = rref.resolved_attributes();
+                    let mut resolved_attrs = rref.resolved_attributes();
+                    for value in resolved_attrs.values_mut() {
+                        if let Some(evaluated) =
+                            carina_core::parser::evaluate_static_value_for_validation(
+                                value,
+                                &self.provider_context,
+                            )
+                        {
+                            *value = evaluated;
+                        }
+                    }
                     let lookup =
                         carina_core::parser::provider_context_lookup(&self.provider_context);
                     let is_string_literal =
@@ -974,19 +1017,25 @@ impl DiagnosticEngine {
                                 continue;
                             }
                             // Skip errors that are already reported with precise positions
-                            // by the attribute-level checks above.
-                            if matches!(
-                                error,
-                                carina_core::schema::TypeError::BlockSyntaxNotAllowed { .. }
-                                    | carina_core::schema::TypeError::TypeMismatch { .. }
-                                    | carina_core::schema::TypeError::InvalidEnumVariant { .. }
-                                    | carina_core::schema::TypeError::ValidationFailed { .. }
-                                    | carina_core::schema::TypeError::UnknownStructField { .. }
-                                    | carina_core::schema::TypeError::UnionStructMismatch { .. }
-                                    | carina_core::schema::TypeError::StructFieldError { .. }
-                                    | carina_core::schema::TypeError::ListItemError { .. }
-                                    | carina_core::schema::TypeError::MapValueError { .. }
-                            ) {
+                            // by the attribute-level checks above. Static `secret(...)`
+                            // calls are materialized only for this shared schema pass,
+                            // so retain their masked nested errors: the authored AST
+                            // seen by the attribute pass was still a FunctionCall.
+                            let is_masked_secret_error = error.to_string().contains("(secret)");
+                            if !is_masked_secret_error
+                                && matches!(
+                                    &error,
+                                    carina_core::schema::TypeError::BlockSyntaxNotAllowed { .. }
+                                        | carina_core::schema::TypeError::TypeMismatch { .. }
+                                        | carina_core::schema::TypeError::InvalidEnumVariant { .. }
+                                        | carina_core::schema::TypeError::ValidationFailed { .. }
+                                        | carina_core::schema::TypeError::UnknownStructField { .. }
+                                        | carina_core::schema::TypeError::UnionStructMismatch { .. }
+                                        | carina_core::schema::TypeError::StructFieldError { .. }
+                                        | carina_core::schema::TypeError::ListItemError { .. }
+                                        | carina_core::schema::TypeError::MapValueError { .. }
+                                )
+                            {
                                 continue;
                             }
                             // Try attribute-level position first, fall back to resource position

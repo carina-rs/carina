@@ -16,6 +16,18 @@ use carina_core::upstream_exports::UpstreamRefDiagnostic;
 
 use super::{DiagnosticEngine, carina_diagnostic};
 
+/// Directory parse plus the module-expansion error, if expansion stopped.
+///
+/// Most diagnostics can still use the partially expanded parse after a
+/// resolver failure, but concrete module constraint failures must not be
+/// discarded: they are actionable editor diagnostics in their own right.
+pub(super) struct MergedParseResult {
+    pub(super) directory: DirectoryParseResult,
+    pub(super) module_error: Option<carina_core::module_resolver::ModuleError>,
+    pub(super) module_error_owner: Option<String>,
+    pub(super) module_constraint_reports: carina_core::module_resolver::ModuleCallConstraintReports,
+}
+
 fn module_call_header_position(line: &str, call: &ModuleCall) -> Option<usize> {
     let module_pattern = format!("{} {{", call.module_name);
     line.match_indices(&module_pattern)
@@ -630,7 +642,7 @@ impl DiagnosticEngine {
         doc: &Document,
         current_file_name: Option<&str>,
         base_path: &std::path::Path,
-    ) -> Option<DirectoryParseResult> {
+    ) -> Option<MergedParseResult> {
         let mut overrides: HashMap<String, String> = HashMap::new();
         if let Some(name) = current_file_name {
             overrides.insert(name.to_string(), doc.text());
@@ -642,21 +654,95 @@ impl DiagnosticEngine {
                 &overrides,
             )
             .ok()?;
-        // Module expansion is a no-op for configs without `module_call`, and
-        // safe to ignore-if-fails for module-loading errors (sibling LSP
-        // checks like `check_module_calls` already report those). We only
-        // care about reaching finalize on the typical case.
-        let _ = carina_core::module_resolver::resolve_modules_with_config(
+        // Module expansion is a no-op for configs without `module_call`.
+        // Retain an error while continuing with the partially expanded parse:
+        // source-level checks still have useful work to do, and concrete
+        // value-constraint failures are surfaced at the owning call site.
+        let root_imports = result.parsed.uses.clone();
+        let module_resolution = carina_core::module_resolver::resolve_modules_with_diagnostics(
             &mut result.parsed,
             base_path,
             &self.provider_context,
         );
+        let module_error = module_resolution.error;
+        // Nested expansion can fail while a root import is being loaded,
+        // before the resolver has a root instance prefix to attach. Identify
+        // that import alias on the error path so the LSP can still anchor the
+        // diagnostic at its authored root call.
+        let module_error_owner = module_error.as_ref().and_then(|expected| {
+            root_imports.iter().find_map(|import| {
+                let mut resolver = carina_core::module_resolver::ModuleResolver::with_config(
+                    base_path,
+                    &self.provider_context,
+                );
+                match resolver.load_module(&import.path) {
+                    Err(candidate) if candidate.to_string() == expected.to_string() => {
+                        Some(import.alias.clone())
+                    }
+                    _ => None,
+                }
+            })
+        });
         let _ = carina_core::parser::resolve_provider_unresolved_attributes(
             &mut result.parsed,
             &self.provider_context,
         );
         let _ = carina_core::parser::finalize_provider_configs(&mut result.parsed);
-        Some(result)
+        Some(MergedParseResult {
+            directory: result,
+            module_error,
+            module_error_owner,
+            module_constraint_reports: module_resolution.constraint_reports,
+        })
+    }
+
+    /// Anchor a concrete nested module-constraint resolver failure at the
+    /// root call that owns its instance path. Direct-call constraints are
+    /// emitted solely by `check_module_calls` from the shared core result;
+    /// this fallback owns only failures below that root call.
+    pub(super) fn module_resolver_constraint_diagnostic(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+        error: &carina_core::module_resolver::ModuleError,
+        owner: Option<&str>,
+    ) -> Option<Diagnostic> {
+        let instance = match error {
+            carina_core::module_resolver::ModuleError::Constraint(diagnostic) => {
+                diagnostic.instance.as_str()
+            }
+            _ => return None,
+        };
+
+        parsed
+            .module_calls
+            .iter()
+            .enumerate()
+            .find_map(|(call_index, call)| {
+                let root_instance = carina_core::module_resolver::instance_prefix_for_call(call);
+                let owns_failure = instance == root_instance
+                    || instance
+                        .strip_prefix(&root_instance)
+                        .is_some_and(|suffix| suffix.starts_with('.'))
+                    || owner.is_some_and(|alias| call.module_name == alias);
+                if !owns_failure {
+                    return None;
+                }
+                if instance == root_instance {
+                    return None;
+                }
+                let occurrence = module_call_occurrence(&parsed.module_calls, call_index)?;
+                let (line, col, width) = self
+                    .find_module_call_position(doc, call, occurrence)
+                    .map(|(line, col)| (line, col, call.module_name.chars().count() as u32))?;
+                Some(carina_diagnostic(
+                    line,
+                    col,
+                    col + width,
+                    DiagnosticSeverity::ERROR,
+                    error.to_string(),
+                ))
+            })
     }
 
     /// Check tag-key casing against the directory-wide CLI population while
@@ -1197,6 +1283,57 @@ impl DiagnosticEngine {
             }
         }
 
+        diagnostics
+    }
+
+    /// Map resolver-owned constraint outcomes onto their parser-authored
+    /// source spans. This layer never rebuilds argument values or re-runs a
+    /// constraint expression.
+    pub(super) fn module_constraint_diagnostics(
+        &self,
+        current_file: &std::path::Path,
+        reports: &carina_core::module_resolver::ModuleCallConstraintReports,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        for report in reports.values() {
+            if report.source.file != current_file {
+                continue;
+            }
+            for outcome in &report.outcomes {
+                let carina_core::module_resolver::ResolvedModuleConstraintStatus::Failed(failure) =
+                    &outcome.status
+                else {
+                    continue;
+                };
+                let span = match &failure.kind {
+                    carina_core::module_resolver::ModuleConstraintKind::ArgumentValidation {
+                        argument,
+                    } => report
+                        .source
+                        .argument_spans
+                        .get(argument)
+                        .copied()
+                        .unwrap_or(report.source.call_span),
+                    carina_core::module_resolver::ModuleConstraintKind::Require => {
+                        report.source.call_span
+                    }
+                };
+                let line = span.start_line.saturating_sub(1) as u32;
+                let col = span.start_column.saturating_sub(1) as u32;
+                let width = if span.start_line == span.end_line {
+                    span.end_column.saturating_sub(span.start_column) as u32
+                } else {
+                    1
+                };
+                diagnostics.push(carina_diagnostic(
+                    line,
+                    col,
+                    col + width.max(1),
+                    DiagnosticSeverity::ERROR,
+                    failure.to_string(),
+                ));
+            }
+        }
         diagnostics
     }
 

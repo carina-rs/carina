@@ -6,7 +6,8 @@ use carina_core::provider::{
     ProviderFactory, ProviderNormalizer, ProviderResult, ReadRequest, UpdateRequest,
 };
 use carina_core::resource::{
-    DataSource, DeferredValue, ResolvedDataSource, ResolvedResource, Resource, ResourceId,
+    Composition, CompositionArgument, DataSource, DeferredValue, ModuleConstraintId, ModuleSource,
+    PendingModuleConstraint, ResolvedDataSource, ResolvedResource, Resource, ResourceId, Signature,
 };
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use carina_state::{DeposedInstance, DeposedKey, NameOverride, ResourceState};
@@ -25,6 +26,39 @@ use crate::commands::shared::cancellation_test_support::MOCK_PROVIDER_ENV_LOCK;
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
+}
+
+fn saved_module_composition(argument: Value, rejected: &str) -> Composition {
+    let argument_name = "value";
+    Composition {
+        id: ResourceId::with_identity("_virtual", "root.checked"),
+        signature: Signature {
+            arguments: indexmap::IndexMap::from([(
+                argument_name.to_string(),
+                CompositionArgument::from_value(argument, carina_core::parser::TypeExpr::String),
+            )]),
+            attributes: indexmap::IndexMap::new(),
+            pending_constraints: vec![PendingModuleConstraint {
+                id: ModuleConstraintId::argument_validation(argument_name, 0),
+                expression: carina_core::parser::ValidateExpr::Compare {
+                    lhs: Box::new(carina_core::parser::ValidateExpr::Var(
+                        argument_name.to_string(),
+                    )),
+                    op: carina_core::parser::CompareOp::Ne,
+                    rhs: Box::new(carina_core::parser::ValidateExpr::String(
+                        rejected.to_string(),
+                    )),
+                },
+                message: format!("value must not be {rejected}"),
+            }],
+        },
+        binding: Some("checked".to_string()),
+        dependency_bindings: BTreeSet::new(),
+        module_name: "checked_module".to_string(),
+        instance: "root.checked".to_string(),
+        provenance: Default::default(),
+        quoted_string_attrs: HashSet::new(),
+    }
 }
 
 fn state_file_from_json(json: serde_json::Value) -> StateFile {
@@ -98,7 +132,10 @@ impl Provider for FailBCreateProvider {
         Box::pin(async move { Ok(State::not_found(id)) })
     }
 
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        resource: &carina_core::provider::ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = resource.id.clone();
         Box::pin(async move { Ok(State::not_found(id)) })
     }
@@ -113,7 +150,7 @@ impl Provider for FailBCreateProvider {
             if id.identity_or_empty() == "b" {
                 return Err(ProviderError::api_error("create failed").for_resource(id));
             }
-            let resource = request.resource.as_resource().clone();
+            let resource = request.resource().as_resource().clone();
             Ok(carina_core::provider::CreateOutcome::Success {
                 state: State::existing(id, resource.resolved_attributes())
                     .with_identifier("mock-id"),
@@ -372,7 +409,10 @@ impl Provider for ApplyCascadeProvider {
         })
     }
 
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        resource: &carina_core::provider::ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = resource.id.clone();
         Box::pin(async move { Ok(State::not_found(id)) })
     }
@@ -383,7 +423,7 @@ impl Provider for ApplyCascadeProvider {
         request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
         let id = id.clone();
-        let attrs = request.resource.as_resource().resolved_attributes();
+        let attrs = request.resource().as_resource().resolved_attributes();
         self.shared
             .creates
             .lock()
@@ -695,7 +735,10 @@ impl Provider for ApplyTimeReadProvider {
         })
     }
 
-    fn read_data_source(&self, resource: &DataSource) -> BoxFuture<'_, ProviderResult<State>> {
+    fn read_data_source(
+        &self,
+        resource: &carina_core::provider::ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
         let resource = resource.clone();
         let shared = self.shared.clone();
         Box::pin(async move {
@@ -724,7 +767,7 @@ impl Provider for ApplyTimeReadProvider {
                 .collect();
 
             Ok(State::existing(
-                resource.id,
+                resource.id.clone(),
                 HashMap::from([(
                     "names".to_string(),
                     Value::Concrete(ConcreteValue::List(names)),
@@ -742,7 +785,7 @@ impl Provider for ApplyTimeReadProvider {
         let id = id.clone();
         let shared = self.shared.clone();
         Box::pin(async move {
-            let mut attrs = request.resource.as_resource().resolved_attributes();
+            let mut attrs = request.resource().as_resource().resolved_attributes();
             if id.resource_type == "iam.Role" {
                 attrs
                     .entry("path".to_string())
@@ -1225,7 +1268,8 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         sorted_resources: vec![target.clone(), consumer.clone()],
         unresolved_resources: vec![target, consumer],
         compositions: Vec::new(),
-        data_sources: vec![lookup],
+        data_sources: vec![lookup.clone()],
+        data_source_origins: vec![lookup],
         current_states: vec![
             crate::commands::plan::CurrentStateEntry {
                 id: target_id,
@@ -1283,6 +1327,223 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         Some(&serde_json::json!("target")),
         "consumer must receive the value published by the apply-time read"
     );
+}
+
+#[tokio::test]
+async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create() {
+    let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
+    let fixture = ApplyCancellationFixture::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mock_state_path = tmp.path().join("mock-provider-state.json");
+    let op_log_path = tmp.path().join("op.log");
+    std::fs::write(&mock_state_path, "{}").expect("empty mock provider state");
+
+    unsafe {
+        std::env::set_var("CARINA_MOCK_STATE_FILE", &mock_state_path);
+        std::env::set_var("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1");
+        std::env::set_var("CARINA_MOCK_OP_LOG", &op_log_path);
+    }
+
+    let mut producer = Resource::with_provider("mock", "test.resource", "producer", None);
+    producer.binding = Some("producer".to_string());
+    producer.set_attr("name", string_value("bad"));
+    let producer_id = producer.id.clone();
+
+    let mut consumer = Resource::with_provider("mock", "test.resource", "consumer", None);
+    consumer.binding = Some("consumer".to_string());
+    consumer.module_source = Some(ModuleSource::module("checked_module", "root.checked"));
+    consumer.set_attr("name", string_value("consumer"));
+    consumer.set_attr(
+        "comment",
+        Value::resource_ref("producer", "identifier", vec![]),
+    );
+    consumer.dependency_bindings.insert("producer".to_string());
+    let consumer_id = consumer.id.clone();
+
+    let composition = saved_module_composition(
+        Value::resource_ref("producer", "identifier", vec![]),
+        "bad-id",
+    );
+    let mut plan = Plan::new();
+    plan.add(carina_core::effect::Effect::Create(resolved(
+        producer.clone(),
+    )));
+    plan.add(carina_core::effect::Effect::Create(resolved(
+        consumer.clone(),
+    )));
+    let plan_file = PlanFile {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-09-29T00:00:00Z".to_string(),
+        source_path: fixture.config_path().display().to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: vec![ProviderConfig {
+            name: "mock".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+            is_default: true,
+        }],
+        backend_config: None,
+        plan,
+        sorted_resources: vec![producer.clone(), consumer.clone()],
+        unresolved_resources: vec![producer, consumer],
+        compositions: vec![composition],
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        current_states: vec![
+            crate::commands::plan::CurrentStateEntry {
+                id: producer_id.clone(),
+                state: State::not_found(producer_id.clone()),
+            },
+            crate::commands::plan::CurrentStateEntry {
+                id: consumer_id.clone(),
+                state: State::not_found(consumer_id),
+            },
+        ],
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    };
+
+    let observer_factory = fixture.observer_factory();
+    let result = run_apply_from_plan_locked(
+        plan_file,
+        true,
+        fixture.backend(),
+        None,
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: tmp.path(),
+        },
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await;
+
+    unsafe {
+        std::env::remove_var("CARINA_MOCK_STATE_FILE");
+        std::env::remove_var("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA");
+        std::env::remove_var("CARINA_MOCK_OP_LOG");
+    }
+
+    let error = result.expect_err("saved-plan module constraint must fail apply");
+    assert!(error.to_string().contains("1 failed"), "error: {error}");
+    assert_eq!(
+        std::fs::read_to_string(&op_log_path).expect("producer operation log"),
+        "create test.resource.producer\n",
+        "the consuming resource must not reach the provider"
+    );
+}
+
+#[tokio::test]
+async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
+    let fixture = ApplyCancellationFixture::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan_file = PlanFile {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-09-29T00:00:00Z".to_string(),
+        source_path: fixture.config_path().display().to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: Vec::new(),
+        backend_config: None,
+        plan: Plan::new(),
+        sorted_resources: Vec::new(),
+        unresolved_resources: Vec::new(),
+        compositions: vec![saved_module_composition(string_value("bad"), "bad")],
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        current_states: Vec::new(),
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    };
+
+    let observer_factory = fixture.observer_factory();
+    let error = run_apply_from_plan_locked(
+        plan_file,
+        true,
+        fixture.backend(),
+        None,
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: tmp.path(),
+        },
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect_err("saved-plan no-op must run the terminal module gate");
+
+    assert!(
+        matches!(&error, AppError::ModuleConstraint(_)),
+        "terminal module failures must retain their typed AppError variant: {error:?}"
+    );
+    let message = error.to_string();
+    for expected in [
+        "module 'checked_module' (call 'checked')",
+        "value must not be bad",
+        "\"bad\"",
+    ] {
+        assert!(message.contains(expected), "message: {message}");
+    }
+}
+
+#[tokio::test]
+async fn live_apply_noop_rejects_unconsumed_module_constraint() {
+    let fixture = ApplyCancellationFixture::new();
+    let mut parsed = carina_core::parser::InferredFile {
+        compositions: vec![saved_module_composition(
+            Value::resource_ref("missing", "value", vec![]),
+            "bad",
+        )],
+        ..Default::default()
+    };
+    let unresolved_parsed = carina_core::parser::ParsedFile::default();
+    let ctx = WiringContext::new(Vec::new());
+    let observer_factory = fixture.observer_factory();
+
+    let error = run_apply_locked(
+        &ctx,
+        &mut parsed,
+        &unresolved_parsed,
+        true,
+        fixture.backend(),
+        None,
+        get_base_dir(fixture.config_path()),
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect_err("live-apply no-op must run the terminal module gate");
+
+    assert!(
+        matches!(&error, AppError::ModuleConstraint(_)),
+        "terminal module failures must retain their typed AppError variant: {error:?}"
+    );
+    let message = error.to_string();
+    for expected in [
+        "module 'checked_module' (call 'checked')",
+        "value must not be bad",
+        "constraint inputs are still unresolved at end of apply",
+        "missing.value",
+    ] {
+        assert!(message.contains(expected), "message: {message}");
+    }
 }
 
 #[test]
@@ -2363,6 +2624,224 @@ fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::Backend
     }
 }
 
+struct BootstrapRecordingProvider {
+    create_calls: AtomicUsize,
+    fail_create: bool,
+}
+
+impl Provider for BootstrapRecordingProvider {
+    fn name(&self) -> &str {
+        "aws"
+    }
+
+    fn read(
+        &self,
+        id: &ResourceId,
+        _identifier: Option<&str>,
+        _request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        Box::pin(async move { Ok(State::not_found(id)) })
+    }
+
+    fn read_data_source(
+        &self,
+        resource: &carina_core::provider::ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = resource.id.clone();
+        Box::pin(async move { Ok(State::not_found(id)) })
+    }
+
+    fn create(
+        &self,
+        id: &ResourceId,
+        _request: CreateRequest,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
+        self.create_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_create {
+            return Box::pin(async { Err(ProviderError::internal("bootstrap create failed")) });
+        }
+        let state = State::existing(id.clone(), HashMap::new()).with_identifier("bucket-id");
+        Box::pin(async move { Ok(carina_core::provider::CreateOutcome::Success { state }) })
+    }
+
+    fn update(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: UpdateRequest,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
+        Box::pin(async { Err(ProviderError::internal("unexpected update")) })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _request: DeleteRequest,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
+    }
+
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: carina_core::effect::PlanOp,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+#[tokio::test]
+async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        fail_create: false,
+    };
+    let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
+    resource.set_attr(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("invalid-bucket".to_string())),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("s3.Bucket").attribute(AttributeSchema::new(
+            "bucket",
+            AttributeType::refined_string(None, Some("^state-".to_string()), None, None),
+        )),
+    );
+
+    let parsed = carina_core::parser::InferredFile::default();
+    let error = create_checked_bootstrap_resource(
+        &provider,
+        resource,
+        &parsed,
+        &NoopNormalizer,
+        &[],
+        &schemas,
+    )
+    .await
+    .expect_err("invalid bootstrap bucket must fail its value constraint");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("aws.s3.Bucket.state"),
+        "error must name the bootstrap resource: {message}"
+    );
+    assert!(
+        message.contains("'bucket'"),
+        "error must name the invalid attribute: {message}"
+    );
+    assert!(
+        message.contains("does not match required pattern /^state-/"),
+        "error must retain the value-constraint reason: {message}"
+    );
+    let mut source = std::error::Error::source(&error);
+    let mut saw_preparation = false;
+    let mut saw_type_error = false;
+    while let Some(error) = source {
+        saw_preparation |= error
+            .downcast_ref::<carina_core::executor::ProviderPreparationError>()
+            .is_some();
+        saw_type_error |= error
+            .downcast_ref::<carina_core::schema::TypeError>()
+            .is_some();
+        source = error.source();
+    }
+    assert!(
+        saw_preparation,
+        "typed preparation error was erased: {error:?}"
+    );
+    assert!(saw_type_error, "typed schema error was erased: {error:?}");
+    assert_eq!(provider.create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn state_bucket_provider_error_keeps_typed_source() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        fail_create: true,
+    };
+    let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
+    resource.set_attr(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("state-bucket".to_string())),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::new("bucket", AttributeType::string())),
+    );
+
+    let error = create_checked_bootstrap_resource(
+        &provider,
+        resource,
+        &carina_core::parser::InferredFile::default(),
+        &NoopNormalizer,
+        &[],
+        &schemas,
+    )
+    .await
+    .expect_err("provider create failure must escape bootstrap");
+
+    assert_eq!(
+        error.to_string(),
+        "Failed to create state bucket: bootstrap create failed"
+    );
+    let source = std::error::Error::source(&error).expect("provider source must be retained");
+    assert!(
+        source.downcast_ref::<ProviderError>().is_some(),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        fail_create: false,
+    };
+    let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
+    resource.set_attr(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("state-bucket".to_string())),
+    );
+    let parsed = carina_core::parser::InferredFile {
+        compositions: vec![saved_module_composition(
+            Value::Concrete(ConcreteValue::String("forbidden".to_string())),
+            "forbidden",
+        )],
+        ..Default::default()
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::new("bucket", AttributeType::string())),
+    );
+
+    let result = create_checked_bootstrap_resource(
+        &provider,
+        resource,
+        &parsed,
+        &NoopNormalizer,
+        &[],
+        &schemas,
+    )
+    .await;
+
+    assert_eq!(
+        provider.create_calls.load(Ordering::SeqCst),
+        0,
+        "the bootstrap provider dispatch must be gated by module constraints"
+    );
+    let error = result.expect_err("the violating constraint must fail bootstrap preparation");
+    assert!(matches!(&error, AppError::ModuleConstraint(_)), "{error:?}");
+    assert!(error.to_string().contains("value must not be forbidden"));
+}
+
 #[test]
 fn saved_plan_backend_cross_check_rejects_non_addressing_attribute_change() {
     let planned = s3_backend_config_with_encrypt(false);
@@ -3421,6 +3900,7 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         signature: carina_core::resource::Signature {
             arguments: indexmap::IndexMap::new(),
             attributes: virt_attrs,
+            pending_constraints: Vec::new(),
         },
         binding: Some("github_actions_carina".to_string()),
         dependency_bindings: std::collections::BTreeSet::new(),
@@ -3526,6 +4006,7 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
             signature: carina_core::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes,
+                pending_constraints: Vec::new(),
             },
             binding: Some(binding.to_string()),
             dependency_bindings: std::collections::BTreeSet::new(),
@@ -3707,6 +4188,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         signature: carina_core::resource::Signature {
             arguments: indexmap::IndexMap::new(),
             attributes: virt_attrs,
+            pending_constraints: Vec::new(),
         },
         binding: Some("carina_module".to_string()),
         dependency_bindings: std::collections::BTreeSet::new(),
@@ -4415,11 +4897,11 @@ mod saved_plan_version_tests {
     }
 
     #[tokio::test]
-    async fn version_9_saved_plan_is_rejected_after_delete_generation_bump() {
+    async fn version_10_saved_plan_is_rejected_after_constraint_metadata_bump() {
         let dir = TempDir::new().expect("tempdir");
         let plan_path = dir.path().join("plan.json");
-        let v9 = serde_json::json!({
-            "version": 9,
+        let v10 = serde_json::json!({
+            "version": 10,
             "carina_version": "0.4.0",
             "timestamp": "2026-07-02T00:00:00Z",
             "source_path": "infra/nested",
@@ -4437,7 +4919,7 @@ mod saved_plan_version_tests {
             "upstream_sources": [],
             "wait_bindings": [],
         });
-        std::fs::write(&plan_path, serde_json::to_string(&v9).unwrap()).expect("write plan");
+        std::fs::write(&plan_path, serde_json::to_string(&v10).unwrap()).expect("write plan");
 
         let result = crate::commands::apply::run_apply_from_plan(
             &plan_path,
@@ -4450,7 +4932,7 @@ mod saved_plan_version_tests {
         )
         .await;
 
-        let err = result.expect_err("v9 saved plan must be rejected after v10 bump");
+        let err = result.expect_err("v10 saved plan must be rejected after v11 bump");
         let crate::error::AppError::UnsupportedPlanVersion {
             path: error_path,
             found,
@@ -4461,19 +4943,23 @@ mod saved_plan_version_tests {
             panic!("expected typed unsupported-version error, got: {err}");
         };
         assert_eq!(error_path, &plan_path);
-        assert_eq!(*found, 9);
+        assert_eq!(*found, 10);
         assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
         let expected_replan = format!("carina plan --out {} infra/nested", plan_path.display());
         assert_eq!(replan_command.as_deref(), Some(expected_replan.as_str()));
 
         let msg = err.to_string();
         assert!(
-            msg.contains("Unsupported plan file version: 9"),
-            "error must name the rejected version, got: {msg}",
+            msg.contains("Unsupported plan file version: 10"),
+            "error must name the rejected v10 version, got: {msg}",
         );
         assert!(
-            msg.contains("expected 10"),
-            "error must name the v10 expected version, got: {msg}",
+            msg.contains("expected 11"),
+            "error must name the v11 expected version, got: {msg}",
+        );
+        assert!(
+            msg.contains(&format!("Re-run `{expected_replan}`")),
+            "error must include the path-aware re-plan command, got: {msg}",
         );
     }
 
@@ -4677,6 +5163,7 @@ mod saved_plan_version_tests {
             unresolved_resources: vec![resource],
             compositions: Vec::new(),
             data_sources: Vec::new(),
+            data_source_origins: Vec::new(),
             current_states: vec![crate::commands::plan::CurrentStateEntry {
                 id,
                 state: current_state,

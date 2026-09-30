@@ -10,10 +10,9 @@ use std::path::{Path, PathBuf};
 use carina_core::config_loader::{get_base_dir, load_configuration};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::create_plan_with_cascades;
-use carina_core::executor::normalized::apply_desired_normalization_slice;
 use carina_core::override_aware::OverrideAwareResources;
 use carina_core::plan::Plan;
-use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
+use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult, ProviderRouter};
 use carina_core::resource::{ResourceId, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, StructField,
@@ -23,12 +22,11 @@ use carina_state::{StateFile, check_and_migrate};
 
 use crate::commands::validate_and_resolve_with_config;
 use crate::wiring::{
-    WiringContext, add_deferred_create_effects,
+    PlanPreprocessor, WiringContext, add_deferred_create_effects,
     adopt_unique_state_identity_for_unresolved_anonymous,
     assign_fallback_identities_for_unresolved_anonymous, compute_anonymous_identifiers_with_ctx,
-    expand_same_config_deferred_for, normalize_state_with_ctx,
-    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
-    resolve_enum_aliases_in_states,
+    expand_same_config_deferred_for, reconcile_anonymous_identifiers_with_ctx,
+    reconcile_prefixed_names,
 };
 
 /// Fixture root path relative to the `carina-cli` crate manifest.
@@ -77,6 +75,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let loaded = load_configuration(&fixture_pathbuf).unwrap();
     let inference_errors = loaded.inference_errors;
     let duplicate_declarations = loaded.duplicate_declarations;
+    let unresolved_resources = loaded.unresolved_parsed.resources;
     let mut parsed = loaded.parsed;
     let base_dir = get_base_dir(&fixture_pathbuf);
     validate_and_resolve_with_config(
@@ -255,6 +254,20 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &override_aware_resources,
         state_file.as_ref(),
     );
+    let unresolved_override_aware_resources = OverrideAwareResources::build_for_plan(
+        unresolved_resources,
+        state_file.as_ref(),
+        carina_core::binding_index::PreApplyInputs {
+            managed: &[],
+            compositions: &parsed.compositions,
+            data_sources: &data_sources,
+            current_states: &pre_apply_input_states,
+            remote_bindings: &remote_bindings,
+            wait_aliases: &wait_aliases,
+        },
+        &upstream_binding_names,
+    )
+    .expect("Failed to build unresolved override-aware resources");
 
     // Resolve data-source input refs for the plan (carina#3181).
     let mut data_sources_for_plan = data_sources.clone();
@@ -265,38 +278,54 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     )
     .expect("Failed to resolve data source refs with state");
 
-    carina_core::value::canonicalize_data_sources_with_schemas(
-        &mut data_sources_for_plan,
-        wiring.schemas(),
-    );
     carina_core::utils::lift_current_state_enum_leaves_for_data_sources(
         &mut current_states,
         &data_sources,
         wiring.schemas(),
     );
-
-    normalize_state_with_ctx(&wiring, &mut current_states);
-
-    {
-        use carina_core::provider::ProviderRouter;
+    let constraint_origin_resources = override_aware_resources
+        .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
+    let prepared_compositions = parsed.compositions.clone();
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&prepared_compositions);
+    let mut wait_bindings = parsed.wait_bindings.clone();
+    let preparation = {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("failed to build tokio runtime for desired normalization");
+            .expect("failed to build tokio runtime for plan preprocessing");
         let mut router = ProviderRouter::new();
         for factory in wiring.factories() {
             let attrs = indexmap::IndexMap::new();
             router.add_normalizer(rt.block_on(factory.create_normalizer(None, &attrs)));
         }
-        rt.block_on(apply_desired_normalization_slice(
-            override_aware_resources.resources_mut(),
+        rt.block_on(PlanPreprocessor::new(&router, &wiring).prepare(
+            &mut override_aware_resources,
+            &constraint_origin_resources,
+            &module_gate,
+            &mut current_states,
             &parsed.providers,
-            &router,
-            wiring.factories(),
-            wiring.schemas(),
-        ));
+            &mut data_sources_for_plan,
+            &data_sources,
+            &mut wait_bindings,
+        ))
+    };
+    if let Err(errors) = preparation {
+        let mut plan = Plan::new();
+        for error in errors {
+            plan.add_error(error);
+        }
+        return FixturePlan {
+            plan,
+            current_states,
+            state_file,
+            schemas: wiring.schemas().clone(),
+            moved_origins: HashMap::new(),
+            deferred_for_expressions: parsed.deferred_for_expressions,
+            export_params: parsed.export_params,
+            resolved_export_params: Vec::new(),
+            prev_explicit,
+            expansion_trace: parsed.expansion_trace,
+        };
     }
-
-    resolve_enum_aliases_in_states(&wiring, &mut current_states);
     {
         let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
             override_aware_resources.resources_mut(),
@@ -360,18 +389,6 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     )
     .expect("state block collision validation failed");
 
-    // carina#3358: resolve `until` predicate enum aliases before the
-    // differ lowers the wait, the same step the plan/apply pipelines run.
-    // The fixture harness uses an empty factory set so this is a no-op
-    // here, but keeping the sibling call consistent means a fixture that
-    // ever gains real factories cannot silently regress.
-    let mut wait_bindings = parsed.wait_bindings.clone();
-    crate::wiring::resolve_enum_aliases_in_wait_bindings(
-        &wiring,
-        &mut wait_bindings,
-        override_aware_resources.resources(),
-        &data_sources_for_plan,
-    );
     let deferred_for_expansion = expand_same_config_deferred_for(
         &parsed,
         &sorted_resources,
@@ -479,7 +496,56 @@ fn fixture_provider_factories(fixture_path: &Path) -> Vec<Box<dyn ProviderFactor
         Some("route53_hosted_zone_name_strip_suffix_no_diff") => {
             vec![Box::new(Route53HostedZoneFixtureFactory)]
         }
+        Some("resolved_value_constraint_multifile") => {
+            vec![Box::new(ResolvedValueConstraintFixtureFactory)]
+        }
         _ => vec![],
+    }
+}
+
+struct ResolvedValueConstraintFixtureFactory;
+
+impl ProviderFactory for ResolvedValueConstraintFixtureFactory {
+    fn name(&self) -> &str {
+        "fixture"
+    }
+
+    fn display_name(&self) -> &str {
+        "Resolved value constraint fixture provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::new()
+    }
+
+    fn validate_config(
+        &self,
+        _attributes: &indexmap::IndexMap<String, Value>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &indexmap::IndexMap<String, Value>) -> String {
+        "test".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _attributes: &indexmap::IndexMap<String, Value>,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
+    }
+
+    fn schemas(&self) -> Vec<ResourceSchema> {
+        let constrained =
+            AttributeType::refined_string(None, Some("^good-".to_string()), None, None);
+        vec![
+            ResourceSchema::new("test.Source")
+                .attribute(AttributeSchema::new("value", AttributeType::string()).required()),
+            ResourceSchema::new("test.Consumer")
+                .attribute(AttributeSchema::new("target", constrained).required()),
+        ]
     }
 }
 
