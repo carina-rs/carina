@@ -132,7 +132,7 @@ pub struct PlanFile {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 12;
+    pub const CURRENT_VERSION: u32 = 11;
 
     pub(crate) fn validate_replace_display(&self) -> Result<(), String> {
         let effects = self.plan.effects();
@@ -309,15 +309,11 @@ fn build_plan_file<E>(
         .to_string();
 
     Ok(PlanFile {
-        // carina#3805: bumped 11→12 — `data_source_origins` preserves the
-        // authored input paired with each canonical plan-time data source so
-        // apply can validate only values that become known at runtime.
-        // A v11 plan cannot distinguish normalized literals from authored
-        // values at the provider gate.
-        //
-        // carina#3805: bumped 10→11 — `compositions` now stores the
-        // post-preprocessing pending module constraints required by apply.
-        // A v10 plan cannot enforce those constraints at the provider gate.
+        // carina#3805: bumped 10→11 — `compositions` stores the pending module
+        // constraints required by apply, and `data_source_origins` preserves
+        // the authored input paired with each canonical plan-time data source
+        // so apply can validate only values that become known at runtime. A
+        // v10 plan can enforce neither provider-boundary guarantee.
         //
         // Phase 9: bumped 8→9 — `data_sources` now stores the exact
         // differ/executor view: resolved refresh-time reads and unresolved

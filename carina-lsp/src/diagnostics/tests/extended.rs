@@ -3842,10 +3842,16 @@ let instance = checked {
     std::fs::write(root.join("main.crn"), source).unwrap();
 
     let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", source);
-    let diagnostic = diagnostics
+    let matching = diagnostics
         .iter()
-        .find(|diagnostic| diagnostic.message.contains("name must not be empty"))
-        .unwrap_or_else(|| panic!("authored validation message missing: {diagnostics:#?}"));
+        .filter(|diagnostic| diagnostic.message.contains("name must not be empty"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "authored validation must be reported exactly once: {diagnostics:#?}"
+    );
+    let diagnostic = matching[0];
     assert_eq!(diagnostic.range.start.line, 3);
     assert_eq!(diagnostic.range.start.character, 2);
 }
@@ -3879,10 +3885,16 @@ let instance = checked {
     std::fs::write(root.join("main.crn"), source).unwrap();
 
     let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", source);
-    let diagnostic = diagnostics
+    let matching = diagnostics
         .iter()
-        .find(|diagnostic| diagnostic.message.contains("left and right must match"))
-        .unwrap_or_else(|| panic!("authored require message missing: {diagnostics:#?}"));
+        .filter(|diagnostic| diagnostic.message.contains("left and right must match"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "authored require must be reported exactly once: {diagnostics:#?}"
+    );
+    let diagnostic = matching[0];
     assert_eq!(diagnostic.range.start.line, 2);
     assert_eq!(diagnostic.range.start.character, 15);
 }

@@ -2049,6 +2049,90 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
     );
 }
 
+#[tokio::test]
+async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+
+    let provider = MockProvider::new();
+    let upstream = make_resource("plan-data-source-producer", &[]);
+    let upstream_id = upstream.id.clone();
+    let mut data_source = DataSource::with_provider("test", "Lookup", "plan-lookup", None);
+    data_source.binding = Some("plan-lookup".to_string());
+    data_source.attributes.insert(
+        "filter".to_string(),
+        Value::resource_ref("plan-data-source-producer", "value", vec![]),
+    );
+    let data_source_id = data_source.id.clone();
+
+    provider.push_create(Ok(State::existing(
+        upstream_id.clone(),
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("bad".to_string())),
+        )]),
+    )
+    .with_identifier("producer-id")));
+    provider.push_read(Ok(State::existing(data_source_id.clone(), HashMap::new())));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(upstream.clone()));
+    plan.add(Effect::Read {
+        resource: resolved_data_source(data_source.clone()),
+    });
+    let mut deferred_reads = DeferredDataSourceReads::none();
+    deferred_reads.insert(data_source_id, unresolved_data_source_inputs(&data_source));
+    let resource_origins = HashMap::from([(
+        upstream.id.clone(),
+        UnresolvedResource::from_pre_resolve(upstream.clone()),
+    )]);
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: std::slice::from_ref(&upstream),
+        compositions: &[],
+        data_sources: std::slice::from_ref(&data_source),
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+    let schemas = deferred_data_source_constraint_schemas();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &resource_origins,
+            data_source_origins: std::slice::from_ref(&data_source),
+        },
+        compositions: &[],
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: deferred_reads,
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert!(
+        provider.captured_data_source_reads().is_empty(),
+        "schema-invalid apply-resolved data source reached the provider"
+    );
+    assert_eq!(result.success_count, 1);
+    assert_eq!(result.failure_count, 1);
+    assert_eq!(
+        provider.calls(),
+        vec![("create".to_string(), upstream_id.to_string())]
+    );
+}
+
 fn pending_module_composition(
     instance: &str,
     arguments: Vec<(&str, Value)>,
@@ -2112,6 +2196,107 @@ fn module_require_equal_constraint(
         },
         message: format!("{left} and {right} must match"),
     }
+}
+
+#[tokio::test]
+async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::resource::CompositionAttribute;
+
+    let provider = MockProvider::new();
+    let upstream = make_resource("module-data-source-producer", &[]);
+    let upstream_id = upstream.id.clone();
+    let mut data_source = DataSource::with_provider("test", "Lookup", "module-lookup", None);
+    data_source.binding = Some("module-lookup".to_string());
+    data_source.attributes.insert(
+        "filter".to_string(),
+        Value::resource_ref("checked", "value", vec![]),
+    );
+    let data_source_id = data_source.id.clone();
+    let mut composition = pending_module_composition(
+        "root.checked",
+        vec![(
+            "value",
+            Value::resource_ref("module-data-source-producer", "value", vec![]),
+        )],
+        vec![module_not_bad_constraint("value")],
+    );
+    composition.binding = Some("checked".to_string());
+    composition.signature.attributes.insert(
+        "value".to_string(),
+        CompositionAttribute::from_value(
+            Value::resource_ref("module-data-source-producer", "value", vec![]),
+            None,
+        ),
+    );
+
+    provider.push_create(Ok(State::existing(
+        upstream_id.clone(),
+        HashMap::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("bad".to_string())),
+        )]),
+    )
+    .with_identifier("producer-id")));
+    provider.push_read(Ok(State::existing(data_source_id.clone(), HashMap::new())));
+
+    let mut plan = Plan::new();
+    plan.add(create_effect(upstream.clone()));
+    plan.add(Effect::Read {
+        resource: resolved_data_source(data_source.clone()),
+    });
+    let mut deferred_reads = DeferredDataSourceReads::none();
+    deferred_reads.insert(data_source_id, unresolved_data_source_inputs(&data_source));
+    let resource_origins = HashMap::from([(
+        upstream.id.clone(),
+        UnresolvedResource::from_pre_resolve(upstream.clone()),
+    )]);
+    let bindings = ResolvedBindings::pre_apply(PreApplyInputs {
+        managed: std::slice::from_ref(&upstream),
+        compositions: std::slice::from_ref(&composition),
+        data_sources: std::slice::from_ref(&data_source),
+        current_states: &HashMap::new(),
+        remote_bindings: &HashMap::new(),
+        wait_aliases: &[],
+    });
+    let schemas = SchemaRegistry::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &resource_origins,
+            data_source_origins: std::slice::from_ref(&data_source),
+        },
+        compositions: std::slice::from_ref(&composition),
+        bindings,
+        current_states: HashMap::new(),
+        deferred_data_source_reads: deferred_reads,
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+    };
+
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+
+    assert!(
+        provider.captured_data_source_reads().is_empty(),
+        "module-invalid apply-resolved data source reached the provider"
+    );
+    assert_eq!(result.success_count, 1);
+    assert_eq!(result.failure_count, 1);
+    assert_eq!(
+        provider.calls(),
+        vec![("create".to_string(), upstream_id.to_string())]
+    );
 }
 
 fn mark_module_resource(resource: &mut Resource, instance: &str) {
@@ -2776,6 +2961,53 @@ async fn terminal_pending_constraint_is_silent_after_failed_and_skipped_effects(
     assert!(
         !events.contains("still unresolved at end of apply"),
         "the upstream failure already explains the pending input: {events}"
+    );
+    assert!(
+        !events.contains("module_constraint_failed"),
+        "pending constraint was double-counted: {events}"
+    );
+}
+
+#[tokio::test]
+async fn terminal_pending_constraint_is_silent_after_failure_without_skips() {
+    let provider = MockProvider::new();
+    let failed = make_resource("failed-without-dependent", &[]);
+    provider.push_create(Err(ProviderError::api_error("standalone create failed")));
+    let composition = pending_module_composition(
+        "root.unused",
+        vec![("value", Value::resource_ref("missing", "value", vec![]))],
+        vec![module_not_bad_constraint("value")],
+    );
+    let mut plan = Plan::new();
+    plan.add(create_effect(failed));
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: std::slice::from_ref(&composition),
+        bindings: ResolvedBindings::default(),
+        current_states: HashMap::new(),
+        deferred_data_source_reads: DeferredDataSourceReads::none(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &TEST_SCHEMAS,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let events = observer.events().join("\n");
+
+    assert_eq!(result.failure_count, 1, "events: {events}");
+    assert_eq!(result.skip_count, 0, "events: {events}");
+    assert!(
+        events.contains("standalone create failed"),
+        "events: {events}"
+    );
+    assert!(
+        !events.contains("still unresolved at end of apply"),
+        "the provider failure already explains the pending input: {events}"
     );
     assert!(
         !events.contains("module_constraint_failed"),
