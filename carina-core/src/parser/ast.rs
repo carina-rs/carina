@@ -821,25 +821,26 @@ pub struct ProviderConfig {
     /// empty after finalization. In-memory transit only — never serialized.
     #[serde(skip)]
     pub unresolved_attributes: IndexMap<String, Value>,
-    /// `let` binding name when this entry was declared as a named instance
-    /// via `let <name> = provider <kind> { ... }`. `None` for the default
+    /// The sole source of truth for whether this entry is default or named.
+    /// `Some(name)` identifies a named instance declared via
+    /// `let <name> = provider <kind> { ... }`; `None` identifies the default
     /// instance produced by a top-level `provider <kind> { ... }` block.
+    /// [`ProviderConfig::is_default`] derives its result from this field, and
+    /// resources without an explicit provider directive route to the `None`
+    /// (default) instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<String>,
-    /// True when this entry is the kind's default instance (sourced from a
-    /// top-level `provider <kind> { ... }` block). False for named instances.
-    /// Resources without an explicit provider directive resolve to the
-    /// kind's default instance.
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub is_default: bool,
 }
 
-fn default_true() -> bool {
-    true
-}
-
-fn is_true(b: &bool) -> bool {
-    *b
+impl ProviderConfig {
+    /// Whether this entry is the kind's default instance.
+    ///
+    /// Default instances come from top-level `provider <kind> { ... }`
+    /// blocks and have no binding. Named instances always carry the `let`
+    /// binding that declared them.
+    pub fn is_default(&self) -> bool {
+        self.binding.is_none()
+    }
 }
 
 /// Backend configuration for state storage
@@ -1846,7 +1847,6 @@ mod substitute_placeholder_tests {
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: Some("provider_name".to_string()),
-            is_default: false,
         });
         parsed
             .structural_bindings

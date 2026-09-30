@@ -90,7 +90,6 @@ fn registry_provider_config() -> ProviderConfig {
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
     }

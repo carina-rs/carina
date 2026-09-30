@@ -86,7 +86,7 @@ fn build_factories(providers: &[(PathBuf, ProviderConfig)]) -> FactoryBuildResul
                 // Named instances inherit the kind default's source. Their
                 // missing source is deliberate; every other rejection is a
                 // diagnostic produced directly from this one resolution.
-                if config.is_default || rejection != InstallRejection::MissingSource {
+                if config.is_default() || rejection != InstallRejection::MissingSource {
                     errors.insert(config.name.clone(), rejection.to_string());
                 }
                 fingerprint.push((config.name.clone(), false));
@@ -171,12 +171,7 @@ mod tests {
     use indexmap::IndexMap;
     use std::path::PathBuf;
 
-    fn cfg(
-        name: &str,
-        source: Option<&str>,
-        is_default: bool,
-        binding: Option<&str>,
-    ) -> (PathBuf, ProviderConfig) {
+    fn cfg(name: &str, source: Option<&str>, binding: Option<&str>) -> (PathBuf, ProviderConfig) {
         (
             PathBuf::from("/tmp"),
             ProviderConfig {
@@ -188,7 +183,6 @@ mod tests {
                 revision: None,
                 unresolved_attributes: IndexMap::new(),
                 binding: binding.map(String::from),
-                is_default,
             },
         )
     }
@@ -205,8 +199,8 @@ mod tests {
     #[test]
     fn build_factories_fingerprint_length_matches_configs_length() {
         let providers = vec![
-            cfg("aws", Some("file:///nonexistent/fake.wasm"), true, None),
-            cfg("aws", None, false, Some("us")),
+            cfg("aws", Some("file:///nonexistent/fake.wasm"), None),
+            cfg("aws", None, Some("us")),
         ];
         let (_factories, errors, fingerprint) = build_factories(&providers);
         assert_eq!(
@@ -233,12 +227,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wasm = tmp.path().join("local-provider.wasm");
         std::fs::write(&wasm, b"fixture").unwrap();
-        let providers = cfg(
-            "local",
-            Some(&format!("file://{}", wasm.display())),
-            true,
-            None,
-        );
+        let providers = cfg("local", Some(&format!("file://{}", wasm.display())), None);
 
         let installed = resolve_install(&providers.0, &providers.1)
             .expect("direct file source should be observed by the LSP");
@@ -272,7 +261,7 @@ mod tests {
         lock.save(&tmp.path().join("carina-providers.lock"))
             .unwrap();
 
-        let (_, config) = cfg("native", Some(source), true, None);
+        let (_, config) = cfg("native", Some(source), None);
         let providers = vec![(tmp.path().to_path_buf(), config)];
         let (_factories, errors, fingerprint) = build_factories(&providers);
 

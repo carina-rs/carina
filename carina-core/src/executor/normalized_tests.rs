@@ -85,7 +85,6 @@ fn provider_config(default_tags: IndexMap<String, Value>) -> ProviderConfig {
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: None,
-        is_default: true,
     }
 }
 

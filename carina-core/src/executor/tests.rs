@@ -775,7 +775,6 @@ fn provider_config_with_default_tags(
         revision: None,
         unresolved_attributes: indexmap::IndexMap::new(),
         binding: None,
-        is_default: true,
     }
 }
 

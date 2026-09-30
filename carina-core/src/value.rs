@@ -2961,7 +2961,6 @@ mod tests {
                 revision: None,
                 unresolved_attributes: indexmap::IndexMap::new(),
                 binding: None,
-                is_default: true,
             },
             ProviderConfig {
                 name: "awscc".to_string(),
@@ -2976,7 +2975,6 @@ mod tests {
                 revision: None,
                 unresolved_attributes: indexmap::IndexMap::new(),
                 binding: None,
-                is_default: true,
             },
         ];
 

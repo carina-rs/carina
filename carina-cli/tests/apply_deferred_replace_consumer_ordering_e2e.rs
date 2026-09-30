@@ -271,7 +271,6 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
         }],
         backend_config: Some(BackendConfig {
             backend_type: "local".to_string(),

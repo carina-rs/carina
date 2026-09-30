@@ -1482,23 +1482,23 @@ pub async fn get_provider_with_ctx<E>(
     // may need a WASM plugin to be loaded. Pass 2 handles each named
     // instance (`let <name> = provider <kind> { ... }`), reusing the
     // factory the default instance already brought in.
-    for provider_config in parsed.providers.iter().filter(|p| p.is_default) {
+    for provider_config in parsed.providers.iter().filter(|p| p.is_default()) {
         instantiate_provider_into_router(ctx, &mut router, provider_config, base_dir, None, None)
             .await?;
     }
 
-    for provider_config in parsed.providers.iter().filter(|p| !p.is_default) {
-        let binding = provider_config
-            .binding
-            .clone()
-            .expect("named instance must carry its binding name (parser invariant)");
+    for (provider_config, binding) in parsed
+        .providers
+        .iter()
+        .filter_map(|config| config.binding.as_ref().map(|binding| (config, binding)))
+    {
         let inherited_source = kind_default_source(&parsed.providers, &provider_config.name);
         instantiate_provider_into_router(
             ctx,
             &mut router,
             provider_config,
             base_dir,
-            Some(binding),
+            Some(binding.clone()),
             inherited_source,
         )
         .await?;
@@ -1523,7 +1523,7 @@ pub async fn get_provider_with_ctx<E>(
 fn kind_default_source<'a>(configs: &'a [ProviderConfig], kind: &str) -> Option<&'a str> {
     configs
         .iter()
-        .find(|p| p.is_default && p.name == kind)
+        .find(|p| p.is_default() && p.name == kind)
         .and_then(|p| p.source.as_deref())
 }
 
@@ -1763,21 +1763,20 @@ pub async fn create_providers_from_configs(
     // Same two-pass shape as `get_provider_with_ctx`: default instances
     // first (they may load the WASM plugin), then named instances reuse
     // the factory that was just loaded.
-    for config in configs.iter().filter(|p| p.is_default) {
+    for config in configs.iter().filter(|p| p.is_default()) {
         instantiate_provider_into_router(&ctx, &mut router, config, base_dir, None, None).await?;
     }
-    for config in configs.iter().filter(|p| !p.is_default) {
-        let binding = config
-            .binding
-            .clone()
-            .expect("named instance must carry its binding name (parser invariant)");
+    for (config, binding) in configs
+        .iter()
+        .filter_map(|config| config.binding.as_ref().map(|binding| (config, binding)))
+    {
         let inherited_source = kind_default_source(configs, &config.name);
         instantiate_provider_into_router(
             &ctx,
             &mut router,
             config,
             base_dir,
-            Some(binding),
+            Some(binding.clone()),
             inherited_source,
         )
         .await?;
