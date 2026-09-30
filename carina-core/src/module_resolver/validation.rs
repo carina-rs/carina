@@ -47,7 +47,10 @@ impl fmt::Display for ModuleConstraintFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ModuleConstraintDiagnostic {
     pub module: String,
+    /// Internal call identity used to correlate diagnostics with expansion.
+    /// Display must use `call` so anonymous content hashes never leak.
     pub instance: String,
+    pub call: ModuleConstraintCall,
     pub kind: ModuleConstraintKind,
     pub arguments: Vec<String>,
     pub message: String,
@@ -57,7 +60,15 @@ pub struct ModuleConstraintDiagnostic {
 
 impl fmt::Display for ModuleConstraintDiagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "module '{}' (call '{}'): ", self.module, self.instance)?;
+        match &self.call {
+            ModuleConstraintCall::Named(name) => {
+                write!(f, "module '{}' (call '{name}')", self.module)?;
+            }
+            ModuleConstraintCall::Anonymous => {
+                write!(f, "anonymous call to module '{}'", self.module)?;
+            }
+        }
+        f.write_str(": ")?;
         match &self.kind {
             ModuleConstraintKind::ArgumentValidation { argument } => {
                 write!(f, "argument '{argument}'")?;
@@ -99,6 +110,21 @@ impl fmt::Display for ModuleConstraintDiagnostic {
 }
 
 impl std::error::Error for ModuleConstraintDiagnostic {}
+
+/// Authored identity of a module call for user-facing diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ModuleConstraintCall {
+    Named(String),
+    Anonymous,
+}
+
+impl ModuleConstraintCall {
+    fn from_binding(binding: Option<&str>) -> Self {
+        binding
+            .map(|name| Self::Named(name.to_string()))
+            .unwrap_or(Self::Anonymous)
+    }
+}
 
 /// Result of evaluating a module value constraint at a resolution boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,7 +212,12 @@ impl EvaluatedModuleConstraint {
     /// Convert a concrete failure to the resolver's public error type.
     /// Expansion and LSP diagnostics both use this renderer, so their text
     /// cannot drift independently.
-    pub fn module_error(&self, module: &str, instance: &str) -> Option<ModuleError> {
+    pub fn module_error(
+        &self,
+        module: &str,
+        instance: &str,
+        binding: Option<&str>,
+    ) -> Option<ModuleError> {
         let (message, actuals, detail) = match &self.evaluation {
             ConstraintEvaluation::Violated(violation) => {
                 (violation.message.clone(), violation.actuals.clone(), None)
@@ -202,6 +233,7 @@ impl EvaluatedModuleConstraint {
             ModuleConstraintDiagnostic {
                 module: module.to_string(),
                 instance: instance.to_string(),
+                call: ModuleConstraintCall::from_binding(binding),
                 kind: self.kind.clone(),
                 arguments: self.arguments.clone(),
                 message,
@@ -473,22 +505,24 @@ pub fn evaluate_pending_constraints(
         ) {
             let constraint = evaluated.constraint();
             let arguments = evaluated.arguments().to_vec();
-            let failure =
-                |message: String, actuals: Vec<(String, String)>, detail: Option<String>| {
-                    ModuleConstraintFailure {
-                        composition_id: composition.id.clone(),
-                        constraint_id: constraint.id().clone(),
-                        diagnostic: ModuleConstraintDiagnostic {
-                            module: composition.module_name.clone(),
-                            instance: composition.instance.clone(),
-                            kind: evaluated.kind().clone(),
-                            arguments: arguments.clone(),
-                            message,
-                            actuals,
-                            detail,
-                        },
-                    }
-                };
+            let failure = |message: String,
+                           actuals: Vec<(String, String)>,
+                           detail: Option<String>| {
+                ModuleConstraintFailure {
+                    composition_id: composition.id.clone(),
+                    constraint_id: constraint.id().clone(),
+                    diagnostic: ModuleConstraintDiagnostic {
+                        module: composition.module_name.clone(),
+                        instance: composition.instance.clone(),
+                        call: ModuleConstraintCall::from_binding(composition.binding.as_deref()),
+                        kind: evaluated.kind().clone(),
+                        arguments: arguments.clone(),
+                        message,
+                        actuals,
+                        detail,
+                    },
+                }
+            };
             let actuals = || evaluated.actuals().to_vec();
             let resolution_error = arguments
                 .iter()
@@ -954,7 +988,7 @@ mod tests {
         let detail = format!("error evaluating constraint: {detail}");
         let actuals = vec![("name".to_string(), "\"abc\"".to_string())];
         let resolver_error = evaluated
-            .module_error("mod", "c")
+            .module_error("mod", "c", Some("c"))
             .expect("evaluation error must render");
         let apply_failure = ModuleConstraintFailure {
             composition_id: ResourceId::with_identity("_virtual", "c"),
@@ -962,6 +996,7 @@ mod tests {
             diagnostic: ModuleConstraintDiagnostic {
                 module: "mod".to_string(),
                 instance: "c".to_string(),
+                call: ModuleConstraintCall::Named("c".to_string()),
                 kind: ModuleConstraintKind::ArgumentValidation {
                     argument: "name".to_string(),
                 },
@@ -974,6 +1009,7 @@ mod tests {
         let plan_error = PlanErrorKind::ModuleConstraint(ModuleConstraintDiagnostic {
             module: "mod".to_string(),
             instance: "c".to_string(),
+            call: ModuleConstraintCall::Named("c".to_string()),
             kind: ModuleConstraintKind::ArgumentValidation {
                 argument: "name".to_string(),
             },

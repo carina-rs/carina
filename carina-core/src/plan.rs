@@ -190,7 +190,13 @@ impl std::fmt::Display for PlanErrorKind {
 
 impl std::fmt::Display for PlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.resource_id, self.kind)
+        match &self.kind {
+            // A module constraint already names its module and authored call.
+            // The synthetic `_virtual` id is internal correlation metadata,
+            // not a second user-facing resource identity.
+            PlanErrorKind::ModuleConstraint(diagnostic) => write!(f, "{diagnostic}"),
+            kind => write!(f, "{}: {kind}", self.resource_id),
+        }
     }
 }
 

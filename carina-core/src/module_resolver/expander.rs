@@ -168,7 +168,11 @@ impl ModuleResolver<'_> {
                 }
                 ConstraintEvaluation::Violated(_) | ConstraintEvaluation::EvalError(_) => {
                     return Err(evaluated
-                        .module_error(&call.module_name, instance_prefix)
+                        .module_error(
+                            &call.module_name,
+                            instance_prefix,
+                            call.binding_name.as_deref(),
+                        )
                         .expect("concrete constraint failure has a resolver error"));
                 }
             }

@@ -1305,7 +1305,11 @@ impl DiagnosticEngine {
                     ),
                     &argument_values,
                 ) {
-                    let Some(error) = evaluated.module_error(&call.module_name, &instance) else {
+                    let Some(error) = evaluated.module_error(
+                        &call.module_name,
+                        &instance,
+                        evaluated_call.binding_name.as_deref(),
+                    ) else {
                         continue;
                     };
                     let position = match evaluated.kind() {

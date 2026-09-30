@@ -277,6 +277,61 @@ fn reference_valued_argument_validation_rejects_sibling_variable_during_validati
     );
 }
 
+#[test]
+fn anonymous_module_constraint_hides_synthetic_instance_with_cli_lsp_parity() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let module = fixture.path().join("checked");
+    std::fs::create_dir_all(&module).expect("create module directory");
+    std::fs::write(
+        module.join("main.crn"),
+        r#"arguments {
+  name: String {
+    validation {
+      condition     = length(name) > 0
+      error_message = "name must not be empty"
+    }
+  }
+}
+"#,
+    )
+    .expect("write module");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"let checked = use { source = './checked' }
+
+checked {
+  name = ""
+}
+"#,
+    )
+    .expect("write root configuration");
+
+    let lsp_diags = lsp_diagnostics(
+        &engine_with_schemas(SchemaRegistry::new()),
+        &fixture,
+        "main.crn",
+    );
+    let cli_diags = cli_diagnostics(Vec::new(), &fixture);
+    let lsp_messages = lsp_diags
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("name must not be empty"))
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+    let cli_messages = cli_diags
+        .iter()
+        .filter(|diagnostic| diagnostic.contains("name must not be empty"))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+
+    assert_eq!(lsp_messages.len(), 1, "LSP diagnostics: {lsp_diags:#?}");
+    assert_eq!(cli_messages.len(), 1, "CLI diagnostics: {cli_diags:#?}");
+    assert_eq!(lsp_messages, cli_messages);
+    assert_eq!(
+        lsp_messages,
+        ["anonymous call to module 'checked': argument 'name': name must not be empty (got \"\")"]
+    );
+}
+
 // NOTE: case-sensitive `contains`. LSP and CLI surfaces sometimes
 // differ in casing (e.g. "Type mismatch" vs "type mismatch") because
 // some diagnostics originate in carina-lsp and others in carina-core.

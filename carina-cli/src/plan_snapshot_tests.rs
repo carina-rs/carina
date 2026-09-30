@@ -9,7 +9,9 @@ use std::path::PathBuf;
 
 use carina_core::config_loader::load_configuration;
 use carina_core::effect::{DeletedInstanceKey, Effect};
-use carina_core::module_resolver::{ModuleConstraintDiagnostic, ModuleConstraintKind};
+use carina_core::module_resolver::{
+    ModuleConstraintCall, ModuleConstraintDiagnostic, ModuleConstraintKind,
+};
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::resource::{
     DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceId, State, Value,
@@ -206,6 +208,7 @@ fn snapshot_module_constraint_plan_error() {
         PlanErrorKind::ModuleConstraint(ModuleConstraintDiagnostic {
             module: "mod".to_string(),
             instance: "c".to_string(),
+            call: ModuleConstraintCall::Named("c".to_string()),
             kind: ModuleConstraintKind::ArgumentValidation {
                 argument: "name".to_string(),
             },
@@ -216,7 +219,12 @@ fn snapshot_module_constraint_plan_error() {
         }),
     );
 
-    insta::assert_snapshot!(error.to_string());
+    let rendered = error.to_string();
+    assert_eq!(
+        rendered,
+        "module 'mod' (call 'c'): argument 'name': too long (got \"abcd\")"
+    );
+    insta::assert_snapshot!(rendered);
 }
 
 #[test]
