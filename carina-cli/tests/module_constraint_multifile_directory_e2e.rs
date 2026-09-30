@@ -134,9 +134,9 @@ fn multifile_directory_checks_ref_valued_module_validation_and_require() {
         "violating multi-file directory must fail planning\n{output}"
     );
     for expected in [
-        "module `checked_module` instance `checked` constraint failed for argument(s) `value`",
+        "module 'checked_module' (call 'checked'): argument 'value'",
         "value must not be the bad identifier",
-        "module `checked_module` instance `checked` constraint failed for argument(s) `peer`, `value`",
+        "module 'checked_module' (call 'checked'): arguments 'peer', 'value'",
         "value and peer identifiers must match",
     ] {
         assert!(
