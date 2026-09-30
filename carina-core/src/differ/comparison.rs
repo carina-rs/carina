@@ -7,7 +7,7 @@ use indexmap::IndexMap;
 
 use crate::explicit::{self, ExplicitFields};
 use crate::resource::{
-    ConcreteValue, DeferredValue, ResourceId, SavedValueViews, Value, merge_with_saved,
+    ConcreteValue, DeferredValue, ResolvedResourceId, SavedValueViews, Value, merge_with_saved,
 };
 use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
 use crate::value::{
@@ -678,7 +678,7 @@ pub(super) fn find_changed_attributes(
     saved: Option<&HashMap<String, Value>>,
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,
-    resource_id: Option<&ResourceId>,
+    resource_id: Option<&ResolvedResourceId>,
 ) -> Vec<String> {
     let mut changed = Vec::new();
 
@@ -719,8 +719,8 @@ pub(super) fn find_changed_attributes(
         });
 
         // Build secret hash context from resource ID and attribute key
-        let secret_ctx = resource_id
-            .map(|id| SecretHashContext::new(id.display_type(), id.identity_or_empty(), key));
+        let secret_ctx =
+            resource_id.map(|id| SecretHashContext::new(id.display_type(), id.identity_str(), key));
 
         if key_should_enter_patch(
             key,

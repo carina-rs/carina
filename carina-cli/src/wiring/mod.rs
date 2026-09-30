@@ -801,7 +801,7 @@ pub(crate) fn adopt_unique_state_identity_for_unresolved_anonymous(
     state_file: &StateFile,
 ) {
     for resource in resources {
-        if resource.id.identity.is_some() || resource.binding.is_some() {
+        if resource.id.identity_str().is_some() || resource.binding.is_some() {
             continue;
         }
 
@@ -852,7 +852,7 @@ pub(crate) fn assign_fallback_identities_for_unresolved_anonymous(
     }
 
     for (idx, resource) in resources.iter_mut().enumerate() {
-        if resource.id.identity.is_some() || resource.binding.is_some() {
+        if resource.id.identity_str().is_some() || resource.binding.is_some() {
             continue;
         }
 
@@ -2562,11 +2562,8 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 sorted_resources
                     .iter()
                     .filter_map(|r| {
-                        let rs = sf.find_resource(
-                            &r.id.provider,
-                            &r.id.resource_type,
-                            r.id.identity_or_empty(),
-                        )?;
+                        let identity = r.id.identity_str()?;
+                        let rs = sf.find_resource(&r.id.provider, &r.id.resource_type, identity)?;
                         if rs.dependency_bindings.is_empty() {
                             None
                         } else {
@@ -3380,7 +3377,8 @@ pub fn validate_plan_time_state_block_collisions(
             .find_resource(
                 &from.provider,
                 &from.resource_type,
-                from.identity_or_empty(),
+                from.identity_str()
+                    .expect("moved source identity must be resolved"),
             )
             .is_some();
         if from == to && from_exists {
@@ -3390,7 +3388,12 @@ pub fn validate_plan_time_state_block_collisions(
             )));
         }
         let to_exists = sf
-            .find_resource(&to.provider, &to.resource_type, to.identity_or_empty())
+            .find_resource(
+                &to.provider,
+                &to.resource_type,
+                to.identity_str()
+                    .expect("moved target identity must be resolved"),
+            )
             .is_some();
         if from_exists && to_exists {
             return Err(AppError::Validation(format!(
@@ -3420,7 +3423,7 @@ fn find_desired_id<'a>(
         .find(|k| {
             k.provider == to.provider
                 && k.resource_type == to.resource_type
-                && k.identity_or_empty() == to.name_str()
+                && k.identity_str() == Some(to.name_str())
         })
         .cloned()
 }
@@ -3429,12 +3432,13 @@ fn resolve_import_target_in_desired(
     to: &StateBlockAddress,
     desired: &[Resource],
 ) -> Option<StateBlockAddress> {
-    match_import_target(to, desired.iter()).map(|resource| {
-        StateBlockAddress::new(
+    match_import_target(to, desired.iter()).and_then(|resource| {
+        let identity = resource.id.identity_str()?;
+        Some(StateBlockAddress::new(
             &resource.id.provider,
             &resource.id.resource_type,
-            resource.id.identity_or_empty(),
-        )
+            identity,
+        ))
     })
 }
 
@@ -3493,7 +3497,9 @@ pub fn add_state_block_effects(
                     sf.find_resource(
                         &effective_to.provider,
                         &effective_to.resource_type,
-                        effective_to.identity_or_empty(),
+                        effective_to
+                            .identity_str()
+                            .expect("import target identity must be resolved"),
                     )
                     .is_some()
                 });
@@ -3753,7 +3759,7 @@ fn match_import_target<'a>(
         if resource.id.provider != to.provider || resource.id.resource_type != to.resource_type {
             continue;
         }
-        if resource.id.identity_or_empty() == to.name_str() {
+        if resource.id.identity_str() == Some(to.name_str()) {
             return Some(resource);
         }
     }

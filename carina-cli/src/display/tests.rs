@@ -1647,7 +1647,9 @@ fn module_children_render_with_tree_connectors() {
     plan.add(Effect::Create(resolved(role)));
 
     let cluster_site = CallSite::new(
-        EphemeralId::new(ResourceId::with_identity("_virtual", "cluster")),
+        EphemeralId::new(carina_core::resource::ResolvedResourceId::new(
+            ResourceId::with_identity("_virtual", "cluster"),
+        )),
         "./modules/cluster",
     );
     let mut trace = ExpansionTrace::new();
@@ -1691,7 +1693,9 @@ fn module_child_connector_gutter_extends_through_nested_dependents() {
     plan.add(Effect::Create(resolved(bucket)));
 
     let cluster_site = CallSite::new(
-        EphemeralId::new(ResourceId::with_identity("_virtual", "cluster")),
+        EphemeralId::new(carina_core::resource::ResolvedResourceId::new(
+            ResourceId::with_identity("_virtual", "cluster"),
+        )),
         "./modules/cluster",
     );
     let mut trace = ExpansionTrace::new();

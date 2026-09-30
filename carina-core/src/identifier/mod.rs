@@ -164,13 +164,12 @@ pub fn reconcile_prefixed_names(
         if resource.prefixes.is_empty() {
             continue;
         }
+        let Some(identity) = resource.id.identity_str() else {
+            continue;
+        };
 
         // Find matching resource in state
-        let state_info = find_state(
-            &resource.id.provider,
-            &resource.id.resource_type,
-            resource.id.identity_or_empty(),
-        );
+        let state_info = find_state(&resource.id.provider, &resource.id.resource_type, identity);
         let state_info = match state_info {
             Some(si) => si,
             None => continue,
@@ -581,7 +580,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
     let mut computed: Vec<(usize, String)> = Vec::new();
 
     for (idx, resource) in resources.iter().enumerate() {
-        if resource.id.identity.is_some() {
+        if resource.id.identity_str().is_some() {
             continue;
         }
 
@@ -835,6 +834,9 @@ pub fn reconcile_anonymous_identifiers(
     let mut renames: Vec<(String, String)> = Vec::new();
     let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
     for resource in resources.iter() {
+        let Some(identity) = resource.id.identity_str() else {
+            continue;
+        };
         let key = (
             resource.id.provider.clone(),
             resource.id.resource_type.clone(),
@@ -842,15 +844,15 @@ pub fn reconcile_anonymous_identifiers(
         used_names
             .entry(key)
             .or_default()
-            .insert(resource.id.identity_or_empty().to_string());
+            .insert(identity.to_string());
     }
 
     let mut claimed_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
 
     for resource in resources.iter_mut() {
-        if resource.id.identity.is_none() {
+        let Some(resource_identity) = resource.id.identity_str().map(str::to_string) else {
             continue;
-        }
+        };
 
         // Skip let-bound (named) resources entirely. Reconciliation is only
         // meaningful for anonymous hash-derived identifiers. Named resources
@@ -862,7 +864,7 @@ pub fn reconcile_anonymous_identifiers(
         if claims.claims_to(
             &resource.id.provider,
             &resource.id.resource_type,
-            resource.id.identity_or_empty(),
+            &resource_identity,
         ) {
             continue;
         }
@@ -879,10 +881,7 @@ pub fn reconcile_anonymous_identifiers(
         );
 
         // If the resource's name already exists in state, no reconciliation is needed.
-        if state_entries
-            .iter()
-            .any(|e| e.name == resource.id.identity_or_empty())
-        {
+        if state_entries.iter().any(|e| e.name == resource_identity) {
             continue;
         }
 
@@ -901,14 +900,14 @@ pub fn reconcile_anonymous_identifiers(
             // No create-only properties or none set: use SimHash-based Hamming distance
             // matching to find the closest state entry.
             let Some(AnonymousHashSuffix::SimHash(resource_hash)) =
-                extract_hash_from_identifier(resource.id.identity_or_empty())
+                extract_hash_from_identifier(&resource_identity)
             else {
                 continue;
             };
 
             let candidates = state_entries
                 .iter()
-                .filter(|entry| entry.name != resource.id.identity_or_empty())
+                .filter(|entry| entry.name != resource_identity)
                 .filter(|entry| {
                     !claims.claims_from(
                         &resource.id.provider,
@@ -936,10 +935,7 @@ pub fn reconcile_anonymous_identifiers(
                 // pre-provider-prefix). Keep our freshly-computed new-format
                 // name on the resource and record a rename so the wiring
                 // layer can re-key the state entry.
-                renames.push((
-                    state_name.to_string(),
-                    resource.id.identity_or_empty().to_string(),
-                ));
+                renames.push((state_name.to_string(), resource_identity.clone()));
                 claimed_names
                     .entry(key)
                     .or_default()
@@ -959,7 +955,7 @@ pub fn reconcile_anonymous_identifiers(
         let mut full_matches: Vec<&str> = Vec::new();
         let mut partial_matches: Vec<&str> = Vec::new();
         for entry in &state_entries {
-            if entry.name == resource.id.identity_or_empty() {
+            if entry.name == resource_identity {
                 // Same identifier, no reconciliation needed
                 continue;
             }
@@ -1061,6 +1057,9 @@ pub fn detect_anonymous_to_named_renames(
     // (provider, resource_type). Any state entry not in this set is an orphan.
     let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
     for resource in resources {
+        let Some(identity) = resource.id.identity_str() else {
+            continue;
+        };
         let key = (
             resource.id.provider.clone(),
             resource.id.resource_type.clone(),
@@ -1068,7 +1067,7 @@ pub fn detect_anonymous_to_named_renames(
         used_names
             .entry(key)
             .or_default()
-            .insert(resource.id.identity_or_empty().to_string());
+            .insert(identity.to_string());
     }
 
     let mut renames: Vec<(ResourceId, ResourceId)> = Vec::new();
@@ -1078,10 +1077,13 @@ pub fn detect_anonymous_to_named_renames(
         if resource.binding.is_none() {
             continue;
         }
+        let Some(resource_identity) = resource.id.identity_str() else {
+            continue;
+        };
         if claims.claims_to(
             &resource.id.provider,
             &resource.id.resource_type,
-            resource.id.identity_or_empty(),
+            resource_identity,
         ) {
             continue;
         }
@@ -1093,10 +1095,7 @@ pub fn detect_anonymous_to_named_renames(
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
 
         // Skip if the binding name already exists in state — nothing to rename.
-        if state_entries
-            .iter()
-            .any(|e| e.name == resource.id.identity_or_empty())
-        {
+        if state_entries.iter().any(|e| e.name == resource_identity) {
             continue;
         }
 

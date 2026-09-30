@@ -37,7 +37,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::ResourceId;
+use super::{ResolvedResourceId, ResourceId};
 
 /// An id of a node that **persists** in state — i.e., a leaf node
 /// ([`Resource`](super::Resource) or
@@ -94,26 +94,26 @@ impl PersistentId {
 /// came from a composition.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
-pub struct EphemeralId(ResourceId);
+pub struct EphemeralId(ResolvedResourceId);
 
 impl EphemeralId {
     /// Wrap an owned [`ResourceId`] as an `EphemeralId`.
     ///
     /// The caller asserts the id came from a composition.
-    pub fn new(id: ResourceId) -> Self {
+    pub fn new(id: ResolvedResourceId) -> Self {
         Self(id)
     }
 
-    /// Borrow the wrapped [`ResourceId`].
-    pub fn inner(&self) -> &ResourceId {
+    /// Borrow the wrapped [`ResolvedResourceId`].
+    pub fn inner(&self) -> &ResolvedResourceId {
         &self.0
     }
 
-    /// Unwrap into the inner [`ResourceId`].
+    /// Unwrap into the inner [`ResolvedResourceId`].
     ///
     /// Explicit escape hatch for boundaries that have not yet
     /// migrated to typed-id APIs.
-    pub fn into_inner(self) -> ResourceId {
+    pub fn into_inner(self) -> ResolvedResourceId {
         self.0
     }
 }
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn ephemeral_id_round_trip() {
         let id = ResourceId::with_identity("_virtual", "m");
-        let eid = EphemeralId::new(id.clone());
+        let eid = EphemeralId::new(ResolvedResourceId::new(id.clone()));
         assert_eq!(eid.inner(), &id);
         assert_eq!(eid.into_inner(), id);
     }
@@ -188,15 +188,19 @@ mod tests {
     /// `&PersistentId` cannot accept an `&EphemeralId`.
     ///
     /// ```compile_fail
-    /// use carina_core::resource::{EphemeralId, PersistentId, ResourceId};
+    /// use carina_core::resource::{EphemeralId, PersistentId, ResolvedResourceId, ResourceId};
     /// fn loads_from_state(_pid: &PersistentId) {}
-    /// let eid = EphemeralId::new(ResourceId::with_identity("_virtual", "m"));
+    /// let eid = EphemeralId::new(ResolvedResourceId::new(
+    ///     ResourceId::with_identity("_virtual", "m"),
+    /// ));
     /// loads_from_state(&eid);
     /// ```
     ///
     /// ```compile_fail
-    /// use carina_core::resource::{EphemeralId, PersistentId, ResourceId};
-    /// let eid = EphemeralId::new(ResourceId::with_identity("_virtual", "m"));
+    /// use carina_core::resource::{EphemeralId, PersistentId, ResolvedResourceId, ResourceId};
+    /// let eid = EphemeralId::new(ResolvedResourceId::new(
+    ///     ResourceId::with_identity("_virtual", "m"),
+    /// ));
     /// let _pid: PersistentId = eid.into();
     /// ```
     #[allow(dead_code)]
@@ -212,7 +216,9 @@ mod tests {
 
     #[test]
     fn node_id_from_ephemeral_id() {
-        let eid = EphemeralId::new(ResourceId::with_identity("_virtual", "m"));
+        let eid = EphemeralId::new(ResolvedResourceId::new(ResourceId::with_identity(
+            "_virtual", "m",
+        )));
         let nid: NodeId = eid.clone().into();
         assert!(matches!(nid, NodeId::Ephemeral(_)));
         assert_eq!(nid.inner(), eid.inner());

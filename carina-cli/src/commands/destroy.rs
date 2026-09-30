@@ -471,13 +471,13 @@ async fn run_destroy_locked(
     resources_to_destroy.sort_by(|left, right| {
         let left_key = left
             .binding
-            .as_deref()
-            .unwrap_or_else(|| left.id.identity_or_empty());
+            .clone()
+            .unwrap_or_else(|| left.id.identity_display().to_string());
         let right_key = right
             .binding
-            .as_deref()
-            .unwrap_or_else(|| right.id.identity_or_empty());
-        left_key.cmp(right_key)
+            .clone()
+            .unwrap_or_else(|| right.id.identity_display().to_string());
+        left_key.cmp(&right_key)
     });
 
     // Backend-bucket protection shields the whole state row, including deposed
@@ -513,7 +513,7 @@ async fn run_destroy_locked(
         .map(|effect| {
             effect
                 .binding_name()
-                .unwrap_or_else(|| effect.resource_id().identity_or_empty().to_string())
+                .unwrap_or_else(|| effect.resource_id().identity_display().to_string())
         })
         .collect();
     let display_order = topological_delete_order(
@@ -678,7 +678,7 @@ async fn run_destroy_locked(
         .map(|effect| {
             let binding = effect.binding_name().unwrap_or_else(|| {
                 let id = effect.resource_id();
-                format!("{}:{}", id.resource_type, id.identity_or_empty())
+                format!("{}:{}", id.resource_type, id.identity_display())
             });
             (binding, effect.clone())
         })
@@ -1383,7 +1383,7 @@ fn build_destroy_wait_aliases(
             } => Some((
                 effect
                     .binding_name()
-                    .unwrap_or_else(|| id.identity_or_empty().to_string()),
+                    .unwrap_or_else(|| id.identity_str().to_string()),
                 dependencies.clone(),
             )),
             _ => None,
@@ -1490,7 +1490,12 @@ fn should_skip_destroy_execution(delete_effect_count: usize) -> bool {
 }
 
 fn state_row_key_from_id(id: &ResourceId) -> StateRowKey {
-    state_row_key_from_parts(&id.provider, &id.resource_type, id.identity_or_empty())
+    state_row_key_from_parts(
+        &id.provider,
+        &id.resource_type,
+        id.identity_str()
+            .expect("state-backed destroy identity must be resolved"),
+    )
 }
 
 fn state_row_key_from_parts(provider: &str, resource_type: &str, identity: &str) -> StateRowKey {

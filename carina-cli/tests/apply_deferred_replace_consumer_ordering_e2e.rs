@@ -159,9 +159,13 @@ fn string(value: &str) -> Value {
 }
 
 fn identity(value: &str) -> ResourceIdentity {
-    ResourceId::with_identity("test.resource", value)
-        .identity
-        .expect("fixture identity is non-empty")
+    let id = ResourceId::with_identity("test.resource", value);
+    match id.identity_state() {
+        carina_core::resource::ResourceIdentityState::Pending(_) => {
+            unreachable!("fixture identity is resolved")
+        }
+        carina_core::resource::ResourceIdentityState::Resolved(identity) => identity.clone(),
+    }
 }
 
 fn state_not_found(resource: &Resource) -> CurrentStateEntry {

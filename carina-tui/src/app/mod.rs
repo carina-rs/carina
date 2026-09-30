@@ -670,7 +670,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
                 // For bound resources, show the binding name
                 r.binding()
                     .map(str::to_string)
-                    .unwrap_or_else(|| r.id().identity_or_empty().to_string())
+                    .unwrap_or_else(|| r.id().identity_display().to_string())
             } else {
                 // For anonymous resources, try to extract a compact hint
                 let parent_binding = nodes[idx].parent.and_then(|p_idx| {
@@ -685,7 +685,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
                 if let Some(hint) = extract_compact_hint(r, parent_binding.as_deref()) {
                     format!("({})", hint)
                 } else {
-                    r.id().identity_or_empty().to_string()
+                    r.id().identity_display().to_string()
                 }
             };
 
@@ -704,9 +704,9 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
                 generation,
                 carina_core::effect::EffectGeneration::Deposed(_)
             ) {
-                format!("{} (deposed {identifier})", id.identity_or_empty())
+                format!("{} (deposed {identifier})", id.identity_str())
             } else {
-                id.identity_or_empty().to_string()
+                id.identity_str().to_string()
             };
             nodes[idx].resource_type = display_type.clone();
             nodes[idx].name_part = name_part.clone();
@@ -738,7 +738,7 @@ fn effect_to_node(
         Effect::Read { resource } => TreeNode {
             effect_label: format!("{}", resource.id.human()),
             resource_type: resource.id.display_type(),
-            name_part: resource.id.identity_or_empty().to_string(),
+            name_part: resource.id.identity_display().to_string(),
             symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Read,
             detail_rows,
@@ -749,7 +749,7 @@ fn effect_to_node(
         Effect::Create(resource) => TreeNode {
             effect_label: format!("{}", resource.id.human()),
             resource_type: resource.id.display_type(),
-            name_part: resource.id.identity_or_empty().to_string(),
+            name_part: resource.id.identity_display().to_string(),
             symbol: replacement_info
                 .map(|metadata| {
                     Effect::replace_display_glyph(metadata.create_before_destroy).to_string()
@@ -770,7 +770,7 @@ fn effect_to_node(
             TreeNode {
                 effect_label: format!("{}", id.human()),
                 resource_type: id.display_type(),
-                name_part: id.identity_or_empty().to_string(),
+                name_part: id.identity_display().to_string(),
                 symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Update,
                 detail_rows,
@@ -803,9 +803,9 @@ fn effect_to_node(
                     generation,
                     carina_core::effect::EffectGeneration::Deposed(_)
                 ) {
-                    format!("{} (deposed {identifier})", id.identity_or_empty())
+                    format!("{} (deposed {identifier})", id.identity_str())
                 } else {
-                    id.identity_or_empty().to_string()
+                    id.identity_str().to_string()
                 },
                 symbol: effect.display_glyph().to_string(),
                 kind: EffectKind::Delete,
@@ -818,7 +818,7 @@ fn effect_to_node(
         Effect::Import { id, .. } => TreeNode {
             effect_label: format!("{}", id.human()),
             resource_type: id.display_type(),
-            name_part: id.identity_or_empty().to_string(),
+            name_part: id.identity_str().to_string(),
             symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Read,
             detail_rows,
@@ -829,7 +829,7 @@ fn effect_to_node(
         Effect::Remove { id } => TreeNode {
             effect_label: format!("{}", id.human()),
             resource_type: id.display_type(),
-            name_part: id.identity_or_empty().to_string(),
+            name_part: id.identity_str().to_string(),
             // carina#3332: avoid the `x` glyph that shape-collides with
             // the `✗` failure indicator. `~` matches the CLI plan
             // tree's Remove symbol; `(remove from state)` annotation
@@ -848,7 +848,7 @@ fn effect_to_node(
         Effect::Move { from, to } => TreeNode {
             effect_label: format!("{} -> {}", from.human(), to.human()),
             resource_type: to.display_type(),
-            name_part: to.identity_or_empty().to_string(),
+            name_part: to.identity_str().to_string(),
             symbol: effect.display_glyph().to_string(),
             kind: EffectKind::Update,
             detail_rows,

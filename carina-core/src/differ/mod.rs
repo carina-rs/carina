@@ -8,7 +8,7 @@ mod plan;
 
 use std::collections::HashMap;
 
-use crate::resource::{Resource, ResourceId, State, Value};
+use crate::resource::{ResolvedResourceId, Resource, ResourceId, State, Value};
 use crate::schema::ResourceSchema;
 
 pub use plan::{block_deletes_on_prior_consumer_updates, create_plan, create_plan_with_cascades};
@@ -96,13 +96,14 @@ pub fn diff(
         return Diff::Create(desired.clone());
     }
 
+    let desired_id = ResolvedResourceId::new(desired.id.clone());
     let changed = comparison::find_changed_attributes(
         &desired.resolved_attributes(),
         &current.attributes,
         saved,
         prev_explicit,
         schema,
-        Some(&desired.id),
+        Some(&desired_id),
     );
 
     if changed.is_empty() {

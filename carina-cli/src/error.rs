@@ -21,7 +21,7 @@ impl std::fmt::Display for ResourceProviderPreparationError {
             f,
             "[{}.{}] {}",
             self.resource.resource_type,
-            self.resource.identity_or_empty(),
+            self.resource.identity_display(),
             self.source
         )
     }

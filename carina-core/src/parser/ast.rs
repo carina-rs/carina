@@ -1726,10 +1726,9 @@ fn build_expanded_child(
     key: Option<&str>,
     item: &Value,
 ) -> Resource {
-    let mut resource = deferred.template_resource.clone();
-    resource
-        .id
-        .set_identity(ResourceIdentity::new(address.clone()));
+    let mut resource = deferred
+        .template_resource
+        .instantiate_with_identity(ResourceIdentity::new(address.clone()));
     resource.binding = Some(address);
     resource
         .dependency_bindings
@@ -1860,7 +1859,10 @@ mod substitute_placeholder_tests {
         parsed.data_sources.push(data_source);
 
         parsed.compositions.push(Composition {
-            id: ResourceId::with_identity("_virtual", "composition_node"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "_virtual",
+                "composition_node",
+            )),
             signature: Signature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),
@@ -2017,6 +2019,59 @@ mod substitute_placeholder_tests {
 
         assert_eq!(err.expected_kind(), "list");
         assert_eq!(err.got_kind(), "map");
+    }
+
+    #[test]
+    fn deferred_list_and_map_expansion_produce_distinct_children() {
+        let deferred = |binding| DeferredForExpression {
+            file: None,
+            line: 1,
+            header: "for child in source.children".to_string(),
+            resource_type: "mock.Target".to_string(),
+            attributes: Vec::new(),
+            binding_name: "children".to_string(),
+            iterable_binding: "source".to_string(),
+            iterable_attr: "children".to_string(),
+            binding,
+            template_resource: Resource::pending_with_provider("mock", "Target", None),
+        };
+
+        let list_deferred = deferred(ForBinding::Indexed(
+            "index".to_string(),
+            "child".to_string(),
+        ));
+        let list_children = expand_deferred_children(
+            &list_deferred,
+            &Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("alpha".to_string())),
+                Value::Concrete(ConcreteValue::String("beta".to_string())),
+            ])),
+        )
+        .unwrap();
+        assert_eq!(list_deferred.template_resource.id.identity_str(), None);
+        assert_eq!(list_children[0].id.identity_str(), Some("children[0]"));
+        assert_eq!(list_children[1].id.identity_str(), Some("children[1]"));
+        assert_ne!(list_children[0].id, list_children[1].id);
+
+        let map_deferred = deferred(ForBinding::Map("key".to_string(), "child".to_string()));
+        let map_children = expand_deferred_children(
+            &map_deferred,
+            &Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                (
+                    "alpha".to_string(),
+                    Value::Concrete(ConcreteValue::String("one".to_string())),
+                ),
+                (
+                    "beta".to_string(),
+                    Value::Concrete(ConcreteValue::String("two".to_string())),
+                ),
+            ]))),
+        )
+        .unwrap();
+        assert_eq!(map_deferred.template_resource.id.identity_str(), None);
+        assert_eq!(map_children[0].id.identity_str(), Some("children.alpha"));
+        assert_eq!(map_children[1].id.identity_str(), Some("children.beta"));
+        assert_ne!(map_children[0].id, map_children[1].id);
     }
 
     #[test]

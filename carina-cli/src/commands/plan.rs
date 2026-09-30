@@ -146,6 +146,82 @@ pub struct PlanFile {
 impl PlanFile {
     pub const CURRENT_VERSION: u32 = 11;
 
+    pub(crate) fn validate_resource_identities(&self) -> Result<(), String> {
+        fn require_identity(id: &ResourceId, location: &str) -> Result<(), String> {
+            if id.identity_str().is_none() {
+                return Err(format!(
+                    "Invalid saved plan: {location} has a pending resource identity"
+                ));
+            }
+            Ok(())
+        }
+
+        for (index, resource) in self.sorted_resources.iter().enumerate() {
+            require_identity(&resource.id, &format!("sorted_resources[{index}]"))?;
+        }
+        for (index, resource) in self.unresolved_resources.iter().enumerate() {
+            require_identity(&resource.id, &format!("unresolved_resources[{index}]"))?;
+        }
+        for (index, composition) in self.compositions.iter().enumerate() {
+            require_identity(&composition.id, &format!("compositions[{index}]"))?;
+        }
+        for (index, data_source) in self.data_sources.iter().enumerate() {
+            require_identity(&data_source.id, &format!("data_sources[{index}]"))?;
+        }
+        for (index, data_source) in self.data_source_origins.iter().enumerate() {
+            require_identity(&data_source.id, &format!("data_source_origins[{index}]"))?;
+        }
+        for (index, entry) in self.current_states.iter().enumerate() {
+            require_identity(&entry.id, &format!("current_states[{index}].id"))?;
+            require_identity(
+                &entry.state.id,
+                &format!("current_states[{index}].state.id"),
+            )?;
+        }
+
+        for (index, effect) in self.plan.effects().iter().enumerate() {
+            let location = format!("plan.effects[{index}]");
+            match effect {
+                Effect::Read { resource } => require_identity(&resource.id, &location)?,
+                Effect::Create(resource) => require_identity(&resource.id, &location)?,
+                Effect::Update { from, to, .. } => {
+                    require_identity(&from.id, &format!("{location}.from"))?;
+                    require_identity(&to.id, &format!("{location}.to"))?;
+                }
+                Effect::Delete { id, .. }
+                | Effect::Import { id, .. }
+                | Effect::Remove { id }
+                | Effect::Wait { target_id: id, .. } => require_identity(id, &location)?,
+                Effect::Move { from, to } => {
+                    require_identity(from, &format!("{location}.from"))?;
+                    require_identity(to, &format!("{location}.to"))?;
+                }
+                Effect::DeferredCreate { id, template, .. } => {
+                    require_identity(id, &location)?;
+                    require_identity(
+                        &template.template_resource.id,
+                        &format!("{location}.template"),
+                    )?;
+                }
+                Effect::DeferredReplace(payload) => {
+                    require_identity(&payload.id, &location)?;
+                    require_identity(
+                        &payload.template.template_resource.id,
+                        &format!("{location}.template"),
+                    )?;
+                    for (delete_index, delete) in payload.deletes.iter().enumerate() {
+                        require_identity(
+                            &delete.id,
+                            &format!("{location}.deletes[{delete_index}]"),
+                        )?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn validate_replace_display(&self) -> Result<(), String> {
         let effects = self.plan.effects();
         let mut seen_replace_indices = HashSet::new();
@@ -253,7 +329,7 @@ fn deposed_attributes_for_display(
     identifier: &str,
     key: &carina_state::DeposedKey,
 ) -> Option<HashMap<String, Value>> {
-    let row = state_file.find_resource(&id.provider, &id.resource_type, id.identity_or_empty())?;
+    let row = state_file.find_resource(&id.provider, &id.resource_type, id.identity_str()?)?;
     let deposed = row.deposed.iter().find(|deposed| {
         deposed.key == *key
             && deposed.identifier == identifier
@@ -1924,7 +2000,9 @@ mod run_plan_out_tests {
             ),
         );
         let prepared = Composition {
-            id: ResourceId::with_identity("_virtual", "checked"),
+            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "_virtual", "checked",
+            )),
             signature: Signature {
                 arguments,
                 attributes: indexmap::IndexMap::new(),

@@ -3506,7 +3506,9 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
             module_directory: None,
         };
         Composition {
-            id: ResourceId::with_identity("_virtual", binding),
+            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "_virtual", binding,
+            )),
             signature: Signature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),

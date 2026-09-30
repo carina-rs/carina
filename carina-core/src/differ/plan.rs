@@ -152,7 +152,7 @@ pub fn generate_temporary_name(
                 resource_identity: resource
                     .binding
                     .clone()
-                    .unwrap_or_else(|| resource.id.identity_or_empty().to_string()),
+                    .unwrap_or_else(|| resource.id.identity_display().to_string()),
             }
             .into());
         }
@@ -815,10 +815,12 @@ fn dependencies_from_prior_state(state: &State, directives: Directives) -> HashS
 }
 
 fn resource_identity(id: &ResourceId) -> ResourceIdentity {
-    id.identity
-        .as_ref()
-        .expect("differ only receives resources after identity resolution")
-        .clone()
+    match id.identity_state() {
+        crate::resource::ResourceIdentityState::Pending(_) => {
+            panic!("differ only receives resources after identity resolution")
+        }
+        crate::resource::ResourceIdentityState::Resolved(identity) => identity.clone(),
+    }
 }
 
 fn pending_replace_from_parts(
@@ -876,7 +878,7 @@ pub(super) fn temporary_name_for_cbd(
             resource_identity: resource
                 .binding
                 .clone()
-                .unwrap_or_else(|| resource.id.identity_or_empty().to_string()),
+                .unwrap_or_else(|| resource.id.identity_display().to_string()),
         })?;
     generate_temporary_name(resource, from, schema)
 }

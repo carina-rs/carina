@@ -14,7 +14,7 @@ use std::ops::Deref;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use super::{Directives, ModuleSource, ResourceId, Value, identity_if_present};
+use super::{Directives, ModuleSource, ResourceId, ResourceIdentity, ResourceIdentityState, Value};
 
 /// A read-only resource (data source).
 ///
@@ -55,10 +55,23 @@ pub struct DataSource {
 }
 
 impl DataSource {
-    /// Create a data source with an empty attribute map.
-    pub fn new(resource_type: impl Into<String>, name: impl Into<String>) -> Self {
+    /// Create a pending data source with an empty attribute map.
+    pub fn pending(resource_type: impl Into<String>) -> Self {
         Self {
-            id: ResourceId::new(resource_type, identity_if_present(name)),
+            id: ResourceId::pending(resource_type),
+            attributes: IndexMap::new(),
+            directives: Directives::default(),
+            binding: None,
+            dependency_bindings: BTreeSet::new(),
+            module_source: None,
+            quoted_string_attrs: HashSet::new(),
+        }
+    }
+
+    /// Create a resolved data source with an empty attribute map.
+    pub fn new(resource_type: impl Into<String>, identity: impl Into<String>) -> Self {
+        Self {
+            id: ResourceId::with_identity(resource_type, identity),
             attributes: IndexMap::new(),
             directives: Directives::default(),
             binding: None,
@@ -81,14 +94,14 @@ impl DataSource {
     pub fn with_provider(
         provider: impl Into<String>,
         resource_type: impl Into<String>,
-        name: impl Into<String>,
+        identity: impl Into<String>,
         provider_instance: Option<String>,
     ) -> Self {
         Self {
-            id: ResourceId::with_provider(
+            id: ResourceId::with_provider_identity(
                 provider,
                 resource_type,
-                identity_if_present(name),
+                identity,
                 provider_instance,
             ),
             attributes: IndexMap::new(),
@@ -98,6 +111,35 @@ impl DataSource {
             module_source: None,
             quoted_string_attrs: HashSet::new(),
         }
+    }
+
+    /// Create a pending data source with a provider-qualified id.
+    pub fn pending_with_provider(
+        provider: impl Into<String>,
+        resource_type: impl Into<String>,
+        provider_instance: Option<String>,
+    ) -> Self {
+        Self {
+            id: ResourceId::pending_with_provider(provider, resource_type, provider_instance),
+            attributes: IndexMap::new(),
+            directives: Directives::default(),
+            binding: None,
+            dependency_bindings: BTreeSet::new(),
+            module_source: None,
+            quoted_string_attrs: HashSet::new(),
+        }
+    }
+
+    pub(crate) fn instantiate(&self) -> Self {
+        let mut data_source = self.clone();
+        data_source.id = self.id.instantiate_pending();
+        data_source
+    }
+
+    pub(crate) fn instantiate_with_identity(&self, identity: ResourceIdentity) -> Self {
+        let mut data_source = self.clone();
+        data_source.id = self.id.instantiate_with_identity(identity);
+        data_source
     }
 
     /// Get an attribute value by key.
@@ -129,14 +171,14 @@ impl DataSource {
 /// ```compile_fail
 /// use carina_core::resource::{DataSource, ResolvedDataSource};
 ///
-/// let resource = DataSource::new("test", "");
+/// let resource = DataSource::pending("test");
 /// let _ = ResolvedDataSource(resource);
 /// ```
 ///
 /// ```compile_fail
 /// use carina_core::resource::{DataSource, ResolvedDataSource};
 ///
-/// let resource = DataSource::new("test", "");
+/// let resource = DataSource::pending("test");
 /// let _: ResolvedDataSource = resource.into();
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -147,7 +189,10 @@ impl ResolvedDataSource {
     /// Construct from a [`DataSource`], panicking if identity is `None`.
     pub fn new(resource: DataSource) -> Self {
         assert!(
-            resource.id.identity.is_some(),
+            matches!(
+                resource.id.identity_state(),
+                ResourceIdentityState::Resolved(_)
+            ),
             "ResolvedDataSource requires identity"
         );
         Self(resource)
@@ -155,10 +200,9 @@ impl ResolvedDataSource {
 
     /// Try to construct; returns `None` if identity is absent.
     pub fn try_new(resource: DataSource) -> Option<Self> {
-        if resource.id.identity.is_some() {
-            Some(Self(resource))
-        } else {
-            None
+        match resource.id.identity_state() {
+            ResourceIdentityState::Pending(_) => None,
+            ResourceIdentityState::Resolved(_) => Some(Self(resource)),
         }
     }
 
@@ -170,6 +214,19 @@ impl ResolvedDataSource {
     /// Consume and return the inner [`DataSource`].
     pub fn into_inner(self) -> DataSource {
         self.0
+    }
+
+    pub fn identity(&self) -> &ResourceIdentity {
+        match self.0.id.identity_state() {
+            ResourceIdentityState::Pending(_) => {
+                unreachable!("ResolvedDataSource requires identity")
+            }
+            ResourceIdentityState::Resolved(identity) => identity,
+        }
+    }
+
+    pub fn identity_str(&self) -> &str {
+        self.identity().as_str()
     }
 }
 

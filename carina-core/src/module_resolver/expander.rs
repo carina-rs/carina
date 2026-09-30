@@ -11,7 +11,7 @@ use crate::parser::{
 };
 use crate::resource::{
     Composition, CompositionCall, CompositionProvenance, ConcreteValue, DataSource, DeferredValue,
-    Resource, ResourceId, ResourceIdentity, Value,
+    Resource, ResourceId, ResourceIdentity, ResourceIdentityState, Value,
 };
 
 use super::error::ModuleError;
@@ -376,7 +376,10 @@ impl ModuleResolver<'_> {
             }
 
             let composition = Composition {
-                id: ResourceId::with_identity("_virtual", instance_prefix),
+                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                    "_virtual",
+                    instance_prefix,
+                )),
                 signature: crate::resource::Signature {
                     arguments: signature_arguments,
                     attributes: composition_attrs,
@@ -524,9 +527,8 @@ pub(crate) fn build_expansion_trace(
     leaf_resources: &[Resource],
     leaf_data_sources: &[DataSource],
 ) -> crate::resource::ExpansionTrace {
-    let id = crate::resource::EphemeralId::new(crate::resource::ResourceId::with_identity(
-        "_virtual",
-        instance_prefix,
+    let id = crate::resource::EphemeralId::new(crate::resource::ResolvedResourceId::new(
+        crate::resource::ResourceId::with_identity("_virtual", instance_prefix),
     ));
     let this_call_site = match source_path {
         Some(p) => crate::resource::CallSite::new(id, p),
@@ -690,17 +692,16 @@ fn prefix_module_resource(
     intra_module_bindings: &HashSet<String>,
     argument_values: &HashMap<String, Value>,
 ) -> Resource {
-    let mut new_resource = resource.clone();
-
     // Only assigned identities take the prefix here. Anonymous resources
-    // stay `None` so `compute_anonymous_identifiers` can later attach both
-    // the hash and the instance prefix in one shot (#2516).
-    if let Some(identity) = &new_resource.id.identity {
-        let new_name = apply_instance_prefix(instance_prefix, identity.as_str());
-        new_resource
-            .id
-            .set_identity(ResourceIdentity::new(new_name));
-    }
+    // stay pending so `compute_anonymous_identifiers` can later attach both
+    // the hash and the instance prefix in one shot (#2516). Each module
+    // instance receives a distinct pending token.
+    let mut new_resource = match resource.id.identity_state() {
+        ResourceIdentityState::Pending(_) => resource.instantiate(),
+        ResourceIdentityState::Resolved(identity) => resource.instantiate_with_identity(
+            ResourceIdentity::new(apply_instance_prefix(instance_prefix, identity.as_str())),
+        ),
+    };
 
     if let Some(ref binding) = new_resource.binding {
         new_resource.binding = Some(apply_instance_prefix(instance_prefix, binding));
@@ -747,14 +748,12 @@ fn prefix_module_data_source(
     intra_module_bindings: &HashSet<String>,
     argument_values: &HashMap<String, Value>,
 ) -> DataSource {
-    let mut new_data_source = data_source.clone();
-
-    if let Some(identity) = &new_data_source.id.identity {
-        let new_name = apply_instance_prefix(instance_prefix, identity.as_str());
-        new_data_source
-            .id
-            .set_identity(ResourceIdentity::new(new_name));
-    }
+    let mut new_data_source = match data_source.id.identity_state() {
+        ResourceIdentityState::Pending(_) => data_source.instantiate(),
+        ResourceIdentityState::Resolved(identity) => data_source.instantiate_with_identity(
+            ResourceIdentity::new(apply_instance_prefix(instance_prefix, identity.as_str())),
+        ),
+    };
 
     if let Some(ref binding) = new_data_source.binding {
         new_data_source.binding = Some(apply_instance_prefix(instance_prefix, binding));
@@ -810,10 +809,10 @@ fn prefix_module_composition(
     }
     *new_virtual.provenance = CompositionProvenance::expanded(call, root_call.clone());
 
-    if let Some(identity) = &new_virtual.id.identity {
-        let new_name = apply_instance_prefix(instance_prefix, identity.as_str());
-        new_virtual.id.set_identity(ResourceIdentity::new(new_name));
-    }
+    let new_name = apply_instance_prefix(instance_prefix, composition.id.identity_str());
+    new_virtual.id = composition
+        .id
+        .instantiate_with_identity(ResourceIdentity::new(new_name));
 
     if let Some(ref binding) = new_virtual.binding {
         new_virtual.binding = Some(apply_instance_prefix(instance_prefix, binding));
@@ -1173,7 +1172,10 @@ pub fn reconcile_anonymous_module_instances(
     // expanded DSL — we'll query state for matching entries.
     let mut touched_types: HashSet<(String, String)> = HashSet::new();
     for r in resources.iter() {
-        if split_instance_prefix(r.id.identity_or_empty()).is_none() {
+        let Some(identity) = r.id.identity_str() else {
+            continue;
+        };
+        if split_instance_prefix(identity).is_none() {
             continue;
         }
         touched_types.insert((r.id.provider.clone(), r.id.resource_type.clone()));
@@ -1189,7 +1191,10 @@ pub fn reconcile_anonymous_module_instances(
     let mut current_synthetic_by_module: HashMap<String, HashSet<SimHash>> = HashMap::new();
     let mut claimed_current_by_module: HashMap<String, HashSet<SimHash>> = HashMap::new();
     for r in resources.iter() {
-        let Some((prefix, _)) = split_instance_prefix(r.id.identity_or_empty()) else {
+        let Some(identity) = r.id.identity_str() else {
+            continue;
+        };
+        let Some((prefix, _)) = split_instance_prefix(identity) else {
             continue;
         };
         let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix) else {
@@ -1199,11 +1204,7 @@ pub fn reconcile_anonymous_module_instances(
             .entry(module.to_string())
             .or_default()
             .insert(simhash);
-        if claims.claims_to(
-            &r.id.provider,
-            &r.id.resource_type,
-            r.id.identity_or_empty(),
-        ) {
+        if claims.claims_to(&r.id.provider, &r.id.resource_type, identity) {
             claimed_current_by_module
                 .entry(module.to_string())
                 .or_default()
@@ -1291,7 +1292,10 @@ pub fn reconcile_anonymous_module_instances(
     // Apply remaps: rewrite identity and `binding` for every resource whose
     // instance prefix is in the remap table.
     for r in resources.iter_mut() {
-        let Some((prefix, rest)) = split_instance_prefix(r.id.identity_or_empty()) else {
+        let Some(identity) = r.id.identity_str() else {
+            continue;
+        };
+        let Some((prefix, rest)) = split_instance_prefix(identity) else {
             continue;
         };
         let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix) else {
@@ -1336,10 +1340,10 @@ pub fn reconcile_anonymous_module_instances(
     }
 
     for composition in compositions {
-        if let Some(identity) =
-            rewrite_name_prefix(composition.id.identity_or_empty(), &prefix_remap)
-        {
-            composition.id.set_identity(ResourceIdentity::new(identity));
+        if let Some(identity) = rewrite_name_prefix(composition.id.identity_str(), &prefix_remap) {
+            composition.id = composition
+                .id
+                .instantiate_with_identity(ResourceIdentity::new(identity));
         }
         if let Some(binding) = composition.binding.as_deref()
             && let Some(rewritten) = rewrite_name_prefix(binding, &prefix_remap)
@@ -1474,7 +1478,10 @@ mod tests {
             &HashMap::new(),
         );
 
-        assert_eq!(prefixed.id.identity_or_empty(), "registry_publish.caller");
+        assert_eq!(
+            prefixed.id.identity_str().expect("resolved identity"),
+            "registry_publish.caller"
+        );
         assert_eq!(prefixed.binding.as_deref(), Some("registry_publish.caller"));
         assert_eq!(
             prefixed.dependency_bindings,

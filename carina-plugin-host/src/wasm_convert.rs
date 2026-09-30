@@ -13,7 +13,8 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives,
-    Resource as CoreResource, ResourceId as CoreResourceId, State as CoreState, Value as CoreValue,
+    Resource as CoreResource, ResourceId as CoreResourceId, ResourceIdentityState,
+    State as CoreState, Value as CoreValue,
 };
 use carina_core::schema::{
     AttributeSchema as CoreAttributeSchema, AttributeType as CoreAttributeType,
@@ -427,11 +428,35 @@ pub fn wit_to_core_value_map(entries: &[(String, wit::Value)]) -> HashMap<String
 
 // -- ResourceId --
 
+/// Render the legacy `ResourceId` map key used by the WASM guest contract.
+///
+/// This intentionally does not use `Display`: pending IDs must retain the
+/// exact pre-pending-token wire spelling even though their diagnostic display
+/// now includes `<pending>`.
+pub(crate) fn resource_id_wire_key(id: &CoreResourceId) -> String {
+    match (id.provider.is_empty(), id.identity_state()) {
+        (true, ResourceIdentityState::Pending(_)) => id.resource_type.clone(),
+        (true, ResourceIdentityState::Resolved(identity)) => {
+            format!("{}.{}", id.resource_type, identity.as_str())
+        }
+        (false, ResourceIdentityState::Pending(_)) => {
+            format!("{}.{}", id.provider, id.resource_type)
+        }
+        (false, ResourceIdentityState::Resolved(identity)) => {
+            format!("{}.{}.{}", id.provider, id.resource_type, identity.as_str())
+        }
+    }
+}
+
 pub fn core_to_wit_resource_id(id: &CoreResourceId) -> wit::ResourceId {
+    let identity = match id.identity_state() {
+        ResourceIdentityState::Pending(_) => String::new(),
+        ResourceIdentityState::Resolved(identity) => identity.as_str().to_string(),
+    };
     wit::ResourceId {
         provider: id.provider.clone(),
         resource_type: id.resource_type.clone(),
-        identity: id.identity_or_empty().to_string(),
+        identity,
     }
 }
 
@@ -441,7 +466,11 @@ pub fn wit_to_core_resource_id(id: &wit::ResourceId) -> CoreResourceId {
     // Tracked as a follow-up to extend the WIT contract; until then,
     // callers that need routing must thread it through alongside the
     // converted id.
-    CoreResourceId::with_provider_name_compat(&id.provider, &id.resource_type, &id.identity, None)
+    if id.identity.is_empty() {
+        CoreResourceId::pending_with_provider(&id.provider, &id.resource_type, None)
+    } else {
+        CoreResourceId::with_provider_identity(&id.provider, &id.resource_type, &id.identity, None)
+    }
 }
 
 // -- State --
@@ -526,15 +555,7 @@ pub fn core_data_source_to_wit_resource(
 
 pub fn wit_to_core_resource(resource: &wit::ResourceDef) -> CoreResource {
     let id = wit_to_core_resource_id(&resource.id);
-    // `id` came from `wit_to_core_resource_id`, which has no
-    // `provider_instance` to forward (WIT contract limitation); pass
-    // `None` explicitly to match.
-    let mut core_resource = CoreResource::with_provider(
-        &id.provider,
-        &id.resource_type,
-        id.identity_or_empty(),
-        None,
-    );
+    let mut core_resource = CoreResource::from_id(id);
     core_resource.attributes = resource
         .attributes
         .iter()
@@ -2011,6 +2032,41 @@ mod tests {
         assert_eq!(core, back);
     }
 
+    #[test]
+    fn pending_resource_id_wasm_conversion_never_reuses_identity() {
+        let pending = CoreResourceId::pending_with_provider("mock", "test.resource", None);
+        let wit = core_to_wit_resource_id(&pending);
+        assert_eq!(wit.provider, "mock");
+        assert_eq!(wit.resource_type, "test.resource");
+        assert_eq!(wit.identity, "");
+
+        let first = wit_to_core_resource_id(&wit);
+        let second = wit_to_core_resource_id(&wit);
+        assert_eq!(first.identity_str(), None);
+        assert_eq!(second.identity_str(), None);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn resource_id_wire_key_matches_origin_main_display_format() {
+        let resolved =
+            CoreResourceId::with_provider_identity("mock", "test.resource", "example", None);
+        let pending = CoreResourceId::pending_with_provider("mock", "test.resource", None);
+        let providerless_resolved = CoreResourceId::with_identity("test.resource", "example");
+        let providerless_pending = CoreResourceId::pending("test.resource");
+
+        assert_eq!(
+            resource_id_wire_key(&resolved),
+            "mock.test.resource.example"
+        );
+        assert_eq!(resource_id_wire_key(&pending), "mock.test.resource");
+        assert_eq!(
+            resource_id_wire_key(&providerless_resolved),
+            "test.resource.example"
+        );
+        assert_eq!(resource_id_wire_key(&providerless_pending), "test.resource");
+    }
+
     // -- State roundtrip --
 
     #[test]
@@ -2169,7 +2225,7 @@ mod tests {
         let rid = detail.resource_id.as_ref().expect("resource_id preserved");
         assert_eq!(rid.provider, "aws");
         assert_eq!(rid.resource_type, "s3.Bucket");
-        assert_eq!(rid.identity_or_empty(), "my-bucket");
+        assert_eq!(rid.identity_str().expect("resolved identity"), "my-bucket");
         let cause_str = detail
             .cause
             .as_ref()

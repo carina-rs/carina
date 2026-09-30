@@ -3421,7 +3421,10 @@ mod tests {
             ),
         );
         let virt = Composition {
-            id: ResourceId::with_identity("_virtual", "module_instance"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "_virtual",
+                "module_instance",
+            )),
             signature: Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: attrs,
@@ -4879,19 +4882,14 @@ mod tests {
     }
 
     fn make_resource(attrs: Vec<(&str, Value)>) -> crate::resource::Resource {
-        use crate::resource::{Resource, ResourceId, ResourceIdentity};
+        use crate::resource::{Resource, ResourceId};
         use std::collections::{BTreeSet, HashMap, HashSet};
         let mut attributes = IndexMap::new();
         for (k, v) in attrs {
             attributes.insert(k.to_string(), v);
         }
         Resource {
-            id: ResourceId {
-                provider: "aws".to_string(),
-                resource_type: "iam.policy".to_string(),
-                identity: Some(ResourceIdentity::new("p1")),
-                provider_instance: None,
-            },
+            id: ResourceId::with_provider_identity("aws", "iam.policy", "p1", None),
             attributes,
             directives: Default::default(),
             prefixes: HashMap::new(),
@@ -5049,19 +5047,14 @@ mod tests {
     // ---- canonicalize_states_with_schemas tests (#2481, #2513) ----
 
     fn make_state(attrs: Vec<(&str, Value)>) -> crate::resource::State {
-        use crate::resource::{ResourceId, ResourceIdentity, State};
+        use crate::resource::{ResourceId, State};
         use std::collections::{BTreeSet, HashMap};
         let mut attributes = HashMap::new();
         for (k, v) in attrs {
             attributes.insert(k.to_string(), v);
         }
         State {
-            id: ResourceId {
-                provider: "aws".to_string(),
-                resource_type: "iam.policy".to_string(),
-                identity: Some(ResourceIdentity::new("p1")),
-                provider_instance: None,
-            },
+            id: ResourceId::with_provider_identity("aws", "iam.policy", "p1", None),
             identifier: Some("arn:aws:iam::123:policy/p1".to_string()),
             attributes,
             exists: true,

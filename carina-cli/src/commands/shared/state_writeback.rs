@@ -9,7 +9,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use carina_core::effect::{DeferredReplaceDelete, DeletedInstanceKey, Effect, EffectGeneration};
 use carina_core::executor::ExecutionResult;
 use carina_core::plan::{Plan, ReplaceDisplayInfo};
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_state::{
     DeposedInstance, DeposedKey, LockInfo, PreviousSecretHashAuthority, ResourceState,
@@ -106,7 +106,7 @@ impl PostApplyStates {
     ) -> Self {
         let mut map = current_states.clone();
         for rs in state.resources() {
-            let id = ResourceId::with_provider_name_compat(
+            let id = ResourceId::with_provider_identity(
                 &rs.provider,
                 &rs.resource_type,
                 &rs.identity,
@@ -854,11 +854,10 @@ fn planned_depose(
     state_file: &StateFile,
     current_states: &HashMap<ResourceId, State>,
 ) -> PlannedDepose {
-    let existing = state_file.find_resource(
-        &delete.id.provider,
-        &delete.id.resource_type,
-        delete.id.identity_or_empty(),
-    );
+    let resolved_desired_resource = ResolvedResource::new(desired_resource.clone());
+    let existing = delete.id.identity_str().and_then(|identity| {
+        state_file.find_resource(&delete.id.provider, &delete.id.resource_type, identity)
+    });
     let current = current_states.get(delete.id);
 
     let attributes = if let Some(existing) = existing
@@ -869,7 +868,7 @@ fn planned_depose(
         // compare-only, and this also masks keys that only became
         // secret in the new config.
         ResourceState::protect_state_json_for_resource_and_schema(
-            desired_resource,
+            &resolved_desired_resource,
             schema,
             existing.attributes.clone(),
             PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing.attributes),
@@ -880,14 +879,14 @@ fn planned_depose(
             .unwrap_or(PreviousSecretHashAuthority::None);
         if let Some(previous) = delete.previous_attributes {
             ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
-                desired_resource,
+                &resolved_desired_resource,
                 schema,
                 previous,
                 previous_hash_authority,
             )
         } else if let Some(current) = current {
             ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
-                desired_resource,
+                &resolved_desired_resource,
                 schema,
                 &current.attributes,
                 previous_hash_authority,
@@ -989,9 +988,9 @@ fn plan_displaced_identifier_deposes(
         if !create_side_ids.contains(id) {
             continue;
         }
-        let Some(existing) =
-            state_file.find_resource(&id.provider, &id.resource_type, id.identity_or_empty())
-        else {
+        let Some(existing) = id.identity_str().and_then(|identity| {
+            state_file.find_resource(&id.provider, &id.resource_type, identity)
+        }) else {
             continue;
         };
         let Some(displaced_identifier) = existing.identifier.as_deref() else {
@@ -1194,7 +1193,10 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
 
     for (id, planned) in &writeback.upserts {
         let resource = planned.resource;
-        let existing = state.find_resource(&id.provider, &id.resource_type, id.identity_or_empty());
+        let resolved_resource = ResolvedResource::new(resource.clone());
+        let existing = id
+            .identity_str()
+            .and_then(|identity| state.find_resource(&id.provider, &id.resource_type, identity));
         let write_only_keys: Vec<String> = schemas
             .get_for(resource)
             .map(|schema| {
@@ -1212,7 +1214,7 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
             UpsertSource::CurrentState(s) => (s, false),
         };
         let mut resource_state = ResourceState::from_provider_state_for_resource_and_schema(
-            resource,
+            &resolved_resource,
             applied_state,
             existing,
             schemas.get_for(resource),
@@ -1234,13 +1236,21 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
         state.remove_deposed_generation(
             &planned.id.provider,
             &planned.id.resource_type,
-            planned.id.identity_or_empty(),
+            planned
+                .id
+                .identity_str()
+                .expect("deposed writeback identity must be resolved"),
             &planned.key,
         );
     }
 
     for id in &writeback.cleanups {
-        state.remove_resource(&id.provider, &id.resource_type, id.identity_or_empty());
+        state.remove_resource(
+            &id.provider,
+            &id.resource_type,
+            id.identity_str()
+                .expect("cleanup identity must be resolved"),
+        );
     }
 
     Ok(state)
@@ -1251,7 +1261,10 @@ fn apply_planned_depose(state: &mut StateFile, planned: PlannedDepose) -> Result
     state.upsert_deposed_generation(
         &planned.id.provider,
         &planned.id.resource_type,
-        planned.id.identity_or_empty(),
+        planned
+            .id
+            .identity_str()
+            .expect("deposed writeback identity must be resolved"),
         row_provider_instance,
         planned.instance,
     )?;
@@ -1270,14 +1283,20 @@ pub(crate) fn apply_destroy_to_state(
                 state.remove_resource(
                     &destroyed.id.provider,
                     &destroyed.id.resource_type,
-                    destroyed.id.identity_or_empty(),
+                    destroyed
+                        .id
+                        .identity_str()
+                        .expect("destroyed identity must be resolved"),
                 );
             }
             EffectGeneration::Deposed(key) => {
                 state.remove_deposed_generation(
                     &destroyed.id.provider,
                     &destroyed.id.resource_type,
-                    destroyed.id.identity_or_empty(),
+                    destroyed
+                        .id
+                        .identity_str()
+                        .expect("destroyed identity must be resolved"),
                     key,
                 );
             }
@@ -1299,7 +1318,11 @@ pub(crate) struct DestroyedInstance {
 /// and tree display work correctly.
 pub(crate) fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceId) -> Resource {
     let rs = sf
-        .find_resource(&id.provider, &id.resource_type, id.identity_or_empty())
+        .find_resource(
+            &id.provider,
+            &id.resource_type,
+            id.identity_str().expect("orphan identity must be resolved"),
+        )
         .expect("orphan must exist in state file");
     let attributes: HashMap<String, Value> = rs
         .attributes

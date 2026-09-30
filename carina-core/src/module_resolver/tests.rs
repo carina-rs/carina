@@ -153,7 +153,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
         data_sources: vec![],
         compositions: vec![],
         resources: vec![Resource {
-            id: ResourceId::with_provider("awscc", "iam.RolePolicy", None, None),
+            id: ResourceId::pending_with_provider("awscc", "iam.RolePolicy", None),
             attributes: {
                 let mut attrs = IndexMap::new();
                 attrs.insert(
@@ -212,11 +212,14 @@ fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
     assert_eq!(expanded.len(), 1);
     let policy = &expanded[0];
     assert!(
-        policy.id.identity.is_none(),
+        matches!(
+            policy.id.identity_state(),
+            crate::resource::ResourceIdentityState::Pending(_)
+        ),
         "anonymous resource inside a module instance must keep identity absent after expansion \
          (compute_anonymous_identifiers filters on absent identity and would skip an assigned value); \
          got {:?}",
-        policy.id.identity,
+        policy.id.identity_state(),
     );
     assert_eq!(
         policy.module_source,
@@ -227,6 +230,49 @@ fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
         "module_source must be set so compute_anonymous_identifiers can prepend \
          the instance prefix when the Pending name is bound"
     );
+}
+
+#[test]
+fn anonymous_module_resource_instantiated_twice_has_distinct_pending_ids() {
+    let resolver = {
+        let mut resolver = ModuleResolver::new(".");
+        resolver.imported_modules.insert(
+            "policy_module".to_string(),
+            create_test_module_with_anonymous_resource(),
+        );
+        resolver
+    };
+    let call = ModuleCall {
+        module_name: "policy_module".to_string(),
+        binding_name: None,
+        source: Default::default(),
+        arguments: HashMap::new(),
+    };
+
+    let first = resolver
+        .expand_module_call(&call, "first", None)
+        .unwrap()
+        .resources
+        .into_iter()
+        .next()
+        .unwrap();
+    let second = resolver
+        .expand_module_call(&call, "second", None)
+        .unwrap()
+        .resources
+        .into_iter()
+        .next()
+        .unwrap();
+
+    assert_eq!(first.id.identity_str(), None);
+    assert_eq!(second.id.identity_str(), None);
+    assert_ne!(first.id, second.id);
+
+    let resources = vec![first.clone(), second.clone()];
+    let sorted = crate::deps::sort_resources_by_dependencies(&resources).unwrap();
+    assert_eq!(sorted.len(), 2);
+    assert_eq!(sorted[0].id, first.id);
+    assert_eq!(sorted[1].id, second.id);
 }
 
 #[test]
@@ -259,7 +305,10 @@ fn test_expand_module_call() {
     assert_eq!(expanded.len(), 1);
 
     let sg = &expanded[0];
-    assert_eq!(sg.id.identity_or_empty(), "my_instance.sg");
+    assert_eq!(
+        sg.id.identity_str().expect("resolved identity"),
+        "my_instance.sg"
+    );
     assert_eq!(
         sg.get_attr("vpc_id"),
         Some(&Value::Concrete(ConcreteValue::String(
@@ -427,7 +476,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
     reconcile_anonymous_module_instances(&mut resources, &mut [], &state_lookup);
 
     assert_eq!(
-        resources[0].id.identity_or_empty(),
+        resources[0].id.identity_str().expect("resolved identity"),
         state_name,
         "precondition: remap must actually have rewritten the name",
     );
@@ -597,8 +646,14 @@ fn test_multiple_module_instances_no_collision() {
     );
 
     // Resource names should also be distinct (dot notation)
-    assert_eq!(expanded_a[0].id.identity_or_empty(), "prod.main_vpc");
-    assert_eq!(expanded_b[0].id.identity_or_empty(), "staging.main_vpc");
+    assert_eq!(
+        expanded_a[0].id.identity_str().expect("resolved identity"),
+        "prod.main_vpc"
+    );
+    assert_eq!(
+        expanded_b[0].id.identity_str().expect("resolved identity"),
+        "staging.main_vpc"
+    );
 }
 
 /// Module with an attributes block that exposes a security_group binding.
@@ -779,9 +834,10 @@ fn test_expand_module_call_populates_expansion_trace_single_level() {
 
     // The chain element points at this call site's instance prefix
     // (`_virtual.<instance_prefix>`).
-    let expected_call_site = crate::resource::EphemeralId::new(
-        crate::resource::ResourceId::with_identity("_virtual", "web"),
-    );
+    let expected_call_site =
+        crate::resource::EphemeralId::new(crate::resource::ResolvedResourceId::new(
+            crate::resource::ResourceId::with_identity("_virtual", "web"),
+        ));
     assert_eq!(chain[0].id, expected_call_site);
 }
 
@@ -871,7 +927,9 @@ fn test_build_expansion_trace_prepends_outer_call_site_to_inner_chain() {
         "outer.inner.logs",
     ));
     let inner_call_site = CallSite::new(
-        EphemeralId::new(ResourceId::with_identity("_virtual", "outer.inner")),
+        EphemeralId::new(crate::resource::ResolvedResourceId::new(
+            ResourceId::with_identity("_virtual", "outer.inner"),
+        )),
         "./modules/inner",
     );
     inner_trace.record(inner_leaf.clone(), vec![inner_call_site.clone()]);
@@ -894,7 +952,9 @@ fn test_build_expansion_trace_prepends_outer_call_site_to_inner_chain() {
         2,
         "two-level expansion must produce a two-element chain, got {chain:?}",
     );
-    let expected_outer = EphemeralId::new(ResourceId::with_identity("_virtual", "outer"));
+    let expected_outer = EphemeralId::new(crate::resource::ResolvedResourceId::new(
+        ResourceId::with_identity("_virtual", "outer"),
+    ));
     assert_eq!(
         chain[0].id, expected_outer,
         "outermost element must be the outer call site",
@@ -1222,7 +1282,7 @@ thing { name = 'beta'  }
         .resources
         .iter()
         .filter(|r| r.id.resource_type == "iam.Role")
-        .map(|r| r.id.identity_or_empty().to_string())
+        .map(|r| r.id.identity_str().expect("resolved identity").to_string())
         .collect();
     assert_eq!(role_addresses.len(), 2, "got {:?}", role_addresses);
 
@@ -1255,7 +1315,7 @@ thing              { name = 'anon-call'  }
     let addrs: Vec<&str> = parsed
         .resources
         .iter()
-        .map(|r| r.id.identity_or_empty())
+        .map(|r| r.id.identity_str().expect("resolved identity"))
         .collect();
     assert!(addrs.iter().any(|n| n.starts_with("named.")), "{:?}", addrs);
     assert!(addrs.iter().any(|n| n.starts_with("thing_")), "{:?}", addrs);
@@ -1280,7 +1340,8 @@ thing { name = 'after-edit' }
         .find(|r| r.id.resource_type == "iam.Role")
         .unwrap()
         .id
-        .identity_or_empty()
+        .identity_str()
+        .expect("resolved identity")
         .to_string();
     let (new_prefix, _) = before.split_once('.').unwrap();
     let new_prefix = new_prefix.to_string();
@@ -1290,9 +1351,9 @@ thing { name = 'after-edit' }
     // Model a nested call retained under the anonymous instance. Its address,
     // binding, and argument ref must move with the managed resource.
     let mut nested = parsed.compositions[0].clone();
-    nested
+    nested.id = nested
         .id
-        .set_identity(crate::resource::ResourceIdentity::new(format!(
+        .instantiate_with_identity(crate::resource::ResourceIdentity::new(format!(
             "{new_prefix}.nested"
         )));
     nested.binding = Some(format!("{new_prefix}.nested"));
@@ -1327,7 +1388,10 @@ thing { name = 'after-edit' }
         .iter()
         .find(|r| r.id.resource_type == "iam.Role")
         .unwrap();
-    assert_eq!(role.id.identity_or_empty(), state_name);
+    assert_eq!(
+        role.id.identity_str().expect("resolved identity"),
+        state_name
+    );
     assert_eq!(
         role.binding.as_deref(),
         Some(state_name.as_str()),
@@ -1345,7 +1409,7 @@ thing { name = 'after-edit' }
         .iter()
         .find(|composition| composition.binding.is_none())
         .unwrap();
-    assert_eq!(outer.id.identity_or_empty(), state_prefix);
+    assert_eq!(outer.id.identity_str(), state_prefix);
     assert_eq!(outer.instance, state_prefix);
 
     let nested = parsed
@@ -1353,10 +1417,7 @@ thing { name = 'after-edit' }
         .iter()
         .find(|composition| composition.binding.is_some())
         .unwrap();
-    assert_eq!(
-        nested.id.identity_or_empty(),
-        format!("{state_prefix}.nested")
-    );
+    assert_eq!(nested.id.identity_str(), format!("{state_prefix}.nested"));
     assert_eq!(
         nested.binding.as_deref(),
         Some(format!("{state_prefix}.nested").as_str())
@@ -1603,7 +1664,7 @@ thing { name = 'after-edit' }
         .find(|r| r.id.resource_type == "iam.Role")
         .unwrap();
     assert_eq!(
-        role_after.id.identity_or_empty(),
+        role_after.id.identity_str().expect("resolved identity"),
         format!("thing_{:016x}.role", state_hash),
         "Role address must be remapped to the state prefix",
     );
@@ -1613,7 +1674,7 @@ thing { name = 'after-edit' }
         .find(|r| r.id.resource_type == "iam.OidcProvider")
         .unwrap();
     assert_eq!(
-        provider_after.id.identity_or_empty(),
+        provider_after.id.identity_str().expect("resolved identity"),
         format!("thing_{:016x}.provider_res", state_hash),
         "OidcProvider address must be remapped to the state prefix",
     );
@@ -1789,7 +1850,10 @@ fn test_expand_module_call_uses_dot_path_addressing() {
 
     let sg = &expanded[0];
     // Resource name should use dot notation, not underscore
-    assert_eq!(sg.id.identity_or_empty(), "my_instance.sg");
+    assert_eq!(
+        sg.id.identity_str().expect("resolved identity"),
+        "my_instance.sg"
+    );
 }
 
 #[test]
@@ -1821,8 +1885,14 @@ fn test_module_dot_path_bindings_and_refs() {
         .resources;
 
     // Resource names should use dot notation
-    assert_eq!(expanded[0].id.identity_or_empty(), "prod.main_vpc");
-    assert_eq!(expanded[1].id.identity_or_empty(), "prod.sub");
+    assert_eq!(
+        expanded[0].id.identity_str().expect("resolved identity"),
+        "prod.main_vpc"
+    );
+    assert_eq!(
+        expanded[1].id.identity_str().expect("resolved identity"),
+        "prod.sub"
+    );
 
     // binding should use dot notation
     assert_eq!(expanded[0].binding, Some("prod.vpc".to_string()));
@@ -2818,7 +2888,9 @@ fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
         module_directory: None,
     };
     let inner = Composition {
-        id: ResourceId::with_identity("_virtual", "inner"),
+        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "_virtual", "inner",
+        )),
         signature: Signature {
             arguments: IndexMap::from([(
                 "port".to_string(),
@@ -5167,6 +5239,61 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
     );
 }
 
+#[test]
+fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
+    use crate::parser::{DeferredForExpression, ForBinding};
+
+    let mut module = create_test_module_with_anonymous_resource();
+    module.resources.clear();
+    module.deferred_for_expressions.push(DeferredForExpression {
+        file: None,
+        line: 1,
+        header: "for _, account in accounts.items".to_string(),
+        resource_type: "awscc.sso.Assignment".to_string(),
+        attributes: Vec::new(),
+        binding_name: "assignments".to_string(),
+        iterable_binding: "accounts".to_string(),
+        iterable_attr: "items".to_string(),
+        binding: ForBinding::Map("_".to_string(), "account".to_string()),
+        template_resource: Resource::pending_with_provider("awscc", "sso.Assignment", None),
+    });
+
+    let resolver = {
+        let mut resolver = ModuleResolver::new(".");
+        resolver
+            .imported_modules
+            .insert("assignments".to_string(), module);
+        resolver
+    };
+    let call = ModuleCall {
+        module_name: "assignments".to_string(),
+        binding_name: None,
+        source: Default::default(),
+        arguments: HashMap::new(),
+    };
+
+    let first = resolver
+        .expand_module_call(&call, "first", None)
+        .unwrap()
+        .deferred_for_expressions
+        .into_iter()
+        .next()
+        .unwrap()
+        .template_resource;
+    let second = resolver
+        .expand_module_call(&call, "second", None)
+        .unwrap()
+        .deferred_for_expressions
+        .into_iter()
+        .next()
+        .unwrap()
+        .template_resource;
+
+    assert_eq!(first.id.identity_str(), None);
+    assert_eq!(second.id.identity_str(), None);
+    assert_ne!(first.id, second.id);
+}
+
 /// carina#3126 PR-B negative case: an `iterable_binding` that is NOT a
 /// module-internal binding (a caller-passed / argument binding that
 /// merely shares a name) must **not** be instance-prefixed — the same
@@ -5549,7 +5676,10 @@ let outer = outer_module {}
         .iter()
         .find(|resource| resource.binding.as_deref() == Some("outer.inner.target"))
         .expect("twice-expanded target must exist");
-    assert_eq!(target.id.identity_or_empty(), "outer.inner.target");
+    assert_eq!(
+        target.id.identity_str().expect("resolved identity"),
+        "outer.inner.target"
+    );
 
     let consumer = parsed
         .resources

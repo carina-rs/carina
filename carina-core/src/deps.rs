@@ -130,69 +130,83 @@ pub fn sort_resources_by_dependencies(resources: &[Resource]) -> Result<Vec<Reso
 
 /// Internal topological sort for creation ordering.
 fn topological_sort(resources: &[Resource]) -> Result<Vec<Resource>, String> {
-    // Build binding name to resource mapping
-    let mut binding_to_resource: HashMap<String, &Resource> = HashMap::new();
-    for resource in resources {
+    // Build binding name to input index mapping. Graph membership is indexed
+    // by declaration position so two anonymous resources cannot collapse.
+    let mut binding_to_index: HashMap<String, usize> = HashMap::new();
+    for (index, resource) in resources.iter().enumerate() {
         if let Some(ref binding_name) = resource.binding {
-            binding_to_resource.insert(binding_name.clone(), resource);
+            binding_to_index.insert(binding_name.clone(), index);
         }
     }
 
     // Build dependency graph
     let mut sorted = Vec::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut visiting: Vec<String> = Vec::new();
+    let mut visited: HashSet<usize> = HashSet::new();
+    let mut visiting: Vec<usize> = Vec::new();
 
-    fn visit<'a>(
-        resource: &'a Resource,
-        binding_to_resource: &HashMap<String, &'a Resource>,
-        visited: &mut HashSet<String>,
-        visiting: &mut Vec<String>,
+    fn label(resource: &Resource) -> String {
+        resource
+            .binding
+            .clone()
+            .unwrap_or_else(|| resource.id.to_string())
+    }
+
+    fn visit(
+        index: usize,
+        resources: &[Resource],
+        binding_to_index: &HashMap<String, usize>,
+        visited: &mut HashSet<usize>,
+        visiting: &mut Vec<usize>,
         sorted: &mut Vec<Resource>,
     ) -> Result<(), String> {
-        let binding_name = resource.binding.clone().unwrap_or_else(|| {
-            format!(
-                "{}:{}",
-                resource.id.resource_type,
-                resource.id.identity_or_empty()
-            )
-        });
-
-        if visited.contains(&binding_name) {
+        if visited.contains(&index) {
             return Ok(());
         }
-        if let Some(pos) = visiting.iter().position(|n| n == &binding_name) {
-            let cycle: Vec<&str> = visiting[pos..]
+        if let Some(pos) = visiting
+            .iter()
+            .position(|visiting_index| *visiting_index == index)
+        {
+            let cycle = visiting[pos..]
                 .iter()
-                .map(|s| s.as_str())
-                .chain(std::iter::once(binding_name.as_str()))
-                .collect();
+                .copied()
+                .chain(std::iter::once(index))
+                .map(|cycle_index| label(&resources[cycle_index]))
+                .collect::<Vec<_>>();
             return Err(format!(
                 "Circular dependency detected: {}",
                 cycle.join(" -> ")
             ));
         }
 
-        visiting.push(binding_name.clone());
+        visiting.push(index);
 
         // Visit dependencies first
+        let resource = &resources[index];
         let deps = get_resource_dependencies(resource);
         for dep in &deps {
-            if let Some(dep_resource) = binding_to_resource.get(dep) {
-                visit(dep_resource, binding_to_resource, visited, visiting, sorted)?;
+            if let Some(dep_index) = binding_to_index.get(dep) {
+                visit(
+                    *dep_index,
+                    resources,
+                    binding_to_index,
+                    visited,
+                    visiting,
+                    sorted,
+                )?;
             }
         }
 
         visiting.pop();
-        visited.insert(binding_name);
+        visited.insert(index);
         sorted.push(resource.clone());
         Ok(())
     }
 
-    for resource in resources {
+    for index in 0..resources.len() {
         visit(
-            resource,
-            &binding_to_resource,
+            index,
+            resources,
+            &binding_to_index,
             &mut visited,
             &mut visiting,
             &mut sorted,
@@ -206,7 +220,9 @@ fn topological_sort(resources: &[Resource]) -> Result<Vec<Resource>, String> {
 mod tests {
     use super::*;
     use crate::effect::Effect;
-    use crate::resource::{DeferredValue, Resource, ResourceId, ResourceIdentity, Value};
+    use crate::resource::{
+        ConcreteValue, DeferredValue, Resource, ResourceId, ResourceIdentity, Value,
+    };
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
     fn wait_effect_with_explicit_dependency(binding: Option<&str>) -> Effect {
@@ -271,7 +287,10 @@ mod tests {
         let mut dep_bindings = BTreeSet::new();
         dep_bindings.insert("explicit_dep".to_string());
         let virt = Composition {
-            id: ResourceId::with_identity("_virtual.module", "v"),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "_virtual.module",
+                "v",
+            )),
             signature: Signature {
                 arguments: IndexMap::new(),
                 attributes,
@@ -377,6 +396,24 @@ mod tests {
     }
 
     #[test]
+    fn pending_anonymous_resources_of_the_same_type_survive_in_declaration_order() {
+        let mut alpha = Resource::pending("test.resource");
+        alpha.set_attr(
+            "name",
+            Value::Concrete(ConcreteValue::String("alpha".to_string())),
+        );
+        let mut beta = Resource::pending("test.resource");
+        beta.set_attr(
+            "name",
+            Value::Concrete(ConcreteValue::String("beta".to_string())),
+        );
+
+        let sorted = sort_resources_by_dependencies(&[alpha.clone(), beta.clone()]).unwrap();
+
+        assert_eq!(sorted, vec![alpha, beta]);
+    }
+
+    #[test]
     fn wait_blocking_bindings_include_target_before_explicit_dependencies() {
         let effect = wait_effect_with_explicit_dependency(Some("other_failed"));
         let blocking_bindings = effect.blocking_bindings();
@@ -462,7 +499,7 @@ mod tests {
             .iter()
             .map(|r| {
                 r.binding.clone().unwrap_or_else(|| {
-                    format!("{}:{}", r.id.resource_type, r.id.identity_or_empty())
+                    format!("{}:{}", r.id.resource_type, r.id.identity_display())
                 })
             })
             .collect();
@@ -546,7 +583,7 @@ mod tests {
             .iter()
             .map(|r| {
                 r.binding.clone().unwrap_or_else(|| {
-                    format!("{}:{}", r.id.resource_type, r.id.identity_or_empty())
+                    format!("{}:{}", r.id.resource_type, r.id.identity_display())
                 })
             })
             .collect();

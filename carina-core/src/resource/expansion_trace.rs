@@ -89,7 +89,7 @@ impl CallSite {
 
     /// The call site's binding name (instance prefix), e.g. `cluster`.
     pub fn binding(&self) -> &str {
-        self.id.inner().identity_or_empty()
+        self.id.inner().identity_str()
     }
 }
 
@@ -170,7 +170,7 @@ impl ExpansionTrace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::ResourceId;
+    use crate::resource::{ResolvedResourceId, ResourceId};
 
     fn pid(name: &str) -> PersistentId {
         PersistentId::new(ResourceId::with_identity("aws.s3.Bucket", name))
@@ -178,7 +178,9 @@ mod tests {
 
     fn site(name: &str, source_path: &str) -> CallSite {
         CallSite::new(
-            EphemeralId::new(ResourceId::with_identity("_virtual", name)),
+            EphemeralId::new(ResolvedResourceId::new(ResourceId::with_identity(
+                "_virtual", name,
+            ))),
             source_path,
         )
     }
@@ -221,8 +223,9 @@ mod tests {
         // The renderer drops the parenthesized `(<path>)` suffix in
         // that case — `None` is syntactically distinct from a real
         // user-supplied empty path.
-        let s =
-            CallSite::without_source(EphemeralId::new(ResourceId::with_identity("_virtual", "r")));
+        let s = CallSite::without_source(EphemeralId::new(ResolvedResourceId::new(
+            ResourceId::with_identity("_virtual", "r"),
+        )));
         assert_eq!(s.binding(), "r");
         assert_eq!(s.source_path, None);
     }
@@ -257,7 +260,7 @@ mod tests {
         // shows up exactly once.
         let mut names: Vec<&str> = t
             .iter()
-            .map(|(p, _)| p.inner().identity_or_empty())
+            .map(|(p, _)| p.inner().identity_str().expect("resolved test leaf"))
             .collect();
         names.sort();
         assert_eq!(names, vec!["a_leaf", "b_leaf"]);

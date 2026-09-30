@@ -19,7 +19,7 @@ use tokio::time::Instant;
 use crate::executor::scheduler::FailureView;
 use crate::executor::{ExecutionEvent, ExecutionObserver};
 use crate::provider::{Provider, ProviderError, ReadRequest};
-use crate::resource::{ResourceId, State, Value};
+use crate::resource::{ResolvedResourceId, ResourceId, State, Value};
 use crate::shutdown::{CleanupAwareLoop, CleanupInterrupted, LoopStep};
 use crate::value::format_value_user_facing;
 use crate::wait::WaitObservation;
@@ -370,7 +370,7 @@ impl<'a, 'fut, R> NextReady<'a, 'fut, R> {
 pub async fn execute_wait_effect(
     cleanup_loop: &CleanupAwareLoop<'_>,
     provider: &dyn Provider,
-    target_id: &ResourceId,
+    target_id: &ResolvedResourceId,
     identifier_resolver: &WaitIdentifierResolver<'_>,
     until: &WaitPredicate,
     timeout: Duration,
@@ -381,7 +381,7 @@ pub async fn execute_wait_effect(
     execute_wait_effect_with_heartbeat_cadence(
         cleanup_loop,
         provider,
-        target_id.identity_or_empty(),
+        target_id.identity_str(),
         target_id,
         identifier_resolver,
         until,
@@ -697,7 +697,8 @@ mod tests {
         tokio::time::timeout(CLEANUP_TEST_BOUND, async {
             let provider = ReadSequenceProvider::pending();
             let pred = equals_status("ISSUED");
-            let target = ResourceId::with_identity("acm.Certificate", "cert");
+            let target =
+                ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
             let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
             let observer = NoopWaitObserver;
             let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
@@ -752,7 +753,8 @@ mod tests {
         tokio::time::timeout(CLEANUP_TEST_BOUND, async {
             let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING")]);
             let pred = equals_status("ISSUED");
-            let target = ResourceId::with_identity("acm.Certificate", "cert");
+            let target =
+                ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
             let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
             let observer = NoopWaitObserver;
             let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
@@ -822,7 +824,8 @@ mod tests {
                 .expect("failed to build wait-test runtime");
             let result = runtime.block_on(async move {
                 let pred = equals_status("ISSUED");
-                let target = ResourceId::with_identity("acm.Certificate", "cert");
+                let target =
+                    ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
                 let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
                 let observer = NoopWaitObserver;
                 let cleanup_loop = shutdown.cleanup_aware_loop();
@@ -867,7 +870,8 @@ mod tests {
         tokio::time::timeout(CLEANUP_TEST_BOUND, async {
             let provider = ReadSequenceProvider::new(vec![state_with_status("ISSUED")]);
             let pred = equals_status("ISSUED");
-            let target = ResourceId::with_identity("acm.Certificate", "cert");
+            let target =
+                ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
             let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
             let observer = NoopWaitObserver;
             let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
@@ -910,7 +914,7 @@ mod tests {
     async fn wait_returns_immediately_when_until_already_true() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("ISSUED")]);
         let pred = equals_status("ISSUED");
-        let target = ResourceId::with_identity("acm.Certificate", "cert");
+        let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -947,7 +951,7 @@ mod tests {
             state_with_status("ISSUED"),
         ]);
         let pred = equals_status("ISSUED");
-        let target = ResourceId::with_identity("acm.Certificate", "cert");
+        let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -975,7 +979,7 @@ mod tests {
     async fn wait_returns_timeout_when_predicate_stays_false() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let pred = equals_status("ISSUED");
-        let target = ResourceId::with_identity("acm.Certificate", "cert");
+        let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -1013,7 +1017,7 @@ mod tests {
 
     #[test]
     fn wait_timeout_failure_message_uses_display_formatting_for_last_attrs() {
-        let target = ResourceId::with_identity("acm.Certificate", "cert");
+        let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
         let outcome = WaitOutcome::Timeout {
             last_attrs: HashMap::from([
                 (
@@ -1041,7 +1045,7 @@ mod tests {
 
     #[test]
     fn wait_timeout_failure_message_handles_empty_last_attrs() {
-        let target = ResourceId::with_identity("acm.Certificate", "cert");
+        let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
         let outcome = WaitOutcome::Timeout {
             last_attrs: HashMap::new(),
             elapsed: Duration::from_secs(1),
@@ -1054,7 +1058,7 @@ mod tests {
 
     #[test]
     fn wait_timeout_failure_message_handles_unknown_and_deferred_attrs() {
-        let target = ResourceId::with_identity("acm.Certificate", "cert");
+        let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
         let outcome = WaitOutcome::Timeout {
             last_attrs: HashMap::from([
                 (
@@ -1089,7 +1093,7 @@ mod tests {
             State::not_found(ResourceId::with_identity("acm.Certificate", "cert")),
         ]);
         let pred = equals_status("ISSUED");
-        let target = ResourceId::with_identity("acm.Certificate", "cert");
+        let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let shutdown = crate::shutdown::ShutdownToken::running();
@@ -1116,7 +1120,7 @@ mod tests {
     async fn wait_returns_unsatisfiable_when_cancelled() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let pred = equals_status("ISSUED");
-        let target = ResourceId::with_identity("acm.Certificate", "cert");
+        let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
         let (cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = NoopWaitObserver;
         let reads_seen = AtomicUsize::new(0);
@@ -1165,7 +1169,7 @@ mod tests {
     async fn wait_emits_exact_heartbeat_count_for_cadence() {
         let provider = ReadSequenceProvider::new(vec![state_with_status("PENDING_VALIDATION")]);
         let pred = equals_status("ISSUED");
-        let target = ResourceId::with_identity("acm.Certificate", "cert");
+        let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
         let (_cancel_tx, cancel_rx) = watch::channel(WaitSignal::Continue);
         let observer = HeartbeatObserver::new();
         let shutdown = crate::shutdown::ShutdownToken::running();

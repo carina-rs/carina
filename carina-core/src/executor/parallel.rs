@@ -960,10 +960,10 @@ mod tests {
             self.create_log
                 .lock()
                 .unwrap()
-                .push(id.identity_or_empty().to_string());
+                .push(id.identity_str().expect("resolved identity").to_string());
             let id = id.clone();
             Box::pin(async move {
-                if id.identity_or_empty() == "alb" {
+                if id.identity_str().expect("resolved identity") == "alb" {
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                     Err(ProviderError::api_error("alb create failed"))
                 } else {
@@ -1438,7 +1438,9 @@ mod tests {
             ),
         );
         let virt = Composition {
-            id: ResourceId::with_provider_identity("_virtual", "_virtual", "module", None),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+                "_virtual", "_virtual", "module", None,
+            )),
             signature: crate::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: virt_attrs,
@@ -1533,7 +1535,12 @@ mod tests {
             ),
         );
         let virt = Composition {
-            id: ResourceId::with_provider_identity("_virtual", "_virtual", "bootstrap", None),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+                "_virtual",
+                "_virtual",
+                "bootstrap",
+                None,
+            )),
             signature: crate::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: virt_attrs,

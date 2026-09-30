@@ -1122,20 +1122,13 @@ async fn run_apply_with_observer_factory(
                         .ok_or("Backend does not specify a resource type")?;
                     let bucket_resource_name = parsed
                         .find_resource_by_attr(backend_resource_type, "bucket", &bucket_name)
-                        .map(|r| r.id.identity_or_empty().to_string())
+                        .and_then(|r| r.id.identity_str().map(str::to_string))
                         .ok_or_else(|| {
                             format!(
                                 "Auto-injected state bucket resource '{}' not found after re-parse",
                                 bucket_name
                             )
                         })?;
-                    if bucket_resource_name.is_empty() {
-                        return Err(AppError::Config(format!(
-                            "Auto-injected state bucket resource '{}' has no resolved name; \
-                             anonymous identifier computation may have silently skipped it",
-                            bucket_name
-                        )));
-                    }
                     let initial_state = StateFile::with_managed_state_bucket(
                         backend_provider_name,
                         backend_resource_type,
@@ -1368,11 +1361,8 @@ async fn run_apply_locked(
             sorted_resources
                 .iter()
                 .filter_map(|r| {
-                    let rs = sf.find_resource(
-                        &r.id.provider,
-                        &r.id.resource_type,
-                        r.id.identity_or_empty(),
-                    )?;
+                    let identity = r.id.identity_str()?;
+                    let rs = sf.find_resource(&r.id.provider, &r.id.resource_type, identity)?;
                     if rs.dependency_bindings.is_empty() {
                         None
                     } else {
@@ -2134,6 +2124,9 @@ async fn run_apply_from_plan_with_observer_factory(
         plan_file: plan_path,
         source_dir: &source_path,
     };
+    plan_file
+        .validate_resource_identities()
+        .map_err(AppError::Config)?;
     plan_file
         .validate_replace_display()
         .map_err(AppError::Config)?;

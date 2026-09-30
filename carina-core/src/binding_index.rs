@@ -1483,7 +1483,9 @@ mod tests {
 
     fn composition(binding: &str) -> Composition {
         Composition {
-            id: ResourceId::with_identity("_virtual", binding),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "_virtual", binding,
+            )),
             signature: Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: indexmap::indexmap! {
@@ -2068,7 +2070,9 @@ let vpc = aws.ec2.Vpc {
     #[test]
     fn ref_type_forwarded_composition_cycle_is_unchecked() {
         let make_forwarder = |binding: &str, target: &str| Composition {
-            id: ResourceId::with_identity("_virtual", binding),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "_virtual", binding,
+            )),
             signature: Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: indexmap::indexmap! {

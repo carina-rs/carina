@@ -7,7 +7,7 @@ use crate::differ::{
     AttrComparison, TypedAttr, key_should_enter_patch, secret_grafted_comparison_view,
 };
 use crate::provider::{ProviderReadyResource, UpdatePatch, build_update_patch};
-use crate::resource::{DataSource, Resource, ResourceId, State, Value};
+use crate::resource::{DataSource, ResolvedResourceId, Resource, State, Value};
 use crate::schema::SchemaRegistry;
 use crate::value::SecretHashContext;
 
@@ -23,7 +23,7 @@ pub fn compute_full_diff_patch(
     to: &ProviderReadyResource,
     to_source: &Resource,
     schemas: &SchemaRegistry,
-    resource_id: &ResourceId,
+    resource_id: &ResolvedResourceId,
 ) -> UpdatePatch {
     use std::collections::HashSet;
 
@@ -47,7 +47,7 @@ pub fn compute_full_diff_patch(
                 });
                 let secret_ctx = Some(SecretHashContext::new(
                     resource_id.display_type(),
-                    resource_id.identity_or_empty(),
+                    resource_id.identity_str(),
                     key,
                 ));
                 let comparison_value =

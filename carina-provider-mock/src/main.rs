@@ -19,6 +19,17 @@ impl MockProcessProvider {
     fn resource_key(id: &ResourceId) -> String {
         format!("{}.{}", id.resource_type, id.identity)
     }
+
+    fn resource_id_wire_key(id: &ResourceId) -> String {
+        match (id.provider.is_empty(), id.identity.is_empty()) {
+            (true, true) => id.resource_type.clone(),
+            (true, false) => format!("{}.{}", id.resource_type, id.identity),
+            (false, true) => format!("{}.{}", id.provider, id.resource_type),
+            (false, false) => {
+                format!("{}.{}.{}", id.provider, id.resource_type, id.identity)
+            }
+        }
+    }
 }
 
 impl CarinaProvider for MockProcessProvider {
@@ -172,6 +183,43 @@ impl CarinaProvider for MockProcessProvider {
         _op: carina_plugin_sdk::PlanOp,
     ) -> Vec<String> {
         Vec::new()
+    }
+
+    fn normalize_state(&self, states: HashMap<String, State>) -> HashMap<String, State> {
+        states
+            .into_values()
+            .map(|mut state| {
+                if let Some(marker) = state.attributes.get("__mock_normalize_state__").cloned() {
+                    state
+                        .attributes
+                        .insert("__mock_normalized_state__".to_string(), marker);
+                }
+                let key = Self::resource_id_wire_key(&state.id);
+                (key, state)
+            })
+            .collect()
+    }
+
+    fn hydrate_read_state(
+        &self,
+        states: &mut HashMap<String, State>,
+        saved_attrs: &HashMap<String, HashMap<String, Value>>,
+    ) {
+        *states = std::mem::take(states)
+            .into_iter()
+            .map(|(input_key, mut state)| {
+                if let Some(marker) = saved_attrs
+                    .get(&input_key)
+                    .and_then(|attrs| attrs.get("__mock_hydrate_read_state__"))
+                    .cloned()
+                {
+                    state
+                        .attributes
+                        .insert("__mock_hydrated_read_state__".to_string(), marker);
+                }
+                (Self::resource_id_wire_key(&state.id), state)
+            })
+            .collect();
     }
 
     /// Echo the host-provided `default_tags` back into each resource's

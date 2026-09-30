@@ -59,7 +59,10 @@ fn make_virtual(binding: &str, attrs: &[(&str, Value)]) -> Composition {
         );
     }
     Composition {
-        id: ResourceId::with_identity("_virtual.module", binding),
+        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "_virtual.module",
+            binding,
+        )),
         signature: Signature {
             arguments: IndexMap::new(),
             attributes,
@@ -320,7 +323,7 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
             m.attributes,
             l.attributes,
             "managed/legacy attribute divergence for {}",
-            m.id.identity_or_empty(),
+            m.id.identity_str().expect("resolved identity"),
         );
         // `dependency_bindings` is the second mutation the legacy
         // pipeline performs; the bridge's writeback contract names
@@ -329,7 +332,7 @@ fn resolve_managed_refs_legacy_shim_produces_identical_result() {
             m.dependency_bindings,
             l.dependency_bindings,
             "managed/legacy dependency_bindings divergence for {}",
-            m.id.identity_or_empty(),
+            m.id.identity_str().expect("resolved identity"),
         );
     }
 }

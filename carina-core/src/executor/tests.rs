@@ -821,7 +821,7 @@ impl DelayedCountingProvider {
 
     fn delay_for(&self, id: &ResourceId) -> std::time::Duration {
         self.delays
-            .get(id.identity_or_empty())
+            .get(id.identity_str().expect("resolved identity"))
             .copied()
             .unwrap_or(self.default_delay)
     }
@@ -860,7 +860,7 @@ impl Provider for DelayedCountingProvider {
             started
                 .lock()
                 .unwrap()
-                .push(id.identity_or_empty().to_string());
+                .push(id.identity_str().expect("resolved identity").to_string());
             tokio::time::sleep(delay).await;
             Ok(crate::provider::CreateOutcome::Success {
                 state: ok_state(&id),
@@ -877,10 +877,10 @@ impl Provider for DelayedCountingProvider {
         let id = id.clone();
         let started = self.started.clone();
         Box::pin(async move {
-            started
-                .lock()
-                .unwrap()
-                .push(format!("update:{}", id.identity_or_empty()));
+            started.lock().unwrap().push(format!(
+                "update:{}",
+                id.identity_str().expect("resolved identity")
+            ));
             let mut attrs = HashMap::new();
             attrs.insert(
                 "finalized".to_string(),
@@ -901,10 +901,10 @@ impl Provider for DelayedCountingProvider {
         let id = id.clone();
         let started = self.started.clone();
         Box::pin(async move {
-            started
-                .lock()
-                .unwrap()
-                .push(format!("delete:{}", id.identity_or_empty()));
+            started.lock().unwrap().push(format!(
+                "delete:{}",
+                id.identity_str().expect("resolved identity")
+            ));
             Ok(())
         })
     }
@@ -1142,7 +1142,11 @@ impl ExecutionObserver for RecordingCancelsWhenWaitStarted {
 impl ExecutionObserver for CancelsWhenStarted {
     fn on_event(&self, event: &ExecutionEvent) {
         if let ExecutionEvent::EffectStarted { effect } = event
-            && effect.resource_id().identity_or_empty() == self.name
+            && effect
+                .resource_id()
+                .identity_str()
+                .expect("resolved identity")
+                == self.name
         {
             if self.cleanup_priority {
                 self.trigger.prioritize_cleanup();
@@ -2141,7 +2145,9 @@ fn pending_module_composition(
     use crate::resource::{Composition, CompositionArgument, Signature};
 
     Composition {
-        id: ResourceId::with_identity("_virtual", instance),
+        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "_virtual", instance,
+        )),
         signature: Signature {
             arguments: arguments
                 .into_iter()
@@ -4427,7 +4433,7 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
 
     let secret_ctx = crate::value::SecretHashContext::new(
         rid.display_type(),
-        rid.identity_or_empty(),
+        rid.identity_str().expect("resolved identity"),
         "master_password",
     );
     let hash_json = crate::value::value_to_json_with_context(&secret_value, Some(&secret_ctx))
@@ -4496,7 +4502,7 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
 
     let secret_ctx = crate::value::SecretHashContext::new(
         rid.display_type(),
-        rid.identity_or_empty(),
+        rid.identity_str().expect("resolved identity"),
         "master_password",
     );
     let hash_json = crate::value::value_to_json_with_context(&secret_value, Some(&secret_ctx))
@@ -5227,7 +5233,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
             _request: CreateRequest,
         ) -> BoxFuture<'_, ProviderResult<crate::provider::CreateOutcome>> {
             let id_clone = id.clone();
-            let name = id.identity_or_empty().to_string();
+            let name = id.identity_str().expect("resolved identity").to_string();
             let delay = self.delays.get(&name).copied().unwrap_or(Duration::ZERO);
             let log = self.call_log.clone();
             Box::pin(async move {
@@ -5412,7 +5418,7 @@ impl Provider for YieldingUpdateProvider {
                 "tags".to_string(),
                 Value::Concrete(ConcreteValue::String("new".to_string())),
             );
-            if change_unrelated_id && id.identity_or_empty() == "vpc" {
+            if change_unrelated_id && id.identity_str().expect("resolved identity") == "vpc" {
                 attrs.insert(
                     "id".to_string(),
                     Value::Concrete(ConcreteValue::String("provider-violated-id".to_string())),
@@ -7716,9 +7722,9 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
     impl crate::provider::ProviderNormalizer for LockOrderNormalizer {
         fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
             Box::pin(async move {
-                let is_alb = resources
-                    .iter()
-                    .any(|resource| resource.id.identity_or_empty() == "alb");
+                let is_alb = resources.iter().any(|resource| {
+                    resource.id.identity_str().expect("resolved identity") == "alb"
+                });
                 {
                     let _aws = self.scenario.aws_normalize.lock().await;
                     tokio::task::yield_now().await;
@@ -7768,7 +7774,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             id: &ResourceId,
         ) -> ProviderResult<crate::provider::CreateOutcome> {
             self.scenario.record(format!("create:{id}"));
-            if id.identity_or_empty() == "cert" {
+            if id.identity_str().expect("resolved identity") == "cert" {
                 let _provider_lock = self.scenario.awscc_shared.lock().await;
                 self.scenario.alb_waiting_for_awscc.notified().await;
                 return Ok(crate::provider::CreateOutcome::Success {
@@ -7776,7 +7782,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
                 });
             }
 
-            if id.identity_or_empty() == "alb" {
+            if id.identity_str().expect("resolved identity") == "alb" {
                 let _provider_lock = self.scenario.awscc_shared.lock().await;
                 return Ok(crate::provider::CreateOutcome::Success {
                     state: State::existing(id.clone(), HashMap::new()).with_identifier("alb-id"),
@@ -7784,8 +7790,10 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             }
 
             Ok(crate::provider::CreateOutcome::Success {
-                state: State::existing(id.clone(), HashMap::new())
-                    .with_identifier(format!("{}-id", id.identity_or_empty())),
+                state: State::existing(id.clone(), HashMap::new()).with_identifier(format!(
+                    "{}-id",
+                    id.identity_str().expect("resolved identity")
+                )),
             })
         }
 

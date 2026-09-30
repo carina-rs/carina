@@ -415,7 +415,10 @@ fn build_resource(id: &ResourceId, attrs: &[(&str, Value)]) -> Resource {
     // touch the private `id` field, but immediately overwrite the
     // synthesized id with the one our test owns (same shape, plus an
     // explicit provider).
-    let mut r = Resource::new(id.resource_type.clone(), id.identity_or_empty().to_string());
+    let mut r = Resource::new(
+        id.resource_type.clone(),
+        id.identity_str().expect("resolved identity").to_string(),
+    );
     r.id = id.clone();
     for (k, v) in attrs {
         r = r.with_attribute(k.to_string(), v.clone());

@@ -1694,7 +1694,7 @@ fn assert_claimed_association_stays_orphaned_after_reconcile() {
         .expect("test state identities must remain unique");
 
     assert_eq!(
-        resources[0].id.identity_or_empty(),
+        resources[0].id.identity_str().expect("resolved identity"),
         desired_name,
         "claimed state entry must not be rebound to the desired resource"
     );
@@ -1778,7 +1778,7 @@ fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_s
 
     let names: Vec<_> = resources
         .iter()
-        .map(|resource| resource.id.identity_or_empty())
+        .map(|resource| resource.id.identity_str().expect("resolved identity"))
         .collect();
     assert_eq!(
         names,
@@ -1840,7 +1840,7 @@ fn test_stale_moved_block_releases_claims() {
         .expect("test state identities must remain unique");
 
     assert_eq!(
-        resources[0].id.identity_or_empty(),
+        resources[0].id.identity_str().expect("resolved identity"),
         "ec2_subnet_route_table_association_11111111",
         "stale moved block must release claims so meaning-based matching can preserve the no-op"
     );
@@ -1904,7 +1904,11 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
     assert_eq!(
         resources
             .iter()
-            .map(|resource| resource.id.identity_or_empty().to_string())
+            .map(|resource| resource
+                .id
+                .identity_str()
+                .expect("resolved identity")
+                .to_string())
             .collect::<Vec<_>>(),
         desired_names,
         "heuristics must not re-key desired resources whose names are moved.to claims"
@@ -1919,8 +1923,14 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
     );
     assert_eq!(moved_pairs.len(), 5);
     for (idx, (from, to)) in moved_pairs.iter().enumerate() {
-        assert_eq!(from.identity_or_empty(), old_names[idx]);
-        assert_eq!(to.identity_or_empty(), desired_names[idx]);
+        assert_eq!(
+            from.identity_str().expect("resolved identity"),
+            old_names[idx]
+        );
+        assert_eq!(
+            to.identity_str().expect("resolved identity"),
+            desired_names[idx]
+        );
     }
     for name in old_names {
         let id = ResourceId::with_provider_identity(
@@ -1970,7 +1980,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
 
     fn concrete_subnet_identity(ctx: &WiringContext, providers: &[ProviderConfig]) -> String {
         let mut resources = vec![
-            Resource::with_provider("awscc", "ec2.Subnet", "", None)
+            Resource::pending_with_provider("awscc", "ec2.Subnet", None)
                 .with_attribute("vpc_id", string("vpc-old"))
                 .with_attribute("cidr_block", string("10.220.1.0/24"))
                 .with_attribute("availability_zone", string("ap-northeast-1c")),
@@ -1978,7 +1988,11 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         let canonical = canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
         let errors = compute_anonymous_identifiers_with_ctx(ctx, canonical, providers);
         assert!(errors.is_empty(), "state id setup failed: {errors:?}");
-        resources[0].id.identity_or_empty().to_string()
+        resources[0]
+            .id
+            .identity_str()
+            .expect("resolved identity")
+            .to_string()
     }
 
     let source = r#"
@@ -2967,7 +2981,7 @@ fn region_provider_config(raw_region: &str) -> ProviderConfig {
 }
 
 fn anonymous_route_resource() -> Resource {
-    let mut resource = Resource::with_provider("awscc", "ec2.Route", "", None);
+    let mut resource = Resource::pending_with_provider("awscc", "ec2.Route", None);
     resource.set_attr(
         "route_table_id".to_string(),
         Value::Concrete(ConcreteValue::String("rtb-123".to_string())),
@@ -2980,7 +2994,7 @@ fn fallback_anonymous_identity_is_stable_when_dependency_bindings_are_prefixed()
     fn module_resources(dependency: &str) -> Vec<Resource> {
         let target = Resource::with_provider("mock", "iam.Role", "registry_publish.target", None)
             .with_binding("registry_publish.target");
-        let mut resource = Resource::with_provider("mock", "iam.Role", "", None);
+        let mut resource = Resource::pending_with_provider("mock", "iam.Role", None);
         resource.module_source = Some(carina_core::resource::ModuleSource::Module {
             name: "registry".to_string(),
             instance: "registry_publish".to_string(),
@@ -3021,8 +3035,14 @@ fn compute_anonymous_identifiers_with_ctx_canonicalizes_provider_config_identity
     assert!(errors.is_empty(), "aws spelling errors: {errors:?}");
 
     assert_eq!(
-        resources_awscc[0].id.identity_or_empty(),
-        resources_aws[0].id.identity_or_empty(),
+        resources_awscc[0]
+            .id
+            .identity_str()
+            .expect("resolved identity"),
+        resources_aws[0]
+            .id
+            .identity_str()
+            .expect("resolved identity"),
         "provider config region spelling must canonicalize before anonymous hash"
     );
 }
@@ -3041,7 +3061,11 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
     let errors =
         compute_anonymous_identifiers_with_ctx(&ctx, canonical_anonymous, &providers_awscc);
     assert!(errors.is_empty(), "anonymous setup errors: {errors:?}");
-    let old_name = anonymous[0].id.identity_or_empty().to_string();
+    let old_name = anonymous[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
 
     let mut named = anonymous_route_resource();
     named.id = ResourceId::with_provider_identity("awscc", "ec2.Route", "route", None);
@@ -5704,7 +5728,9 @@ mod resolved_value_constraint_gate {
         constraint: PendingModuleConstraint,
     ) -> Composition {
         Composition {
-            id: ResourceId::with_identity("_virtual", "checked"),
+            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "_virtual", "checked",
+            )),
             signature: Signature {
                 arguments: arguments
                     .into_iter()

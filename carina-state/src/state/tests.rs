@@ -2,6 +2,10 @@ use super::*;
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap};
 
+fn resolved(resource: &carina_core::resource::Resource) -> carina_core::resource::ResolvedResource {
+    carina_core::resource::ResolvedResource::new(resource.clone())
+}
+
 fn list_rule(port: i64, description: Option<&str>) -> Value {
     let mut fields = IndexMap::from([(
         "port".to_string(),
@@ -68,6 +72,18 @@ fn test_state_file_upsert_resource() {
     assert_eq!(
         state.resources[0].attributes.get("region"),
         Some(&serde_json::json!("us-west-2"))
+    );
+}
+
+#[test]
+fn state_rejects_empty_resource_identity() {
+    let mut state = StateFile::new();
+    let error = state
+        .upsert_resource(ResourceState::new("ec2.Vpc", "", "aws"))
+        .expect_err("pending identities must never be persisted");
+
+    assert!(
+        matches!(error, BackendError::InvalidState(message) if message.contains("resource identity cannot be empty"))
     );
 }
 
@@ -789,7 +805,7 @@ fn test_from_provider_state() {
     let existing = ResourceState::new("s3.Bucket", "my-bucket", "awscc").with_protected(true);
 
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         Some(&existing),
         None,
@@ -827,7 +843,7 @@ fn test_from_provider_state_without_existing() {
     };
 
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         None,
         None,
@@ -886,7 +902,7 @@ fn from_provider_state_aligns_reordered_nested_and_provider_added_list_elements(
     .with_identifier("listener-id");
 
     let row = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         None,
         None,
@@ -967,7 +983,7 @@ fn test_from_provider_state_repairs_unrecorded_from_state_attrs() {
     existing.explicit = ExplicitFields::Unrecorded;
 
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         Some(&existing),
         None,
@@ -1016,7 +1032,7 @@ fn test_from_provider_state_emits_unrecorded_for_fresh_empty_body_resource() {
     };
 
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         None,
         None,
@@ -1067,7 +1083,7 @@ fn test_from_provider_state_preserves_populated_struct_when_resource_attrs_empty
     existing.explicit = populated.clone();
 
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         Some(&existing),
         None,
@@ -1102,7 +1118,7 @@ fn test_from_provider_state_demotes_top_level_list_elements_when_resource_attrs_
     existing.explicit = populated.clone();
 
     let row = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         Some(&existing),
         None,
@@ -1156,7 +1172,7 @@ fn bodyless_refresh_demotes_reordered_list_elements_and_merge_stays_conservative
     };
 
     let row = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &reordered_provider,
         Some(&existing),
         None,
@@ -1217,7 +1233,7 @@ fn test_from_provider_state_no_repair_when_state_attrs_also_empty() {
     existing.explicit = ExplicitFields::Unrecorded;
 
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         Some(&existing),
         None,
@@ -1597,7 +1613,7 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
     };
 
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         None,
         None,
@@ -1856,10 +1872,32 @@ fn state_json_with_resources(version: u32, resources: Vec<serde_json::Value>) ->
 }
 
 fn invalid_state_message(result: Result<MigratedStateFile, BackendError>) -> String {
-    match result.expect_err("duplicate identity must be rejected") {
+    match result.expect_err("invalid state must be rejected") {
         BackendError::InvalidState(message) => message,
         other => panic!("expected InvalidState, got {other}"),
     }
+}
+
+#[test]
+fn check_and_migrate_rejects_empty_identity_with_actionable_row_context() {
+    let valid = persisted_resource("mock", "test.resource", "valid");
+    let mut invalid = persisted_resource("mock", "test.resource", "");
+    invalid["identifier"] = serde_json::json!("legacy-resource-123");
+    let json = state_json_with_resources(StateFile::CURRENT_VERSION, vec![valid, invalid]);
+
+    let message = invalid_state_message(check_and_migrate(&json));
+
+    assert_eq!(
+        message,
+        "Failed to parse state file: state resources[1] has an empty identity \
+         (provider=\"mock\", resource_type=\"test.resource\", \
+         identifier=\"legacy-resource-123\"). This row was written by an older Carina \
+         version and is rejected because empty identity rows can no longer be matched to a \
+         resource. Back up the state file, then remove this row from it. Run `carina plan`; the \
+         resource that owned the row appears as a create with the identity Carina now assigns to \
+         it. Put the row back with `identity` set to that value, keeping its `identifier` and \
+         attributes, or leave it removed if the resource is no longer managed."
+    );
 }
 
 #[test]
@@ -2245,7 +2283,7 @@ fn test_merge_write_only_attributes() {
     };
 
     let mut rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         None,
         None,
@@ -2297,7 +2335,7 @@ fn test_merge_write_only_attributes_not_in_desired() {
     };
 
     let mut rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         None,
         None,
@@ -2341,7 +2379,7 @@ fn test_merge_write_only_skips_if_already_in_provider_state() {
     };
 
     let mut rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         None,
         None,
@@ -2425,7 +2463,7 @@ fn test_from_provider_state_secret_stored_as_hash() {
     };
 
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         None,
         None,
@@ -2478,7 +2516,7 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
     };
 
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         Some(&existing),
         None,
@@ -2510,7 +2548,7 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
     )]);
 
     let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
@@ -2540,7 +2578,7 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
     let existing = HashMap::from([("password".to_string(), previous.clone())]);
 
     let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
@@ -2580,7 +2618,7 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
     };
 
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         Some(&existing),
         None,
@@ -2619,7 +2657,7 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
     };
 
     let mut rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         Some(&existing),
         None,
@@ -2661,7 +2699,7 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
     let existing = HashMap::from([("tags".to_string(), previous_tags.clone())]);
 
     let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
@@ -2684,7 +2722,7 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
 
     let second_existing = HashMap::from([("tags".to_string(), stored["tags"].clone())]);
     let stored_again = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&second_existing),
@@ -2710,7 +2748,7 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
     let existing = HashMap::from([("tags".to_string(), previous_tags)]);
 
     let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
@@ -2773,7 +2811,7 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
     let existing = HashMap::from([("items".to_string(), previous_items)]);
 
     let stored = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         None,
         &attrs,
         PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing),
@@ -2840,7 +2878,7 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
     };
 
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         None,
         None,
@@ -2919,7 +2957,7 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
     };
 
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         None,
         None,
@@ -2986,7 +3024,7 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
     };
 
     let rs = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         None,
         None,
@@ -3131,7 +3169,7 @@ fn from_provider_state_rejects_resource_ref_in_provider_attributes() {
     };
 
     let err = ResourceState::from_provider_state_for_resource_and_schema(
-        &resource,
+        &resolved(&resource),
         &provider_state,
         None,
         None,
@@ -3338,7 +3376,7 @@ fn v9_legacy_list_survives_v10_lift_stays_conservative_and_self_heals_on_writeba
     ));
 
     let rewritten = ResourceState::from_provider_state_for_resource_and_schema(
-        &desired,
+        &resolved(&desired),
         &current,
         Some(row),
         None,
@@ -3379,7 +3417,7 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
     )
     .with_identifier("listener-id");
     let first_row = ResourceState::from_provider_state_for_resource_and_schema(
-        &authored,
+        &resolved(&authored),
         &first_provider,
         None,
         None,
@@ -3481,7 +3519,7 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
     )
     .with_identifier("listener-id");
     let second_row = ResourceState::from_provider_state_for_resource_and_schema(
-        &authored,
+        &resolved(&authored),
         &reordered_provider,
         Some(&first_row),
         None,

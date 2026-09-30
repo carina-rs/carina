@@ -31,7 +31,10 @@ fn resolved(resource: Resource) -> ResolvedResource {
 fn saved_module_composition(argument: Value, rejected: &str) -> Composition {
     let argument_name = "value";
     Composition {
-        id: ResourceId::with_identity("_virtual", "root.checked"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "_virtual",
+            "root.checked",
+        )),
         signature: Signature {
             arguments: indexmap::IndexMap::from([(
                 argument_name.to_string(),
@@ -147,7 +150,7 @@ impl Provider for FailBCreateProvider {
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
         let id = id.clone();
         Box::pin(async move {
-            if id.identity_or_empty() == "b" {
+            if id.identity_str().expect("resolved identity") == "b" {
                 return Err(ProviderError::api_error("create failed").for_resource(id));
             }
             let resource = request.resource().as_resource().clone();
@@ -537,7 +540,7 @@ let vpc = awscc.ec2.Vpc {{
 
 fn concrete_subnet_identity(ctx: &WiringContext, providers: &[ProviderConfig]) -> String {
     let mut resources = vec![
-        Resource::with_provider("awscc", "ec2.Subnet", "", None)
+        Resource::pending_with_provider("awscc", "ec2.Subnet", None)
             .with_attribute("vpc_id", string_value("vpc-old"))
             .with_attribute("cidr_block", string_value("10.220.1.0/24"))
             .with_attribute("availability_zone", string_value("ap-northeast-1c")),
@@ -546,7 +549,11 @@ fn concrete_subnet_identity(ctx: &WiringContext, providers: &[ProviderConfig]) -
         carina_core::value::canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
     let errors = crate::wiring::compute_anonymous_identifiers_with_ctx(ctx, canonical, providers);
     assert!(errors.is_empty(), "state id setup failed: {errors:?}");
-    resources[0].id.identity_or_empty().to_string()
+    resources[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string()
 }
 
 fn seed_apply_cascade_state(
@@ -727,7 +734,7 @@ impl Provider for ApplyTimeReadProvider {
         let shared = self.shared.clone();
         Box::pin(async move {
             let roles = shared.created_roles.lock().unwrap();
-            if let Some(attrs) = roles.get(id.identity_or_empty()) {
+            if let Some(attrs) = roles.get(id.identity_str().expect("resolved identity")) {
                 Ok(State::existing(id, attrs.clone()).with_identifier("mock-id"))
             } else {
                 Ok(State::not_found(id))
@@ -743,11 +750,10 @@ impl Provider for ApplyTimeReadProvider {
         let shared = self.shared.clone();
         Box::pin(async move {
             shared.read_calls.fetch_add(1, Ordering::SeqCst);
-            shared
-                .operations
-                .lock()
-                .unwrap()
-                .push(format!("read:{}", resource.id.identity_or_empty()));
+            shared.operations.lock().unwrap().push(format!(
+                "read:{}",
+                resource.id.identity_str().expect("resolved identity")
+            ));
 
             let expected = resource
                 .attributes
@@ -794,19 +800,17 @@ impl Provider for ApplyTimeReadProvider {
                     .entry("max_session_duration".to_string())
                     .or_insert_with(|| Value::Concrete(ConcreteValue::Int(3600)));
             }
-            if id.identity_or_empty() == "consumer" {
+            if id.identity_str().expect("resolved identity") == "consumer" {
                 *shared.consumer_description.lock().unwrap() = attrs.get("description").cloned();
             }
-            shared
-                .created_roles
-                .lock()
-                .unwrap()
-                .insert(id.identity_or_empty().to_string(), attrs.clone());
-            shared
-                .operations
-                .lock()
-                .unwrap()
-                .push(format!("create:{}", id.identity_or_empty()));
+            shared.created_roles.lock().unwrap().insert(
+                id.identity_str().expect("resolved identity").to_string(),
+                attrs.clone(),
+            );
+            shared.operations.lock().unwrap().push(format!(
+                "create:{}",
+                id.identity_str().expect("resolved identity")
+            ));
 
             Ok(carina_core::provider::CreateOutcome::Success {
                 state: State::existing(id, attrs).with_identifier("mock-id"),
@@ -1005,7 +1009,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         plan_ctx
             .data_sources
             .iter()
-            .map(|data_source| data_source.id.identity_or_empty())
+            .map(|data_source| data_source.id.identity_str().expect("resolved identity"))
             .collect::<Vec<_>>(),
         ["registry_publish.caller"],
         "the expanded module data source must be in the planning set"
@@ -1016,7 +1020,8 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         .iter()
         .find_map(|effect| match effect {
             Effect::Create(resource)
-                if resource.id.identity_or_empty() == "registry_publish.consumer" =>
+                if resource.id.identity_str().expect("resolved identity")
+                    == "registry_publish.consumer" =>
             {
                 Some(resource)
             }
@@ -3894,7 +3899,9 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
         ),
     );
     let composition = Composition {
-        id: carina_core::resource::ResourceId::with_identity("_virtual", "github_actions_carina"),
+        id: carina_core::resource::ResolvedResourceId::new(
+            carina_core::resource::ResourceId::with_identity("_virtual", "github_actions_carina"),
+        ),
         signature: carina_core::resource::Signature {
             arguments: indexmap::IndexMap::new(),
             attributes: virt_attrs,
@@ -4000,7 +4007,9 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
             ),
         );
         Composition {
-            id: carina_core::resource::ResourceId::with_identity("_virtual", id_name),
+            id: carina_core::resource::ResolvedResourceId::new(
+                carina_core::resource::ResourceId::with_identity("_virtual", id_name),
+            ),
             signature: carina_core::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes,
@@ -4182,7 +4191,10 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         ),
     );
     let composition = Composition {
-        id: ResourceId::with_identity("_virtual", "carina_module"),
+        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "_virtual",
+            "carina_module",
+        )),
         signature: carina_core::resource::Signature {
             arguments: indexmap::IndexMap::new(),
             attributes: virt_attrs,

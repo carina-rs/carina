@@ -254,7 +254,7 @@ pub fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                     // uses only the target edge because it visualizes the
                     // structural "wait gates this resource" relationship.
                     let mut deps = HashSet::new();
-                    deps.insert(target_id.identity_or_empty().to_string());
+                    deps.insert(target_id.identity_str().to_string());
                     let binding = identity.to_string();
                     binding_to_effect.insert(binding.clone(), idx);
                     effect_bindings.insert(idx, binding.clone());

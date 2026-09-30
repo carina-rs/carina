@@ -45,7 +45,10 @@ fn make_virtual(binding: &str, attrs: &[(&str, Value)]) -> Composition {
         );
     }
     Composition {
-        id: ResourceId::with_identity("_virtual.module", binding),
+        id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+            "_virtual.module",
+            binding,
+        )),
         signature: Signature {
             arguments: IndexMap::new(),
             attributes,

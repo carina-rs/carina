@@ -1,0 +1,9 @@
+backend local { path = "carina.state.json" }
+
+mock.test.resource {
+  name = "alpha"
+}
+
+mock.test.resource {
+  name = "beta"
+}

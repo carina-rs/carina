@@ -7,7 +7,8 @@ use carina_core::override_aware::NameOverrideSource;
 use carina_core::provider::RawSavedAttrs;
 pub use carina_core::resource::DeposedKey;
 use carina_core::resource::{
-    ConcreteValue, DeferredValue, Directives, PartialReadMarker, Resource, ResourceId, State, Value,
+    ConcreteValue, DeferredValue, Directives, PartialReadMarker, ResolvedResource, Resource,
+    ResourceId, State, Value,
 };
 use carina_core::schema::ResourceSchema;
 use carina_core::value::{
@@ -214,6 +215,12 @@ impl StateFile {
     /// any entry matching the current identifier is removed so the live current
     /// instance cannot also be scheduled as deposed.
     pub fn upsert_resource(&mut self, mut resource: ResourceState) -> Result<(), BackendError> {
+        if resource.identity.is_empty() {
+            return Err(BackendError::InvalidState(format!(
+                "resource identity cannot be empty (provider={:?}, resource_type={:?})",
+                resource.provider, resource.resource_type
+            )));
+        }
         validate_deposed_identities(&resource).map_err(BackendError::InvalidState)?;
         if let Some(pos) = self.resources.iter().position(|existing| {
             existing.provider == resource.provider
@@ -337,11 +344,10 @@ impl StateFile {
 
     /// Get the identifier for a resource from state.
     pub fn get_identifier_for_resource(&self, resource: &Resource) -> Option<String> {
-        if let Some(resource_state) = self.find_resource(
-            &resource.id.provider,
-            &resource.id.resource_type,
-            resource.id.identity_or_empty(),
-        ) {
+        let identity = resource.id.identity_str()?;
+        if let Some(resource_state) =
+            self.find_resource(&resource.id.provider, &resource.id.resource_type, identity)
+        {
             return resource_state.identifier.clone();
         }
         None
@@ -358,7 +364,7 @@ impl StateFile {
     }
 
     fn id_for_resource_state(rs: &ResourceState) -> ResourceId {
-        ResourceId::with_provider_name_compat(
+        ResourceId::with_provider_identity(
             &rs.provider,
             &rs.resource_type,
             &rs.identity,
@@ -388,8 +394,9 @@ impl StateFile {
                 current.partial_read = None;
                 continue;
             }
-            let marker = self
-                .find_resource(&id.provider, &id.resource_type, id.identity_or_empty())
+            let marker = id
+                .identity_str()
+                .and_then(|identity| self.find_resource(&id.provider, &id.resource_type, identity))
                 .and_then(|rs| rs.partial_read.clone());
             if let Some(mut marker) = marker {
                 marker
@@ -424,7 +431,9 @@ impl StateFile {
     /// state file. Takes a `&ResourceId` so it works for managed
     /// resources and data sources alike (carina#3181).
     pub fn build_state_for_resource(&self, id: &ResourceId) -> State {
-        let rs = self.find_resource(&id.provider, &id.resource_type, id.identity_or_empty());
+        let rs = id
+            .identity_str()
+            .and_then(|identity| self.find_resource(&id.provider, &id.resource_type, identity));
         if let Some(identifier) = rs.and_then(|r| r.identifier.as_deref()) {
             let attrs: HashMap<String, Value> = rs
                 .unwrap()
@@ -612,7 +621,25 @@ impl Default for StateFile {
 
 fn validate_resource_identities(resources: &[ResourceState]) -> Result<(), String> {
     let mut resource_identities = HashSet::new();
-    for resource in resources {
+    for (index, resource) in resources.iter().enumerate() {
+        if resource.identity.is_empty() {
+            let identifier = resource
+                .identifier
+                .as_ref()
+                .map(|identifier| format!(", identifier={identifier:?}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "state resources[{index}] has an empty identity \
+                 (provider={:?}, resource_type={:?}{identifier}). This row was written by an \
+                 older Carina version and is rejected because empty identity rows can no longer \
+                 be matched to a resource. Back up the state file, then remove this row from it. \
+                 Run `carina plan`; the resource that owned the row appears as a create with the \
+                 identity Carina now assigns to it. Put the row back with `identity` set to that \
+                 value, keeping its `identifier` and attributes, or leave it removed if the \
+                 resource is no longer managed.",
+                resource.provider, resource.resource_type,
+            ));
+        }
         if !resource_identities.insert((
             resource.provider.as_str(),
             resource.resource_type.as_str(),
@@ -1262,13 +1289,13 @@ impl ResourceState {
     /// write-only attributes. Such keys are dropped unless the desired value
     /// carries a `Secret(_)` wrapper that can be merged into a hash.
     pub fn attributes_to_state_json_lossy_for_resource_and_schema(
-        resource: &Resource,
+        resource: &ResolvedResource,
         schema: Option<&ResourceSchema>,
         attributes: &HashMap<String, Value>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
     ) -> HashMap<String, serde_json::Value> {
         let resource_display_type = resource.id.display_type();
-        let identity = resource.id.identity_or_empty();
+        let identity = resource.identity_str();
         let serialized =
             Self::attributes_to_state_json_lossy(&resource_display_type, identity, attributes);
         Self::protect_state_json_for_resource_and_schema(
@@ -1282,14 +1309,14 @@ impl ResourceState {
     /// Apply desired-resource and schema-derived secret protection to an
     /// already serialized state attribute map.
     pub fn protect_state_json_for_resource_and_schema(
-        resource: &Resource,
+        resource: &ResolvedResource,
         schema: Option<&ResourceSchema>,
         serialized: HashMap<String, serde_json::Value>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
     ) -> HashMap<String, serde_json::Value> {
         let mut serialized = serialized;
         let resource_display_type = resource.id.display_type();
-        let identity = resource.id.identity_or_empty();
+        let identity = resource.identity_str();
         let mut protected_secret_keys = std::collections::HashSet::new();
 
         for (key, desired_value) in &resource.attributes {
@@ -1394,20 +1421,20 @@ impl ResourceState {
     /// Returns an error if any provider attribute value cannot be converted to
     /// JSON, such as non-finite float values.
     pub fn from_provider_state_for_resource_and_schema(
-        resource: &Resource,
+        resource: &ResolvedResource,
         state: &State,
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
     ) -> Result<Self, String> {
         let mut rs = Self::new(
             &resource.id.resource_type,
-            resource.id.identity_or_empty(),
+            resource.identity_str(),
             resource.id.provider.clone(),
         );
         rs.identifier = state.identifier.clone();
         rs.partial_read = state.partial_read.clone();
         let resource_display_type = resource.id.display_type();
-        let identity = resource.id.identity_or_empty();
+        let identity = resource.identity_str();
         for (k, v) in &state.attributes {
             rs.attributes.insert(
                 k.clone(),

@@ -1139,7 +1139,7 @@ exports {
 
     fn resource_create_only_enum_file(raw_region: &str) -> carina_core::parser::InferredFile {
         let mut resource =
-            carina_core::resource::Resource::with_provider("awscc", "ec2.Subnet", "", None);
+            carina_core::resource::Resource::pending_with_provider("awscc", "ec2.Subnet", None);
         resource.set_attr(
             "placement_region".to_string(),
             Value::Concrete(ConcreteValue::enum_identifier(raw_region)),
@@ -1184,8 +1184,14 @@ exports {
         assert!(errors.is_empty(), "aws spelling errors: {errors:?}");
 
         assert_eq!(
-            awscc.resources[0].id.identity_or_empty(),
-            aws.resources[0].id.identity_or_empty(),
+            awscc.resources[0]
+                .id
+                .identity_str()
+                .expect("resolved identity"),
+            aws.resources[0]
+                .id
+                .identity_str()
+                .expect("resolved identity"),
             "resource create-only enum spelling must canonicalize before anonymous hash"
         );
     }

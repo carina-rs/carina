@@ -48,10 +48,9 @@ pub(in crate::parser) fn parse_anonymous_resource(
     // Extract directives block from attributes (it's a meta-argument, not a real attribute)
     let directives = extract_directives(&mut attributes)?;
 
-    let id = ResourceId::with_provider(
+    let id = ResourceId::pending_with_provider(
         provider,
         resource_type,
-        None,
         directives.provider_instance.clone(),
     );
 

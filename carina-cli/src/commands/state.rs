@@ -14,7 +14,8 @@ use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, RawSavedAttrs};
 use carina_core::resource::{
-    ConcreteValue, DataSource, ResolvedDataSource, Resource, ResourceId, State, Value,
+    ConcreteValue, DataSource, ResolvedDataSource, ResolvedResource, Resource, ResourceId, State,
+    Value,
 };
 use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
@@ -1148,11 +1149,8 @@ async fn run_state_refresh_locked_with_ctx(
             sorted_resources
                 .iter()
                 .filter_map(|r| {
-                    let rs = sf.find_resource(
-                        &r.id.provider,
-                        &r.id.resource_type,
-                        r.id.identity_or_empty(),
-                    )?;
+                    let identity = r.id.identity_str()?;
+                    let rs = sf.find_resource(&r.id.provider, &r.id.resource_type, identity)?;
                     if rs.dependency_bindings.is_empty() {
                         None
                     } else {
@@ -1202,7 +1200,7 @@ async fn run_state_refresh_locked_with_ctx(
             sf.resources()
                 .iter()
                 .filter_map(|rs| {
-                    let id = ResourceId::with_provider_name_compat(
+                    let id = ResourceId::with_provider_identity(
                         &rs.provider,
                         &rs.resource_type,
                         &rs.identity,
@@ -1669,7 +1667,7 @@ where
             println!(
                 "  {} \"{}\" {}:",
                 target.id.display_type().cyan(),
-                target.id.identity_or_empty(),
+                target.id.identity_display(),
                 deposed_state_marker(&target.key, &target.identifier)
             );
             println!("    {} resource no longer exists", "-".red());
@@ -1696,8 +1694,9 @@ where
             }
         }
         let schema = schemas.get_for(&masking_resource);
+        let resolved_masking_resource = ResolvedResource::new(masking_resource.clone());
         let attributes = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
-            &masking_resource,
+            &resolved_masking_resource,
             schema,
             &fresh_state.attributes,
             carina_state::PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&target.attributes),
@@ -1725,7 +1724,7 @@ where
         println!(
             "  {} \"{}\" {}:",
             target.id.display_type().cyan(),
-            target.id.identity_or_empty(),
+            target.id.identity_display(),
             deposed_state_marker(&target.key, &target.identifier)
         );
         println!("    {} attributes refreshed", "~".yellow());
@@ -1741,7 +1740,7 @@ fn collect_deposed_refresh_targets(state: &carina_state::StateFile) -> Vec<Depos
         .iter()
         .flat_map(|row| {
             row.deposed.iter().map(|deposed| {
-                let id = ResourceId::with_provider_name_compat(
+                let id = ResourceId::with_provider_identity(
                     &row.provider,
                     &row.resource_type,
                     &row.identity,
@@ -1771,7 +1770,7 @@ fn desired_resource_for_deposed<'a>(
     desired_resources.iter().find(|resource| {
         resource.id.provider == target.row_provider
             && resource.id.resource_type == target.row_resource_type
-            && resource.id.identity_or_empty() == target.row_identity
+            && resource.id.identity_str() == Some(target.row_identity.as_str())
             && resource.id.provider_instance == target.provider_instance
     })
 }
@@ -1845,7 +1844,10 @@ fn diff_display_update_resource(
     label_suffix: &str,
     counts: &mut StateRefreshCounts,
 ) -> Result<(), AppError> {
-    let existing = state.find_resource(&id.provider, &id.resource_type, id.identity_or_empty());
+    let Some(identity) = id.identity_str() else {
+        return Ok(());
+    };
+    let existing = state.find_resource(&id.provider, &id.resource_type, identity);
     let existing_rs = match existing {
         Some(rs) => rs,
         None => return Ok(()),
@@ -1859,15 +1861,16 @@ fn diff_display_update_resource(
                 owned_resource = Resource::with_provider(
                     &id.provider,
                     &id.resource_type,
-                    id.identity_or_empty(),
+                    identity,
                     id.provider_instance.clone(),
                 );
                 &owned_resource
             }
         };
+        let resolved_resource = ResolvedResource::new(res.clone());
         let schema = schemas.get_for(res);
         let mut resource_state = ResourceState::from_provider_state_for_resource_and_schema(
-            res,
+            &resolved_resource,
             fresh_state,
             Some(existing_rs),
             schema,
@@ -1967,7 +1970,7 @@ fn diff_display_update_resource(
         println!(
             "  {} \"{}\"{}:",
             id.display_type().cyan(),
-            id.identity_or_empty(),
+            identity,
             label_suffix,
         );
         for change in &changes {
@@ -1982,7 +1985,7 @@ fn diff_display_update_resource(
     if let Some(resource_state) = refreshed_resource_state {
         state.upsert_resource(resource_state)?;
     } else {
-        state.remove_resource(&id.provider, &id.resource_type, id.identity_or_empty());
+        state.remove_resource(&id.provider, &id.resource_type, identity);
     }
 
     Ok(())
@@ -2186,7 +2189,9 @@ mod tests {
     #[tokio::test]
     async fn state_refresh_reports_module_constraint_without_dispatching_data_source() {
         let composition = Composition {
-            id: ResourceId::with_identity("_virtual", "checked"),
+            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "_virtual", "checked",
+            )),
             signature: Signature {
                 arguments: IndexMap::from([(
                     "value".to_string(),
@@ -2610,7 +2615,7 @@ mod tests {
         let mut state_file = StateFile::new();
         let mut child_state = ResourceState::new(
             &child.id.resource_type,
-            child.id.identity_or_empty(),
+            child.id.identity_str().expect("resolved identity"),
             &child.id.provider,
         )
         .with_identifier("widget-1")
@@ -3235,8 +3240,8 @@ mod tests {
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let gone_id = ResourceId::with_provider_name_compat("awscc", "ec2.Vpc", "main", None);
-        let alive_id = ResourceId::with_provider_name_compat(
+        let gone_id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
+        let alive_id = ResourceId::with_provider_identity(
             "awscc",
             "ec2.Vpc",
             "main",
@@ -3308,7 +3313,7 @@ mod tests {
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let id = ResourceId::with_provider_name_compat("awscc", "ec2.Vpc", "main", None);
+        let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let provider = DeposedRefreshTestProvider::default().with_read_state(
             &id,
             "vpc-gone",
@@ -3351,7 +3356,7 @@ mod tests {
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
+        let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let provider = DeposedRefreshTestProvider::default().with_read_state(
             &id,
             "db-old",
@@ -3404,7 +3409,7 @@ mod tests {
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
+        let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let provider = DeposedRefreshTestProvider::default().with_read_state(
             &id,
             "db-old",
@@ -3464,7 +3469,7 @@ mod tests {
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
+        let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let provider = DeposedRefreshTestProvider::default().with_read_state(
             &id,
             "db-old",
@@ -3524,7 +3529,7 @@ mod tests {
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let id = ResourceId::with_provider_name_compat("awscc", "ec2.Vpc", "main", None);
+        let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let mut provider_tags = indexmap::IndexMap::new();
         provider_tags.insert("Name".to_string(), string_value("new-name"));
         provider_tags.insert("SecretTag".to_string(), string_value("plain-secret"));
@@ -3588,7 +3593,7 @@ mod tests {
 
     #[test]
     fn current_orphan_refresh_rehashes_existing_hash_without_desired_secret() {
-        let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
+        let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let mut state = StateFile::new();
         state
             .upsert_resource(
@@ -3630,7 +3635,7 @@ mod tests {
 
     #[test]
     fn current_orphan_refresh_merges_nested_secret_hash_per_leaf_and_converges() {
-        let id = ResourceId::with_provider_name_compat("awscc", "ec2.Vpc", "main", None);
+        let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let previous_tags = json!({
             "Name": "old-name",
             "SecretTag": format!("{SECRET_PREFIX}previous"),
@@ -3708,7 +3713,7 @@ mod tests {
 
     #[test]
     fn current_refresh_drops_schema_write_only_plaintext_absent_from_desired() {
-        let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
+        let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None);
         let mut state = StateFile::new();
         state
@@ -3766,7 +3771,7 @@ mod tests {
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let id = ResourceId::with_provider_name_compat("awscc", "db.Instance", "main", None);
+        let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let provider = DeposedRefreshTestProvider::default()
             .with_saved_attr_hydration()
             .with_read_state(
@@ -3836,7 +3841,7 @@ mod tests {
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let id = ResourceId::with_provider_name_compat("awscc", "service.Widget", "main", None);
+        let id = ResourceId::with_provider_identity("awscc", "service.Widget", "main", None);
         let provider = DeposedRefreshTestProvider::default().with_read_state(
             &id,
             "widget-old",
@@ -3919,7 +3924,7 @@ mod tests {
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let id = ResourceId::with_provider_name_compat(
+        let id = ResourceId::with_provider_identity(
             "awscc",
             "db.Instance",
             "main",
@@ -3981,7 +3986,7 @@ mod tests {
             .upsert_resource(row)
             .expect("test state setup must be valid");
 
-        let id = ResourceId::with_provider_name_compat("awscc", "ec2.Vpc", "main", None);
+        let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let provider =
             DeposedRefreshTestProvider::default().with_read_error(&id, "vpc-old", "read failed");
 
@@ -4016,7 +4021,7 @@ mod tests {
     #[test]
     fn current_instance_refresh_preserves_deposed_entries() {
         let key = deposed_key("old-key");
-        let id = ResourceId::with_provider_name_compat("awscc", "ec2.Vpc", "main", None);
+        let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let mut state = StateFile::new();
         let mut row = ResourceState::new("ec2.Vpc", "main", "awscc")
             .with_identifier("vpc-current")

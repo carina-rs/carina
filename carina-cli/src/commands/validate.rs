@@ -253,7 +253,7 @@ fn validated_entries<E>(parsed: &File<E>) -> Vec<ValidatedEntry<'_>> {
             // by whether the id has a resolved identity.
             other => {
                 let id = other.id();
-                if id.identity.is_some() {
+                if id.identity_str().is_some() {
                     ValidatedEntry::Resolved(id)
                 } else {
                     ValidatedEntry::PendingDirect(id)
@@ -532,10 +532,8 @@ mod tests {
         use carina_core::resource::Resource;
 
         let mut parsed = ParsedFile::default();
-        let mut res = Resource::new("s3.Bucket", "placeholder");
+        let mut res = Resource::pending("s3.Bucket");
         res.id.provider = "aws".to_string();
-        // Force the anonymous/not-yet-promoted state explicitly.
-        res.id.identity = None;
         parsed.resources.push(res); // allow: direct — fixture test inspection
 
         let entries = validated_entries(&parsed);
@@ -559,7 +557,9 @@ mod tests {
         use carina_core::resource::{Composition, ResourceId, Signature};
 
         let composition = |instance: &str, binding: Option<&str>| Composition {
-            id: ResourceId::with_identity("_virtual", instance),
+            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "_virtual", instance,
+            )),
             signature: Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: indexmap::IndexMap::new(),
