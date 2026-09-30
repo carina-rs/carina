@@ -1386,7 +1386,6 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
         }],
         backend_config: None,
         plan,

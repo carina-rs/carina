@@ -2227,7 +2227,6 @@ mod tests {
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-            is_default: true,
         };
         let mut parsed = carina_core::parser::InferredFile::default();
         parsed.providers.push(provider_config);
