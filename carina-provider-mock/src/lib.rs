@@ -779,16 +779,20 @@ mod tests {
             let from = State::existing(id.clone(), from_attrs).with_identifier("mock-id");
             let bindings = carina_core::binding_index::ResolvedBindings::default();
             let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
-            let request = carina_core::executor::prepare_update_request(
-                update_resource,
-                from,
-                &["comment".to_string()],
+            let schemas = carina_core::schema::SchemaRegistry::new();
+            let preparation = carina_core::executor::ProviderPreparationContext::new(
                 &bindings,
                 &module_gate,
                 &[],
                 &carina_core::provider::NoopNormalizer,
                 &[],
-                &carina_core::schema::SchemaRegistry::new(),
+                &schemas,
+            );
+            let request = carina_core::executor::prepare_update_request(
+                update_resource,
+                from,
+                &["comment".to_string()],
+                &preparation,
             )
             .await
             .expect("update request should pass checked preparation");

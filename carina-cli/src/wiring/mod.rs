@@ -3917,14 +3917,17 @@ pub async fn read_data_source_with_retry(
     factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &carina_core::schema::SchemaRegistry,
 ) -> Result<State, AppError> {
-    let ready = carina_core::executor::prepare_provider_ready_data_source(
-        resource.clone(),
+    let preparation = carina_core::executor::ProviderPreparationContext::new(
         bindings,
         module_gate,
+        &[],
+        &carina_core::provider::NoopNormalizer,
         factories,
         schemas,
-    )
-    .map_err(|source| AppError::from_resource_preparation(resource.id.clone(), source))?;
+    );
+    let ready =
+        carina_core::executor::prepare_provider_ready_data_source(resource.clone(), &preparation)
+            .map_err(|source| AppError::from_resource_preparation(resource.id.clone(), source))?;
     carina_core::executor::read_data_source_with_retry(provider, &ready)
         .await
         .map_err(AppError::Provider)

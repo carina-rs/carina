@@ -12,14 +12,17 @@ use crate::resource::{ConcreteValue, Resource, ResourceIdentity};
 fn provider_ready(resource: Resource) -> crate::provider::ProviderReadyResource {
     let bindings = crate::binding_index::ResolvedBindings::default();
     let gate = crate::executor::ModuleConstraintGate::new(&[]);
-    futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
-        resource,
+    let schemas = crate::schema::SchemaRegistry::new();
+    let context = crate::executor::ProviderPreparationContext::new(
         &bindings,
         &gate,
         &[],
         &crate::provider::NoopNormalizer,
         &[],
-        &crate::schema::SchemaRegistry::new(),
+        &schemas,
+    );
+    futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
+        resource, &context,
     ))
     .expect("test resource should pass provider preparation")
 }

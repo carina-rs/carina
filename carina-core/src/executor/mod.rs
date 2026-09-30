@@ -25,9 +25,9 @@ pub(crate) mod wait;
 pub use crate::effect::deps::UnresolvedResource;
 pub use provider_ready::{
     ModuleConstraintFailure, ModuleConstraintGate, ModuleConstraintGateError,
-    ProviderPreparationError, ProviderValueConstraintErrors, prepare_create_request,
-    prepare_provider_ready_data_source, prepare_provider_ready_resource, prepare_update_request,
-    provider_custom_type_lookup,
+    ProviderPreparationContext, ProviderPreparationError, ProviderValueConstraintErrors,
+    prepare_create_request, prepare_provider_ready_data_source, prepare_provider_ready_resource,
+    prepare_update_request, provider_custom_type_lookup,
 };
 pub use replace::compute_full_diff_patch;
 

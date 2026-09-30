@@ -82,17 +82,17 @@ async fn create_checked_bootstrap_resource(
     let id = resource.id.clone();
     let bindings = bootstrap_resolved_bindings(parsed);
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&parsed.compositions);
-    let request = carina_core::executor::prepare_create_request(
-        resource,
+    let preparation = carina_core::executor::ProviderPreparationContext::new(
         &bindings,
         &module_gate,
         &parsed.providers,
         normalizer,
         factories,
         schemas,
-    )
-    .await
-    .map_err(AppError::from_state_bucket_preparation)?;
+    );
+    let request = carina_core::executor::prepare_create_request(resource, &preparation)
+        .await
+        .map_err(AppError::from_state_bucket_preparation)?;
     provider
         .create(&id, request)
         .await

@@ -13,17 +13,18 @@ use carina_plugin_host::WasmProviderFactory;
 async fn create_request_for_test(resource: Resource) -> CreateRequest {
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
-    carina_core::executor::prepare_create_request(
-        resource,
+    let schemas = carina_core::schema::SchemaRegistry::new();
+    let preparation = carina_core::executor::ProviderPreparationContext::new(
         &bindings,
         &module_gate,
         &[],
         &carina_core::provider::NoopNormalizer,
         &[],
-        &carina_core::schema::SchemaRegistry::new(),
-    )
-    .await
-    .expect("test resource should pass checked create preparation")
+        &schemas,
+    );
+    carina_core::executor::prepare_create_request(resource, &preparation)
+        .await
+        .expect("test resource should pass checked create preparation")
 }
 
 async fn update_request_for_test(
@@ -33,19 +34,18 @@ async fn update_request_for_test(
 ) -> UpdateRequest {
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
-    carina_core::executor::prepare_update_request(
-        resource,
-        from,
-        changed_attributes,
+    let schemas = carina_core::schema::SchemaRegistry::new();
+    let preparation = carina_core::executor::ProviderPreparationContext::new(
         &bindings,
         &module_gate,
         &[],
         &carina_core::provider::NoopNormalizer,
         &[],
-        &carina_core::schema::SchemaRegistry::new(),
-    )
-    .await
-    .expect("test resource should pass checked update preparation")
+        &schemas,
+    );
+    carina_core::executor::prepare_update_request(resource, from, changed_attributes, &preparation)
+        .await
+        .expect("test resource should pass checked update preparation")
 }
 
 fn wasm_path() -> Option<PathBuf> {
@@ -462,14 +462,18 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     ]);
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
-    let resource = carina_core::executor::prepare_provider_ready_data_source(
-        resource,
+    let schemas = carina_core::schema::SchemaRegistry::new();
+    let preparation = carina_core::executor::ProviderPreparationContext::new(
         &bindings,
         &module_gate,
         &[],
-        &carina_core::schema::SchemaRegistry::new(),
-    )
-    .expect("data-source request should pass the checked host boundary");
+        &carina_core::provider::NoopNormalizer,
+        &[],
+        &schemas,
+    );
+    let resource =
+        carina_core::executor::prepare_provider_ready_data_source(resource, &preparation)
+            .expect("data-source request should pass the checked host boundary");
 
     let state = provider
         .read_data_source(&resource)

@@ -11,12 +11,12 @@ use crate::differ::{
 };
 use crate::effect::{BasicEffect, DeletedInstanceKey, Effect, EffectGeneration};
 use crate::executor::provider_ready::{
-    CheckInput, ResolvedCheckInput, prepare_provider_ready_resource_after_resolution,
+    CheckInput, ProviderPreparationContext, ResolvedCheckInput,
+    prepare_provider_ready_resource_after_resolution,
 };
-use crate::parser::ProviderConfig;
 use crate::provider::{
-    CreateRequest, DeleteRequest, PartialReadDiagnostic, Provider, ProviderNormalizer,
-    ProviderReadyResource, ReadRequest, UpdateOutcome, UpdateRequest,
+    CreateRequest, DeleteRequest, PartialReadDiagnostic, Provider, ProviderReadyResource,
+    ReadRequest, UpdateOutcome, UpdateRequest,
 };
 use crate::resolver::resolve_ref_value;
 use crate::resource::{
@@ -138,9 +138,9 @@ pub(super) async fn refresh_pending_states(
 /// CloudFront `domain_name`, etc.).
 pub(super) async fn resolve_resource(
     input: Result<CheckInput<Resource>, String>,
-    bindings: &ResolvedBindings,
-    pipeline: &RenormalizePipeline<'_>,
+    context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, String> {
+    let bindings = context.bindings();
     let input = input?;
     let checked = match input {
         CheckInput::Authored(source) => {
@@ -192,17 +192,9 @@ pub(super) async fn resolve_resource(
             )
         }
     };
-    prepare_provider_ready_resource_after_resolution(
-        checked,
-        bindings,
-        pipeline.module_gate,
-        pipeline.provider_configs,
-        pipeline.normalizer,
-        pipeline.factories,
-        pipeline.schemas,
-    )
-    .await
-    .map_err(|err| err.to_string())
+    prepare_provider_ready_resource_after_resolution(checked, context)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 fn needs_apply_resolution(value: &Value) -> bool {
@@ -292,19 +284,6 @@ pub(super) fn resolved_resource(
 ) -> Result<crate::resource::ResolvedResource, SerializationError> {
     crate::resource::assert_resource_fully_resolved(&resource)?;
     Ok(crate::resource::ResolvedResource::new(resource))
-}
-
-/// The full plan-time normalization pipeline, threaded into the apply
-/// executor so reference re-resolution cannot undo it.
-///
-/// Bundled into one struct (rather than three separate args) so the
-/// resolve helpers and `BasicEffectCtx` carry a single field.
-pub(super) struct RenormalizePipeline<'a> {
-    pub(super) module_gate: &'a super::ModuleConstraintGate,
-    pub(super) normalizer: &'a dyn ProviderNormalizer,
-    pub(super) provider_configs: &'a [ProviderConfig],
-    pub(super) factories: &'a [Box<dyn crate::provider::ProviderFactory>],
-    pub(super) schemas: &'a crate::schema::SchemaRegistry,
 }
 
 /// Reject a resolved attribute value that still carries an unresolved
@@ -547,10 +526,9 @@ pub(super) fn count_actionable_effects(effects: &[Effect]) -> usize {
 /// and keeping dispatch context fields grouped consistently.
 pub(super) struct BasicEffectCtx<'a> {
     pub(super) provider: &'a dyn Provider,
-    pub(super) bindings: &'a ResolvedBindings,
     pub(super) provider_check_inputs: &'a super::ProviderCheckInputs<'a>,
     pub(super) runtime_authored: bool,
-    pub(super) pipeline: &'a RenormalizePipeline<'a>,
+    pub(super) preparation: &'a ProviderPreparationContext<'a>,
     pub(super) completed: &'a AtomicUsize,
     pub(super) total: usize,
 }
@@ -574,8 +552,7 @@ pub(super) async fn execute_basic_effect<'a>(
     observer: &'a dyn ExecutionObserver,
 ) -> BasicEffectResult {
     let provider = ctx.provider;
-    let bindings = ctx.bindings;
-    let pipeline = ctx.pipeline;
+    let preparation = ctx.preparation;
     let completed = ctx.completed;
     let total = ctx.total;
     let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -592,7 +569,7 @@ pub(super) async fn execute_basic_effect<'a>(
             let check_input = ctx
                 .provider_check_inputs
                 .resource_input(resource.as_inner(), ctx.runtime_authored);
-            let resolved = match resolve_resource(check_input, bindings, pipeline).await {
+            let resolved = match resolve_resource(check_input, preparation).await {
                 Ok(r) => r,
                 Err(e) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {
@@ -672,7 +649,7 @@ pub(super) async fn execute_basic_effect<'a>(
                     CheckInput::PlanNormalized { authored, .. } => Some(authored.clone()),
                 })
                 .unwrap_or_else(|| to.as_inner().clone());
-            let resolved_to = match resolve_resource(check_input, bindings, pipeline).await {
+            let resolved_to = match resolve_resource(check_input, preparation).await {
                 Ok(r) => r,
                 Err(e) => {
                     observer.on_event(&ExecutionEvent::EffectFailed {
@@ -697,7 +674,7 @@ pub(super) async fn execute_basic_effect<'a>(
             // to update it.
             let mut effective_changed: Vec<String> = changed_attributes.to_vec();
             let resolved_resource = resolved_to.as_resource();
-            let schema = pipeline.schemas.get_for(resolved_resource);
+            let schema = preparation.schemas().get_for(resolved_resource);
             for (key, new_value) in &resolved_resource.attributes {
                 if effective_changed.iter().any(|k| k == key) {
                     continue;

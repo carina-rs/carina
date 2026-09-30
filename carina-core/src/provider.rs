@@ -1996,14 +1996,17 @@ mod tests {
     fn resolved_for_test(resource: Resource) -> ProviderReadyResource {
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = crate::executor::ModuleConstraintGate::new(&[]);
-        futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
-            resource,
+        let schemas = crate::schema::SchemaRegistry::new();
+        let context = crate::executor::ProviderPreparationContext::new(
             &bindings,
             &gate,
             &[],
             &NoopNormalizer,
             &[],
-            &crate::schema::SchemaRegistry::new(),
+            &schemas,
+        );
+        futures::executor::block_on(crate::executor::prepare_provider_ready_resource(
+            resource, &context,
         ))
         .expect("test resource should pass provider preparation")
     }
@@ -2011,14 +2014,17 @@ mod tests {
     fn ready_data_source_for_test(resource: DataSource) -> ProviderReadyDataSource {
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = crate::executor::ModuleConstraintGate::new(&[]);
-        crate::executor::prepare_provider_ready_data_source(
-            resource,
+        let schemas = crate::schema::SchemaRegistry::new();
+        let context = crate::executor::ProviderPreparationContext::new(
             &bindings,
             &gate,
             &[],
-            &crate::schema::SchemaRegistry::new(),
-        )
-        .expect("test data source should pass provider preparation")
+            &NoopNormalizer,
+            &[],
+            &schemas,
+        );
+        crate::executor::prepare_provider_ready_data_source(resource, &context)
+            .expect("test data source should pass provider preparation")
     }
 
     // Mock Provider for testing

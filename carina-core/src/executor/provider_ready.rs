@@ -62,6 +62,49 @@ pub type ProviderReadyResource = ProviderReady<ResolvedResource>;
 /// A fully resolved data source whose known input constraints have run.
 pub type ProviderReadyDataSource = ProviderReady<ResolvedDataSource>;
 
+/// Dependencies shared by every checked provider-boundary preparation.
+///
+/// Keeping these values together gives create, update, and data-source
+/// preparation one coherent execution snapshot, rather than letting each
+/// downstream helper accept independently supplied views.
+#[derive(Clone, Copy)]
+pub struct ProviderPreparationContext<'a> {
+    bindings: &'a ResolvedBindings,
+    module_gate: &'a ModuleConstraintGate,
+    provider_configs: &'a [ProviderConfig],
+    normalizer: &'a dyn ProviderNormalizer,
+    factories: &'a [Box<dyn ProviderFactory>],
+    schemas: &'a SchemaRegistry,
+}
+
+impl<'a> ProviderPreparationContext<'a> {
+    pub fn new(
+        bindings: &'a ResolvedBindings,
+        module_gate: &'a ModuleConstraintGate,
+        provider_configs: &'a [ProviderConfig],
+        normalizer: &'a dyn ProviderNormalizer,
+        factories: &'a [Box<dyn ProviderFactory>],
+        schemas: &'a SchemaRegistry,
+    ) -> Self {
+        Self {
+            bindings,
+            module_gate,
+            provider_configs,
+            normalizer,
+            factories,
+            schemas,
+        }
+    }
+
+    pub(super) fn bindings(&self) -> &ResolvedBindings {
+        self.bindings
+    }
+
+    pub(super) fn schemas(&self) -> &SchemaRegistry {
+        self.schemas
+    }
+}
+
 /// Whether a provider-bound value is still in its authored form or came from
 /// the plan after normalization. The latter always carries the authored
 /// snapshot; omitting it is not representable at the preparation seam.
@@ -235,22 +278,12 @@ impl ProviderReadyResource {
     pub fn as_resource(&self) -> &Resource {
         self.0.as_resource()
     }
-
-    /// Borrow the identity-resolved resource wrapper.
-    pub fn as_resolved_resource(&self) -> &ResolvedResource {
-        &self.0
-    }
 }
 
 impl ProviderReadyDataSource {
     /// Borrow the provider-facing data-source payload.
     pub fn as_data_source(&self) -> &DataSource {
         self.0.as_inner()
-    }
-
-    /// Borrow the identity-resolved data-source wrapper.
-    pub fn as_resolved_data_source(&self) -> &ResolvedDataSource {
-        &self.0
     }
 }
 
@@ -318,24 +351,13 @@ impl std::error::Error for ProviderValueConstraintErrors {
 /// secrets for the provider, validates every newly known schema value
 /// (including provider custom types), re-runs the complete desired-side
 /// normalization pipeline, and finally proves no deferred placeholder remains.
-#[allow(clippy::too_many_arguments)]
 pub async fn prepare_provider_ready_resource(
     resource: Resource,
-    bindings: &ResolvedBindings,
-    module_gate: &ModuleConstraintGate,
-    provider_configs: &[ProviderConfig],
-    normalizer: &dyn ProviderNormalizer,
-    factories: &[Box<dyn ProviderFactory>],
-    schemas: &SchemaRegistry,
+    context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     prepare_provider_ready_resource_with_value_check(
         ResolvedCheckInput::authored(resource),
-        bindings,
-        module_gate,
-        provider_configs,
-        normalizer,
-        factories,
-        schemas,
+        context,
     )
     .await
 }
@@ -348,26 +370,11 @@ pub async fn prepare_provider_ready_resource(
 /// effect. This prevents provider normalization performed during planning
 /// from being mistaken for user input while still rerunning cross-attribute
 /// validators when at least one input became known now.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn prepare_provider_ready_resource_after_resolution(
     input: ResolvedCheckInput<Resource>,
-    bindings: &ResolvedBindings,
-    module_gate: &ModuleConstraintGate,
-    provider_configs: &[ProviderConfig],
-    normalizer: &dyn ProviderNormalizer,
-    factories: &[Box<dyn ProviderFactory>],
-    schemas: &SchemaRegistry,
+    context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
-    prepare_provider_ready_resource_with_value_check(
-        input,
-        bindings,
-        module_gate,
-        provider_configs,
-        normalizer,
-        factories,
-        schemas,
-    )
-    .await
+    prepare_provider_ready_resource_with_value_check(input, context).await
 }
 
 enum ResourceValueCheck {
@@ -378,30 +385,24 @@ enum ResourceValueCheck {
     },
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn prepare_provider_ready_resource_with_value_check(
     input: ResolvedCheckInput<Resource>,
-    bindings: &ResolvedBindings,
-    module_gate: &ModuleConstraintGate,
-    provider_configs: &[ProviderConfig],
-    normalizer: &dyn ProviderNormalizer,
-    factories: &[Box<dyn ProviderFactory>],
-    schemas: &SchemaRegistry,
+    context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
     let ResolvedCheckInput {
         mut value,
         check: value_check,
     } = input;
     let resource = &mut value;
-    module_gate.check(bindings)?;
-    if let Some(schema) = schemas.get_for(resource) {
+    context.module_gate.check(context.bindings)?;
+    if let Some(schema) = context.schemas.get_for(resource) {
         match value_check {
             ResourceValueCheck::All => validate_known_provider_values(
                 &resource.id,
                 schema,
                 &resource.resolved_attributes(),
                 &resource.quoted_string_attrs,
-                factories,
+                context.factories,
             )?,
             ResourceValueCheck::ApplyResolved { attributes, names } => {
                 validate_selected_provider_values(
@@ -410,7 +411,7 @@ async fn prepare_provider_ready_resource_with_value_check(
                     &attributes,
                     &names,
                     &resource.quoted_string_attrs,
-                    factories,
+                    context.factories,
                 )?;
             }
         }
@@ -418,8 +419,14 @@ async fn prepare_provider_ready_resource_with_value_check(
     for value in resource.attributes.values_mut() {
         *value = unwrap_secret(value.clone());
     }
-    let normalized =
-        apply_desired_normalization(value, provider_configs, normalizer, factories, schemas).await;
+    let normalized = apply_desired_normalization(
+        value,
+        context.provider_configs,
+        context.normalizer,
+        context.factories,
+        context.schemas,
+    )
+    .await;
     let resource = normalized.into_resource();
     crate::resource::assert_resource_fully_resolved(&resource)?;
     Ok(ProviderReady(ResolvedResource::new(resource)))
@@ -435,17 +442,11 @@ async fn prepare_provider_ready_resource_with_value_check(
 /// provider can be called.
 pub fn prepare_provider_ready_data_source(
     resource: DataSource,
-    bindings: &ResolvedBindings,
-    module_gate: &ModuleConstraintGate,
-    factories: &[Box<dyn ProviderFactory>],
-    schemas: &SchemaRegistry,
+    context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyDataSource, ProviderPreparationError> {
     prepare_provider_ready_data_source_after_resolution(
         ResolvedCheckInput::authored(resource),
-        bindings,
-        module_gate,
-        factories,
-        schemas,
+        context,
     )
 }
 
@@ -455,25 +456,22 @@ pub fn prepare_provider_ready_data_source(
 /// scope because they already passed the plan-time authored-value gate.
 pub(super) fn prepare_provider_ready_data_source_after_resolution(
     input: ResolvedCheckInput<DataSource>,
-    bindings: &ResolvedBindings,
-    module_gate: &ModuleConstraintGate,
-    factories: &[Box<dyn ProviderFactory>],
-    schemas: &SchemaRegistry,
+    context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyDataSource, ProviderPreparationError> {
     let ResolvedCheckInput {
         mut value,
         check: value_check,
     } = input;
     let resource = &mut value;
-    module_gate.check(bindings)?;
-    if let Some(schema) = schemas.get_for_data_source(resource) {
+    context.module_gate.check(context.bindings)?;
+    if let Some(schema) = context.schemas.get_for_data_source(resource) {
         match value_check {
             ResourceValueCheck::All => validate_known_provider_values(
                 &resource.id,
                 schema,
                 &crate::resource::attrs_to_hashmap(&resource.attributes),
                 &resource.quoted_string_attrs,
-                factories,
+                context.factories,
             )?,
             ResourceValueCheck::ApplyResolved { attributes, names } => {
                 validate_selected_provider_values(
@@ -482,7 +480,7 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution(
                     &attributes,
                     &names,
                     &resource.quoted_string_attrs,
-                    factories,
+                    context.factories,
                 )?;
             }
         }
@@ -490,7 +488,10 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution(
     for value in resource.attributes.values_mut() {
         *value = unwrap_secret(value.clone());
     }
-    crate::value::canonicalize_data_sources_with_schemas(std::slice::from_mut(&mut value), schemas);
+    crate::value::canonicalize_data_sources_with_schemas(
+        std::slice::from_mut(&mut value),
+        context.schemas,
+    );
     for value in value.attributes.values() {
         crate::resource::assert_value_fully_resolved(value)?;
     }
@@ -498,52 +499,22 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution(
 }
 
 /// Prepare a checked create request through the provider-boundary gate.
-#[allow(clippy::too_many_arguments)]
 pub async fn prepare_create_request(
     resource: Resource,
-    bindings: &ResolvedBindings,
-    module_gate: &ModuleConstraintGate,
-    provider_configs: &[ProviderConfig],
-    normalizer: &dyn ProviderNormalizer,
-    factories: &[Box<dyn ProviderFactory>],
-    schemas: &SchemaRegistry,
+    context: &ProviderPreparationContext<'_>,
 ) -> Result<CreateRequest, ProviderPreparationError> {
-    let resource = prepare_provider_ready_resource(
-        resource,
-        bindings,
-        module_gate,
-        provider_configs,
-        normalizer,
-        factories,
-        schemas,
-    )
-    .await?;
+    let resource = prepare_provider_ready_resource(resource, context).await?;
     Ok(CreateRequest::checked(resource))
 }
 
 /// Prepare a checked update request through the provider-boundary gate.
-#[allow(clippy::too_many_arguments)]
 pub async fn prepare_update_request(
     resource: Resource,
     from: crate::resource::State,
     changed_attributes: &[String],
-    bindings: &ResolvedBindings,
-    module_gate: &ModuleConstraintGate,
-    provider_configs: &[ProviderConfig],
-    normalizer: &dyn ProviderNormalizer,
-    factories: &[Box<dyn ProviderFactory>],
-    schemas: &SchemaRegistry,
+    context: &ProviderPreparationContext<'_>,
 ) -> Result<UpdateRequest, ProviderPreparationError> {
-    let resource = prepare_provider_ready_resource(
-        resource,
-        bindings,
-        module_gate,
-        provider_configs,
-        normalizer,
-        factories,
-        schemas,
-    )
-    .await?;
+    let resource = prepare_provider_ready_resource(resource, context).await?;
     Ok(UpdateRequest::checked(from, changed_attributes, &resource))
 }
 

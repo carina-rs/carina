@@ -14,10 +14,11 @@ use crate::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownT
 #[cfg(test)]
 use super::ProviderCheckInputs;
 use super::basic::{
-    BasicEffectCtx, ExecutionState, RenormalizePipeline, count_actionable_effects,
-    execute_basic_effect, process_basic_result, refresh_pending_states, resolve_data_source,
+    BasicEffectCtx, ExecutionState, count_actionable_effects, execute_basic_effect,
+    process_basic_result, refresh_pending_states, resolve_data_source,
 };
 use super::deferred_dispatch::PureMetaCtx;
+use super::provider_ready::ProviderPreparationContext;
 use super::replace::SingleEffectResult;
 use super::scheduler::{
     FailureView, PureMetaOutcome, build_scheduler_deps, dependency_failed_reason,
@@ -428,18 +429,24 @@ pub(super) async fn execute_effects_sequential(
             let wait_identifiers = wait_identifiers.clone();
             let provider_check_inputs = &input.provider_check_inputs;
             let runtime_authored = runtime_authored_resource_ids.contains(effect.resource_id());
-            let pipeline = RenormalizePipeline {
-                module_gate: &module_gate,
-                normalizer: input.normalizer,
-                provider_configs: input.provider_configs,
-                factories: input.factories,
-                schemas: input.schemas,
-            };
+            let module_gate = &module_gate;
+            let normalizer = input.normalizer;
+            let provider_configs = input.provider_configs;
+            let factories = input.factories;
+            let schemas = input.schemas;
             let completed_ref = &completed;
             let effect_for_future = effect.clone();
             let make_future = move |wait_cancel_rx: Option<
                 tokio::sync::watch::Receiver<WaitSignal>,
             >| async move {
+                let preparation = ProviderPreparationContext::new(
+                    &binding_snapshot,
+                    module_gate,
+                    provider_configs,
+                    normalizer,
+                    factories,
+                    schemas,
+                );
                 let result = match effect_for_future.as_basic() {
                     // `BasicEffect` is the type-level contract for
                     // `execute_basic_effect`: any Create/Update/Delete
@@ -453,10 +460,9 @@ pub(super) async fn execute_effects_sequential(
                             basic,
                             &BasicEffectCtx {
                                 provider,
-                                bindings: &binding_snapshot,
                                 provider_check_inputs,
                                 runtime_authored,
-                                pipeline: &pipeline,
+                                preparation: &preparation,
                                 completed: completed_ref,
                                 total,
                             },
@@ -492,10 +498,7 @@ pub(super) async fn execute_effects_sequential(
                                         if unresolved.is_empty() {
                                             match super::provider_ready::prepare_provider_ready_data_source_after_resolution(
                                                 resolved_input,
-                                                &binding_snapshot,
-                                                pipeline.module_gate,
-                                                pipeline.factories,
-                                                pipeline.schemas,
+                                                &preparation,
                                             ) {
                                                 Ok(ready) => {
                                                     resolved = ready.as_data_source().clone();
