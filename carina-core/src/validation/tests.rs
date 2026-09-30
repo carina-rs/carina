@@ -395,6 +395,7 @@ fn binding_referenced_in_module_call() {
     parsed.module_calls.push(ModuleCall {
         module_name: "web_tier".to_string(),
         binding_name: None,
+        source: Default::default(),
         arguments: args,
     });
 
@@ -2605,6 +2606,7 @@ fn validate_module_calls_rejects_custom_type() {
     let module_calls = vec![ModuleCall {
         module_name: "github".to_string(),
         binding_name: None,
+        source: Default::default(),
         arguments: args,
     }];
 
@@ -3113,6 +3115,7 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
     let call = ModuleCall {
         module_name: "consumer".to_string(),
         binding_name: Some("instance".to_string()),
+        source: Default::default(),
         arguments: HashMap::from([(
             "subnet_ids".to_string(),
             Value::Concrete(ConcreteValue::List(vec![

@@ -16,6 +16,9 @@ use crate::resource::{
 
 use super::error::ModuleError;
 use super::resolver::ModuleResolver;
+use super::resolver::{
+    ModuleCallConstraintReport, ResolvedModuleConstraintOutcome, ResolvedModuleConstraintStatus,
+};
 use super::typecheck::check_module_arg_type;
 use super::validation::{ConstraintEvaluation, ModuleConstraints, evaluate_module_constraints};
 
@@ -156,11 +159,45 @@ impl ModuleResolver<'_> {
         // Collect and evaluate argument-local validations and module-level
         // requirements through the single constraint seam shared by the LSP,
         // planning, and apply.
-        let mut pending_constraints = Vec::new();
-        for evaluated in evaluate_module_constraints(
+        let evaluated_constraints = evaluate_module_constraints(
             ModuleConstraints::declarations(&module.arguments, &module.requires),
             &argument_values,
-        ) {
+        );
+        if self.records_constraint_reports()
+            && let Some(source) = call.diagnostic_source()
+        {
+            let outcomes = evaluated_constraints
+                .iter()
+                .map(|evaluated| {
+                    let status = match evaluated.evaluation() {
+                        ConstraintEvaluation::Satisfied => {
+                            ResolvedModuleConstraintStatus::Satisfied
+                        }
+                        ConstraintEvaluation::Pending => ResolvedModuleConstraintStatus::Pending,
+                        ConstraintEvaluation::Violated(_) | ConstraintEvaluation::EvalError(_) => {
+                            ResolvedModuleConstraintStatus::Failed(
+                                evaluated
+                                    .module_diagnostic(
+                                        &call.module_name,
+                                        instance_prefix,
+                                        call.binding_name.as_deref(),
+                                    )
+                                    .expect("concrete outcome has a diagnostic"),
+                            )
+                        }
+                    };
+                    ResolvedModuleConstraintOutcome {
+                        id: evaluated.constraint().id().clone(),
+                        status,
+                    }
+                })
+                .collect();
+            let (identity, report) = ModuleCallConstraintReport::new(source, outcomes);
+            self.record_constraint_report(identity, report);
+        }
+
+        let mut pending_constraints = Vec::new();
+        for evaluated in evaluated_constraints {
             match evaluated.evaluation() {
                 ConstraintEvaluation::Satisfied => {}
                 ConstraintEvaluation::Pending => {

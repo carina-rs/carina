@@ -431,20 +431,23 @@ impl DiagnosticEngine {
                 })
                 .unwrap_or_default();
             if base_path.is_some() {
-                let merged_calls = current_file_name.and_then(|file_name| {
-                    merged_result
+                diagnostics.extend(self.check_module_calls(doc, parsed, &module_signatures));
+                let constraint_diagnostics = base_path
+                    .zip(current_file_name)
+                    .zip(merged_result.as_ref())
+                    .map(|((base_path, file_name), result)| {
+                        self.module_constraint_diagnostics(
+                            &base_path.join(file_name),
+                            &result.module_constraint_reports,
+                        )
+                    })
+                    .unwrap_or_default();
+                let has_source_owned_constraint_diagnostic = !constraint_diagnostics.is_empty();
+                diagnostics.extend(constraint_diagnostics);
+                if !has_source_owned_constraint_diagnostic
+                    && let Some(error) = merged_result
                         .as_ref()
-                        .map(|result| (&result.directory, file_name))
-                });
-                diagnostics.extend(self.check_module_calls(
-                    doc,
-                    parsed,
-                    merged_calls,
-                    &module_signatures,
-                ));
-                if let Some(error) = merged_result
-                    .as_ref()
-                    .and_then(|result| result.module_error.as_ref())
+                        .and_then(|result| result.module_error.as_ref())
                     && let Some(diagnostic) = self.module_resolver_constraint_diagnostic(
                         doc,
                         parsed,

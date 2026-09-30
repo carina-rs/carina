@@ -218,6 +218,18 @@ impl EvaluatedModuleConstraint {
         instance: &str,
         binding: Option<&str>,
     ) -> Option<ModuleError> {
+        self.module_diagnostic(module, instance, binding)
+            .map(|diagnostic| ModuleError::Constraint(Box::new(diagnostic)))
+    }
+
+    /// Convert a concrete outcome to the shared typed diagnostic without
+    /// re-evaluating its expression or reconstructing its argument values.
+    pub fn module_diagnostic(
+        &self,
+        module: &str,
+        instance: &str,
+        binding: Option<&str>,
+    ) -> Option<ModuleConstraintDiagnostic> {
         let (message, actuals, detail) = match &self.evaluation {
             ConstraintEvaluation::Violated(violation) => {
                 (violation.message.clone(), violation.actuals.clone(), None)
@@ -229,18 +241,16 @@ impl EvaluatedModuleConstraint {
             ),
             ConstraintEvaluation::Satisfied | ConstraintEvaluation::Pending => return None,
         };
-        Some(ModuleError::Constraint(Box::new(
-            ModuleConstraintDiagnostic {
-                module: module.to_string(),
-                instance: instance.to_string(),
-                call: ModuleConstraintCall::from_binding(binding),
-                kind: self.kind.clone(),
-                arguments: self.arguments.clone(),
-                message,
-                actuals,
-                detail,
-            },
-        )))
+        Some(ModuleConstraintDiagnostic {
+            module: module.to_string(),
+            instance: instance.to_string(),
+            call: ModuleConstraintCall::from_binding(binding),
+            kind: self.kind.clone(),
+            arguments: self.arguments.clone(),
+            message,
+            actuals,
+            detail,
+        })
     }
 }
 

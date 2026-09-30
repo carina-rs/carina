@@ -1676,6 +1676,7 @@ mod tests {
         parsed.module_calls.push(crate::parser::ModuleCall {
             module_name: "github_module".to_string(),
             binding_name: Some("github_actions_carina".to_string()),
+            source: Default::default(),
             arguments: std::collections::HashMap::new(),
         });
         parsed.export_params.push(crate::parser::ParsedExportParam {

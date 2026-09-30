@@ -3975,6 +3975,153 @@ fn multifile_sibling_let_violating_module_constraint_has_one_lsp_diagnostic() {
     );
 }
 
+fn multifile_for_before_checked_constraint_diagnostics(
+    name: &str,
+) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let checked = tmp.path().join("checked");
+    let other = tmp.path().join("other");
+    std::fs::create_dir_all(&checked).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        checked.join("arguments.crn"),
+        r#"arguments {
+  name: String {
+    validation {
+      condition     = length(name) <= 3
+      error_message = "name must be at most three characters"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        checked.join("attributes.crn"),
+        "attributes {\n  name = name\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        other.join("arguments.crn"),
+        "arguments {\n  label: String\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        other.join("attributes.crn"),
+        "attributes {\n  label = label\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("consts.crn"),
+        format!("let labels = [\"one\", \"two\"]\nlet n = \"{name}\"\n"),
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("providers.crn"), "provider aws {}\n").unwrap();
+    let main = r#"let other = use { source = './other' }
+let checked = use { source = './checked' }
+
+let many = for x in labels { other { label = x } }
+
+checked {
+  name = n
+}
+"#;
+    std::fs::write(tmp.path().join("main.crn"), main).unwrap();
+
+    analyze_with_buffer(&engine, tmp.path(), "main.crn", main)
+}
+
+#[test]
+fn multifile_expanded_for_does_not_shift_checked_constraint_diagnostic() {
+    let diagnostics = multifile_for_before_checked_constraint_diagnostics("abcd");
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("name must be at most three characters")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        matching.len(),
+        1,
+        "the resolver-owned checked-call failure must be emitted once: {diagnostics:#?}"
+    );
+    assert_eq!(
+        matching[0].message,
+        "anonymous call to module 'checked': argument 'name': name must be at most three characters (got \"abcd\")"
+    );
+    assert_eq!(matching[0].range.start.line, 6);
+}
+
+#[test]
+fn multifile_expanded_for_before_valid_checked_call_has_no_constraint_diagnostic() {
+    let diagnostics = multifile_for_before_checked_constraint_diagnostics("ab");
+
+    assert!(
+        diagnostics.is_empty(),
+        "a valid checked call must not inherit another expanded call's values: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn multifile_forward_reference_default_uses_resolver_constraint_outcome() {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let checked = tmp.path().join("checked");
+    std::fs::create_dir_all(&checked).unwrap();
+    std::fs::write(
+        checked.join("arguments.crn"),
+        r#"arguments {
+  prefix: String {
+    default = later
+    validation {
+      condition     = length(prefix) <= 3
+      error_message = "prefix must be at most three characters"
+    }
+  }
+  later: String = "abcdef"
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        checked.join("attributes.crn"),
+        "attributes {\n  prefix = prefix\n}\n",
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("consts.crn"), "let unrelated = true\n").unwrap();
+    std::fs::write(tmp.path().join("providers.crn"), "provider aws {}\n").unwrap();
+    let main = r#"let checked = use { source = './checked' }
+
+checked {}
+"#;
+    std::fs::write(tmp.path().join("main.crn"), main).unwrap();
+
+    let diagnostics = analyze_with_buffer(&engine, tmp.path(), "main.crn", main);
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("prefix must be at most three characters")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        matching.len(),
+        1,
+        "the LSP must consume the expander's fixed-point result: {diagnostics:#?}"
+    );
+    assert_eq!(
+        matching[0].message,
+        "anonymous call to module 'checked': argument 'prefix': prefix must be at most three characters (got \"abcdef\")"
+    );
+    assert_eq!(matching[0].range.start.line, 2);
+}
+
 #[test]
 fn nested_concrete_module_constraint_survives_merged_expansion_failure() {
     let engine = module_boundary_identity_engine();
@@ -7687,7 +7834,6 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
             (current_file, current_source.to_string()),
             (sibling_file, sibling_source.to_string()),
         ],
-        module_calls_by_source: Vec::new(),
     };
 
     let diagnostics =

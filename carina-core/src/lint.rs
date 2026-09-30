@@ -1371,6 +1371,7 @@ tags = {
                 .map(|name| ModuleCall {
                     module_name: name.to_string(),
                     binding_name: None,
+                    source: Default::default(),
                     arguments: HashMap::new(),
                 })
                 .collect(),

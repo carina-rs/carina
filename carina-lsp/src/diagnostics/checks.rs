@@ -25,6 +25,7 @@ pub(super) struct MergedParseResult {
     pub(super) directory: DirectoryParseResult,
     pub(super) module_error: Option<carina_core::module_resolver::ModuleError>,
     pub(super) module_error_owner: Option<String>,
+    pub(super) module_constraint_reports: carina_core::module_resolver::ModuleCallConstraintReports,
 }
 
 fn module_call_header_position(line: &str, call: &ModuleCall) -> Option<usize> {
@@ -658,12 +659,12 @@ impl DiagnosticEngine {
         // source-level checks still have useful work to do, and concrete
         // value-constraint failures are surfaced at the owning call site.
         let root_imports = result.parsed.uses.clone();
-        let module_error = carina_core::module_resolver::resolve_modules_with_config(
+        let module_resolution = carina_core::module_resolver::resolve_modules_with_diagnostics(
             &mut result.parsed,
             base_path,
             &self.provider_context,
-        )
-        .err();
+        );
+        let module_error = module_resolution.error;
         // Nested expansion can fail while a root import is being loaded,
         // before the resolver has a root instance prefix to attach. Identify
         // that import alias on the error path so the LSP can still anchor the
@@ -691,6 +692,7 @@ impl DiagnosticEngine {
             directory: result,
             module_error,
             module_error_owner,
+            module_constraint_reports: module_resolution.constraint_reports,
         })
     }
 
@@ -1201,7 +1203,6 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         parsed: &ParsedFile,
-        merged: Option<(&DirectoryParseResult, &str)>,
         imported_modules: &carina_core::module_resolver::ResolvedModuleSignatures,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
@@ -1210,28 +1211,10 @@ impl DiagnosticEngine {
         for (call_index, call) in parsed.module_calls.iter().enumerate() {
             let call_occurrence = module_call_occurrence(&parsed.module_calls, call_index)
                 .expect("enumerated module call has an occurrence");
-            let evaluated_call = merged
-                .and_then(|(directory, file_name)| {
-                    directory.module_call_in_file(file_name, call_index)
-                })
-                .unwrap_or(call);
             if let Some(signature) = imported_modules.get(&call.module_name) {
                 let module_args = &signature.arguments;
-                let argument_values: HashMap<String, Value> = module_args
-                    .iter()
-                    .filter_map(|argument| {
-                        evaluated_call
-                            .arguments
-                            .get(&argument.name)
-                            .cloned()
-                            .or_else(|| argument.default.clone())
-                            .map(|value| (argument.name.clone(), value))
-                    })
-                    .collect();
-                let instance =
-                    carina_core::module_resolver::instance_prefix_for_call(evaluated_call);
                 // Check for unknown parameters
-                for (arg_name, arg_value) in &evaluated_call.arguments {
+                for (arg_name, arg_value) in &call.arguments {
                     let matching_arg = module_args.iter().find(|arg| &arg.name == arg_name);
 
                     if matching_arg.is_none() {
@@ -1297,51 +1280,60 @@ impl DiagnosticEngine {
                         ));
                     }
                 }
-
-                for evaluated in carina_core::module_resolver::evaluate_module_constraints(
-                    carina_core::module_resolver::ModuleConstraints::declarations(
-                        module_args,
-                        &signature.requires,
-                    ),
-                    &argument_values,
-                ) {
-                    let Some(error) = evaluated.module_error(
-                        &call.module_name,
-                        &instance,
-                        evaluated_call.binding_name.as_deref(),
-                    ) else {
-                        continue;
-                    };
-                    let position = match evaluated.kind() {
-                        carina_core::module_resolver::ModuleConstraintKind::ArgumentValidation {
-                            argument,
-                        } => self
-                            .find_module_call_arg_position(
-                                doc,
-                                call,
-                                call_occurrence,
-                                argument,
-                            )
-                            .map(|(line, col)| (line, col, argument.chars().count() as u32)),
-                        carina_core::module_resolver::ModuleConstraintKind::Require => self
-                            .find_module_call_position(doc, call, call_occurrence)
-                            .map(|(line, col)| {
-                                (line, col, call.module_name.chars().count() as u32)
-                            }),
-                    };
-                    if let Some((line, col, width)) = position {
-                        diagnostics.push(carina_diagnostic(
-                            line,
-                            col,
-                            col + width,
-                            DiagnosticSeverity::ERROR,
-                            error.to_string(),
-                        ));
-                    }
-                }
             }
         }
 
+        diagnostics
+    }
+
+    /// Map resolver-owned constraint outcomes onto their parser-authored
+    /// source spans. This layer never rebuilds argument values or re-runs a
+    /// constraint expression.
+    pub(super) fn module_constraint_diagnostics(
+        &self,
+        current_file: &std::path::Path,
+        reports: &carina_core::module_resolver::ModuleCallConstraintReports,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        for report in reports.values() {
+            if report.source.file != current_file {
+                continue;
+            }
+            for outcome in &report.outcomes {
+                let carina_core::module_resolver::ResolvedModuleConstraintStatus::Failed(failure) =
+                    &outcome.status
+                else {
+                    continue;
+                };
+                let span = match &failure.kind {
+                    carina_core::module_resolver::ModuleConstraintKind::ArgumentValidation {
+                        argument,
+                    } => report
+                        .source
+                        .argument_spans
+                        .get(argument)
+                        .copied()
+                        .unwrap_or(report.source.call_span),
+                    carina_core::module_resolver::ModuleConstraintKind::Require => {
+                        report.source.call_span
+                    }
+                };
+                let line = span.start_line.saturating_sub(1) as u32;
+                let col = span.start_column.saturating_sub(1) as u32;
+                let width = if span.start_line == span.end_line {
+                    span.end_column.saturating_sub(span.start_column) as u32
+                } else {
+                    1
+                };
+                diagnostics.push(carina_diagnostic(
+                    line,
+                    col,
+                    col + width.max(1),
+                    DiagnosticSeverity::ERROR,
+                    failure.to_string(),
+                ));
+            }
+        }
         diagnostics
     }
 

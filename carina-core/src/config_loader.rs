@@ -559,27 +559,6 @@ pub struct DirectoryParseResult {
     pub duplicate_declarations: Vec<DuplicateDeclaration>,
     /// Exact source inputs used for the parse, including in-memory overrides.
     pub source_files: Vec<(PathBuf, String)>,
-    /// Directory-resolved module calls paired with their authoring files.
-    ///
-    /// This preserves the source association after sibling-file bindings have
-    /// been expanded, allowing editor diagnostics to use the same values as
-    /// CLI validation while remaining anchored in the open file.
-    pub module_calls_by_source: Vec<(PathBuf, parser::ModuleCall)>,
-}
-
-impl DirectoryParseResult {
-    /// Return one module call authored in `file_name`, in source order.
-    pub fn module_call_in_file(
-        &self,
-        file_name: &str,
-        occurrence: usize,
-    ) -> Option<&parser::ModuleCall> {
-        self.module_calls_by_source
-            .iter()
-            .filter(|(path, _)| path.ends_with(file_name))
-            .nth(occurrence)
-            .map(|(_, call)| call)
-    }
 }
 
 /// Diagnostic-preserving variant of [`parse_directory_with_overrides`].
@@ -629,12 +608,11 @@ pub fn parse_directory_with_overrides_and_diagnostics(
     let duplicate_declarations = find_duplicate_declarations(dir, &parsed_files);
 
     let mut merged = ParsedFile::default();
-    let mut module_call_source_files = Vec::new();
-
     for (file, resolved) in parsed_files {
         let mut parsed = resolved.into_inner();
-        module_call_source_files
-            .extend(std::iter::repeat_n(file.clone(), parsed.module_calls.len()));
+        for call in &mut parsed.module_calls {
+            call.set_source_file(file.clone());
+        }
         let file_path = Some(file.display().to_string());
         for w in &mut parsed.warnings {
             w.file = file_path.clone();
@@ -649,11 +627,6 @@ pub fn parse_directory_with_overrides_and_diagnostics(
     if let Err(e) = parser::resolve_resource_refs_with_config(&mut merged, config) {
         return Err(e.to_string());
     }
-    let module_calls_by_source = module_call_source_files
-        .into_iter()
-        .zip(merged.module_calls.iter().cloned())
-        .collect();
-
     // `finalize_provider_configs` is intentionally NOT called here. The
     // merged result is pre-module-expansion; deferred provider
     // attributes that reference module-call bindings cannot be resolved
@@ -670,7 +643,6 @@ pub fn parse_directory_with_overrides_and_diagnostics(
         parsed: merged,
         duplicate_declarations,
         source_files: file_inputs,
-        module_calls_by_source,
     })
 }
 
@@ -1885,6 +1857,7 @@ awscc.ec2.SecurityGroup {
             module_calls: vec![crate::parser::ModuleCall {
                 module_name: "module".to_string(),
                 binding_name: Some("shared".to_string()),
+                source: Default::default(),
                 arguments: HashMap::new(),
             }],
             ..ParsedFile::default()

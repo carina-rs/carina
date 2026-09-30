@@ -793,6 +793,83 @@ pub struct ModuleCall {
     pub module_name: String,
     pub binding_name: Option<String>,
     pub arguments: HashMap<String, Value>,
+    pub(crate) source: Box<ModuleCallSource>,
+}
+
+impl ModuleCall {
+    /// Construct a synthetic module call that has no authored source site.
+    ///
+    /// Parser-created calls always carry source metadata. This constructor is
+    /// public for analysis and test code that deliberately creates an AST
+    /// without parsing source text.
+    pub fn synthetic(
+        module_name: impl Into<String>,
+        binding_name: Option<String>,
+        arguments: HashMap<String, Value>,
+    ) -> Self {
+        Self {
+            module_name: module_name.into(),
+            binding_name,
+            arguments,
+            source: Box::default(),
+        }
+    }
+
+    pub(crate) fn with_source(mut self, source: ModuleCallSource) -> Self {
+        self.source = Box::new(source);
+        self
+    }
+
+    pub(crate) fn set_source_file(&mut self, file: std::path::PathBuf) {
+        self.source.file = Some(file);
+    }
+
+    pub(crate) fn set_expansion_key(&mut self, expansion_key: String) {
+        self.source.expansion_key = Some(expansion_key);
+    }
+
+    pub(crate) fn diagnostic_source(&self) -> Option<ModuleCallDiagnosticSource> {
+        Some(ModuleCallDiagnosticSource {
+            file: self.source.file.clone()?,
+            call_span: self.source.call_span?,
+            argument_spans: self.source.argument_spans.clone(),
+            expansion_key: self.source.expansion_key.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ModuleCallSource {
+    pub(crate) file: Option<std::path::PathBuf>,
+    pub(crate) call_span: Option<ModuleCallSourceSpan>,
+    pub(crate) argument_spans: HashMap<String, ModuleCallSourceSpan>,
+    pub(crate) expansion_key: Option<String>,
+}
+
+/// A parser-authored source span for a module call or one of its arguments.
+///
+/// Lines and columns are one-indexed, matching pest positions. Byte offsets
+/// are retained as the stable, parser-assigned identity of the authored call
+/// within its source file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ModuleCallSourceSpan {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
+/// Source identity carried from parsing through module expansion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleCallDiagnosticSource {
+    pub file: std::path::PathBuf,
+    pub call_span: ModuleCallSourceSpan,
+    pub argument_spans: HashMap<String, ModuleCallSourceSpan>,
+    /// Distinguishes concrete calls expanded from the same authored `for`
+    /// body. Direct calls have no expansion key.
+    pub expansion_key: Option<String>,
 }
 
 /// Provider configuration
@@ -1806,6 +1883,7 @@ mod substitute_placeholder_tests {
         parsed.module_calls.push(ModuleCall {
             module_name: "module".to_string(),
             binding_name: Some("module_call_name".to_string()),
+            source: Default::default(),
             arguments: HashMap::new(),
         });
         parsed.upstream_states.push(UpstreamState {

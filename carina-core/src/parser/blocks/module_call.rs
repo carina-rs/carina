@@ -3,7 +3,7 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::parser::Rule;
-use crate::parser::ast::ModuleCall;
+use crate::parser::ast::{ModuleCall, ModuleCallSource, ModuleCallSourceSpan};
 use crate::parser::context::{ParseContext, next_pair};
 use crate::parser::error::ParseError;
 use crate::parser::parse_expression;
@@ -15,6 +15,16 @@ pub(crate) fn parse_module_call(
     ctx: &ParseContext,
 ) -> Result<ModuleCall, ParseError> {
     let span = pair.as_span();
+    let (start_line, start_column) = span.start_pos().line_col();
+    let (end_line, end_column) = span.end_pos().line_col();
+    let call_span = ModuleCallSourceSpan {
+        start_byte: span.start(),
+        end_byte: span.end(),
+        start_line,
+        start_column,
+        end_line,
+        end_column,
+    };
     let mut inner = pair.into_inner();
     let module_name = next_pair(&mut inner, "module name", "module call")?
         .as_str()
@@ -28,23 +38,40 @@ pub(crate) fn parse_module_call(
     }
 
     let mut arguments = HashMap::new();
+    let mut argument_spans = HashMap::new();
     for arg in inner {
         if arg.as_rule() == Rule::module_call_arg {
             let mut arg_inner = arg.into_inner();
-            let key = next_pair(&mut arg_inner, "argument name", "module call argument")?
-                .as_str()
-                .to_string();
+            let key_pair = next_pair(&mut arg_inner, "argument name", "module call argument")?;
+            let key_span = key_pair.as_span();
+            let (start_line, start_column) = key_span.start_pos().line_col();
+            let (end_line, end_column) = key_span.end_pos().line_col();
+            let key = key_pair.as_str().to_string();
             let value = parse_expression(
                 next_pair(&mut arg_inner, "argument value", "module call argument")?,
                 ctx,
             )?;
+            argument_spans.insert(
+                key.clone(),
+                ModuleCallSourceSpan {
+                    start_byte: key_span.start(),
+                    end_byte: key_span.end(),
+                    start_line,
+                    start_column,
+                    end_line,
+                    end_column,
+                },
+            );
             arguments.insert(key, value);
         }
     }
 
-    Ok(ModuleCall {
-        module_name,
-        binding_name: None,
-        arguments,
-    })
+    Ok(
+        ModuleCall::synthetic(module_name, None, arguments).with_source(ModuleCallSource {
+            file: None,
+            call_span: Some(call_span),
+            argument_spans,
+            expansion_key: None,
+        }),
+    )
 }
