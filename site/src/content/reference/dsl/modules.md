@@ -114,6 +114,53 @@ arguments {
 }
 ```
 
+A `validation` block is local to the argument that contains it. Its
+`condition` may reference that argument, but not another argument in the same
+module. Use a module-level `require` when a rule relates multiple arguments.
+
+### Require Constraints
+
+A `require` statement declares an invariant across any of the module's
+arguments. It consists of a boolean condition followed by the error message
+shown when the condition is false:
+
+```crn
+arguments {
+  min_size: Int
+  max_size: Int
+}
+
+require min_size <= max_size, 'min_size must not exceed max_size'
+```
+
+Unlike an argument-local `validation` block, a `require` condition can
+reference every argument declared by the module. An undeclared name is an
+error during validation, even when one of the declared argument values is
+still unresolved.
+
+### When Constraints Run
+
+Carina checks a constraint when its input value becomes known:
+
+- Literal module arguments are checked during `carina validate`.
+- Reference-valued arguments are checked after resolution during planning when
+  the referenced value is already available.
+- Values produced only by an apply-time effect are checked during apply,
+  before Carina dispatches a provider operation that consumes the now-known
+  argument.
+- A constraint whose inputs are still unresolved at the end of an otherwise
+  successful apply is an error.
+
+Pending constraints remain attached to the module call and are checked again
+at later resolution boundaries. This matters when an update or replacement
+publishes a value that differs from the value available during planning.
+
+Resource schema value constraints follow the same value-time rule. Carina
+checks authored literal values first, then re-checks reference values against
+schema `pattern`, `length`, and numeric `range` constraints when those values
+become known. An apply-time value must pass these checks before the resource
+create, update, or data-source read reaches its provider.
+
 ### Supported Types
 
 Parameter types can be any [type expression](/reference/dsl/types-and-values/#type-expressions):
