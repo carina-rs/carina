@@ -75,6 +75,28 @@ fn composition_call_matches(
     }
 }
 
+fn resource_type_occurrence(
+    text: &str,
+    pattern: &str,
+    wanted_occurrence: usize,
+) -> Option<(u32, u32)> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(line_index, line)| {
+            let byte_position = line.find(pattern)?;
+            line[byte_position + pattern.len()..]
+                .trim_start()
+                .starts_with('{')
+                .then(|| {
+                    (
+                        line_index as u32,
+                        position::byte_offset_to_char_offset(line, byte_position),
+                    )
+                })
+        })
+        .nth(wanted_occurrence)
+}
+
 /// Locate the `source = '<expected>'` or `source = "<expected>"` line inside
 /// an `upstream_state { ... }` block whose value equals `expected`. Returns
 /// `(line, start_col, end_col)` in character columns, positioned over the
@@ -216,6 +238,65 @@ fn deferred_in_current_file(
 }
 
 impl DiagnosticEngine {
+    /// Report anonymous resources that would share an identity scheme derived
+    /// from mutable attributes. The core check owns classification and
+    /// grouping; this adapter only maps the directory-wide result back onto
+    /// declarations in the current document.
+    pub(super) fn attribute_derived_anonymous_resource_diagnostics(
+        &self,
+        doc: &Document,
+        current_file: &ParsedFile,
+        directory: &ParsedFile,
+    ) -> Vec<Diagnostic> {
+        let conflicts =
+            carina_core::identifier::check_attribute_derived_anonymous_resource_conflicts(
+                &directory.resources,
+                &self.schemas,
+            );
+        if conflicts.is_empty() {
+            return Vec::new();
+        }
+
+        let text = doc.text();
+        let mut occurrences = HashMap::<(String, String), usize>::new();
+        let mut diagnostics = Vec::new();
+        for resource in &current_file.resources {
+            let occurrence = occurrences
+                .entry((
+                    resource.id.provider.clone(),
+                    resource.id.resource_type.clone(),
+                ))
+                .or_default();
+            let current_occurrence = *occurrence;
+            *occurrence += 1;
+
+            let Some(conflict) = conflicts
+                .iter()
+                .find(|conflict| conflict.includes(resource, &self.schemas))
+            else {
+                continue;
+            };
+            let pattern = if resource.id.provider.is_empty() {
+                resource.id.resource_type.clone()
+            } else {
+                format!("{}.{}", resource.id.provider, resource.id.resource_type)
+            };
+            let Some((line, col)) = resource_type_occurrence(&text, &pattern, current_occurrence)
+            else {
+                continue;
+            };
+            diagnostics.push(carina_diagnostic(
+                line,
+                col,
+                col + pattern.chars().count() as u32,
+                DiagnosticSeverity::ERROR,
+                conflict.to_string(),
+            ));
+        }
+
+        diagnostics
+    }
+
     /// Flag `arguments` blocks placed in a root configuration.
     ///
     /// `arguments` is a module-input declaration; it has no caller in a

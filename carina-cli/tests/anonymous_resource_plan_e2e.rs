@@ -1,8 +1,8 @@
 //! End-to-end regression coverage for carina#3826.
 //!
-//! Two anonymous resources whose identities are still pending must both reach
-//! the real plan. Historically dependency sorting keyed both resources as the
-//! same empty identity and silently dropped the second declaration.
+//! Anonymous resources must never collapse while their identities are still
+//! pending. Schema-stable and let-bound resources both reach the real plan;
+//! multiple mutable-attribute-derived resources are rejected before planning.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,14 +31,26 @@ impl Scenario {
     }
 
     fn carina(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_carina"))
+        self.carina_with_schema(args, false)
+    }
+
+    fn carina_with_stable_schema(&self, args: &[&str]) -> Output {
+        self.carina_with_schema(args, true)
+    }
+
+    fn carina_with_schema(&self, args: &[&str], stable_schema: bool) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_carina"));
+        command
             .current_dir(&self.project)
             .env("NO_COLOR", "1")
             .env_remove("CLICOLOR_FORCE")
-            .env_remove("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA")
-            .args(args)
-            .output()
-            .expect("run carina")
+            .args(args);
+        if stable_schema {
+            command.env("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1");
+        } else {
+            command.env_remove("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA");
+        }
+        command.output().expect("run carina")
     }
 
     fn write_main(&self, resources: &str) {
@@ -74,6 +86,38 @@ mock.test.resource {
 }
 "#;
 
+const LET_ALPHA_AND_BETA: &str = r#"let alpha = mock.test.resource {
+  name = "alpha"
+}
+
+let beta = mock.test.resource {
+  name = "beta"
+}
+"#;
+
+const LET_ALPHA_AND_ANONYMOUS_BETA: &str = r#"let alpha = mock.test.resource {
+  name = "alpha"
+}
+
+mock.test.resource {
+  name = "beta"
+}
+"#;
+
+const LET_ALPHA_AND_ANONYMOUS_BETA2: &str = r#"let alpha = mock.test.resource {
+  name = "alpha"
+}
+
+mock.test.resource {
+  name = "beta2"
+}
+"#;
+
+const ATTRIBUTE_DERIVED_IDENTITY_ERROR: &str = "Anonymous resource identity is derived from \
+mutable attributes for multiple 'mock.test.resource' declarations in the same scope (provider \
+instance '<default>', module instance '<root>'): declaration #1 'mock.test.resource', declaration \
+#2 'mock.test.resource'. Use `let` bindings to give them distinct stable identities.";
+
 fn copy_fixture(destination: &Path) {
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/anonymous_resource_plan");
@@ -93,13 +137,50 @@ fn assert_success(label: &str, output: &Output) {
 }
 
 #[test]
-fn two_pending_anonymous_resources_both_reach_the_plan() {
+fn validate_rejects_multiple_attribute_derived_anonymous_resources() {
     let scenario = Scenario::new();
 
     let init = scenario.carina(&["init", "."]);
     assert_success("carina init", &init);
 
-    let plan = scenario.carina(&["plan", "--refresh=false", "--out", "plan.json", "."]);
+    let validate = scenario.carina(&["validate", "."]);
+    let stderr = String::from_utf8_lossy(&validate.stderr);
+    assert!(
+        !validate.status.success() && stderr.contains(ATTRIBUTE_DERIVED_IDENTITY_ERROR),
+        "validate must reject ambiguous attribute-derived anonymous identities\n\
+         status: {}\nstdout:\n{}\nstderr:\n{stderr}",
+        validate.status,
+        String::from_utf8_lossy(&validate.stdout),
+    );
+}
+
+#[test]
+fn plan_rejects_multiple_attribute_derived_anonymous_resources() {
+    let scenario = Scenario::new();
+
+    let init = scenario.carina(&["init", "."]);
+    assert_success("carina init", &init);
+
+    let plan = scenario.carina(&["plan", "--refresh=false", "."]);
+    let stderr = String::from_utf8_lossy(&plan.stderr);
+    assert!(
+        !plan.status.success() && stderr.contains(ATTRIBUTE_DERIVED_IDENTITY_ERROR),
+        "plan must reject ambiguous attribute-derived anonymous identities\n\
+         status: {}\nstdout:\n{}\nstderr:\n{stderr}",
+        plan.status,
+        String::from_utf8_lossy(&plan.stdout),
+    );
+}
+
+#[test]
+fn stable_anonymous_resources_both_reach_the_plan() {
+    let scenario = Scenario::new();
+
+    let init = scenario.carina_with_stable_schema(&["init", "."]);
+    assert_success("carina init", &init);
+
+    let plan =
+        scenario.carina_with_stable_schema(&["plan", "--refresh=false", "--out", "plan.json", "."]);
     assert_success("carina plan", &plan);
 
     let stdout = String::from_utf8(plan.stdout).expect("plan stdout is UTF-8");
@@ -126,17 +207,17 @@ fn apply_two_anonymous_resources_then_plan_is_clean_and_destroy_removes_both() {
     let scenario = Scenario::new();
     scenario.write_main(ALPHA_AND_BETA);
 
-    let init = scenario.carina(&["init", "."]);
+    let init = scenario.carina_with_stable_schema(&["init", "."]);
     assert_success("carina init", &init);
 
-    let apply = scenario.carina(&["apply", "--auto-approve", "."]);
+    let apply = scenario.carina_with_stable_schema(&["apply", "--auto-approve", "."]);
     assert_success("initial carina apply", &apply);
 
-    let plan = scenario.carina(&["plan", "."]);
+    let plan = scenario.carina_with_stable_schema(&["plan", "."]);
     let plan_stdout = String::from_utf8_lossy(&plan.stdout);
     let plan_stderr = String::from_utf8_lossy(&plan.stderr);
 
-    let destroy = scenario.carina(&["destroy", "--auto-approve", "."]);
+    let destroy = scenario.carina_with_stable_schema(&["destroy", "--auto-approve", "."]);
     let state = scenario.state();
 
     assert!(
@@ -154,16 +235,16 @@ fn apply_two_anonymous_resources_then_plan_is_clean_and_destroy_removes_both() {
 }
 
 #[test]
-fn adding_second_anonymous_resource_preserves_first_and_releases_apply_lock() {
+fn claimed_named_row_is_not_adopted_by_the_single_attribute_derived_anonymous_resource() {
     let scenario = Scenario::new();
-    scenario.write_main(ALPHA);
+    scenario.write_main(LET_ALPHA_AND_ANONYMOUS_BETA);
 
     let init = scenario.carina(&["init", "."]);
     assert_success("carina init", &init);
     let first_apply = scenario.carina(&["apply", "--auto-approve", "."]);
-    assert_success("apply alpha", &first_apply);
+    assert_success("apply alpha and beta", &first_apply);
 
-    scenario.write_main(ALPHA_AND_BETA);
+    scenario.write_main(LET_ALPHA_AND_ANONYMOUS_BETA2);
     let plan = scenario.carina(&["plan", "--refresh=false", "."]);
     let apply = scenario.carina(&["apply", "--auto-approve", "."]);
     let lock_path = scenario.project.join("carina.state.lock");
@@ -175,13 +256,13 @@ fn adding_second_anonymous_resource_preserves_first_and_releases_apply_lock() {
     let state_rows = scenario.state().resources().len();
     assert!(
         plan.status.success()
-            && plan_stdout.contains("Plan: 1 to add, 0 to change, 0 to destroy.")
+            && plan_stdout.contains("Plan: 0 to add, 1 to change, 0 to destroy.")
             && apply.status.success()
             && !lock_remains
             && replan.status.success()
             && replan_stdout.contains("No changes")
             && state_rows == 2,
-        "adding beta must create only beta, apply cleanly, and converge\n\
+        "editing the sole anonymous resource must update it in place without claiming the named row\n\
          plan stdout:\n{plan_stdout}\nplan stderr:\n{}\n\
          apply status: {}\napply stdout:\n{}\napply stderr:\n{}\n\
          lock remains: {lock_remains}\nreplan stdout:\n{replan_stdout}\n\
@@ -195,9 +276,9 @@ fn adding_second_anonymous_resource_preserves_first_and_releases_apply_lock() {
 }
 
 #[test]
-fn saved_plan_apply_for_two_anonymous_resources_converges() {
+fn saved_plan_apply_for_two_let_bound_resources_converges() {
     let scenario = Scenario::new();
-    scenario.write_main(ALPHA_AND_BETA);
+    scenario.write_main(LET_ALPHA_AND_BETA);
 
     let init = scenario.carina(&["init", "."]);
     assert_success("carina init", &init);
@@ -215,7 +296,7 @@ fn saved_plan_apply_for_two_anonymous_resources_converges() {
             && replan.status.success()
             && replan_stdout.contains("No changes")
             && state_rows == 2,
-        "saved-plan apply must preserve both anonymous resources and converge\n\
+        "saved-plan apply must preserve both let-bound resources and converge\n\
          plan stdout:\n{plan_stdout}\nplan stderr:\n{}\n\
          apply status: {}\napply stdout:\n{}\napply stderr:\n{}\n\
          replan stdout:\n{replan_stdout}\nreplan stderr:\n{}\nstate rows: {state_rows}",
@@ -230,6 +311,7 @@ fn saved_plan_apply_for_two_anonymous_resources_converges() {
 #[test]
 fn plan_reports_how_to_repair_a_legacy_empty_identity_row() {
     let scenario = Scenario::new();
+    scenario.write_main(ALPHA);
 
     let init = scenario.carina(&["init", "."]);
     assert_success("carina init", &init);

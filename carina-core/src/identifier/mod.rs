@@ -64,6 +64,158 @@ pub fn generate_random_suffix() -> String {
     hex[..8].to_string()
 }
 
+/// Whether an anonymous resource's generated identity is anchored in schema
+/// fields that cannot change in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnonymousIdentityBasis {
+    /// At least one configured create-only or schema identity attribute is
+    /// set, so the normal identifier hash is based on immutable input.
+    Stable,
+    /// No stable schema attribute is set (or no schema is available), so the
+    /// identifier would be derived from mutable user attributes.
+    AttributeDerived,
+}
+
+/// Classify the identity basis for an anonymous resource.
+///
+/// Presence is what matters here, not whether a value is concrete yet. A
+/// deferred create-only or identity value will become concrete later but is
+/// still an immutable identity input.
+pub fn classify_anonymous_identity_basis(
+    resource: &Resource,
+    registry: &SchemaRegistry,
+) -> AnonymousIdentityBasis {
+    let Some(schema) = registry.get_for(resource) else {
+        return AnonymousIdentityBasis::AttributeDerived;
+    };
+
+    let has_stable_input = schema
+        .create_only_attributes()
+        .into_iter()
+        .chain(schema.identity_attributes())
+        .any(|attribute| {
+            let unresolved_prefix = format!("{attribute}_prefix");
+            resource.attributes.contains_key(attribute)
+                || resource.attributes.contains_key(&unresolved_prefix)
+                || resource.prefixes.contains_key(attribute)
+        });
+
+    if has_stable_input {
+        AnonymousIdentityBasis::Stable
+    } else {
+        AnonymousIdentityBasis::AttributeDerived
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct AnonymousResourceKind {
+    provider: String,
+    resource_type: String,
+    provider_instance: Option<String>,
+    module_instance: Option<String>,
+}
+
+impl AnonymousResourceKind {
+    fn of(resource: &Resource) -> Self {
+        let module_instance = match &resource.module_source {
+            Some(crate::resource::ModuleSource::Module { instance, .. }) => Some(instance.clone()),
+            Some(crate::resource::ModuleSource::Root) | None => None,
+        };
+        Self {
+            provider: resource.id.provider.clone(),
+            resource_type: resource.id.resource_type.clone(),
+            provider_instance: resource.id.provider_instance.clone(),
+            module_instance,
+        }
+    }
+
+    fn display_type(&self) -> String {
+        if self.provider.is_empty() {
+            self.resource_type.clone()
+        } else {
+            format!("{}.{}", self.provider, self.resource_type)
+        }
+    }
+}
+
+/// A group of anonymous resources whose identities would all be derived from
+/// mutable attributes within the same ownership scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeDerivedAnonymousResourceConflict {
+    kind: AnonymousResourceKind,
+    declaration_count: usize,
+}
+
+impl AttributeDerivedAnonymousResourceConflict {
+    /// Return whether `resource` is one of the declarations represented by
+    /// this conflict. This lets source-aware callers attach the shared error to
+    /// each declaration without reimplementing the grouping rule.
+    pub fn includes(&self, resource: &Resource, registry: &SchemaRegistry) -> bool {
+        resource.binding.is_none()
+            && classify_anonymous_identity_basis(resource, registry)
+                == AnonymousIdentityBasis::AttributeDerived
+            && AnonymousResourceKind::of(resource) == self.kind
+    }
+}
+
+impl std::fmt::Display for AttributeDerivedAnonymousResourceConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let display_type = self.kind.display_type();
+        let provider_instance = self
+            .kind
+            .provider_instance
+            .as_deref()
+            .unwrap_or("<default>");
+        let module_instance = self.kind.module_instance.as_deref().unwrap_or("<root>");
+        write!(
+            f,
+            "Anonymous resource identity is derived from mutable attributes for multiple \
+             '{display_type}' declarations in the same scope (provider instance \
+             '{provider_instance}', module instance '{module_instance}'): "
+        )?;
+        for declaration in 1..=self.declaration_count {
+            if declaration > 1 {
+                f.write_str(", ")?;
+            }
+            write!(f, "declaration #{declaration} '{display_type}'")?;
+        }
+        f.write_str(". Use `let` bindings to give them distinct stable identities.")
+    }
+}
+
+impl std::error::Error for AttributeDerivedAnonymousResourceConflict {}
+
+/// Find ambiguous anonymous-resource groups before any generated identity is
+/// assigned. A mutable-attribute identity is safe to reconcile only when it is
+/// the sole anonymous declaration of its kind and ownership scope.
+pub fn check_attribute_derived_anonymous_resource_conflicts(
+    resources: &[Resource],
+    registry: &SchemaRegistry,
+) -> Vec<AttributeDerivedAnonymousResourceConflict> {
+    let mut counts = BTreeMap::<AnonymousResourceKind, usize>::new();
+    for resource in resources {
+        if resource.binding.is_some()
+            || classify_anonymous_identity_basis(resource, registry)
+                != AnonymousIdentityBasis::AttributeDerived
+        {
+            continue;
+        }
+        *counts
+            .entry(AnonymousResourceKind::of(resource))
+            .or_default() += 1;
+    }
+
+    counts
+        .into_iter()
+        .filter_map(|(kind, declaration_count)| {
+            (declaration_count >= 2).then_some(AttributeDerivedAnonymousResourceConflict {
+                kind,
+                declaration_count,
+            })
+        })
+        .collect()
+}
+
 /// Resolve `<attr>_prefix` meta-attributes in resources.
 ///
 /// For each resource attribute ending in `_prefix`, checks if the base attribute
@@ -634,14 +786,18 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
         // These distinguish resources that share create-only values but differ
         // in other key attributes (e.g., Route 53 RecordSet `type`).
         for attr_name in &schema_identity_attrs {
-            if !hash_values.contains_key(attr_name)
-                && let Some(value) = resource.get_attr(attr_name)
-            {
+            if hash_values.contains_key(attr_name) {
+                continue;
+            }
+            if let Some(prefix) = resource.prefixes.get(*attr_name) {
+                hash_values.insert(attr_name, format!("Prefix({prefix:?})"));
+            } else if let Some(value) = resource.get_attr(attr_name) {
                 hash_values.insert(attr_name, deterministic_value_string(value));
             }
         }
 
-        let use_simhash = hash_values.is_empty();
+        let use_simhash = classify_anonymous_identity_basis(resource, registry)
+            == AnonymousIdentityBasis::AttributeDerived;
 
         let hash_str = if use_simhash {
             // Use SimHash for locality-sensitive hashing: similar inputs produce

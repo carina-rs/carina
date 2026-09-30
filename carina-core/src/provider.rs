@@ -648,14 +648,6 @@ impl LiftedSavedAttrs {
             self.0.insert(to, attrs);
         }
     }
-
-    /// Drop the source entry when the destination already contains attributes
-    /// read under its resolved identity; otherwise transfer the source entry.
-    pub fn remap_resource_id_preserving_target(&mut self, from: &ResourceId, to: ResourceId) {
-        if let Some(attrs) = self.0.remove(from) {
-            self.0.entry(to).or_insert(attrs);
-        }
-    }
 }
 
 /// Result of a provider create operation.

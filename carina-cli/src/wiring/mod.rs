@@ -803,26 +803,19 @@ pub(crate) fn adopt_unique_state_identity_for_unresolved_anonymous(
 ) {
     type ResourceKind = (String, String, Option<String>);
 
-    let mut unresolved_counts: HashMap<ResourceKind, usize> = HashMap::new();
-    let mut claimed_state_identities: HashMap<ResourceKind, HashSet<ResourceIdentity>> =
-        HashMap::new();
-
+    let mut claimed_state_identities = HashMap::<ResourceKind, HashSet<ResourceIdentity>>::new();
     for resource in resources.iter() {
-        let kind = (
-            resource.id.provider.clone(),
-            resource.id.resource_type.clone(),
-            resource.id.provider_instance.clone(),
-        );
-        match (resource.id.identity(), resource.binding.as_ref()) {
-            (None, None) => *unresolved_counts.entry(kind).or_default() += 1,
-            (Some(identity), _) => {
-                claimed_state_identities
-                    .entry(kind)
-                    .or_default()
-                    .insert(identity.clone());
-            }
-            (None, Some(_)) => {}
-        }
+        let Some(identity) = resource.id.identity() else {
+            continue;
+        };
+        claimed_state_identities
+            .entry((
+                resource.id.provider.clone(),
+                resource.id.resource_type.clone(),
+                resource.id.provider_instance.clone(),
+            ))
+            .or_default()
+            .insert(identity.clone());
     }
 
     for resource in resources {
@@ -835,14 +828,11 @@ pub(crate) fn adopt_unique_state_identity_for_unresolved_anonymous(
             resource.id.resource_type.clone(),
             resource.id.provider_instance.clone(),
         );
-        if unresolved_counts.get(&kind) != Some(&1) {
-            continue;
-        }
-
         let candidates: Vec<_> = state_file
             .resources_by_type(&resource.id.provider, &resource.id.resource_type)
             .into_iter()
             .filter(|state| state.directives.provider_instance == resource.id.provider_instance)
+            .filter(|state| module_instance_owns_identity(resource, &state.identity))
             .filter(|state| {
                 !claimed_state_identities
                     .get(&kind)
@@ -854,6 +844,23 @@ pub(crate) fn adopt_unique_state_identity_for_unresolved_anonymous(
         };
 
         resource.id.set_identity(state.identity.clone());
+        claimed_state_identities
+            .entry(kind)
+            .or_default()
+            .insert(state.identity.clone());
+    }
+}
+
+fn module_instance_owns_identity(resource: &Resource, identity: &ResourceIdentity) -> bool {
+    let identity_instance = identity
+        .as_str()
+        .rsplit_once('.')
+        .map(|(instance, _)| instance);
+    match &resource.module_source {
+        Some(carina_core::resource::ModuleSource::Module { instance, .. }) => {
+            identity_instance == Some(instance.as_str())
+        }
+        Some(carina_core::resource::ModuleSource::Root) | None => identity_instance.is_none(),
     }
 }
 
@@ -870,21 +877,9 @@ pub(crate) fn assign_fallback_identities_for_unresolved_anonymous(
                 .filter_map(|data_source| data_source.binding.clone()),
         )
         .collect();
-    let mut used: HashMap<(String, String, Option<String>), HashSet<String>> = HashMap::new();
     let mut renames = Vec::new();
-    for resource in resources.iter() {
-        if let Some(identity) = resource.id.identity_str() {
-            used.entry((
-                resource.id.provider.clone(),
-                resource.id.resource_type.clone(),
-                resource.id.provider_instance.clone(),
-            ))
-            .or_default()
-            .insert(identity.to_string());
-        }
-    }
 
-    for (idx, resource) in resources.iter_mut().enumerate() {
+    for resource in resources.iter_mut() {
         if resource.id.identity_str().is_some() || resource.binding.is_some() {
             continue;
         }
@@ -909,24 +904,12 @@ pub(crate) fn assign_fallback_identities_for_unresolved_anonymous(
         } else {
             format!("{provider_snake}_{type_snake}_{hash}")
         };
-        let base_identifier = match &resource.module_source {
+        let identifier = match &resource.module_source {
             Some(carina_core::resource::ModuleSource::Module { instance, .. }) => {
                 format!("{instance}.{bare_identifier}")
             }
             _ => bare_identifier,
         };
-
-        let key = (
-            resource.id.provider.clone(),
-            resource.id.resource_type.clone(),
-            resource.id.provider_instance.clone(),
-        );
-        let used_for_type = used.entry(key).or_default();
-        let mut identifier = base_identifier;
-        if used_for_type.contains(&identifier) {
-            identifier = format!("{identifier}_{idx}");
-        }
-        used_for_type.insert(identifier.clone());
 
         let old_id = resource.id.clone();
         let identity = match ResourceIdentity::try_from(identifier) {
@@ -985,11 +968,9 @@ pub(crate) fn reconcile_late_anonymous_identities(
                 state
             });
         }
-        inputs
-            .saved_attrs
-            .remap_resource_id_preserving_target(from, to.clone());
+        inputs.saved_attrs.remap_resource_id(from, to.clone());
         if let Some(explicit) = inputs.prev_explicit.remove(from) {
-            inputs.prev_explicit.entry(to.clone()).or_insert(explicit);
+            inputs.prev_explicit.insert(to.clone(), explicit);
         }
     }
 

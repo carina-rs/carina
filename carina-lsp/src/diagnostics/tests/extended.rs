@@ -2,6 +2,78 @@ use super::*;
 use crate::backend::document_end_position;
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 
+const ATTRIBUTE_DERIVED_IDENTITY_ERROR: &str = "Anonymous resource identity is derived from \
+mutable attributes for multiple 'mock.test.resource' declarations in the same scope (provider \
+instance '<default>', module instance '<root>'): declaration #1 'mock.test.resource', declaration \
+#2 'mock.test.resource'. Use `let` bindings to give them distinct stable identities.";
+
+#[test]
+fn attribute_derived_anonymous_identity_error_is_directory_scoped_and_anchored() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path();
+    let alpha = "mock.test.resource {\n  name = \"alpha\"\n}\n";
+    let beta = "\nmock.test.resource {\n  name = \"beta\"\n}\n";
+    std::fs::write(base.join("alpha.crn"), alpha).unwrap();
+    std::fs::write(base.join("beta.crn"), beta).unwrap();
+
+    let alpha_diagnostics =
+        engine.analyze_with_filename(&create_document(alpha), Some("alpha.crn"), Some(base));
+    let beta_diagnostics =
+        engine.analyze_with_filename(&create_document(beta), Some("beta.crn"), Some(base));
+
+    for (diagnostics, expected_line) in [(&alpha_diagnostics, 0), (&beta_diagnostics, 1)] {
+        let matching = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message == ATTRIBUTE_DERIVED_IDENTITY_ERROR)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+        assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(matching[0].range.start.line, expected_line);
+        assert_eq!(matching[0].range.start.character, 0);
+        assert_eq!(matching[0].range.end.line, expected_line);
+        assert_eq!(matching[0].range.end.character, 18);
+    }
+}
+
+#[test]
+fn attribute_derived_anonymous_identity_error_anchors_every_same_file_declaration() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let temp = tempfile::tempdir().unwrap();
+    let source = "mock.test.resource {\n  name = \"alpha\"\n}\n\nmock.test.resource {\n  name = \"beta\"\n}\n";
+    std::fs::write(temp.path().join("main.crn"), source).unwrap();
+
+    let diagnostics = engine.analyze_with_filename(
+        &create_document(source),
+        Some("main.crn"),
+        Some(temp.path()),
+    );
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message == ATTRIBUTE_DERIVED_IDENTITY_ERROR)
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].range.start.line, 0);
+    assert_eq!(matching[1].range.start.line, 4);
+}
+
 #[test]
 fn block_name_not_flagged_as_unknown() {
     let engine = test_engine();

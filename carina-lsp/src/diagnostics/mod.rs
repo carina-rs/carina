@@ -199,6 +199,13 @@ impl DiagnosticEngine {
         let merged = merged_result
             .as_ref()
             .map(|result| &result.directory.parsed);
+        if let Some(current_file) = doc.parsed() {
+            diagnostics.extend(self.attribute_derived_anonymous_resource_diagnostics(
+                doc,
+                current_file,
+                merged.unwrap_or(current_file),
+            ));
+        }
         let upstream_resolution = match (base_path, merged) {
             (Some(base), Some(merged)) => Some(
                 carina_core::upstream_exports::resolve_upstream_exports_with_schemas(

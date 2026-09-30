@@ -165,6 +165,170 @@ fn simhash_suffix_for_test(identifier: &str) -> SimHash {
 }
 
 #[test]
+fn anonymous_identity_basis_is_attribute_derived_without_a_schema() {
+    let resource = Resource::pending_with_provider("mock", "test.resource", None);
+
+    assert_eq!(
+        classify_anonymous_identity_basis(&resource, &SchemaRegistry::new()),
+        AnonymousIdentityBasis::AttributeDerived,
+    );
+}
+
+#[test]
+fn anonymous_identity_basis_is_attribute_derived_when_no_stable_attribute_is_set() {
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).create_only());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    resource.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("alpha".to_string())),
+    );
+
+    assert_eq!(
+        classify_anonymous_identity_basis(&resource, &registry),
+        AnonymousIdentityBasis::AttributeDerived,
+    );
+}
+
+#[test]
+fn anonymous_identity_basis_is_stable_when_create_only_value_is_deferred() {
+    use crate::resource::AccessPath;
+
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).create_only());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    resource.set_attr(
+        "immutable_name".to_string(),
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("source", "name"),
+        }),
+    );
+
+    assert_eq!(
+        classify_anonymous_identity_basis(&resource, &registry),
+        AnonymousIdentityBasis::Stable,
+    );
+}
+
+#[test]
+fn anonymous_identity_basis_is_stable_when_identity_attribute_prefix_is_set() {
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).identity());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    resource
+        .prefixes
+        .insert("immutable_name".to_string(), "example-".to_string());
+
+    assert_eq!(
+        classify_anonymous_identity_basis(&resource, &registry),
+        AnonymousIdentityBasis::Stable,
+    );
+}
+
+#[test]
+fn anonymous_identity_basis_recognizes_unresolved_prefix_syntax() {
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).create_only());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    resource.set_attr(
+        "immutable_name_prefix".to_string(),
+        Value::Concrete(ConcreteValue::String("example-".to_string())),
+    );
+
+    assert_eq!(
+        classify_anonymous_identity_basis(&resource, &registry),
+        AnonymousIdentityBasis::Stable,
+    );
+}
+
+#[test]
+fn identity_attribute_prefix_values_produce_distinct_stable_identifiers() {
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).identity());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+    let mut alpha = Resource::pending_with_provider("mock", "test.resource", None);
+    alpha
+        .prefixes
+        .insert("immutable_name".to_string(), "alpha-".to_string());
+    let mut beta = Resource::pending_with_provider("mock", "test.resource", None);
+    beta.prefixes
+        .insert("immutable_name".to_string(), "beta-".to_string());
+    let mut resources = vec![alpha, beta];
+
+    let result =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new());
+
+    assert!(result.is_ok(), "prefixes must not collide: {result:?}");
+    assert_ne!(resources[0].id, resources[1].id);
+}
+
+#[test]
+fn check_rejects_multiple_attribute_derived_anonymous_resources_in_one_kind() {
+    let resources = vec![
+        Resource::pending_with_provider("mock", "test.resource", None),
+        Resource::pending_with_provider("mock", "test.resource", None),
+    ];
+
+    let conflicts =
+        check_attribute_derived_anonymous_resource_conflicts(&resources, &SchemaRegistry::new());
+
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(
+        conflicts[0].to_string(),
+        "Anonymous resource identity is derived from mutable attributes for multiple \
+         'mock.test.resource' declarations in the same scope (provider instance '<default>', \
+         module instance '<root>'): declaration #1 'mock.test.resource', declaration #2 \
+         'mock.test.resource'. Use `let` bindings to give them distinct stable identities."
+    );
+}
+
+#[test]
+fn check_allows_stable_named_and_separate_module_instance_resources() {
+    use crate::resource::ModuleSource;
+
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).create_only());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+
+    let mut stable_one = Resource::pending_with_provider("mock", "test.resource", None);
+    stable_one.set_attr(
+        "immutable_name".to_string(),
+        Value::Concrete(ConcreteValue::String("one".to_string())),
+    );
+    let mut stable_two = Resource::pending_with_provider("mock", "test.resource", None);
+    stable_two.set_attr(
+        "immutable_name".to_string(),
+        Value::Concrete(ConcreteValue::String("two".to_string())),
+    );
+
+    let mut named = Resource::pending_with_provider("mock", "other.resource", None);
+    named.binding = Some("named".to_string());
+
+    let module_one = Resource::pending_with_provider("mock", "other.resource", None)
+        .with_module_source(ModuleSource::module("fixture", "module_one"));
+    let module_two = Resource::pending_with_provider("mock", "other.resource", None)
+        .with_module_source(ModuleSource::module("fixture", "module_two"));
+
+    let conflicts = check_attribute_derived_anonymous_resource_conflicts(
+        &[stable_one, stable_two, named, module_one, module_two],
+        &registry,
+    );
+
+    assert!(conflicts.is_empty(), "unexpected conflicts: {conflicts:?}");
+}
+
+#[test]
 fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
     let schema = ResourceSchema::new("ec2.Route")
         .attribute(AttributeSchema::new(
