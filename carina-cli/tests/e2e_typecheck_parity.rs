@@ -173,6 +173,108 @@ let instance = checked {
     assert_eq!(lsp_constraint_messages, cli_constraint_messages);
 }
 
+fn reference_valued_module_scope_fixture(module_source: &str) -> (TempDir, SchemaRegistry) {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let module = fixture.path().join("checked");
+    std::fs::create_dir_all(&module).expect("create module directory");
+    std::fs::write(module.join("main.crn"), module_source).expect("write module");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"provider test {}
+
+let checked = use { source = './checked' }
+
+let name_source = test.r.producer {
+  name = "name"
+}
+
+let peer_source = test.r.producer {
+  name = "peer"
+}
+
+let instance = checked {
+  name = name_source.id
+  peer = peer_source.id
+}
+"#,
+    )
+    .expect("write root configuration");
+
+    let producer = ResourceSchema::new("r.producer")
+        .attribute(AttributeSchema::new("name", AttributeType::string()).required())
+        .attribute(AttributeSchema::new("id", AttributeType::string()).read_only());
+    (fixture, single_schema_map(producer))
+}
+
+fn assert_single_cli_lsp_constraint_scope_error(
+    fixture: &TempDir,
+    schemas: &SchemaRegistry,
+    expected: &str,
+) {
+    let lsp_diags = lsp_diagnostics(&engine_with_schemas(schemas.clone()), fixture, "main.crn");
+    let cli_diags = cli_diagnostics(factories_for(schemas), fixture);
+    let lsp_matching = lsp_diags
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains(expected))
+        .collect::<Vec<_>>();
+    let cli_matching = cli_diags
+        .iter()
+        .filter(|diagnostic| diagnostic.contains(expected))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        lsp_matching.len(),
+        1,
+        "LSP must report the static constraint scope error once: {lsp_diags:#?}"
+    );
+    assert_eq!(
+        cli_matching.len(),
+        1,
+        "CLI validate must report the static constraint scope error once: {cli_diags:#?}"
+    );
+}
+
+#[test]
+fn reference_valued_require_rejects_undeclared_variable_during_validation() {
+    let (fixture, schemas) = reference_valued_module_scope_fixture(
+        r#"arguments {
+  name: String
+  peer: String
+}
+
+require nmae != peer, "names must differ"
+"#,
+    );
+
+    assert_single_cli_lsp_constraint_scope_error(
+        &fixture,
+        &schemas,
+        "unknown variable 'nmae' in constraint expression",
+    );
+}
+
+#[test]
+fn reference_valued_argument_validation_rejects_sibling_variable_during_validation() {
+    let (fixture, schemas) = reference_valued_module_scope_fixture(
+        r#"arguments {
+  name: String {
+    validation {
+      condition     = name != peer
+      error_message = "names must differ"
+    }
+  }
+  peer: String
+}
+"#,
+    );
+
+    assert_single_cli_lsp_constraint_scope_error(
+        &fixture,
+        &schemas,
+        "unknown variable 'peer' in constraint expression",
+    );
+}
+
 // NOTE: case-sensitive `contains`. LSP and CLI surfaces sometimes
 // differ in casing (e.g. "Type mismatch" vs "type mismatch") because
 // some diagnostics originate in carina-lsp and others in carina-core.

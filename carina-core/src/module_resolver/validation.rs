@@ -211,40 +211,40 @@ pub fn evaluate_module_constraints(
             arguments,
             requires,
         } => {
-            let validations = arguments.iter().flat_map(|argument| {
-                argument
-                    .validations
-                    .iter()
-                    .enumerate()
-                    .map(move |(ordinal, validation)| {
-                        (
-                            PendingModuleConstraint {
-                                id: ModuleConstraintId::argument_validation(
-                                    &argument.name,
-                                    ordinal,
-                                ),
-                                expression: validation.condition.clone(),
-                                message: validation.error_message.clone().unwrap_or_else(|| {
-                                    format!("validation failed for argument '{}'", argument.name)
-                                }),
-                            },
-                            ModuleConstraintKind::ArgumentValidation {
-                                argument: argument.name.clone(),
-                            },
-                        )
-                    })
-            });
-            let requirements = requires.iter().enumerate().map(|(ordinal, require)| {
-                (
+            let declared_arguments = arguments
+                .iter()
+                .map(|argument| argument.name.clone())
+                .collect::<BTreeSet<_>>();
+            let mut definitions = Vec::new();
+            for argument in arguments {
+                for (ordinal, validation) in argument.validations.iter().enumerate() {
+                    definitions.push((
+                        PendingModuleConstraint {
+                            id: ModuleConstraintId::argument_validation(&argument.name, ordinal),
+                            expression: validation.condition.clone(),
+                            message: validation.error_message.clone().unwrap_or_else(|| {
+                                format!("validation failed for argument '{}'", argument.name)
+                            }),
+                        },
+                        ModuleConstraintKind::ArgumentValidation {
+                            argument: argument.name.clone(),
+                        },
+                        BTreeSet::from([argument.name.clone()]),
+                    ));
+                }
+            }
+            for (ordinal, require) in requires.iter().enumerate() {
+                definitions.push((
                     PendingModuleConstraint {
                         id: ModuleConstraintId::require(ordinal),
                         expression: require.condition.clone(),
                         message: require.error_message.clone(),
                     },
                     ModuleConstraintKind::Require,
-                )
-            });
-            validations.chain(requirements).collect::<Vec<_>>()
+                    declared_arguments.clone(),
+                ));
+            }
+            definitions
         }
         ModuleConstraints::Pending(constraints) => constraints
             .iter()
@@ -257,50 +257,64 @@ pub fn evaluate_module_constraints(
                         argument: argument.to_string(),
                     })
                     .unwrap_or(ModuleConstraintKind::Require);
-                (constraint, kind)
+                let declared_arguments = match &kind {
+                    ModuleConstraintKind::ArgumentValidation { argument } => {
+                        BTreeSet::from([argument.clone()])
+                    }
+                    ModuleConstraintKind::Require => argument_values.keys().cloned().collect(),
+                };
+                (constraint, kind, declared_arguments)
             })
             .collect(),
     };
 
     definitions
         .into_iter()
-        .map(|(constraint, kind)| {
+        .map(|(constraint, kind, declared_arguments)| {
+            let referenced_arguments = referenced_constraint_arguments(constraint.expression());
             let arguments = match &kind {
                 ModuleConstraintKind::ArgumentValidation { argument } => vec![argument.clone()],
-                ModuleConstraintKind::Require => {
-                    referenced_constraint_arguments(constraint.expression())
-                }
+                ModuleConstraintKind::Require => referenced_arguments.clone(),
             };
             let actuals = constraint_actuals(&arguments, argument_values);
-            let evaluation = match &kind {
-                ModuleConstraintKind::ArgumentValidation { argument } => {
-                    let Some(value) = argument_values.get(argument) else {
-                        return EvaluatedModuleConstraint {
-                            constraint,
-                            kind,
-                            arguments,
-                            actuals,
-                            evaluation: ConstraintEvaluation::Pending,
+            let unknown_argument = referenced_arguments
+                .iter()
+                .find(|argument| !declared_arguments.contains(*argument));
+            let evaluation = if let Some(argument) = unknown_argument {
+                ConstraintEvaluation::EvalError(format!(
+                    "unknown variable '{argument}' in constraint expression"
+                ))
+            } else {
+                match &kind {
+                    ModuleConstraintKind::ArgumentValidation { argument } => {
+                        let Some(value) = argument_values.get(argument) else {
+                            return EvaluatedModuleConstraint {
+                                constraint,
+                                kind,
+                                arguments,
+                                actuals,
+                                evaluation: ConstraintEvaluation::Pending,
+                            };
                         };
-                    };
-                    evaluate_constraint(
+                        evaluate_constraint(
+                            constraint.expression(),
+                            &HashMap::from([(argument.clone(), value.clone())]),
+                            constraint.message(),
+                        )
+                    }
+                    ModuleConstraintKind::Require
+                        if arguments
+                            .iter()
+                            .any(|argument| !argument_values.contains_key(argument)) =>
+                    {
+                        ConstraintEvaluation::Pending
+                    }
+                    ModuleConstraintKind::Require => evaluate_constraint(
                         constraint.expression(),
-                        &HashMap::from([(argument.clone(), value.clone())]),
+                        argument_values,
                         constraint.message(),
-                    )
+                    ),
                 }
-                ModuleConstraintKind::Require
-                    if arguments
-                        .iter()
-                        .any(|argument| !argument_values.contains_key(argument)) =>
-                {
-                    ConstraintEvaluation::Pending
-                }
-                ModuleConstraintKind::Require => evaluate_constraint(
-                    constraint.expression(),
-                    argument_values,
-                    constraint.message(),
-                ),
             };
             EvaluatedModuleConstraint {
                 constraint,
