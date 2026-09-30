@@ -33,11 +33,11 @@
 //! ```
 //!
 //! ```compile_fail
-//! use carina_core::executor::{normalized::NormalizedResource, resolve_normalized_for_provider};
-//! use carina_core::provider::CreateRequest;
-//! fn request(normalized: NormalizedResource) -> CreateRequest {
-//!     let resolved = resolve_normalized_for_provider(normalized).unwrap();
-//!     CreateRequest { resource: resolved } // normalization alone is not validation
+//! use carina_core::executor::normalized::NormalizedResource;
+//! use carina_core::provider::ProviderReadyResource;
+//!
+//! fn bypass_value_checks(normalized: NormalizedResource) -> ProviderReadyResource {
+//!     normalized.into() // no unchecked normalization-to-provider conversion
 //! }
 //! ```
 //!
