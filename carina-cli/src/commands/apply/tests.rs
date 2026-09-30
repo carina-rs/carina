@@ -1477,6 +1477,10 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
     .await
     .expect_err("saved-plan no-op must run the terminal module gate");
 
+    assert!(
+        matches!(&error, AppError::ModuleConstraint(_)),
+        "terminal module failures must retain their typed AppError variant: {error:?}"
+    );
     let message = error.to_string();
     for expected in [
         "module 'checked_module' (call 'checked')",
@@ -1518,6 +1522,10 @@ async fn live_apply_noop_rejects_unconsumed_module_constraint() {
     .await
     .expect_err("live-apply no-op must run the terminal module gate");
 
+    assert!(
+        matches!(&error, AppError::ModuleConstraint(_)),
+        "terminal module failures must retain their typed AppError variant: {error:?}"
+    );
     let message = error.to_string();
     for expected in [
         "module 'checked_module' (call 'checked')",
@@ -2543,6 +2551,7 @@ fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::Backend
 
 struct BootstrapRecordingProvider {
     create_calls: AtomicUsize,
+    fail_create: bool,
 }
 
 impl Provider for BootstrapRecordingProvider {
@@ -2574,6 +2583,9 @@ impl Provider for BootstrapRecordingProvider {
         _request: CreateRequest,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::CreateOutcome>> {
         self.create_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_create {
+            return Box::pin(async { Err(ProviderError::internal("bootstrap create failed")) });
+        }
         let state = State::existing(id.clone(), HashMap::new()).with_identifier("bucket-id");
         Box::pin(async move { Ok(carina_core::provider::CreateOutcome::Success { state }) })
     }
@@ -2609,6 +2621,7 @@ impl Provider for BootstrapRecordingProvider {
 async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create() {
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
+        fail_create: false,
     };
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
     resource.set_attr(
@@ -2649,13 +2662,71 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
         message.contains("does not match required pattern /^state-/"),
         "error must retain the value-constraint reason: {message}"
     );
+    let mut source = std::error::Error::source(&error);
+    let mut saw_preparation = false;
+    let mut saw_type_error = false;
+    while let Some(error) = source {
+        saw_preparation |= error
+            .downcast_ref::<carina_core::executor::ProviderPreparationError>()
+            .is_some();
+        saw_type_error |= error
+            .downcast_ref::<carina_core::schema::TypeError>()
+            .is_some();
+        source = error.source();
+    }
+    assert!(
+        saw_preparation,
+        "typed preparation error was erased: {error:?}"
+    );
+    assert!(saw_type_error, "typed schema error was erased: {error:?}");
     assert_eq!(provider.create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn state_bucket_provider_error_keeps_typed_source() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        fail_create: true,
+    };
+    let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
+    resource.set_attr(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("state-bucket".to_string())),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::new("bucket", AttributeType::string())),
+    );
+
+    let error = create_checked_bootstrap_resource(
+        &provider,
+        resource,
+        &carina_core::parser::InferredFile::default(),
+        &NoopNormalizer,
+        &[],
+        &schemas,
+    )
+    .await
+    .expect_err("provider create failure must escape bootstrap");
+
+    assert_eq!(
+        error.to_string(),
+        "Failed to create state bucket: bootstrap create failed"
+    );
+    let source = std::error::Error::source(&error).expect("provider source must be retained");
+    assert!(
+        source.downcast_ref::<ProviderError>().is_some(),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
 async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
+        fail_create: false,
     };
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
     resource.set_attr(
@@ -2692,6 +2763,7 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
         "the bootstrap provider dispatch must be gated by module constraints"
     );
     let error = result.expect_err("the violating constraint must fail bootstrap preparation");
+    assert!(matches!(&error, AppError::ModuleConstraint(_)), "{error:?}");
     assert!(error.to_string().contains("value must not be forbidden"));
 }
 

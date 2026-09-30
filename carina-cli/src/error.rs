@@ -1,7 +1,56 @@
 //! Typed application error for carina-cli
 
 use carina_core::provider::ProviderError;
+use carina_core::resource::ResourceId;
 use carina_state::BackendError;
+
+/// Provider preparation failure annotated with the same resource header that
+/// `ProviderError::for_resource` historically rendered.
+#[derive(Debug)]
+pub struct ResourceProviderPreparationError {
+    resource: ResourceId,
+    source: Box<carina_core::executor::ProviderPreparationError>,
+}
+
+impl std::fmt::Display for ResourceProviderPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[{}.{}] {}",
+            self.resource.resource_type,
+            self.resource.identity_or_empty(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for ResourceProviderPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Provider preparation failure while creating the managed state bucket.
+#[derive(Debug)]
+pub struct StateBucketPreparationError {
+    source: Box<carina_core::executor::ProviderPreparationError>,
+}
+
+impl std::fmt::Display for StateBucketPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Failed to prepare state bucket before create: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for StateBucketPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
 
 /// Render a provider initialization error as user-facing text.
 ///
@@ -129,6 +178,21 @@ pub enum AppError {
     #[error(transparent)]
     ModuleConstraint(#[from] carina_core::executor::ModuleConstraintGateError),
 
+    /// A provider-boundary check failed for a resource before dispatch.
+    #[error(transparent)]
+    ProviderPreparation(#[from] ResourceProviderPreparationError),
+
+    /// State-backend bootstrap preparation failed before provider dispatch.
+    #[error(transparent)]
+    StateBucketPreparation(StateBucketPreparationError),
+
+    /// The provider rejected state-backend bootstrap creation.
+    #[error("Failed to create state bucket: {source}")]
+    StateBucketCreate {
+        #[source]
+        source: ProviderError,
+    },
+
     /// Provider lock-file loading or constraint errors.
     #[error(transparent)]
     LockConstraint(#[from] carina_provider_resolver::LockConstraintError),
@@ -148,6 +212,36 @@ pub enum AppError {
     /// Operation interrupted by user (Ctrl+C / SIGINT)
     #[error("Operation cancelled by user")]
     Interrupted,
+}
+
+impl AppError {
+    pub fn from_resource_preparation(
+        resource: ResourceId,
+        source: carina_core::executor::ProviderPreparationError,
+    ) -> Self {
+        match source {
+            carina_core::executor::ProviderPreparationError::ModuleConstraint(source) => {
+                Self::ModuleConstraint(source)
+            }
+            source => Self::ProviderPreparation(ResourceProviderPreparationError {
+                resource,
+                source: Box::new(source),
+            }),
+        }
+    }
+
+    pub fn from_state_bucket_preparation(
+        source: carina_core::executor::ProviderPreparationError,
+    ) -> Self {
+        match source {
+            carina_core::executor::ProviderPreparationError::ModuleConstraint(source) => {
+                Self::ModuleConstraint(source)
+            }
+            source => Self::StateBucketPreparation(StateBucketPreparationError {
+                source: Box::new(source),
+            }),
+        }
+    }
 }
 
 impl From<String> for AppError {

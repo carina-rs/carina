@@ -2765,6 +2765,60 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
     );
 }
 
+#[tokio::test]
+async fn invalid_data_source_preparation_keeps_typed_error_chain() {
+    use carina_core::resource::DataSource;
+
+    let lookup = DataSource::with_provider("test", "Lookup", "roles", None).with_attribute(
+        "filter",
+        Value::Concrete(ConcreteValue::String("bad".to_string())),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("Lookup")
+            .attribute(AttributeSchema::new(
+                "filter",
+                AttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+            ))
+            .as_data_source(),
+    );
+    let provider = ReadWithRetryProvider::new(ReadBehavior::NotFound);
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+
+    let error = read_data_source_with_retry(
+        &provider,
+        &lookup,
+        &ResolvedBindings::default(),
+        &module_gate,
+        &[],
+        &schemas,
+    )
+    .await
+    .expect_err("invalid data-source input must fail preparation");
+
+    assert_eq!(
+        error.to_string(),
+        "[Lookup.roles] test.Lookup.roles: value constraint failed before provider dispatch: Invalid value 'bad' for 'filter': does not match required pattern /^good-/"
+    );
+    let mut source = std::error::Error::source(&error);
+    let mut saw_preparation = false;
+    let mut saw_type_error = false;
+    while let Some(error) = source {
+        saw_preparation |= error
+            .downcast_ref::<carina_core::executor::ProviderPreparationError>()
+            .is_some();
+        saw_type_error |= error.downcast_ref::<TypeError>().is_some();
+        source = error.source();
+    }
+    assert!(
+        saw_preparation,
+        "typed preparation error was erased: {error:?}"
+    );
+    assert!(saw_type_error, "typed schema error was erased: {error:?}");
+    assert_eq!(provider.data_source_read_calls(), 0);
+}
+
 // Two resources with unknown types must surface as two distinct
 // `AppError::Validation` entries instead of one joined string, so
 // the driver can accumulate diagnostics across validators.

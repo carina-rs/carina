@@ -2729,8 +2729,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                                 ctx.factories(),
                                 ctx.schemas(),
                             )
-                            .await
-                            .map_err(AppError::Provider)?;
+                            .await?;
                             if let Some(deps) = dep_bindings {
                                 state.dependency_bindings = deps;
                             }
@@ -3917,7 +3916,7 @@ pub async fn read_data_source_with_retry(
     module_gate: &carina_core::executor::ModuleConstraintGate,
     factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &carina_core::schema::SchemaRegistry,
-) -> Result<State, ProviderError> {
+) -> Result<State, AppError> {
     let ready = carina_core::executor::prepare_provider_ready_data_source(
         resource.clone(),
         bindings,
@@ -3925,10 +3924,10 @@ pub async fn read_data_source_with_retry(
         factories,
         schemas,
     )
-    .map_err(|err| {
-        ProviderError::invalid_input(err.to_string()).for_resource(resource.id.clone())
-    })?;
-    carina_core::executor::read_data_source_with_retry(provider, &ready).await
+    .map_err(|source| AppError::from_resource_preparation(resource.id.clone(), source))?;
+    carina_core::executor::read_data_source_with_retry(provider, &ready)
+        .await
+        .map_err(AppError::Provider)
 }
 
 #[derive(Clone, Debug, PartialEq)]

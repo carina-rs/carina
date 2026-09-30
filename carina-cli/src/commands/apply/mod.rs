@@ -92,15 +92,11 @@ async fn create_checked_bootstrap_resource(
         schemas,
     )
     .await
-    .map_err(|err| {
-        AppError::Config(format!(
-            "Failed to prepare state bucket before create: {err}"
-        ))
-    })?;
+    .map_err(AppError::from_state_bucket_preparation)?;
     provider
         .create(&id, request)
         .await
-        .map_err(|err| AppError::Config(format!("Failed to create state bucket: {err}")))?;
+        .map_err(|source| AppError::StateBucketCreate { source })?;
     Ok(())
 }
 
@@ -135,7 +131,7 @@ fn finalize_module_constraints(
 ) -> Result<(), AppError> {
     carina_core::executor::ModuleConstraintGate::new(compositions)
         .finish(bindings, true)
-        .map_err(|error| AppError::Validation(error.to_string()))
+        .map_err(AppError::from)
 }
 
 fn deferred_data_source_reads_from_data_sources(
@@ -1452,8 +1448,7 @@ async fn run_apply_locked(
                         ctx.factories(),
                         ctx.schemas(),
                     )
-                    .await
-                    .map_err(AppError::Provider)?;
+                    .await?;
                     if let Some(deps) = dep_bindings {
                         state.dependency_bindings = deps;
                     }

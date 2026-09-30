@@ -1294,8 +1294,7 @@ async fn run_state_refresh_locked_with_ctx(
                 ctx.factories(),
                 ctx.schemas(),
             )
-            .await
-            .map_err(AppError::Provider)?;
+            .await?;
             match cancel.phase() {
                 ShutdownPhase::Running => {}
                 ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {

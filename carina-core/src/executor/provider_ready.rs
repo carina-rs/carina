@@ -261,14 +261,55 @@ pub enum ProviderPreparationError {
     #[error(transparent)]
     Serialization(#[from] SerializationError),
     /// A known value violates its resource schema or provider validator.
-    #[error("{resource}: value constraint failed before provider dispatch: {message}")]
+    #[error("{resource}: value constraint failed before provider dispatch: {errors}")]
     ValueConstraint {
         resource: ResourceId,
-        message: String,
+        #[source]
+        errors: ProviderValueConstraintErrors,
     },
     /// A pending module argument constraint became decidable and failed.
     #[error(transparent)]
     ModuleConstraint(#[from] ModuleConstraintGateError),
+}
+
+/// Typed collection of schema failures from one provider-boundary check.
+///
+/// `Display` intentionally retains the historical `; `-joined text, while
+/// `Error::source` exposes the first structured [`TypeError`] to callers that
+/// inspect the chain. All errors remain available through [`Self::errors`].
+#[derive(Debug)]
+pub struct ProviderValueConstraintErrors(Vec<TypeError>);
+
+impl ProviderValueConstraintErrors {
+    pub fn errors(&self) -> &[TypeError] {
+        &self.0
+    }
+}
+
+impl From<Vec<TypeError>> for ProviderValueConstraintErrors {
+    fn from(errors: Vec<TypeError>) -> Self {
+        Self(errors)
+    }
+}
+
+impl fmt::Display for ProviderValueConstraintErrors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, error) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_str("; ")?;
+            }
+            error.fmt(f)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ProviderValueConstraintErrors {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0
+            .first()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
 }
 
 /// Validate and prepare a resource for provider dispatch.
@@ -539,11 +580,7 @@ fn validate_known_provider_values(
         .validate_known_values_with_origins_and_lookup(attributes, &is_string_literal, &lookup)
         .map_err(|errors| ProviderPreparationError::ValueConstraint {
             resource: id.clone(),
-            message: errors
-                .into_iter()
-                .map(|error| error.to_string())
-                .collect::<Vec<_>>()
-                .join("; "),
+            errors: errors.into(),
         })
 }
 
@@ -566,11 +603,7 @@ fn validate_selected_provider_values(
         )
         .map_err(|errors| ProviderPreparationError::ValueConstraint {
             resource: id.clone(),
-            message: errors
-                .into_iter()
-                .map(|error| error.to_string())
-                .collect::<Vec<_>>()
-                .join("; "),
+            errors: errors.into(),
         })
 }
 
