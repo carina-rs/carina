@@ -1205,6 +1205,7 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         parsed: &ParsedFile,
+        merged: Option<(&DirectoryParseResult, &str)>,
         imported_modules: &carina_core::module_resolver::ResolvedModuleSignatures,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
@@ -1213,21 +1214,28 @@ impl DiagnosticEngine {
         for (call_index, call) in parsed.module_calls.iter().enumerate() {
             let call_occurrence = module_call_occurrence(&parsed.module_calls, call_index)
                 .expect("enumerated module call has an occurrence");
+            let evaluated_call = merged
+                .and_then(|(directory, file_name)| {
+                    directory.module_call_in_file(file_name, call_index)
+                })
+                .unwrap_or(call);
             if let Some(signature) = imported_modules.get(&call.module_name) {
                 let module_args = &signature.arguments;
                 let argument_values: HashMap<String, Value> = module_args
                     .iter()
                     .filter_map(|argument| {
-                        call.arguments
+                        evaluated_call
+                            .arguments
                             .get(&argument.name)
                             .cloned()
                             .or_else(|| argument.default.clone())
                             .map(|value| (argument.name.clone(), value))
                     })
                     .collect();
-                let instance = carina_core::module_resolver::instance_prefix_for_call(call);
+                let instance =
+                    carina_core::module_resolver::instance_prefix_for_call(evaluated_call);
                 // Check for unknown parameters
-                for (arg_name, arg_value) in &call.arguments {
+                for (arg_name, arg_value) in &evaluated_call.arguments {
                     let matching_arg = module_args.iter().find(|arg| &arg.name == arg_name);
 
                     if matching_arg.is_none() {

@@ -431,7 +431,17 @@ impl DiagnosticEngine {
                 })
                 .unwrap_or_default();
             if base_path.is_some() {
-                diagnostics.extend(self.check_module_calls(doc, parsed, &module_signatures));
+                let merged_calls = current_file_name.and_then(|file_name| {
+                    merged_result
+                        .as_ref()
+                        .map(|result| (&result.directory, file_name))
+                });
+                diagnostics.extend(self.check_module_calls(
+                    doc,
+                    parsed,
+                    merged_calls,
+                    &module_signatures,
+                ));
                 if let Some(error) = merged_result
                     .as_ref()
                     .and_then(|result| result.module_error.as_ref())

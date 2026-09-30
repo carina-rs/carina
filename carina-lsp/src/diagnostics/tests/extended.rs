@@ -3899,6 +3899,82 @@ let instance = checked {
     assert_eq!(diagnostic.range.start.character, 15);
 }
 
+fn multifile_sibling_let_module_constraint_diagnostics(
+    name: &str,
+) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+    let engine = module_boundary_identity_engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let module = tmp.path().join("checked");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(
+        module.join("arguments.crn"),
+        r#"arguments {
+  name: String {
+    validation {
+      condition     = length(name) <= 3
+      error_message = "name must be at most three characters"
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("attributes.crn"),
+        "attributes {\n  name = name\n}\n",
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("providers.crn"), "provider aws {}\n").unwrap();
+    std::fs::write(
+        tmp.path().join("consts.crn"),
+        format!("let n = \"{name}\"\n"),
+    )
+    .unwrap();
+    let main = r#"let checked = use { source = './checked' }
+
+checked {
+  name = n
+}
+"#;
+    std::fs::write(tmp.path().join("main.crn"), main).unwrap();
+
+    analyze_with_buffer(&engine, tmp.path(), "main.crn", main)
+}
+
+#[test]
+fn multifile_sibling_let_satisfying_module_constraint_has_no_lsp_diagnostic() {
+    let diagnostics = multifile_sibling_let_module_constraint_diagnostics("ab");
+
+    assert!(
+        diagnostics.is_empty(),
+        "the LSP must evaluate the expanded sibling let value: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn multifile_sibling_let_violating_module_constraint_has_one_lsp_diagnostic() {
+    let diagnostics = multifile_sibling_let_module_constraint_diagnostics("abcd");
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("name must be at most three characters")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        matching.len(),
+        1,
+        "the expanded sibling let violation must be reported once: {diagnostics:#?}"
+    );
+    assert!(
+        matching[0].message.contains("\"abcd\"")
+            && !matching[0].message.contains("enum identifier"),
+        "the diagnostic must render the expanded value: {diagnostics:#?}"
+    );
+}
+
 #[test]
 fn nested_concrete_module_constraint_survives_merged_expansion_failure() {
     let engine = module_boundary_identity_engine();
@@ -7611,6 +7687,7 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
             (current_file, current_source.to_string()),
             (sibling_file, sibling_source.to_string()),
         ],
+        module_calls_by_source: Vec::new(),
     };
 
     let diagnostics =
