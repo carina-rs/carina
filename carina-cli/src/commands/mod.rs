@@ -41,6 +41,7 @@ use crate::wiring::{
     validate_no_upstream_states_in_modules, validate_provider_region_with_ctx,
     validate_resources_with_ctx, validate_wait_bindings_with_ctx,
 };
+use carina_core::hint::ProjectCommand;
 
 #[must_use = "Drifted must be handled before mutating state — apply/destroy must refuse, init/plan must warn"]
 #[derive(Debug, PartialEq)]
@@ -124,18 +125,19 @@ impl VerifiedBackend {
 }
 
 pub fn verify_for_mutation(
-    base_dir: &Path,
+    project_dir: &Path,
     backend_config: Option<&BackendConfig>,
     command: DriftCommand,
 ) -> Result<VerifiedBackend, AppError> {
-    let verified_base_dir = base_dir
+    let verified_base_dir = project_dir
         .canonicalize()
-        .unwrap_or_else(|_| base_dir.to_path_buf());
+        .unwrap_or_else(|_| project_dir.to_path_buf());
 
     match inspect_backend_drift(&verified_base_dir, backend_config)? {
-        BackendDriftStatus::Fresh => Err(AppError::Config(
-            "Backend lock file not found. Run 'carina init' to initialize the project.".to_string(),
-        )),
+        BackendDriftStatus::Fresh => Err(AppError::Config(format!(
+            "Backend lock file not found. Run `{}` to initialize the project.",
+            ProjectCommand::new("init", project_dir)
+        ))),
         BackendDriftStatus::Unchanged => Ok(VerifiedBackend {
             parser_config: backend_config.cloned(),
             state_config: backend_config.map(StateBackendConfig::from),
@@ -148,6 +150,7 @@ pub fn verify_for_mutation(
             command,
             &existing,
             &configured,
+            project_dir,
         ))),
     }
 }
@@ -159,13 +162,18 @@ fn backend_drift_header(existing: &BackendLock, configured: &BackendLock) -> Str
     )
 }
 
-pub fn drift_warning(existing: &BackendLock, configured: &BackendLock) -> String {
+pub fn drift_warning(
+    existing: &BackendLock,
+    configured: &BackendLock,
+    project_dir: &Path,
+) -> String {
     format!(
         "{}\n\n    plan reads state from the OLD backend recorded in carina-backend.lock.\n    \
-         Before running apply or destroy, run `carina init --migrate-state .`\n    \
+         Before running apply or destroy, run `{}`\n    \
          to migrate state from the OLD backend to the new one.\n\n    \
          To revert instead, restore the backend block to match the lock.",
-        backend_drift_header(existing, configured)
+        backend_drift_header(existing, configured),
+        ProjectCommand::new("init --migrate-state", project_dir)
     )
 }
 
@@ -173,13 +181,15 @@ pub fn drift_error_message(
     command: DriftCommand,
     existing: &BackendLock,
     configured: &BackendLock,
+    project_dir: &Path,
 ) -> String {
     format!(
         "{}\n\n{} without first migrating the state. State migration is an\n\
-         explicit, named operation:\n\n    carina init --migrate-state .\n\n\
+         explicit, named operation:\n\n    {}\n\n\
          Or revert the `backend` block to match the lock if the change was unintended.",
         backend_drift_header(existing, configured),
-        command.verb_phrase()
+        command.verb_phrase(),
+        ProjectCommand::new("init --migrate-state", project_dir)
     )
 }
 
@@ -814,7 +824,7 @@ mod tests {
                 BackendLock::for_config(Some(&local_backend_config("legacy/state.json"))).unwrap();
             let new = BackendLock::for_config(Some(&local_backend_config("state.json"))).unwrap();
 
-            let warning = drift_warning(&old, &new);
+            let warning = drift_warning(&old, &new, Path::new("."));
 
             assert!(warning.contains("legacy/state.json"));
             assert!(warning.contains("state.json"));
@@ -827,9 +837,10 @@ mod tests {
                 BackendLock::for_config(Some(&local_backend_config("legacy/state.json"))).unwrap();
             let new = BackendLock::for_config(Some(&local_backend_config("state.json"))).unwrap();
 
-            let error = drift_error_message(DriftCommand::Apply, &old, &new);
+            let error = drift_error_message(DriftCommand::Apply, &old, &new, Path::new("."));
 
             assert!(error.contains("carina init --migrate-state"));
+            assert!(!error.contains("carina init --migrate-state ."));
             assert!(error.contains("Cannot apply without first migrating the state"));
         }
 
@@ -839,11 +850,27 @@ mod tests {
                 BackendLock::for_config(Some(&local_backend_config("legacy/state.json"))).unwrap();
             let new = BackendLock::for_config(Some(&local_backend_config("state.json"))).unwrap();
 
-            let error = drift_error_message(DriftCommand::RefreshState, &old, &new);
+            let error = drift_error_message(DriftCommand::RefreshState, &old, &new, Path::new("."));
 
             assert!(error.contains("carina init --migrate-state"));
             assert!(error.contains("Cannot refresh state without first migrating the state"));
             assert!(!error.contains("Cannot apply without first migrating the state"));
+        }
+
+        #[test]
+        fn drift_error_renders_copy_pasteable_indented_command() {
+            let old =
+                BackendLock::for_config(Some(&local_backend_config("legacy/state.json"))).unwrap();
+            let new = BackendLock::for_config(Some(&local_backend_config("state.json"))).unwrap();
+
+            let error =
+                drift_error_message(DriftCommand::Apply, &old, &new, Path::new("infra/foo"));
+            let command = error
+                .lines()
+                .find(|line| line.trim_start().starts_with("carina init --migrate-state"))
+                .unwrap();
+
+            assert_eq!(command, "    carina init --migrate-state infra/foo");
         }
     }
 

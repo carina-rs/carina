@@ -77,7 +77,7 @@ aws.ec2.SecurityGroupIngress {
 Download and install the provider plugins declared in the `provider` blocks:
 
 ```bash
-$ carina init .
+$ carina init
 Resolving 1 provider(s)...
 Resolving revision 'main' for provider 'aws'...
 Installed provider 'aws' (github.com/carina-rs/carina-provider-aws@2906c22e0b25)
@@ -87,10 +87,10 @@ Initialized successfully.
 
 ### 3. Validate
 
-Point `carina` at the directory containing your `.crn` files (all `.crn` files in that directory are merged):
+Run `carina` from the directory containing your `.crn` files (or pass that directory as an argument); all `.crn` files in that directory are merged:
 
 ```bash
-$ carina validate .
+$ carina validate
 Validating...
 ✓ 3 resources validated successfully.
   • aws.ec2.Vpc.main_vpc
@@ -101,7 +101,7 @@ Validating...
 ### 4. Plan
 
 ```bash
-$ carina plan .
+$ carina plan
 Execution Plan:
 
   + aws.ec2.Vpc main_vpc
@@ -131,7 +131,7 @@ Plan: 3 to add, 0 to change, 0 to destroy.
 ### 5. Apply
 
 ```bash
-$ carina apply .
+$ carina apply
 Applying changes...
 
   ✓ Create aws.ec2.Vpc main_vpc took 2.1s 1/3
@@ -398,7 +398,7 @@ Configure valid AWS credentials via:
 ### Using with aws-vault
 
 ```bash
-aws-vault exec myprofile -- carina apply .
+aws-vault exec myprofile -- carina apply
 ```
 
 ## Commands
@@ -420,7 +420,7 @@ $ carina fmt -r
 # Check formatting without modifying files
 $ carina fmt --check
 
-# Show diff of formatting changes
+# Show diff of formatting changes without modifying files
 $ carina fmt --diff
 ```
 
@@ -429,7 +429,7 @@ $ carina fmt --diff
 Remove all resources defined in a configuration:
 
 ```bash
-$ carina destroy .
+$ carina destroy
 Destroy Plan:
 
   - aws.ec2.Vpc main_vpc

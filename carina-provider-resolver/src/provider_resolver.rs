@@ -13,9 +13,17 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use carina_core::hint::ProjectCommand;
 use carina_core::parser::ProviderConfig;
 
 use crate::signing::{self, ExpectedIdentity};
+
+const PROVIDER_LOCK_FILE_NAME: &str = "carina-providers.lock";
+
+/// Return the provider lock-file path for a project directory.
+pub fn provider_lock_path(project_dir: &Path) -> PathBuf {
+    project_dir.join(PROVIDER_LOCK_FILE_NAME)
+}
 
 /// Distinguishes the three shapes a lock entry can take. Encoded as a tagged
 /// enum so that invalid field combinations (e.g. `version = ""` *and*
@@ -1617,7 +1625,7 @@ fn canonicalize_registry_host_keys<T>(
 /// rewrites the on-disk file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockFileMigration {
-    path: PathBuf,
+    project_dir: PathBuf,
     from: u32,
     to: u32,
     discarded_discovery_pins: BTreeMap<CanonicalRegistryHostname, LegacyRegistryDiscoveryPin>,
@@ -1637,7 +1645,11 @@ impl fmt::Display for LockFileMigration {
             "Provider lock format migration: version {} -> version {}",
             self.from, self.to
         )?;
-        writeln!(f, "Lock file: {}", self.path.display())?;
+        writeln!(
+            f,
+            "Lock file: {}",
+            provider_lock_path(&self.project_dir).display()
+        )?;
         if self.discarded_discovery_pins.is_empty() {
             writeln!(
                 f,
@@ -1664,6 +1676,12 @@ impl fmt::Display for LockFileMigration {
                 "Retaining v2 discovery document SHA-256 pending authorization: {}",
                 pin.discovery_sha256
             )?;
+            writeln!(
+                f,
+                "After verifying out of band that discarding this host's legacy discovery values is intended, run `{}`.",
+                ProjectCommand::new("providers repin-discovery", &self.project_dir)
+                    .with_argument(host.as_str())
+            )?;
         }
         writeln!(
             f,
@@ -1675,7 +1693,7 @@ impl fmt::Display for LockFileMigration {
         )?;
         write!(
             f,
-            "Run `carina providers repin-discovery <host>` for each migrated host after verifying the change out of band. The on-disk lock remains unchanged until Carina next saves it."
+            "The on-disk lock remains unchanged until Carina next saves it."
         )
     }
 }
@@ -1770,11 +1788,11 @@ define_lock_file_error! {
         supported: LockFile::CURRENT_VERSION,
     },
     MissingRegistryHostRecord {
-        path: PathBuf,
+        project_dir: PathBuf,
         provider: String,
         hostname: String,
     } => Self::MissingRegistryHostRecord {
-        path: PathBuf::from("carina-providers.lock"),
+        project_dir: PathBuf::from("."),
         provider: "carina-rs/aws".into(),
         hostname: "registry.carina-rs.dev".into(),
     },
@@ -1838,14 +1856,18 @@ impl fmt::Display for LockFileError {
                 "Lock file version {found} uses an older format that this Carina release cannot read; version {supported} is required. This release can migrate version 2 only. Restore a supported lock from version control or backup, or preserve this file for manual recovery."
             ),
             Self::MissingRegistryHostRecord {
-                path,
+                project_dir,
                 provider,
                 hostname,
-            } => write!(
-                f,
-                "Lock file {} records registry provider {provider:?} as resolved through host {hostname:?}, but that host record is missing. The host record must be restored before a normal `carina init` can re-resolve against that host and re-establish the discovery pin.",
-                path.display()
-            ),
+            } => {
+                let path = provider_lock_path(project_dir);
+                write!(
+                    f,
+                    "Lock file {} records registry provider {provider:?} as resolved through host {hostname:?}, but that host record is missing. The host record must be restored before a normal `{}` can re-resolve against that host and re-establish the discovery pin.",
+                    path.display(),
+                    ProjectCommand::new("init", project_dir)
+                )
+            }
             Self::RegistryHostKeyConflict { path, hostname } => write!(
                 f,
                 "Lock file {} contains multiple registry host records that canonicalize to {hostname:?}. Loading cannot choose between their security states; reconcile those host records in place without discarding protection state, or restore the file from version control or backup.",
@@ -1891,6 +1913,7 @@ pub enum LockConstraintError {
         provider: String,
         locked_version: String,
         constraint: String,
+        project_dir: PathBuf,
     },
 }
 
@@ -1902,9 +1925,11 @@ impl fmt::Display for LockConstraintError {
                 provider,
                 locked_version,
                 constraint,
+                project_dir,
             } => write!(
                 f,
-                "Provider '{provider}' locked at version {locked_version}, but constraint '{constraint}' requires a different version.\nRun `carina init --upgrade` to resolve."
+                "Provider '{provider}' locked at version {locked_version}, but constraint '{constraint}' requires a different version.\nRun `{}` to resolve.",
+                ProjectCommand::new("init --upgrade", project_dir)
             ),
         }
     }
@@ -2136,7 +2161,19 @@ impl LockFile {
     /// Parse errors — including an entry that can't be discriminated into a
     /// [`LockEntryKind`] variant — surface as `Err` rather than being silently
     /// collapsed into a default-empty lock.
-    pub fn load(path: &Path) -> Result<Option<LoadedLockFile>, LockFileError> {
+    ///
+    /// `project_dir` is also the user-facing project argument used in
+    /// remediation commands; callers must not derive it from a canonicalized
+    /// lock path.
+    pub fn load(project_dir: &Path) -> Result<Option<LoadedLockFile>, LockFileError> {
+        let path = provider_lock_path(project_dir);
+        let Some(content) = Self::read_from_path(&path)? else {
+            return Ok(None);
+        };
+        Self::parse_toml_str(&content, &path, project_dir).map(Some)
+    }
+
+    fn read_from_path(path: &Path) -> Result<Option<String>, LockFileError> {
         let content = match fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -2147,12 +2184,24 @@ impl LockFile {
                 });
             }
         };
-        Self::parse_toml_str(&content, path).map(Some)
+        Ok(Some(content))
+    }
+
+    #[cfg(test)]
+    fn load_from_path(path: &Path) -> Result<Option<LoadedLockFile>, LockFileError> {
+        let Some(content) = Self::read_from_path(path)? else {
+            return Ok(None);
+        };
+        Self::parse_toml_str(&content, path, resolve_parent(path)).map(Some)
     }
 
     /// Validated parse seam. It is private so callers cannot deserialize a
     /// `LockFile` around the version gate or lose the typed migration event.
-    fn parse_toml_str(content: &str, path: &Path) -> Result<LoadedLockFile, LockFileError> {
+    fn parse_toml_str(
+        content: &str,
+        path: &Path,
+        project_dir: &Path,
+    ) -> Result<LoadedLockFile, LockFileError> {
         let version: LockFileVersion =
             toml::from_str(content).map_err(|source| LockFileError::Parse {
                 path: path.to_path_buf(),
@@ -2177,7 +2226,7 @@ impl LockFile {
                         path: path.to_path_buf(),
                         source,
                     })?;
-                let lock_file = Self::from_unchecked(unchecked, path)?;
+                let lock_file = Self::from_unchecked(unchecked, path, project_dir)?;
                 Ok(LoadedLockFile::Pristine(lock_file))
             }
             2 => {
@@ -2208,11 +2257,12 @@ impl LockFile {
                     legacy.provider,
                     legacy.unpinned_registry_ratchets,
                     path,
+                    project_dir,
                 )?;
                 Ok(LoadedLockFile::Migrated {
                     lock_file,
                     migration: LockFileMigration {
-                        path: path.to_path_buf(),
+                        project_dir: project_dir.to_path_buf(),
                         from: version,
                         to: Self::CURRENT_VERSION,
                         discarded_discovery_pins,
@@ -2228,16 +2278,22 @@ impl LockFile {
 
     #[cfg(test)]
     fn from_toml_str(content: &str, path: &Path) -> Result<Self, LockFileError> {
-        Self::parse_toml_str(content, path).map(LoadedLockFile::into_lock_file)
+        Self::parse_toml_str(content, path, resolve_parent(path))
+            .map(LoadedLockFile::into_lock_file)
     }
 
-    fn from_unchecked(unchecked: UncheckedLockFile, path: &Path) -> Result<Self, LockFileError> {
+    fn from_unchecked(
+        unchecked: UncheckedLockFile,
+        path: &Path,
+        project_dir: &Path,
+    ) -> Result<Self, LockFileError> {
         let registry_host = canonicalize_registry_host_keys(unchecked.registry_host, path)?;
         Self::from_parts(
             registry_host,
             unchecked.provider,
             unchecked.unpinned_registry_ratchets,
             path,
+            project_dir,
         )
     }
 
@@ -2246,6 +2302,7 @@ impl LockFile {
         provider: Vec<LockEntry<RegistryLock>>,
         unpinned_registry_ratchets: UnpinnedRegistryRatchets,
         path: &Path,
+        project_dir: &Path,
     ) -> Result<Self, LockFileError> {
         let unpinned_registry_ratchets =
             unpinned_registry_ratchets
@@ -2261,7 +2318,7 @@ impl LockFile {
             };
             if !registry_host.contains_key(registry.resolved_hostname()) {
                 return Err(LockFileError::MissingRegistryHostRecord {
-                    path: path.to_path_buf(),
+                    project_dir: project_dir.to_path_buf(),
                     provider: canonical_lock_source(&entry.source),
                     hostname: registry.resolved_hostname().to_owned(),
                 });
@@ -2686,13 +2743,13 @@ impl LockFile {
     }
 }
 
-fn load_lock_file(path: &Path) -> Result<Option<LockFile>, LockFileError> {
-    LockFile::load(path).map(|loaded| loaded.map(LoadedLockFile::into_resolution_lock_file))
+fn load_lock_file(project_dir: &Path) -> Result<Option<LockFile>, LockFileError> {
+    LockFile::load(project_dir).map(|loaded| loaded.map(LoadedLockFile::into_resolution_lock_file))
 }
 
 #[cfg(test)]
 fn load_lock_file_for_test(path: &Path) -> Result<Option<LockFile>, LockFileError> {
-    LockFile::load(path).map(|loaded| loaded.map(LoadedLockFile::into_lock_file))
+    LockFile::load_from_path(path).map(|loaded| loaded.map(LoadedLockFile::into_lock_file))
 }
 
 /// The non-ratchet fields and validated sequence proof needed for a final
@@ -2714,11 +2771,16 @@ struct RegistryProviderLockEntry {
 struct PersistentLockFile<'a> {
     lock_file: &'a mut LockFile,
     path: PathBuf,
+    project_dir: PathBuf,
 }
 
 impl<'a> PersistentLockFile<'a> {
-    fn new(lock_file: &'a mut LockFile, path: PathBuf) -> Self {
-        Self { lock_file, path }
+    fn new(lock_file: &'a mut LockFile, project_dir: &Path) -> Self {
+        Self {
+            lock_file,
+            path: provider_lock_path(project_dir),
+            project_dir: project_dir.to_path_buf(),
+        }
     }
 
     fn lock_file(&self) -> &LockFile {
@@ -2761,8 +2823,13 @@ impl<'a> PersistentLockFile<'a> {
             .known_registry_ratchets(&source_key)
             .map_err(|error| error.to_string())?;
         let sequence_anchor = self.lock_file.registry_sequence_anchor(&source_key);
-        let validated =
-            ValidatedRegistryListing::validate(source, versions, &locked, sequence_anchor)?;
+        let validated = ValidatedRegistryListing::validate(
+            source,
+            versions,
+            &locked,
+            sequence_anchor,
+            &self.project_dir,
+        )?;
         let (observations, validated_sequence) = validated.into_parts();
 
         if let Some(observations) = observations {
@@ -2893,7 +2960,7 @@ impl InstalledProvider {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderArtifactProvenance {
     LockFile {
-        lock_path: PathBuf,
+        project_dir: PathBuf,
         pin: LockedProviderPin,
     },
     File {
@@ -2947,11 +3014,13 @@ impl fmt::Display for LockedProviderPin {
 impl fmt::Display for ProviderArtifactProvenance {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProviderArtifactProvenance::LockFile { lock_path, pin } => {
+            ProviderArtifactProvenance::LockFile { project_dir, pin } => {
+                let lock_path = provider_lock_path(project_dir);
                 write!(
                     f,
-                    "provider resolved from {} ({pin}); if this lock is stale, run `carina init --upgrade`",
-                    lock_path.display()
+                    "provider resolved from {} ({pin}); if this lock is stale, run `{}`",
+                    lock_path.display(),
+                    ProjectCommand::new("init --upgrade", project_dir)
                 )
             }
             ProviderArtifactProvenance::File { source } => write!(
@@ -2989,16 +3058,16 @@ impl<E> std::error::Error for ProviderArtifactLoadError<E> where E: std::error::
 
 fn missing_locked_artifact_error(
     base_dir: &Path,
-    lock_path: &Path,
     pin: &LockedProviderPin,
     requested_revision: Option<&str>,
 ) -> String {
+    let command = ProjectCommand::new("init", base_dir);
+    let lock_path = provider_lock_path(base_dir);
     let action = match requested_revision {
-        Some(revision) => format!(
-            "not installed. Run `carina init` in {} to install (revision: {revision})",
-            base_dir.display()
-        ),
-        None => format!("not installed. Run `carina init` in {}", base_dir.display()),
+        Some(revision) => {
+            format!("not installed. Run `{command}` to install (revision: {revision})")
+        }
+        None => format!("not installed. Run `{command}`"),
     };
     format!(
         "{action}\nConsulted {} ({pin}), but its artifact is missing.",
@@ -3061,14 +3130,28 @@ const DEFAULT_REGISTRY_HOST: &str = "registry.carina-rs.dev";
 // observation cannot move that anchor, and true first contact has no numeric base.
 const MAX_SEQUENCE_FAST_FORWARD: u64 = 1_000_000;
 const MAX_SIGNATURE_BUNDLE_BYTES: usize = 1024 * 1024;
-const IDENTITY_REPIN_REMEDIATION: &str = "After verifying out-of-band that the signing-identity change is intended, run `carina providers repin-identity <provider>` to clear only the identity pin, then re-run `carina init` to acquire and verify a new pin.";
-const SEQUENCE_REBOOTSTRAP_REMEDIATION: &str = "After verifying out-of-band that resetting registry freshness is intended, run `carina providers re-bootstrap <provider>` to clear only the persisted sequence observation and anchor, then re-run `carina init`.";
-const DISCOVERY_REPIN_REMEDIATION: &str = "After verifying out-of-band that the change to the pinned discovery values (today, the resolved API base) is intended, run `carina providers repin-discovery <host>` to clear only those host discovery values, then re-run `carina init` to acquire and verify new values.";
+fn identity_repin_remediation(target: &str, project_dir: &Path) -> String {
+    format!(
+        "After verifying out-of-band that the signing-identity change is intended, run `{}` to clear only the identity pin, then re-run `{}` to acquire and verify a new pin.",
+        ProjectCommand::new("providers repin-identity", project_dir).with_argument(target),
+        ProjectCommand::new("init", project_dir),
+    )
+}
 
-fn recovery_remediation(template: &str, target: &str) -> String {
-    template
-        .replace("<provider>", target)
-        .replace("<host>", target)
+fn sequence_rebootstrap_remediation(target: &str, project_dir: &Path) -> String {
+    format!(
+        "After verifying out-of-band that resetting registry freshness is intended, run `{}` to clear only the persisted sequence observation and anchor, then re-run `{}`.",
+        ProjectCommand::new("providers re-bootstrap", project_dir).with_argument(target),
+        ProjectCommand::new("init", project_dir),
+    )
+}
+
+fn discovery_repin_remediation(target: &str, project_dir: &Path) -> String {
+    format!(
+        "After verifying out-of-band that the change to the pinned discovery values (today, the resolved API base) is intended, run `{}` to clear only those host discovery values, then re-run `{}` to acquire and verify new values.",
+        ProjectCommand::new("providers repin-discovery", project_dir).with_argument(target),
+        ProjectCommand::new("init", project_dir),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3315,6 +3398,7 @@ mod registry_listing_validation {
             versions: &RegistryVersions,
             locked: &RegistryRatchets,
             sequence_anchor: RegistrySequenceAnchor,
+            project_dir: &Path,
         ) -> Result<Self, String> {
             let valid_until = versions
                 .valid_until
@@ -3336,20 +3420,16 @@ mod registry_listing_validation {
                         ));
                     };
                     if sequence < previous {
-                        let remediation = recovery_remediation(
-                            SEQUENCE_REBOOTSTRAP_REMEDIATION,
-                            &source.source_key(),
-                        );
+                        let remediation =
+                            sequence_rebootstrap_remediation(&source.source_key(), project_dir);
                         return Err(format!(
                             "registry sequence rollback for {}/{}: previous {}, got {}. {}",
                             source.namespace, source.name, previous, sequence, remediation
                         ));
                     }
                     if sequence.saturating_sub(previous) > MAX_SEQUENCE_FAST_FORWARD {
-                        let remediation = recovery_remediation(
-                            SEQUENCE_REBOOTSTRAP_REMEDIATION,
-                            &source.source_key(),
-                        );
+                        let remediation =
+                            sequence_rebootstrap_remediation(&source.source_key(), project_dir);
                         return Err(format!(
                             "registry sequence fast-forward for {}/{} is too large: established anchor {}, got {}. {}",
                             source.namespace, source.name, previous, sequence, remediation
@@ -3640,12 +3720,12 @@ fn same_consumed_discovery_values(
 fn resolve_registry<H: RegistryHttp>(
     source: &RegistrySource,
     existing_host: Option<&RegistryHostLock>,
+    project_dir: &Path,
     http: &H,
 ) -> Result<ResolvedRegistry, String> {
     let existing_discovery = match existing_host {
         Some(host) => Some(host.authorized_discovery().map_err(|_| {
-            let remediation =
-                recovery_remediation(DISCOVERY_REPIN_REMEDIATION, &source.hostname);
+            let remediation = discovery_repin_remediation(&source.hostname, project_dir);
             format!(
                 "registry discovery for host {} is blocked because its v2 lock-format migration requires operator authorization. {remediation}",
                 source.hostname
@@ -3671,7 +3751,7 @@ fn resolve_registry<H: RegistryHttp>(
         && !same_consumed_discovery_values(existing_pin, &discovery_pin)
     {
         let host = source.hostname.as_str();
-        let remediation = recovery_remediation(DISCOVERY_REPIN_REMEDIATION, host);
+        let remediation = discovery_repin_remediation(host, project_dir);
         return Err(format!(
             "registry pinned discovery values mismatch for host {host}: pinned providers.v1 was {}; resolved providers.v1 is {}. {remediation}",
             existing_pin.api_base_url(),
@@ -3959,6 +4039,7 @@ fn hash_and_check(
     wasm_path: &Path,
     expected_shasum: &str,
     context: &str,
+    project_dir: &Path,
 ) -> Result<Sha256, String> {
     let artifact_digest = sha256_file_digest(wasm_path)
         .map_err(|error| format!("Failed to hash WASM binary: {error}"))?;
@@ -3966,7 +4047,8 @@ fn hash_and_check(
     if actual_hash != expected_shasum {
         let _ = fs::remove_file(wasm_path);
         return Err(format!(
-            "SHA256 mismatch for {context}. Expected registry shasum {expected_shasum}, got {actual_hash}. Re-run `carina init` to re-download."
+            "SHA256 mismatch for {context}. Expected registry shasum {expected_shasum}, got {actual_hash}. Re-run `{}` to re-download.",
+            ProjectCommand::new("init", project_dir)
         ));
     }
     Ok(artifact_digest)
@@ -4057,6 +4139,7 @@ fn verify_or_record_version_cache(
     version: &str,
     name: &str,
     lock_file: &mut LockFile,
+    project_dir: &Path,
 ) -> Result<(), String> {
     let actual_hash =
         sha256_file(binary_path).map_err(|e| format!("Failed to hash binary: {e}"))?;
@@ -4066,8 +4149,13 @@ fn verify_or_record_version_cache(
         Some(entry) => {
             if actual_hash != entry.sha256 {
                 return Err(format!(
-                    "SHA256 mismatch for provider '{}' ({}@{}). Expected: {}, got: {}. Re-run `carina init` to re-download.",
-                    name, source, version, entry.sha256, actual_hash
+                    "SHA256 mismatch for provider '{}' ({}@{}). Expected: {}, got: {}. Re-run `{}` to re-download.",
+                    name,
+                    source,
+                    version,
+                    entry.sha256,
+                    actual_hash,
+                    ProjectCommand::new("init", project_dir)
                 ));
             }
             match &entry.kind {
@@ -4136,7 +4224,7 @@ fn verify_registry_lock_pin(
         .map_err(|error| error.to_string())?;
     let expected_identity = ratchets.signature.expected_identity();
     if ratchets.signature.is_required() && signature.is_none() {
-        let remediation = recovery_remediation(IDENTITY_REPIN_REMEDIATION, &source_key);
+        let remediation = identity_repin_remediation(&source_key, &lock_file.project_dir);
         return Err(format!(
             "the resolved version of {source_key} has no registry signature, but carina-providers.lock records signatures as required for this provider; downgrades from signed to unsigned versions are refused and have no override. {remediation}"
         ));
@@ -4146,7 +4234,7 @@ fn verify_registry_lock_pin(
         if signature.certificate_identity != certificate_identity
             || signature.certificate_oidc_issuer != certificate_oidc_issuer
         {
-            let remediation = recovery_remediation(IDENTITY_REPIN_REMEDIATION, &source_key);
+            let remediation = identity_repin_remediation(&source_key, &lock_file.project_dir);
             return Err(format!(
                 "registry signature identity for {source_key} differs from the carina-providers.lock pin; signature verification has no override. {remediation}"
             ));
@@ -4208,9 +4296,8 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
     http: &H,
 ) -> Result<PathBuf, String> {
     let existing_host = lock_file.registry_host_lock(&source.hostname).cloned();
-    let registry = resolve_registry(source, existing_host.as_ref(), http)?;
-    let lock_path = base_dir.join("carina-providers.lock");
-    let mut persistent_lock = PersistentLockFile::new(lock_file, lock_path);
+    let registry = resolve_registry(source, existing_host.as_ref(), base_dir, http)?;
+    let mut persistent_lock = PersistentLockFile::new(lock_file, base_dir);
     let RecordedRegistryListing {
         versions,
         validated_sequence,
@@ -4285,10 +4372,11 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
             &wasm_path,
             &download.shasum,
             &format!("cached {provider_context}"),
+            base_dir,
         )?
     } else {
         http.download_to_file(&download_url, &wasm_path)?;
-        hash_and_check(&wasm_path, &download.shasum, &provider_context)?
+        hash_and_check(&wasm_path, &download.shasum, &provider_context, base_dir)?
     };
 
     let verified_identity = match signed {
@@ -4397,14 +4485,14 @@ fn resolve_provider_with_http<H: RegistryHttp>(
     // 1. Check local WASM cache first.
     let wasm_path = cache_path_wasm(base_dir, source, version);
     if wasm_path.exists() {
-        verify_or_record_version_cache(&wasm_path, source, version, name, lock_file)?;
+        verify_or_record_version_cache(&wasm_path, source, version, name, lock_file, base_dir)?;
         return Ok(wasm_path);
     }
 
     // 2. Check native binary cache.
     let binary_path = cache_path(base_dir, source, version);
     if binary_path.exists() {
-        verify_or_record_version_cache(&binary_path, source, version, name, lock_file)?;
+        verify_or_record_version_cache(&binary_path, source, version, name, lock_file, base_dir)?;
         return Ok(binary_path);
     }
 
@@ -4543,13 +4631,13 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
         .ok_or_else(|| format!("Provider '{}' has no source", config.name))?;
     let source = canonical_provider_source(source)?;
 
-    let lock_path = base_dir.join("carina-providers.lock");
-    let mut lock_file = load_lock_file(&lock_path)
+    let lock_path = provider_lock_path(base_dir);
+    let mut lock_file = load_lock_file(base_dir)
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
 
     let binary_path = if registry_revision(&source, config)?.is_some() {
-        let version = resolve_version(&source, config, &mut lock_file, &lock_path, false, http)?;
+        let version = resolve_version(base_dir, &source, config, &mut lock_file, false, http)?;
         let path = resolve_provider_with_http(
             base_dir,
             &source,
@@ -4571,7 +4659,7 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
         )?;
         path
     } else {
-        let version = resolve_version(&source, config, &mut lock_file, &lock_path, false, http)?;
+        let version = resolve_version(base_dir, &source, config, &mut lock_file, false, http)?;
         let path = resolve_provider_with_http(
             base_dir,
             &source,
@@ -4659,14 +4747,13 @@ pub fn find_installed_provider(
             });
         }
         return Err(format!(
-            "not installed. Run `carina init` in {}",
-            base_dir.display()
+            "not installed. Run `{}`",
+            ProjectCommand::new("init", base_dir)
         ));
     }
     let source = canonical_provider_source(source)?;
 
-    let lock_path = base_dir.join("carina-providers.lock");
-    let lock_file = load_lock_file(&lock_path)
+    let lock_file = load_lock_file(base_dir)
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
 
@@ -4702,14 +4789,13 @@ pub fn find_installed_provider(
                         path,
                         provider_name: config.name.clone(),
                         provenance: ProviderArtifactProvenance::LockFile {
-                            lock_path: lock_path.clone(),
+                            project_dir: base_dir.to_path_buf(),
                             pin,
                         },
                     });
                 }
                 return Err(missing_locked_artifact_error(
                     base_dir,
-                    &lock_path,
                     &pin,
                     Some(revision),
                 ));
@@ -4732,23 +4818,21 @@ pub fn find_installed_provider(
                         path: wasm_path,
                         provider_name: config.name.clone(),
                         provenance: ProviderArtifactProvenance::LockFile {
-                            lock_path: lock_path.clone(),
+                            project_dir: base_dir.to_path_buf(),
                             pin,
                         },
                     });
                 }
                 return Err(missing_locked_artifact_error(
                     base_dir,
-                    &lock_path,
                     &pin,
                     Some(revision),
                 ));
             }
         }
         return Err(format!(
-            "not installed. Run `carina init` in {} to install (revision: {})",
-            base_dir.display(),
-            revision
+            "not installed. Run `{}` to install (revision: {revision})",
+            ProjectCommand::new("init", base_dir)
         ));
     }
 
@@ -4775,17 +4859,18 @@ pub fn find_installed_provider(
             return Ok(InstalledProvider {
                 path,
                 provider_name: config.name.clone(),
-                provenance: ProviderArtifactProvenance::LockFile { lock_path, pin },
+                provenance: ProviderArtifactProvenance::LockFile {
+                    project_dir: base_dir.to_path_buf(),
+                    pin,
+                },
             });
         }
-        return Err(missing_locked_artifact_error(
-            base_dir, &lock_path, &pin, None,
-        ));
+        return Err(missing_locked_artifact_error(base_dir, &pin, None));
     }
 
     Err(format!(
-        "not installed. Run `carina init` in {}",
-        base_dir.display()
+        "not installed. Run `{}`",
+        ProjectCommand::new("init", base_dir)
     ))
 }
 
@@ -4840,10 +4925,10 @@ fn try_reuse_locked_version(
 
 /// Resolve the exact version to use for a provider.
 fn resolve_version<H: RegistryHttp>(
+    project_dir: &Path,
     source: &str,
     config: &ProviderConfig,
     lock_file: &mut LockFile,
-    lock_path: &Path,
     upgrade: bool,
     http: &H,
 ) -> Result<String, String> {
@@ -4853,10 +4938,10 @@ fn resolve_version<H: RegistryHttp>(
 
     if let ProviderSource::Registry(registry_source) = parse_provider_source(source)? {
         return resolve_registry_version_with_http(
+            project_dir,
             &registry_source,
             config,
             lock_file,
-            lock_path,
             http,
         );
     }
@@ -4884,16 +4969,16 @@ fn resolve_version<H: RegistryHttp>(
 }
 
 fn resolve_registry_version_with_http<H: RegistryHttp>(
+    project_dir: &Path,
     source: &RegistrySource,
     config: &ProviderConfig,
     lock_file: &mut LockFile,
-    lock_path: &Path,
     http: &H,
 ) -> Result<String, String> {
     let existing_host = lock_file.registry_host_lock(&source.hostname).cloned();
-    let registry = resolve_registry(source, existing_host.as_ref(), http)?;
+    let registry = resolve_registry(source, existing_host.as_ref(), project_dir, http)?;
     let RecordedRegistryListing { versions, .. } = {
-        let mut persistent_lock = PersistentLockFile::new(lock_file, lock_path.to_path_buf());
+        let mut persistent_lock = PersistentLockFile::new(lock_file, project_dir);
         fetch_registry_versions(&registry, source, &mut persistent_lock, http)?
     };
     let candidates = SelectableRegistryVersions::from_listing(&versions.versions);
@@ -4930,14 +5015,19 @@ pub enum LockMode {
 /// Orphan lock entries (present in lock, absent in `.crn`) are intentionally
 /// not reported here — they don't block `init` and the normal resolve loop
 /// leaves them in place. `--upgrade` is the way to prune.
+/// `project_dir` is the user-facing project argument rendered in any mismatch
+/// remediation.
 pub fn check_lock_mismatch(
     providers: &[ProviderConfig],
     lock_file: &LockFile,
     mode: LockMode,
+    project_dir: &Path,
 ) -> Result<(), String> {
     if mode == LockMode::Upgrade {
         return Ok(());
     }
+    let mismatch_error =
+        |name, lock_shape, crn_shape| mismatch_error(name, lock_shape, crn_shape, project_dir);
 
     for config in providers {
         let source = match &config.source {
@@ -4954,8 +5044,9 @@ pub fn check_lock_mismatch(
                     return Err(format!(
                         "provider '{}' is declared in .crn but missing from carina-providers.lock\n\
                          hint: running with --locked requires the lock to be committed up-to-date;\n\
-                               re-run without --locked (or `carina init --upgrade`) to populate it.",
-                        config.name
+                               re-run without --locked (or `{}`) to populate it.",
+                        config.name,
+                        ProjectCommand::new("init --upgrade", project_dir)
                     ));
                 }
                 continue;
@@ -5136,14 +5227,15 @@ pub fn check_lock_mismatch(
     Ok(())
 }
 
-fn mismatch_error(name: &str, lock_shape: &str, crn_shape: &str) -> String {
+fn mismatch_error(name: &str, lock_shape: &str, crn_shape: &str, project_dir: &Path) -> String {
     format!(
         "lock file does not match providers.crn\n  \
          provider '{name}':\n    \
          providers.crn:  {crn_shape}\n    \
          lock:           {lock_shape}\n  \
-         hint: run `carina init --upgrade` to resolve providers from the current\n        \
-         configuration and rewrite carina-providers.lock"
+         hint: run `{}` to resolve providers from the current\n        \
+         configuration and rewrite carina-providers.lock",
+        ProjectCommand::new("init --upgrade", project_dir)
     )
 }
 
@@ -5162,15 +5254,15 @@ fn resolve_all_with_http<H: RegistryHttp>(
     mode: LockMode,
     http: &H,
 ) -> Result<HashMap<String, PathBuf>, String> {
-    let lock_path = base_dir.join("carina-providers.lock");
-    let mut lock_file = load_lock_file(&lock_path)
+    let lock_path = provider_lock_path(base_dir);
+    let mut lock_file = load_lock_file(base_dir)
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
 
     // Fail before touching the filesystem if the lock disagrees with .crn.
     // Rewriting the lock requires `--upgrade`; `--locked` tightens this to
     // require every provider to be present in the lock too.
-    check_lock_mismatch(providers, &lock_file, mode)?;
+    check_lock_mismatch(providers, &lock_file, mode, base_dir)?;
 
     let upgrade = mode == LockMode::Upgrade;
     let mut resolved = HashMap::new();
@@ -5236,7 +5328,7 @@ fn resolve_all_with_http<H: RegistryHttp>(
 
         let binary_path = if registry_revision(&source, config)?.is_some() {
             let version =
-                resolve_version(&source, config, &mut lock_file, &lock_path, upgrade, http)?;
+                resolve_version(base_dir, &source, config, &mut lock_file, upgrade, http)?;
             let path = resolve_provider_with_http(
                 base_dir,
                 &source,
@@ -5259,7 +5351,7 @@ fn resolve_all_with_http<H: RegistryHttp>(
             path
         } else {
             let version =
-                resolve_version(&source, config, &mut lock_file, &lock_path, upgrade, http)?;
+                resolve_version(base_dir, &source, config, &mut lock_file, upgrade, http)?;
             let path = resolve_provider_with_http(
                 base_dir,
                 &source,
@@ -5293,8 +5385,7 @@ pub fn validate_lock_constraints(
     base_dir: &Path,
     providers: &[ProviderConfig],
 ) -> Result<(), LockConstraintError> {
-    let lock_path = base_dir.join("carina-providers.lock");
-    let lock_file = match load_lock_file(&lock_path)? {
+    let lock_file = match load_lock_file(base_dir)? {
         Some(lf) => lf,
         None => return Ok(()),
     };
@@ -5323,6 +5414,7 @@ pub fn validate_lock_constraints(
                 provider: config.name.clone(),
                 locked_version: version.clone(),
                 constraint: constraint.raw.clone(),
+                project_dir: base_dir.to_path_buf(),
             });
         }
     }
@@ -5347,6 +5439,22 @@ mod tests {
         "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/versions";
     const REGISTRY_DOWNLOAD_URL: &str =
         "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.5.0/download";
+
+    fn resolve_registry<H: RegistryHttp>(
+        source: &RegistrySource,
+        existing_host: Option<&RegistryHostLock>,
+        http: &H,
+    ) -> Result<ResolvedRegistry, String> {
+        super::resolve_registry(source, existing_host, Path::new("."), http)
+    }
+
+    fn check_lock_mismatch(
+        providers: &[ProviderConfig],
+        lock_file: &LockFile,
+        mode: LockMode,
+    ) -> Result<(), String> {
+        super::check_lock_mismatch(providers, lock_file, mode, Path::new("."))
+    }
 
     fn resolve_api_base_url_for_host(hostname: &str, providers_v1: &str) -> Result<String, String> {
         let discovery_url = registry_discovery_url(hostname)?;
@@ -5653,6 +5761,7 @@ transparency_log_present = false
             &listing,
             &known,
             lock.registry_sequence_anchor("carina-rs/aws"),
+            Path::new("."),
         ) {
             Ok(_) => panic!("an explicitly recorded yank must not be reversible"),
             Err(error) => error,
@@ -6774,7 +6883,7 @@ valid_until_present = false
 signature_present = false
 transparency_log_present = false
 "#,
-            Path::new("carina-providers.lock"),
+            Path::new("infra/foo/carina-providers.lock"),
         )
         .expect_err("a registry entry must not outlive its host record");
 
@@ -6788,9 +6897,13 @@ transparency_log_present = false
         ));
         let rendered = error.to_string();
         assert!(rendered.contains("registry.carina-rs.dev"), "{rendered}");
+        assert!(
+            rendered.contains("Lock file infra/foo/carina-providers.lock"),
+            "{rendered}"
+        );
         assert!(rendered.contains("host record"), "{rendered}");
         assert!(rendered.contains("must be restored"), "{rendered}");
-        assert!(rendered.contains("`carina init`"), "{rendered}");
+        assert!(rendered.contains("`carina init infra/foo`"), "{rendered}");
         assert!(
             rendered.contains("re-resolve against that host"),
             "{rendered}"
@@ -6870,8 +6983,12 @@ transparency_log_present = false
                 "resolved_hostname = \"Registry.Carina-RS.dev\"",
             );
 
-        let loaded = LockFile::parse_toml_str(&serialized, Path::new("carina-providers.lock"))
-            .expect("migration must canonicalize a v2 host key before validating references");
+        let loaded = LockFile::parse_toml_str(
+            &serialized,
+            Path::new("carina-providers.lock"),
+            Path::new("."),
+        )
+        .expect("migration must canonicalize a v2 host key before validating references");
         let (lock, migration) = loaded.into_parts();
 
         assert_eq!(
@@ -6911,8 +7028,12 @@ discovery_pin_present = false
 [[provider]]"#,
             );
 
-        let error = LockFile::parse_toml_str(&serialized, Path::new("carina-providers.lock"))
-            .expect_err("canonicalization must not choose between colliding host security states");
+        let error = LockFile::parse_toml_str(
+            &serialized,
+            Path::new("carina-providers.lock"),
+            Path::new("."),
+        )
+        .expect_err("canonicalization must not choose between colliding host security states");
 
         assert!(matches!(
             &error,
@@ -6927,9 +7048,12 @@ discovery_pin_present = false
 
     #[test]
     fn v2_unpinned_host_migrates_without_authorization_gate() {
-        let loaded =
-            LockFile::parse_toml_str(&unpinned_v2_lock_toml(), Path::new("carina-providers.lock"))
-                .expect("an unpinned v2 host must migrate");
+        let loaded = LockFile::parse_toml_str(
+            &unpinned_v2_lock_toml(),
+            Path::new("carina-providers.lock"),
+            Path::new("."),
+        )
+        .expect("an unpinned v2 host must migrate");
         let (lock, migration) = loaded.into_parts();
         let migration = migration.expect("v2 load must expose migration details");
 
@@ -6980,9 +7104,12 @@ discovery_pin_present = false
 
     #[test]
     fn v2_multi_host_migration_report_lists_every_discarded_pin_once() {
-        let loaded =
-            LockFile::parse_toml_str(&two_host_v2_lock_toml(), Path::new("carina-providers.lock"))
-                .expect("a multi-host v2 lock must migrate");
+        let loaded = LockFile::parse_toml_str(
+            &two_host_v2_lock_toml(),
+            Path::new("infra/foo/carina-providers.lock"),
+            Path::new("infra/foo"),
+        )
+        .expect("a multi-host v2 lock must migrate");
         let (_, migration) = loaded.into_parts();
         let migration = migration.expect("v2 load must expose migration details");
 
@@ -7001,6 +7128,10 @@ discovery_pin_present = false
         );
 
         let report = migration.to_string();
+        assert!(
+            report.contains("Lock file: infra/foo/carina-providers.lock"),
+            "{report}"
+        );
         assert_eq!(
             report.matches("Registry host:").count(),
             2,
@@ -7018,10 +7149,25 @@ discovery_pin_present = false
         );
         assert!(report.contains("legacy-discovery-sha256"), "{report}");
         assert!(report.contains("other-legacy-discovery-sha256"), "{report}");
+        assert!(
+            report.contains("`carina providers repin-discovery registry.carina-rs.dev infra/foo`"),
+            "{report}"
+        );
+        assert!(
+            report.contains("`carina providers repin-discovery registry.example.test infra/foo`"),
+            "{report}"
+        );
+        assert_eq!(
+            report.matches("carina providers repin-discovery").count(),
+            2,
+            "each migrated host must have one concrete recovery command: {report}"
+        );
+        assert!(!report.contains("<host>"), "{report}");
     }
 
     #[test]
     fn migrated_v2_discovery_pin_requires_operator_authorization_before_resolution() {
+        let project_dir = tempfile::tempdir().unwrap();
         let lock = LockFile::from_toml_str(
             fully_protected_v2_lock_toml(),
             Path::new("carina-providers.lock"),
@@ -7036,9 +7182,10 @@ discovery_pin_present = false
             r#"{"providers.v1":"/v2/providers/"}"#,
         );
 
-        let error = resolve_registry(
+        let error = super::resolve_registry(
             &source,
             lock.registry_host.get("registry.carina-rs.dev"),
+            project_dir.path(),
             &http,
         )
         .expect_err("migration must not authorize consuming new discovery values");
@@ -7048,7 +7195,10 @@ discovery_pin_present = false
             "{error}"
         );
         assert!(
-            error.contains("carina providers repin-discovery registry.carina-rs.dev"),
+            error.contains(&format!(
+                "`carina providers repin-discovery registry.carina-rs.dev {}`",
+                project_dir.path().display()
+            )),
             "{error}"
         );
     }
@@ -7060,7 +7210,7 @@ discovery_pin_present = false
         let original = fully_protected_v2_lock_toml();
         fs::write(&lock_path, original).unwrap();
 
-        let loaded = LockFile::load(&lock_path)
+        let loaded = LockFile::load(dir.path())
             .expect("v2 load must succeed")
             .expect("lock must be present");
         let (lock, migration) = loaded.into_parts();
@@ -7319,8 +7469,7 @@ discovery_pin_present = true
                 ProviderSource::Registry(source) => source,
                 ProviderSource::GithubDirect { .. } => unreachable!(),
             };
-            let mut persistent =
-                PersistentLockFile::new(&mut lock, dir.path().join("carina-providers.lock"));
+            let mut persistent = PersistentLockFile::new(&mut lock, dir.path());
             verify_registry_lock_pin(
                 &mut persistent,
                 &source,
@@ -7352,9 +7501,10 @@ discovery_pin_present = true
                 ProviderSource::Registry(source) => source,
                 ProviderSource::GithubDirect { .. } => unreachable!(),
             };
-            let error = match resolve_registry(
+            let error = match super::resolve_registry(
                 &source,
                 lock.registry_host.get(hostname),
+                dir.path(),
                 &FakeRegistryHttp::default().json(
                     "https://registry.carina-rs.dev/.well-known/carina.json",
                     r#"{"providers.v1":"/v1/providers/"}"#,
@@ -7371,7 +7521,10 @@ discovery_pin_present = true
                 "{error}"
             );
             assert!(
-                error.contains("carina providers repin-discovery registry.carina-rs.dev"),
+                error.contains(&format!(
+                    "`carina providers repin-discovery registry.carina-rs.dev {}`",
+                    dir.path().display()
+                )),
                 "{error}"
             );
             assert!(!error.contains(&source.source_key()), "{error}");
@@ -7392,8 +7545,7 @@ discovery_pin_present = true
             "registry.carina-rs.dev",
             "https://registry.carina-rs.dev/v1/providers/",
         );
-        let mut persistent =
-            PersistentLockFile::new(&mut lock, PathBuf::from("carina-providers.lock"));
+        let mut persistent = PersistentLockFile::new(&mut lock, Path::new("."));
         let error = match verify_registry_lock_pin(
             &mut persistent,
             &source,
@@ -7419,6 +7571,7 @@ discovery_pin_present = true
 
     #[test]
     fn discovery_values_mismatch_reports_the_host_and_repin_operation() {
+        let project_dir = tempfile::tempdir().unwrap();
         let source = match parse_provider_source("carina-rs/aws").unwrap() {
             ProviderSource::Registry(source) => source,
             ProviderSource::GithubDirect { .. } => unreachable!(),
@@ -7432,7 +7585,7 @@ discovery_pin_present = true
             "https://registry.carina-rs.dev/.well-known/carina.json",
             r#"{"providers.v1":"/v2/providers/"}"#,
         );
-        let error = resolve_registry(&source, Some(&locked_host), &http)
+        let error = super::resolve_registry(&source, Some(&locked_host), project_dir.path(), &http)
             .expect_err("changed pinned discovery values must trip the host pin");
 
         assert!(
@@ -7448,7 +7601,10 @@ discovery_pin_present = true
             "{error}"
         );
         assert!(
-            error.contains("carina providers repin-discovery registry.carina-rs.dev"),
+            error.contains(&format!(
+                "`carina providers repin-discovery registry.carina-rs.dev {}`",
+                project_dir.path().display()
+            )),
             "{error}"
         );
         assert!(
@@ -8276,8 +8432,7 @@ transparency_log_present = false
             "registry.carina-rs.dev",
             "https://registry.carina-rs.dev/v1/providers/",
         );
-        let lock_path = dir.path().join("carina-providers.lock");
-        let mut persistent = PersistentLockFile::new(&mut lock, lock_path);
+        let mut persistent = PersistentLockFile::new(&mut lock, dir.path());
 
         let error = match verify_registry_lock_pin(
             &mut persistent,
@@ -8293,7 +8448,13 @@ transparency_log_present = false
         };
 
         assert!(error.contains("signed to unsigned"), "{error}");
-        assert!(error.contains("carina providers repin-identity"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "`carina providers repin-identity carina-rs/aws {}`",
+                dir.path().display()
+            )),
+            "{error}"
+        );
     }
 
     #[test]
@@ -8357,6 +8518,7 @@ transparency_log_present = false
             &listing_without_sequence,
             &before,
             lock.registry_sequence_anchor("carina-rs/aws"),
+            Path::new("."),
         ) {
             Ok(_) => panic!("an established sequence anchor must reject a missing sequence"),
             Err(error) => error,
@@ -8382,6 +8544,7 @@ transparency_log_present = false
             &listing_without_sequence,
             &after,
             lock.registry_sequence_anchor("carina-rs/aws"),
+            Path::new("."),
         )
         .expect("re-bootstrap must make a sequence-less listing first contact");
         let (_, validated_sequence) = validated.into_parts();
@@ -8576,21 +8739,36 @@ transparency_log_present = false
 
     #[test]
     fn recovery_remediations_name_operations_without_lock_entry_deletion_advice() {
-        assert!(IDENTITY_REPIN_REMEDIATION.contains("carina providers repin-identity <provider>"));
+        let project_dir = Path::new("infra/foo");
+        let identity = identity_repin_remediation("carina-rs/aws", project_dir);
+        let sequence = sequence_rebootstrap_remediation("carina-rs/aws", project_dir);
+        let discovery = discovery_repin_remediation("registry.carina-rs.dev", project_dir);
         assert!(
-            SEQUENCE_REBOOTSTRAP_REMEDIATION.contains("carina providers re-bootstrap <provider>")
+            identity.contains("`carina providers repin-identity carina-rs/aws infra/foo`"),
+            "{identity}"
         );
-        assert!(DISCOVERY_REPIN_REMEDIATION.contains("carina providers repin-discovery <host>"));
-        for remediation in [
-            IDENTITY_REPIN_REMEDIATION,
-            SEQUENCE_REBOOTSTRAP_REMEDIATION,
-            DISCOVERY_REPIN_REMEDIATION,
-        ] {
+        assert!(
+            sequence.contains("`carina providers re-bootstrap carina-rs/aws infra/foo`"),
+            "{sequence}"
+        );
+        assert!(
+            discovery
+                .contains("`carina providers repin-discovery registry.carina-rs.dev infra/foo`"),
+            "{discovery}"
+        );
+        for remediation in [&identity, &sequence, &discovery] {
             let remediation = remediation.to_ascii_lowercase();
             assert!(!remediation.contains("delete"), "{remediation}");
             assert!(!remediation.contains("remove"), "{remediation}");
             assert!(!remediation.contains("lock entry"), "{remediation}");
         }
+
+        let default = identity_repin_remediation("carina-rs/aws", Path::new("."));
+        assert!(
+            default.contains("`carina providers repin-identity carina-rs/aws`"),
+            "{default}"
+        );
+        assert!(!default.contains("carina-rs/aws ."), "{default}");
     }
 
     #[test]
@@ -8714,11 +8892,11 @@ transparency_log_present = true
                 },
                 &RegistryRatchets::default(),
                 RegistrySequenceAnchor::Unestablished,
+                Path::new("."),
             )
             .unwrap();
             let (_, validated_sequence) = validated.into_parts();
-            let mut persistent =
-                PersistentLockFile::new(&mut lock, PathBuf::from("carina-providers.lock"));
+            let mut persistent = PersistentLockFile::new(&mut lock, Path::new("."));
 
             persistent
                 .upsert_registry_provider(RegistryProviderLockEntry {
@@ -8861,6 +9039,82 @@ transparency_log_present = true
             sha256_file(&file_path).unwrap(),
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
+    }
+
+    #[test]
+    fn registry_checksum_mismatch_hint_uses_project_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir
+            .path()
+            .join("infra/foo/.carina/providers/carina-rs/aws/1.0.0/aws.wasm");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, b"tampered").unwrap();
+
+        let error = hash_and_check(
+            &artifact,
+            "expected-shasum",
+            "cached registry provider 'aws'",
+            Path::new("infra/foo"),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("Re-run `carina init infra/foo` to re-download"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn version_cache_checksum_mismatch_hint_uses_project_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir
+            .path()
+            .join("infra/foo/.carina/providers/github.com/acme/aws/1.0.0/aws.wasm");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, b"tampered").unwrap();
+        let mut lock = LockFile::default();
+        lock.upsert(version_entry("github.com/acme/aws", "1.0.0"));
+
+        let error = verify_or_record_version_cache(
+            &artifact,
+            "github.com/acme/aws",
+            "1.0.0",
+            "aws",
+            &mut lock,
+            Path::new("infra/foo"),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("Re-run `carina init infra/foo` to re-download"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn lock_constraint_hint_uses_project_dir_and_omits_dot() {
+        let render = |project_dir: &Path| {
+            LockConstraintError::ConstraintMismatch {
+                provider: "aws".into(),
+                locked_version: "1.0.0".into(),
+                constraint: "^2".into(),
+                project_dir: project_dir.to_path_buf(),
+            }
+            .to_string()
+        };
+
+        let nested = render(Path::new("infra/foo"));
+        assert!(
+            nested.contains("Run `carina init --upgrade infra/foo` to resolve"),
+            "{nested}"
+        );
+
+        let default = render(Path::new("."));
+        assert!(
+            default.contains("Run `carina init --upgrade` to resolve"),
+            "{default}"
+        );
+        assert!(!default.contains("carina init --upgrade ."), "{default}");
     }
 
     /// `find` and `find_by_source_and_sha` now pattern-match on the kind, so a
@@ -10053,10 +10307,10 @@ transparency_log_present = true
         );
 
         let selected = resolve_registry_version_with_http(
+            dir.path(),
             &source,
             &config,
             &mut lock_file,
-            &lock_path,
             &initial_http,
         )
         .unwrap();
@@ -10076,10 +10330,10 @@ transparency_log_present = true
             r#"{"sequence":5,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
         let selected = resolve_registry_version_with_http(
+            dir.path(),
             &source,
             &config,
             &mut reloaded,
-            &lock_path,
             &rollback_http,
         )
         .expect("an unpinned observation must not become a rollback floor");
@@ -10335,12 +10589,11 @@ transparency_log_present = true
             r#"{"sequence":7,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]},{"version":"0.4.0","protocols":["1"],"yanked":true}]}"#,
         );
 
-        let lock_path = dir.path().join("carina-providers.lock");
         let selected = resolve_registry_version_with_http(
+            dir.path(),
             &source,
             &config,
             &mut lock_file,
-            &lock_path,
             &selection_http,
         )
         .unwrap();
@@ -10528,7 +10781,10 @@ transparency_log_present = true
         assert!(error.contains("no override"), "{error}");
         assert!(error.contains("verifying out-of-band"), "{error}");
         assert!(
-            error.contains("carina providers repin-identity carina-rs/aws"),
+            error.contains(&format!(
+                "`carina providers repin-identity carina-rs/aws {}`",
+                pinned_dir.path().display()
+            )),
             "{error}"
         );
         assert!(!mismatched_http.was_requested("https://downloads.example.test/aws.wasm"));
@@ -10572,7 +10828,10 @@ transparency_log_present = true
         assert!(error.contains("signatures as required"), "{error}");
         assert!(error.contains("verifying out-of-band"), "{error}");
         assert!(
-            error.contains("carina providers repin-identity carina-rs/aws"),
+            error.contains(&format!(
+                "`carina providers repin-identity carina-rs/aws {}`",
+                dir.path().display()
+            )),
             "{error}"
         );
         assert!(!unsigned_http.was_requested("https://downloads.example.test/aws.wasm"));
@@ -11204,7 +11463,10 @@ transparency_log_present = false
             "{error}"
         );
         assert!(
-            error.contains("carina providers repin-discovery registry.carina-rs.dev"),
+            error.contains(&format!(
+                "`carina providers repin-discovery registry.carina-rs.dev {}`",
+                dir.path().display()
+            )),
             "{error}"
         );
         assert!(
@@ -11709,7 +11971,10 @@ transparency_log_present = false
         .unwrap_err();
         assert!(err.contains("sequence"), "{err}");
         assert!(
-            err.contains("carina providers re-bootstrap carina-rs/aws"),
+            err.contains(&format!(
+                "`carina providers re-bootstrap carina-rs/aws {}`",
+                dir.path().display()
+            )),
             "{err}"
         );
     }
@@ -11851,7 +12116,10 @@ transparency_log_present = false
         .unwrap_err();
         assert!(err.contains("sequence fast-forward"), "{err}");
         assert!(
-            err.contains("carina providers re-bootstrap carina-rs/aws"),
+            err.contains(&format!(
+                "`carina providers re-bootstrap carina-rs/aws {}`",
+                dir.path().display()
+            )),
             "{err}"
         );
     }
@@ -11912,7 +12180,10 @@ transparency_log_present = false
             "{err}"
         );
         assert!(
-            err.contains("carina providers repin-identity carina-rs/aws"),
+            err.contains(&format!(
+                "`carina providers repin-identity carina-rs/aws {}`",
+                dir.path().display()
+            )),
             "{err}"
         );
     }
@@ -12546,7 +12817,10 @@ transparency_log_present = false
             .expect_err("the locked revision artifact was deliberately not installed");
         let rendered = error.to_string();
 
-        assert!(rendered.contains("Run `carina init`"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("Run `carina init {}`", base.display())),
+            "{rendered}"
+        );
         assert!(
             rendered.contains(&lock_path.display().to_string()),
             "{rendered}"
@@ -12558,6 +12832,32 @@ transparency_log_present = false
         );
         assert!(!rendered.contains("lock is stale"), "{rendered}");
         assert!(!rendered.contains("carina init --upgrade"), "{rendered}");
+    }
+
+    #[test]
+    fn missing_locked_artifact_init_hint_uses_project_dir_and_omits_dot() {
+        let pin = LockedProviderPin::Revision {
+            revision: "main".into(),
+            resolved_sha: "deadbeefcafe".into(),
+        };
+        let nested = missing_locked_artifact_error(Path::new("infra/foo"), &pin, Some("main"));
+        assert!(
+            nested.contains("Run `carina init infra/foo` to install"),
+            "{nested}"
+        );
+        assert!(
+            nested.contains("Consulted infra/foo/carina-providers.lock"),
+            "{nested}"
+        );
+
+        let default = missing_locked_artifact_error(Path::new("."), &pin, None);
+        assert!(default.contains("Run `carina init`"), "{default}");
+        assert!(
+            default.contains("Consulted ./carina-providers.lock"),
+            "{default}"
+        );
+        assert!(!default.contains("carina init ."), "{default}");
+        assert!(!default.contains("in ."), "{default}");
     }
 
     #[test]
@@ -12585,7 +12885,10 @@ transparency_log_present = false
             .expect_err("the locked version artifact was deliberately not installed");
         let rendered = error.to_string();
 
-        assert!(rendered.contains("Run `carina init`"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("Run `carina init {}`", base.display())),
+            "{rendered}"
+        );
         assert!(
             rendered.contains(&lock_path.display().to_string()),
             "{rendered}"
@@ -12598,10 +12901,9 @@ transparency_log_present = false
 
     #[test]
     fn locked_version_provenance_renders_with_and_without_a_constraint() {
-        let lock_path = PathBuf::from("project/carina-providers.lock");
-        let render = |constraint: Option<&str>| {
+        let render = |constraint: Option<&str>, project_dir: &Path| {
             ProviderArtifactProvenance::LockFile {
-                lock_path: lock_path.clone(),
+                project_dir: project_dir.to_path_buf(),
                 pin: LockedProviderPin::Version {
                     version: "1.2.3".into(),
                     constraint: constraint.map(str::to_string),
@@ -12611,19 +12913,23 @@ transparency_log_present = false
         };
 
         assert_eq!(
-            render(None),
-            "provider resolved from project/carina-providers.lock (version 1.2.3); if this lock is stale, run `carina init --upgrade`"
+            render(None, Path::new("project")),
+            "provider resolved from project/carina-providers.lock (version 1.2.3); if this lock is stale, run `carina init --upgrade project`"
         );
         assert_eq!(
-            render(Some("^1.0")),
-            "provider resolved from project/carina-providers.lock (version 1.2.3, constraint ^1.0); if this lock is stale, run `carina init --upgrade`"
+            render(Some("^1.0"), Path::new("project")),
+            "provider resolved from project/carina-providers.lock (version 1.2.3, constraint ^1.0); if this lock is stale, run `carina init --upgrade project`"
+        );
+        assert_eq!(
+            render(None, Path::new(".")),
+            "provider resolved from ./carina-providers.lock (version 1.2.3); if this lock is stale, run `carina init --upgrade`"
         );
     }
 
     #[test]
     fn locked_registry_revision_provenance_renders_revision_and_version() {
         let provenance = ProviderArtifactProvenance::LockFile {
-            lock_path: PathBuf::from("project/carina-providers.lock"),
+            project_dir: PathBuf::from("project"),
             pin: LockedProviderPin::RegistryRevision {
                 revision: "main".into(),
                 version: "0.0.0-main.10.bbb".into(),
@@ -12632,7 +12938,7 @@ transparency_log_present = false
 
         assert_eq!(
             provenance.to_string(),
-            "provider resolved from project/carina-providers.lock (registry revision main, version 0.0.0-main.10.bbb); if this lock is stale, run `carina init --upgrade`"
+            "provider resolved from project/carina-providers.lock (registry revision main, version 0.0.0-main.10.bbb); if this lock is stale, run `carina init --upgrade project`"
         );
     }
 
@@ -12752,12 +13058,14 @@ transparency_log_present = false
         lock.upsert(version_entry(SRC, "0.5.2"));
         let cfg = versioned_config(SRC, "~0.6.0");
 
-        let err = check_lock_mismatch(&[cfg], &lock, LockMode::Normal)
-            .expect_err("lock version 0.5.2 does not satisfy ~0.6.0 — must error");
+        let err =
+            super::check_lock_mismatch(&[cfg], &lock, LockMode::Normal, Path::new("infra/foo"))
+                .expect_err("lock version 0.5.2 does not satisfy ~0.6.0 — must error");
         assert!(err.contains("awscc"), "{err}");
         assert!(err.contains("0.5.2"), "{err}");
         assert!(err.contains("~0.6.0"), "{err}");
         assert!(err.contains("--upgrade"), "{err}");
+        assert!(err.contains("`carina init --upgrade infra/foo`"), "{err}");
     }
 
     #[test]

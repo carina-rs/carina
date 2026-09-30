@@ -36,12 +36,13 @@ use crate::wiring::{
     reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
     resolve_data_source_refs_for_refresh,
 };
+use carina_core::hint::ProjectCommand;
 
 /// Convert a lock acquisition error into an `AppError`.
 ///
 /// For `Locked` errors, includes a hint about `force-unlock`.
 /// All other backend errors are passed through as `AppError::Backend`.
-pub fn map_lock_error(e: BackendError) -> AppError {
+pub fn map_lock_error(e: BackendError, project_dir: &Path) -> AppError {
     match e {
         BackendError::Locked {
             who,
@@ -49,8 +50,11 @@ pub fn map_lock_error(e: BackendError) -> AppError {
             operation,
         } => AppError::Config(format!(
             "State is locked by {} (lock ID: {}, operation: {})\n\
-             If you believe this is stale, run: carina force-unlock {}",
-            who, lock_id, operation, lock_id
+             If you believe this is stale, run: `{}`",
+            who,
+            lock_id,
+            operation,
+            ProjectCommand::new("force-unlock", project_dir).with_argument(lock_id.as_str())
         )),
         other => AppError::Backend(other),
     }
@@ -966,11 +970,8 @@ pub async fn run_state_refresh(
         &duplicate_declarations,
     )?;
 
-    let verified_backend = verify_for_mutation(
-        base_dir,
-        parsed.backend.as_ref(),
-        DriftCommand::RefreshState,
-    )?;
+    let verified_backend =
+        verify_for_mutation(path, parsed.backend.as_ref(), DriftCommand::RefreshState)?;
 
     // Create backend
     let backend: Box<dyn StateBackend> = verified_backend
@@ -984,7 +985,7 @@ pub async fn run_state_refresh(
         let li = backend
             .acquire_lock("refresh")
             .await
-            .map_err(map_lock_error)?;
+            .map_err(|error| map_lock_error(error, path))?;
         println!("  {} Lock acquired", "✓".green());
         Some(li)
     } else {
@@ -2008,7 +2009,7 @@ mod tests {
     use carina_state::{DeposedInstance, DeposedKey};
     use indexmap::IndexMap;
     use serde_json::json;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     struct ModuleConstraintRefreshBackend {
@@ -2263,6 +2264,24 @@ mod tests {
         );
         assert!(!rendered.contains("unrelated"), "{rendered}");
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn map_lock_error_includes_non_default_project_dir_in_force_unlock_hint() {
+        let error = map_lock_error(
+            BackendError::Locked {
+                who: "another process".to_string(),
+                lock_id: "lock-123".to_string(),
+                operation: "apply".to_string(),
+            },
+            Path::new("infra/foo"),
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "State is locked by another process (lock ID: lock-123, operation: apply)\n\
+             If you believe this is stale, run: `carina force-unlock lock-123 infra/foo`"
+        );
     }
 
     #[derive(Default)]

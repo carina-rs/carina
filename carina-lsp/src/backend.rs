@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -154,9 +154,9 @@ struct ProviderStates {
     /// Directory → ProviderState. Each directory with provider declarations
     /// gets its own state with its own schemas.
     by_dir: HashMap<PathBuf, ProviderState>,
-    /// Reverse import map: module directory → list of caller directories.
+    /// Reverse import map: module directory → sorted set of caller directories.
     /// Used to resolve providers for module files that don't declare their own.
-    import_map: HashMap<PathBuf, Vec<PathBuf>>,
+    import_map: HashMap<PathBuf, BTreeSet<PathBuf>>,
     /// Fallback state for files that don't belong to any config directory.
     empty: ProviderState,
 }
@@ -196,10 +196,6 @@ impl ProviderStates {
         // Check import map for module files
         let canonical = file_path.canonicalize().unwrap_or(file_path.to_path_buf());
         if let Some(callers) = self.import_map.get(&canonical) {
-            // `state_for_path` is shared by formatting, completion, and hover.
-            // Sort here so its caller-state fallback is deterministic.
-            let mut callers: Vec<&PathBuf> = callers.iter().collect();
-            callers.sort();
             for caller_dir in callers {
                 let mut dir = Some(caller_dir.as_path());
                 while let Some(d) = dir {
@@ -972,7 +968,7 @@ mod tests {
             .insert(last_caller.clone(), provider_state("last_rule"));
         states
             .import_map
-            .insert(module.clone(), vec![last_caller, first_caller]);
+            .insert(module.clone(), BTreeSet::from([last_caller, first_caller]));
 
         let state = states.state_for_path(&module);
         let block_names = collect_all_block_names(&state.schemas);

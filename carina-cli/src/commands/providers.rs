@@ -1,11 +1,10 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use carina_provider_resolver::{LockFile, LockFileMigration};
+use carina_provider_resolver::{LockFile, LockFileMigration, provider_lock_path};
 
 use crate::error::AppError;
-
-const PROVIDER_LOCK_FILE: &str = "carina-providers.lock";
+use carina_core::hint::ProjectCommand;
 
 #[derive(clap::Subcommand)]
 pub enum ProvidersCommands {
@@ -70,13 +69,14 @@ pub fn run_providers_command(command: ProvidersCommands) -> Result<(), AppError>
 }
 
 fn load_lock(base_dir: &Path) -> Result<(PathBuf, LockFile, Option<LockFileMigration>), AppError> {
-    let lock_path = base_dir.join(PROVIDER_LOCK_FILE);
-    let loaded = LockFile::load(&lock_path)
+    let lock_path = provider_lock_path(base_dir);
+    let loaded = LockFile::load(base_dir)
         .map_err(|error| AppError::Config(error.to_string()))?
         .ok_or_else(|| {
             AppError::Config(format!(
-                "Provider lock file {} does not exist; run `carina init` first",
-                lock_path.display()
+                "Provider lock file {} does not exist; run `{}` first",
+                lock_path.display(),
+                ProjectCommand::new("init", base_dir)
             ))
         })?;
     let (lock, migration) = loaded.into_parts();
@@ -147,7 +147,8 @@ fn run_repin_discovery(host: &str, force: bool, base_dir: &Path) -> Result<(), A
     recovery.commit();
     save_lock(&lock, &lock_path)?;
     println!(
-        "Registry discovery pin cleared. Run `carina init` to verify discovery and acquire the new host pin."
+        "Registry discovery pin cleared. Run `{}` to verify discovery and acquire the new host pin.",
+        ProjectCommand::new("init", base_dir)
     );
     Ok(())
 }
@@ -177,7 +178,8 @@ fn run_repin_identity(provider: &str, force: bool, base_dir: &Path) -> Result<()
         .map_err(|error| AppError::Config(error.to_string()))?;
     save_lock(&lock, &lock_path)?;
     println!(
-        "Identity pin cleared. Run `carina init` to verify a signed artifact and acquire the new pin."
+        "Identity pin cleared. Run `{}` to verify a signed artifact and acquire the new pin.",
+        ProjectCommand::new("init", base_dir)
     );
     Ok(())
 }
@@ -216,7 +218,8 @@ fn run_rebootstrap(provider: &str, force: bool, base_dir: &Path) -> Result<(), A
         .map_err(|error| AppError::Config(error.to_string()))?;
     save_lock(&lock, &lock_path)?;
     println!(
-        "Registry freshness reset. Run `carina init` to establish a new first-contact anchor."
+        "Registry freshness reset. Run `{}` to establish a new first-contact anchor.",
+        ProjectCommand::new("init", base_dir)
     );
     Ok(())
 }

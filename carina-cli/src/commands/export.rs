@@ -8,6 +8,7 @@ use carina_core::parser::ProviderContext;
 use carina_state::{StateBackend, resolve_backend_for_read};
 
 use crate::error::AppError;
+use carina_core::hint::ProjectCommand;
 
 /// Output format for the export command.
 pub enum OutputFormat {
@@ -48,7 +49,10 @@ pub async fn run_export(
         .map_err(AppError::Backend)?
         .map(|loaded| loaded.into_state())
         .ok_or_else(|| {
-            AppError::Config("No state file found. Run 'carina apply' first.".to_string())
+            AppError::Config(format!(
+                "No state file found. Run `{}` first.",
+                ProjectCommand::new("apply", path)
+            ))
         })?;
 
     let exports = &state_file.exports;

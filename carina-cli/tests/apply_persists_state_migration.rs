@@ -1,8 +1,8 @@
 //! Regression test for carina#3315.
 //!
 //! After carina#3283 improved the v6→current migration warning to promise
-//! the operator that the upgrade "will be rewritten on the next
-//! `carina apply` or `carina state refresh`", an apply with no
+//! the operator that the upgrade "will be rewritten during the next apply
+//! or state refresh of that project", an apply with no
 //! resource diff still left the on-disk state at v6: the no-op path
 //! returned without calling the state writer. The warning then
 //! re-emitted forever on every subsequent plan.

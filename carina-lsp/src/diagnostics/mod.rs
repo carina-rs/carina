@@ -529,8 +529,11 @@ impl DiagnosticEngine {
                             ));
                         }
                     } else if !provider_loaded {
-                        // Provider not downloaded: point at `carina init`,
-                        // not a generic "unknown" message that reads as a typo.
+                        // This directory-scoped provider state has neither a load error
+                        // nor a loaded factory for the provider. It does not prove the
+                        // provider is absent from the workspace: parse failures, scope
+                        // boundaries, and the known discovery gap in carina#3820 can
+                        // also leave it out of this file's configuration.
                         if let Some((line, col)) = self.find_resource_type_position(
                             doc,
                             provider,
@@ -546,7 +549,7 @@ impl DiagnosticEngine {
                                 end_col,
                                 DiagnosticSeverity::ERROR,
                                 format!(
-                                    "Provider '{}' is not downloaded. Run `carina init` to fetch it.",
+                                    "Provider '{}' has no loaded schema for this file: no provider block for it was found in this file's configuration.",
                                     provider
                                 ),
                             ));

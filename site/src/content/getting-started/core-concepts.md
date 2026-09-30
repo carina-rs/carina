@@ -21,9 +21,9 @@ Effects are values you can inspect before anything is executed. Running `carina 
 
 The workflow is always:
 
-1. **Validate** -- `carina validate .` checks syntax and schema without cloud access
-2. **Plan** -- `carina plan .` computes the diff between desired state (`.crn` files) and current state
-3. **Apply** -- `carina apply .` executes the plan
+1. **Validate** -- `carina validate` checks syntax and schema without cloud access
+2. **Plan** -- `carina plan` computes the diff between desired state (`.crn` files) and current state
+3. **Apply** -- `carina apply` executes the plan
 
 This separation ensures you always see what will change before it happens.
 

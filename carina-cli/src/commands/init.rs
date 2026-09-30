@@ -11,6 +11,7 @@ use crate::commands::migrate_state::{MigrationOutcome, SourceDisposition, run_in
 use crate::commands::{
     BackendDriftStatus, drift_warning, ensure_backend_lock, inspect_backend_drift,
 };
+use carina_core::hint::ProjectCommand;
 
 pub async fn run_init(
     path: &Path,
@@ -116,10 +117,10 @@ pub async fn run_init(
             configured,
         } => {
             if !migrate_state {
-                eprintln!("{}", drift_warning(&existing, &configured).yellow());
+                eprintln!("{}", drift_warning(&existing, &configured, path).yellow());
                 migration_pending = true;
             } else {
-                match run_init_migrate_state(base_dir, backend_config, force)
+                match run_init_migrate_state(path, backend_config, force)
                     .await
                     .map_err(|e| e.to_string())?
                 {
@@ -151,8 +152,11 @@ pub async fn run_init(
     if migration_pending {
         println!(
             "{}",
-            "Backend migration pending. Provider plugins resolved; run `carina init --migrate-state .` to complete initialization."
-                .yellow()
+            format!(
+                "Backend migration pending. Provider plugins resolved; run `{}` to complete initialization.",
+                ProjectCommand::new("init --migrate-state", path)
+            )
+            .yellow()
         );
     } else {
         println!("{}", "Initialized successfully.".green());

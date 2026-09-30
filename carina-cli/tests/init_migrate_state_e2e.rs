@@ -34,8 +34,13 @@ fn state_json(lineage: &str, n: usize) -> String {
 }
 
 fn carina(args: &[&str]) -> std::process::Output {
+    carina_in(args, std::path::Path::new("."))
+}
+
+fn carina_in(args: &[&str], current_dir: &std::path::Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_carina"))
         .args(args)
+        .current_dir(current_dir)
         .output()
         .expect("failed to execute carina")
 }
@@ -92,10 +97,20 @@ fn init_then_backend_change_blocks_without_flag_and_migrates_with_it() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
+    let expected_command = format!("carina init --migrate-state {project_str}");
+    assert!(
+        stdout.contains(&expected_command),
+        "migration hint must contain copy-pasteable migration advice, got:\n{stdout}",
+    );
     assert!(
         stderr.contains("Backend configuration changed") && stderr.contains("--migrate-state"),
         "drift warning must name --migrate-state, got:\n{stderr}",
+    );
+    assert!(
+        stderr.contains(&expected_command),
+        "drift warning must contain copy-pasteable migration advice, got:\n{stderr}",
     );
     assert_eq!(
         fs::read_to_string(project.join("carina-backend.lock")).unwrap(),
@@ -140,6 +155,40 @@ fn init_then_backend_change_blocks_without_flag_and_migrates_with_it() {
          stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[test]
+fn migrate_state_defaults_to_current_directory() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path();
+
+    write_project(project, "old.state.json");
+    assert!(
+        carina(&["init", project.to_str().unwrap()])
+            .status
+            .success()
+    );
+    fs::write(project.join("old.state.json"), state_json("lineage-cwd", 1)).unwrap();
+    write_project(project, "new.state.json");
+
+    let out = carina_in(&["init", "--migrate-state"], project);
+    assert!(
+        out.status.success(),
+        "init --migrate-state should default to the current directory.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let new_state = project.join("new.state.json");
+    assert!(new_state.exists(), "state must be migrated to the new path");
+    let migrated = fs::read_to_string(new_state).unwrap();
+    assert!(
+        migrated.contains("lineage-cwd") && migrated.contains("demo-bucket"),
+        "migrated state must preserve lineage and resources, got:\n{migrated}",
+    );
+    assert!(
+        !project.join("old.state.json").exists(),
+        "local source state should be deleted after a verified copy",
     );
 }
 

@@ -501,6 +501,51 @@ broken.test.resource {
 }
 
 #[test]
+fn diff_notes_unavailable_providers_without_changing_exit_semantics() {
+    let project = tempfile::tempdir().unwrap();
+    let main = project.path().join("main.crn");
+    let original = r#"provider broken {
+  source = "https://unsupported.example/provider"
+}
+
+broken.test.resource {
+  description="still format me"
+}
+"#;
+    std::fs::write(&main, original).unwrap();
+
+    let dirty_diff = run_fmt_with_args(project.path(), false, &["--diff"]);
+
+    assert_success(&dirty_diff);
+    assert_eq!(std::fs::read_to_string(&main).unwrap(), original);
+    assert!(
+        String::from_utf8_lossy(&dirty_diff.stdout).contains("1 file(s) would be reformatted.")
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&dirty_diff.stderr)
+            .matches(PROVIDER_WARNING)
+            .count(),
+        1
+    );
+    assert!(!String::from_utf8_lossy(&dirty_diff.stdout).contains(PROVIDER_WARNING));
+
+    let format = run_fmt(project.path(), false);
+    assert_success(&format);
+    assert!(format.stderr.is_empty());
+
+    let clean_diff = run_fmt_with_args(project.path(), false, &["--diff"]);
+
+    assert_success(&clean_diff);
+    assert_eq!(
+        String::from_utf8_lossy(&clean_diff.stderr)
+            .matches(PROVIDER_WARNING)
+            .count(),
+        1
+    );
+    assert!(!String::from_utf8_lossy(&clean_diff.stdout).contains(PROVIDER_WARNING));
+}
+
+#[test]
 fn check_surfaces_unversioned_lock_remediation() {
     let project = tempfile::tempdir().unwrap();
     std::fs::write(

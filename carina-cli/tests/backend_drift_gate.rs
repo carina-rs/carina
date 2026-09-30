@@ -87,6 +87,13 @@ fn write_project(project: &std::path::Path, backend_path: &str, include_resource
 fn write_drift_fixture(include_resource: bool) -> TempDir {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path();
+    write_drift_project(project, include_resource);
+
+    tmp
+}
+
+fn write_drift_project(project: &std::path::Path, include_resource: bool) {
+    fs::create_dir_all(project).unwrap();
     write_project(project, "state.json", include_resource);
 
     fs::create_dir_all(project.join("legacy")).unwrap();
@@ -98,8 +105,6 @@ fn write_drift_fixture(include_resource: bool) -> TempDir {
     local_backend_lock("legacy/state.json")
         .save(project)
         .unwrap();
-
-    tmp
 }
 
 fn write_clean_fixture(include_resource: bool) -> TempDir {
@@ -131,7 +136,7 @@ mod backend_drift_gate {
         let project = tmp.path();
         let before_lock = lock_json(project);
 
-        let output = carina(project, &["init", "."]);
+        let output = carina(project, &["init"]);
 
         assert!(
             output.status.success(),
@@ -140,10 +145,20 @@ mod backend_drift_gate {
             stderr(&output),
         );
         let stderr = stderr(&output);
+        let stdout = stdout(&output);
         assert!(
             stderr.contains("Backend configuration changed")
                 && stderr.contains("carina init --migrate-state"),
             "init drift warning must name the pending migration, got:\n{stderr}",
+        );
+        assert!(
+            !stderr.contains("carina init --migrate-state ."),
+            "bare init must not add a redundant project path, got:\n{stderr}",
+        );
+        assert!(
+            stdout.contains("carina init --migrate-state")
+                && !stdout.contains("carina init --migrate-state ."),
+            "bare init migration note must omit a redundant project path, got:\n{stdout}",
         );
         assert_eq!(
             lock_json(project),
@@ -226,6 +241,34 @@ mod backend_drift_gate {
     }
 
     #[test]
+    fn plan_from_different_cwd_includes_explicit_project_path_in_drift_hints() {
+        let tmp = TempDir::new().unwrap();
+        let project_arg = "infra/foo";
+        let project = tmp.path().join(project_arg);
+        write_drift_project(&project, true);
+
+        let output = carina(tmp.path(), &["plan", "--refresh=false", project_arg]);
+
+        assert!(
+            output.status.success(),
+            "plan should warn and exit 0 on drift.\nstdout: {}\nstderr: {}",
+            stdout(&output),
+            stderr(&output),
+        );
+        let expected = "carina init --migrate-state infra/foo";
+        assert!(
+            stderr(&output).contains(expected),
+            "stderr drift warning must include the explicit project path.\nstderr:\n{}",
+            stderr(&output),
+        );
+        assert!(
+            stdout(&output).contains(expected),
+            "stdout migration note must include the explicit project path.\nstdout:\n{}",
+            stdout(&output),
+        );
+    }
+
+    #[test]
     fn plan_drift_warning_prints_after_plan_summary() {
         let tmp = write_drift_fixture(true);
         let project = tmp.path();
@@ -245,6 +288,14 @@ mod backend_drift_gate {
         let warning_idx = stdout
             .find("Backend migration pending: plan read state from the OLD backend")
             .expect("backend migration warning must be present in stdout");
+        assert!(
+            stdout.contains("carina init --migrate-state"),
+            "migration-pending note must name the migration command, got stdout:\n{stdout}",
+        );
+        assert!(
+            !stdout.contains("carina init --migrate-state ."),
+            "migration-pending note must not include a redundant path argument, got stdout:\n{stdout}",
+        );
         assert!(
             warning_idx > no_changes_idx,
             "warning must appear after the plan summary, got stdout:\n{stdout}",
@@ -293,6 +344,7 @@ mod backend_drift_gate {
         );
         let stderr = stderr(&output);
         assert!(stderr.contains("carina init --migrate-state"));
+        assert!(!stderr.contains("carina init --migrate-state ."));
         assert!(stderr.contains("Cannot apply without first migrating the state"));
         assert!(!stderr.contains("Cannot refresh state without first migrating the state"));
         assert_eq!(
@@ -304,6 +356,27 @@ mod backend_drift_gate {
             !project.join("state.json").exists(),
             "refused apply must not create state at the configured backend path",
         );
+    }
+
+    #[test]
+    fn apply_from_different_cwd_includes_explicit_project_path_in_drift_error() {
+        let tmp = TempDir::new().unwrap();
+        let project_arg = "infra/foo";
+        let project = tmp.path().join(project_arg);
+        write_drift_project(&project, true);
+
+        let output = carina(tmp.path(), &["apply", "--auto-approve", project_arg]);
+
+        assert!(
+            !output.status.success(),
+            "apply must refuse on backend drift"
+        );
+        let stderr = stderr(&output);
+        assert!(
+            stderr.contains("carina init --migrate-state infra/foo"),
+            "apply drift error must include the explicit project path.\nstderr:\n{stderr}",
+        );
+        assert!(stderr.contains("Cannot apply without first migrating the state"));
     }
 
     #[test]
@@ -322,6 +395,14 @@ mod backend_drift_gate {
             stdout(&plan_output),
             stderr(&plan_output),
         );
+        let plan_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(project.join("plan.json")).expect("read saved plan"),
+        )
+        .expect("parse saved plan");
+        let recorded_source_path = plan_json
+            .get("source_path")
+            .and_then(serde_json::Value::as_str)
+            .expect("saved plan source path");
 
         write_project(project, "new/state.json", true);
         let output = carina(project, &["apply", "--auto-approve", "plan.json"]);
@@ -331,7 +412,13 @@ mod backend_drift_gate {
             "saved-plan apply must refuse when current backend config drifted",
         );
         let stderr = stderr(&output);
-        assert!(stderr.contains("carina init --migrate-state"));
+        assert!(
+            stderr.contains(&format!(
+                "carina init --migrate-state {}",
+                recorded_source_path
+            )),
+            "saved-plan drift hint must use the recorded source path.\nstderr:\n{stderr}",
+        );
         assert!(stderr.contains("Cannot apply without first migrating the state"));
     }
 
@@ -528,6 +615,27 @@ mod backend_drift_gate {
             !project.join("state.json").exists(),
             "refused destroy must not create state at the configured backend path",
         );
+    }
+
+    #[test]
+    fn destroy_from_different_cwd_includes_explicit_project_path_in_drift_error() {
+        let tmp = TempDir::new().unwrap();
+        let project_arg = "infra/foo";
+        let project = tmp.path().join(project_arg);
+        write_drift_project(&project, true);
+
+        let output = carina(tmp.path(), &["destroy", "--auto-approve", project_arg]);
+
+        assert!(
+            !output.status.success(),
+            "destroy must refuse on backend drift",
+        );
+        let stderr = stderr(&output);
+        assert!(
+            stderr.contains("carina init --migrate-state infra/foo"),
+            "destroy drift error must include the explicit project path.\nstderr:\n{stderr}",
+        );
+        assert!(stderr.contains("Cannot destroy without first migrating the state"));
     }
 
     #[test]

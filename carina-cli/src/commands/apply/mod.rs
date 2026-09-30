@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use colored::Colorize;
@@ -57,11 +57,21 @@ use crate::wiring::{
     read_with_retry, reconcile_anonymous_identifiers_with_ctx, reconcile_late_anonymous_identities,
     reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
 };
+use carina_core::hint::ProjectCommand;
 
 /// Re-export ExecutionResult as the public API for apply results.
 pub type ApplyResult = ExecutionResult;
 
 type ObserverFactory<'a> = dyn Fn(&Plan) -> Box<dyn ExecutionObserver> + 'a;
+
+#[derive(serde::Deserialize)]
+struct PlanFileHeader {
+    version: u32,
+    #[serde(rename = "timestamp")]
+    _timestamp: serde::de::IgnoredAny,
+    #[serde(default)]
+    source_path: Option<serde_json::Value>,
+}
 
 fn cli_observer_factory(plan: &Plan) -> Box<dyn ExecutionObserver> {
     Box::new(CliObserver::new(plan))
@@ -153,12 +163,14 @@ fn deferred_data_source_reads_from_data_sources(
 fn saved_plan_unresolved_by_resolved_id(
     sorted_resources: &[Resource],
     unresolved_resources: &[Resource],
+    apply_target: ApplyTarget<'_>,
 ) -> Result<HashMap<ResourceId, UnresolvedResource>, AppError> {
     if sorted_resources.len() != unresolved_resources.len() {
         return Err(AppError::Config(format!(
-            "Saved plan resource snapshot mismatch: {} sorted resources but {} unresolved resources. Re-run `carina plan`.",
+            "Saved plan resource snapshot mismatch: {} sorted resources but {} unresolved resources. Re-run `{}`.",
             sorted_resources.len(),
-            unresolved_resources.len()
+            unresolved_resources.len(),
+            apply_target.replan_command()
         )));
     }
 
@@ -169,8 +181,10 @@ fn saved_plan_unresolved_by_resolved_id(
             || resolved.id.provider_instance != unresolved.id.provider_instance
         {
             return Err(AppError::Config(format!(
-                "Saved plan resource snapshot mismatch for {} and {}. Re-run `carina plan`.",
-                resolved.id, unresolved.id
+                "Saved plan resource snapshot mismatch for {} and {}. Re-run `{}`.",
+                resolved.id,
+                unresolved.id,
+                apply_target.replan_command()
             )));
         }
 
@@ -184,8 +198,9 @@ fn saved_plan_unresolved_by_resolved_id(
             .is_some()
         {
             return Err(AppError::Config(format!(
-                "Saved plan contains duplicate resource id {}. Re-run `carina plan`.",
-                resolved.id
+                "Saved plan contains duplicate resource id {}. Re-run `{}`.",
+                resolved.id,
+                apply_target.replan_command()
             )));
         }
     }
@@ -200,7 +215,46 @@ fn can_use_export_only_fast_path(
     !plan.has_mutations() && deferred_data_source_reads.is_empty()
 }
 
-fn check_legacy_name_overrides(state_file: &StateFile, accept: bool) -> Result<(), AppError> {
+#[derive(Clone, Copy)]
+pub(crate) enum ApplyTarget<'a> {
+    Project(&'a Path),
+    SavedPlan {
+        plan_file: &'a Path,
+        source_dir: &'a Path,
+    },
+}
+
+impl<'a> ApplyTarget<'a> {
+    fn source_dir(self) -> &'a Path {
+        match self {
+            Self::Project(dir) => dir,
+            Self::SavedPlan { source_dir, .. } => source_dir,
+        }
+    }
+
+    fn replan_command(self) -> ProjectCommand<'a> {
+        match self {
+            Self::Project(dir) => ProjectCommand::new("plan", dir),
+            Self::SavedPlan {
+                plan_file,
+                source_dir,
+            } => ProjectCommand::new("plan --out", source_dir).with_path_argument(plan_file),
+        }
+    }
+
+    fn apply_path(self) -> &'a Path {
+        match self {
+            Self::Project(dir) => dir,
+            Self::SavedPlan { plan_file, .. } => plan_file,
+        }
+    }
+}
+
+fn check_legacy_name_overrides(
+    state_file: &StateFile,
+    accept: bool,
+    apply_target: ApplyTarget<'_>,
+) -> Result<(), AppError> {
     if !state_file.has_legacy_name_overrides() || accept {
         return Ok(());
     }
@@ -220,10 +274,35 @@ fn check_legacy_name_overrides(state_file: &StateFile, accept: bool) -> Result<(
 
     Err(AppError::Validation(format!(
         "State file contains pre-Phase-5 legacy name overrides without recorded original DSL values for: {}.\n\
-         Run `carina plan` first to inspect the drift, or re-run `carina apply` with \
-         `--accept-legacy-name-overrides` to proceed.",
-        affected.join(", ")
+         Run `{}` first to inspect the drift, or re-run \
+         `{} --accept-legacy-name-overrides` to proceed.",
+        affected.join(", "),
+        apply_target.replan_command(),
+        ProjectCommand::new("apply", apply_target.apply_path())
     )))
+}
+
+/// Recover the project directory recorded by plan versions that stored a
+/// single `.crn` source file. Current plan versions record the directory and
+/// must use that raw path unchanged.
+fn saved_plan_replan_project_dir(source_path: &Path) -> &Path {
+    if source_path
+        .extension()
+        .is_some_and(|extension| extension == "crn")
+    {
+        source_path.parent().unwrap_or_else(|| Path::new(""))
+    } else {
+        source_path
+    }
+}
+
+fn saved_plan_replan_command(plan_path: &Path, source_path: &Path) -> String {
+    ApplyTarget::SavedPlan {
+        plan_file: plan_path,
+        source_dir: saved_plan_replan_project_dir(source_path),
+    }
+    .replan_command()
+    .to_string()
 }
 
 /// Execute all effects in a plan, resolving references dynamically.
@@ -323,9 +402,10 @@ async fn execute_effects_with_observer(
 async fn verify_upstream_snapshot(
     sources: &[crate::commands::plan::UpstreamSource],
     snapshot: &HashMap<String, HashMap<String, Value>>,
-    base_dir: &std::path::Path,
+    apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
     use carina_core::parser::UpstreamState;
+    let project_dir = apply_target.source_dir();
     let upstream_states: Vec<UpstreamState> = sources
         .iter()
         .map(|s| UpstreamState {
@@ -334,17 +414,17 @@ async fn verify_upstream_snapshot(
         })
         .collect();
     let provider_context = ProviderContext::default();
-    let mut cycle_guard = super::plan::seed_cycle_guard(base_dir);
+    let mut cycle_guard = super::plan::seed_cycle_guard(project_dir);
     let current = super::plan::load_upstream_states(
         &upstream_states,
-        base_dir,
+        project_dir,
         &provider_context,
         &mut cycle_guard,
         super::plan::UpstreamMissingStatePolicy::Strict,
     )
     .await?;
 
-    diff_upstream_snapshot(snapshot, &current).map_err(AppError::Config)
+    diff_upstream_snapshot(snapshot, &current, apply_target).map_err(AppError::Config)
 }
 
 /// Pure comparison between a planned snapshot and a freshly-loaded
@@ -356,21 +436,24 @@ async fn verify_upstream_snapshot(
 fn diff_upstream_snapshot(
     snapshot: &HashMap<String, HashMap<String, Value>>,
     current: &HashMap<String, HashMap<String, Value>>,
+    apply_target: ApplyTarget<'_>,
 ) -> Result<(), String> {
     for (binding, planned_attrs) in snapshot {
         match current.get(binding) {
             None => {
                 return Err(format!(
                     "upstream_state '{}' was present at plan time but is missing now. \
-                     Re-run 'carina plan' to capture the current upstream view.",
-                    binding
+                     Re-run `{}` to capture the current upstream view.",
+                    binding,
+                    apply_target.replan_command()
                 ));
             }
             Some(current_attrs) if current_attrs != planned_attrs => {
                 return Err(format!(
                     "upstream_state '{}' has drifted since the plan was created. \
-                     Re-run 'carina plan' so the apply uses the values it was computed against.",
-                    binding
+                     Re-run `{}` so the apply uses the values it was computed against.",
+                    binding,
+                    apply_target.replan_command()
                 ));
             }
             Some(_) => {}
@@ -380,8 +463,9 @@ fn diff_upstream_snapshot(
         if !snapshot.contains_key(binding) {
             return Err(format!(
                 "upstream_state '{}' was added since the plan was created. \
-                 Re-run 'carina plan' so the apply sees the new upstream binding.",
-                binding
+                 Re-run `{}` so the apply sees the new upstream binding.",
+                binding,
+                apply_target.replan_command()
             ));
         }
     }
@@ -412,7 +496,10 @@ mod upstream_snapshot_tests {
                 .into_iter()
                 .collect();
         let current = snapshot.clone();
-        assert!(diff_upstream_snapshot(&snapshot, &current).is_ok());
+        assert!(
+            diff_upstream_snapshot(&snapshot, &current, ApplyTarget::Project(Path::new(".")))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -428,7 +515,8 @@ mod upstream_snapshot_tests {
             vec![binding("network", &[("vpc_id", "vpc-B")])]
                 .into_iter()
                 .collect();
-        let err = diff_upstream_snapshot(&snapshot, &current).expect_err("must fail");
+        let err = diff_upstream_snapshot(&snapshot, &current, ApplyTarget::Project(Path::new(".")))
+            .expect_err("must fail");
         assert!(
             err.contains("network"),
             "error must name the binding: {err}"
@@ -443,7 +531,8 @@ mod upstream_snapshot_tests {
                 .into_iter()
                 .collect();
         let current: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        let err = diff_upstream_snapshot(&snapshot, &current).expect_err("must fail");
+        let err = diff_upstream_snapshot(&snapshot, &current, ApplyTarget::Project(Path::new(".")))
+            .expect_err("must fail");
         assert!(err.contains("missing now"), "got: {err}");
     }
 
@@ -454,14 +543,17 @@ mod upstream_snapshot_tests {
             vec![binding("network", &[("vpc_id", "vpc-A")])]
                 .into_iter()
                 .collect();
-        let err = diff_upstream_snapshot(&snapshot, &current).expect_err("must fail");
+        let err = diff_upstream_snapshot(&snapshot, &current, ApplyTarget::Project(Path::new(".")))
+            .expect_err("must fail");
         assert!(err.contains("added since"), "got: {err}");
     }
 
     #[test]
     fn empty_both_sides_passes() {
         let empty: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        assert!(diff_upstream_snapshot(&empty, &empty).is_ok());
+        assert!(
+            diff_upstream_snapshot(&empty, &empty, ApplyTarget::Project(Path::new("."))).is_ok()
+        );
     }
 }
 
@@ -635,7 +727,7 @@ pub(crate) async fn save_state_unlocked_after_execute(
 /// would skip the writer entirely and leave the on-disk version
 /// stuck at the older schema — which is the bug reported in
 /// carina#3315 and which makes carina#3283's "Disk state will be
-/// rewritten on the next `carina apply` or `carina state refresh`"
+/// rewritten during the next apply or state refresh of that project."
 /// warning text a lie.
 ///
 /// Persistence happens exactly once per state file's schema lifetime:
@@ -717,10 +809,11 @@ pub(crate) async fn persist_exports_only(
 ///
 /// Returns `Ok(None)` if no drift is detected, or `Ok(Some(messages))` with drift details.
 /// Returns `Err` if a resource is missing from planned_states or if a provider read fails.
-pub async fn detect_drift(
+pub(crate) async fn detect_drift(
     sorted_resources: &[Resource],
     planned_states: &HashMap<ResourceId, State>,
     provider: &dyn Provider,
+    apply_target: ApplyTarget<'_>,
 ) -> Result<Option<Vec<String>>, AppError> {
     let mut drift_detected = false;
     let mut drift_messages: Vec<String> = Vec::new();
@@ -804,8 +897,9 @@ pub async fn detect_drift(
         } else {
             return Err(AppError::Config(format!(
                 "Resource {} is present in plan but missing from planned states. \
-                 The plan file may be corrupted. Please re-run 'carina plan'.",
-                resource.id
+                 The plan file may be corrupted. Please re-run `{}`.",
+                resource.id,
+                apply_target.replan_command()
             )));
         }
     }
@@ -815,6 +909,13 @@ pub async fn detect_drift(
     } else {
         Ok(None)
     }
+}
+
+fn drift_replan_hint(apply_target: ApplyTarget<'_>) -> String {
+    format!(
+        "Please re-run `{}` to create a new plan that reflects the current state.",
+        apply_target.replan_command()
+    )
 }
 
 pub async fn run_apply(
@@ -873,8 +974,7 @@ async fn run_apply_with_observer_factory(
         &duplicate_declarations,
     )?;
 
-    let verified_backend =
-        verify_for_mutation(base_dir, parsed.backend.as_ref(), DriftCommand::Apply)?;
+    let verified_backend = verify_for_mutation(path, parsed.backend.as_ref(), DriftCommand::Apply)?;
 
     // Check for backend configuration - use local backend by default
     let backend: Box<dyn StateBackend> = verified_backend
@@ -1077,7 +1177,7 @@ async fn run_apply_with_observer_factory(
             backend
                 .acquire_lock("apply")
                 .await
-                .map_err(map_lock_error)?,
+                .map_err(|error| map_lock_error(error, path))?,
         );
         println!("  {} Lock acquired", "✓".green());
     } else {
@@ -1098,7 +1198,7 @@ async fn run_apply_with_observer_factory(
         auto_approve,
         backend.as_ref(),
         lock_info.as_ref(),
-        base_dir,
+        path,
         provider_context,
         cancel.clone(),
         observer_factory,
@@ -1139,7 +1239,7 @@ async fn run_apply_locked(
     auto_approve: bool,
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
-    base_dir: &std::path::Path,
+    project_dir: &Path,
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_>,
@@ -1150,10 +1250,15 @@ async fn run_apply_locked(
     // lifted an older on-disk schema in memory, persist the upgrade
     // under the current lock before any short-circuit path can return
     // — otherwise the carina#3283 warning text ("Disk state will be
-    // rewritten on the next `carina apply`...") becomes a lie.
+    // rewritten during the next apply or state refresh of that project.")
+    // becomes a lie.
     let mut state_file = load_state_persist_if_migrated(backend, lock).await?;
     if let Some(state) = state_file.as_ref() {
-        check_legacy_name_overrides(state, accept_legacy_name_overrides)?;
+        check_legacy_name_overrides(
+            state,
+            accept_legacy_name_overrides,
+            ApplyTarget::Project(project_dir),
+        )?;
     }
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
@@ -1193,10 +1298,10 @@ async fn run_apply_locked(
     // upstream.arn`) can be substituted before `create_provider` crosses
     // the WASM boundary (carina#3182). Order matters: load upstream
     // first, then resolve, then build the provider.
-    let mut cycle_guard = super::plan::seed_cycle_guard(base_dir);
+    let mut cycle_guard = super::plan::seed_cycle_guard(project_dir);
     let remote_bindings = super::plan::load_upstream_states(
         &parsed.upstream_states,
-        base_dir,
+        project_dir,
         provider_context,
         &mut cycle_guard,
         super::plan::UpstreamMissingStatePolicy::Strict,
@@ -1213,7 +1318,7 @@ async fn run_apply_locked(
     .map_err(|e| AppError::Config(format!("Provider attribute resolution error: {}", e)))?;
 
     // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(ctx, parsed, base_dir).await?;
+    let provider = get_provider_with_ctx(ctx, parsed, project_dir).await?;
 
     // carina#3132: `sorted_resources` is `mut` because deferred-for
     // expansion now runs post-refresh (after phase-2, below) via the
@@ -1892,6 +1997,7 @@ async fn run_apply_locked(
 fn ensure_saved_plan_backend_matches_current(
     plan_backend_config: Option<&carina_core::parser::BackendConfig>,
     current_backend_config: Option<&carina_core::parser::BackendConfig>,
+    apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
     let planned = BackendLock::for_config(plan_backend_config)
         .map_err(|e| AppError::Config(format!("Failed to inspect saved plan backend: {e}")))?;
@@ -1904,14 +2010,15 @@ fn ensure_saved_plan_backend_matches_current(
         Err(AppError::Config(format!(
             "Saved plan backend does not match the current `backend.crn`.\n\
              The plan file recorded one backend, but the project now declares another.\n\
-             Re-run `carina plan` to produce a fresh saved plan before applying.\n{}",
+             Re-run `{}` to produce a fresh saved plan before applying.\n{}",
+            apply_target.replan_command(),
             planned.describe_diff(&current)
         )))
     }
 }
 
 pub async fn run_apply_from_plan(
-    plan_path: &PathBuf,
+    plan_path: &Path,
     auto_approve: bool,
     lock: bool,
     parallelism: NonZeroUsize,
@@ -1935,7 +2042,7 @@ pub async fn run_apply_from_plan(
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_with_observer_factory(
-    plan_path: &PathBuf,
+    plan_path: &Path,
     auto_approve: bool,
     lock: bool,
     parallelism: NonZeroUsize,
@@ -1944,11 +2051,41 @@ async fn run_apply_from_plan_with_observer_factory(
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_>,
 ) -> Result<(), AppError> {
-    // Read and deserialize the plan file
-    let content =
-        fs::read_to_string(plan_path).map_err(|e| format!("Failed to read plan file: {}", e))?;
-    let plan_file: PlanFile =
-        serde_json::from_str(&content).map_err(|e| format!("Failed to parse plan file: {}", e))?;
+    let bytes = fs::read(plan_path).map_err(|source| AppError::PlanFileRead {
+        path: plan_path.to_path_buf(),
+        source,
+    })?;
+    let header: PlanFileHeader =
+        serde_json::from_slice(&bytes).map_err(|source| match source.classify() {
+            serde_json::error::Category::Data => AppError::InvalidPlanFile {
+                path: plan_path.to_path_buf(),
+                source,
+            },
+            serde_json::error::Category::Syntax
+            | serde_json::error::Category::Eof
+            | serde_json::error::Category::Io => AppError::UnreadableJsonPlanFile {
+                path: plan_path.to_path_buf(),
+                source,
+            },
+        })?;
+    if bytes
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        != Some(b'{')
+    {
+        return Err(AppError::InvalidPlanFile {
+            path: plan_path.to_path_buf(),
+            source: <serde_json::Error as serde::de::Error>::custom(
+                "expected a top-level JSON object",
+            ),
+        });
+    }
+    let replan_command = header
+        .source_path
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
     // Validate version compatibility. Plan-file version 10 persists
     // `Effect::Delete.generation`; older binaries would silently
@@ -1977,14 +2114,26 @@ async fn run_apply_from_plan_with_observer_factory(
     // view as the live-apply path (carina#3246). Older plans cannot be
     // applied by the post-#3248 binding-construction path and are
     // rejected outright per the repo's no-backward-compat policy.
-    if plan_file.version != PlanFile::CURRENT_VERSION {
-        return Err(AppError::Config(format!(
-            "Unsupported plan file version: {} (expected {}). \
-             Re-run 'carina plan' to produce a plan in the current format.",
-            plan_file.version,
-            PlanFile::CURRENT_VERSION
-        )));
+    if header.version != PlanFile::CURRENT_VERSION {
+        return Err(AppError::UnsupportedPlanVersion {
+            path: plan_path.to_path_buf(),
+            found: header.version,
+            expected: PlanFile::CURRENT_VERSION,
+            replan_command,
+        });
     }
+
+    let plan_file: PlanFile =
+        serde_json::from_slice(&bytes).map_err(|source| AppError::CorruptPlanFile {
+            path: plan_path.to_path_buf(),
+            replan_command,
+            source,
+        })?;
+    let source_path = std::path::PathBuf::from(&plan_file.source_path);
+    let apply_target = ApplyTarget::SavedPlan {
+        plan_file: plan_path,
+        source_dir: &source_path,
+    };
     plan_file
         .validate_replace_display()
         .map_err(AppError::Config)?;
@@ -1994,7 +2143,7 @@ async fn run_apply_from_plan_with_observer_factory(
         println!(
             "{}",
             format!(
-                "Warning: plan was created with carina {} but current version is {}",
+                "Warning: plan was created with carina version {} but current version is {}",
                 plan_file.carina_version, current_version
             )
             .yellow()
@@ -2010,7 +2159,6 @@ async fn run_apply_from_plan_with_observer_factory(
         .cyan()
     );
 
-    let source_path = std::path::PathBuf::from(&plan_file.source_path);
     let base_dir = get_base_dir(&source_path);
     let current_config = load_configuration_with_config(
         &source_path,
@@ -2026,13 +2174,14 @@ async fn run_apply_from_plan_with_observer_factory(
         return Err(crate::commands::collapse_errors(duplicate_errors));
     }
     let verified_backend = verify_for_mutation(
-        base_dir,
+        &source_path,
         current_config.parsed.backend.as_ref(),
         DriftCommand::Apply,
     )?;
     ensure_saved_plan_backend_matches_current(
         plan_file.backend_config.as_ref(),
         current_config.parsed.backend.as_ref(),
+        apply_target,
     )?;
 
     // Set up backend
@@ -2047,7 +2196,7 @@ async fn run_apply_from_plan_with_observer_factory(
         let li = backend
             .acquire_lock("apply")
             .await
-            .map_err(map_lock_error)?;
+            .map_err(|error| map_lock_error(error, &source_path))?;
         println!("  {} Lock acquired", "✓".green());
         Some(li)
     } else {
@@ -2065,7 +2214,7 @@ async fn run_apply_from_plan_with_observer_factory(
         auto_approve,
         backend.as_ref(),
         lock_info.as_ref(),
-        base_dir,
+        apply_target,
         cancel.clone(),
         observer_factory,
         parallelism,
@@ -2103,12 +2252,13 @@ async fn run_apply_from_plan_locked(
     auto_approve: bool,
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
-    base_dir: &std::path::Path,
+    apply_target: ApplyTarget<'_>,
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_>,
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
+    let project_dir = apply_target.source_dir();
     // Read current state and validate lineage. carina#3315: a
     // pending in-memory schema migration must be persisted under
     // the apply lock so the carina#3283 warning text matches
@@ -2123,7 +2273,7 @@ async fn run_apply_from_plan_locked(
             Some(carina_state::LoadedState::Migrated { state, info }) => (Some(state), Some(info)),
         };
     if let Some(state) = state_file.as_ref() {
-        check_legacy_name_overrides(state, accept_legacy_name_overrides)?;
+        check_legacy_name_overrides(state, accept_legacy_name_overrides, apply_target)?;
     }
 
     if let Some(ref state) = state_file {
@@ -2188,11 +2338,12 @@ async fn run_apply_from_plan_locked(
 
     // Create provider early for drift detection
     let (provider, ctx) =
-        create_providers_from_configs(&plan_file.provider_configs, base_dir).await?;
+        create_providers_from_configs(&plan_file.provider_configs, project_dir).await?;
 
     // Drift detection: re-read actual infrastructure state and compare against planned states
     println!("{}", "Checking for infrastructure drift...".cyan());
-    let drift_result = detect_drift(sorted_resources, &planned_states, &provider).await?;
+    let drift_result =
+        detect_drift(sorted_resources, &planned_states, &provider, apply_target).await?;
 
     if let Some(drift_messages) = drift_result {
         println!();
@@ -2206,11 +2357,7 @@ async fn run_apply_from_plan_locked(
             println!("{}", msg);
         }
         println!();
-        println!(
-            "{}",
-            "Please re-run 'carina plan' to create a new plan that reflects the current state."
-                .yellow()
-        );
+        println!("{}", drift_replan_hint(apply_target).yellow());
         return Err(AppError::Config(
             "Apply aborted due to infrastructure drift.".to_string(),
         ));
@@ -2285,7 +2432,12 @@ async fn run_apply_from_plan_locked(
     // plan-time and apply-time values during cascade re-resolution.
     let upstream_snapshot = plan_file.upstream_snapshot.clone();
     if !plan_file.upstream_sources.is_empty() {
-        verify_upstream_snapshot(&plan_file.upstream_sources, &upstream_snapshot, base_dir).await?;
+        verify_upstream_snapshot(
+            &plan_file.upstream_sources,
+            &upstream_snapshot,
+            apply_target,
+        )
+        .await?;
     }
     // Rebuild the wait passthrough aliases from the persisted
     // `(binding, target)` pairs so `apply --plan`'s cascade
@@ -2330,8 +2482,11 @@ async fn run_apply_from_plan_locked(
     // Build unresolved resource map for re-resolution at apply time from
     // the saved pre-resolution snapshot, keyed by the paired sorted
     // resource IDs rather than the unresolved snapshot's own identity.
-    let unresolved_resources =
-        saved_plan_unresolved_by_resolved_id(sorted_resources, &plan_file.unresolved_resources)?;
+    let unresolved_resources = saved_plan_unresolved_by_resolved_id(
+        sorted_resources,
+        &plan_file.unresolved_resources,
+        apply_target,
+    )?;
     // Same object in both positions: `ProviderRouter` is both the
     // `Provider` and the `ProviderNormalizer`, so apply re-normalizes
     // with the plan-time normalizer (carina#3060).
@@ -2364,7 +2519,7 @@ async fn run_apply_from_plan_locked(
     let resources_finished = Instant::now();
 
     // Build schemas for write-only attribute persistence
-    let (factories, _) = build_factories_from_providers(&plan_file.provider_configs, base_dir)?;
+    let (factories, _) = build_factories_from_providers(&plan_file.provider_configs, project_dir)?;
     let ctx = WiringContext::new(factories);
 
     let skipped_exports = finalize_after_execute(

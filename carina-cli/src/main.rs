@@ -1,5 +1,6 @@
+use std::io::ErrorKind;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{CompleteEnv, Shell, generate};
@@ -9,7 +10,7 @@ use carina_cli::commands;
 use carina_cli::commands::apply::{run_apply, run_apply_from_plan};
 use carina_cli::commands::destroy::run_destroy;
 use carina_cli::commands::docs;
-use carina_cli::commands::fmt::run_fmt;
+use carina_cli::commands::fmt::{FmtMode, run_fmt};
 use carina_cli::commands::lint::run_lint;
 use carina_cli::commands::module::{ModuleCommands, run_module_command};
 use carina_cli::commands::plan::run_plan;
@@ -87,7 +88,7 @@ enum Commands {
     },
     /// Apply changes to reach the desired state
     Apply {
-        /// Path to directory containing .crn files
+        /// Path to a project directory or a plan file written by `carina plan --out`
         #[arg(default_value = ".")]
         path: PathBuf,
 
@@ -161,7 +162,7 @@ enum Commands {
         #[arg(long, short)]
         check: bool,
 
-        /// Show diff of formatting changes
+        /// Show the formatting diff without writing files
         #[arg(long)]
         diff: bool,
 
@@ -263,6 +264,35 @@ enum SkillsCommands {
     Uninstall,
     /// Show install status and version comparison
     Status,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyInput<'a> {
+    Project(&'a Path),
+    SavedPlan(&'a Path),
+}
+
+fn classify_apply_input(path: &Path) -> Result<ApplyInput<'_>, error::AppError> {
+    match path.metadata() {
+        Ok(metadata) if metadata.is_dir() => Ok(ApplyInput::Project(path)),
+        Ok(_) => Ok(ApplyInput::SavedPlan(path)),
+        Err(source) if source.kind() == ErrorKind::NotFound => match path.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(error::AppError::ApplyInputDanglingSymlink {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
+            _ => Err(error::AppError::ApplyInputNotFound {
+                path: path.to_path_buf(),
+                source,
+            }),
+        },
+        Err(source) => Err(error::AppError::ApplyInputInspection {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 /// Create the parser configuration with AWS KMS decryptor.
@@ -378,21 +408,10 @@ async fn main() {
                 lock,
                 parallelism,
                 accept_legacy_name_overrides,
-            } => {
-                if path.extension().is_some_and(|ext| ext == "json") {
+            } => match classify_apply_input(&path) {
+                Ok(ApplyInput::SavedPlan(plan_path)) => {
                     run_apply_from_plan(
-                        &path,
-                        auto_approve,
-                        lock,
-                        parallelism,
-                        accept_legacy_name_overrides,
-                        &provider_context,
-                        shutdown.clone(),
-                    )
-                    .await
-                } else {
-                    run_apply(
-                        &path,
+                        plan_path,
                         auto_approve,
                         lock,
                         parallelism,
@@ -402,7 +421,20 @@ async fn main() {
                     )
                     .await
                 }
-            }
+                Ok(ApplyInput::Project(project_path)) => {
+                    run_apply(
+                        project_path,
+                        auto_approve,
+                        lock,
+                        parallelism,
+                        accept_legacy_name_overrides,
+                        &provider_context,
+                        shutdown.clone(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            },
             Commands::Destroy {
                 path,
                 auto_approve,
@@ -439,7 +471,7 @@ async fn main() {
                 check,
                 diff,
                 recursive,
-            } => run_fmt(&path, check, diff, recursive),
+            } => run_fmt(&path, FmtMode::from_flags(check, diff), recursive),
             Commands::Module { command } => run_module_command(command, &provider_context),
             Commands::ForceUnlock { lock_id, path } => {
                 run_force_unlock(&lock_id, &path, &provider_context).await
@@ -729,6 +761,78 @@ mod error_format_tests {
     #[test]
     fn plan_check_iam_flag_parses() {
         assert!(Cli::try_parse_from(["carina", "plan", "--check-iam"]).is_ok());
+    }
+
+    #[test]
+    fn plan_out_before_project_path_parses() {
+        let cli =
+            Cli::try_parse_from(["carina", "plan", "--out", "reviewed-plan.json", "infra/foo"])
+                .expect("plan --out <file> <dir> should parse");
+
+        match cli.command {
+            Commands::Plan { path, out, .. } => {
+                assert_eq!(path, PathBuf::from("infra/foo"));
+                assert_eq!(out, Some(PathBuf::from("reviewed-plan.json")));
+            }
+            _ => panic!("expected plan command"),
+        }
+    }
+
+    #[test]
+    fn plan_out_path_prefixed_to_protect_leading_dash_parses() {
+        let cli = Cli::try_parse_from([
+            "carina",
+            "plan",
+            "--out",
+            "./-reviewed-plan.json",
+            "infra/foo",
+        ])
+        .expect("a leading-dash --out value protected with ./ should parse");
+
+        match cli.command {
+            Commands::Plan { path, out, .. } => {
+                assert_eq!(path, PathBuf::from("infra/foo"));
+                assert_eq!(out, Some(PathBuf::from("./-reviewed-plan.json")));
+            }
+            _ => panic!("expected plan command"),
+        }
+    }
+
+    #[test]
+    fn force_unlock_accepts_leading_dash_lock_id_after_option_terminator() {
+        let cli = Cli::try_parse_from(["carina", "force-unlock", "--", "-lock-id", "infra/foo"])
+            .expect("force-unlock should accept a leading-dash lock ID after --");
+
+        match cli.command {
+            Commands::ForceUnlock { lock_id, path } => {
+                assert_eq!(lock_id, "-lock-id");
+                assert_eq!(path, PathBuf::from("infra/foo"));
+            }
+            _ => panic!("expected force-unlock command"),
+        }
+    }
+
+    #[test]
+    fn saved_plan_apply_accepts_legacy_override_flag_after_plan_path() {
+        let cli = Cli::try_parse_from([
+            "carina",
+            "apply",
+            "reviewed-plan.json",
+            "--accept-legacy-name-overrides",
+        ])
+        .expect("saved-plan apply should accept the legacy override flag");
+
+        match cli.command {
+            Commands::Apply {
+                path,
+                accept_legacy_name_overrides,
+                ..
+            } => {
+                assert_eq!(path, PathBuf::from("reviewed-plan.json"));
+                assert!(accept_legacy_name_overrides);
+            }
+            _ => panic!("expected apply command"),
+        }
     }
 
     #[test]

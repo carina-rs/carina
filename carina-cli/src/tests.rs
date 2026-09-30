@@ -21,7 +21,8 @@ use carina_state::{
 };
 
 use crate::commands::apply::{
-    ApplyResult, detect_drift, finalize_apply, refresh_pending_states, save_state_locked,
+    ApplyResult, ApplyTarget, detect_drift, finalize_apply, refresh_pending_states,
+    save_state_locked,
 };
 use crate::commands::plan::{CurrentStateEntry, PlanFile};
 use crate::commands::shared::finalize::StatePersistence;
@@ -1264,7 +1265,13 @@ async fn detect_drift_errors_when_resource_missing_from_planned_states() {
     // planned_states is empty - resource is missing
     let planned_states: HashMap<ResourceId, State> = HashMap::new();
 
-    let result = detect_drift(&[resource], &planned_states, &provider).await;
+    let result = detect_drift(
+        &[resource],
+        &planned_states,
+        &provider,
+        ApplyTarget::Project(std::path::Path::new(".")),
+    )
+    .await;
 
     assert!(
         result.is_err(),
@@ -1296,7 +1303,13 @@ async fn detect_drift_returns_none_when_no_drift() {
     let provider = TestProvider::with_read_state(&id, identifier, state.clone());
     let planned_states = HashMap::from([(id.clone(), state)]);
 
-    let result = detect_drift(&[resource], &planned_states, &provider).await;
+    let result = detect_drift(
+        &[resource],
+        &planned_states,
+        &provider,
+        ApplyTarget::Project(std::path::Path::new(".")),
+    )
+    .await;
 
     assert!(result.is_ok());
     assert!(result.unwrap().is_none(), "Should detect no drift");
@@ -1330,7 +1343,13 @@ async fn detect_drift_returns_messages_when_drift_detected() {
     let provider = TestProvider::with_read_state(&id, identifier, actual);
     let planned_states = HashMap::from([(id.clone(), planned)]);
 
-    let result = detect_drift(&[resource], &planned_states, &provider).await;
+    let result = detect_drift(
+        &[resource],
+        &planned_states,
+        &provider,
+        ApplyTarget::Project(std::path::Path::new(".")),
+    )
+    .await;
 
     assert!(result.is_ok());
     let messages = result.unwrap();

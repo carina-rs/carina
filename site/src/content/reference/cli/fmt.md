@@ -10,7 +10,7 @@ Format `.crn` files. The formatter aligns attributes within each block and appli
 carina fmt [OPTIONS] [PATH]
 ```
 
-**PATH** defaults to `.` (current directory). May be a single `.crn` file or a directory.
+**PATH** defaults to `.` (current directory). It must be a directory — single-file paths are rejected. Without `--recursive`, only the `.crn` files directly inside PATH are formatted.
 
 ## Flags
 
@@ -20,11 +20,11 @@ Exit with a non-zero status if any file would be reformatted. Does not modify fi
 
 ### `--diff`
 
-Print the formatting diff to stdout instead of rewriting the file.
+Print the formatting diff to stdout without rewriting any files. Combine with `--check` to also exit non-zero when any file would be reformatted.
 
 ### `--recursive`, `-r`
 
-When PATH is a directory, recurse into subdirectories and format every `.crn` file found.
+Recurse into subdirectories of PATH and include every `.crn` file found.
 
 ## Examples
 
@@ -34,26 +34,26 @@ Format every `.crn` file in the current directory:
 carina fmt
 ```
 
-Format a single file:
+Format the `.crn` files in another directory:
 
 ```bash
-carina fmt main.crn
+carina fmt infra/network
 ```
 
 Format every `.crn` under the current tree:
 
 ```bash
-carina fmt --recursive .
+carina fmt --recursive
 ```
 
 Show the diff without writing changes:
 
 ```bash
-carina fmt --diff main.crn
+carina fmt --diff
 ```
 
 Verify formatting in CI:
 
 ```bash
-carina fmt --check --recursive .
+carina fmt --check --recursive
 ```

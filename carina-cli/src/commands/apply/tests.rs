@@ -1052,7 +1052,7 @@ async fn apply_reads_module_data_source_and_resolves_consumer_interpolation() {
         true,
         fixture.backend(),
         None,
-        get_base_dir(fixture.config_path()),
+        fixture.config_path(),
         fixture.provider_context(),
         fixture.cancel_token(),
         &observer_factory,
@@ -1301,7 +1301,10 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         true,
         fixture.backend(),
         None,
-        tmp.path(),
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: tmp.path(),
+        },
         fixture.cancel_token(),
         &observer_factory,
         NonZeroUsize::new(4).unwrap(),
@@ -1414,7 +1417,10 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         true,
         fixture.backend(),
         None,
-        tmp.path(),
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: tmp.path(),
+        },
         fixture.cancel_token(),
         &observer_factory,
         NonZeroUsize::new(1).unwrap(),
@@ -1468,7 +1474,10 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         true,
         fixture.backend(),
         None,
-        tmp.path(),
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: tmp.path(),
+        },
         fixture.cancel_token(),
         &observer_factory,
         NonZeroUsize::new(1).unwrap(),
@@ -1541,21 +1550,87 @@ async fn live_apply_noop_rejects_unconsumed_module_constraint() {
 fn apply_refuses_v7_state_without_accept_flag() {
     let state = legacy_override_state();
 
-    let err =
-        check_legacy_name_overrides(&state, false).expect_err("legacy state must require opt-in");
+    let err = check_legacy_name_overrides(&state, false, ApplyTarget::Project(Path::new(".")))
+        .expect_err("legacy state must require opt-in");
 
     assert!(matches!(err, AppError::Validation(_)));
     let msg = err.to_string();
     assert!(msg.contains("mock.test.resource.legacy"));
     assert!(msg.contains("carina plan"));
-    assert!(msg.contains("--accept-legacy-name-overrides"));
+    assert!(msg.contains("carina apply --accept-legacy-name-overrides"));
+}
+
+#[test]
+fn legacy_override_hint_names_live_project_apply_target() {
+    let state = legacy_override_state();
+    let project_dir = Path::new("infra/foo");
+
+    let err = check_legacy_name_overrides(&state, false, ApplyTarget::Project(project_dir))
+        .expect_err("legacy state must require opt-in");
+    let msg = err.to_string();
+
+    assert!(msg.contains("Run `carina plan infra/foo` first"), "{msg}");
+    assert!(!msg.contains("--out"), "{msg}");
+    assert!(
+        msg.contains("re-run `carina apply infra/foo --accept-legacy-name-overrides`"),
+        "{msg}",
+    );
+}
+
+#[test]
+fn legacy_override_hint_names_saved_plan_apply_target() {
+    let state = legacy_override_state();
+
+    let err = check_legacy_name_overrides(
+        &state,
+        false,
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("reviewed-plan.json"),
+            source_dir: Path::new("/canonical/project"),
+        },
+    )
+    .expect_err("legacy state must require opt-in");
+    let msg = err.to_string();
+
+    assert!(
+        msg.contains("Run `carina plan --out reviewed-plan.json /canonical/project` first"),
+        "{msg}",
+    );
+    assert!(
+        msg.contains("re-run `carina apply reviewed-plan.json --accept-legacy-name-overrides`"),
+        "{msg}",
+    );
+    assert!(!msg.contains("carina apply /canonical/project"), "{msg}");
+}
+
+#[test]
+fn saved_plan_drift_hint_regenerates_the_applied_plan_file() {
+    assert_eq!(
+        drift_replan_hint(ApplyTarget::SavedPlan {
+            plan_file: Path::new("reviewed-plan.json"),
+            source_dir: Path::new("infra/foo"),
+        }),
+        "Please re-run `carina plan --out reviewed-plan.json infra/foo` to create a new plan that reflects the current state."
+    );
+}
+
+#[test]
+fn live_apply_drift_hint_does_not_add_saved_plan_output() {
+    let hint = drift_replan_hint(ApplyTarget::Project(Path::new("infra/foo")));
+
+    assert_eq!(
+        hint,
+        "Please re-run `carina plan infra/foo` to create a new plan that reflects the current state."
+    );
+    assert!(!hint.contains("--out"));
 }
 
 #[test]
 fn apply_proceeds_with_accept_flag_against_legacy_state() {
     let state = legacy_override_state();
 
-    check_legacy_name_overrides(&state, true).expect("accept flag should permit legacy state");
+    check_legacy_name_overrides(&state, true, ApplyTarget::Project(Path::new(".")))
+        .expect("accept flag should permit legacy state");
 }
 
 #[test]
@@ -1631,7 +1706,7 @@ fn apply_does_not_require_flag_after_v7_to_v8_migration() {
     .expect("writeback should migrate legacy override");
 
     assert!(!migrated.has_legacy_name_overrides());
-    check_legacy_name_overrides(&migrated, false)
+    check_legacy_name_overrides(&migrated, false, ApplyTarget::Project(Path::new(".")))
         .expect("second apply should not require the legacy accept flag");
 }
 
@@ -2772,13 +2847,20 @@ fn saved_plan_backend_cross_check_rejects_non_addressing_attribute_change() {
     let planned = s3_backend_config_with_encrypt(false);
     let current = s3_backend_config_with_encrypt(true);
 
-    let err = ensure_saved_plan_backend_matches_current(Some(&planned), Some(&current))
-        .expect_err("any backend attribute change should invalidate a saved plan");
+    let err = ensure_saved_plan_backend_matches_current(
+        Some(&planned),
+        Some(&current),
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("reviewed-plan.json"),
+            source_dir: Path::new("infra/foo"),
+        },
+    )
+    .expect_err("any backend attribute change should invalidate a saved plan");
     let msg = err.to_string();
 
     assert!(msg.contains("Saved plan backend does not match the current `backend.crn`"));
     assert!(msg.contains("The plan file recorded one backend"));
-    assert!(msg.contains("Re-run `carina plan`"));
+    assert!(msg.contains("Re-run `carina plan --out reviewed-plan.json infra/foo`"));
 }
 
 #[test]
@@ -4622,7 +4704,101 @@ mod saved_plan_version_tests {
     //! no-backward-compat policy — re-running `carina plan` is the
     //! supported migration path.
 
+    use std::path::Path;
+
     use tempfile::TempDir;
+
+    use super::{ApplyTarget, PlanFileHeader, saved_plan_replan_project_dir};
+
+    #[tokio::test]
+    async fn future_saved_plan_without_source_path_is_rejected_by_version() {
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("future-plan");
+        std::fs::write(&plan_path, r#"{"version":99,"timestamp":"x"}"#).expect("write future plan");
+
+        let result = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await;
+
+        let error = result.expect_err("future saved plan must be rejected by version");
+        let crate::error::AppError::UnsupportedPlanVersion {
+            path: error_path,
+            found,
+            expected,
+            replan_command,
+        } = &error
+        else {
+            panic!("expected typed unsupported-version error, got: {error}");
+        };
+        assert_eq!(error_path, &plan_path);
+        assert_eq!(*found, 99);
+        assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
+        assert_eq!(replan_command, &None);
+
+        let message = error.to_string();
+        assert!(
+            message.contains("Unsupported plan file version: 99"),
+            "version must be checked without requiring source_path: {message}",
+        );
+        assert!(
+            message
+                .contains("Re-create the plan with plan --out from the project that produced it"),
+            "missing source_path must use source-agnostic guidance: {message}",
+        );
+        assert!(
+            !message.contains("is not a Carina plan file") && !message.contains("`carina plan"),
+            "future plans without source_path must not be misclassified or use a guessed command: {message}",
+        );
+    }
+
+    #[tokio::test]
+    async fn current_saved_plan_without_source_path_is_corrupt_without_command() {
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("current-plan");
+        let malformed = serde_json::json!({
+            "version": crate::commands::plan::PlanFile::CURRENT_VERSION,
+            "timestamp": "x",
+            "foo": 1,
+        });
+        std::fs::write(
+            &plan_path,
+            serde_json::to_vec(&malformed).expect("serialize malformed plan"),
+        )
+        .expect("write malformed plan");
+
+        let result = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await;
+
+        let message = result
+            .expect_err("malformed current plan must be reported as corrupt")
+            .to_string();
+        assert!(
+            message.contains("The plan file may be corrupted")
+                && message.contains(
+                    "Re-create the plan with plan --out from the project that produced it"
+                ),
+            "missing source_path must use corruption guidance without a command: {message}",
+        );
+        assert!(
+            !message.contains("is not a Carina plan file") && !message.contains("`carina plan"),
+            "a recognized current-version plan must not be misclassified or use a guessed command: {message}",
+        );
+    }
 
     /// A `version: 3` saved plan must be rejected by
     /// `run_apply_from_plan` with a message that names the expected
@@ -4642,7 +4818,7 @@ mod saved_plan_version_tests {
             "version": 3,
             "carina_version": "0.4.0",
             "timestamp": "2026-05-24T00:00:00Z",
-            "source_path": "test.crn",
+            "source_path": "infra/nested/main.crn",
             "state_lineage": null,
             "state_serial": null,
             "provider_configs": [],
@@ -4682,9 +4858,41 @@ mod saved_plan_version_tests {
             msg.contains(&expected),
             "error must name the expected version, got: {msg}",
         );
+        let expected_replan = format!(
+            "Re-run `carina plan --out {} infra/nested`",
+            plan_path.display()
+        );
         assert!(
-            msg.contains("Re-run 'carina plan'"),
-            "error must point the user at the supported migration path, got: {msg}",
+            msg.contains(&expected_replan),
+            "version-mismatch hint must regenerate the same saved plan, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn old_recorded_crn_source_uses_parent_directory_for_replan_hint() {
+        let source_path = Path::new("infra/nested/main.crn");
+
+        assert_eq!(
+            ApplyTarget::SavedPlan {
+                plan_file: Path::new("reviewed-plan.json"),
+                source_dir: saved_plan_replan_project_dir(source_path),
+            }
+            .replan_command()
+            .to_string(),
+            "carina plan --out reviewed-plan.json infra/nested"
+        );
+    }
+
+    #[test]
+    fn current_saved_plan_replan_hint_keeps_recorded_source_path() {
+        assert_eq!(
+            ApplyTarget::SavedPlan {
+                plan_file: Path::new("reviewed-plan.json"),
+                source_dir: Path::new("infra/nested/main.crn"),
+            }
+            .replan_command()
+            .to_string(),
+            "carina plan --out reviewed-plan.json infra/nested/main.crn"
         );
     }
 
@@ -4696,7 +4904,7 @@ mod saved_plan_version_tests {
             "version": 10,
             "carina_version": "0.4.0",
             "timestamp": "2026-07-02T00:00:00Z",
-            "source_path": "test.crn",
+            "source_path": "infra/nested",
             "state_lineage": null,
             "state_serial": null,
             "provider_configs": [],
@@ -4725,6 +4933,21 @@ mod saved_plan_version_tests {
         .await;
 
         let err = result.expect_err("v10 saved plan must be rejected after v11 bump");
+        let crate::error::AppError::UnsupportedPlanVersion {
+            path: error_path,
+            found,
+            expected,
+            replan_command,
+        } = &err
+        else {
+            panic!("expected typed unsupported-version error, got: {err}");
+        };
+        assert_eq!(error_path, &plan_path);
+        assert_eq!(*found, 10);
+        assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
+        let expected_replan = format!("carina plan --out {} infra/nested", plan_path.display());
+        assert_eq!(replan_command.as_deref(), Some(expected_replan.as_str()));
+
         let msg = err.to_string();
         assert!(
             msg.contains("Unsupported plan file version: 10"),
@@ -4735,8 +4958,145 @@ mod saved_plan_version_tests {
             "error must name the v11 expected version, got: {msg}",
         );
         assert!(
-            msg.contains("Re-run 'carina plan'"),
-            "error must point the user at re-planning, got: {msg}",
+            msg.contains(&format!("Re-run `{expected_replan}`")),
+            "error must include the path-aware re-plan command, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_plan_decode_rejects_legacy_import_shape_by_version() {
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("reviewed-plan");
+        let import_id = carina_core::resource::ResolvedResourceId::new(
+            carina_core::resource::ResourceId::with_identity("mock.test.resource", "legacy"),
+        );
+        let legacy_v4 = serde_json::json!({
+            "version": 4,
+            "carina_version": "0.4.0",
+            "timestamp": "2026-05-24T00:00:00Z",
+            "source_path": "infra/nested",
+            "state_lineage": null,
+            "state_serial": null,
+            "provider_configs": [],
+            "backend_config": null,
+            "plan": {
+                "effects": [{
+                    "Import": {
+                        "id": import_id,
+                        "identifier": "legacy-provider-id"
+                    }
+                }]
+            },
+            "sorted_resources": [],
+            "unresolved_resources": [],
+            "compositions": [],
+            "data_sources": [],
+            "current_states": [],
+            "upstream_snapshot": {},
+            "upstream_sources": [],
+            "wait_bindings": [],
+        });
+        std::fs::write(
+            &plan_path,
+            serde_json::to_string(&legacy_v4).expect("serialize legacy plan"),
+        )
+        .expect("write legacy plan");
+
+        let result = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await;
+
+        let message = result
+            .expect_err("legacy saved plan must be rejected by the version gate")
+            .to_string();
+        let current_version = crate::commands::plan::PlanFile::CURRENT_VERSION;
+        assert!(
+            message.contains(&format!(
+                "Unsupported plan file version: 4 (expected {current_version})"
+            )),
+            "legacy wire shapes must reach the version gate: {message}",
+        );
+        assert!(
+            message.contains(&format!(
+                "Re-run `carina plan --out {} infra/nested`",
+                plan_path.display()
+            )),
+            "version error must include the recorded source path: {message}",
+        );
+        assert!(
+            !message.contains("is not a Carina plan file"),
+            "a recognized older plan must not be called a non-plan file: {message}",
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_plan_decode_reports_malformed_current_version_as_corrupt() {
+        let dir = TempDir::new().expect("tempdir");
+        let plan_path = dir.path().join("reviewed-plan");
+        let malformed = serde_json::json!({
+            "version": crate::commands::plan::PlanFile::CURRENT_VERSION,
+            "carina_version": "0.4.0",
+            "timestamp": "2026-07-02T00:00:00Z",
+            "source_path": "infra/nested",
+            "state_lineage": null,
+            "state_serial": null,
+            "provider_configs": [],
+            "backend_config": null,
+            "plan": { "effects": "not-an-array" },
+            "sorted_resources": [],
+            "unresolved_resources": [],
+            "compositions": [],
+            "data_sources": [],
+            "current_states": [],
+            "upstream_snapshot": {},
+            "upstream_sources": [],
+            "wait_bindings": [],
+        });
+        std::fs::write(
+            &plan_path,
+            serde_json::to_string(&malformed).expect("serialize malformed plan"),
+        )
+        .expect("write malformed plan");
+
+        let result = crate::commands::apply::run_apply_from_plan(
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::default(),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await;
+
+        let message = result
+            .expect_err("malformed current-version plan must be rejected")
+            .to_string();
+        assert!(
+            message.contains("The plan file may be corrupted. Re-run"),
+            "current-version structural errors must be reported as corruption: {message}",
+        );
+        assert!(
+            message.contains("line") && message.contains("column"),
+            "body decode errors must retain their source location: {message}",
+        );
+        assert!(
+            message.contains(&format!(
+                "`carina plan --out {} infra/nested`",
+                plan_path.display()
+            )),
+            "corruption error must include the replan command: {message}",
+        );
+        assert!(
+            !message.contains("is not a Carina plan file"),
+            "a recognized current-version plan must not be called a non-plan file: {message}",
         );
     }
 
@@ -4814,6 +5174,27 @@ mod saved_plan_version_tests {
         };
         let json = serde_json::to_value(&plan_file).expect("plan file should serialize");
         (dir, plan_path, json)
+    }
+
+    #[test]
+    fn saved_plan_header_decodes_from_current_serialized_plan_file() {
+        let (_dir, _plan_path, json) = replacement_plan_json();
+        let serialized = serde_json::to_vec(&json).expect("real plan must serialize");
+
+        let header: PlanFileHeader =
+            serde_json::from_slice(&serialized).expect("real plan must decode as a header");
+
+        assert_eq!(
+            header.version,
+            crate::commands::plan::PlanFile::CURRENT_VERSION
+        );
+        assert_eq!(
+            header
+                .source_path
+                .as_ref()
+                .and_then(serde_json::Value::as_str),
+            json.get("source_path").and_then(serde_json::Value::as_str)
+        );
     }
 
     async fn rejected_saved_plan_message(

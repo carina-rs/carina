@@ -2167,11 +2167,7 @@ fn warning_when_provider_loaded_but_schema_missing() {
 }
 
 #[test]
-fn error_when_provider_not_loaded_at_all() {
-    // Provider completely unknown — not in provider_names, not in errors.
-    // Message should point at the missing download, not a generic "Unknown
-    // resource type" (which misleads the user into searching for typos in a
-    // name that is actually correct — see issue #2005).
+fn error_when_provider_has_no_loaded_schema_for_file_configuration() {
     let engine = DiagnosticEngine::new(Arc::new(SchemaRegistry::new()), vec![], Arc::new(vec![]));
     let doc = create_document(
         r#"awscc.iam.role {
@@ -2182,18 +2178,22 @@ fn error_when_provider_not_loaded_at_all() {
 
     let diagnostics = engine.analyze(&doc, None);
 
-    let not_downloaded = diagnostics.iter().find(|d| {
-        d.message.contains("Provider 'awscc' is not downloaded")
-            && d.message.contains("carina init")
-    });
+    let expected = "Provider 'awscc' has no loaded schema for this file: no provider block for it was found in this file's configuration.";
+    let unavailable = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message == expected);
     assert!(
-        not_downloaded.is_some(),
-        "Provider-not-downloaded case should say so explicitly, not 'Unknown resource type'. Got: {:?}",
+        unavailable.is_some(),
+        "a provider absent from this file's loaded configuration should be distinguished from an unknown resource type. Got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
     assert_eq!(
-        not_downloaded.unwrap().severity,
+        unavailable.unwrap().severity,
         Some(DiagnosticSeverity::ERROR)
+    );
+    assert!(
+        !unavailable.unwrap().message.contains("carina init"),
+        "a missing-schema diagnostic must not suggest initialization"
     );
 
     // And the old generic message should no longer fire for this case.
@@ -2202,7 +2202,7 @@ fn error_when_provider_not_loaded_at_all() {
         .find(|d| d.message == "Unknown resource type: awscc.iam.role");
     assert!(
         generic_unknown.is_none(),
-        "Should not emit generic 'Unknown resource type' when the provider itself is not downloaded. Got: {:?}",
+        "Should not emit generic 'Unknown resource type' when the provider is absent from the file's loaded configuration. Got: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
