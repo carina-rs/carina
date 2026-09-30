@@ -4287,6 +4287,25 @@ fn parse_removed_block() {
 }
 
 #[test]
+fn empty_removed_identity_reports_its_source_line_and_preserves_the_cause() {
+    let input = r#"
+removed { from = mock.test.resource "" }
+"#;
+
+    let error = parse(input, &ProviderContext::default())
+        .expect_err("an empty removed-block identity must be rejected");
+
+    assert_eq!(
+        error.to_string(),
+        "Invalid expression at line 2: resource identity cannot be empty"
+    );
+    assert!(
+        std::error::Error::source(&error).is_some(),
+        "the typed ResourceIdentityError must remain in the source chain"
+    );
+}
+
+#[test]
 fn parse_moved_block() {
     let input = r#"
         moved {

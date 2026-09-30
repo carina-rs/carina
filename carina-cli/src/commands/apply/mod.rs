@@ -1122,7 +1122,7 @@ async fn run_apply_with_observer_factory(
                         .ok_or("Backend does not specify a resource type")?;
                     let bucket_resource_name = parsed
                         .find_resource_by_attr(backend_resource_type, "bucket", &bucket_name)
-                        .and_then(|r| r.id.identity_str().map(str::to_string))
+                        .and_then(|r| r.id.identity().cloned())
                         .ok_or_else(|| {
                             format!(
                                 "Auto-injected state bucket resource '{}' not found after re-parse",
@@ -1271,7 +1271,7 @@ async fn run_apply_locked(
             &|provider, resource_type| {
                 sf.resources_by_type(provider, resource_type)
                     .into_iter()
-                    .map(|r| r.identity.clone())
+                    .map(|r| r.identity.to_string())
                     .collect()
             },
             &state_block_claims,
@@ -1915,7 +1915,7 @@ async fn run_apply_locked(
 
     // Build unresolved resource map for re-resolution at apply time
     let unresolved_resources = override_aware_resources
-        .unresolved_by_resolved_id_with_binding_sources(&unresolved_override_aware_resources);
+        .unresolved_by_resolved_id_with_binding_sources(&unresolved_override_aware_resources)?;
     let mut bindings = override_aware_resources.bindings().clone();
 
     // `provider` is a `ProviderRouter`, which impls both `Provider` and
@@ -2216,7 +2216,8 @@ async fn run_apply_from_plan_with_observer_factory(
         parallelism,
         accept_legacy_name_overrides,
     )
-    .await;
+    .await
+    .map_err(|error| error.with_project_dir(&source_path));
 
     // Always release lock if it was acquired
     if let Some(ref li) = lock_info {

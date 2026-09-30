@@ -6427,7 +6427,9 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
     );
     assert_eq!(plan.replace_display_info().count(), 2);
 
-    let unresolved_resources = override_aware.unresolved_by_resolved_id();
+    let unresolved_resources = override_aware
+        .unresolved_by_resolved_id()
+        .expect("test resources have distinct resolved ids");
     let deps = build_dependency_analysis(
         plan.effects(),
         &unresolved_resources,

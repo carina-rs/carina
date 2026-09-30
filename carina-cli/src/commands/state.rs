@@ -15,7 +15,7 @@ use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, RawSavedAttrs};
 use carina_core::resource::{
     ConcreteValue, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource,
-    ResourceId, ResourceIdentity, ResourceIdentityError, State, Value,
+    ResourceId, ResourceIdentity, State, Value,
 };
 use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
@@ -186,7 +186,7 @@ fn complete_state_lookup_from(state: &StateFile, current: &str) -> Vec<Completio
     // Top-level: resource bindings/identities + optional `exports`.
     let mut candidates: Vec<CompletionCandidate> = Vec::new();
     for rs in state.resources() {
-        let display_name = rs.binding.as_deref().unwrap_or(&rs.identity);
+        let display_name = rs.binding.as_deref().unwrap_or(rs.identity.as_str());
         if display_name.starts_with(current) {
             candidates.push(CompletionCandidate::new(display_name));
         }
@@ -274,6 +274,27 @@ pub enum StateCommands {
         #[arg(long)]
         json: bool,
     },
+}
+
+impl StateCommands {
+    pub fn project_dir(&self) -> Option<&Path> {
+        match self {
+            Self::BucketDelete { path, .. } | Self::Refresh { path, .. } => Some(path),
+            Self::List { path, state_url }
+            | Self::Lookup {
+                path, state_url, ..
+            }
+            | Self::Show {
+                path, state_url, ..
+            } => {
+                if state_url.is_some() {
+                    None
+                } else {
+                    Some(path.as_deref().unwrap_or_else(|| Path::new(".")))
+                }
+            }
+        }
+    }
 }
 
 /// Run state subcommands
@@ -425,7 +446,10 @@ fn find_resource_by_query<'a>(state: &'a StateFile, name: &str) -> Option<&'a Re
         .find(|r| r.binding.as_deref() == Some(name))
         .or_else(|| {
             // Fall back to identity
-            state.resources().iter().find(|r| r.identity == name)
+            state
+                .resources()
+                .iter()
+                .find(|r| r.identity.as_str() == name)
         })
 }
 
@@ -433,7 +457,7 @@ fn find_resource_by_query<'a>(state: &'a StateFile, name: &str) -> Option<&'a Re
 fn format_state_list(state: &StateFile) -> Vec<String> {
     let mut lines = Vec::new();
     for rs in state.resources() {
-        let display_name = rs.binding.as_deref().unwrap_or(&rs.identity);
+        let display_name = rs.binding.as_deref().unwrap_or(rs.identity.as_str());
         let row_prefix = format!("{}.{} {}", rs.provider, rs.resource_type, display_name);
         if rs.identifier.is_none() {
             lines.push(format!("{row_prefix}  (no current instance)"));
@@ -650,7 +674,7 @@ fn format_resource_full_value_with_deposed(rs: &ResourceState) -> Result<String,
 }
 
 fn missing_attribute_error<T>(rs: &ResourceState, attr: &str) -> Result<T, AppError> {
-    let display_name = rs.binding.as_deref().unwrap_or(&rs.identity);
+    let display_name = rs.binding.as_deref().unwrap_or(rs.identity.as_str());
     Err(AppError::Config(format!(
         "Attribute '{}' not found on resource '{}'.",
         attr, display_name
@@ -704,10 +728,7 @@ async fn run_state_lookup(
 fn build_plan_from_state(state: &StateFile) -> Plan {
     let mut plan = Plan::new();
     for rs in state.resources() {
-        let identity = match ResourceIdentity::try_from(rs.identity.clone()) {
-            Ok(identity) => identity,
-            Err(ResourceIdentityError::Empty) => continue,
-        };
+        let identity = rs.identity.clone();
         // carina#3181 PR D: `Effect::Read` carries a `DataSource`.
         let mut resource = carina_core::resource::DataSource::with_provider(
             &rs.provider,
@@ -744,7 +765,7 @@ fn format_state_show(state: &StateFile) -> String {
         if i > 0 {
             output.push('\n');
         }
-        let display_name = rs.binding.as_deref().unwrap_or(&rs.identity);
+        let display_name = rs.binding.as_deref().unwrap_or(rs.identity.as_str());
         output.push_str(&format!(
             "# {}.{} ({})\n",
             rs.provider, rs.resource_type, display_name
@@ -1205,10 +1226,7 @@ async fn run_state_refresh_locked_with_ctx(
             sf.resources()
                 .iter()
                 .filter_map(|rs| {
-                    let identity = match ResourceIdentity::try_from(rs.identity.clone()) {
-                        Ok(identity) => identity,
-                        Err(ResourceIdentityError::Empty) => return None,
-                    };
+                    let identity = rs.identity.clone();
                     let id = ResourceId::with_provider_identity(
                         rs.provider.clone(),
                         rs.resource_type.clone(),
@@ -1726,7 +1744,7 @@ where
         state.upsert_deposed_generation(
             &target.row_provider,
             &target.row_resource_type,
-            target.row_identity.as_str(),
+            &target.row_identity,
             target.row_provider_instance.clone(),
             updated,
         )?;
@@ -1748,18 +1766,15 @@ fn collect_deposed_refresh_targets(state: &carina_state::StateFile) -> Vec<Depos
         .resources()
         .iter()
         .flat_map(|row| {
-            row.deposed.iter().filter_map(|deposed| {
-                let identity = match ResourceIdentity::try_from(row.identity.clone()) {
-                    Ok(identity) => identity,
-                    Err(ResourceIdentityError::Empty) => return None,
-                };
+            row.deposed.iter().map(|deposed| {
+                let identity = row.identity.clone();
                 let id = ResolvedResourceId::with_provider_identity(
                     row.provider.clone(),
                     row.resource_type.clone(),
                     identity.clone(),
                     deposed.provider_instance.clone(),
                 );
-                Some(DeposedRefreshTarget {
+                DeposedRefreshTarget {
                     row_provider: row.provider.clone(),
                     row_resource_type: row.resource_type.clone(),
                     row_identity: identity,
@@ -1770,7 +1785,7 @@ fn collect_deposed_refresh_targets(state: &carina_state::StateFile) -> Vec<Depos
                     provider_instance: deposed.provider_instance.clone(),
                     attributes: deposed.attributes.clone(),
                     dependency_bindings: deposed.dependency_bindings.clone(),
-                })
+                }
             })
         })
         .collect()
@@ -2623,7 +2638,7 @@ mod tests {
         let mut state_file = StateFile::new();
         let mut child_state = ResourceState::new(
             &child.id.resource_type,
-            child.id.identity_str().expect("resolved identity"),
+            child.id.identity().expect("resolved identity").clone(),
             &child.id.provider,
         )
         .with_identifier("widget-1")
@@ -2763,7 +2778,7 @@ mod tests {
     fn find_resource_by_binding() {
         let state = load_fixture_state();
         let found = find_resource_by_query(&state, "vpc").unwrap();
-        assert_eq!(found.identity, "my-vpc");
+        assert_eq!(found.identity.as_str(), "my-vpc");
         assert_eq!(found.resource_type, "ec2.Vpc");
     }
 

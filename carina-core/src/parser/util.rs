@@ -100,6 +100,7 @@ pub(crate) fn split_namespaced_id(namespaced: &str) -> (String, String) {
 pub(crate) fn parse_state_block_address(
     pair: pest::iterators::Pair<Rule>,
 ) -> Result<crate::parser::ast::StateBlockAddress, ParseError> {
+    let line = pair.as_span().start_pos().line_col().0;
     let mut inner = pair.into_inner();
     let namespaced = next_pair(&mut inner, "namespaced id", "resource address")?
         .as_str()
@@ -110,12 +111,8 @@ pub(crate) fn parse_state_block_address(
     // invariant holds for every constructor, not just this parser
     // path. A future programmatic caller can't bypass it.
     let (provider, resource_type) = split_namespaced_id(&namespaced);
-    let name = crate::resource::ResourceIdentity::try_from(raw_name).map_err(|error| {
-        ParseError::InvalidExpression {
-            line: 0,
-            message: error.to_string(),
-        }
-    })?;
+    let name = crate::resource::ResourceIdentity::try_from(raw_name)
+        .map_err(|source| ParseError::InvalidResourceIdentity { line, source })?;
     Ok(crate::parser::ast::StateBlockAddress::new(
         provider,
         resource_type,

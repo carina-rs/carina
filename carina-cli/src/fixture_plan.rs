@@ -131,7 +131,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             &|provider, resource_type| {
                 sf.resources_by_type(provider, resource_type)
                     .into_iter()
-                    .map(|r| r.identity.clone())
+                    .map(|r| r.identity.to_string())
                     .collect()
             },
             &state_block_claims,

@@ -50,6 +50,18 @@ fn test_state_file_increment_serial() {
 }
 
 #[test]
+fn resource_state_identity_is_typed_and_serializes_as_a_plain_string() {
+    let resource = ResourceState::new("s3.Bucket", "main", "aws");
+    let identity: &ResourceIdentity = &resource.identity;
+
+    assert_eq!(identity.as_str(), "main");
+    assert_eq!(
+        serde_json::to_value(&resource).expect("resource state must serialize")["identity"],
+        serde_json::json!("main")
+    );
+}
+
+#[test]
 fn test_state_file_upsert_resource() {
     let mut state = StateFile::new();
 
@@ -72,18 +84,6 @@ fn test_state_file_upsert_resource() {
     assert_eq!(
         state.resources[0].attributes.get("region"),
         Some(&serde_json::json!("us-west-2"))
-    );
-}
-
-#[test]
-fn state_rejects_empty_resource_identity() {
-    let mut state = StateFile::new();
-    let error = state
-        .upsert_resource(ResourceState::new("ec2.Vpc", "", "aws"))
-        .expect_err("pending identities must never be persisted");
-
-    assert!(
-        matches!(error, BackendError::InvalidState(message) if message.contains("resource identity cannot be empty"))
     );
 }
 
@@ -166,11 +166,12 @@ fn upsert_deposed_generation_returns_error_when_key_and_identity_cross_generatio
         .upsert_resource(resource)
         .expect("setup generations are unique on both axes");
 
+    let identity = ResourceIdentity::from("main");
     let error = state
         .upsert_deposed_generation(
             "aws",
             "ec2.Vpc",
-            "main",
+            &identity,
             None,
             DeposedInstance {
                 key: first_key,
@@ -426,7 +427,8 @@ fn test_resource_state_managed_state_bucket_shape() {
     assert_eq!(resource.provider, "aws");
     assert_eq!(resource.resource_type, "s3.Bucket");
     assert_eq!(
-        resource.identity, "aws_s3_bucket_a3f2b1c8",
+        resource.identity.as_str(),
+        "aws_s3_bucket_a3f2b1c8",
         "identity must match the desired resource's anonymous identifier"
     );
     assert_eq!(
@@ -451,7 +453,7 @@ fn test_state_file_with_managed_state_bucket_contains_one_resource() {
     );
     assert_eq!(state.resources.len(), 1);
     let bucket = &state.resources[0];
-    assert_eq!(bucket.identity, "aws_s3_bucket_a3f2b1c8");
+    assert_eq!(bucket.identity.as_str(), "aws_s3_bucket_a3f2b1c8");
     assert_eq!(bucket.identifier.as_deref(), Some("my-state-bucket"));
     assert!(bucket.protected);
 }
@@ -559,7 +561,7 @@ fn state_file_has_legacy_name_overrides_detects_v7_shape() {
     assert!(state.has_legacy_name_overrides());
     let affected = state.legacy_name_override_resources();
     assert_eq!(affected.len(), 1);
-    assert_eq!(affected[0].identity, "legacy");
+    assert_eq!(affected[0].identity.as_str(), "legacy");
 
     let typed_only_json = serde_json::json!({
         "version": StateFile::CURRENT_VERSION,
@@ -721,7 +723,7 @@ fn test_resource_state_serialization_with_binding_and_deps() {
     }"#;
 
     let deserialized: ResourceState = serde_json::from_str(json).unwrap();
-    assert_eq!(deserialized.identity, "my-bucket");
+    assert_eq!(deserialized.identity.as_str(), "my-bucket");
     assert_eq!(deserialized.binding, Some("my_bucket".to_string()));
     assert_eq!(
         deserialized.dependency_bindings,
@@ -745,7 +747,7 @@ fn test_resource_state_deserialization_without_v3_fields() {
     }"#;
 
     let deserialized: ResourceState = serde_json::from_str(json).unwrap();
-    assert_eq!(deserialized.identity, "my-bucket");
+    assert_eq!(deserialized.identity.as_str(), "my-bucket");
     assert_eq!(deserialized.binding, None);
     assert!(deserialized.dependency_bindings.is_empty());
     assert!(deserialized.write_only_attributes.is_empty());
@@ -1283,7 +1285,7 @@ fn test_migrate_v6_empty_struct_to_unrecorded() {
     let rs = state
         .resources
         .iter()
-        .find(|r| r.identity == "x")
+        .find(|r| r.identity.as_str() == "x")
         .expect("test resource");
     assert!(
         matches!(rs.explicit, ExplicitFields::Unrecorded),
@@ -1329,7 +1331,7 @@ fn test_migrate_v6_preserves_populated_explicit() {
     let rs = state
         .resources
         .iter()
-        .find(|r| r.identity == "vpc")
+        .find(|r| r.identity.as_str() == "vpc")
         .unwrap();
     let ExplicitFields::Struct { children } = &rs.explicit else {
         panic!(
@@ -1382,7 +1384,7 @@ fn test_migrate_v6_does_not_rewrite_nested_empty_struct() {
     let rs = state
         .resources
         .iter()
-        .find(|r| r.identity == "vpc")
+        .find(|r| r.identity.as_str() == "vpc")
         .unwrap();
     let ExplicitFields::Struct { children } = &rs.explicit else {
         panic!("expected top-level Struct, got {:?}", rs.explicit);
@@ -1885,18 +1887,25 @@ fn check_and_migrate_rejects_empty_identity_with_actionable_row_context() {
     invalid["identifier"] = serde_json::json!("legacy-resource-123");
     let json = state_json_with_resources(StateFile::CURRENT_VERSION, vec![valid, invalid]);
 
-    let message = invalid_state_message(check_and_migrate(&json));
+    let error = check_and_migrate(&json).expect_err("empty identities must be rejected on load");
+    let message = error.to_string();
 
     assert_eq!(
         message,
-        "Failed to parse state file: state resources[1] has an empty identity \
+        "Invalid state file: resources[1] has an empty identity \
          (provider=\"mock\", resource_type=\"test.resource\", \
-         identifier=\"legacy-resource-123\"). This row was written by an older Carina \
-         version and is rejected because empty identity rows can no longer be matched to a \
-         resource. Back up the state file, then remove this row from it. Run `carina plan`; the \
-         resource that owned the row appears as a create with the identity Carina now assigns to \
-         it. Put the row back with `identity` set to that value, keeping its `identifier` and \
-         attributes, or leave it removed if the resource is no longer managed."
+         identifier=\"legacy-resource-123\"). It was written by an older Carina version and is \
+         rejected because an empty identity can no longer be matched to a resource. Back up the \
+         state file, then remove this row. Run `carina plan`; the resource that owned it appears \
+         as a create with its newly assigned identity. Put the row back with `identity` set to \
+         that value (keep its `identifier` and attributes), or leave it removed if the resource \
+         is no longer managed."
+    );
+    let row_error = std::error::Error::source(&error)
+        .expect("BackendError must preserve the contextual row error");
+    assert!(
+        row_error.source().is_some(),
+        "the row error must preserve ResourceIdentityError as its source"
     );
 }
 
@@ -2008,7 +2017,7 @@ fn check_and_migrate_loads_legacy_name_alias_and_checks_it_for_duplicates() {
     let state = check_and_migrate(&valid_json)
         .expect("legacy name alias must remain readable")
         .into_state();
-    assert_eq!(state.resources[0].identity, "logs");
+    assert_eq!(state.resources[0].identity.as_str(), "logs");
 
     let duplicate_json = state_json_with_resources(
         StateFile::CURRENT_VERSION,
@@ -3076,7 +3085,7 @@ fn build_remote_bindings_ignores_resource_bindings() {
     state
         .upsert_resource(ResourceState {
             resource_type: "ec2.Vpc".to_string(),
-            identity: "vpc_123".to_string(),
+            identity: ResourceIdentity::from("vpc_123"),
             provider: "awscc".to_string(),
             identifier: Some("vpc-123".to_string()),
             attributes: HashMap::from([(
@@ -3132,7 +3141,7 @@ fn check_and_migrate_canonicalizes_legacy_map_key_addresses() {
     );
     let state = check_and_migrate(&json).expect("load state").into_state();
     let r = &state.resources[0];
-    assert_eq!(r.identity, "_accounts.registry_prod");
+    assert_eq!(r.identity.as_str(), "_accounts.registry_prod");
     assert_eq!(r.binding.as_deref(), Some("_accounts.registry_prod"));
     let deps: Vec<&str> = r.dependency_bindings.iter().map(String::as_str).collect();
     assert!(deps.contains(&"other.a"));

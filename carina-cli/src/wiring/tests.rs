@@ -1231,7 +1231,11 @@ fn bucket_state_file(names: &[&str]) -> carina_state::state::StateFile {
     let mut state_file = StateFile::new();
     for name in names {
         state_file
-            .upsert_resource(ResourceState::new("s3.Bucket", *name, "awscc"))
+            .upsert_resource(ResourceState::new(
+                "s3.Bucket",
+                test_identity(*name),
+                "awscc",
+            ))
             .expect("test state setup must be valid");
     }
     state_file
@@ -1630,7 +1634,8 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
 }
 
 fn route_table_state(binding: &str, id: &str) -> carina_state::state::ResourceState {
-    let mut state = carina_state::state::ResourceState::new("ec2.RouteTable", binding, "awscc");
+    let mut state =
+        carina_state::state::ResourceState::new("ec2.RouteTable", test_identity(binding), "awscc");
     state.binding = Some(binding.to_string());
     state
         .attributes
@@ -1643,8 +1648,11 @@ fn association_state(
     route_table_id: &str,
     subnet_id: &str,
 ) -> carina_state::state::ResourceState {
-    let mut state =
-        carina_state::state::ResourceState::new("ec2.SubnetRouteTableAssociation", name, "awscc");
+    let mut state = carina_state::state::ResourceState::new(
+        "ec2.SubnetRouteTableAssociation",
+        test_identity(name),
+        "awscc",
+    );
     state.attributes.insert(
         "route_table_id".to_string(),
         serde_json::Value::String(route_table_id.to_string()),
@@ -2044,11 +2052,12 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         .with_attribute("vpc_id", serde_json::json!("vpc-old"));
     vpc_state.binding = Some("vpc".to_string());
 
-    let mut subnet_state = ResourceState::new("ec2.Subnet", &state_subnet_identity, "awscc")
-        .with_identifier("subnet-old")
-        .with_attribute("vpc_id", serde_json::json!("vpc-old"))
-        .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
-        .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
+    let mut subnet_state =
+        ResourceState::new("ec2.Subnet", test_identity(&state_subnet_identity), "awscc")
+            .with_identifier("subnet-old")
+            .with_attribute("vpc_id", serde_json::json!("vpc-old"))
+            .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
+            .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
     subnet_state.dependency_bindings.insert("vpc".to_string());
 
     let mut state_file = StateFile::new();
@@ -2201,10 +2210,14 @@ moved {{
 
         state_file
             .upsert_resource(
-                ResourceState::new("ec2.SubnetRouteTableAssociation", &old_name, "awscc")
-                    .with_identifier(format!("assoc-{idx}"))
-                    .with_attribute("route_table_id", serde_json::Value::String(route_table_id))
-                    .with_attribute("subnet_id", serde_json::Value::String(subnet_id)),
+                ResourceState::new(
+                    "ec2.SubnetRouteTableAssociation",
+                    test_identity(old_name),
+                    "awscc",
+                )
+                .with_identifier(format!("assoc-{idx}"))
+                .with_attribute("route_table_id", serde_json::Value::String(route_table_id))
+                .with_attribute("subnet_id", serde_json::Value::String(subnet_id)),
             )
             .expect("test state setup must be valid");
     }
@@ -3084,7 +3097,11 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
 
     let mut state_file = StateFile::new();
     state_file
-        .upsert_resource(ResourceState::new("ec2.Route", &old_name, "awscc"))
+        .upsert_resource(ResourceState::new(
+            "ec2.Route",
+            test_identity(&old_name),
+            "awscc",
+        ))
         .expect("test state setup must be valid");
     let mut current_states = HashMap::new();
     let mut prev_explicit = HashMap::new();
@@ -3107,7 +3124,7 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
             ResolvedResourceId::with_provider_identity(
                 "awscc",
                 "ec2.Route",
-                test_identity(old_name),
+                test_identity(&old_name),
                 None,
             ),
             ResolvedResourceId::new(named.id)

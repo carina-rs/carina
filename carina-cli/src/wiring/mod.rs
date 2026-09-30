@@ -700,7 +700,7 @@ pub fn apply_anonymous_to_named_renames(
                         })
                         .collect();
                     AnonymousIdStateInfo {
-                        name: sr.identity.clone(),
+                        name: sr.identity.to_string(),
                         create_only_values,
                     }
                 })
@@ -739,7 +739,7 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
             Some((
                 binding.clone(),
                 AnonymousIdBindingStateInfo {
-                    name: sr.identity.clone(),
+                    name: sr.identity.to_string(),
                     attribute_values: sr
                         .attributes
                         .iter()
@@ -784,7 +784,7 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
                         })
                         .collect();
                     AnonymousIdStateInfo {
-                        name: sr.identity.clone(),
+                        name: sr.identity.to_string(),
                         create_only_values,
                     }
                 })
@@ -801,25 +801,59 @@ pub(crate) fn adopt_unique_state_identity_for_unresolved_anonymous(
     resources: &mut [Resource],
     state_file: &StateFile,
 ) {
+    type ResourceKind = (String, String, Option<String>);
+
+    let mut unresolved_counts: HashMap<ResourceKind, usize> = HashMap::new();
+    let mut claimed_state_identities: HashMap<ResourceKind, HashSet<ResourceIdentity>> =
+        HashMap::new();
+
+    for resource in resources.iter() {
+        let kind = (
+            resource.id.provider.clone(),
+            resource.id.resource_type.clone(),
+            resource.id.provider_instance.clone(),
+        );
+        match (resource.id.identity(), resource.binding.as_ref()) {
+            (None, None) => *unresolved_counts.entry(kind).or_default() += 1,
+            (Some(identity), _) => {
+                claimed_state_identities
+                    .entry(kind)
+                    .or_default()
+                    .insert(identity.clone());
+            }
+            (None, Some(_)) => {}
+        }
+    }
+
     for resource in resources {
         if resource.id.identity_str().is_some() || resource.binding.is_some() {
+            continue;
+        }
+
+        let kind = (
+            resource.id.provider.clone(),
+            resource.id.resource_type.clone(),
+            resource.id.provider_instance.clone(),
+        );
+        if unresolved_counts.get(&kind) != Some(&1) {
             continue;
         }
 
         let candidates: Vec<_> = state_file
             .resources_by_type(&resource.id.provider, &resource.id.resource_type)
             .into_iter()
-            .filter(|state| !state.identity.is_empty())
             .filter(|state| state.directives.provider_instance == resource.id.provider_instance)
+            .filter(|state| {
+                !claimed_state_identities
+                    .get(&kind)
+                    .is_some_and(|claimed| claimed.contains(&state.identity))
+            })
             .collect();
         let [state] = candidates.as_slice() else {
             continue;
         };
 
-        match ResourceIdentity::try_from(state.identity.clone()) {
-            Ok(identity) => resource.id.set_identity(identity),
-            Err(ResourceIdentityError::Empty) => continue,
-        }
+        resource.id.set_identity(state.identity.clone());
     }
 }
 
@@ -946,12 +980,16 @@ pub(crate) fn reconcile_late_anonymous_identities(
     );
     for (from, to) in &fallback_renames {
         if let Some(mut state) = inputs.current_states.remove(from) {
-            state.id = to.clone();
-            inputs.current_states.insert(to.clone(), state);
+            inputs.current_states.entry(to.clone()).or_insert_with(|| {
+                state.id = to.clone();
+                state
+            });
         }
-        inputs.saved_attrs.remap_resource_id(from, to.clone());
+        inputs
+            .saved_attrs
+            .remap_resource_id_preserving_target(from, to.clone());
         if let Some(explicit) = inputs.prev_explicit.remove(from) {
-            inputs.prev_explicit.insert(to.clone(), explicit);
+            inputs.prev_explicit.entry(to.clone()).or_insert(explicit);
         }
     }
 
@@ -3110,15 +3148,12 @@ fn resolved_state_row_id(
     row: &carina_state::ResourceState,
     provider_instance: Option<String>,
 ) -> Option<ResolvedResourceId> {
-    match ResourceIdentity::try_from(row.identity.clone()) {
-        Ok(identity) => Some(ResolvedResourceId::with_provider_identity(
-            row.provider.clone(),
-            row.resource_type.clone(),
-            identity,
-            provider_instance,
-        )),
-        Err(ResourceIdentityError::Empty) => None,
-    }
+    Some(ResolvedResourceId::with_provider_identity(
+        row.provider.clone(),
+        row.resource_type.clone(),
+        row.identity.clone(),
+        provider_instance,
+    ))
 }
 
 /// Pre-process moved blocks by transferring state, `prev_explicit`, and

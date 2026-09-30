@@ -394,7 +394,7 @@ async fn main() {
                     return CommandCompletion::Success;
                 }
                 Err(e) => {
-                    return CommandCompletion::Error(e);
+                    return CommandCompletion::Error(e.with_project_dir(&path));
                 }
             }
         }
@@ -421,18 +421,17 @@ async fn main() {
                     )
                     .await
                 }
-                Ok(ApplyInput::Project(project_path)) => {
-                    run_apply(
-                        project_path,
-                        auto_approve,
-                        lock,
-                        parallelism,
-                        accept_legacy_name_overrides,
-                        &provider_context,
-                        shutdown.clone(),
-                    )
-                    .await
-                }
+                Ok(ApplyInput::Project(project_path)) => run_apply(
+                    project_path,
+                    auto_approve,
+                    lock,
+                    parallelism,
+                    accept_legacy_name_overrides,
+                    &provider_context,
+                    shutdown.clone(),
+                )
+                .await
+                .map_err(|error| error.with_project_dir(project_path)),
                 Err(error) => Err(error),
             },
             Commands::Destroy {
@@ -442,19 +441,18 @@ async fn main() {
                 refresh,
                 force,
                 parallelism,
-            } => {
-                run_destroy(
-                    &path,
-                    auto_approve,
-                    lock,
-                    refresh,
-                    force,
-                    parallelism,
-                    &provider_context,
-                    shutdown.clone(),
-                )
-                .await
-            }
+            } => run_destroy(
+                &path,
+                auto_approve,
+                lock,
+                refresh,
+                force,
+                parallelism,
+                &provider_context,
+                shutdown.clone(),
+            )
+            .await
+            .map_err(|error| error.with_project_dir(&path)),
             Commands::Export { name, json, raw } => {
                 let format = if raw {
                     commands::export::OutputFormat::Raw
@@ -464,7 +462,9 @@ async fn main() {
                     commands::export::OutputFormat::Human
                 };
                 let path = PathBuf::from(".");
-                commands::export::run_export(&path, name, format, &provider_context).await
+                commands::export::run_export(&path, name, format, &provider_context)
+                    .await
+                    .map_err(|error| error.with_project_dir(&path))
             }
             Commands::Fmt {
                 path,
@@ -477,7 +477,14 @@ async fn main() {
                 run_force_unlock(&lock_id, &path, &provider_context).await
             }
             Commands::State { command } => {
-                run_state_command(command, &provider_context, shutdown.clone()).await
+                let project_dir = command.project_dir().map(Path::to_path_buf);
+                let result = run_state_command(command, &provider_context, shutdown.clone()).await;
+                match project_dir {
+                    Some(project_dir) => {
+                        result.map_err(|error| error.with_project_dir(&project_dir))
+                    }
+                    None => result,
+                }
             }
             Commands::Providers { command } => run_providers_command(command),
             Commands::Init {
@@ -488,7 +495,8 @@ async fn main() {
                 force,
             } => commands::init::run_init(&path, upgrade, locked, migrate_state, force)
                 .await
-                .map_err(error::AppError::from),
+                .map_err(error::AppError::from)
+                .map_err(|error| error.with_project_dir(&path)),
             Commands::Lint { path } => run_lint(&path, &provider_context),
             Commands::Completions { shell } => {
                 generate(shell, &mut Cli::command(), "carina", &mut std::io::stdout());

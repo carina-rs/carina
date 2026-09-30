@@ -7,7 +7,8 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     Composition, CompositionArgument, DataSource, DeferredValue, ModuleConstraintId, ModuleSource,
-    PendingModuleConstraint, ResolvedDataSource, ResolvedResource, Resource, ResourceId, Signature,
+    PendingModuleConstraint, ResolvedDataSource, ResolvedResource, Resource, ResourceId,
+    ResourceIdentity, Signature,
 };
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use carina_state::{DeposedInstance, DeposedKey, NameOverride, ResourceState};
@@ -538,7 +539,7 @@ let vpc = awscc.ec2.Vpc {{
     )
 }
 
-fn concrete_subnet_identity(ctx: &WiringContext, providers: &[ProviderConfig]) -> String {
+fn concrete_subnet_identity(ctx: &WiringContext, providers: &[ProviderConfig]) -> ResourceIdentity {
     let mut resources = vec![
         Resource::pending_with_provider("awscc", "ec2.Subnet", None)
             .with_attribute("vpc_id", string_value("vpc-old"))
@@ -551,9 +552,9 @@ fn concrete_subnet_identity(ctx: &WiringContext, providers: &[ProviderConfig]) -
     assert!(errors.is_empty(), "state id setup failed: {errors:?}");
     resources[0]
         .id
-        .identity_str()
+        .identity()
         .expect("resolved identity")
-        .to_string()
+        .clone()
 }
 
 fn seed_apply_cascade_state(
@@ -2156,7 +2157,7 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
     let raw = std::fs::read_to_string(fixture.state_path()).expect("state file must be written");
     let state: serde_json::Value = serde_json::from_str(&raw).expect("state must be valid JSON");
     let subnet_identity = concrete_subnet_identity(&ctx, &parsed.providers);
-    let subnet = state_json_resource(&state, "awscc", "ec2.Subnet", &subnet_identity);
+    let subnet = state_json_resource(&state, "awscc", "ec2.Subnet", subnet_identity.as_str());
     assert_eq!(subnet["identifier"], serde_json::json!("subnet-new"));
     let subnet_deposed = subnet
         .get("deposed")

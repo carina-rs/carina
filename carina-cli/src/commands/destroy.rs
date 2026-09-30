@@ -188,7 +188,7 @@ async fn run_destroy_locked(
             &|provider, resource_type| {
                 sf.resources_by_type(provider, resource_type)
                     .into_iter()
-                    .map(|r| r.identity.clone())
+                    .map(|r| r.identity.to_string())
                     .collect()
             },
             &state_block_claims,
@@ -1463,7 +1463,7 @@ fn build_destroy_delete_effects(
             if protected_row_keys.contains(&state_row_key_from_parts(
                 &row.provider,
                 &row.resource_type,
-                &row.identity,
+                row.identity.as_str(),
             )) {
                 continue;
             }

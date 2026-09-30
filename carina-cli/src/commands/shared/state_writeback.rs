@@ -10,8 +10,7 @@ use carina_core::effect::{DeferredReplaceDelete, DeletedInstanceKey, Effect, Eff
 use carina_core::executor::ExecutionResult;
 use carina_core::plan::{Plan, ReplaceDisplayInfo};
 use carina_core::resource::{
-    ConcreteValue, ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity,
-    ResourceIdentityError, State, Value,
+    ConcreteValue, ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
 };
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_state::{
@@ -109,10 +108,7 @@ impl PostApplyStates {
     ) -> Self {
         let mut map = current_states.clone();
         for rs in state.resources() {
-            let identity = match ResourceIdentity::try_from(rs.identity.clone()) {
-                Ok(identity) => identity,
-                Err(ResourceIdentityError::Empty) => continue,
-            };
+            let identity = rs.identity.clone();
             let id = ResourceId::with_provider_identity(
                 rs.provider.clone(),
                 rs.resource_type.clone(),
@@ -1272,7 +1268,7 @@ fn apply_planned_depose(state: &mut StateFile, planned: PlannedDepose) -> Result
     state.upsert_deposed_generation(
         &planned.id.provider,
         &planned.id.resource_type,
-        planned.id.identity_str(),
+        planned.id.identity(),
         row_provider_instance,
         planned.instance,
     )?;
@@ -1691,7 +1687,7 @@ mod apply_state_save_tests {
                 .iter()
                 .any(|row| row.provider == child_id.provider
                     && row.resource_type == child_id.resource_type
-                    && row.identity == "validation_records[0]"),
+                    && row.identity.as_str() == "validation_records[0]"),
             "runtime-synthesized child must be persisted in state"
         );
     }

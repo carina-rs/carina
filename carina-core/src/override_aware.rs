@@ -7,6 +7,13 @@ use crate::effect::deps::UnresolvedResource;
 use crate::name_override::{ApplyDecision, NameOverride, should_apply_override};
 use crate::resource::{ConcreteValue, Resource, ResourceId, Value};
 
+/// Two paired resources resolved to the same identity before execution.
+#[derive(Debug, thiserror::Error)]
+#[error("override-aware resources contain duplicate resolved id {id}")]
+pub struct DuplicateResolvedResourceIdError {
+    id: ResourceId,
+}
+
 /// Minimal state-like surface needed by [`OverrideAwareResources`].
 pub trait NameOverrideSource {
     fn name_overrides_for(
@@ -185,7 +192,9 @@ impl OverrideAwareResources {
             .collect()
     }
 
-    pub fn unresolved_by_resolved_id(&self) -> HashMap<ResourceId, UnresolvedResource> {
+    pub fn unresolved_by_resolved_id(
+        &self,
+    ) -> Result<HashMap<ResourceId, UnresolvedResource>, DuplicateResolvedResourceIdError> {
         unresolved_map_from_paired(self.resources(), self.paired_unresolved_resources())
     }
 
@@ -240,7 +249,7 @@ impl OverrideAwareResources {
     pub fn unresolved_by_resolved_id_with_binding_sources(
         &self,
         binding_sources: &OverrideAwareResources,
-    ) -> HashMap<ResourceId, UnresolvedResource> {
+    ) -> Result<HashMap<ResourceId, UnresolvedResource>, DuplicateResolvedResourceIdError> {
         let paired_unresolved =
             self.paired_unresolved_resources_with_binding_sources(binding_sources);
         unresolved_map_from_paired(self.resources(), paired_unresolved)
@@ -319,7 +328,7 @@ fn can_pair_by_binding(resource: &Resource, source: &Resource) -> bool {
 fn unresolved_map_from_paired(
     resources: &[Resource],
     paired_unresolved: Vec<Resource>,
-) -> HashMap<ResourceId, UnresolvedResource> {
+) -> Result<HashMap<ResourceId, UnresolvedResource>, DuplicateResolvedResourceIdError> {
     assert_eq!(
         resources.len(),
         paired_unresolved.len(),
@@ -327,16 +336,13 @@ fn unresolved_map_from_paired(
     );
     let mut by_id = HashMap::with_capacity(paired_unresolved.len());
     for (resource, unresolved) in resources.iter().zip(paired_unresolved) {
-        let previous = by_id.insert(
-            resource.id.clone(),
-            UnresolvedResource::from_pre_resolve(unresolved),
-        );
-        assert!(
-            previous.is_none(),
-            "override-aware resources must not contain duplicate resolved ids"
-        );
+        let id = resource.id.clone();
+        let previous = by_id.insert(id.clone(), UnresolvedResource::from_pre_resolve(unresolved));
+        if previous.is_some() {
+            return Err(DuplicateResolvedResourceIdError { id });
+        }
     }
-    by_id
+    Ok(by_id)
 }
 
 fn resolve_resources(

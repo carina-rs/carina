@@ -274,8 +274,13 @@ mod tests {
             // artifacts. Production-shaped `state.resources` rows always
             // carry an identifier from the provider's apply result.
             s.upsert_resource(
-                ResourceState::new("s3.Bucket", format!("r{i}"), "aws")
-                    .with_identifier(format!("bucket-{i}")),
+                ResourceState::new(
+                    "s3.Bucket",
+                    carina_core::resource::ResourceIdentity::try_from(format!("r{i}"))
+                        .expect("formatted test identity is non-empty"),
+                    "aws",
+                )
+                .with_identifier(format!("bucket-{i}")),
             )
             .expect("test state setup must be valid");
         }

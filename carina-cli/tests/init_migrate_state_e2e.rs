@@ -25,8 +25,13 @@ fn state_json(lineage: &str, n: usize) -> String {
     s.lineage = lineage.to_string();
     for i in 0..n {
         s.upsert_resource(
-            ResourceState::new("s3.Bucket", format!("demo{i}"), "aws")
-                .with_identifier(format!("demo-bucket-{i}")),
+            ResourceState::new(
+                "s3.Bucket",
+                carina_core::resource::ResourceIdentity::try_from(format!("demo{i}"))
+                    .expect("formatted test identity is non-empty"),
+                "aws",
+            )
+            .with_identifier(format!("demo-bucket-{i}")),
         )
         .expect("test state setup must be valid");
     }
