@@ -1684,7 +1684,7 @@ fn apply_does_not_require_flag_after_v7_to_v8_migration() {
         Value::Concrete(ConcreteValue::String("legacy".to_string())),
     );
     let id = resource.id.clone();
-    let sorted_resources = vec![resource];
+    let sorted_resources = vec![resolved(resource)];
     let applied_state = State::existing(
         id.clone(),
         HashMap::from([(
@@ -2890,7 +2890,7 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
         Value::Concrete(ConcreteValue::String("16".to_string())),
     );
 
-    let sorted_resources = vec![resource];
+    let sorted_resources = vec![resolved(resource)];
 
     // Simulate provider returning state without the write-only attribute
     let mut applied_attrs = HashMap::new();
@@ -2983,7 +2983,7 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
         )])),
     );
 
-    let sorted_resources = vec![resource];
+    let sorted_resources = vec![resolved(resource)];
 
     // Simulate provider returning state WITH carried-over policies attribute
     // (This is what AwsccProvider::create_resource does in the carry-over logic)
@@ -3229,7 +3229,7 @@ fn block_unique_name_attribute_state_roundtrip() {
         Value::Concrete(ConcreteValue::String("test IPAM".to_string())),
     );
 
-    let sorted_resources = vec![resource];
+    let sorted_resources = vec![resolved(resource)];
 
     // Simulate provider state with carried-over operating_regions
     let mut applied_attrs = HashMap::new();
@@ -3345,7 +3345,7 @@ fn move_plus_update_keeps_post_update_attributes() {
         "value".to_string(),
         Value::Concrete(ConcreteValue::String("prod".to_string())),
     );
-    let sorted_resources = vec![resource];
+    let sorted_resources = vec![resolved(resource)];
 
     let mut applied_attrs = HashMap::new();
     applied_attrs.insert(
@@ -3374,7 +3374,7 @@ fn move_plus_update_keeps_post_update_attributes() {
     let from_id = ResourceId::with_provider_identity("awscc", "ec2.Tag", "tag_old", None);
     plan.add(Effect::Update {
         from: Box::new(State::existing(from_id.clone(), HashMap::new())),
-        to: resolved(sorted_resources[0].clone()),
+        to: sorted_resources[0].clone(),
         changed_attributes: vec!["value".to_string()],
     });
     plan.add(Effect::Move {
@@ -3432,7 +3432,7 @@ fn move_alone_carries_attributes_via_current_states() {
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
     );
-    let sorted_resources = vec![resource];
+    let sorted_resources = vec![resolved(resource)];
 
     // current_states already carries the migrated row at the new id.
     let mut current_attrs = HashMap::new();
@@ -3548,7 +3548,7 @@ fn failed_refresh_preserves_existing_row() {
 
     let id = ResourceId::with_provider_identity("awscc", "s3.Bucket", "stuck", None);
     let resource = Resource::with_provider("awscc", "s3.Bucket", "stuck", None);
-    let sorted_resources = vec![resource];
+    let sorted_resources = vec![resolved(resource)];
 
     let mut failed_refreshes = HashSet::new();
     failed_refreshes.insert(id.clone());
@@ -3606,7 +3606,7 @@ fn move_from_overlapping_desired_resource_errors() {
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("x".to_string())),
     );
-    let sorted_resources = vec![resource.clone()];
+    let sorted_resources = vec![resolved(resource.clone())];
 
     let mut applied = HashMap::new();
     applied.insert(
@@ -3663,7 +3663,7 @@ fn remove_overlapping_desired_resource_errors() {
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("x".to_string())),
     );
-    let sorted_resources = vec![resource];
+    let sorted_resources = vec![resolved(resource)];
 
     let mut applied = HashMap::new();
     applied.insert(
@@ -3716,7 +3716,7 @@ fn self_move_overlapping_desired_resource_errors() {
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("x".to_string())),
     );
-    let sorted_resources = vec![resource];
+    let sorted_resources = vec![resolved(resource)];
 
     let mut applied = HashMap::new();
     applied.insert(
@@ -5148,8 +5148,9 @@ mod saved_plan_version_tests {
             &SchemaRegistry::new(),
             &[],
         );
+        let resolved_resource = carina_core::resource::ResolvedResource::new(resource.clone());
         let plan = carina_core::differ::create_plan(
-            std::slice::from_ref(&resource),
+            std::slice::from_ref(&resolved_resource),
             &[],
             &ProviderRouter::new(),
             &plan_input_states,

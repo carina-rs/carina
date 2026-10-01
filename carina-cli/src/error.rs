@@ -233,6 +233,18 @@ pub enum AppError {
     #[error(transparent)]
     ResourceIdentity(#[from] carina_core::resource::ResourceIdentityError),
 
+    /// A state-bucket argument was not a valid resource identity.
+    #[error("State bucket name '{bucket_name}' is not a valid resource identity: {source}")]
+    InvalidStateBucketIdentity {
+        bucket_name: String,
+        #[source]
+        source: carina_core::resource::ResourceIdentityError,
+    },
+
+    /// Identity assignment was incomplete at a resolved-only pipeline boundary.
+    #[error(transparent)]
+    PendingResourceIdentity(#[from] carina_core::resource::PendingResourceIdentityError),
+
     /// State backend errors (lock contention, I/O, serialization, etc.)
     #[error(transparent)]
     Backend(#[from] BackendError),

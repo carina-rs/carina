@@ -6,7 +6,6 @@ use crate::deps::get_resource_dependencies;
 
 use crate::effect::{ChangedCreateOnly, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
-use crate::override_aware::OverrideAwareResources;
 use crate::parser::WaitBinding;
 use crate::plan::{
     CreateBeforeDestroyError, PermanentNameOverride, Plan, PlanError, PlanErrorKind,
@@ -299,7 +298,7 @@ pub fn generate_temporary_name(
 /// ```
 #[allow(clippy::too_many_arguments)]
 pub fn create_plan(
-    managed: &[Resource],
+    managed: &[ResolvedResource],
     data_sources: &[DataSource],
     provider: &dyn Provider,
     current_states: &HashMap<ResourceId, PlanInputState>,
@@ -329,7 +328,8 @@ pub fn create_plan(
 
 #[allow(clippy::too_many_arguments)]
 pub fn create_plan_with_cascades(
-    managed: &OverrideAwareResources,
+    managed: &[ResolvedResource],
+    unresolved_managed: &[ResolvedResource],
     data_sources: &[DataSource],
     provider: &dyn Provider,
     current_states: &HashMap<ResourceId, PlanInputState>,
@@ -340,8 +340,6 @@ pub fn create_plan_with_cascades(
     orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
     wait_bindings: &[WaitBinding],
 ) -> Plan {
-    let unresolved_managed = managed.paired_unresolved_resources();
-    let managed = managed.resources();
     let mut build = create_plan_parts(
         managed,
         data_sources,
@@ -357,7 +355,7 @@ pub fn create_plan_with_cascades(
     cascade_dependent_updates(
         &mut build.plan,
         &mut build.pending_replaces,
-        &unresolved_managed,
+        unresolved_managed,
         current_states,
         registry,
     );
@@ -373,7 +371,7 @@ struct PlanBuild {
 
 #[allow(clippy::too_many_arguments)]
 fn create_plan_parts(
-    managed: &[Resource],
+    managed: &[ResolvedResource],
     data_sources: &[DataSource],
     provider: &dyn Provider,
     current_states: &HashMap<ResourceId, PlanInputState>,
@@ -405,7 +403,6 @@ fn create_plan_parts(
     }
 
     for resource in managed {
-        let resolved_resource = ResolvedResource::new(resource.clone());
         let current = current_states
             .get(&resource.id)
             .cloned()
@@ -419,7 +416,7 @@ fn create_plan_parts(
             SchemaKind::Resource,
         );
         let d = diff(
-            &resolved_resource,
+            resource,
             current.as_state(),
             saved,
             prev_explicit_for_resource,
@@ -925,7 +922,10 @@ fn decompose_replace_into_effects(
     }
 }
 
-fn known_binding_names(managed: &[Resource], data_sources: &[DataSource]) -> HashSet<String> {
+fn known_binding_names(
+    managed: &[ResolvedResource],
+    data_sources: &[DataSource],
+) -> HashSet<String> {
     managed
         .iter()
         .filter_map(|resource| resource.binding.clone())
@@ -940,7 +940,7 @@ fn known_binding_names(managed: &[Resource], data_sources: &[DataSource]) -> Has
 fn cascade_dependent_updates(
     plan: &mut Plan,
     pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
-    unresolved_managed: &[Resource],
+    unresolved_managed: &[ResolvedResource],
     current_states: &HashMap<ResourceId, PlanInputState>,
     registry: &SchemaRegistry,
 ) {
@@ -968,7 +968,7 @@ fn cascade_dependent_updates(
 fn promote_referenced_replaces_to_cbd(
     plan: &mut Plan,
     pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
-    unresolved_managed: &[Resource],
+    unresolved_managed: &[ResolvedResource],
     registry: &SchemaRegistry,
 ) {
     let ref_targets = pending_reference_targets(pending_replaces, false);
@@ -1032,7 +1032,7 @@ fn mark_pending_create_before_destroy(
 fn promote_pending_replaces_for_dependents(
     plan: &mut Plan,
     pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
-    unresolved_managed: &[Resource],
+    unresolved_managed: &[ResolvedResource],
     current_states: &HashMap<ResourceId, PlanInputState>,
     registry: &SchemaRegistry,
 ) -> bool {
@@ -1040,8 +1040,7 @@ fn promote_pending_replaces_for_dependents(
     let mut promoted = false;
 
     for resource in unresolved_managed {
-        let resolved_resource = ResolvedResource::new(resource.clone());
-        let consumer_identity = resource_identity(&resolved_resource);
+        let consumer_identity = resource_identity(resource);
         let deps = get_resource_dependencies(resource);
 
         for dep in &deps {

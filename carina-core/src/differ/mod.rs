@@ -13,6 +13,36 @@ use crate::schema::ResourceSchema;
 
 pub use plan::{block_deletes_on_prior_consumer_updates, create_plan, create_plan_with_cascades};
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn create_plan_for_tests(
+    managed: &[Resource],
+    data_sources: &[crate::resource::DataSource],
+    provider: &dyn crate::provider::Provider,
+    current_states: &HashMap<ResourceId, crate::resource::PlanInputState>,
+    directives_map: &HashMap<ResourceId, crate::resource::Directives>,
+    registry: &crate::schema::SchemaRegistry,
+    saved_attrs: &crate::provider::LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+    orphan_dependencies: &HashMap<ResourceId, std::collections::BTreeSet<String>>,
+    wait_bindings: &[crate::parser::WaitBinding],
+) -> crate::plan::Plan {
+    let managed = ResolvedResource::collect_resolved(managed.iter().cloned())
+        .expect("differ test resources must have resolved identities");
+    plan::create_plan(
+        &managed,
+        data_sources,
+        provider,
+        current_states,
+        directives_map,
+        registry,
+        saved_attrs,
+        prev_explicit,
+        orphan_dependencies,
+        wait_bindings,
+    )
+}
+
 // Imports used by test submodules (accessible via `use super::*;`)
 #[cfg(test)]
 use crate::effect::Effect;

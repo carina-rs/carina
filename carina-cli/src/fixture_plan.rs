@@ -422,8 +422,17 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         wiring.schemas(),
         override_aware_resources.resources(),
     );
+    let resolved_resources = carina_core::resource::ResolvedResource::collect_resolved(
+        override_aware_resources.resources().iter().cloned(),
+    )
+    .expect("fixture resources must have assigned identities");
+    let unresolved_resources = carina_core::resource::ResolvedResource::collect_resolved(
+        override_aware_resources.paired_unresolved_resources(),
+    )
+    .expect("fixture unresolved resources must have paired identities");
     let mut plan = create_plan_with_cascades(
-        &override_aware_resources,
+        &resolved_resources,
+        &unresolved_resources,
         &data_sources_for_plan,
         &carina_core::provider::ProviderRouter::new(),
         &plan_input_states,

@@ -12,7 +12,7 @@ use carina_core::parser::{File, ProviderContext, ResourceRef, UpstreamState};
 use carina_core::resource::ResourceId;
 
 use crate::error::AppError;
-use crate::wiring::check_unused_bindings;
+use crate::wiring::{WiringContext, build_factories_from_providers};
 
 #[derive(Serialize)]
 struct ValidateOutput {
@@ -301,10 +301,14 @@ pub fn run_validate(
         println!("{}", "Validating...".cyan());
     }
 
-    let validation_errors = super::validate_and_resolve_errors(
+    let (factories, load_errors) = build_factories_from_providers(&parsed.providers, base_dir)?;
+    let ctx = WiringContext::new(factories);
+    let validation_errors = super::validate_and_resolve_errors_with_context(
         &mut parsed,
         base_dir,
         false,
+        &ctx,
+        load_errors,
         &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
@@ -316,7 +320,10 @@ pub fn run_validate(
     }
 
     // Check for unused let bindings (warnings, not errors)
-    let unused_warnings = check_unused_bindings(&loaded.unresolved_parsed);
+    let unused_warnings = carina_core::validation::check_unused_bindings_with_identity_requirements(
+        &loaded.unresolved_parsed,
+        ctx.schemas(),
+    );
 
     // Check for duplicate attribute keys
     let source_files: Vec<(PathBuf, String)> = {

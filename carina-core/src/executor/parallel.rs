@@ -8,7 +8,9 @@ use std::time::Instant;
 use crate::effect::deps::UnresolvedResource;
 use crate::effect::{DeletedInstanceKey, Effect};
 use crate::provider::Provider;
-use crate::resource::{Resource, ResourceId, ResourceIdentity, Value};
+#[cfg(test)]
+use crate::resource::Resource;
+use crate::resource::{ResolvedResource, ResourceId, ResourceIdentity, Value};
 use crate::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
 #[cfg(test)]
@@ -230,7 +232,7 @@ pub(super) async fn execute_effects_sequential(
     let mut successfully_deleted: HashSet<DeletedInstanceKey> = HashSet::new();
     let permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
-    let mut runtime_synthesized_resources: Vec<Resource> = Vec::new();
+    let mut runtime_synthesized_resources: Vec<ResolvedResource> = Vec::new();
     let mut runtime_authored_resource_ids: HashSet<ResourceId> = HashSet::new();
     let module_gate = super::ModuleConstraintGate::new(input.compositions);
 
@@ -403,7 +405,7 @@ pub(super) async fn execute_effects_sequential(
                             let child_idx = effects.len();
                             if let Effect::Create(resource) = &child {
                                 runtime_authored_resource_ids.insert(resource.id.clone());
-                                runtime_synthesized_resources.push(resource.clone().into_inner());
+                                runtime_synthesized_resources.push(resource.clone());
                             }
                             if let Some(binding) = failure_binding_name(&child) {
                                 idx_to_binding.insert(child_idx, binding);

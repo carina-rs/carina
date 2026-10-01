@@ -1,7 +1,6 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::hash::{Hash, Hasher};
 use std::io::IsTerminal;
 use std::path::Path;
 
@@ -38,8 +37,8 @@ use carina_core::provider::{
     ProviderNormalizer, ProviderRouter,
 };
 use carina_core::resource::{
-    Composition, ConcreteValue, DataSource, DeferredValue, ResolvedResourceId, Resource,
-    ResourceId, ResourceIdentity, ResourceIdentityError, State, Value,
+    Composition, ConcreteValue, DataSource, DeferredValue, ResolvedResource, ResolvedResourceId,
+    Resource, ResourceId, ResourceIdentity, ResourceIdentityError, State, Value,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, CustomTypeLookup, ResourceSchema, SchemaRegistry, StructField,
@@ -870,38 +869,8 @@ pub(crate) fn assign_fallback_identities_for_unresolved_anonymous(
             continue;
         }
 
-        let provider_snake = resource
-            .id
-            .provider
-            .split('.')
-            .map(carina_core::parser::pascal_to_snake)
-            .collect::<Vec<_>>()
-            .join("_");
-        let type_snake = resource
-            .id
-            .resource_type
-            .split('.')
-            .map(carina_core::parser::pascal_to_snake)
-            .collect::<Vec<_>>()
-            .join("_");
-        let hash = fallback_anonymous_hash(resource, &known_bindings);
-        let bare_identifier = if provider_snake.is_empty() {
-            format!("{type_snake}_{hash}")
-        } else {
-            format!("{provider_snake}_{type_snake}_{hash}")
-        };
-        let identifier = match &resource.module_source {
-            Some(carina_core::resource::ModuleSource::Module { instance, .. }) => {
-                format!("{instance}.{bare_identifier}")
-            }
-            _ => bare_identifier,
-        };
-
         let old_id = resource.id.clone();
-        let identity = match ResourceIdentity::try_from(identifier) {
-            Ok(identity) => identity,
-            Err(ResourceIdentityError::Empty) => continue,
-        };
+        let identity = identifier::fallback_anonymous_identity(resource, &known_bindings);
         resource.id.set_identity(identity);
         renames.push((old_id, resource.id.clone()));
     }
@@ -966,65 +935,6 @@ pub(crate) fn reconcile_late_anonymous_identities(
     }
 
     Ok(())
-}
-
-fn fallback_hash_dependency_bindings(
-    resource: &Resource,
-    known_bindings: &HashSet<String>,
-) -> BTreeSet<String> {
-    let Some(carina_core::resource::ModuleSource::Module { instance, .. }) =
-        &resource.module_source
-    else {
-        // Preserve the historical hash input byte-for-byte for root resources.
-        return resource.dependency_bindings.clone();
-    };
-
-    let instance_prefix = format!("{instance}.");
-    resource
-        .dependency_bindings
-        .iter()
-        .map(|binding| {
-            if binding.starts_with(&instance_prefix) {
-                return binding.clone();
-            }
-
-            let expanded = format!("{instance_prefix}{binding}");
-            if known_bindings.contains(&expanded) {
-                expanded
-            } else {
-                // Module arguments and outer-scope bindings are not owned by
-                // this module instance and retain their historical spelling.
-                binding.clone()
-            }
-        })
-        .collect()
-}
-
-fn fallback_anonymous_hash(resource: &Resource, known_bindings: &HashSet<String>) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    resource.id.provider.hash(&mut hasher);
-    resource.id.resource_type.hash(&mut hasher);
-    resource.id.provider_instance.hash(&mut hasher);
-    resource.module_source.hash(&mut hasher);
-    for (key, value) in &resource.attributes {
-        key.hash(&mut hasher);
-        format!("{value:?}").hash(&mut hasher);
-    }
-    resource.directives.force_delete.hash(&mut hasher);
-    resource.directives.create_before_destroy.hash(&mut hasher);
-    resource.directives.prevent_destroy.hash(&mut hasher);
-    resource.directives.depends_on.hash(&mut hasher);
-    resource.directives.provider_instance.hash(&mut hasher);
-    for (key, value) in BTreeMap::from_iter(resource.prefixes.iter()) {
-        key.hash(&mut hasher);
-        value.hash(&mut hasher);
-    }
-    // Released module identities hashed the expanded binding spelling. Promote
-    // a module-local spelling to that compatibility form only when the prefixed
-    // name is an actual sibling binding; arguments and outer-scope names pass
-    // through unchanged. Root resources retain their exact historical set.
-    fallback_hash_dependency_bindings(resource, known_bindings).hash(&mut hasher);
-    format!("{:08x}", hasher.finish() & 0xffff_ffff)
 }
 
 pub fn compute_anonymous_identifiers_with_ctx(
@@ -3061,8 +2971,15 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         .as_ref()
         .map(|sf| sf.build_directives())
         .unwrap_or_default();
+    let paired_unresolved_resources = override_aware_resources
+        .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
+    let resolved_resources =
+        ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())?;
+    let resolved_unresolved_resources =
+        ResolvedResource::collect_resolved(paired_unresolved_resources.iter().cloned())?;
     let mut plan = create_plan_with_cascades(
-        &override_aware_resources,
+        &resolved_resources,
+        &resolved_unresolved_resources,
         &data_sources_for_plan,
         &provider,
         &plan_input_states,
@@ -3098,8 +3015,6 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         .iter()
         .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
         .collect();
-    let paired_unresolved_resources = override_aware_resources
-        .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
     Ok(PlanContext {
         plan,
         provider,
@@ -3119,13 +3034,13 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
 fn resolved_state_row_id(
     row: &carina_state::ResourceState,
     provider_instance: Option<String>,
-) -> Option<ResolvedResourceId> {
-    Some(ResolvedResourceId::with_provider_identity(
+) -> ResolvedResourceId {
+    ResolvedResourceId::with_provider_identity(
         row.provider.clone(),
         row.resource_type.clone(),
         row.identity.clone(),
         provider_instance,
-    ))
+    )
 }
 
 /// Pre-process moved blocks by transferring state, `prev_explicit`, and
@@ -3183,9 +3098,7 @@ fn materialize_moved_states_with_warning_sink(
             // address shape.
             let resolved_from = state_file.as_ref().and_then(|sf| {
                 sf.find_resource(&from.provider, &from.resource_type, from.name_str())
-                    .and_then(|rs| {
-                        resolved_state_row_id(rs, rs.directives.provider_instance.clone())
-                    })
+                    .map(|rs| resolved_state_row_id(rs, rs.directives.provider_instance.clone()))
             });
             let Some(resolved_from) = resolved_from else {
                 let to_exists = state_file.as_ref().is_some_and(|sf| {
@@ -3288,9 +3201,7 @@ pub fn resolve_state_blocks(
                         &removed_from.resource_type,
                         removed_from.name_str(),
                     )
-                    .and_then(|rs| {
-                        resolved_state_row_id(rs, rs.directives.provider_instance.clone())
-                    })
+                    .map(|rs| resolved_state_row_id(rs, rs.directives.provider_instance.clone()))
                 }) {
                     from.insert(removed_from.clone());
                     resolved_removed_from.push(id.into_inner());
@@ -3547,7 +3458,7 @@ pub fn add_state_block_effects(
                 // Import arm above (carina#3324).
                 let resolved_from = state_file.as_ref().and_then(|sf| {
                     sf.find_resource(&from.provider, &from.resource_type, from.name_str())
-                        .and_then(|rs| {
+                        .map(|rs| {
                             resolved_state_row_id(rs, rs.directives.provider_instance.clone())
                         })
                 });
@@ -3694,9 +3605,9 @@ pub fn add_deposed_delete_effects(plan: &mut Plan, state_file: &Option<StateFile
 pub(crate) fn deposed_delete_effects_for_row(row: &carina_state::ResourceState) -> Vec<Effect> {
     row.deposed
         .iter()
-        .filter_map(|deposed| {
-            let id = resolved_state_row_id(row, deposed.provider_instance.clone())?;
-            Some(Effect::Delete {
+        .map(|deposed| {
+            let id = resolved_state_row_id(row, deposed.provider_instance.clone());
+            Effect::Delete {
                 id,
                 identifier: deposed.identifier.clone(),
                 generation: EffectGeneration::Deposed(deposed.key.clone()),
@@ -3705,7 +3616,7 @@ pub(crate) fn deposed_delete_effects_for_row(row: &carina_state::ResourceState) 
                 dependencies: deposed.dependency_bindings.iter().cloned().collect(),
                 explicit_dependencies: HashSet::new(),
                 blocked_by_updates: HashSet::new(),
-            })
+            }
         })
         .collect()
 }

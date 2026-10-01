@@ -186,7 +186,7 @@ impl DataSource {
 pub struct ResolvedDataSource(DataSource);
 
 impl ResolvedDataSource {
-    /// Construct from a [`DataSource`], panicking if identity is `None`.
+    /// Construct from a [`DataSource`], panicking if identity is pending.
     pub fn new(resource: DataSource) -> Self {
         assert!(
             matches!(
@@ -198,7 +198,7 @@ impl ResolvedDataSource {
         Self(resource)
     }
 
-    /// Try to construct; returns `None` if identity is absent.
+    /// Try to construct; returns `None` if identity is pending.
     pub fn try_new(resource: DataSource) -> Option<Self> {
         match resource.id.identity_state() {
             ResourceIdentityState::Pending(_) => None,

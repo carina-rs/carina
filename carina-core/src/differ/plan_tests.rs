@@ -1,4 +1,4 @@
-use super::*;
+use super::{create_plan_for_tests as create_plan, *};
 
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashSet};

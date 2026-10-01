@@ -141,6 +141,23 @@ fn rename_resource_identities_returns_error_for_duplicate_destination() {
 }
 
 #[test]
+fn rename_resource_identities_preserves_invalid_identity_source() {
+    let mut state = StateFile::new();
+    state
+        .upsert_resource(ResourceState::new("ec2.Vpc", "old", "aws"))
+        .expect("fresh state accepts the old identity");
+
+    let error = state
+        .rename_resource_identities(&[("old".to_string(), String::new())])
+        .expect_err("rename must reject an empty destination identity");
+
+    assert!(matches!(error, BackendError::InvalidStateIdentity { .. }));
+    let source = std::error::Error::source(&error).expect("identity error must remain the source");
+    assert_eq!(source.to_string(), "resource identity cannot be empty");
+    assert!(state.find_resource("aws", "ec2.Vpc", "old").is_some());
+}
+
+#[test]
 fn upsert_deposed_generation_returns_error_when_key_and_identity_cross_generations() {
     let mut state = StateFile::new();
     let first_key = DeposedKey::new_unique();

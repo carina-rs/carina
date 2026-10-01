@@ -5819,8 +5819,9 @@ fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
         (consumer_id, consumer_state),
         (orphan_id.clone(), orphan_state),
     ]);
+    let desired = ResolvedResource::collect_resolved([desired]).unwrap();
     let plan = crate::differ::create_plan(
-        &[desired],
+        &desired,
         &[],
         &crate::provider::ProviderRouter::new(),
         &crate::resource::into_plan_input_map(
@@ -6413,8 +6414,13 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         vec![managed_vpc, managed_subnet],
         vec![unresolved_vpc, unresolved_subnet],
     );
+    let unresolved =
+        ResolvedResource::collect_resolved(override_aware.paired_unresolved_resources()).unwrap();
+    let managed =
+        ResolvedResource::collect_resolved(override_aware.resources().iter().cloned()).unwrap();
     let plan = create_plan_with_cascades(
-        &override_aware,
+        &managed,
+        &unresolved,
         &[],
         &crate::provider::ProviderRouter::new(),
         &plan_input_states,

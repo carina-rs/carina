@@ -175,7 +175,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(existing_state),
-        sorted_resources: &[resource],
+        sorted_resources: &[resolved(resource)],
         runtime_synthesized_resources: &[],
         current_states: &current_states,
         applied_states: &HashMap::new(),
@@ -228,7 +228,7 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(existing_state),
-        sorted_resources: &[resource],
+        sorted_resources: &[resolved(resource)],
         runtime_synthesized_resources: &[],
         current_states: &current_states,
         applied_states: &HashMap::new(),
@@ -277,7 +277,7 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(existing_state),
-        sorted_resources: &[resource],
+        sorted_resources: &[resolved(resource)],
         runtime_synthesized_resources: &[],
         current_states: &current_states,
         applied_states: &HashMap::new(),
@@ -1452,7 +1452,7 @@ fn orphaned_state_resource_produces_delete_effect() {
     let prev_explicit = state_file.build_explicit();
 
     let plan = create_plan(
-        &desired,
+        &ResolvedResource::collect_resolved(desired.clone()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
         &carina_core::resource::into_plan_input_map(
@@ -2157,7 +2157,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
     let prev_explicit = state_file.build_explicit();
 
     let plan = create_plan(
-        &desired,
+        &ResolvedResource::collect_resolved(desired.clone()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
         &carina_core::resource::into_plan_input_map(
@@ -2250,7 +2250,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
     let prev_explicit = state_file.build_explicit();
 
     let plan = create_plan(
-        &desired,
+        &ResolvedResource::collect_resolved(desired.clone()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
         &carina_core::resource::into_plan_input_map(
@@ -2305,7 +2305,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
     let prev_explicit = state_file.build_explicit();
 
     let plan = create_plan(
-        &desired,
+        &ResolvedResource::collect_resolved(desired.clone()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
         &carina_core::resource::into_plan_input_map(
@@ -2356,7 +2356,7 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
     }
 
     let plan = create_plan(
-        &desired,
+        &ResolvedResource::collect_resolved(desired.clone()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
         &carina_core::resource::into_plan_input_map(
@@ -2427,7 +2427,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: None,
-        sorted_resources: &[resource],
+        sorted_resources: &[resolved(resource)],
         runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
@@ -2522,7 +2522,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: None,
-        sorted_resources: &[resource],
+        sorted_resources: &[resolved(resource)],
         runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
@@ -2599,7 +2599,7 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: None,
-        sorted_resources: &[resource.clone()],
+        sorted_resources: &[resolved(resource.clone())],
         runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
@@ -2613,7 +2613,7 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
 
     let resources = [resource];
     let plan = create_plan(
-        &resources,
+        &ResolvedResource::collect_resolved(resources.iter().cloned()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
         &carina_core::resource::into_plan_input_map(
@@ -2691,7 +2691,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(existing_state),
-        sorted_resources: &[resource],
+        sorted_resources: &[resolved(resource)],
         runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
@@ -3204,7 +3204,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     resource_a.binding = Some("a".to_string());
     let mut resource_b = Resource::with_provider("mock", "test.resource", "b", None);
     resource_b.binding = Some("b".to_string());
-    let sorted_resources = vec![resource_a.clone(), resource_b];
+    let sorted_resources = vec![resolved(resource_a.clone()), resolved(resource_b)];
 
     let a_id = resource_a.id.clone();
     let mut a_attrs = HashMap::new();

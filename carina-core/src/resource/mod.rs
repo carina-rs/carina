@@ -445,7 +445,7 @@ impl ResolvedResourceId {
         ))
     }
 
-    /// Construct from a `ResourceId`, panicking if identity is `None`.
+    /// Construct from a `ResourceId`, panicking if identity is pending.
     pub fn new(id: ResourceId) -> Self {
         assert!(
             matches!(id.identity_state(), ResourceIdentityState::Resolved(_)),
@@ -454,7 +454,7 @@ impl ResolvedResourceId {
         Self(id)
     }
 
-    /// Try to construct; returns `None` if identity is absent.
+    /// Try to construct; returns `None` if identity is pending.
     pub fn try_new(id: ResourceId) -> Option<Self> {
         match id.identity_state() {
             ResourceIdentityState::Pending(_) => None,
@@ -596,8 +596,21 @@ impl Borrow<ResourceId> for ResolvedResourceId {
 #[serde(try_from = "Resource", into = "Resource")]
 pub struct ResolvedResource(Resource);
 
+/// A resource reached a resolved-only pipeline boundary before its identity
+/// was assigned.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("resource '{id}' still has a pending identity")]
+pub struct PendingResourceIdentityError {
+    id: ResourceId,
+}
+
 impl ResolvedResource {
-    /// Construct from a [`Resource`], panicking if identity is `None`.
+    /// Construct a resource from an already-resolved id.
+    pub fn from_id(id: ResolvedResourceId) -> Self {
+        Self(Resource::from_id(id.into_inner()))
+    }
+
+    /// Construct from a [`Resource`], panicking if identity is pending.
     pub fn new(resource: Resource) -> Self {
         assert!(
             matches!(
@@ -609,12 +622,28 @@ impl ResolvedResource {
         Self(resource)
     }
 
-    /// Try to construct; returns `None` if identity is absent.
+    /// Try to construct; returns `None` if identity is pending.
     pub fn try_new(resource: Resource) -> Option<Self> {
         match resource.id.identity_state() {
             ResourceIdentityState::Pending(_) => None,
             ResourceIdentityState::Resolved(_) => Some(Self(resource)),
         }
+    }
+
+    /// Convert a whole resource collection at the pipeline boundary where
+    /// identity assignment is complete.
+    pub fn collect_resolved(
+        resources: impl IntoIterator<Item = Resource>,
+    ) -> Result<Vec<Self>, PendingResourceIdentityError> {
+        resources
+            .into_iter()
+            .map(|resource| match resource.id.identity_state() {
+                ResourceIdentityState::Pending(_) => {
+                    Err(PendingResourceIdentityError { id: resource.id })
+                }
+                ResourceIdentityState::Resolved(_) => Ok(Self(resource)),
+            })
+            .collect()
     }
 
     /// Borrow the inner [`Resource`].
@@ -647,6 +676,11 @@ impl ResolvedResource {
 
     pub fn resolved_id(&self) -> ResolvedResourceId {
         ResolvedResourceId(self.0.id.clone())
+    }
+
+    /// Set an attribute without weakening the resolved-identity invariant.
+    pub fn set_attr(&mut self, key: impl Into<String>, value: Value) {
+        self.0.set_attr(key, value);
     }
 }
 

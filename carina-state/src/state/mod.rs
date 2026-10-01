@@ -377,7 +377,14 @@ impl StateFile {
         for resource in &mut renamed {
             if let Some(new_identity) = by_old.get(resource.identity.as_str()) {
                 resource.identity = ResourceIdentity::try_from((*new_identity).to_owned())
-                    .map_err(|source| BackendError::InvalidState(source.to_string()))?;
+                    .map_err(|source| BackendError::InvalidStateIdentity {
+                        context: format!(
+                            "cannot rename resource identity {:?} to {:?}",
+                            resource.identity.as_str(),
+                            new_identity
+                        ),
+                        source,
+                    })?;
             }
         }
         validate_resource_identities(&renamed).map_err(BackendError::InvalidState)?;
@@ -640,7 +647,15 @@ impl StateFile {
         for r in &mut self.resources {
             r.identity =
                 ResourceIdentity::try_from(canonicalize_map_key_address(r.identity.as_str()))
-                    .map_err(|source| BackendError::InvalidState(source.to_string()))?;
+                    .map_err(|source| BackendError::InvalidStateIdentity {
+                        context: format!(
+                            "cannot canonicalize identity {:?} for {}.{}",
+                            r.identity.as_str(),
+                            r.provider,
+                            r.resource_type
+                        ),
+                        source,
+                    })?;
             if let Some(b) = r.binding.as_ref() {
                 r.binding = Some(canonicalize_map_key_address(b));
             }

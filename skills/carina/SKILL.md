@@ -31,7 +31,7 @@ provider aws {
 
 ### Resource Definition
 
-Anonymous resource (ID derived from `name` attribute):
+Anonymous resource (ID derived from configured create-only or provider identity attributes, with a single-resource attribute fallback):
 
 ```crn
 aws.s3.Bucket {
@@ -121,7 +121,7 @@ carina fmt --check
 
 - Always run `carina validate` before `carina plan`
 - Use `let` bindings when resources reference each other
-- Use anonymous resources (no `let`) when the binding is not referenced elsewhere
+- Use anonymous resources (no `let`) when the binding is not referenced elsewhere. Two or more anonymous resources of the same type in one scope must set a create-only or identity attribute; otherwise, use `let` bindings for stable identities.
 - Use modules for reusable infrastructure patterns
 - Configure a remote backend (S3) for team collaboration
 - Run `carina init` after adding or updating provider requirements

@@ -6,6 +6,93 @@ const ATTRIBUTE_DERIVED_IDENTITY_ERROR: &str = "Anonymous resource identity is d
 mutable attributes for multiple 'mock.test.resource' declarations using provider instance \
 '<default>' in the root scope. Use `let` bindings to give them distinct stable identities.";
 
+fn unused_binding_messages(diagnostics: &[Diagnostic]) -> Vec<&str> {
+    diagnostics
+        .iter()
+        .filter_map(|diagnostic| {
+            diagnostic
+                .message
+                .starts_with("Unused let binding")
+                .then_some(diagnostic.message.as_str())
+        })
+        .collect()
+}
+
+#[test]
+fn attribute_derived_bindings_required_across_sibling_files_are_not_unused() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let temp = tempfile::tempdir().unwrap();
+    let alpha = "let alpha = mock.test.resource {\n  name = \"alpha\"\n}\n";
+    let beta = "let beta = mock.test.resource {\n  name = \"beta\"\n}\n";
+    std::fs::write(temp.path().join("alpha.crn"), alpha).unwrap();
+    std::fs::write(temp.path().join("beta.crn"), beta).unwrap();
+
+    let alpha_diagnostics = engine.analyze_with_filename(
+        &create_document(alpha),
+        Some("alpha.crn"),
+        Some(temp.path()),
+    );
+    let beta_diagnostics =
+        engine.analyze_with_filename(&create_document(beta), Some("beta.crn"), Some(temp.path()));
+
+    assert!(
+        unused_binding_messages(&alpha_diagnostics).is_empty(),
+        "alpha diagnostics: {alpha_diagnostics:#?}",
+    );
+    assert!(
+        unused_binding_messages(&beta_diagnostics).is_empty(),
+        "beta diagnostics: {beta_diagnostics:#?}",
+    );
+}
+
+#[test]
+fn single_unused_attribute_derived_binding_still_warns() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let source = "let alpha = mock.test.resource {\n  name = \"alpha\"\n}\n";
+    let diagnostics = engine.analyze(&create_document(source), None);
+
+    assert_eq!(
+        unused_binding_messages(&diagnostics),
+        vec!["Unused let binding 'alpha'. Consider using an anonymous resource instead."],
+    );
+}
+
+#[test]
+fn unused_stable_binding_still_warns() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only()),
+    );
+    let engine = custom_engine(schemas);
+    let source = "let alpha = mock.test.resource {\n  name = \"alpha\"\n}\n";
+    let diagnostics = engine.analyze(&create_document(source), None);
+
+    assert_eq!(
+        unused_binding_messages(&diagnostics),
+        vec!["Unused let binding 'alpha'. Consider using an anonymous resource instead."],
+    );
+}
+
 #[test]
 fn attribute_derived_anonymous_identity_error_is_directory_scoped_and_anchored() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};

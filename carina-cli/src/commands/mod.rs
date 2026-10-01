@@ -355,6 +355,26 @@ pub fn validate_and_resolve_errors_with_factories(
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Vec<AppError> {
     let ctx = WiringContext::new(factories);
+    validate_and_resolve_errors_with_context(
+        parsed,
+        base_dir,
+        skip_resource_validation,
+        &ctx,
+        load_errors,
+        prior_inference_errors,
+        duplicate_declarations,
+    )
+}
+
+pub(crate) fn validate_and_resolve_errors_with_context(
+    parsed: &mut carina_core::parser::InferredFile,
+    base_dir: &Path,
+    skip_resource_validation: bool,
+    ctx: &WiringContext,
+    load_errors: HashMap<String, String>,
+    prior_inference_errors: &[ExportInferenceError],
+    duplicate_declarations: &[DuplicateDeclaration],
+) -> Vec<AppError> {
     let module_walk = if skip_resource_validation {
         ModuleWalk::default()
     } else {
@@ -428,7 +448,7 @@ pub fn validate_and_resolve_errors_with_factories(
     }
 
     // Validate provider region
-    errors.extend(validate_provider_region_with_ctx(&ctx, parsed));
+    errors.extend(validate_provider_region_with_ctx(ctx, parsed));
 
     // Enrich provider context with custom type validators from loaded schemas
     let enriched_context = enrich_provider_context(ctx.schemas(), ctx.factories_arc());
@@ -454,7 +474,7 @@ pub fn validate_and_resolve_errors_with_factories(
     }
     if !skip_resource_validation {
         errors.extend(validate_module_internal_ref_types(
-            &ctx,
+            ctx,
             &module_walk,
             &enriched_context,
         ));
@@ -507,7 +527,7 @@ pub fn validate_and_resolve_errors_with_factories(
         // fallback never runs on the successful path, so it cannot duplicate
         // composition diagnostics.
         errors.extend(validate_module_attribute_refs_after_expansion_failure(
-            &ctx,
+            ctx,
             &module_walk,
             &enriched_context,
         ));
@@ -541,7 +561,7 @@ pub fn validate_and_resolve_errors_with_factories(
     // Resolve names (let bindings -> resource names) — must succeed
     // before per-resource schema checks can look up the renamed
     // attributes, so its failures gate the remaining pipeline.
-    errors.extend(resolve_names_with_ctx(&ctx, &mut parsed.resources));
+    errors.extend(resolve_names_with_ctx(ctx, &mut parsed.resources));
     if !errors.is_empty() {
         return errors;
     }
@@ -564,10 +584,10 @@ pub fn validate_and_resolve_errors_with_factories(
         // below try to type-check around the marker. See #2487.
         errors.extend(validate_no_empty_interpolations(parsed));
 
-        errors.extend(validate_resources_with_ctx(&ctx, parsed, &enriched_context));
+        errors.extend(validate_resources_with_ctx(ctx, parsed, &enriched_context));
         errors.extend(validate_depends_on_with_ctx(parsed));
-        errors.extend(validate_wait_bindings_with_ctx(&ctx, parsed));
-        errors.extend(validate_deferred_populate_refs_with_ctx(&ctx, parsed));
+        errors.extend(validate_wait_bindings_with_ctx(ctx, parsed));
+        errors.extend(validate_deferred_populate_refs_with_ctx(ctx, parsed));
         errors.extend(
             carina_core::identifier::check_attribute_derived_anonymous_resource_conflicts(
                 &parsed.resources,
@@ -638,7 +658,7 @@ pub fn validate_and_resolve_errors_with_factories(
     // every resource has a stable id, so a collision error must stop
     // the pipeline here.
     errors.extend(compute_anonymous_identifiers_with_ctx(
-        &ctx,
+        ctx,
         canonical_resources,
         &parsed.providers,
     ));

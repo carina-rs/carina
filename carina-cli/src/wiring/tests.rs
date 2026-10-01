@@ -26,6 +26,34 @@ fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn create_plan(
+    managed: &[Resource],
+    data_sources: &[carina_core::resource::DataSource],
+    provider: &dyn Provider,
+    current_states: &HashMap<ResourceId, carina_core::resource::PlanInputState>,
+    directives_map: &HashMap<ResourceId, Directives>,
+    registry: &SchemaRegistry,
+    saved_attrs: &carina_core::provider::LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
+    wait_bindings: &[carina_core::parser::WaitBinding],
+) -> Plan {
+    let managed = ResolvedResource::collect_resolved(managed.iter().cloned()).unwrap();
+    carina_core::differ::create_plan(
+        &managed,
+        data_sources,
+        provider,
+        current_states,
+        directives_map,
+        registry,
+        saved_attrs,
+        prev_explicit,
+        orphan_dependencies,
+        wait_bindings,
+    )
+}
+
 fn test_identity(value: impl Into<String>) -> ResourceIdentity {
     ResourceIdentity::try_from(value.into()).unwrap()
 }
@@ -493,7 +521,6 @@ fn test_resolve_enum_aliases_in_struct_field() {
 #[test]
 #[ignore = "requires provider binary for state normalization"]
 fn test_normalize_state_prevents_false_enum_diff() {
-    use carina_core::differ::create_plan;
     use carina_core::resource::Directives;
 
     let ctx = WiringContext::new(vec![]);
@@ -584,7 +611,6 @@ fn test_normalize_state_prevents_false_enum_diff() {
 #[test]
 #[ignore = "requires provider binary for default tags merging"]
 fn test_merge_default_tags_prevents_false_diff() {
-    use carina_core::differ::create_plan;
     use carina_core::resource::Directives;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
@@ -5046,16 +5072,15 @@ mod wait_until_enum_alias {
     /// plan path uses.
     #[test]
     fn create_plan_elides_already_satisfied_wait_after_enum_alias_resolution() {
-        use carina_core::differ::create_plan;
-
         let ctx = WiringContext::new(vec![Box::new(AcmAliasFactory) as Box<dyn ProviderFactory>]);
         let resources = vec![cert_resource(), changed_consumer()];
         let states = cert_state();
 
         // Bug repro: unresolved RAW enum RHS → wait wrongly emitted.
         let raw_waits = vec![enum_wait_binding()];
-        let plan_raw = create_plan(
-            &resources,
+        let resolved_resources = ResolvedResource::collect_resolved(resources.clone()).unwrap();
+        let plan_raw = carina_core::differ::create_plan(
+            &resolved_resources,
             &[],
             &carina_core::provider::ProviderRouter::new(),
             &carina_core::resource::into_plan_input_map(
@@ -5080,8 +5105,8 @@ mod wait_until_enum_alias {
         // Fixed: resolve the alias first → predicate satisfied → elided.
         let mut waits = vec![enum_wait_binding()];
         resolve_enum_aliases_in_wait_bindings(&ctx, &mut waits, &resources, &[]);
-        let plan_fixed = create_plan(
-            &resources,
+        let plan_fixed = carina_core::differ::create_plan(
+            &resolved_resources,
             &[],
             &carina_core::provider::ProviderRouter::new(),
             &carina_core::resource::into_plan_input_map(

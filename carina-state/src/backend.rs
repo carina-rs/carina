@@ -125,6 +125,14 @@ pub enum BackendError {
     #[error("Invalid state file: {0}")]
     InvalidState(String),
 
+    /// An identity transformation produced a value that cannot be represented.
+    #[error("Invalid state file: {context}: {source}")]
+    InvalidStateIdentity {
+        context: String,
+        #[source]
+        source: ResourceIdentityError,
+    },
+
     /// A legacy state row contains an identity that can no longer be matched.
     #[error("{0}")]
     InvalidResourceIdentity(#[source] InvalidResourceIdentityError),

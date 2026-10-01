@@ -21,7 +21,7 @@ use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
 #[cfg(test)]
 use carina_core::resource::ConcreteValue;
-use carina_core::resource::{DataSource, Resource, ResourceId, State, Value};
+use carina_core::resource::{DataSource, ResolvedResource, Resource, ResourceId, State, Value};
 use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
 use carina_state::{BackendLock, LockInfo, StateBackend, StateFile};
@@ -628,9 +628,14 @@ pub(crate) async fn finalize_apply(
     let skipped_exports = if let Some(params) = input.export_params {
         let post_apply_states =
             PostApplyStates::from_current_and_state(input.current_states, &state);
+        let export_resources: Vec<Resource> = input
+            .sorted_resources
+            .iter()
+            .map(|resource| resource.as_resource().clone())
+            .collect();
         let resolution = resolve_exports(
             params,
-            input.sorted_resources,
+            &export_resources,
             input.data_sources,
             input.pre_resolve_compositions,
             &post_apply_states,
@@ -1733,6 +1738,10 @@ async fn run_apply_locked(
     )?;
     let paired_unresolved_resources = override_aware_resources
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
+    let resolved_resources =
+        ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())?;
+    let resolved_unresolved_resources =
+        ResolvedResource::collect_resolved(paired_unresolved_resources.iter().cloned())?;
     let plan_input_states = carina_core::resource::into_plan_input_map(
         current_states.clone(),
         ctx.schemas(),
@@ -1745,7 +1754,8 @@ async fn run_apply_locked(
         .unwrap_or_default();
     let schemas = ctx.schemas();
     let mut plan = create_plan_with_cascades(
-        &override_aware_resources,
+        &resolved_resources,
+        &resolved_unresolved_resources,
         &data_sources_for_plan,
         &provider,
         &plan_input_states,
@@ -1961,7 +1971,7 @@ async fn run_apply_locked(
                 FinalizeApplyInput {
                     result: &result,
                     state_file,
-                    sorted_resources: override_aware_resources.resources(),
+                    sorted_resources: &resolved_resources,
                     data_sources: &data_sources_for_plan,
                     current_states: &current_states,
                     plan: &plan,
@@ -2316,6 +2326,8 @@ async fn run_apply_from_plan_locked(
 
     let plan = &plan_file.plan;
     let sorted_resources = &plan_file.sorted_resources;
+    let resolved_sorted_resources =
+        ResolvedResource::collect_resolved(sorted_resources.iter().cloned())?;
     let plan_compositions: &[carina_core::resource::Composition] = &plan_file.compositions;
     let plan_data_sources: &[carina_core::resource::DataSource] = &plan_file.data_sources;
     let plan_data_source_origins: &[carina_core::resource::DataSource] =
@@ -2525,7 +2537,7 @@ async fn run_apply_from_plan_locked(
                 FinalizeApplyInput {
                     result: &result,
                     state_file,
-                    sorted_resources,
+                    sorted_resources: &resolved_sorted_resources,
                     data_sources: plan_data_sources,
                     current_states: &current_states,
                     plan,

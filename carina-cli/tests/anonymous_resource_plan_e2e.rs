@@ -183,6 +183,10 @@ fn assert_success(label: &str, output: &Output) {
     );
 }
 
+fn unused_binding_warning(binding: &str) -> String {
+    format!("Unused let binding '{binding}'. Consider using an anonymous resource instead.")
+}
+
 #[test]
 fn validate_rejects_multiple_attribute_derived_anonymous_resources() {
     let scenario = Scenario::new();
@@ -198,6 +202,81 @@ fn validate_rejects_multiple_attribute_derived_anonymous_resources() {
          status: {}\nstdout:\n{}\nstderr:\n{stderr}",
         validate.status,
         String::from_utf8_lossy(&validate.stdout),
+    );
+}
+
+#[test]
+fn validate_does_not_warn_for_attribute_derived_bindings_required_across_sibling_files() {
+    let scenario = Scenario::new();
+    scenario.write_main(
+        r#"let alpha = mock.test.resource {
+  name = "alpha"
+}
+"#,
+    );
+    fs::write(
+        scenario.project.join("beta.crn"),
+        r#"let beta = mock.test.resource {
+  name = "beta"
+}
+"#,
+    )
+    .expect("write sibling resource");
+
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+    let validate = scenario.carina(&["validate", "."]);
+    assert_success("carina validate", &validate);
+    let stdout = String::from_utf8_lossy(&validate.stdout);
+
+    assert!(
+        !stdout.contains(&unused_binding_warning("alpha"))
+            && !stdout.contains(&unused_binding_warning("beta")),
+        "identity-required bindings must not receive contradictory unused warnings\n{stdout}",
+    );
+}
+
+#[test]
+fn validate_still_warns_for_single_unused_attribute_derived_binding() {
+    let scenario = Scenario::new();
+    scenario.write_main(
+        r#"let alpha = mock.test.resource {
+  name = "alpha"
+}
+"#,
+    );
+
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+    let validate = scenario.carina(&["validate", "."]);
+    assert_success("carina validate", &validate);
+    let stdout = String::from_utf8_lossy(&validate.stdout);
+
+    assert!(
+        stdout.contains(&unused_binding_warning("alpha")),
+        "a lone attribute-derived binding is safe to anonymize and must still warn\n{stdout}",
+    );
+}
+
+#[test]
+fn validate_still_warns_for_unused_stable_binding() {
+    let scenario = Scenario::new();
+    scenario.write_main(
+        r#"let alpha = mock.test.resource {
+  name = "alpha"
+}
+"#,
+    );
+
+    assert_success(
+        "carina init",
+        &scenario.carina_with_stable_schema(&["init", "."]),
+    );
+    let validate = scenario.carina_with_stable_schema(&["validate", "."]);
+    assert_success("carina validate", &validate);
+    let stdout = String::from_utf8_lossy(&validate.stdout);
+
+    assert!(
+        stdout.contains(&unused_binding_warning("alpha")),
+        "a stable binding does not prevent an identity conflict and must still warn\n{stdout}",
     );
 }
 

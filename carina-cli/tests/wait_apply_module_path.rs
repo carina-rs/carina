@@ -40,7 +40,7 @@ use carina_core::parser::ProviderContext;
 use carina_core::provider::{
     BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
-use carina_core::resource::{ResourceId, State, Value};
+use carina_core::resource::{ResolvedResource, ResourceId, State, Value};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 use indexmap::IndexMap;
 use std::sync::Mutex;
@@ -532,10 +532,12 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .await
         .expect("plan preprocessing");
     let resources_for_plan = override_aware_resources.resources().to_vec();
+    let resolved_resources_for_plan =
+        ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
 
     let saved_attrs = carina_core::provider::RawSavedAttrs::default().lift(ctx.schemas());
     let plan = create_plan(
-        &resources_for_plan,
+        &resolved_resources_for_plan,
         &parsed.data_sources,
         &carina_core::provider::ProviderRouter::new(),
         &carina_core::resource::into_plan_input_map(

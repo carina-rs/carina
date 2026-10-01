@@ -14,7 +14,7 @@ use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, RawSavedAttrs};
 use carina_core::resource::{
-    ConcreteValue, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource,
+    ConcreteValue, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId,
     ResourceId, ResourceIdentity, State, Value,
 };
 use carina_core::shutdown::{
@@ -944,7 +944,13 @@ async fn run_state_bucket_delete(
     // Delete the bucket resource (identifier is the bucket name)
     // Backend bucket is provider-default; named-instance routing is
     // a DSL concern that doesn't apply to the implicit state bucket.
-    let bucket_identity = ResourceIdentity::try_from(bucket_name.to_string())?;
+    let bucket_identity =
+        ResourceIdentity::try_from(bucket_name.to_string()).map_err(|source| {
+            AppError::InvalidStateBucketIdentity {
+                bucket_name: bucket_name.to_string(),
+                source,
+            }
+        })?;
     let bucket_id = ResourceId::with_provider_identity(
         backend_provider_name,
         backend_resource_type,
@@ -1220,20 +1226,20 @@ async fn run_state_refresh_locked_with_ctx(
 
     // Also read states for orphaned resources (in state but removed from config)
     let desired_ids: HashSet<ResourceId> = sorted_resources.iter().map(|r| r.id.clone()).collect();
-    let orphan_ids: Vec<(ResourceId, String)> = state_file
+    let orphan_ids: Vec<(ResolvedResourceId, String)> = state_file
         .as_ref()
         .map(|sf| {
             sf.resources()
                 .iter()
                 .filter_map(|rs| {
                     let identity = rs.identity.clone();
-                    let id = ResourceId::with_provider_identity(
+                    let id = ResolvedResourceId::with_provider_identity(
                         rs.provider.clone(),
                         rs.resource_type.clone(),
                         identity,
                         rs.directives.provider_instance.clone(),
                     );
-                    if desired_ids.contains(&id) {
+                    if desired_ids.contains(id.as_inner()) {
                         return None;
                     }
                     rs.identifier.as_ref().map(|ident| (id, ident.clone()))
@@ -1242,8 +1248,12 @@ async fn run_state_refresh_locked_with_ctx(
         })
         .unwrap_or_default();
 
+    let orphan_reads = orphan_ids
+        .iter()
+        .map(|(id, identifier)| (id.as_inner().clone(), identifier.clone()))
+        .collect();
     let orphan_states =
-        refresh_existing_resources_until_cancelled(&provider, orphan_ids.clone(), &cancel)
+        refresh_existing_resources_until_cancelled(&provider, orphan_reads, &cancel)
             .await?
             .0;
     for (id, fresh_state) in orphan_states {
@@ -1348,19 +1358,21 @@ async fn run_state_refresh_locked_with_ctx(
         ctx.schemas(),
     );
 
+    let resolved_resources = ResolvedResource::collect_resolved(sorted_resources.iter().cloned())?;
+
     let mut state = state_file.take().unwrap();
 
     println!();
 
     let mut refresh_counts = StateRefreshCounts::default();
 
-    for resource in &sorted_resources {
+    for resource in &resolved_resources {
         let fresh_state = match current_states.get(&resource.id) {
             Some(s) => s,
             None => continue, // Not in state, skip
         };
         diff_display_update_resource(
-            &resource.id,
+            &resource.resolved_id(),
             fresh_state,
             &mut state,
             Some(resource),
@@ -1372,7 +1384,7 @@ async fn run_state_refresh_locked_with_ctx(
 
     // Process orphaned resources (in state but removed from config)
     for (orphan_id, _) in &orphan_ids {
-        let fresh_state = match current_states.get(orphan_id) {
+        let fresh_state = match current_states.get(orphan_id.as_inner()) {
             Some(s) => s,
             None => continue,
         };
@@ -1390,7 +1402,7 @@ async fn run_state_refresh_locked_with_ctx(
     let deposed_summary = refresh_deposed_generations_until_cancelled(
         &provider,
         &mut state,
-        &sorted_resources,
+        &resolved_resources,
         ctx.schemas(),
         &cancel,
     )
@@ -1619,7 +1631,7 @@ struct DeposedRefreshSummary {
 async fn refresh_deposed_generations_until_cancelled<P>(
     provider: &P,
     state: &mut carina_state::StateFile,
-    desired_resources: &[Resource],
+    desired_resources: &[ResolvedResource],
     schemas: &carina_core::schema::SchemaRegistry,
     cancel: &ShutdownToken,
 ) -> Result<DeposedRefreshSummary, AppError>
@@ -1721,9 +1733,8 @@ where
             }
         }
         let schema = schemas.get_for(&masking_resource);
-        let resolved_masking_resource = ResolvedResource::new(masking_resource.clone());
         let attributes = ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
-            &resolved_masking_resource,
+            &masking_resource,
             schema,
             &fresh_state.attributes,
             carina_state::PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&target.attributes),
@@ -1792,9 +1803,9 @@ fn collect_deposed_refresh_targets(state: &carina_state::StateFile) -> Vec<Depos
 }
 
 fn desired_resource_for_deposed<'a>(
-    desired_resources: &'a [Resource],
+    desired_resources: &'a [ResolvedResource],
     target: &DeposedRefreshTarget,
-) -> Option<&'a Resource> {
+) -> Option<&'a ResolvedResource> {
     desired_resources.iter().find(|resource| {
         resource.id.provider == target.row_provider
             && resource.id.resource_type == target.row_resource_type
@@ -1803,8 +1814,8 @@ fn desired_resource_for_deposed<'a>(
     })
 }
 
-fn synthetic_deposed_resource(target: &DeposedRefreshTarget) -> Resource {
-    let mut resource = Resource::from_id(target.id.as_inner().clone());
+fn synthetic_deposed_resource(target: &DeposedRefreshTarget) -> ResolvedResource {
+    let mut resource = ResolvedResource::from_id(target.id.clone());
     for (key, value) in &target.attributes {
         if let Some(dsl_value) = json_to_dsl_value(value) {
             resource.set_attr(key.clone(), dsl_value);
@@ -1816,14 +1827,14 @@ fn synthetic_deposed_resource(target: &DeposedRefreshTarget) -> Resource {
 async fn normalize_deposed_read_state<P>(
     provider: &P,
     target: &DeposedRefreshTarget,
-    resource: &Resource,
+    resource: &ResolvedResource,
     fresh_state: &mut State,
     schemas: &carina_core::schema::SchemaRegistry,
 ) where
     P: ProviderNormalizer + ?Sized,
 {
     let mut states = HashMap::from([(target.id.as_inner().clone(), fresh_state.clone())]);
-    let resources = std::slice::from_ref(resource);
+    let resources = std::slice::from_ref(resource.as_resource());
     let saved_attrs = deposed_saved_attrs(target).lift(schemas);
     provider
         .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
@@ -1859,18 +1870,16 @@ struct StateRefreshCounts {
 }
 
 fn diff_display_update_resource(
-    id: &ResourceId,
+    id: &ResolvedResourceId,
     fresh_state: &State,
     state: &mut carina_state::StateFile,
-    resource: Option<&Resource>,
+    resource: Option<&ResolvedResource>,
     schemas: &carina_core::schema::SchemaRegistry,
     label_suffix: &str,
     counts: &mut StateRefreshCounts,
 ) -> Result<(), AppError> {
-    let Some(identity) = id.identity() else {
-        return Ok(());
-    };
-    let existing = state.find_resource(&id.provider, &id.resource_type, identity.as_str());
+    let identity = id.identity();
+    let existing = state.find_resource(&id.provider, &id.resource_type, id.identity_str());
     let existing_rs = match existing {
         Some(rs) => rs,
         None => return Ok(()),
@@ -1881,19 +1890,13 @@ fn diff_display_update_resource(
         let res = match resource {
             Some(r) => r,
             None => {
-                owned_resource = Resource::with_provider(
-                    id.provider.clone(),
-                    id.resource_type.clone(),
-                    identity.clone(),
-                    id.provider_instance.clone(),
-                );
+                owned_resource = ResolvedResource::from_id(id.clone());
                 &owned_resource
             }
         };
-        let resolved_resource = ResolvedResource::new(res.clone());
         let schema = schemas.get_for(res);
         let mut resource_state = ResourceState::from_provider_state_for_resource_and_schema(
-            &resolved_resource,
+            res,
             fresh_state,
             Some(existing_rs),
             schema,
@@ -2028,7 +2031,7 @@ mod tests {
     };
     use carina_core::resource::{
         Composition, CompositionArgument, DeferredValue, ModuleConstraintId,
-        PendingModuleConstraint, Signature,
+        PendingModuleConstraint, Resource, Signature,
     };
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
     use carina_core::value::SECRET_PREFIX;
@@ -2037,6 +2040,10 @@ mod tests {
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+
+    fn resolved(resource: Resource) -> ResolvedResource {
+        ResolvedResource::new(resource)
+    }
 
     struct ModuleConstraintRefreshBackend {
         state: StateFile,
@@ -3289,7 +3296,7 @@ mod tests {
         let summary = refresh_deposed_generations_until_cancelled(
             &provider,
             &mut state,
-            &[desired],
+            &[resolved(desired)],
             &SchemaRegistry::new(),
             &ShutdownToken::running(),
         )
@@ -3399,7 +3406,7 @@ mod tests {
         refresh_deposed_generations_until_cancelled(
             &provider,
             &mut state,
-            &[desired],
+            &[resolved(desired)],
             &SchemaRegistry::new(),
             &ShutdownToken::running(),
         )
@@ -3434,7 +3441,7 @@ mod tests {
 
         let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let provider = DeposedRefreshTestProvider::default().with_read_state(
-            &id,
+            &ResolvedResourceId::new(id.clone()),
             "db-old",
             State::existing(
                 id.clone(),
@@ -3494,7 +3501,7 @@ mod tests {
 
         let id = ResourceId::with_provider_identity("awscc", "db.Instance", "main", None);
         let provider = DeposedRefreshTestProvider::default().with_read_state(
-            &id,
+            &ResolvedResourceId::new(id.clone()),
             "db-old",
             State::existing(
                 id.clone(),
@@ -3557,7 +3564,7 @@ mod tests {
         provider_tags.insert("Name".to_string(), string_value("new-name"));
         provider_tags.insert("SecretTag".to_string(), string_value("plain-secret"));
         let provider = DeposedRefreshTestProvider::default().with_read_state(
-            &id,
+            &ResolvedResourceId::new(id.clone()),
             "vpc-old",
             State::existing(
                 id.clone(),
@@ -3633,7 +3640,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
-            &id,
+            &ResolvedResourceId::new(id.clone()),
             &fresh,
             &mut state,
             None,
@@ -3685,7 +3692,7 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
-            &id,
+            &ResolvedResourceId::new(id.clone()),
             &fresh,
             &mut state,
             None,
@@ -3712,7 +3719,7 @@ mod tests {
         assert_eq!(counts.unchanged, 0);
 
         diff_display_update_resource(
-            &id,
+            &ResolvedResourceId::new(id.clone()),
             &fresh,
             &mut state,
             None,
@@ -3758,10 +3765,10 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
-            &id,
+            &ResolvedResourceId::new(id.clone()),
             &fresh,
             &mut state,
-            Some(&desired),
+            Some(&resolved(desired.clone())),
             &schemas,
             "",
             &mut counts,
@@ -3879,7 +3886,7 @@ mod tests {
         let first = refresh_deposed_generations_until_cancelled(
             &provider,
             &mut state,
-            std::slice::from_ref(&desired),
+            std::slice::from_ref(&resolved(desired.clone())),
             &schemas,
             &ShutdownToken::running(),
         )
@@ -3908,7 +3915,7 @@ mod tests {
         let second = refresh_deposed_generations_until_cancelled(
             &provider,
             &mut state,
-            std::slice::from_ref(&desired),
+            std::slice::from_ref(&resolved(desired.clone())),
             &schemas,
             &ShutdownToken::running(),
         )
@@ -3976,7 +3983,7 @@ mod tests {
         refresh_deposed_generations_until_cancelled(
             &provider,
             &mut state,
-            &[wrong_instance, right_instance],
+            &[resolved(wrong_instance), resolved(right_instance)],
             &SchemaRegistry::new(),
             &ShutdownToken::running(),
         )
@@ -4067,10 +4074,10 @@ mod tests {
         let mut counts = StateRefreshCounts::default();
 
         diff_display_update_resource(
-            &id,
+            &ResolvedResourceId::new(id.clone()),
             &fresh,
             &mut state,
-            Some(&desired),
+            Some(&resolved(desired.clone())),
             &SchemaRegistry::new(),
             "",
             &mut counts,

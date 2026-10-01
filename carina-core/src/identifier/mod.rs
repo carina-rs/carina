@@ -4,6 +4,7 @@
 //! reconciling prefixed names with state, and computing anonymous resource identifiers.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 #[cfg(test)]
 use crate::parser::ProviderConfig;
@@ -62,6 +63,96 @@ pub fn generate_random_suffix() -> String {
     let uuid = uuid::Uuid::new_v4();
     let hex = uuid.as_simple().to_string();
     hex[..8].to_string()
+}
+
+fn fallback_hash_dependency_bindings(
+    resource: &Resource,
+    known_bindings: &HashSet<String>,
+) -> std::collections::BTreeSet<String> {
+    let Some(crate::resource::ModuleSource::Module { instance, .. }) = &resource.module_source
+    else {
+        // Preserve the historical hash input byte-for-byte for root resources.
+        return resource.dependency_bindings.clone();
+    };
+
+    let instance_prefix = format!("{instance}.");
+    resource
+        .dependency_bindings
+        .iter()
+        .map(|binding| {
+            if binding.starts_with(&instance_prefix) {
+                return binding.clone();
+            }
+
+            let expanded = format!("{instance_prefix}{binding}");
+            if known_bindings.contains(&expanded) {
+                expanded
+            } else {
+                // Module arguments and outer-scope bindings are not owned by
+                // this module instance and retain their historical spelling.
+                binding.clone()
+            }
+        })
+        .collect()
+}
+
+/// Build the late fallback identity for an anonymous resource.
+///
+/// The formatted value always contains at least the resource type and hash, so
+/// this constructor can establish non-emptiness without a fallible caller-side
+/// conversion.
+pub fn fallback_anonymous_identity(
+    resource: &Resource,
+    known_bindings: &HashSet<String>,
+) -> ResourceIdentity {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    resource.id.provider.hash(&mut hasher);
+    resource.id.resource_type.hash(&mut hasher);
+    resource.id.provider_instance.hash(&mut hasher);
+    resource.module_source.hash(&mut hasher);
+    for (key, value) in &resource.attributes {
+        key.hash(&mut hasher);
+        format!("{value:?}").hash(&mut hasher);
+    }
+    resource.directives.force_delete.hash(&mut hasher);
+    resource.directives.create_before_destroy.hash(&mut hasher);
+    resource.directives.prevent_destroy.hash(&mut hasher);
+    resource.directives.depends_on.hash(&mut hasher);
+    resource.directives.provider_instance.hash(&mut hasher);
+    for (key, value) in BTreeMap::from_iter(resource.prefixes.iter()) {
+        key.hash(&mut hasher);
+        value.hash(&mut hasher);
+    }
+    fallback_hash_dependency_bindings(resource, known_bindings).hash(&mut hasher);
+    let hash = format!("{:08x}", hasher.finish() & 0xffff_ffff);
+
+    let provider_snake = resource
+        .id
+        .provider
+        .split('.')
+        .map(crate::parser::pascal_to_snake)
+        .collect::<Vec<_>>()
+        .join("_");
+    let type_snake = resource
+        .id
+        .resource_type
+        .split('.')
+        .map(crate::parser::pascal_to_snake)
+        .collect::<Vec<_>>()
+        .join("_");
+    let bare_identifier = if provider_snake.is_empty() {
+        format!("{type_snake}_{hash}")
+    } else {
+        format!("{provider_snake}_{type_snake}_{hash}")
+    };
+    let identifier = match &resource.module_source {
+        Some(crate::resource::ModuleSource::Module { instance, .. }) => {
+            format!("{instance}.{bare_identifier}")
+        }
+        _ => bare_identifier,
+    };
+
+    ResourceIdentity::new(identifier)
 }
 
 /// Whether an anonymous resource's generated identity is anchored in schema
@@ -272,6 +363,39 @@ pub fn check_attribute_derived_anonymous_resource_conflicts(
         .filter_map(|(kind, declaration_count)| {
             (declaration_count >= 2).then_some(AttributeDerivedAnonymousResourceConflict { kind })
         })
+        .collect()
+}
+
+/// Return bindings that are necessary to distinguish a group of resources
+/// whose anonymous identities would otherwise be derived from mutable
+/// attributes.
+///
+/// This uses the same identity-basis classifier and ownership key as the
+/// anonymous-resource conflict check. A group needs bindings when at least two
+/// resources of that kind share the attribute-derived basis; stable resources
+/// and singleton groups remain safe to anonymize.
+pub(crate) fn attribute_derived_identity_required_bindings(
+    resources: &[Resource],
+    registry: &SchemaRegistry,
+) -> HashSet<String> {
+    let mut resources_by_kind = BTreeMap::<AnonymousResourceKind, Vec<&Resource>>::new();
+    for resource in resources {
+        if classify_anonymous_identity_basis(resource, registry)
+            != AnonymousIdentityBasis::AttributeDerived
+        {
+            continue;
+        }
+        resources_by_kind
+            .entry(AnonymousResourceKind::of(resource))
+            .or_default()
+            .push(resource);
+    }
+
+    resources_by_kind
+        .into_values()
+        .filter(|resources| resources.len() >= 2)
+        .flatten()
+        .filter_map(|resource| resource.binding.clone())
         .collect()
 }
 

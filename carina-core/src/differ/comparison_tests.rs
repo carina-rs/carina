@@ -1,5 +1,5 @@
 use super::comparison::SavedAttr;
-use super::*;
+use super::{create_plan_for_tests as create_plan, *};
 
 use crate::explicit::ExplicitFields;
 use crate::resource::{CanonicalEnumValue, ConcreteValue, DeferredValue, Value};

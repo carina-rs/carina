@@ -1129,12 +1129,18 @@ impl DiagnosticEngine {
                         .iter_all_resources()
                         .filter_map(|rref| rref.binding().map(str::to_string))
                         .collect();
-                    carina_core::validation::check_unused_bindings(merged)
-                        .into_iter()
-                        .filter(|b| current_file_bindings.contains(b))
-                        .collect()
+                    carina_core::validation::check_unused_bindings_with_identity_requirements(
+                        merged,
+                        &self.schemas,
+                    )
+                    .into_iter()
+                    .filter(|b| current_file_bindings.contains(b))
+                    .collect()
                 }
-                None => carina_core::validation::check_unused_bindings(parsed),
+                None => carina_core::validation::check_unused_bindings_with_identity_requirements(
+                    parsed,
+                    &self.schemas,
+                ),
             };
             diagnostics.extend(self.unused_binding_diagnostics(doc, unused_binding_names));
 
