@@ -7,6 +7,42 @@ use carina_core::provider::ProviderError;
 use carina_core::resource::ResourceId;
 use carina_state::BackendError;
 
+/// A backend error rendered with the concrete project directory available at
+/// the CLI boundary.
+#[derive(Debug)]
+pub struct ProjectBackendError {
+    project_dir: PathBuf,
+    source: BackendError,
+}
+
+impl ProjectBackendError {
+    fn new(source: BackendError, project_dir: &Path) -> Self {
+        Self {
+            project_dir: project_dir
+                .canonicalize()
+                .unwrap_or_else(|_| project_dir.to_path_buf()),
+            source,
+        }
+    }
+}
+
+impl std::fmt::Display for ProjectBackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(error) = self.source.invalid_resource_identity() {
+            let plan_command = ProjectCommand::new("plan", &self.project_dir).to_string();
+            f.write_str(&error.render_with_plan_command(&plan_command))
+        } else {
+            std::fmt::Display::fmt(&self.source, f)
+        }
+    }
+}
+
+impl std::error::Error for ProjectBackendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Provider preparation failure annotated with the same resource header that
 /// `ProviderError::for_resource` historically rendered.
 #[derive(Debug)]
@@ -21,7 +57,7 @@ impl std::fmt::Display for ResourceProviderPreparationError {
             f,
             "[{}.{}] {}",
             self.resource.resource_type,
-            self.resource.identity_or_empty(),
+            self.resource.identity_display(),
             self.source
         )
     }
@@ -193,9 +229,29 @@ fn parse_account_guard_clause(msg: &str, kind: &str) -> Option<AccountGuardClaus
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    /// A runtime string was not a valid resource identity.
+    #[error(transparent)]
+    ResourceIdentity(#[from] carina_core::resource::ResourceIdentityError),
+
+    /// A state-bucket argument was not a valid resource identity.
+    #[error("State bucket name '{bucket_name}' is not a valid resource identity: {source}")]
+    InvalidStateBucketIdentity {
+        bucket_name: String,
+        #[source]
+        source: carina_core::resource::ResourceIdentityError,
+    },
+
+    /// Identity assignment was incomplete at a resolved-only pipeline boundary.
+    #[error(transparent)]
+    PendingResourceIdentity(#[from] carina_core::resource::PendingResourceIdentityError),
+
     /// State backend errors (lock contention, I/O, serialization, etc.)
     #[error(transparent)]
     Backend(#[from] BackendError),
+
+    /// A state backend error with a project-scoped recovery command.
+    #[error(transparent)]
+    ProjectBackend(Box<ProjectBackendError>),
 
     /// Provider errors (AWS API failures, timeouts, etc.)
     #[error(transparent)]
@@ -204,6 +260,12 @@ pub enum AppError {
     /// A module argument constraint became decidable during an operation.
     #[error(transparent)]
     ModuleConstraint(#[from] carina_core::executor::ModuleConstraintGateError),
+
+    /// Distinct desired resources resolved to the same execution identity.
+    #[error(transparent)]
+    DuplicateResolvedResourceId(
+        #[from] carina_core::override_aware::DuplicateResolvedResourceIdError,
+    ),
 
     /// A provider-boundary check failed for a resource before dispatch.
     #[error(transparent)]
@@ -334,6 +396,16 @@ pub enum AppError {
 }
 
 impl AppError {
+    /// Enrich legacy-state recovery guidance with the command's project path.
+    pub fn with_project_dir(self, project_dir: &Path) -> Self {
+        match self {
+            Self::Backend(source) if source.invalid_resource_identity().is_some() => {
+                Self::ProjectBackend(Box::new(ProjectBackendError::new(source, project_dir)))
+            }
+            other => other,
+        }
+    }
+
     pub fn from_resource_preparation(
         resource: ResourceId,
         source: carina_core::executor::ProviderPreparationError,

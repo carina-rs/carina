@@ -2,7 +2,7 @@ use super::*;
 use crate::parser::{BindingName, ParsedFile, ProviderContext, UntilPredicateAst, WaitBinding};
 use crate::resource::{
     Composition, CompositionArgument, CompositionAttribute, CompositionCall, CompositionProvenance,
-    Resource, ResourceId, Signature,
+    Resource, Signature,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
 use std::collections::HashMap;
@@ -504,7 +504,7 @@ let route = awscc.ec2.route {
     let route = parsed
         .resources
         .iter()
-        .find(|r| r.id.identity_or_empty() == "route")
+        .find(|r| r.id.identity_str().expect("resolved identity") == "route")
         .unwrap();
     let gateway_id = route.get_attr("gateway_id").unwrap();
     match gateway_id {
@@ -691,7 +691,10 @@ fn make_composition(binding: &str, attributes: &[&str]) -> Composition {
         module_directory: None,
     };
     Composition {
-        id: ResourceId::with_identity("_virtual", binding),
+        id: crate::resource::ResolvedResourceId::with_identity(
+            "_virtual",
+            crate::resource::ResourceIdentity::try_from(binding.to_string()).unwrap(),
+        ),
         signature: Signature {
             arguments: IndexMap::new(),
             attributes: attributes

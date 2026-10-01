@@ -46,7 +46,7 @@ use std::collections::HashMap;
 
 use carina_core::differ::{Diff, diff};
 use carina_core::explicit::ExplicitFields;
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
 
 fn load_dc(name: &str) -> Value {
     let path = format!(
@@ -101,7 +101,13 @@ fn carina3122_live_distribution_readback_defaults_are_projected_away() {
     state_attrs.insert("distribution_config".to_string(), state_dc);
     let current = State::existing(id, state_attrs);
 
-    let result = diff(&desired, &current, None, Some(&prev_explicit), None);
+    let result = diff(
+        &ResolvedResource::new(desired),
+        &current,
+        None,
+        Some(&prev_explicit),
+        None,
+    );
 
     assert!(
         matches!(result, Diff::NoChange(_)),

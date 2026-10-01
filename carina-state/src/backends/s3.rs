@@ -462,14 +462,13 @@ impl StateBackend for S3Backend {
                     .await
                     .map_err(|e| BackendError::Io(e.to_string()))?;
                 let bytes = body.into_bytes();
-                let outcome = state::check_and_migrate_bytes(&bytes)?;
+                let state_location =
+                    format!("s3://{}/{}", self.bucket, self.key.trim_start_matches('/'));
+                let outcome = state::check_and_migrate_bytes(&bytes)
+                    .map_err(|error| error.with_state_location(state_location.clone()))?;
                 let (state, migration) = outcome.into_parts();
                 let loaded = if let Some(info) = migration {
-                    log_state_migration_once(
-                        &self.migration_logged,
-                        info,
-                        &format!("s3://{}/{}", self.bucket, self.key.trim_start_matches('/')),
-                    );
+                    log_state_migration_once(&self.migration_logged, info, &state_location);
                     LoadedState::Migrated { state, info }
                 } else {
                     LoadedState::Pristine(state)

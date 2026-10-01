@@ -7,7 +7,8 @@ use carina_core::override_aware::NameOverrideSource;
 use carina_core::provider::RawSavedAttrs;
 pub use carina_core::resource::DeposedKey;
 use carina_core::resource::{
-    ConcreteValue, DeferredValue, Directives, PartialReadMarker, Resource, ResourceId, State, Value,
+    ConcreteValue, DeferredValue, Directives, PartialReadMarker, ResolvedResource, Resource,
+    ResourceId, ResourceIdentity, State, Value,
 };
 use carina_core::schema::ResourceSchema;
 use carina_core::value::{
@@ -17,7 +18,7 @@ use carina_core::value::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::backend::BackendError;
+use crate::backend::{BackendError, InvalidResourceIdentityError};
 
 /// The main state file structure that persists to the backend
 #[derive(Debug, Clone, Serialize)]
@@ -43,9 +44,37 @@ struct UncheckedStateFile {
     serial: u64,
     lineage: String,
     carina_version: String,
-    resources: Vec<ResourceState>,
+    resources: Vec<serde_json::Value>,
     #[serde(default)]
     exports: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug)]
+pub(crate) enum StateFileDecodeError {
+    Json(serde_json::Error),
+    InvalidResourceIdentity(InvalidResourceIdentityError),
+    Validation(String),
+}
+
+fn map_state_file_decode_error(
+    error: StateFileDecodeError,
+    migration_from: Option<u32>,
+) -> BackendError {
+    match error {
+        StateFileDecodeError::InvalidResourceIdentity(error) => error.into(),
+        StateFileDecodeError::Json(error) => match migration_from {
+            Some(version) => BackendError::InvalidState(format!(
+                "Failed to migrate state file from v{version}: {error}"
+            )),
+            None => BackendError::InvalidState(format!("Failed to parse state file: {error}")),
+        },
+        StateFileDecodeError::Validation(message) => match migration_from {
+            Some(version) => BackendError::InvalidState(format!(
+                "Failed to migrate state file from v{version}: {message}"
+            )),
+            None => BackendError::InvalidState(format!("Failed to parse state file: {message}")),
+        },
+    }
 }
 
 impl StateFile {
@@ -55,19 +84,59 @@ impl StateFile {
     /// consumers cannot read future-version or unmigrated state files
     /// (carina#3731). Parsing here still validates duplicate identities on
     /// every parse (carina#2858).
-    pub(crate) fn from_json_str(content: &str) -> Result<Self, serde_json::Error> {
-        let unchecked: UncheckedStateFile = serde_json::from_str(content)?;
+    pub(crate) fn from_json_str(content: &str) -> Result<Self, StateFileDecodeError> {
+        let unchecked: UncheckedStateFile =
+            serde_json::from_str(content).map_err(StateFileDecodeError::Json)?;
+        let resources = unchecked
+            .resources
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let identity = value
+                    .get("identity")
+                    .or_else(|| value.get("name"))
+                    .and_then(serde_json::Value::as_str);
+                if let Some(identity) = identity
+                    && let Err(source) = ResourceIdentity::try_from(identity.to_owned())
+                {
+                    let provider = value
+                        .get("provider")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("<missing>")
+                        .to_owned();
+                    let resource_type = value
+                        .get("resource_type")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("<missing>")
+                        .to_owned();
+                    let identifier = value
+                        .get("identifier")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    return Err(StateFileDecodeError::InvalidResourceIdentity(
+                        InvalidResourceIdentityError::new(
+                            index,
+                            provider,
+                            resource_type,
+                            identifier,
+                            source,
+                        ),
+                    ));
+                }
+                serde_json::from_value(value).map_err(StateFileDecodeError::Json)
+            })
+            .collect::<Result<Vec<ResourceState>, StateFileDecodeError>>()?;
         let state = Self {
             version: unchecked.version,
             serial: unchecked.serial,
             lineage: unchecked.lineage,
             carina_version: unchecked.carina_version,
-            resources: unchecked.resources,
+            resources,
             exports: unchecked.exports,
         };
         state
             .validate_unique_identities()
-            .map_err(<serde_json::Error as serde::de::Error>::custom)?;
+            .map_err(StateFileDecodeError::Validation)?;
         Ok(state)
     }
 
@@ -129,12 +198,12 @@ impl StateFile {
     ///     "my-state-bucket",
     /// );
     /// assert_eq!(state.resources().len(), 1);
-    /// assert_eq!(state.resources()[0].identity, "aws_s3_bucket_a3f2b1c8");
+    /// assert_eq!(state.resources()[0].identity.as_str(), "aws_s3_bucket_a3f2b1c8");
     /// ```
     pub fn with_managed_state_bucket(
         provider: impl Into<String>,
         resource_type: impl Into<String>,
-        resource_identity: impl Into<String>,
+        resource_identity: impl Into<ResourceIdentity>,
         bucket_name: impl Into<String>,
     ) -> Self {
         let mut state = Self::new();
@@ -194,7 +263,9 @@ impl StateFile {
         identity: &str,
     ) -> Option<&ResourceState> {
         self.resources.iter().find(|r| {
-            r.provider == provider && r.resource_type == resource_type && r.identity == identity
+            r.provider == provider
+                && r.resource_type == resource_type
+                && r.identity.as_str() == identity
         })
     }
 
@@ -243,15 +314,16 @@ impl StateFile {
         &mut self,
         provider: &str,
         resource_type: &str,
-        identity: &str,
+        identity: &ResourceIdentity,
         row_provider_instance: Option<String>,
         instance: DeposedInstance,
     ) -> Result<(), BackendError> {
         let mut row = self
-            .find_resource(provider, resource_type, identity)
+            .find_resource(provider, resource_type, identity.as_str())
             .cloned()
             .unwrap_or_else(|| {
-                let mut row = ResourceState::new(resource_type.to_string(), identity, provider);
+                let mut row =
+                    ResourceState::new(resource_type.to_string(), identity.clone(), provider);
                 row.directives.provider_instance = row_provider_instance;
                 row
             });
@@ -270,9 +342,12 @@ impl StateFile {
                     "cannot upsert deposed generation key {:?} with identity \
                      (identifier={:?}, provider_instance={:?}) for resource \
                      (provider={provider:?}, resource_type={resource_type:?}, \
-                     identity={identity:?}): the key and identity match different \
+                    identity={:?}): the key and identity match different \
                      existing generations",
-                    instance.key, instance.identifier, instance.provider_instance
+                    instance.key,
+                    instance.identifier,
+                    instance.provider_instance,
+                    identity.as_str(),
                 )));
             }
             (Some(position), _) | (_, Some(position)) => Some(position),
@@ -301,7 +376,15 @@ impl StateFile {
         let mut renamed = self.resources.clone();
         for resource in &mut renamed {
             if let Some(new_identity) = by_old.get(resource.identity.as_str()) {
-                resource.identity = (*new_identity).to_string();
+                resource.identity = ResourceIdentity::try_from((*new_identity).to_owned())
+                    .map_err(|source| BackendError::InvalidStateIdentity {
+                        context: format!(
+                            "cannot rename resource identity {:?} to {:?}",
+                            resource.identity.as_str(),
+                            new_identity
+                        ),
+                        source,
+                    })?;
             }
         }
         validate_resource_identities(&renamed).map_err(BackendError::InvalidState)?;
@@ -320,7 +403,9 @@ impl StateFile {
         key: &DeposedKey,
     ) -> Option<DeposedInstance> {
         let row_pos = self.resources.iter().position(|r| {
-            r.provider == provider && r.resource_type == resource_type && r.identity == identity
+            r.provider == provider
+                && r.resource_type == resource_type
+                && r.identity.as_str() == identity
         })?;
         let deposed_pos = self.resources[row_pos]
             .deposed
@@ -337,11 +422,10 @@ impl StateFile {
 
     /// Get the identifier for a resource from state.
     pub fn get_identifier_for_resource(&self, resource: &Resource) -> Option<String> {
-        if let Some(resource_state) = self.find_resource(
-            &resource.id.provider,
-            &resource.id.resource_type,
-            resource.id.identity_or_empty(),
-        ) {
+        let identity = resource.id.identity_str()?;
+        if let Some(resource_state) =
+            self.find_resource(&resource.id.provider, &resource.id.resource_type, identity)
+        {
             return resource_state.identifier.clone();
         }
         None
@@ -358,10 +442,10 @@ impl StateFile {
     }
 
     fn id_for_resource_state(rs: &ResourceState) -> ResourceId {
-        ResourceId::with_provider_name_compat(
-            &rs.provider,
-            &rs.resource_type,
-            &rs.identity,
+        ResourceId::with_provider_identity(
+            rs.provider.clone(),
+            rs.resource_type.clone(),
+            rs.identity.clone(),
             rs.directives.provider_instance.clone(),
         )
     }
@@ -388,8 +472,9 @@ impl StateFile {
                 current.partial_read = None;
                 continue;
             }
-            let marker = self
-                .find_resource(&id.provider, &id.resource_type, id.identity_or_empty())
+            let marker = id
+                .identity_str()
+                .and_then(|identity| self.find_resource(&id.provider, &id.resource_type, identity))
                 .and_then(|rs| rs.partial_read.clone());
             if let Some(mut marker) = marker {
                 marker
@@ -424,7 +509,9 @@ impl StateFile {
     /// state file. Takes a `&ResourceId` so it works for managed
     /// resources and data sources alike (carina#3181).
     pub fn build_state_for_resource(&self, id: &ResourceId) -> State {
-        let rs = self.find_resource(&id.provider, &id.resource_type, id.identity_or_empty());
+        let rs = id
+            .identity_str()
+            .and_then(|identity| self.find_resource(&id.provider, &id.resource_type, identity));
         if let Some(identifier) = rs.and_then(|r| r.identifier.as_deref()) {
             let attrs: HashMap<String, Value> = rs
                 .unwrap()
@@ -555,10 +642,20 @@ impl StateFile {
     /// `binding['key']` for non-identifier-safe keys). Running this on
     /// load lets old state resolve against new desired-state addresses
     /// without a `moved` block.
-    fn canonicalize_addresses(&mut self) {
+    fn canonicalize_addresses(&mut self) -> Result<(), BackendError> {
         use carina_core::utils::canonicalize_map_key_address;
         for r in &mut self.resources {
-            r.identity = canonicalize_map_key_address(&r.identity);
+            r.identity =
+                ResourceIdentity::try_from(canonicalize_map_key_address(r.identity.as_str()))
+                    .map_err(|source| BackendError::InvalidStateIdentity {
+                        context: format!(
+                            "cannot canonicalize identity {:?} for {}.{}",
+                            r.identity.as_str(),
+                            r.provider,
+                            r.resource_type
+                        ),
+                        source,
+                    })?;
             if let Some(b) = r.binding.as_ref() {
                 r.binding = Some(canonicalize_map_key_address(b));
             }
@@ -568,6 +665,7 @@ impl StateFile {
                 .map(|d| canonicalize_map_key_address(d))
                 .collect();
         }
+        Ok(())
     }
 
     /// Remove a resource's current instance from the state.
@@ -581,7 +679,9 @@ impl StateFile {
         identity: &str,
     ) -> Option<ResourceState> {
         if let Some(pos) = self.resources.iter().position(|r| {
-            r.provider == provider && r.resource_type == resource_type && r.identity == identity
+            r.provider == provider
+                && r.resource_type == resource_type
+                && r.identity.as_str() == identity
         }) {
             if self.resources[pos].deposed.is_empty() {
                 Some(self.resources.remove(pos))
@@ -892,9 +992,8 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
 
     let mut migration: Option<MigrationInfo> = None;
     let mut state: StateFile = match check.version {
-        v if v == StateFile::CURRENT_VERSION => StateFile::from_json_str(content).map_err(|e| {
-            BackendError::InvalidState(format!("Failed to parse state file: {}", e))
-        })?,
+        v if v == StateFile::CURRENT_VERSION => StateFile::from_json_str(content)
+            .map_err(|error| map_state_file_decode_error(error, None))?,
         v if v > StateFile::CURRENT_VERSION => {
             return Err(BackendError::StateVersionTooNew {
                 found: v,
@@ -906,12 +1005,8 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
                 from: v,
                 to: StateFile::CURRENT_VERSION,
             });
-            let mut state = StateFile::from_json_str(content).map_err(|e| {
-                BackendError::InvalidState(format!(
-                    "Failed to migrate state file from v{}: {}",
-                    v, e
-                ))
-            })?;
+            let mut state = StateFile::from_json_str(content)
+                .map_err(|error| map_state_file_decode_error(error, Some(v)))?;
             // v5 → v6: lift the flat `desired_keys: Vec<String>` field
             // (already discarded by serde because the v6 struct no longer
             // declares it) back from the source JSON, and use it to
@@ -944,7 +1039,7 @@ pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendErro
     // Map-key addresses written under the legacy `["..."]` shape are
     // rewritten to the canonical form on read so existing state files
     // resolve cleanly against new emissions. See #1903.
-    state.canonicalize_addresses();
+    state.canonicalize_addresses()?;
     // carina#3266: `state.resources` is managed-only by invariant
     // (since #3181). Pre-#3181 versions of `carina state refresh` /
     // older apply paths persisted `read aws.*` data-source rows here;
@@ -1011,7 +1106,7 @@ pub struct ResourceState {
     pub resource_type: String,
     /// Resource identity (from the DSL resource address identity)
     #[serde(alias = "name")]
-    pub identity: String,
+    pub identity: ResourceIdentity,
     /// Provider name (e.g., "aws")
     pub provider: String,
     /// AWS internal identifier (e.g., vpc-xxx, subnet-xxx)
@@ -1111,7 +1206,7 @@ impl ResourceState {
     /// Create a new resource state
     pub fn new(
         resource_type: impl Into<String>,
-        identity: impl Into<String>,
+        identity: impl Into<ResourceIdentity>,
         provider: impl Into<String>,
     ) -> Self {
         Self {
@@ -1183,7 +1278,7 @@ impl ResourceState {
     pub fn managed_state_bucket(
         provider: impl Into<String>,
         resource_type: impl Into<String>,
-        resource_identity: impl Into<String>,
+        resource_identity: impl Into<ResourceIdentity>,
         bucket_name: impl Into<String>,
     ) -> Self {
         let bucket_name = bucket_name.into();
@@ -1262,13 +1357,13 @@ impl ResourceState {
     /// write-only attributes. Such keys are dropped unless the desired value
     /// carries a `Secret(_)` wrapper that can be merged into a hash.
     pub fn attributes_to_state_json_lossy_for_resource_and_schema(
-        resource: &Resource,
+        resource: &ResolvedResource,
         schema: Option<&ResourceSchema>,
         attributes: &HashMap<String, Value>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
     ) -> HashMap<String, serde_json::Value> {
         let resource_display_type = resource.id.display_type();
-        let identity = resource.id.identity_or_empty();
+        let identity = resource.identity_str();
         let serialized =
             Self::attributes_to_state_json_lossy(&resource_display_type, identity, attributes);
         Self::protect_state_json_for_resource_and_schema(
@@ -1282,14 +1377,14 @@ impl ResourceState {
     /// Apply desired-resource and schema-derived secret protection to an
     /// already serialized state attribute map.
     pub fn protect_state_json_for_resource_and_schema(
-        resource: &Resource,
+        resource: &ResolvedResource,
         schema: Option<&ResourceSchema>,
         serialized: HashMap<String, serde_json::Value>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
     ) -> HashMap<String, serde_json::Value> {
         let mut serialized = serialized;
         let resource_display_type = resource.id.display_type();
-        let identity = resource.id.identity_or_empty();
+        let identity = resource.identity_str();
         let mut protected_secret_keys = std::collections::HashSet::new();
 
         for (key, desired_value) in &resource.attributes {
@@ -1394,20 +1489,20 @@ impl ResourceState {
     /// Returns an error if any provider attribute value cannot be converted to
     /// JSON, such as non-finite float values.
     pub fn from_provider_state_for_resource_and_schema(
-        resource: &Resource,
+        resource: &ResolvedResource,
         state: &State,
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
     ) -> Result<Self, String> {
         let mut rs = Self::new(
             &resource.id.resource_type,
-            resource.id.identity_or_empty(),
+            resource.identity().clone(),
             resource.id.provider.clone(),
         );
         rs.identifier = state.identifier.clone();
         rs.partial_read = state.partial_read.clone();
         let resource_display_type = resource.id.display_type();
-        let identity = resource.id.identity_or_empty();
+        let identity = resource.identity_str();
         for (k, v) in &state.attributes {
             rs.attributes.insert(
                 k.clone(),
@@ -1749,7 +1844,9 @@ fn migrate_v5_desired_keys_to_explicit(
             continue;
         }
         if let Some(rs) = state.resources.iter_mut().find(|rs| {
-            rs.provider == provider && rs.resource_type == resource_type && rs.identity == identity
+            rs.provider == provider
+                && rs.resource_type == resource_type
+                && rs.identity.as_str() == identity
         }) {
             rs.explicit = ExplicitFields::Struct { children };
         }

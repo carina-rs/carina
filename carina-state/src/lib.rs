@@ -51,7 +51,10 @@ pub mod lock;
 pub mod state;
 
 // Re-export main types for convenience
-pub use backend::{BackendConfig, BackendError, BackendResult, LOCAL_BACKEND_TYPE, StateBackend};
+pub use backend::{
+    BackendConfig, BackendError, BackendResult, InvalidResourceIdentityError, LOCAL_BACKEND_TYPE,
+    StateBackend,
+};
 pub use backend_lock::BackendLock;
 pub use backends::{
     LocalBackend, StateUrl, anchored_local_path, create_backend, create_remote_backend,

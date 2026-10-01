@@ -29,7 +29,7 @@ use carina_core::provider::{
     ProviderFactory, ProviderNormalizer, ProviderResult, ReadRequest, SavedAttrs, UpdateOutcome,
     UpdateRequest,
 };
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{Resource, ResourceId, ResourceIdentityState, State, Value};
 use carina_core::schema::{CompletionValue, ResourceSchema, TypeIdentity};
 use carina_core::value::SerializationError;
 use carina_core::wait::BindingPattern;
@@ -2887,38 +2887,82 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         current_states: &'a mut HashMap<ResourceId, State>,
     ) -> carina_core::provider::BoxFuture<'a, ()> {
         Box::pin(async move {
-            let wit_states: Vec<(String, _)> = current_states
-                .iter()
-                .map(|(id, state)| {
-                    let wit = expect_unresolvable_absent(
-                        wasm_convert::core_to_wit_state(state),
-                        "normalize_state",
-                    );
-                    (id.to_string(), wit)
-                })
-                .collect();
+            let mut resolved_ids_by_key = HashMap::new();
+            let mut resolved_wit_states = Vec::new();
+            let mut pending_wit_states = Vec::new();
 
-            // Plain `.await`, not a nested `block_on` — see `normalize_desired`.
-            let result = {
-                let mut store = self.instance.store.lock().await;
-                store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
-                self.instance
-                    .bindings
-                    .call_normalize_state(&mut store, &wit_states)
-                    .await
-            };
+            for (id, state) in current_states.iter() {
+                let key = wasm_convert::resource_id_wire_key(id);
+                let wit = expect_unresolvable_absent(
+                    wasm_convert::core_to_wit_state(state),
+                    "normalize_state",
+                );
+                match id.identity_state() {
+                    ResourceIdentityState::Pending(_) => {
+                        pending_wit_states.push((id.clone(), key, wit));
+                    }
+                    ResourceIdentityState::Resolved(_) => {
+                        resolved_ids_by_key.insert(key.clone(), id.clone());
+                        resolved_wit_states.push((key, wit));
+                    }
+                }
+            }
 
-            match result {
-                Ok(result) => {
-                    for state in current_states.values_mut() {
-                        let key = state.id.to_string();
-                        if let Some((_, wit_state)) = result.iter().find(|(k, _)| k == &key) {
+            if !resolved_wit_states.is_empty() {
+                // Plain `.await`, not a nested `block_on` — see `normalize_desired`.
+                let result = {
+                    let mut store = self.instance.store.lock().await;
+                    store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+                    self.instance
+                        .bindings
+                        .call_normalize_state(&mut store, &resolved_wit_states)
+                        .await
+                };
+
+                match result {
+                    Ok(result) => {
+                        for (key, wit_state) in &result {
+                            let Some(id) = resolved_ids_by_key.get(key) else {
+                                continue;
+                            };
+                            let Some(state) = current_states.get_mut(id) else {
+                                continue;
+                            };
                             state.attributes =
                                 wasm_convert::wit_to_core_value_map(&wit_state.attributes);
                         }
                     }
+                    Err(e) => log::error!("WASM trap in normalize_state: {e}"),
                 }
-                Err(e) => log::error!("WASM trap in normalize_state: {e}"),
+            }
+
+            // Pending IDs intentionally share their legacy wire key. Send one
+            // per call so the guest's key-parsing HashMap cannot collapse
+            // distinct host IDs, and ignore the guest's re-rendered key when
+            // correlating the single result.
+            for (id, key, wit_state) in pending_wit_states {
+                let result = {
+                    let mut store = self.instance.store.lock().await;
+                    store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+                    self.instance
+                        .bindings
+                        .call_normalize_state(&mut store, &[(key, wit_state)])
+                        .await
+                };
+
+                match result {
+                    Ok(result) => {
+                        let Some((_, wit_state)) = result.into_iter().next() else {
+                            continue;
+                        };
+                        let Some(state) = current_states.get_mut(&id) else {
+                            continue;
+                        };
+                        state.attributes =
+                            wasm_convert::wit_to_core_value_map(&wit_state.attributes);
+                    }
+                    Err(e) => log::error!("WASM trap in normalize_state: {e}"),
+                }
             }
         })
     }
@@ -2929,49 +2973,96 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         saved_attrs: &'a SavedAttrs,
     ) -> carina_core::provider::BoxFuture<'a, ()> {
         Box::pin(async move {
-            let wit_states: Vec<(String, _)> = current_states
-                .iter()
-                .map(|(id, state)| {
-                    let wit = expect_unresolvable_absent(
-                        wasm_convert::core_to_wit_state(state),
-                        "hydrate_read_state (current_states)",
-                    );
-                    (id.to_string(), wit)
-                })
-                .collect();
+            let mut resolved_ids_by_key = HashMap::new();
+            let mut resolved_wit_states = Vec::new();
+            let mut resolved_wit_saved = Vec::new();
+            let mut pending_batches = Vec::new();
 
-            let wit_saved: Vec<(String, Vec<(String, _)>)> = saved_attrs
-                .iter()
-                .map(|(id, attrs)| {
-                    let wit = expect_unresolvable_absent(
+            for (id, state) in current_states.iter() {
+                let key = wasm_convert::resource_id_wire_key(id);
+                let wit_state = expect_unresolvable_absent(
+                    wasm_convert::core_to_wit_state(state),
+                    "hydrate_read_state (current_states)",
+                );
+                let wit_saved = saved_attrs.get(id).map(|attrs| {
+                    expect_unresolvable_absent(
                         wasm_convert::core_to_wit_value_map(attrs),
                         "hydrate_read_state (saved_attrs)",
-                    );
-                    (id.to_string(), wit)
-                })
-                .collect();
+                    )
+                });
 
-            // Plain `.await`, not a nested `block_on` — see `normalize_desired`.
-            let result = {
-                let mut store = self.instance.store.lock().await;
-                store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
-                self.instance
-                    .bindings
-                    .call_hydrate_read_state(&mut store, &wit_states, &wit_saved)
-                    .await
-            };
+                match id.identity_state() {
+                    ResourceIdentityState::Pending(_) => {
+                        pending_batches.push((id.clone(), key, wit_state, wit_saved));
+                    }
+                    ResourceIdentityState::Resolved(_) => {
+                        resolved_ids_by_key.insert(key.clone(), id.clone());
+                        resolved_wit_states.push((key.clone(), wit_state));
+                        if let Some(wit_saved) = wit_saved {
+                            resolved_wit_saved.push((key, wit_saved));
+                        }
+                    }
+                }
+            }
 
-            match result {
-                Ok(result) => {
-                    for state in current_states.values_mut() {
-                        let key = state.id.to_string();
-                        if let Some((_, wit_state)) = result.iter().find(|(k, _)| k == &key) {
+            if !resolved_wit_states.is_empty() {
+                // Plain `.await`, not a nested `block_on` — see `normalize_desired`.
+                let result = {
+                    let mut store = self.instance.store.lock().await;
+                    store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+                    self.instance
+                        .bindings
+                        .call_hydrate_read_state(
+                            &mut store,
+                            &resolved_wit_states,
+                            &resolved_wit_saved,
+                        )
+                        .await
+                };
+
+                match result {
+                    Ok(result) => {
+                        for (key, wit_state) in &result {
+                            let Some(id) = resolved_ids_by_key.get(key) else {
+                                continue;
+                            };
+                            let Some(state) = current_states.get_mut(id) else {
+                                continue;
+                            };
                             state.attributes =
                                 wasm_convert::wit_to_core_value_map(&wit_state.attributes);
                         }
                     }
+                    Err(e) => log::error!("WASM trap in hydrate_read_state: {e}"),
                 }
-                Err(e) => log::error!("WASM trap in hydrate_read_state: {e}"),
+            }
+
+            for (id, key, wit_state, wit_saved) in pending_batches {
+                let wit_saved = wit_saved
+                    .map(|attrs| vec![(key.clone(), attrs)])
+                    .unwrap_or_default();
+                let result = {
+                    let mut store = self.instance.store.lock().await;
+                    store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
+                    self.instance
+                        .bindings
+                        .call_hydrate_read_state(&mut store, &[(key, wit_state)], &wit_saved)
+                        .await
+                };
+
+                match result {
+                    Ok(result) => {
+                        let Some((_, wit_state)) = result.into_iter().next() else {
+                            continue;
+                        };
+                        let Some(state) = current_states.get_mut(&id) else {
+                            continue;
+                        };
+                        state.attributes =
+                            wasm_convert::wit_to_core_value_map(&wit_state.attributes);
+                    }
+                    Err(e) => log::error!("WASM trap in hydrate_read_state: {e}"),
+                }
             }
         })
     }

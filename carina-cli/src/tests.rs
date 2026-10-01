@@ -175,7 +175,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(existing_state),
-        sorted_resources: &[resource],
+        sorted_resources: &[resolved(resource)],
         runtime_synthesized_resources: &[],
         current_states: &current_states,
         applied_states: &HashMap::new(),
@@ -228,7 +228,7 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(existing_state),
-        sorted_resources: &[resource],
+        sorted_resources: &[resolved(resource)],
         runtime_synthesized_resources: &[],
         current_states: &current_states,
         applied_states: &HashMap::new(),
@@ -277,7 +277,7 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(existing_state),
-        sorted_resources: &[resource],
+        sorted_resources: &[resolved(resource)],
         runtime_synthesized_resources: &[],
         current_states: &current_states,
         applied_states: &HashMap::new(),
@@ -663,13 +663,13 @@ fn make_awscc_provider(region_dsl: &str) -> ProviderConfig {
 #[ignore = "requires provider binary for identity_attributes"]
 fn test_anonymous_id_different_regions_produce_different_identifiers() {
     // Two anonymous ec2_vpc resources with same cidr_block but different provider regions
-    let mut r1 = Resource::with_provider("awscc", "ec2.Vpc", "", None);
+    let mut r1 = Resource::pending_with_provider("awscc", "ec2.Vpc", None);
     r1.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
 
-    let mut r2 = Resource::with_provider("awscc", "ec2.Vpc", "", None);
+    let mut r2 = Resource::pending_with_provider("awscc", "ec2.Vpc", None);
     r2.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -687,12 +687,30 @@ fn test_anonymous_id_different_regions_produce_different_identifiers() {
     compute_anonymous_identifiers(&mut resources_west, &providers_west).unwrap();
 
     // Both should have identifiers assigned
-    assert!(!resources_east[0].id.identity_or_empty().is_empty());
-    assert!(!resources_west[0].id.identity_or_empty().is_empty());
+    assert!(
+        !resources_east[0]
+            .id
+            .identity_str()
+            .expect("resolved identity")
+            .is_empty()
+    );
+    assert!(
+        !resources_west[0]
+            .id
+            .identity_str()
+            .expect("resolved identity")
+            .is_empty()
+    );
     // They must be different because providers have different regions
     assert_ne!(
-        resources_east[0].id.identity_or_empty(),
-        resources_west[0].id.identity_or_empty()
+        resources_east[0]
+            .id
+            .identity_str()
+            .expect("resolved identity"),
+        resources_west[0]
+            .id
+            .identity_str()
+            .expect("resolved identity")
     );
 }
 
@@ -700,13 +718,13 @@ fn test_anonymous_id_different_regions_produce_different_identifiers() {
 #[ignore = "requires provider binary for identity_attributes"]
 fn test_anonymous_id_same_region_same_create_only_collides() {
     // Two anonymous ec2_vpc resources with same cidr_block and same provider region -> collision
-    let mut r1 = Resource::with_provider("awscc", "ec2.Vpc", "", None);
+    let mut r1 = Resource::pending_with_provider("awscc", "ec2.Vpc", None);
     r1.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
 
-    let mut r2 = Resource::with_provider("awscc", "ec2.Vpc", "", None);
+    let mut r2 = Resource::pending_with_provider("awscc", "ec2.Vpc", None);
     r2.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -723,13 +741,13 @@ fn test_anonymous_id_same_region_same_create_only_collides() {
 #[ignore = "requires provider binary for identity_attributes"]
 fn test_anonymous_id_different_create_only_same_region_no_collision() {
     // Two anonymous ec2_vpc resources with different cidr_block in same provider region -> no collision
-    let mut r1 = Resource::with_provider("awscc", "ec2.Vpc", "", None);
+    let mut r1 = Resource::pending_with_provider("awscc", "ec2.Vpc", None);
     r1.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
     );
 
-    let mut r2 = Resource::with_provider("awscc", "ec2.Vpc", "", None);
+    let mut r2 = Resource::pending_with_provider("awscc", "ec2.Vpc", None);
     r2.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
@@ -739,11 +757,23 @@ fn test_anonymous_id_different_create_only_same_region_no_collision() {
     let mut resources = vec![r1, r2];
     compute_anonymous_identifiers(&mut resources, &providers).unwrap();
 
-    assert!(!resources[0].id.identity_or_empty().is_empty());
-    assert!(!resources[1].id.identity_or_empty().is_empty());
+    assert!(
+        !resources[0]
+            .id
+            .identity_str()
+            .expect("resolved identity")
+            .is_empty()
+    );
+    assert!(
+        !resources[1]
+            .id
+            .identity_str()
+            .expect("resolved identity")
+            .is_empty()
+    );
     assert_ne!(
-        resources[0].id.identity_or_empty(),
-        resources[1].id.identity_or_empty()
+        resources[0].id.identity_str().expect("resolved identity"),
+        resources[1].id.identity_str().expect("resolved identity")
     );
 }
 
@@ -761,7 +791,10 @@ fn test_anonymous_id_named_resources_are_skipped() {
     compute_anonymous_identifiers(&mut resources, &providers).unwrap();
 
     // Name should remain unchanged
-    assert_eq!(resources[0].id.identity_or_empty(), "my_vpc");
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        "my_vpc"
+    );
 }
 
 #[test]
@@ -878,7 +911,7 @@ fn validate_regular_resource_without_read_keyword_passes() {
 fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
     // --- First run (apply) ---
     // 1. Parse: anonymous resource with bucket_name_prefix
-    let mut resource_run1 = Resource::with_provider("awscc", "s3.Bucket", "", None);
+    let mut resource_run1 = Resource::pending_with_provider("awscc", "s3.Bucket", None);
     resource_run1.set_attr(
         "bucket_name_prefix".to_string(),
         Value::Concrete(ConcreteValue::String("my-app-".to_string())),
@@ -929,7 +962,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
     .with_identifier("my-app-abcd1234");
 
     let resource_state = ResourceState::from_provider_state_for_resource_and_schema(
-        &resources_run1[0],
+        &ResolvedResource::new(resources_run1[0].clone()),
         &applied_state,
         None,
         None,
@@ -943,7 +976,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
 
     // --- Second run (plan-verify) ---
     // 1. Parse again: same anonymous resource with bucket_name_prefix
-    let mut resource_run2 = Resource::with_provider("awscc", "s3.Bucket", "", None);
+    let mut resource_run2 = Resource::pending_with_provider("awscc", "s3.Bucket", None);
     resource_run2.set_attr(
         "bucket_name_prefix".to_string(),
         Value::Concrete(ConcreteValue::String("my-app-".to_string())),
@@ -997,7 +1030,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     let providers = vec![make_awscc_provider("awscc.Region.ap_northeast_1")];
 
     // --- First run ---
-    let mut resource_run1 = Resource::with_provider("awscc", "iam.role", "", None);
+    let mut resource_run1 = Resource::pending_with_provider("awscc", "iam.role", None);
     resource_run1.set_attr(
         "role_name_prefix".to_string(),
         Value::Concrete(ConcreteValue::String("carina-acc-test-".to_string())),
@@ -1054,7 +1087,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     .with_identifier(run1_role_name.as_str());
 
     let resource_state = ResourceState::from_provider_state_for_resource_and_schema(
-        &resources_run1[0],
+        &ResolvedResource::new(resources_run1[0].clone()),
         &applied_state,
         None,
         None,
@@ -1066,7 +1099,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
         .expect("test state setup must be valid");
 
     // --- Second run ---
-    let mut resource_run2 = Resource::with_provider("awscc", "iam.role", "", None);
+    let mut resource_run2 = Resource::pending_with_provider("awscc", "iam.role", None);
     resource_run2.set_attr(
         "role_name_prefix".to_string(),
         Value::Concrete(ConcreteValue::String("carina-acc-test-".to_string())),
@@ -1120,7 +1153,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
     let providers = vec![make_awscc_provider("awscc.Region.ap_northeast_1")];
 
     // --- First run ---
-    let mut resource_run1 = Resource::with_provider("awscc", "ec2.flow_log", "", None);
+    let mut resource_run1 = Resource::pending_with_provider("awscc", "ec2.flow_log", None);
     resource_run1.set_attr(
         "resource_id".to_string(),
         Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
@@ -1165,6 +1198,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
 
     let mut resources_run1 = vec![resource_run1];
     compute_anonymous_identifiers(&mut resources_run1, &providers).unwrap();
+    crate::wiring::assign_fallback_identities_for_unresolved_anonymous(&mut resources_run1, &[]);
     let run1_name = resources_run1[0]
         .id
         .identity_str()
@@ -1176,7 +1210,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
         .with_identifier("fl-12345678");
 
     let resource_state = ResourceState::from_provider_state_for_resource_and_schema(
-        &resources_run1[0],
+        &ResolvedResource::new(resources_run1[0].clone()),
         &applied_state,
         None,
         None,
@@ -1188,7 +1222,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
         .expect("test state setup must be valid");
 
     // --- Second run ---
-    let mut resource_run2 = Resource::with_provider("awscc", "ec2.flow_log", "", None);
+    let mut resource_run2 = Resource::pending_with_provider("awscc", "ec2.flow_log", None);
     resource_run2.set_attr(
         "resource_id".to_string(),
         Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
@@ -1233,6 +1267,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
 
     let mut resources_run2 = vec![resource_run2];
     compute_anonymous_identifiers(&mut resources_run2, &providers).unwrap();
+    crate::wiring::assign_fallback_identities_for_unresolved_anonymous(&mut resources_run2, &[]);
     let run2_name = resources_run2[0]
         .id
         .identity_str()
@@ -1417,7 +1452,7 @@ fn orphaned_state_resource_produces_delete_effect() {
     let prev_explicit = state_file.build_explicit();
 
     let plan = create_plan(
-        &desired,
+        &ResolvedResource::collect_resolved(desired.clone()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
         &carina_core::resource::into_plan_input_map(
@@ -1449,7 +1484,7 @@ fn orphaned_state_resource_produces_delete_effect() {
 
     match &delete_effects[0] {
         Effect::Delete { id, identifier, .. } => {
-            assert_eq!(id.identity_or_empty(), "removed-bucket");
+            assert_eq!(id.identity_str(), "removed-bucket");
             assert_eq!(identifier, "removed-bucket");
         }
         _ => unreachable!(),
@@ -2122,7 +2157,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
     let prev_explicit = state_file.build_explicit();
 
     let plan = create_plan(
-        &desired,
+        &ResolvedResource::collect_resolved(desired.clone()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
         &carina_core::resource::into_plan_input_map(
@@ -2215,7 +2250,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
     let prev_explicit = state_file.build_explicit();
 
     let plan = create_plan(
-        &desired,
+        &ResolvedResource::collect_resolved(desired.clone()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
         &carina_core::resource::into_plan_input_map(
@@ -2270,7 +2305,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
     let prev_explicit = state_file.build_explicit();
 
     let plan = create_plan(
-        &desired,
+        &ResolvedResource::collect_resolved(desired.clone()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
         &carina_core::resource::into_plan_input_map(
@@ -2321,7 +2356,7 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
     }
 
     let plan = create_plan(
-        &desired,
+        &ResolvedResource::collect_resolved(desired.clone()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
         &carina_core::resource::into_plan_input_map(
@@ -2392,7 +2427,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: None,
-        sorted_resources: &[resource],
+        sorted_resources: &[resolved(resource)],
         runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
@@ -2487,7 +2522,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: None,
-        sorted_resources: &[resource],
+        sorted_resources: &[resolved(resource)],
         runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
@@ -2564,7 +2599,7 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: None,
-        sorted_resources: &[resource.clone()],
+        sorted_resources: &[resolved(resource.clone())],
         runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
@@ -2578,7 +2613,7 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
 
     let resources = [resource];
     let plan = create_plan(
-        &resources,
+        &ResolvedResource::collect_resolved(resources.iter().cloned()).unwrap(),
         &[],
         &carina_core::provider::ProviderRouter::new(),
         &carina_core::resource::into_plan_input_map(
@@ -2656,7 +2691,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
 
     let saved = build_state_after_apply(ApplyStateSave {
         state_file: Some(existing_state),
-        sorted_resources: &[resource],
+        sorted_resources: &[resolved(resource)],
         runtime_synthesized_resources: &[],
         current_states: &HashMap::new(),
         applied_states: &applied_states,
@@ -2752,6 +2787,82 @@ fn plan_file_serialization_redacts_secrets() {
 
     // Non-secret values should still be present
     assert!(json.contains("my-db"));
+}
+
+#[test]
+fn plan_file_serialization_rejects_pending_resource_identity() {
+    let plan_file = PlanFile {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-01-01T00:00:00Z".to_string(),
+        source_path: "main.crn".to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: Vec::new(),
+        backend_config: None,
+        plan: Plan::new(),
+        sorted_resources: vec![Resource::pending_with_provider(
+            "mock",
+            "test.resource",
+            None,
+        )],
+        unresolved_resources: Vec::new(),
+        compositions: Vec::new(),
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        current_states: Vec::new(),
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    };
+
+    let error = serde_json::to_string(&plan_file)
+        .expect_err("a saved plan must never persist a pending resource identity");
+    assert!(
+        error
+            .to_string()
+            .contains("pending resource identity cannot be serialized")
+    );
+}
+
+#[test]
+fn plan_file_validation_rejects_missing_resource_identity() {
+    let plan_file = PlanFile {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-01-01T00:00:00Z".to_string(),
+        source_path: "main.crn".to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: Vec::new(),
+        backend_config: None,
+        plan: Plan::new(),
+        sorted_resources: vec![Resource::with_provider(
+            "mock",
+            "test.resource",
+            "alpha",
+            None,
+        )],
+        unresolved_resources: Vec::new(),
+        compositions: Vec::new(),
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        current_states: Vec::new(),
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    };
+    let mut json = serde_json::to_value(plan_file).unwrap();
+    json["sorted_resources"][0]["id"]
+        .as_object_mut()
+        .unwrap()
+        .remove("identity");
+
+    let decoded: PlanFile = serde_json::from_value(json).unwrap();
+    let error = decoded
+        .validate_resource_identities()
+        .expect_err("a saved plan must reject a missing resource identity");
+    assert!(error.contains("sorted_resources[0]"), "got: {error}");
 }
 
 /// Backend that captures the state written to it.
@@ -3093,7 +3204,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     resource_a.binding = Some("a".to_string());
     let mut resource_b = Resource::with_provider("mock", "test.resource", "b", None);
     resource_b.binding = Some("b".to_string());
-    let sorted_resources = vec![resource_a.clone(), resource_b];
+    let sorted_resources = vec![resolved(resource_a.clone()), resolved(resource_b)];
 
     let a_id = resource_a.id.clone();
     let mut a_attrs = HashMap::new();

@@ -15,6 +15,13 @@ pub enum ParseError {
     #[error("Invalid expression at line {line}: {message}")]
     InvalidExpression { line: usize, message: String },
 
+    #[error("Invalid expression at line {line}: {source}")]
+    InvalidResourceIdentity {
+        line: usize,
+        #[source]
+        source: crate::resource::ResourceIdentityError,
+    },
+
     #[error("Undefined variable: {0}")]
     UndefinedVariable(String),
 

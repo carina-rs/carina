@@ -57,6 +57,18 @@ pub struct TopLevelBlockSourceSpan {
     pub end_column: usize,
 }
 
+/// Parser-backed source location of a top-level anonymous resource block.
+///
+/// The provider/type split mirrors [`crate::resource::ResourceId`]. Collecting
+/// this from pest pairs keeps comments, let-bound resources, and resources
+/// nested in `for` expressions out of editor diagnostic anchoring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnonymousResourceSourceSpan {
+    pub provider: String,
+    pub resource_type: String,
+    pub span: TopLevelBlockSourceSpan,
+}
+
 impl<'a> BindingSeed<'a> {
     pub(crate) fn value(name: &'a str, value: &'a Value) -> Self {
         Self {
@@ -161,6 +173,64 @@ pub fn top_level_upstream_state_spans(
         }
         pair_contains_rule(statement, Rule::upstream_state_expr).then_some("let")
     })
+}
+
+/// Return type-name spans for authored top-level anonymous resources.
+pub fn top_level_anonymous_resource_spans(
+    input: &str,
+) -> Result<Vec<AnonymousResourceSourceSpan>, ParseError> {
+    let preprocess_result =
+        crate::heredoc::preprocess_heredocs(input).map_err(|e| ParseError::InvalidExpression {
+            line: 0,
+            message: e.to_string(),
+        })?;
+    let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)
+        .map_err(|e| map_pest_error_lines(e, &preprocess_result.line_map))?;
+    let mut spans = Vec::new();
+
+    for pair in pairs {
+        if pair.as_rule() != Rule::file {
+            continue;
+        }
+        for statement in pair
+            .into_inner()
+            .filter(|pair| pair.as_rule() == Rule::statement)
+        {
+            let block = statement
+                .into_inner()
+                .next()
+                .ok_or_else(|| ParseError::InternalError {
+                    expected: "top-level statement body".to_string(),
+                    context: "anonymous resource source span collection".to_string(),
+                })?;
+            if block.as_rule() != Rule::anonymous_resource {
+                continue;
+            }
+            let type_pair = block
+                .into_inner()
+                .next()
+                .ok_or_else(|| ParseError::InternalError {
+                    expected: "anonymous resource type".to_string(),
+                    context: "anonymous resource source span collection".to_string(),
+                })?;
+            let full_type = type_pair.as_str();
+            let Some((provider, resource_type)) = full_type.split_once('.') else {
+                continue;
+            };
+            let (preprocessed_line, start_column) = type_pair.as_span().start_pos().line_col();
+            spans.push(AnonymousResourceSourceSpan {
+                provider: provider.to_string(),
+                resource_type: resource_type.to_string(),
+                span: TopLevelBlockSourceSpan {
+                    start_line: original_line(preprocessed_line, &preprocess_result.line_map),
+                    start_column,
+                    end_column: start_column + full_type.chars().count(),
+                },
+            });
+        }
+    }
+
+    Ok(spans)
 }
 
 fn top_level_block_spans(
@@ -486,7 +556,10 @@ fn parse_with_seeded_bindings_inner(
                                         // so a placeholder managed binding stands in
                                         // for resolution purposes — same shape as the
                                         // `_module_binding` / `_wait` placeholders.
-                                        let placeholder = Resource::new("_data_source", &name);
+                                        let placeholder = Resource::new(
+                                            "_data_source",
+                                            crate::resource::ResourceIdentity::new(name.clone()),
+                                        );
                                         ctx.set_resource_binding(name.clone(), placeholder);
                                     }
                                     data_sources.extend(expanded_data_sources);
@@ -501,12 +574,18 @@ fn parse_with_seeded_bindings_inner(
                                     if !is_discard {
                                         // Register as a resource binding so that
                                         // `name.attr` resolves as ResourceRef
-                                        let placeholder = Resource::new("_module_binding", &name);
+                                        let placeholder = Resource::new(
+                                            "_module_binding",
+                                            crate::resource::ResourceIdentity::new(name.clone()),
+                                        );
                                         ctx.set_resource_binding(name.clone(), placeholder);
                                     }
                                 }
                                 if is_upstream_state && !is_discard {
-                                    let placeholder = Resource::new("_upstream_state", &name);
+                                    let placeholder = Resource::new(
+                                        "_upstream_state",
+                                        crate::resource::ResourceIdentity::new(name.clone()),
+                                    );
                                     ctx.set_resource_binding(name.clone(), placeholder);
                                     upstream_states.push(ctx.upstream_states[&name].clone());
                                 }
@@ -516,7 +595,10 @@ fn parse_with_seeded_bindings_inner(
                                     // `<wait-binding>.<attr>` parses as `ResourceRef`.
                                     // Downstream resolution (Phase 4 of #2825) treats
                                     // it as passthrough of the target's snapshot.
-                                    let placeholder = Resource::new("_wait", &name);
+                                    let placeholder = Resource::new(
+                                        "_wait",
+                                        crate::resource::ResourceIdentity::new(name.clone()),
+                                    );
                                     ctx.set_resource_binding(name.clone(), placeholder);
                                     wait_bindings.push(ctx.wait_bindings[&name].clone());
                                 }
@@ -740,7 +822,10 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
                     binding: seed.name().to_string(),
                 });
                 ctx.set_variable(seed.name().to_string(), placeholder_ref);
-                let placeholder = Resource::new("_seeded", seed.name());
+                let placeholder = Resource::new(
+                    "_seeded",
+                    crate::resource::ResourceIdentity::new(seed.name().to_string()),
+                );
                 ctx.set_resource_binding(seed.name().to_string(), placeholder);
             }
         }

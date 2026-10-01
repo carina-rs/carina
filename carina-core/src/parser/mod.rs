@@ -26,12 +26,13 @@ pub use ast::{
     expand_deferred_children,
 };
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
+pub use entry::{
+    AnonymousResourceSourceSpan, TopLevelBlockSourceSpan, parse, parse_and_resolve,
+    top_level_anonymous_resource_spans, top_level_backend_block_spans,
+    top_level_exports_block_spans, top_level_state_block_spans, top_level_upstream_state_spans,
+};
 pub(crate) use entry::{
     BindingSeed, parse_with_seeded_bindings, parse_with_seeded_bindings_without_literal_warnings,
-};
-pub use entry::{
-    TopLevelBlockSourceSpan, parse, parse_and_resolve, top_level_backend_block_spans,
-    top_level_exports_block_spans, top_level_state_block_spans, top_level_upstream_state_spans,
 };
 pub(crate) use entry::{parse_expression, parse_expression_eval};
 pub use error::{

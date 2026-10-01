@@ -324,7 +324,10 @@ fn tree_scroll_cursor_moves_within_visible_area_before_scrolling() {
     // Create a plan with 10 items
     let mut plan = Plan::new();
     for i in 0..10 {
-        plan.add(create(Resource::new("s3.Bucket", format!("bucket-{}", i))));
+        plan.add(create(Resource::new(
+            "s3.Bucket",
+            carina_core::resource::ResourceIdentity::try_from(format!("bucket-{i}")).unwrap(),
+        )));
     }
     let mut app = App::new(&plan, &SchemaRegistry::new());
     // Simulate a visible area of 5 items

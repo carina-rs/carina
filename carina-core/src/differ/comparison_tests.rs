@@ -1,5 +1,5 @@
 use super::comparison::SavedAttr;
-use super::*;
+use super::{create_plan_for_tests as create_plan, *};
 
 use crate::explicit::ExplicitFields;
 use crate::resource::{CanonicalEnumValue, ConcreteValue, DeferredValue, Value};
@@ -160,7 +160,7 @@ fn type_aware_diff_no_change_with_schema() {
     );
 
     // Without schema: detects a change (Int != Float)
-    let result = diff(&desired, &current, None, None, None);
+    let result = diff_test(&desired, &current, None, None, None);
     assert!(
         matches!(result, Diff::Update { .. }),
         "Without schema, Int(443) != Float(443.0) should be Update, got {:?}",
@@ -168,7 +168,7 @@ fn type_aware_diff_no_change_with_schema() {
     );
 
     // With schema: no change (type-aware coercion)
-    let result = diff(&desired, &current, None, None, Some(&schema));
+    let result = diff_test(&desired, &current, None, None, Some(&schema));
     assert!(
         matches!(result, Diff::NoChange(_)),
         "With schema, Int(443) and Float(443.0) should be NoChange, got {:?}",
@@ -1019,10 +1019,15 @@ fn secret_with_context_no_change_when_hash_matches() {
     use crate::resource::{ConcreteValue, DeferredValue, ResourceId};
     use crate::value::{SecretHashContext, value_to_json_with_context};
 
-    let resource_id = ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None);
+    let resource_id = crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+        "awscc",
+        "rds.db_instance",
+        "my-db",
+        None,
+    ));
     let ctx = SecretHashContext::new(
         resource_id.display_type(),
-        resource_id.identity_or_empty(),
+        resource_id.identity_str(),
         "master_password",
     );
 
@@ -1053,10 +1058,15 @@ fn secret_with_context_detects_change() {
     use crate::resource::ResourceId;
     use crate::value::{SecretHashContext, value_to_json_with_context};
 
-    let resource_id = ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None);
+    let resource_id = crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+        "awscc",
+        "rds.db_instance",
+        "my-db",
+        None,
+    ));
     let ctx = SecretHashContext::new(
         resource_id.display_type(),
-        resource_id.identity_or_empty(),
+        resource_id.identity_str(),
         "master_password",
     );
 
@@ -1104,7 +1114,12 @@ fn secret_same_password_different_resources_produces_different_hashes() {
     );
 
     // Each hash should match its own context
-    let id1 = ResourceId::with_provider_identity("awscc", "rds.db_instance", "db-1", None);
+    let id1 = crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+        "awscc",
+        "rds.db_instance",
+        "db-1",
+        None,
+    ));
     let desired1 = HashMap::from([("master_password".to_string(), secret.clone())]);
     let current1 = HashMap::from([(
         "master_password".to_string(),
@@ -1117,7 +1132,12 @@ fn secret_same_password_different_resources_produces_different_hashes() {
     );
 
     // But not the other resource's context
-    let id2 = ResourceId::with_provider_identity("awscc", "rds.db_instance", "db-2", None);
+    let id2 = crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+        "awscc",
+        "rds.db_instance",
+        "db-2",
+        None,
+    ));
     let desired2 = HashMap::from([("master_password".to_string(), secret)]);
     let current2 = HashMap::from([(
         "master_password".to_string(),
@@ -1190,8 +1210,12 @@ fn secret_in_map_with_refresh_no_false_diff() {
     use crate::resource::ResourceId;
     use crate::schema::{AttributeSchema, ResourceSchema};
 
-    let resource_id =
-        ResourceId::with_provider_identity("awscc", "ec2.Vpc", "ec2_vpc_fb75c929", None);
+    let resource_id = crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+        "awscc",
+        "ec2.Vpc",
+        "ec2_vpc_fb75c929",
+        None,
+    ));
 
     // Desired: tags map with a secret value (as written in .crn)
     let desired_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
@@ -1542,7 +1566,7 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
     canonicalize_states_with_schemas(&mut states, &registry);
 
     let current = states.into_values().next().unwrap();
-    let result = diff(&resources[0], &current, None, None, Some(&schema));
+    let result = diff_test(&resources[0], &current, None, None, Some(&schema));
     assert!(
         matches!(result, Diff::NoChange(_)),
         "carina#3080: scalar (desired) vs singleton-list (state) under \
@@ -1626,7 +1650,7 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
     )]))
     .lift(&registry);
 
-    let result = diff(
+    let result = diff_test(
         &resources[0],
         states.get(&id).unwrap(),
         saved_attrs.get(&id),
@@ -1708,7 +1732,7 @@ fn carina3740_saved_nested_secret_hash_union_scalar_is_no_change() {
     )]))
     .lift(&registry);
 
-    let result = diff(
+    let result = diff_test(
         &desired,
         &current,
         saved_attrs.get(&desired.id),
@@ -1972,7 +1996,7 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     let prev_explicit = crate::explicit::build_from_resource(&resources[0]);
 
     let current = states.into_values().next().unwrap();
-    let result = diff(
+    let result = diff_test(
         &resources[0],
         &current,
         None,
@@ -2090,7 +2114,7 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
 
     let prev_explicit = crate::explicit::build_from_resource(&resources[0]);
     let current = states.into_values().next().unwrap();
-    let result = diff(
+    let result = diff_test(
         &resources[0],
         &current,
         None,

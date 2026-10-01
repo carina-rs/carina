@@ -1,6 +1,6 @@
 //! Semantic checks: provider region, module calls, unused bindings, undefined references.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
@@ -216,6 +216,80 @@ fn deferred_in_current_file(
 }
 
 impl DiagnosticEngine {
+    /// Report anonymous resources that would share an identity scheme derived
+    /// from mutable attributes. The core check owns classification and
+    /// grouping; this adapter only maps the directory-wide result back onto
+    /// declarations in the current document.
+    pub(super) fn attribute_derived_anonymous_resource_diagnostics(
+        &self,
+        doc: &Document,
+        current_file: &ParsedFile,
+        directory: &ParsedFile,
+    ) -> Vec<Diagnostic> {
+        let conflicts =
+            carina_core::identifier::check_attribute_derived_anonymous_resource_conflicts(
+                &directory.resources,
+                &self.schemas,
+            );
+        if conflicts.is_empty() {
+            return Vec::new();
+        }
+
+        let Ok(authored_spans) =
+            carina_core::parser::top_level_anonymous_resource_spans(&doc.text())
+        else {
+            return Vec::new();
+        };
+        let mut spans_by_kind = HashMap::<(String, String), VecDeque<_>>::new();
+        for authored in authored_spans {
+            spans_by_kind
+                .entry((authored.provider, authored.resource_type))
+                .or_default()
+                .push_back(authored.span);
+        }
+
+        let mut diagnostics = Vec::new();
+        for resource in current_file
+            .resources
+            .iter()
+            .filter(|resource| resource.binding.is_none())
+        {
+            let key = (
+                resource.id.provider.clone(),
+                resource.id.resource_type.clone(),
+            );
+            let Some(span) = spans_by_kind.get_mut(&key).and_then(VecDeque::pop_front) else {
+                continue;
+            };
+
+            // The general schema diagnostic below is the actionable error in
+            // this situation. Without a schema, LSP cannot truthfully classify
+            // the resource's identity basis even though CLI intentionally
+            // treats genuinely schema-less providers as attribute-derived.
+            if self.schemas.get_for(resource).is_none() {
+                continue;
+            }
+
+            let Some(conflict) = conflicts
+                .iter()
+                .find(|conflict| conflict.includes(resource, &self.schemas))
+            else {
+                continue;
+            };
+            let line = span.start_line.saturating_sub(1) as u32;
+            let col = span.start_column.saturating_sub(1) as u32;
+            diagnostics.push(carina_diagnostic(
+                line,
+                col,
+                span.end_column.saturating_sub(1) as u32,
+                DiagnosticSeverity::ERROR,
+                conflict.to_string(),
+            ));
+        }
+
+        diagnostics
+    }
+
     /// Flag `arguments` blocks placed in a root configuration.
     ///
     /// `arguments` is a module-input declaration; it has no caller in a

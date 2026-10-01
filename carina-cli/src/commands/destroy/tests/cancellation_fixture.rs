@@ -51,8 +51,10 @@ impl DestroyCancellationFixture {
         }
 
         for name in names {
+            let identity = carina_core::resource::ResourceIdentity::try_from(name.to_owned())
+                .expect("test identity is non-empty");
             let mut resource =
-                ResourceState::new("test.resource", name, "mock").with_identifier("mock-id");
+                ResourceState::new("test.resource", identity, "mock").with_identifier("mock-id");
             resource.binding = Some(name.to_string());
             resource
                 .attributes
@@ -80,8 +82,10 @@ impl DestroyCancellationFixture {
             .insert("surviving_export".to_string(), serde_json::json!("value"));
 
         for name in names {
+            let identity = carina_core::resource::ResourceIdentity::try_from(name.to_owned())
+                .expect("test identity is non-empty");
             let mut resource =
-                ResourceState::new("test.resource", name, "mock").with_identifier("mock-id");
+                ResourceState::new("test.resource", identity, "mock").with_identifier("mock-id");
             resource.binding = Some(name.to_string());
             resource
                 .attributes

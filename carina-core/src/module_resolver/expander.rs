@@ -11,7 +11,8 @@ use crate::parser::{
 };
 use crate::resource::{
     Composition, CompositionCall, CompositionProvenance, ConcreteValue, DataSource, DeferredValue,
-    Resource, ResourceId, ResourceIdentity, Value,
+    ModuleInstanceScope, ModuleSource, Resource, ResourceId, ResourceIdentity,
+    ResourceIdentityState, Value,
 };
 
 use super::error::ModuleError;
@@ -247,6 +248,11 @@ impl ModuleResolver<'_> {
             // that exact binding must gain the new outer prefix as well.
             .chain(module.compositions.iter().filter_map(|c| c.binding.clone()))
             .collect();
+        let module_instance_scope = ModuleInstanceScope::for_call(
+            &call.module_name,
+            call.binding_name.as_deref(),
+            instance_prefix,
+        );
 
         // Expand managed resources with substituted values.
         let mut resources: Vec<Resource> = Vec::new();
@@ -255,6 +261,7 @@ impl ModuleResolver<'_> {
                 resource,
                 instance_prefix,
                 &call.module_name,
+                &module_instance_scope,
                 &intra_module_bindings,
                 &argument_values,
             ));
@@ -267,6 +274,7 @@ impl ModuleResolver<'_> {
                 data_source,
                 instance_prefix,
                 &call.module_name,
+                &module_instance_scope,
                 &intra_module_bindings,
                 &argument_values,
             ));
@@ -376,7 +384,10 @@ impl ModuleResolver<'_> {
             }
 
             let composition = Composition {
-                id: ResourceId::with_identity("_virtual", instance_prefix),
+                id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                    "_virtual",
+                    crate::resource::ResourceIdentity::new(instance_prefix.to_string()),
+                )),
                 signature: crate::resource::Signature {
                     arguments: signature_arguments,
                     attributes: composition_attrs,
@@ -418,6 +429,7 @@ impl ModuleResolver<'_> {
                     d,
                     instance_prefix,
                     &call.module_name,
+                    &module_instance_scope,
                     &intra_module_bindings,
                     &argument_values,
                 )
@@ -524,9 +536,11 @@ pub(crate) fn build_expansion_trace(
     leaf_resources: &[Resource],
     leaf_data_sources: &[DataSource],
 ) -> crate::resource::ExpansionTrace {
-    let id = crate::resource::EphemeralId::new(crate::resource::ResourceId::with_identity(
-        "_virtual",
-        instance_prefix,
+    let id = crate::resource::EphemeralId::new(crate::resource::ResolvedResourceId::new(
+        crate::resource::ResourceId::with_identity(
+            "_virtual",
+            crate::resource::ResourceIdentity::new(instance_prefix.to_string()),
+        ),
     ));
     let this_call_site = match source_path {
         Some(p) => crate::resource::CallSite::new(id, p),
@@ -687,20 +701,20 @@ fn prefix_module_resource(
     resource: &Resource,
     instance_prefix: &str,
     module_name: &str,
+    module_instance_scope: &ModuleInstanceScope,
     intra_module_bindings: &HashSet<String>,
     argument_values: &HashMap<String, Value>,
 ) -> Resource {
-    let mut new_resource = resource.clone();
-
     // Only assigned identities take the prefix here. Anonymous resources
-    // stay `None` so `compute_anonymous_identifiers` can later attach both
-    // the hash and the instance prefix in one shot (#2516).
-    if let Some(identity) = &new_resource.id.identity {
-        let new_name = apply_instance_prefix(instance_prefix, identity.as_str());
-        new_resource
-            .id
-            .set_identity(ResourceIdentity::new(new_name));
-    }
+    // stay pending so `compute_anonymous_identifiers` can later attach both
+    // the hash and the instance prefix in one shot (#2516). Each module
+    // instance receives a distinct pending token.
+    let mut new_resource = match resource.id.identity_state() {
+        ResourceIdentityState::Pending(_) => resource.instantiate(),
+        ResourceIdentityState::Resolved(identity) => resource.instantiate_with_identity(
+            ResourceIdentity::new(apply_instance_prefix(instance_prefix, identity.as_str())),
+        ),
+    };
 
     if let Some(ref binding) = new_resource.binding {
         new_resource.binding = Some(apply_instance_prefix(instance_prefix, binding));
@@ -711,10 +725,17 @@ fn prefix_module_resource(
         intra_module_bindings,
     );
 
-    new_resource.module_source = Some(crate::resource::ModuleSource::Module {
-        name: module_name.to_string(),
-        instance: instance_prefix.to_string(),
-    });
+    let scope = new_resource
+        .module_source
+        .as_ref()
+        .and_then(ModuleSource::identity_scope)
+        .map(|child| module_instance_scope.with_child(&child))
+        .unwrap_or_else(|| module_instance_scope.clone());
+    new_resource.module_source = Some(ModuleSource::expanded_module(
+        module_name,
+        instance_prefix,
+        scope,
+    ));
 
     // `IndexMap` preserves authored attribute order across expansion
     // (#2222); each value goes through the shared `prefix_attr_value`.
@@ -744,17 +765,16 @@ fn prefix_module_data_source(
     data_source: &DataSource,
     instance_prefix: &str,
     module_name: &str,
+    module_instance_scope: &ModuleInstanceScope,
     intra_module_bindings: &HashSet<String>,
     argument_values: &HashMap<String, Value>,
 ) -> DataSource {
-    let mut new_data_source = data_source.clone();
-
-    if let Some(identity) = &new_data_source.id.identity {
-        let new_name = apply_instance_prefix(instance_prefix, identity.as_str());
-        new_data_source
-            .id
-            .set_identity(ResourceIdentity::new(new_name));
-    }
+    let mut new_data_source = match data_source.id.identity_state() {
+        ResourceIdentityState::Pending(_) => data_source.instantiate(),
+        ResourceIdentityState::Resolved(identity) => data_source.instantiate_with_identity(
+            ResourceIdentity::new(apply_instance_prefix(instance_prefix, identity.as_str())),
+        ),
+    };
 
     if let Some(ref binding) = new_data_source.binding {
         new_data_source.binding = Some(apply_instance_prefix(instance_prefix, binding));
@@ -765,10 +785,17 @@ fn prefix_module_data_source(
         intra_module_bindings,
     );
 
-    new_data_source.module_source = Some(crate::resource::ModuleSource::Module {
-        name: module_name.to_string(),
-        instance: instance_prefix.to_string(),
-    });
+    let scope = new_data_source
+        .module_source
+        .as_ref()
+        .and_then(ModuleSource::identity_scope)
+        .map(|child| module_instance_scope.with_child(&child))
+        .unwrap_or_else(|| module_instance_scope.clone());
+    new_data_source.module_source = Some(ModuleSource::expanded_module(
+        module_name,
+        instance_prefix,
+        scope,
+    ));
 
     let mut substituted_attrs: IndexMap<String, Value> = IndexMap::new();
     for (key, expr) in &new_data_source.attributes {
@@ -810,10 +837,10 @@ fn prefix_module_composition(
     }
     *new_virtual.provenance = CompositionProvenance::expanded(call, root_call.clone());
 
-    if let Some(identity) = &new_virtual.id.identity {
-        let new_name = apply_instance_prefix(instance_prefix, identity.as_str());
-        new_virtual.id.set_identity(ResourceIdentity::new(new_name));
-    }
+    let new_name = apply_instance_prefix(instance_prefix, composition.id.identity_str());
+    new_virtual.id = composition
+        .id
+        .instantiate_with_identity(ResourceIdentity::new(new_name));
 
     if let Some(ref binding) = new_virtual.binding {
         new_virtual.binding = Some(apply_instance_prefix(instance_prefix, binding));
@@ -889,6 +916,7 @@ fn prefix_deferred_for_expression(
     d: &DeferredForExpression,
     instance_prefix: &str,
     module_name: &str,
+    module_instance_scope: &ModuleInstanceScope,
     intra_module_bindings: &HashSet<String>,
     argument_values: &HashMap<String, Value>,
 ) -> DeferredForExpression {
@@ -966,6 +994,7 @@ fn prefix_deferred_for_expression(
             template_resource,
             instance_prefix,
             module_name,
+            module_instance_scope,
             intra_module_bindings,
             argument_values,
         ),
@@ -1173,7 +1202,10 @@ pub fn reconcile_anonymous_module_instances(
     // expanded DSL — we'll query state for matching entries.
     let mut touched_types: HashSet<(String, String)> = HashSet::new();
     for r in resources.iter() {
-        if split_instance_prefix(r.id.identity_or_empty()).is_none() {
+        let Some(identity) = r.id.identity_str() else {
+            continue;
+        };
+        if split_instance_prefix(identity).is_none() {
             continue;
         }
         touched_types.insert((r.id.provider.clone(), r.id.resource_type.clone()));
@@ -1189,7 +1221,10 @@ pub fn reconcile_anonymous_module_instances(
     let mut current_synthetic_by_module: HashMap<String, HashSet<SimHash>> = HashMap::new();
     let mut claimed_current_by_module: HashMap<String, HashSet<SimHash>> = HashMap::new();
     for r in resources.iter() {
-        let Some((prefix, _)) = split_instance_prefix(r.id.identity_or_empty()) else {
+        let Some(identity) = r.id.identity_str() else {
+            continue;
+        };
+        let Some((prefix, _)) = split_instance_prefix(identity) else {
             continue;
         };
         let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix) else {
@@ -1199,11 +1234,7 @@ pub fn reconcile_anonymous_module_instances(
             .entry(module.to_string())
             .or_default()
             .insert(simhash);
-        if claims.claims_to(
-            &r.id.provider,
-            &r.id.resource_type,
-            r.id.identity_or_empty(),
-        ) {
+        if claims.claims_to(&r.id.provider, &r.id.resource_type, identity) {
             claimed_current_by_module
                 .entry(module.to_string())
                 .or_default()
@@ -1291,13 +1322,17 @@ pub fn reconcile_anonymous_module_instances(
     // Apply remaps: rewrite identity and `binding` for every resource whose
     // instance prefix is in the remap table.
     for r in resources.iter_mut() {
-        let Some((prefix, rest)) = split_instance_prefix(r.id.identity_or_empty()) else {
+        let Some(identity) = r.id.identity_str() else {
+            continue;
+        };
+        let Some((prefix, rest)) = split_instance_prefix(identity) else {
             continue;
         };
         let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix) else {
             continue;
         };
         if let Some(&target) = prefix_remap.get(&(module.to_string(), simhash)) {
+            let old_prefix = prefix.to_string();
             let new_prefix = format!("{}_{:016x}", module, target);
             let new_name = format!("{}.{}", new_prefix, rest);
             r.id.set_identity(ResourceIdentity::new(new_name));
@@ -1306,12 +1341,18 @@ pub fn reconcile_anonymous_module_instances(
             {
                 r.binding = Some(format!("{}.{}", new_prefix, binding_rest));
             }
-            if let Some(crate::resource::ModuleSource::Module { name, instance: _ }) =
-                &r.module_source
+            if let Some(crate::resource::ModuleSource::Module {
+                name,
+                instance: _,
+                scope,
+            }) = &r.module_source
             {
                 r.module_source = Some(crate::resource::ModuleSource::Module {
                     name: name.clone(),
                     instance: new_prefix.clone(),
+                    scope: scope
+                        .as_ref()
+                        .map(|scope| scope.remap_prefix(&old_prefix, &new_prefix)),
                 });
             }
         }
@@ -1336,10 +1377,10 @@ pub fn reconcile_anonymous_module_instances(
     }
 
     for composition in compositions {
-        if let Some(identity) =
-            rewrite_name_prefix(composition.id.identity_or_empty(), &prefix_remap)
-        {
-            composition.id.set_identity(ResourceIdentity::new(identity));
+        if let Some(identity) = rewrite_name_prefix(composition.id.identity_str(), &prefix_remap) {
+            composition.id = composition
+                .id
+                .instantiate_with_identity(ResourceIdentity::new(identity));
         }
         if let Some(binding) = composition.binding.as_deref()
             && let Some(rewritten) = rewrite_name_prefix(binding, &prefix_remap)
@@ -1470,11 +1511,19 @@ mod tests {
             &data_source,
             "registry_publish",
             "registry",
+            &ModuleInstanceScope::for_call(
+                "registry",
+                Some("registry_publish"),
+                "registry_publish",
+            ),
             &HashSet::from(["caller".to_string(), "target".to_string()]),
             &HashMap::new(),
         );
 
-        assert_eq!(prefixed.id.identity_or_empty(), "registry_publish.caller");
+        assert_eq!(
+            prefixed.id.identity_str().expect("resolved identity"),
+            "registry_publish.caller"
+        );
         assert_eq!(prefixed.binding.as_deref(), Some("registry_publish.caller"));
         assert_eq!(
             prefixed.dependency_bindings,
@@ -1499,6 +1548,11 @@ mod tests {
             &resource,
             "registry_publish",
             "registry",
+            &ModuleInstanceScope::for_call(
+                "registry",
+                Some("registry_publish"),
+                "registry_publish",
+            ),
             &HashSet::from(["consumer".to_string(), "target".to_string()]),
             &HashMap::new(),
         );
@@ -1524,6 +1578,11 @@ mod tests {
             &roles,
             "registry_publish",
             "registry",
+            &ModuleInstanceScope::for_call(
+                "registry",
+                Some("registry_publish"),
+                "registry_publish",
+            ),
             &intra_module_bindings,
             &HashMap::new(),
         );

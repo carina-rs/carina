@@ -601,11 +601,11 @@ impl<'a> TreeRenderContext<'a> {
                     let moved_note = self
                         .moved_origins
                         .get(id)
-                        .map(|from| format!(" (moved from: {})", from.identity_or_empty()));
+                        .map(|from| format!(" (moved from: {})", from.identity_display()));
                     if self.detail == DetailLevel::None {
                         let name_part = format_compact_name(
                             carina_core::parser::ResourceRef::Resource(r),
-                            id.identity_or_empty(),
+                            r.identity_str(),
                             parent_binding,
                         );
                         writeln!(
@@ -624,7 +624,7 @@ impl<'a> TreeRenderContext<'a> {
                             "{}{} {} {}{}",
                             line_prefix,
                             id.display_type().cyan().bold(),
-                            id.identity_or_empty().magenta().bold(),
+                            r.identity_str().magenta().bold(),
                             replace_note.magenta(),
                             moved_note.as_deref().unwrap_or("").magenta()
                         )
@@ -633,7 +633,7 @@ impl<'a> TreeRenderContext<'a> {
                 } else if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(
                         carina_core::parser::ResourceRef::Resource(r),
-                        r.id.identity_or_empty(),
+                        r.identity_str(),
                         parent_binding,
                     );
                     writeln!(
@@ -650,7 +650,7 @@ impl<'a> TreeRenderContext<'a> {
                         "{}{} {}",
                         line_prefix,
                         r.id.display_type().cyan().bold(),
-                        r.id.identity_or_empty().white().bold()
+                        r.identity_str().white().bold()
                     )
                     .unwrap();
                 }
@@ -660,11 +660,11 @@ impl<'a> TreeRenderContext<'a> {
                 let moved_note = self
                     .moved_origins
                     .get(id)
-                    .map(|from| format!(" (moved from: {})", from.identity_or_empty()));
+                    .map(|from| format!(" (moved from: {})", from.identity_display()));
                 if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(
                         carina_core::parser::ResourceRef::Resource(to),
-                        id.identity_or_empty(),
+                        to.identity_str(),
                         parent_binding,
                     );
                     writeln!(
@@ -682,7 +682,7 @@ impl<'a> TreeRenderContext<'a> {
                         "{}{} {}{}",
                         line_prefix,
                         id.display_type().cyan().bold(),
-                        id.identity_or_empty().yellow().bold(),
+                        to.identity_str().yellow().bold(),
                         moved_note.as_deref().unwrap_or("").yellow()
                     )
                     .unwrap();
@@ -695,7 +695,7 @@ impl<'a> TreeRenderContext<'a> {
                 binding,
                 ..
             } => {
-                let display_name = binding.as_deref().unwrap_or(id.identity_or_empty());
+                let display_name = binding.as_deref().unwrap_or(id.identity_str());
                 let deposed_note = if matches!(
                     generation,
                     carina_core::effect::EffectGeneration::Deposed(_)
@@ -718,7 +718,7 @@ impl<'a> TreeRenderContext<'a> {
                 if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(
                         carina_core::parser::ResourceRef::DataSource(resource),
-                        resource.id.identity_or_empty(),
+                        resource.identity_str(),
                         parent_binding,
                     );
                     writeln!(
@@ -736,7 +736,7 @@ impl<'a> TreeRenderContext<'a> {
                         "{}{} {} {}",
                         line_prefix,
                         resource.id.display_type().cyan().bold(),
-                        resource.id.identity_or_empty().cyan().bold(),
+                        resource.identity_str().cyan().bold(),
                         "(data source)".dimmed()
                     )
                     .unwrap();
@@ -755,7 +755,7 @@ impl<'a> TreeRenderContext<'a> {
                     "{}{} {} {}",
                     line_prefix,
                     id.display_type().cyan().bold(),
-                    id.identity_or_empty().cyan().bold(),
+                    id.identity_str().cyan().bold(),
                     format!("(import: {})", identifier_str).dimmed()
                 )
                 .unwrap();
@@ -771,7 +771,7 @@ impl<'a> TreeRenderContext<'a> {
                     // "state-only success looks like failure" misread
                     // even after the leading `x` glyph fix. Yellow
                     // matches the `~` symbol family and Move's row.
-                    id.identity_or_empty().yellow().bold(),
+                    id.identity_str().yellow().bold(),
                     "(remove from state)".dimmed()
                 )
                 .unwrap();
@@ -788,8 +788,8 @@ impl<'a> TreeRenderContext<'a> {
                     "{}{} {} {}",
                     line_prefix,
                     to.display_type().cyan().bold(),
-                    to.identity_or_empty().yellow().bold(),
-                    format!("(moved from: {})", from.identity_or_empty()).dimmed()
+                    to.identity_str().yellow().bold(),
+                    format!("(moved from: {})", from.identity_str()).dimmed()
                 )
                 .unwrap();
             }
@@ -2244,7 +2244,7 @@ pub fn format_effect(effect: &Effect) -> String {
             binding,
             ..
         } => {
-            let display_name = binding.as_deref().unwrap_or(id.identity_or_empty());
+            let display_name = binding.as_deref().unwrap_or(id.identity_str());
             let deposed_note = if matches!(
                 generation,
                 carina_core::effect::EffectGeneration::Deposed(_)

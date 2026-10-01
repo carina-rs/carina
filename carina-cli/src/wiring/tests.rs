@@ -11,7 +11,9 @@ use carina_core::provider::{
     BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, ProviderResult, ReadRequest,
     UpdateOutcome, UpdateRequest,
 };
-use carina_core::resource::{Directives, ResolvedResource, Resource, Value};
+use carina_core::resource::{
+    Directives, ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
+};
 use carina_core::value::canonicalize_resources_with_schemas;
 
 enum ReadBehavior {
@@ -22,6 +24,38 @@ enum ReadBehavior {
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_plan(
+    managed: &[Resource],
+    data_sources: &[carina_core::resource::DataSource],
+    provider: &dyn Provider,
+    current_states: &HashMap<ResourceId, carina_core::resource::PlanInputState>,
+    directives_map: &HashMap<ResourceId, Directives>,
+    registry: &SchemaRegistry,
+    saved_attrs: &carina_core::provider::LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
+    orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
+    wait_bindings: &[carina_core::parser::WaitBinding],
+) -> Plan {
+    let managed = ResolvedResource::collect_resolved(managed.iter().cloned()).unwrap();
+    carina_core::differ::create_plan(
+        &managed,
+        data_sources,
+        provider,
+        current_states,
+        directives_map,
+        registry,
+        saved_attrs,
+        prev_explicit,
+        orphan_dependencies,
+        wait_bindings,
+    )
+}
+
+fn test_identity(value: impl Into<String>) -> ResourceIdentity {
+    ResourceIdentity::try_from(value.into()).unwrap()
 }
 
 struct ReadWithRetryProvider {
@@ -487,7 +521,6 @@ fn test_resolve_enum_aliases_in_struct_field() {
 #[test]
 #[ignore = "requires provider binary for state normalization"]
 fn test_normalize_state_prevents_false_enum_diff() {
-    use carina_core::differ::create_plan;
     use carina_core::resource::Directives;
 
     let ctx = WiringContext::new(vec![]);
@@ -578,7 +611,6 @@ fn test_normalize_state_prevents_false_enum_diff() {
 #[test]
 #[ignore = "requires provider binary for default tags merging"]
 fn test_merge_default_tags_prevents_false_diff() {
-    use carina_core::differ::create_plan;
     use carina_core::resource::Directives;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
@@ -837,7 +869,13 @@ fn same_type_moved_block_parses_and_materializes_state() {
         &Some(state_file),
     );
 
-    assert_eq!(moved_pairs, vec![(from.clone(), to.clone())]);
+    assert_eq!(
+        moved_pairs,
+        vec![(
+            ResolvedResourceId::new(from.clone()),
+            ResolvedResourceId::new(to.clone())
+        )]
+    );
     assert!(!current_states.contains_key(&from));
     let moved = current_states
         .get(&to)
@@ -1205,12 +1243,12 @@ fn test_materialize_moved_states_warns_on_missing_from() {
     );
 }
 
-fn bucket_id(name: &str) -> ResourceId {
-    ResourceId::with_provider_identity("awscc", "s3.Bucket", name, None)
+fn bucket_id(name: &str) -> ResolvedResourceId {
+    ResolvedResourceId::with_provider_identity("awscc", "s3.Bucket", test_identity(name), None)
 }
 
 fn bucket_resource(name: &str) -> Resource {
-    Resource::with_provider("awscc", "s3.Bucket", name, None)
+    Resource::with_provider("awscc", "s3.Bucket", test_identity(name), None)
 }
 
 fn bucket_state_file(names: &[&str]) -> carina_state::state::StateFile {
@@ -1219,7 +1257,11 @@ fn bucket_state_file(names: &[&str]) -> carina_state::state::StateFile {
     let mut state_file = StateFile::new();
     for name in names {
         state_file
-            .upsert_resource(ResourceState::new("s3.Bucket", *name, "awscc"))
+            .upsert_resource(ResourceState::new(
+                "s3.Bucket",
+                test_identity(*name),
+                "awscc",
+            ))
             .expect("test state setup must be valid");
     }
     state_file
@@ -1618,7 +1660,8 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
 }
 
 fn route_table_state(binding: &str, id: &str) -> carina_state::state::ResourceState {
-    let mut state = carina_state::state::ResourceState::new("ec2.RouteTable", binding, "awscc");
+    let mut state =
+        carina_state::state::ResourceState::new("ec2.RouteTable", test_identity(binding), "awscc");
     state.binding = Some(binding.to_string());
     state
         .attributes
@@ -1631,8 +1674,11 @@ fn association_state(
     route_table_id: &str,
     subnet_id: &str,
 ) -> carina_state::state::ResourceState {
-    let mut state =
-        carina_state::state::ResourceState::new("ec2.SubnetRouteTableAssociation", name, "awscc");
+    let mut state = carina_state::state::ResourceState::new(
+        "ec2.SubnetRouteTableAssociation",
+        test_identity(name),
+        "awscc",
+    );
     state.attributes.insert(
         "route_table_id".to_string(),
         serde_json::Value::String(route_table_id.to_string()),
@@ -1647,8 +1693,12 @@ fn association_state(
 fn desired_association(name: &str, route_table_binding: &str, subnet_id: &str) -> Resource {
     use carina_core::resource::AccessPath;
 
-    let mut resource =
-        Resource::with_provider("awscc", "ec2.SubnetRouteTableAssociation", name, None);
+    let mut resource = Resource::with_provider(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        test_identity(name),
+        None,
+    );
     resource.set_attr(
         "route_table_id".to_string(),
         Value::Deferred(DeferredValue::ResourceRef {
@@ -1694,7 +1744,7 @@ fn assert_claimed_association_stays_orphaned_after_reconcile() {
         .expect("test state identities must remain unique");
 
     assert_eq!(
-        resources[0].id.identity_or_empty(),
+        resources[0].id.identity_str().expect("resolved identity"),
         desired_name,
         "claimed state entry must not be rebound to the desired resource"
     );
@@ -1778,7 +1828,7 @@ fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_s
 
     let names: Vec<_> = resources
         .iter()
-        .map(|resource| resource.id.identity_or_empty())
+        .map(|resource| resource.id.identity_str().expect("resolved identity"))
         .collect();
     assert_eq!(
         names,
@@ -1840,7 +1890,7 @@ fn test_stale_moved_block_releases_claims() {
         .expect("test state identities must remain unique");
 
     assert_eq!(
-        resources[0].id.identity_or_empty(),
+        resources[0].id.identity_str().expect("resolved identity"),
         "ec2_subnet_route_table_association_11111111",
         "stale moved block must release claims so meaning-based matching can preserve the no-op"
     );
@@ -1877,15 +1927,15 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
             addresses: MovedAddresses::new(
                 "awscc",
                 "ec2.SubnetRouteTableAssociation",
-                &old_name,
-                &desired_name,
+                test_identity(old_name.clone()),
+                test_identity(desired_name.clone()),
             ),
         });
 
         let old_id = ResourceId::with_provider_identity(
             "awscc",
             "ec2.SubnetRouteTableAssociation",
-            &old_name,
+            test_identity(old_name.clone()),
             None,
         );
         current_states.insert(old_id.clone(), State::not_found(old_id));
@@ -1904,7 +1954,11 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
     assert_eq!(
         resources
             .iter()
-            .map(|resource| resource.id.identity_or_empty().to_string())
+            .map(|resource| resource
+                .id
+                .identity_str()
+                .expect("resolved identity")
+                .to_string())
             .collect::<Vec<_>>(),
         desired_names,
         "heuristics must not re-key desired resources whose names are moved.to claims"
@@ -1919,14 +1973,14 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
     );
     assert_eq!(moved_pairs.len(), 5);
     for (idx, (from, to)) in moved_pairs.iter().enumerate() {
-        assert_eq!(from.identity_or_empty(), old_names[idx]);
-        assert_eq!(to.identity_or_empty(), desired_names[idx]);
+        assert_eq!(from.identity_str(), old_names[idx]);
+        assert_eq!(to.identity_str(), desired_names[idx]);
     }
     for name in old_names {
         let id = ResourceId::with_provider_identity(
             "awscc",
             "ec2.SubnetRouteTableAssociation",
-            name,
+            test_identity(name),
             None,
         );
         assert!(
@@ -1938,7 +1992,7 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
         let id = ResourceId::with_provider_identity(
             "awscc",
             "ec2.SubnetRouteTableAssociation",
-            name,
+            test_identity(name),
             None,
         );
         assert!(
@@ -1970,7 +2024,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
 
     fn concrete_subnet_identity(ctx: &WiringContext, providers: &[ProviderConfig]) -> String {
         let mut resources = vec![
-            Resource::with_provider("awscc", "ec2.Subnet", "", None)
+            Resource::pending_with_provider("awscc", "ec2.Subnet", None)
                 .with_attribute("vpc_id", string("vpc-old"))
                 .with_attribute("cidr_block", string("10.220.1.0/24"))
                 .with_attribute("availability_zone", string("ap-northeast-1c")),
@@ -1978,7 +2032,11 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         let canonical = canonicalize_resources_with_schemas(&mut resources, ctx.schemas());
         let errors = compute_anonymous_identifiers_with_ctx(ctx, canonical, providers);
         assert!(errors.is_empty(), "state id setup failed: {errors:?}");
-        resources[0].id.identity_or_empty().to_string()
+        resources[0]
+            .id
+            .identity_str()
+            .expect("resolved identity")
+            .to_string()
     }
 
     let source = r#"
@@ -2020,11 +2078,12 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         .with_attribute("vpc_id", serde_json::json!("vpc-old"));
     vpc_state.binding = Some("vpc".to_string());
 
-    let mut subnet_state = ResourceState::new("ec2.Subnet", &state_subnet_identity, "awscc")
-        .with_identifier("subnet-old")
-        .with_attribute("vpc_id", serde_json::json!("vpc-old"))
-        .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
-        .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
+    let mut subnet_state =
+        ResourceState::new("ec2.Subnet", test_identity(&state_subnet_identity), "awscc")
+            .with_identifier("subnet-old")
+            .with_attribute("vpc_id", serde_json::json!("vpc-old"))
+            .with_attribute("cidr_block", serde_json::json!("10.220.1.0/24"))
+            .with_attribute("availability_zone", serde_json::json!("ap-northeast-1c"));
     subnet_state.dependency_bindings.insert("vpc".to_string());
 
     let mut state_file = StateFile::new();
@@ -2177,10 +2236,14 @@ moved {{
 
         state_file
             .upsert_resource(
-                ResourceState::new("ec2.SubnetRouteTableAssociation", &old_name, "awscc")
-                    .with_identifier(format!("assoc-{idx}"))
-                    .with_attribute("route_table_id", serde_json::Value::String(route_table_id))
-                    .with_attribute("subnet_id", serde_json::Value::String(subnet_id)),
+                ResourceState::new(
+                    "ec2.SubnetRouteTableAssociation",
+                    test_identity(old_name),
+                    "awscc",
+                )
+                .with_identifier(format!("assoc-{idx}"))
+                .with_attribute("route_table_id", serde_json::Value::String(route_table_id))
+                .with_attribute("subnet_id", serde_json::Value::String(subnet_id)),
             )
             .expect("test state setup must be valid");
     }
@@ -2967,7 +3030,7 @@ fn region_provider_config(raw_region: &str) -> ProviderConfig {
 }
 
 fn anonymous_route_resource() -> Resource {
-    let mut resource = Resource::with_provider("awscc", "ec2.Route", "", None);
+    let mut resource = Resource::pending_with_provider("awscc", "ec2.Route", None);
     resource.set_attr(
         "route_table_id".to_string(),
         Value::Concrete(ConcreteValue::String("rtb-123".to_string())),
@@ -2980,10 +3043,11 @@ fn fallback_anonymous_identity_is_stable_when_dependency_bindings_are_prefixed()
     fn module_resources(dependency: &str) -> Vec<Resource> {
         let target = Resource::with_provider("mock", "iam.Role", "registry_publish.target", None)
             .with_binding("registry_publish.target");
-        let mut resource = Resource::with_provider("mock", "iam.Role", "", None);
+        let mut resource = Resource::pending_with_provider("mock", "iam.Role", None);
         resource.module_source = Some(carina_core::resource::ModuleSource::Module {
             name: "registry".to_string(),
             instance: "registry_publish".to_string(),
+            scope: None,
         });
         resource.dependency_bindings.insert(dependency.to_string());
         vec![target, resource]
@@ -3021,8 +3085,14 @@ fn compute_anonymous_identifiers_with_ctx_canonicalizes_provider_config_identity
     assert!(errors.is_empty(), "aws spelling errors: {errors:?}");
 
     assert_eq!(
-        resources_awscc[0].id.identity_or_empty(),
-        resources_aws[0].id.identity_or_empty(),
+        resources_awscc[0]
+            .id
+            .identity_str()
+            .expect("resolved identity"),
+        resources_aws[0]
+            .id
+            .identity_str()
+            .expect("resolved identity"),
         "provider config region spelling must canonicalize before anonymous hash"
     );
 }
@@ -3041,7 +3111,11 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
     let errors =
         compute_anonymous_identifiers_with_ctx(&ctx, canonical_anonymous, &providers_awscc);
     assert!(errors.is_empty(), "anonymous setup errors: {errors:?}");
-    let old_name = anonymous[0].id.identity_or_empty().to_string();
+    let old_name = anonymous[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
 
     let mut named = anonymous_route_resource();
     named.id = ResourceId::with_provider_identity("awscc", "ec2.Route", "route", None);
@@ -3050,7 +3124,11 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
 
     let mut state_file = StateFile::new();
     state_file
-        .upsert_resource(ResourceState::new("ec2.Route", &old_name, "awscc"))
+        .upsert_resource(ResourceState::new(
+            "ec2.Route",
+            test_identity(&old_name),
+            "awscc",
+        ))
         .expect("test state setup must be valid");
     let mut current_states = HashMap::new();
     let mut prev_explicit = HashMap::new();
@@ -3070,8 +3148,13 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
     assert_eq!(
         renames,
         vec![(
-            ResourceId::with_provider_identity("awscc", "ec2.Route", old_name, None),
-            named.id
+            ResolvedResourceId::with_provider_identity(
+                "awscc",
+                "ec2.Route",
+                test_identity(&old_name),
+                None,
+            ),
+            ResolvedResourceId::new(named.id)
         )],
         "provider config region spelling must canonicalize before rename simhash"
     );
@@ -3522,7 +3605,12 @@ fn deferred_replace_test_template() -> carina_core::parser::DeferredForExpressio
 
 fn deferred_replace_test_target() -> DeferredCreateTarget {
     DeferredCreateTarget {
-        id: ResourceId::with_provider_identity("aws", "__deferred_for", "validation_records", None),
+        id: ResolvedResourceId::with_provider_identity(
+            "aws",
+            "__deferred_for",
+            "validation_records",
+            None,
+        ),
         upstream_binding: "cert".to_string(),
         template: deferred_replace_test_template(),
     }
@@ -3530,12 +3618,12 @@ fn deferred_replace_test_target() -> DeferredCreateTarget {
 
 fn delete_effect_for_binding(binding: &str) -> Effect {
     Effect::Delete {
-        id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+        id: ResolvedResourceId::with_provider_identity(
             "aws",
             "route53.Record",
-            binding,
+            test_identity(binding),
             None,
-        )),
+        ),
         identifier: format!("{binding}-old-id"),
         generation: carina_core::effect::EffectGeneration::Current,
         directives: Directives::default(),
@@ -4984,16 +5072,15 @@ mod wait_until_enum_alias {
     /// plan path uses.
     #[test]
     fn create_plan_elides_already_satisfied_wait_after_enum_alias_resolution() {
-        use carina_core::differ::create_plan;
-
         let ctx = WiringContext::new(vec![Box::new(AcmAliasFactory) as Box<dyn ProviderFactory>]);
         let resources = vec![cert_resource(), changed_consumer()];
         let states = cert_state();
 
         // Bug repro: unresolved RAW enum RHS → wait wrongly emitted.
         let raw_waits = vec![enum_wait_binding()];
-        let plan_raw = create_plan(
-            &resources,
+        let resolved_resources = ResolvedResource::collect_resolved(resources.clone()).unwrap();
+        let plan_raw = carina_core::differ::create_plan(
+            &resolved_resources,
             &[],
             &carina_core::provider::ProviderRouter::new(),
             &carina_core::resource::into_plan_input_map(
@@ -5018,8 +5105,8 @@ mod wait_until_enum_alias {
         // Fixed: resolve the alias first → predicate satisfied → elided.
         let mut waits = vec![enum_wait_binding()];
         resolve_enum_aliases_in_wait_bindings(&ctx, &mut waits, &resources, &[]);
-        let plan_fixed = create_plan(
-            &resources,
+        let plan_fixed = carina_core::differ::create_plan(
+            &resolved_resources,
             &[],
             &carina_core::provider::ProviderRouter::new(),
             &carina_core::resource::into_plan_input_map(
@@ -5704,7 +5791,9 @@ mod resolved_value_constraint_gate {
         constraint: PendingModuleConstraint,
     ) -> Composition {
         Composition {
-            id: ResourceId::with_identity("_virtual", "checked"),
+            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "_virtual", "checked",
+            )),
             signature: Signature {
                 arguments: arguments
                     .into_iter()

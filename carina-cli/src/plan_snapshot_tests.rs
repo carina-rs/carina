@@ -237,7 +237,10 @@ fn non_module_anonymous_dependency_keeps_historical_fallback_identity() {
         .expect("all_create must contain the anonymous route table");
 
     assert_eq!(
-        route_table.resource_id().identity_or_empty(),
+        route_table
+            .resource_id()
+            .identity_str()
+            .expect("resolved identity"),
         "awscc_ec2_route_table_8710819e",
         "top-level dependency metadata must retain its byte-for-byte legacy hash input"
     );
@@ -283,7 +286,7 @@ fn multi_instance_create_propagates_provider_instance() {
     for effect in plan.effects() {
         let id = effect.resource_id();
         by_name.insert(
-            id.identity_or_empty().to_string(),
+            id.identity_str().expect("resolved identity").to_string(),
             id.provider_instance.clone(),
         );
     }
@@ -321,7 +324,7 @@ fn module_routed_instance_propagates_provider_instance() {
         .map(|e| {
             let id = e.resource_id();
             (
-                id.identity_or_empty().to_string(),
+                id.identity_str().expect("resolved identity").to_string(),
                 id.provider_instance.clone(),
             )
         })
@@ -2278,7 +2281,9 @@ fn snapshot_composition_folding() {
     // path so the rendered header reads
     // `module "cluster" (./modules/cluster)`.
     let cluster_site = CallSite::new(
-        EphemeralId::new(ResourceId::with_identity("_virtual", "cluster")),
+        EphemeralId::new(carina_core::resource::ResolvedResourceId::new(
+            ResourceId::with_identity("_virtual", "cluster"),
+        )),
         "./modules/cluster",
     );
     trace.record(PersistentId::new(inner_id), vec![cluster_site.clone()]);
@@ -2371,7 +2376,9 @@ fn snapshot_top_level_sigil_alignment() {
 
     let mut trace = ExpansionTrace::new();
     let cluster_site = CallSite::new(
-        EphemeralId::new(ResourceId::with_identity("_virtual", "cluster")),
+        EphemeralId::new(carina_core::resource::ResolvedResourceId::new(
+            ResourceId::with_identity("_virtual", "cluster"),
+        )),
         "./modules/cluster",
     );
     trace.record(PersistentId::new(cluster_id), vec![cluster_site]);

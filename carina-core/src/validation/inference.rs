@@ -1623,7 +1623,9 @@ mod tests {
             ),
         );
         let virt = crate::resource::Composition {
-            id: crate::resource::ResourceId::with_identity("_virtual", "github_actions_carina"),
+            id: crate::resource::ResolvedResourceId::new(
+                crate::resource::ResourceId::with_identity("_virtual", "github_actions_carina"),
+            ),
             signature: crate::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: virt_attrs,

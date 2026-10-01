@@ -41,7 +41,7 @@ use carina_core::provider::{
     ProviderResult, ReadRequest, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resolver::resolve_refs_with_state_and_remote;
-use carina_core::resource::{ConcreteValue, ResourceId, State, Value};
+use carina_core::resource::{ConcreteValue, ResolvedResource, ResourceId, State, Value};
 use carina_core::schema::SchemaRegistry;
 
 fn empty_lifted_saved_attrs() -> carina_core::provider::LiftedSavedAttrs {
@@ -268,8 +268,10 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     .expect("resolve_refs should succeed");
 
     let registry = SchemaRegistry::new();
+    let resolved_resources_for_plan =
+        ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
     let plan = create_plan(
-        &resources_for_plan,
+        &resolved_resources_for_plan,
         &[],
         &carina_core::provider::ProviderRouter::new(),
         &carina_core::resource::into_plan_input_map(
@@ -437,8 +439,10 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     .expect("resolve_refs should succeed");
 
     let registry = SchemaRegistry::new();
+    let resolved_resources_for_plan =
+        ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
     let plan = create_plan(
-        &resources_for_plan,
+        &resolved_resources_for_plan,
         &[],
         &carina_core::provider::ProviderRouter::new(),
         &carina_core::resource::into_plan_input_map(
@@ -614,8 +618,10 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
 
     // ---- The dependency edge is intact: Effect::Wait still emitted.
     let registry = SchemaRegistry::new();
+    let resolved_resources_for_plan =
+        ResolvedResource::collect_resolved(resources_for_plan.clone()).unwrap();
     let plan = create_plan(
-        &resources_for_plan,
+        &resolved_resources_for_plan,
         &[],
         &carina_core::provider::ProviderRouter::new(),
         &carina_core::resource::into_plan_input_map(

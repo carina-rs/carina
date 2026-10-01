@@ -12,7 +12,7 @@ use carina_core::parser::{File, ProviderContext, ResourceRef, UpstreamState};
 use carina_core::resource::ResourceId;
 
 use crate::error::AppError;
-use crate::wiring::check_unused_bindings;
+use crate::wiring::{WiringContext, build_factories_from_providers};
 
 #[derive(Serialize)]
 struct ValidateOutput {
@@ -253,7 +253,7 @@ fn validated_entries<E>(parsed: &File<E>) -> Vec<ValidatedEntry<'_>> {
             // by whether the id has a resolved identity.
             other => {
                 let id = other.id();
-                if id.identity.is_some() {
+                if id.identity_str().is_some() {
                     ValidatedEntry::Resolved(id)
                 } else {
                     ValidatedEntry::PendingDirect(id)
@@ -301,10 +301,14 @@ pub fn run_validate(
         println!("{}", "Validating...".cyan());
     }
 
-    let validation_errors = super::validate_and_resolve_errors(
+    let (factories, load_errors) = build_factories_from_providers(&parsed.providers, base_dir)?;
+    let ctx = WiringContext::new(factories);
+    let validation_errors = super::validate_and_resolve_errors_with_context(
         &mut parsed,
         base_dir,
         false,
+        &ctx,
+        load_errors,
         &loaded.inference_errors,
         &loaded.duplicate_declarations,
     );
@@ -316,7 +320,10 @@ pub fn run_validate(
     }
 
     // Check for unused let bindings (warnings, not errors)
-    let unused_warnings = check_unused_bindings(&loaded.unresolved_parsed);
+    let unused_warnings = carina_core::validation::check_unused_bindings_with_identity_requirements(
+        &loaded.unresolved_parsed,
+        ctx.schemas(),
+    );
 
     // Check for duplicate attribute keys
     let source_files: Vec<(PathBuf, String)> = {
@@ -532,10 +539,8 @@ mod tests {
         use carina_core::resource::Resource;
 
         let mut parsed = ParsedFile::default();
-        let mut res = Resource::new("s3.Bucket", "placeholder");
+        let mut res = Resource::pending("s3.Bucket");
         res.id.provider = "aws".to_string();
-        // Force the anonymous/not-yet-promoted state explicitly.
-        res.id.identity = None;
         parsed.resources.push(res); // allow: direct — fixture test inspection
 
         let entries = validated_entries(&parsed);
@@ -558,8 +563,10 @@ mod tests {
         use carina_core::parser::ParsedFile;
         use carina_core::resource::{Composition, ResourceId, Signature};
 
-        let composition = |instance: &str, binding: Option<&str>| Composition {
-            id: ResourceId::with_identity("_virtual", instance),
+        let composition = |instance: &'static str, binding: Option<&str>| Composition {
+            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "_virtual", instance,
+            )),
             signature: Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: indexmap::IndexMap::new(),

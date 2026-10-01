@@ -519,7 +519,7 @@ pub fn evaluate_pending_constraints(
                            actuals: Vec<(String, String)>,
                            detail: Option<String>| {
                 ModuleConstraintFailure {
-                    composition_id: composition.id.clone(),
+                    composition_id: composition.id.as_inner().clone(),
                     constraint_id: constraint.id().clone(),
                     diagnostic: ModuleConstraintDiagnostic {
                         module: composition.module_name.clone(),

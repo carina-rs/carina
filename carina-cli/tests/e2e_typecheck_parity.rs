@@ -605,15 +605,15 @@ fn region_accepts_bare_and_typequalified_forms_parity() {
     let fixture = write_fixture(&[(
         "main.crn",
         r#"
-test.r.region_holder {
+let a = test.r.region_holder {
     name = "a"
     region = ap_northeast_1
 }
-test.r.region_holder {
+let b = test.r.region_holder {
     name = "b"
     region = Region.us_west_2
 }
-test.r.region_holder {
+let c = test.r.region_holder {
     name = "c"
     region = test.Region.ap_northeast_1
 }
@@ -641,11 +641,11 @@ fn region_accepts_aws_string_form_parity() {
     let fixture = write_fixture(&[(
         "main.crn",
         r#"
-test.r.region_holder {
+let a = test.r.region_holder {
     name = "a"
     region = "ap-northeast-1"
 }
-test.r.region_holder {
+let b = test.r.region_holder {
     name = "b"
     region = "us-west-2"
 }

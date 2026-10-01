@@ -891,17 +891,18 @@ impl Effect {
     /// through the `Resolved*` checked constructors after the resolver boundary.
     /// `Wait` is keyed by the wait effect's own identity, not by its target.
     pub fn identity(&self) -> ResourceIdentity {
-        if let Effect::Wait { identity, .. } = self {
-            return identity.clone();
+        match self {
+            Effect::Read { resource } => resource.identity().clone(),
+            Effect::Create(resource) => resource.identity().clone(),
+            Effect::Update { to, .. } => to.identity().clone(),
+            Effect::Delete { id, .. }
+            | Effect::Import { id, .. }
+            | Effect::Remove { id }
+            | Effect::DeferredCreate { id, .. } => id.identity().clone(),
+            Effect::Move { to, .. } => to.identity().clone(),
+            Effect::Wait { identity, .. } => identity.clone(),
+            Effect::DeferredReplace(payload) => payload.id.identity().clone(),
         }
-        self.resource_id()
-            .identity
-            .as_ref()
-            .expect(
-                "Effect::identity is total because all scheduler-bound Effect payloads \
-                 went through the Resolved* checked constructors",
-            )
-            .clone()
     }
 
     /// Returns the exact instance generation this effect addresses.
@@ -974,7 +975,7 @@ impl Effect {
     pub fn writeback_cleanup_ids(
         &self,
         successfully_deleted: &HashSet<DeletedInstanceKey>,
-    ) -> Vec<ResourceId> {
+    ) -> Vec<ResolvedResourceId> {
         match self {
             Effect::Read { .. } => Vec::new(),
             Effect::Create(_) => Vec::new(),
@@ -989,7 +990,7 @@ impl Effect {
                     id.clone().into_inner(),
                     identifier.clone(),
                 )) {
-                    vec![id.clone().into_inner()]
+                    vec![id.clone()]
                 } else {
                     Vec::new()
                 }
@@ -999,8 +1000,8 @@ impl Effect {
                 ..
             } => Vec::new(),
             Effect::Import { .. } => Vec::new(),
-            Effect::Remove { id } => vec![id.clone().into_inner()],
-            Effect::Move { from, .. } => vec![from.clone().into_inner()],
+            Effect::Remove { id } => vec![id.clone()],
+            Effect::Move { from, .. } => vec![from.clone()],
             Effect::Wait { .. } => Vec::new(),
             Effect::DeferredCreate { .. } => Vec::new(),
             // Absorbed deletes are replacement outcomes, not ordinary
@@ -1087,7 +1088,7 @@ impl Effect {
 
     /// Bindings whose failure must prevent this effect from being dispatched.
     ///
-    /// For [`Effect::Wait`] this is `target_id.identity_or_empty()` plus the wait's
+    /// For [`Effect::Wait`] this is the target's resolved identity plus the wait's
     /// explicit dependencies, with the target binding first. For other
     /// resource-carrying variants this is value-reference bindings plus
     /// explicit dependencies. State-only effects that do not carry dependency
@@ -1102,7 +1103,7 @@ impl Effect {
                 explicit_dependencies,
                 ..
             } => {
-                let target_binding = target_id.identity_or_empty();
+                let target_binding = target_id.identity_str();
                 let mut out = Vec::with_capacity(1 + explicit_dependencies.len());
                 out.push(target_binding.to_string());
                 out.extend(

@@ -160,6 +160,7 @@ pub fn expand_to_leaves(nodes: Vec<GraphNode>) -> Vec<LeafNode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource::ResolvedResourceId;
 
     fn sample_resource() -> Resource {
         Resource::new("aws.s3.Bucket", "b")
@@ -173,7 +174,7 @@ mod tests {
         use indexmap::IndexMap;
         use std::collections::{BTreeSet, HashSet};
         Composition {
-            id: ResourceId::with_identity("_virtual", "m"),
+            id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "m")),
             signature: super::super::Signature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),
