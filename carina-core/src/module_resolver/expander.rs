@@ -11,7 +11,8 @@ use crate::parser::{
 };
 use crate::resource::{
     Composition, CompositionCall, CompositionProvenance, ConcreteValue, DataSource, DeferredValue,
-    Resource, ResourceId, ResourceIdentity, ResourceIdentityState, Value,
+    ModuleInstanceScope, ModuleSource, Resource, ResourceId, ResourceIdentity,
+    ResourceIdentityState, Value,
 };
 
 use super::error::ModuleError;
@@ -247,6 +248,11 @@ impl ModuleResolver<'_> {
             // that exact binding must gain the new outer prefix as well.
             .chain(module.compositions.iter().filter_map(|c| c.binding.clone()))
             .collect();
+        let module_instance_scope = ModuleInstanceScope::for_call(
+            &call.module_name,
+            call.binding_name.as_deref(),
+            instance_prefix,
+        );
 
         // Expand managed resources with substituted values.
         let mut resources: Vec<Resource> = Vec::new();
@@ -255,6 +261,7 @@ impl ModuleResolver<'_> {
                 resource,
                 instance_prefix,
                 &call.module_name,
+                &module_instance_scope,
                 &intra_module_bindings,
                 &argument_values,
             ));
@@ -267,6 +274,7 @@ impl ModuleResolver<'_> {
                 data_source,
                 instance_prefix,
                 &call.module_name,
+                &module_instance_scope,
                 &intra_module_bindings,
                 &argument_values,
             ));
@@ -421,6 +429,7 @@ impl ModuleResolver<'_> {
                     d,
                     instance_prefix,
                     &call.module_name,
+                    &module_instance_scope,
                     &intra_module_bindings,
                     &argument_values,
                 )
@@ -692,6 +701,7 @@ fn prefix_module_resource(
     resource: &Resource,
     instance_prefix: &str,
     module_name: &str,
+    module_instance_scope: &ModuleInstanceScope,
     intra_module_bindings: &HashSet<String>,
     argument_values: &HashMap<String, Value>,
 ) -> Resource {
@@ -715,10 +725,17 @@ fn prefix_module_resource(
         intra_module_bindings,
     );
 
-    new_resource.module_source = Some(crate::resource::ModuleSource::Module {
-        name: module_name.to_string(),
-        instance: instance_prefix.to_string(),
-    });
+    let scope = new_resource
+        .module_source
+        .as_ref()
+        .and_then(ModuleSource::identity_scope)
+        .map(|child| module_instance_scope.with_child(&child))
+        .unwrap_or_else(|| module_instance_scope.clone());
+    new_resource.module_source = Some(ModuleSource::expanded_module(
+        module_name,
+        instance_prefix,
+        scope,
+    ));
 
     // `IndexMap` preserves authored attribute order across expansion
     // (#2222); each value goes through the shared `prefix_attr_value`.
@@ -748,6 +765,7 @@ fn prefix_module_data_source(
     data_source: &DataSource,
     instance_prefix: &str,
     module_name: &str,
+    module_instance_scope: &ModuleInstanceScope,
     intra_module_bindings: &HashSet<String>,
     argument_values: &HashMap<String, Value>,
 ) -> DataSource {
@@ -767,10 +785,17 @@ fn prefix_module_data_source(
         intra_module_bindings,
     );
 
-    new_data_source.module_source = Some(crate::resource::ModuleSource::Module {
-        name: module_name.to_string(),
-        instance: instance_prefix.to_string(),
-    });
+    let scope = new_data_source
+        .module_source
+        .as_ref()
+        .and_then(ModuleSource::identity_scope)
+        .map(|child| module_instance_scope.with_child(&child))
+        .unwrap_or_else(|| module_instance_scope.clone());
+    new_data_source.module_source = Some(ModuleSource::expanded_module(
+        module_name,
+        instance_prefix,
+        scope,
+    ));
 
     let mut substituted_attrs: IndexMap<String, Value> = IndexMap::new();
     for (key, expr) in &new_data_source.attributes {
@@ -891,6 +916,7 @@ fn prefix_deferred_for_expression(
     d: &DeferredForExpression,
     instance_prefix: &str,
     module_name: &str,
+    module_instance_scope: &ModuleInstanceScope,
     intra_module_bindings: &HashSet<String>,
     argument_values: &HashMap<String, Value>,
 ) -> DeferredForExpression {
@@ -968,6 +994,7 @@ fn prefix_deferred_for_expression(
             template_resource,
             instance_prefix,
             module_name,
+            module_instance_scope,
             intra_module_bindings,
             argument_values,
         ),
@@ -1305,6 +1332,7 @@ pub fn reconcile_anonymous_module_instances(
             continue;
         };
         if let Some(&target) = prefix_remap.get(&(module.to_string(), simhash)) {
+            let old_prefix = prefix.to_string();
             let new_prefix = format!("{}_{:016x}", module, target);
             let new_name = format!("{}.{}", new_prefix, rest);
             r.id.set_identity(ResourceIdentity::new(new_name));
@@ -1313,12 +1341,18 @@ pub fn reconcile_anonymous_module_instances(
             {
                 r.binding = Some(format!("{}.{}", new_prefix, binding_rest));
             }
-            if let Some(crate::resource::ModuleSource::Module { name, instance: _ }) =
-                &r.module_source
+            if let Some(crate::resource::ModuleSource::Module {
+                name,
+                instance: _,
+                scope,
+            }) = &r.module_source
             {
                 r.module_source = Some(crate::resource::ModuleSource::Module {
                     name: name.clone(),
                     instance: new_prefix.clone(),
+                    scope: scope
+                        .as_ref()
+                        .map(|scope| scope.remap_prefix(&old_prefix, &new_prefix)),
                 });
             }
         }
@@ -1477,6 +1511,11 @@ mod tests {
             &data_source,
             "registry_publish",
             "registry",
+            &ModuleInstanceScope::for_call(
+                "registry",
+                Some("registry_publish"),
+                "registry_publish",
+            ),
             &HashSet::from(["caller".to_string(), "target".to_string()]),
             &HashMap::new(),
         );
@@ -1509,6 +1548,11 @@ mod tests {
             &resource,
             "registry_publish",
             "registry",
+            &ModuleInstanceScope::for_call(
+                "registry",
+                Some("registry_publish"),
+                "registry_publish",
+            ),
             &HashSet::from(["consumer".to_string(), "target".to_string()]),
             &HashMap::new(),
         );
@@ -1534,6 +1578,11 @@ mod tests {
             &roles,
             "registry_publish",
             "registry",
+            &ModuleInstanceScope::for_call(
+                "registry",
+                Some("registry_publish"),
+                "registry_publish",
+            ),
             &intra_module_bindings,
             &HashMap::new(),
         );

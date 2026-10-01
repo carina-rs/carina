@@ -273,6 +273,64 @@ fn identity_attribute_prefix_values_produce_distinct_stable_identifiers() {
 }
 
 #[test]
+fn unresolved_identity_prefix_values_produce_distinct_stable_identifiers() {
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).identity());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+    let mut alpha = Resource::pending_with_provider("mock", "test.resource", None);
+    alpha.set_attr(
+        "immutable_name_prefix".to_string(),
+        Value::Concrete(ConcreteValue::String("alpha-".to_string())),
+    );
+    let mut beta = Resource::pending_with_provider("mock", "test.resource", None);
+    beta.set_attr(
+        "immutable_name_prefix".to_string(),
+        Value::Concrete(ConcreteValue::String("beta-".to_string())),
+    );
+    let mut resources = vec![alpha, beta];
+
+    let result =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new());
+
+    assert!(
+        result.is_ok(),
+        "unresolved prefix inputs must be hashed: {result:?}"
+    );
+    assert_ne!(resources[0].id, resources[1].id);
+}
+
+#[test]
+fn unresolved_and_resolved_prefix_forms_hash_to_the_same_identity() {
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).identity());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+    let mut unresolved = Resource::pending_with_provider("mock", "test.resource", None);
+    unresolved.set_attr(
+        "immutable_name_prefix".to_string(),
+        Value::Concrete(ConcreteValue::String("same-".to_string())),
+    );
+    let mut resolved = Resource::pending_with_provider("mock", "test.resource", None);
+    resolved
+        .prefixes
+        .insert("immutable_name".to_string(), "same-".to_string());
+
+    let mut unresolved_resources = vec![unresolved];
+    let mut resolved_resources = vec![resolved];
+    compute_anonymous_identifiers_for_test(&mut unresolved_resources, &[], &registry, &|_| {
+        Vec::new()
+    })
+    .expect("unresolved prefix identity");
+    compute_anonymous_identifiers_for_test(&mut resolved_resources, &[], &registry, &|_| {
+        Vec::new()
+    })
+    .expect("resolved prefix identity");
+
+    assert_eq!(unresolved_resources[0].id, resolved_resources[0].id);
+}
+
+#[test]
 fn check_rejects_multiple_attribute_derived_anonymous_resources_in_one_kind() {
     let resources = vec![
         Resource::pending_with_provider("mock", "test.resource", None),
@@ -286,10 +344,22 @@ fn check_rejects_multiple_attribute_derived_anonymous_resources_in_one_kind() {
     assert_eq!(
         conflicts[0].to_string(),
         "Anonymous resource identity is derived from mutable attributes for multiple \
-         'mock.test.resource' declarations in the same scope (provider instance '<default>', \
-         module instance '<root>'): declaration #1 'mock.test.resource', declaration #2 \
-         'mock.test.resource'. Use `let` bindings to give them distinct stable identities."
+         'mock.test.resource' declarations using provider instance '<default>' in the root scope. \
+         Use `let` bindings to give them distinct stable identities."
     );
+}
+
+#[test]
+fn check_keeps_default_and_named_provider_instances_in_separate_scopes() {
+    let resources = vec![
+        Resource::pending_with_provider("mock", "test.resource", None),
+        Resource::pending_with_provider("mock", "test.resource", Some("west".to_string())),
+    ];
+
+    let conflicts =
+        check_attribute_derived_anonymous_resource_conflicts(&resources, &SchemaRegistry::new());
+
+    assert!(conflicts.is_empty(), "unexpected conflicts: {conflicts:?}");
 }
 
 #[test]
@@ -1347,6 +1417,7 @@ fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
     r.module_source = Some(ModuleSource::Module {
         name: "github_oidc".to_string(),
         instance: "bootstrap".to_string(),
+        scope: None,
     });
 
     let mut resources = vec![r];
@@ -1816,6 +1887,7 @@ fn route_with_deferred_route_table(name: &'static str, route_table_binding: &str
     resource.module_source = Some(ModuleSource::Module {
         name: "mymod".to_string(),
         instance: "inst".to_string(),
+        scope: None,
     });
     resource.set_attr(
         "route_table_id".to_string(),

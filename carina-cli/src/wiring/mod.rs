@@ -832,7 +832,6 @@ pub(crate) fn adopt_unique_state_identity_for_unresolved_anonymous(
             .resources_by_type(&resource.id.provider, &resource.id.resource_type)
             .into_iter()
             .filter(|state| state.directives.provider_instance == resource.id.provider_instance)
-            .filter(|state| module_instance_owns_identity(resource, &state.identity))
             .filter(|state| {
                 !claimed_state_identities
                     .get(&kind)
@@ -848,19 +847,6 @@ pub(crate) fn adopt_unique_state_identity_for_unresolved_anonymous(
             .entry(kind)
             .or_default()
             .insert(state.identity.clone());
-    }
-}
-
-fn module_instance_owns_identity(resource: &Resource, identity: &ResourceIdentity) -> bool {
-    let identity_instance = identity
-        .as_str()
-        .rsplit_once('.')
-        .map(|(instance, _)| instance);
-    match &resource.module_source {
-        Some(carina_core::resource::ModuleSource::Module { instance, .. }) => {
-            identity_instance == Some(instance.as_str())
-        }
-        Some(carina_core::resource::ModuleSource::Root) | None => identity_instance.is_none(),
     }
 }
 
@@ -961,6 +947,11 @@ pub(crate) fn reconcile_late_anonymous_identities(
         inputs.resources.resources_mut(),
         inputs.data_sources,
     );
+    // Every pending identity is now assigned. Validate the resolved-key
+    // invariant at this seam so two separately scoped module leaves that map
+    // to the same state-visible identity return the existing typed error
+    // instead of reaching map construction or execution as duplicates.
+    inputs.resources.unresolved_by_resolved_id()?;
     for (from, to) in &fallback_renames {
         if let Some(mut state) = inputs.current_states.remove(from) {
             inputs.current_states.entry(to.clone()).or_insert_with(|| {

@@ -2045,6 +2045,7 @@ fn resource_module_source_typed_field() {
         Resource::new("ec2.SecurityGroup", "web_sg").with_module_source(ModuleSource::Module {
             name: "web_tier".to_string(),
             instance: "web".to_string(),
+            scope: None,
         });
 
     // Module source info should be in the typed field
@@ -2053,6 +2054,7 @@ fn resource_module_source_typed_field() {
         Some(ModuleSource::Module {
             name: "web_tier".to_string(),
             instance: "web".to_string(),
+            scope: None,
         })
     );
 

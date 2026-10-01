@@ -228,6 +228,7 @@ fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
         Some(crate::resource::ModuleSource::Module {
             name: "policy_module".to_string(),
             instance: "bootstrap".to_string(),
+            scope: None,
         }),
         "module_source must be set so compute_anonymous_identifiers can prepend \
          the instance prefix when the Pending name is bound"
@@ -322,6 +323,7 @@ fn test_expand_module_call() {
         Some(crate::resource::ModuleSource::Module {
             name: "test_module".to_string(),
             instance: "my_instance".to_string(),
+            scope: None,
         })
     );
     // Module info should NOT be in attributes
@@ -470,6 +472,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
         module_source: Some(crate::resource::ModuleSource::Module {
             name: "thing".to_string(),
             instance: current_prefix.clone(),
+            scope: None,
         }),
         quoted_string_attrs: std::collections::HashSet::new(),
     }];

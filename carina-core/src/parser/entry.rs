@@ -57,6 +57,18 @@ pub struct TopLevelBlockSourceSpan {
     pub end_column: usize,
 }
 
+/// Parser-backed source location of a top-level anonymous resource block.
+///
+/// The provider/type split mirrors [`crate::resource::ResourceId`]. Collecting
+/// this from pest pairs keeps comments, let-bound resources, and resources
+/// nested in `for` expressions out of editor diagnostic anchoring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnonymousResourceSourceSpan {
+    pub provider: String,
+    pub resource_type: String,
+    pub span: TopLevelBlockSourceSpan,
+}
+
 impl<'a> BindingSeed<'a> {
     pub(crate) fn value(name: &'a str, value: &'a Value) -> Self {
         Self {
@@ -161,6 +173,64 @@ pub fn top_level_upstream_state_spans(
         }
         pair_contains_rule(statement, Rule::upstream_state_expr).then_some("let")
     })
+}
+
+/// Return type-name spans for authored top-level anonymous resources.
+pub fn top_level_anonymous_resource_spans(
+    input: &str,
+) -> Result<Vec<AnonymousResourceSourceSpan>, ParseError> {
+    let preprocess_result =
+        crate::heredoc::preprocess_heredocs(input).map_err(|e| ParseError::InvalidExpression {
+            line: 0,
+            message: e.to_string(),
+        })?;
+    let pairs = CarinaParser::parse(Rule::file, &preprocess_result.source)
+        .map_err(|e| map_pest_error_lines(e, &preprocess_result.line_map))?;
+    let mut spans = Vec::new();
+
+    for pair in pairs {
+        if pair.as_rule() != Rule::file {
+            continue;
+        }
+        for statement in pair
+            .into_inner()
+            .filter(|pair| pair.as_rule() == Rule::statement)
+        {
+            let block = statement
+                .into_inner()
+                .next()
+                .ok_or_else(|| ParseError::InternalError {
+                    expected: "top-level statement body".to_string(),
+                    context: "anonymous resource source span collection".to_string(),
+                })?;
+            if block.as_rule() != Rule::anonymous_resource {
+                continue;
+            }
+            let type_pair = block
+                .into_inner()
+                .next()
+                .ok_or_else(|| ParseError::InternalError {
+                    expected: "anonymous resource type".to_string(),
+                    context: "anonymous resource source span collection".to_string(),
+                })?;
+            let full_type = type_pair.as_str();
+            let Some((provider, resource_type)) = full_type.split_once('.') else {
+                continue;
+            };
+            let (preprocessed_line, start_column) = type_pair.as_span().start_pos().line_col();
+            spans.push(AnonymousResourceSourceSpan {
+                provider: provider.to_string(),
+                resource_type: resource_type.to_string(),
+                span: TopLevelBlockSourceSpan {
+                    start_line: original_line(preprocessed_line, &preprocess_result.line_map),
+                    start_column,
+                    end_column: start_column + full_type.chars().count(),
+                },
+            });
+        }
+    }
+
+    Ok(spans)
 }
 
 fn top_level_block_spans(

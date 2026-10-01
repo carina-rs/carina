@@ -736,17 +736,19 @@ impl ModularPlan {
                 ModuleSource::Module {
                     name: n1,
                     instance: i1,
+                    ..
                 },
                 ModuleSource::Module {
                     name: n2,
                     instance: i2,
+                    ..
                 },
             ) => (n1, i1).cmp(&(n2, i2)),
             _ => std::cmp::Ordering::Equal,
         });
 
         for source in module_sources {
-            if let ModuleSource::Module { name, instance } = &source {
+            if let ModuleSource::Module { name, instance, .. } = &source {
                 output.push_str(&format!("Module: {} (instance: {})\n", name, instance));
 
                 if let Some(indices) = groups.get(&source) {
@@ -1186,6 +1188,7 @@ mod tests {
             Resource::new("security_group", "web_sg").with_module_source(ModuleSource::Module {
                 name: "web_tier".to_string(),
                 instance: "web".to_string(),
+                scope: None,
             });
         plan.add(Effect::Create(resolved(module_resource)));
 
@@ -1196,7 +1199,8 @@ mod tests {
             modular.source_of(1),
             &ModuleSource::Module {
                 name: "web_tier".to_string(),
-                instance: "web".to_string()
+                instance: "web".to_string(),
+                scope: None,
             }
         );
     }
@@ -1214,6 +1218,7 @@ mod tests {
             Resource::new("security_group", "web_sg").with_module_source(ModuleSource::Module {
                 name: "web_tier".to_string(),
                 instance: "web".to_string(),
+                scope: None,
             });
         plan.add(Effect::Create(resolved(module_resource)));
 

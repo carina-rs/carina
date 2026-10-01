@@ -2763,8 +2763,94 @@ pub struct Directives {
     pub provider_instance: Option<String>,
 }
 
-/// Source of a resource (root or from a module)
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// The full expansion scope of a module-owned resource.
+///
+/// `key` is an internal, collision-resistant path used only when grouping
+/// anonymous resources for identity validation. `display` retains the
+/// authored call form so diagnostics never expose synthetic instance hashes.
+#[derive(Debug, Clone)]
+pub struct ModuleInstanceScope {
+    key: String,
+    display: ModuleInstanceScopeDisplay,
+}
+
+#[derive(Debug, Clone)]
+enum ModuleInstanceScopeDisplay {
+    Bound(String),
+    Anonymous(String),
+}
+
+impl ModuleInstanceScope {
+    pub(crate) fn for_call(
+        module_name: &str,
+        binding: Option<&str>,
+        instance_prefix: &str,
+    ) -> Self {
+        let display = match binding {
+            Some(binding) => ModuleInstanceScopeDisplay::Bound(binding.to_string()),
+            None => ModuleInstanceScopeDisplay::Anonymous(module_name.to_string()),
+        };
+        Self {
+            key: instance_prefix.to_string(),
+            display,
+        }
+    }
+
+    fn bound(instance: &str) -> Self {
+        Self {
+            key: instance.to_string(),
+            display: ModuleInstanceScopeDisplay::Bound(instance.to_string()),
+        }
+    }
+
+    pub(crate) fn with_child(&self, child: &Self) -> Self {
+        let display = match (&self.display, &child.display) {
+            (
+                ModuleInstanceScopeDisplay::Bound(parent),
+                ModuleInstanceScopeDisplay::Bound(child),
+            ) => ModuleInstanceScopeDisplay::Bound(format!("{parent}.{child}")),
+            (_, child) => child.clone(),
+        };
+        Self {
+            key: format!("{}.{}", self.key, child.key),
+            display,
+        }
+    }
+
+    pub(crate) fn remap_prefix(&self, from: &str, to: &str) -> Self {
+        let key = if self.key == from {
+            to.to_string()
+        } else if let Some(rest) = self.key.strip_prefix(&format!("{from}.")) {
+            format!("{to}.{rest}")
+        } else {
+            self.key.clone()
+        };
+        Self {
+            key,
+            display: self.display.clone(),
+        }
+    }
+
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub(crate) fn description(&self) -> String {
+        match &self.display {
+            ModuleInstanceScopeDisplay::Bound(path) => format!("module instance '{path}'"),
+            ModuleInstanceScopeDisplay::Anonymous(module_name) => {
+                format!("an anonymous call of module '{module_name}'")
+            }
+        }
+    }
+}
+
+/// Source of a resource (root or from a module).
+///
+/// `scope` is validation-only expansion provenance. It is excluded from
+/// serialization and from this type's equality/hash semantics so adding the
+/// full nested path changes only anonymous-identity conflict grouping.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ModuleSource {
     /// Resource defined at the root level
     Root,
@@ -2774,7 +2860,49 @@ pub enum ModuleSource {
         name: String,
         /// Instance binding name (e.g., "web")
         instance: String,
+        /// Full nested instance path plus its authored diagnostic form.
+        #[serde(skip)]
+        scope: Option<ModuleInstanceScope>,
     },
+}
+
+impl PartialEq for ModuleSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Root, Self::Root) => true,
+            (
+                Self::Module {
+                    name: left_name,
+                    instance: left_instance,
+                    ..
+                },
+                Self::Module {
+                    name: right_name,
+                    instance: right_instance,
+                    ..
+                },
+            ) => left_name == right_name && left_instance == right_instance,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ModuleSource {}
+
+impl Hash for ModuleSource {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Match the discriminant hashing emitted by the former derived `Hash`
+        // implementation byte-for-byte; fallback anonymous identities include
+        // `ModuleSource` in their input and therefore depend on this detail.
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Root => {}
+            Self::Module { name, instance, .. } => {
+                name.hash(state);
+                instance.hash(state);
+            }
+        }
+    }
 }
 
 impl ModuleSource {
@@ -2783,6 +2911,32 @@ impl ModuleSource {
         Self::Module {
             name: name.into(),
             instance: instance.into(),
+            scope: None,
+        }
+    }
+
+    pub(crate) fn expanded_module(
+        name: impl Into<String>,
+        instance: impl Into<String>,
+        scope: ModuleInstanceScope,
+    ) -> Self {
+        Self::Module {
+            name: name.into(),
+            instance: instance.into(),
+            scope: Some(scope),
+        }
+    }
+
+    pub(crate) fn identity_scope(&self) -> Option<ModuleInstanceScope> {
+        match self {
+            Self::Root => None,
+            Self::Module {
+                instance, scope, ..
+            } => Some(
+                scope
+                    .clone()
+                    .unwrap_or_else(|| ModuleInstanceScope::bound(instance)),
+            ),
         }
     }
 

@@ -11,7 +11,7 @@ use crate::parser::StateBlockAddress;
 use crate::resource::{
     ConcreteValue, DeferredValue, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
 };
-use crate::schema::SchemaRegistry;
+use crate::schema::{ResourceSchema, SchemaRegistry};
 use crate::validation::is_string_compatible_type;
 use crate::value::CanonicalizedProviderConfigs;
 
@@ -76,6 +76,50 @@ pub enum AnonymousIdentityBasis {
     AttributeDerived,
 }
 
+/// Return the immutable schema inputs that participate in an anonymous
+/// resource's standard identity hash.
+///
+/// This is the single definition of both "stable identity basis" and the
+/// bytes hashed for that basis. An unresolved `<attribute>_prefix` is treated
+/// identically to the same prefix after [`resolve_attr_prefixes`] moves it into
+/// [`Resource::prefixes`].
+fn stable_anonymous_hash_inputs(
+    resource: &Resource,
+    schema: &ResourceSchema,
+) -> BTreeMap<String, String> {
+    let mut inputs = BTreeMap::new();
+    for attribute in schema
+        .create_only_attributes()
+        .into_iter()
+        .chain(schema.identity_attributes())
+    {
+        if inputs.contains_key(attribute) {
+            continue;
+        }
+
+        let hash_value = if let Some(prefix) = resource.prefixes.get(attribute) {
+            Some(format!("Prefix({prefix:?})"))
+        } else {
+            let unresolved_prefix = format!("{attribute}_prefix");
+            resource
+                .attributes
+                .get(&unresolved_prefix)
+                .map(|value| match value {
+                    Value::Concrete(ConcreteValue::String(prefix)) => {
+                        format!("Prefix({prefix:?})")
+                    }
+                    value => format!("Prefix({})", deterministic_value_string(value)),
+                })
+                .or_else(|| resource.get_attr(attribute).map(deterministic_value_string))
+        };
+
+        if let Some(hash_value) = hash_value {
+            inputs.insert(attribute.to_string(), hash_value);
+        }
+    }
+    inputs
+}
+
 /// Classify the identity basis for an anonymous resource.
 ///
 /// Presence is what matters here, not whether a value is concrete yet. A
@@ -89,43 +133,65 @@ pub fn classify_anonymous_identity_basis(
         return AnonymousIdentityBasis::AttributeDerived;
     };
 
-    let has_stable_input = schema
-        .create_only_attributes()
-        .into_iter()
-        .chain(schema.identity_attributes())
-        .any(|attribute| {
-            let unresolved_prefix = format!("{attribute}_prefix");
-            resource.attributes.contains_key(attribute)
-                || resource.attributes.contains_key(&unresolved_prefix)
-                || resource.prefixes.contains_key(attribute)
-        });
-
-    if has_stable_input {
-        AnonymousIdentityBasis::Stable
-    } else {
+    if stable_anonymous_hash_inputs(resource, schema).is_empty() {
         AnonymousIdentityBasis::AttributeDerived
+    } else {
+        AnonymousIdentityBasis::Stable
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone)]
 struct AnonymousResourceKind {
     provider: String,
     resource_type: String,
     provider_instance: Option<String>,
-    module_instance: Option<String>,
+    module_scope_key: Option<String>,
+    module_scope_description: Option<String>,
+}
+
+impl PartialEq for AnonymousResourceKind {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for AnonymousResourceKind {}
+
+impl PartialOrd for AnonymousResourceKind {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AnonymousResourceKind {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            &self.provider,
+            &self.resource_type,
+            &self.provider_instance,
+            &self.module_scope_key,
+        )
+            .cmp(&(
+                &other.provider,
+                &other.resource_type,
+                &other.provider_instance,
+                &other.module_scope_key,
+            ))
+    }
 }
 
 impl AnonymousResourceKind {
     fn of(resource: &Resource) -> Self {
-        let module_instance = match &resource.module_source {
-            Some(crate::resource::ModuleSource::Module { instance, .. }) => Some(instance.clone()),
-            Some(crate::resource::ModuleSource::Root) | None => None,
-        };
+        let module_scope = resource
+            .module_source
+            .as_ref()
+            .and_then(crate::resource::ModuleSource::identity_scope);
         Self {
             provider: resource.id.provider.clone(),
             resource_type: resource.id.resource_type.clone(),
             provider_instance: resource.id.provider_instance.clone(),
-            module_instance,
+            module_scope_key: module_scope.as_ref().map(|scope| scope.key().to_string()),
+            module_scope_description: module_scope.map(|scope| scope.description()),
         }
     }
 
@@ -143,7 +209,6 @@ impl AnonymousResourceKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeDerivedAnonymousResourceConflict {
     kind: AnonymousResourceKind,
-    declaration_count: usize,
 }
 
 impl AttributeDerivedAnonymousResourceConflict {
@@ -166,20 +231,17 @@ impl std::fmt::Display for AttributeDerivedAnonymousResourceConflict {
             .provider_instance
             .as_deref()
             .unwrap_or("<default>");
-        let module_instance = self.kind.module_instance.as_deref().unwrap_or("<root>");
+        let scope = self
+            .kind
+            .module_scope_description
+            .as_deref()
+            .unwrap_or("the root scope");
         write!(
             f,
             "Anonymous resource identity is derived from mutable attributes for multiple \
-             '{display_type}' declarations in the same scope (provider instance \
-             '{provider_instance}', module instance '{module_instance}'): "
-        )?;
-        for declaration in 1..=self.declaration_count {
-            if declaration > 1 {
-                f.write_str(", ")?;
-            }
-            write!(f, "declaration #{declaration} '{display_type}'")?;
-        }
-        f.write_str(". Use `let` bindings to give them distinct stable identities.")
+             '{display_type}' declarations using provider instance '{provider_instance}' in \
+             {scope}. Use `let` bindings to give them distinct stable identities."
+        )
     }
 }
 
@@ -208,10 +270,7 @@ pub fn check_attribute_derived_anonymous_resource_conflicts(
     counts
         .into_iter()
         .filter_map(|(kind, declaration_count)| {
-            (declaration_count >= 2).then_some(AttributeDerivedAnonymousResourceConflict {
-                kind,
-                declaration_count,
-            })
+            (declaration_count >= 2).then_some(AttributeDerivedAnonymousResourceConflict { kind })
         })
         .collect()
 }
@@ -727,7 +786,6 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), String> {
-    use std::collections::BTreeMap;
     use std::hash::{Hash, Hasher};
 
     // First pass: compute identifiers and detect collisions
@@ -748,9 +806,6 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
             continue;
         };
 
-        let create_only_attrs = schema.create_only_attributes();
-        let schema_identity_attrs = schema.identity_attributes();
-
         // Collect identity attribute values (e.g., region) from provider config
         let mut identity_values: BTreeMap<String, String> = BTreeMap::new();
         let identity_attrs = identity_attributes_fn(provider_name);
@@ -766,38 +821,8 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
             }
         }
 
-        // Collect create-only values in sorted order for deterministic hashing.
-        // If no create-only properties exist or none are set, fall back to
-        // all user-specified attributes.
-        //
-        // For prefixed attributes (e.g., bucket_name_prefix -> bucket_name),
-        // hash the prefix value instead of the randomly generated name.
-        // This ensures the anonymous identifier is stable across runs.
-        let mut hash_values: BTreeMap<&str, String> = BTreeMap::new();
-        for attr_name in &create_only_attrs {
-            if let Some(prefix) = resource.prefixes.get(*attr_name) {
-                // Use the prefix for hashing to produce a stable identifier
-                hash_values.insert(attr_name, format!("Prefix({:?})", prefix));
-            } else if let Some(value) = resource.get_attr(attr_name) {
-                hash_values.insert(attr_name, deterministic_value_string(value));
-            }
-        }
-        // Also include schema-level identity attributes in the hash.
-        // These distinguish resources that share create-only values but differ
-        // in other key attributes (e.g., Route 53 RecordSet `type`).
-        for attr_name in &schema_identity_attrs {
-            if hash_values.contains_key(attr_name) {
-                continue;
-            }
-            if let Some(prefix) = resource.prefixes.get(*attr_name) {
-                hash_values.insert(attr_name, format!("Prefix({prefix:?})"));
-            } else if let Some(value) = resource.get_attr(attr_name) {
-                hash_values.insert(attr_name, deterministic_value_string(value));
-            }
-        }
-
-        let use_simhash = classify_anonymous_identity_basis(resource, registry)
-            == AnonymousIdentityBasis::AttributeDerived;
+        let hash_values = stable_anonymous_hash_inputs(resource, schema);
+        let use_simhash = hash_values.is_empty();
 
         let hash_str = if use_simhash {
             // Use SimHash for locality-sensitive hashing: similar inputs produce

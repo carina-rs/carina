@@ -1,6 +1,6 @@
 //! Semantic checks: provider region, module calls, unused bindings, undefined references.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
@@ -73,28 +73,6 @@ fn composition_call_matches(
         }
         _ => false,
     }
-}
-
-fn resource_type_occurrence(
-    text: &str,
-    pattern: &str,
-    wanted_occurrence: usize,
-) -> Option<(u32, u32)> {
-    text.lines()
-        .enumerate()
-        .filter_map(|(line_index, line)| {
-            let byte_position = line.find(pattern)?;
-            line[byte_position + pattern.len()..]
-                .trim_start()
-                .starts_with('{')
-                .then(|| {
-                    (
-                        line_index as u32,
-                        position::byte_offset_to_char_offset(line, byte_position),
-                    )
-                })
-        })
-        .nth(wanted_occurrence)
 }
 
 /// Locate the `source = '<expected>'` or `source = "<expected>"` line inside
@@ -257,18 +235,40 @@ impl DiagnosticEngine {
             return Vec::new();
         }
 
-        let text = doc.text();
-        let mut occurrences = HashMap::<(String, String), usize>::new();
+        let Ok(authored_spans) =
+            carina_core::parser::top_level_anonymous_resource_spans(&doc.text())
+        else {
+            return Vec::new();
+        };
+        let mut spans_by_kind = HashMap::<(String, String), VecDeque<_>>::new();
+        for authored in authored_spans {
+            spans_by_kind
+                .entry((authored.provider, authored.resource_type))
+                .or_default()
+                .push_back(authored.span);
+        }
+
         let mut diagnostics = Vec::new();
-        for resource in &current_file.resources {
-            let occurrence = occurrences
-                .entry((
-                    resource.id.provider.clone(),
-                    resource.id.resource_type.clone(),
-                ))
-                .or_default();
-            let current_occurrence = *occurrence;
-            *occurrence += 1;
+        for resource in current_file
+            .resources
+            .iter()
+            .filter(|resource| resource.binding.is_none())
+        {
+            let key = (
+                resource.id.provider.clone(),
+                resource.id.resource_type.clone(),
+            );
+            let Some(span) = spans_by_kind.get_mut(&key).and_then(VecDeque::pop_front) else {
+                continue;
+            };
+
+            // The general schema diagnostic below is the actionable error in
+            // this situation. Without a schema, LSP cannot truthfully classify
+            // the resource's identity basis even though CLI intentionally
+            // treats genuinely schema-less providers as attribute-derived.
+            if self.schemas.get_for(resource).is_none() {
+                continue;
+            }
 
             let Some(conflict) = conflicts
                 .iter()
@@ -276,19 +276,12 @@ impl DiagnosticEngine {
             else {
                 continue;
             };
-            let pattern = if resource.id.provider.is_empty() {
-                resource.id.resource_type.clone()
-            } else {
-                format!("{}.{}", resource.id.provider, resource.id.resource_type)
-            };
-            let Some((line, col)) = resource_type_occurrence(&text, &pattern, current_occurrence)
-            else {
-                continue;
-            };
+            let line = span.start_line.saturating_sub(1) as u32;
+            let col = span.start_column.saturating_sub(1) as u32;
             diagnostics.push(carina_diagnostic(
                 line,
                 col,
-                col + pattern.chars().count() as u32,
+                span.end_column.saturating_sub(1) as u32,
                 DiagnosticSeverity::ERROR,
                 conflict.to_string(),
             ));

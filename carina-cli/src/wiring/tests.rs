@@ -3021,6 +3021,7 @@ fn fallback_anonymous_identity_is_stable_when_dependency_bindings_are_prefixed()
         resource.module_source = Some(carina_core::resource::ModuleSource::Module {
             name: "registry".to_string(),
             instance: "registry_publish".to_string(),
+            scope: None,
         });
         resource.dependency_bindings.insert(dependency.to_string());
         vec![target, resource]

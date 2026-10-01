@@ -3,9 +3,8 @@ use crate::backend::document_end_position;
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 
 const ATTRIBUTE_DERIVED_IDENTITY_ERROR: &str = "Anonymous resource identity is derived from \
-mutable attributes for multiple 'mock.test.resource' declarations in the same scope (provider \
-instance '<default>', module instance '<root>'): declaration #1 'mock.test.resource', declaration \
-#2 'mock.test.resource'. Use `let` bindings to give them distinct stable identities.";
+mutable attributes for multiple 'mock.test.resource' declarations using provider instance \
+'<default>' in the root scope. Use `let` bindings to give them distinct stable identities.";
 
 #[test]
 fn attribute_derived_anonymous_identity_error_is_directory_scoped_and_anchored() {
@@ -66,12 +65,139 @@ fn attribute_derived_anonymous_identity_error_anchors_every_same_file_declaratio
     );
     let matching = diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.message == ATTRIBUTE_DERIVED_IDENTITY_ERROR)
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("identity is derived from mutable attributes")
+        })
         .collect::<Vec<_>>();
 
     assert_eq!(matching.len(), 2, "diagnostics: {diagnostics:#?}");
     assert_eq!(matching[0].range.start.line, 0);
     assert_eq!(matching[1].range.start.line, 4);
+}
+
+#[test]
+fn attribute_derived_identity_diagnostics_ignore_for_generated_resources_when_anchoring() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let temp = tempfile::tempdir().unwrap();
+    let source = r#"let generated = for name in ["one", "two"] {
+  mock.test.resource {
+    name = name
+  }
+}
+
+mock.test.resource {
+  name = "p"
+}
+
+mock.test.resource {
+  name = "q"
+}
+"#;
+    std::fs::write(temp.path().join("main.crn"), source).unwrap();
+
+    let diagnostics = engine.analyze_with_filename(
+        &create_document(source),
+        Some("main.crn"),
+        Some(temp.path()),
+    );
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("identity is derived from mutable attributes")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].range.start.line, 6);
+    assert_eq!(matching[1].range.start.line, 10);
+}
+
+#[test]
+fn attribute_derived_identity_diagnostics_ignore_commented_resource_blocks() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let temp = tempfile::tempdir().unwrap();
+    let source = r#"# mock.test.resource {
+#   name = "commented"
+# }
+
+mock.test.resource {
+  name = "p"
+}
+
+mock.test.resource {
+  name = "q"
+}
+"#;
+    std::fs::write(temp.path().join("main.crn"), source).unwrap();
+
+    let diagnostics = engine.analyze_with_filename(
+        &create_document(source),
+        Some("main.crn"),
+        Some(temp.path()),
+    );
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("identity is derived from mutable attributes")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].range.start.line, 4);
+    assert_eq!(matching[1].range.start.line, 8);
+}
+
+#[test]
+fn missing_provider_schema_suppresses_attribute_derived_identity_conflict() {
+    let engine = DiagnosticEngine::new(
+        std::sync::Arc::new(SchemaRegistry::new()),
+        vec![],
+        std::sync::Arc::new(vec![]),
+    );
+    let source = r#"awscc.iam.role {
+  role_name = "one"
+}
+
+awscc.iam.role {
+  role_name = "two"
+}
+"#;
+    let diagnostics = engine.analyze(&create_document(source), None);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("has no loaded schema")),
+        "the existing missing-schema diagnostic must still fire: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics.iter().all(|diagnostic| !diagnostic
+            .message
+            .contains("identity is derived from mutable attributes")),
+        "a missing schema must not also produce the identity-basis diagnostic: {diagnostics:#?}"
+    );
 }
 
 #[test]
