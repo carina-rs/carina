@@ -6,7 +6,6 @@ use crate::deps::get_resource_dependencies;
 
 use crate::effect::{ChangedCreateOnly, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
-use crate::override_aware::OverrideAwareResources;
 use crate::parser::WaitBinding;
 use crate::plan::{
     CreateBeforeDestroyError, PermanentNameOverride, Plan, PlanError, PlanErrorKind,
@@ -152,7 +151,7 @@ pub fn generate_temporary_name(
                 resource_identity: resource
                     .binding
                     .clone()
-                    .unwrap_or_else(|| resource.id.identity_or_empty().to_string()),
+                    .unwrap_or_else(|| resource.id.identity_display().to_string()),
             }
             .into());
         }
@@ -299,7 +298,7 @@ pub fn generate_temporary_name(
 /// ```
 #[allow(clippy::too_many_arguments)]
 pub fn create_plan(
-    managed: &[Resource],
+    managed: &[ResolvedResource],
     data_sources: &[DataSource],
     provider: &dyn Provider,
     current_states: &HashMap<ResourceId, PlanInputState>,
@@ -329,7 +328,8 @@ pub fn create_plan(
 
 #[allow(clippy::too_many_arguments)]
 pub fn create_plan_with_cascades(
-    managed: &OverrideAwareResources,
+    managed: &[ResolvedResource],
+    unresolved_managed: &[ResolvedResource],
     data_sources: &[DataSource],
     provider: &dyn Provider,
     current_states: &HashMap<ResourceId, PlanInputState>,
@@ -340,8 +340,6 @@ pub fn create_plan_with_cascades(
     orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
     wait_bindings: &[WaitBinding],
 ) -> Plan {
-    let unresolved_managed = managed.paired_unresolved_resources();
-    let managed = managed.resources();
     let mut build = create_plan_parts(
         managed,
         data_sources,
@@ -357,7 +355,7 @@ pub fn create_plan_with_cascades(
     cascade_dependent_updates(
         &mut build.plan,
         &mut build.pending_replaces,
-        &unresolved_managed,
+        unresolved_managed,
         current_states,
         registry,
     );
@@ -373,7 +371,7 @@ struct PlanBuild {
 
 #[allow(clippy::too_many_arguments)]
 fn create_plan_parts(
-    managed: &[Resource],
+    managed: &[ResolvedResource],
     data_sources: &[DataSource],
     provider: &dyn Provider,
     current_states: &HashMap<ResourceId, PlanInputState>,
@@ -475,7 +473,7 @@ fn create_plan_parts(
                         registry,
                     ) {
                         Ok(pending) => {
-                            pending_replaces.insert(resource_identity(&pending.create.id), pending);
+                            pending_replaces.insert(resource_identity(&pending.create), pending);
                         }
                         Err(err) => plan.add_error(PlanError::new(id.clone(), err.into())),
                     }
@@ -596,7 +594,7 @@ fn create_plan_parts(
             });
         let Some(target_id_resolved) = resolved else {
             plan.add_error(PlanError::new(
-                ResourceId::with_identity("__wait", wb.binding.as_str()),
+                ResourceId::with_identity("__wait", ResourceIdentity::new(wb.binding.to_string())),
                 PlanErrorKind::WaitTargetMissing {
                     wait_binding: wb.binding.to_string(),
                     target: wb.target.to_string(),
@@ -763,7 +761,7 @@ pub fn block_deletes_on_prior_consumer_updates(
         .iter()
         .filter_map(|effect| match effect {
             Effect::Update { from, to, .. } => Some((
-                resource_identity(&to.id),
+                resource_identity(to),
                 dependencies_from_prior_state(
                     from,
                     prior_directives.get(&from.id).cloned().unwrap_or_default(),
@@ -814,11 +812,8 @@ fn dependencies_from_prior_state(state: &State, directives: Directives) -> HashS
     get_resource_dependencies(&prior_resource)
 }
 
-fn resource_identity(id: &ResourceId) -> ResourceIdentity {
-    id.identity
-        .as_ref()
-        .expect("differ only receives resources after identity resolution")
-        .clone()
+fn resource_identity(resource: &ResolvedResource) -> ResourceIdentity {
+    resource.identity().clone()
 }
 
 fn pending_replace_from_parts(
@@ -876,7 +871,7 @@ pub(super) fn temporary_name_for_cbd(
             resource_identity: resource
                 .binding
                 .clone()
-                .unwrap_or_else(|| resource.id.identity_or_empty().to_string()),
+                .unwrap_or_else(|| resource.id.identity_display().to_string()),
         })?;
     generate_temporary_name(resource, from, schema)
 }
@@ -927,7 +922,10 @@ fn decompose_replace_into_effects(
     }
 }
 
-fn known_binding_names(managed: &[Resource], data_sources: &[DataSource]) -> HashSet<String> {
+fn known_binding_names(
+    managed: &[ResolvedResource],
+    data_sources: &[DataSource],
+) -> HashSet<String> {
     managed
         .iter()
         .filter_map(|resource| resource.binding.clone())
@@ -942,7 +940,7 @@ fn known_binding_names(managed: &[Resource], data_sources: &[DataSource]) -> Has
 fn cascade_dependent_updates(
     plan: &mut Plan,
     pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
-    unresolved_managed: &[Resource],
+    unresolved_managed: &[ResolvedResource],
     current_states: &HashMap<ResourceId, PlanInputState>,
     registry: &SchemaRegistry,
 ) {
@@ -970,7 +968,7 @@ fn cascade_dependent_updates(
 fn promote_referenced_replaces_to_cbd(
     plan: &mut Plan,
     pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
-    unresolved_managed: &[Resource],
+    unresolved_managed: &[ResolvedResource],
     registry: &SchemaRegistry,
 ) {
     let ref_targets = pending_reference_targets(pending_replaces, false);
@@ -1034,7 +1032,7 @@ fn mark_pending_create_before_destroy(
 fn promote_pending_replaces_for_dependents(
     plan: &mut Plan,
     pending_replaces: &mut HashMap<ResourceIdentity, PendingReplace>,
-    unresolved_managed: &[Resource],
+    unresolved_managed: &[ResolvedResource],
     current_states: &HashMap<ResourceId, PlanInputState>,
     registry: &SchemaRegistry,
 ) -> bool {
@@ -1042,7 +1040,7 @@ fn promote_pending_replaces_for_dependents(
     let mut promoted = false;
 
     for resource in unresolved_managed {
-        let consumer_identity = resource_identity(&resource.id);
+        let consumer_identity = resource_identity(resource);
         let deps = get_resource_dependencies(resource);
 
         for dep in &deps {

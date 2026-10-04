@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
-    CreateRequest, DeleteRequest, Provider, ProviderFactory, ReadRequest, UpdateRequest,
+    CreateRequest, DeleteRequest, Provider, ProviderFactory, ReadRequest, SavedAttrs, UpdateRequest,
 };
 use carina_core::resource::{ConcreteValue, DataSource, Resource, ResourceId, State, Value};
 use carina_plugin_host::WasmProviderFactory;
@@ -306,10 +306,16 @@ async fn test_wasm_mock_provider_normalizer() {
 
     // normalize_state: mock provider returns states unchanged
     let id = ResourceId::with_provider_identity("mock", "test.resource", "norm-test", None);
-    let attrs = HashMap::from([(
-        "key".into(),
-        Value::Concrete(ConcreteValue::String("value".into())),
-    )]);
+    let attrs = HashMap::from([
+        (
+            "key".into(),
+            Value::Concrete(ConcreteValue::String("value".into())),
+        ),
+        (
+            "__mock_normalize_state__".into(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        ),
+    ]);
     let state = carina_core::resource::State::existing(id.clone(), attrs.clone());
     let mut states = HashMap::from([(id.clone(), state)]);
     normalizer.normalize_state(&mut states).await;
@@ -318,6 +324,112 @@ async fn test_wasm_mock_provider_normalizer() {
         result_state.attributes.get("key"),
         Some(&Value::Concrete(ConcreteValue::String("value".into())))
     );
+    assert_eq!(
+        result_state.attributes.get("__mock_normalized_state__"),
+        Some(&Value::Concrete(ConcreteValue::Bool(true))),
+        "resolved-state normalization returned by the guest must be applied"
+    );
+
+    // Two pending IDs have the same display string. Correlation across the
+    // WASM boundary must therefore use the IDs themselves, not `to_string()`.
+    let first_id = ResourceId::pending_with_provider("mock", "test.resource", None);
+    let second_id = ResourceId::pending_with_provider("mock", "test.resource", None);
+    assert_ne!(first_id, second_id);
+    let mut pending_states = HashMap::from([
+        (
+            first_id.clone(),
+            State::existing(
+                first_id.clone(),
+                HashMap::from([(
+                    "__mock_normalize_state__".to_string(),
+                    Value::Concrete(ConcreteValue::String("first".to_string())),
+                )]),
+            ),
+        ),
+        (
+            second_id.clone(),
+            State::existing(
+                second_id.clone(),
+                HashMap::from([(
+                    "__mock_normalize_state__".to_string(),
+                    Value::Concrete(ConcreteValue::String("second".to_string())),
+                )]),
+            ),
+        ),
+    ]);
+
+    normalizer.normalize_state(&mut pending_states).await;
+
+    assert_eq!(pending_states.len(), 2);
+    assert_eq!(
+        pending_states[&first_id]
+            .attributes
+            .get("__mock_normalized_state__"),
+        Some(&Value::Concrete(ConcreteValue::String("first".to_string()))),
+        "the first pending state must receive its own normalized WASM result"
+    );
+    assert_eq!(
+        pending_states[&second_id]
+            .attributes
+            .get("__mock_normalized_state__"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "second".to_string()
+        ))),
+        "the second pending state must receive its own normalized WASM result"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_mock_provider_hydrate_read_state_preserves_host_ids() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &indexmap::IndexMap::new())
+        .await;
+
+    let resolved = ResourceId::with_provider_identity("mock", "test.resource", "resolved", None);
+    let first_pending = ResourceId::pending_with_provider("mock", "test.resource", None);
+    let second_pending = ResourceId::pending_with_provider("mock", "test.resource", None);
+    let ids = [resolved, first_pending, second_pending];
+
+    let mut states = ids
+        .iter()
+        .cloned()
+        .map(|id| {
+            let state = State::existing(id.clone(), HashMap::new());
+            (id, state)
+        })
+        .collect::<HashMap<_, _>>();
+    let saved_attrs: SavedAttrs = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            (
+                id.clone(),
+                HashMap::from([(
+                    "__mock_hydrate_read_state__".to_string(),
+                    Value::Concrete(ConcreteValue::String(format!("marker-{index}"))),
+                )]),
+            )
+        })
+        .collect();
+
+    normalizer
+        .hydrate_read_state(&mut states, &saved_attrs)
+        .await;
+
+    assert_eq!(states.len(), ids.len());
+    for (index, id) in ids.iter().enumerate() {
+        let state = &states[id];
+        assert_eq!(&state.id, id, "the original host ResourceId must survive");
+        assert_eq!(
+            state.attributes.get("__mock_hydrated_read_state__"),
+            Some(&Value::Concrete(ConcreteValue::String(format!(
+                "marker-{index}"
+            )))),
+            "each state must receive the saved attrs associated with its host ID"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -422,9 +534,18 @@ async fn test_wasm_mock_provider_merge_default_tags_preserves_order() {
         .merge_default_tags(&mut resources, &default_tags, &registry)
         .await;
 
-    assert_eq!(resources[0].id.identity_or_empty(), "alpha");
-    assert_eq!(resources[1].id.identity_or_empty(), "beta");
-    assert_eq!(resources[2].id.identity_or_empty(), "gamma");
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        "alpha"
+    );
+    assert_eq!(
+        resources[1].id.identity_str().expect("resolved identity"),
+        "beta"
+    );
+    assert_eq!(
+        resources[2].id.identity_str().expect("resolved identity"),
+        "gamma"
+    );
     for r in &resources {
         assert!(
             r.get_attr("__mock_merged_default_tags__").is_some(),

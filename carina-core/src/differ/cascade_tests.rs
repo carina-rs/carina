@@ -104,8 +104,13 @@ fn plan_for(
     schemas: &SchemaRegistry,
 ) -> Plan {
     let managed = OverrideAwareResources::from_parts_for_tests(managed, unresolved);
+    let unresolved = ResolvedResource::collect_resolved(managed.paired_unresolved_resources())
+        .expect("cascade test resources must have resolved identities");
+    let resolved = ResolvedResource::collect_resolved(managed.resources().iter().cloned())
+        .expect("cascade test resources must have resolved identities");
     create_plan_with_cascades(
-        &managed,
+        &resolved,
+        &unresolved,
         &[],
         &crate::provider::ProviderRouter::new(),
         &crate::resource::into_plan_input_map(

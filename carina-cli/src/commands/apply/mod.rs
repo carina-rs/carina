@@ -21,7 +21,7 @@ use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ReadRequest};
 #[cfg(test)]
 use carina_core::resource::ConcreteValue;
-use carina_core::resource::{DataSource, Resource, ResourceId, State, Value};
+use carina_core::resource::{DataSource, ResolvedResource, Resource, ResourceId, State, Value};
 use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
 use carina_state::{BackendLock, LockInfo, StateBackend, StateFile};
@@ -628,9 +628,14 @@ pub(crate) async fn finalize_apply(
     let skipped_exports = if let Some(params) = input.export_params {
         let post_apply_states =
             PostApplyStates::from_current_and_state(input.current_states, &state);
+        let export_resources: Vec<Resource> = input
+            .sorted_resources
+            .iter()
+            .map(|resource| resource.as_resource().clone())
+            .collect();
         let resolution = resolve_exports(
             params,
-            input.sorted_resources,
+            &export_resources,
             input.data_sources,
             input.pre_resolve_compositions,
             &post_apply_states,
@@ -1122,20 +1127,13 @@ async fn run_apply_with_observer_factory(
                         .ok_or("Backend does not specify a resource type")?;
                     let bucket_resource_name = parsed
                         .find_resource_by_attr(backend_resource_type, "bucket", &bucket_name)
-                        .map(|r| r.id.identity_or_empty().to_string())
+                        .and_then(|r| r.id.identity().cloned())
                         .ok_or_else(|| {
                             format!(
                                 "Auto-injected state bucket resource '{}' not found after re-parse",
                                 bucket_name
                             )
                         })?;
-                    if bucket_resource_name.is_empty() {
-                        return Err(AppError::Config(format!(
-                            "Auto-injected state bucket resource '{}' has no resolved name; \
-                             anonymous identifier computation may have silently skipped it",
-                            bucket_name
-                        )));
-                    }
                     let initial_state = StateFile::with_managed_state_bucket(
                         backend_provider_name,
                         backend_resource_type,
@@ -1278,7 +1276,7 @@ async fn run_apply_locked(
             &|provider, resource_type| {
                 sf.resources_by_type(provider, resource_type)
                     .into_iter()
-                    .map(|r| r.identity.clone())
+                    .map(|r| r.identity.to_string())
                     .collect()
             },
             &state_block_claims,
@@ -1368,11 +1366,8 @@ async fn run_apply_locked(
             sorted_resources
                 .iter()
                 .filter_map(|r| {
-                    let rs = sf.find_resource(
-                        &r.id.provider,
-                        &r.id.resource_type,
-                        r.id.identity_or_empty(),
-                    )?;
+                    let identity = r.id.identity_str()?;
+                    let rs = sf.find_resource(&r.id.provider, &r.id.resource_type, identity)?;
                     if rs.dependency_bindings.is_empty() {
                         None
                     } else {
@@ -1584,7 +1579,10 @@ async fn run_apply_locked(
     // apply and refresh paths cannot diverge on these phases. The
     // constructor is the only way to obtain an `ExpandedRefreshState`
     // — leaving a phase out becomes a compile error.
-    let moved_targets: HashSet<ResourceId> = moved_pairs.iter().map(|(_, to)| to.clone()).collect();
+    let moved_targets: HashSet<ResourceId> = moved_pairs
+        .iter()
+        .map(|(_, to)| to.as_inner().clone())
+        .collect();
     let crate::wiring::ExpandedRefreshState {
         sorted_resources: resorted,
         residual_deferred_for,
@@ -1740,6 +1738,10 @@ async fn run_apply_locked(
     )?;
     let paired_unresolved_resources = override_aware_resources
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);
+    let resolved_resources =
+        ResolvedResource::collect_resolved(override_aware_resources.resources().iter().cloned())?;
+    let resolved_unresolved_resources =
+        ResolvedResource::collect_resolved(paired_unresolved_resources.iter().cloned())?;
     let plan_input_states = carina_core::resource::into_plan_input_map(
         current_states.clone(),
         ctx.schemas(),
@@ -1752,7 +1754,8 @@ async fn run_apply_locked(
         .unwrap_or_default();
     let schemas = ctx.schemas();
     let mut plan = create_plan_with_cascades(
-        &override_aware_resources,
+        &resolved_resources,
+        &resolved_unresolved_resources,
         &data_sources_for_plan,
         &provider,
         &plan_input_states,
@@ -1881,7 +1884,7 @@ async fn run_apply_locked(
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
         .iter()
-        .map(|(from, to)| (to.clone(), from.clone()))
+        .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
         .collect();
 
     let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
@@ -1922,7 +1925,7 @@ async fn run_apply_locked(
 
     // Build unresolved resource map for re-resolution at apply time
     let unresolved_resources = override_aware_resources
-        .unresolved_by_resolved_id_with_binding_sources(&unresolved_override_aware_resources);
+        .unresolved_by_resolved_id_with_binding_sources(&unresolved_override_aware_resources)?;
     let mut bindings = override_aware_resources.bindings().clone();
 
     // `provider` is a `ProviderRouter`, which impls both `Provider` and
@@ -1968,7 +1971,7 @@ async fn run_apply_locked(
                 FinalizeApplyInput {
                     result: &result,
                     state_file,
-                    sorted_resources: override_aware_resources.resources(),
+                    sorted_resources: &resolved_resources,
                     data_sources: &data_sources_for_plan,
                     current_states: &current_states,
                     plan: &plan,
@@ -2135,6 +2138,9 @@ async fn run_apply_from_plan_with_observer_factory(
         source_dir: &source_path,
     };
     plan_file
+        .validate_resource_identities()
+        .map_err(AppError::Config)?;
+    plan_file
         .validate_replace_display()
         .map_err(AppError::Config)?;
 
@@ -2220,7 +2226,8 @@ async fn run_apply_from_plan_with_observer_factory(
         parallelism,
         accept_legacy_name_overrides,
     )
-    .await;
+    .await
+    .map_err(|error| error.with_project_dir(&source_path));
 
     // Always release lock if it was acquired
     if let Some(ref li) = lock_info {
@@ -2319,6 +2326,8 @@ async fn run_apply_from_plan_locked(
 
     let plan = &plan_file.plan;
     let sorted_resources = &plan_file.sorted_resources;
+    let resolved_sorted_resources =
+        ResolvedResource::collect_resolved(sorted_resources.iter().cloned())?;
     let plan_compositions: &[carina_core::resource::Composition] = &plan_file.compositions;
     let plan_data_sources: &[carina_core::resource::DataSource] = &plan_file.data_sources;
     let plan_data_source_origins: &[carina_core::resource::DataSource] =
@@ -2528,7 +2537,7 @@ async fn run_apply_from_plan_locked(
                 FinalizeApplyInput {
                     result: &result,
                     state_file,
-                    sorted_resources,
+                    sorted_resources: &resolved_sorted_resources,
                     data_sources: plan_data_sources,
                     current_states: &current_states,
                     plan,

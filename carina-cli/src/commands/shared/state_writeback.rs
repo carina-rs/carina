@@ -9,7 +9,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use carina_core::effect::{DeferredReplaceDelete, DeletedInstanceKey, Effect, EffectGeneration};
 use carina_core::executor::ExecutionResult;
 use carina_core::plan::{Plan, ReplaceDisplayInfo};
-use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use carina_core::resource::{
+    ConcreteValue, ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
+};
 use carina_core::schema::{ResourceSchema, SchemaRegistry};
 use carina_state::{
     DeposedInstance, DeposedKey, LockInfo, PreviousSecretHashAuthority, ResourceState,
@@ -106,10 +108,11 @@ impl PostApplyStates {
     ) -> Self {
         let mut map = current_states.clone();
         for rs in state.resources() {
-            let id = ResourceId::with_provider_name_compat(
-                &rs.provider,
-                &rs.resource_type,
-                &rs.identity,
+            let identity = rs.identity.clone();
+            let id = ResourceId::with_provider_identity(
+                rs.provider.clone(),
+                rs.resource_type.clone(),
+                identity,
                 rs.directives.provider_instance.clone(),
             );
             let attrs: HashMap<String, carina_core::resource::Value> = rs
@@ -142,7 +145,7 @@ impl PostApplyStates {
 pub(crate) struct FinalizeApplyInput<'a> {
     pub result: &'a ExecutionResult,
     pub state_file: Option<StateFile>,
-    pub sorted_resources: &'a [Resource],
+    pub sorted_resources: &'a [ResolvedResource],
     /// Data sources (`read`-keyword resources). Layered into the
     /// export-resolution binding view so `exports { x = some_read.attr }`
     /// resolves (carina#3181).
@@ -600,8 +603,8 @@ pub(crate) fn dsl_value_to_json(
 
 pub(crate) struct ApplyStateSave<'a> {
     pub state_file: Option<StateFile>,
-    pub sorted_resources: &'a [Resource],
-    pub runtime_synthesized_resources: &'a [Resource],
+    pub sorted_resources: &'a [ResolvedResource],
+    pub runtime_synthesized_resources: &'a [ResolvedResource],
     pub current_states: &'a HashMap<ResourceId, State>,
     pub applied_states: &'a HashMap<ResourceId, State>,
     pub plan: &'a Plan,
@@ -632,16 +635,16 @@ pub(crate) struct WritebackPlan<'a> {
     upserts: indexmap::IndexMap<ResourceId, PlannedUpsert<'a>>,
     deposes: Vec<PlannedDepose>,
     remove_deposed: Vec<PlannedRemoveDeposed>,
-    cleanups: HashSet<ResourceId>,
+    cleanups: HashSet<ResolvedResourceId>,
 }
 
-/// One planned upsert. Carrying the desired `&Resource` here (rather
+/// One planned upsert. Carrying the desired `&ResolvedResource` here (rather
 /// than re-deriving it from `sorted_resources` in the apply loop)
 /// makes the "every upsert has a desired resource" invariant
 /// representable in the type — there is no separate lookup that can
 /// miss.
 struct PlannedUpsert<'a> {
-    resource: &'a Resource,
+    resource: &'a ResolvedResource,
     source: UpsertSource<'a>,
 }
 
@@ -666,19 +669,19 @@ impl<'a> UpsertSource<'a> {
 }
 
 struct PlannedDepose {
-    id: ResourceId,
+    id: ResolvedResourceId,
     instance: DeposedInstance,
 }
 
 struct PlannedRemoveDeposed {
-    id: ResourceId,
+    id: ResolvedResourceId,
     key: DeposedKey,
 }
 
 enum ReplacementOutcome {
     CurrentRowOnly,
     CreateAppliedDeposeOld(PlannedDepose),
-    DeleteSucceededCreateAbsent(ResourceId),
+    DeleteSucceededCreateAbsent(ResolvedResourceId),
     KeepOld,
 }
 
@@ -716,26 +719,36 @@ impl<'a> WritebackPlan<'a> {
     /// `UpsertCleanupOverlap`.
     fn add_upsert(
         &mut self,
-        resource: &'a Resource,
+        resource: &'a ResolvedResource,
         source: UpsertSource<'a>,
     ) -> Result<(), WritebackConflict> {
-        let id = &resource.id;
-        if self.cleanups.contains(id) {
-            return Err(WritebackConflict::UpsertCleanupOverlap { id: id.clone() });
+        let id = resource.resolved_id();
+        if self
+            .cleanups
+            .iter()
+            .any(|cleanup| cleanup.as_inner() == id.as_inner())
+        {
+            return Err(WritebackConflict::UpsertCleanupOverlap {
+                id: id.into_inner(),
+            });
         }
-        if self.upserts.contains_key(id) {
-            return Err(WritebackConflict::DuplicateUpsert { id: id.clone() });
+        if self.upserts.contains_key(id.as_inner()) {
+            return Err(WritebackConflict::DuplicateUpsert {
+                id: id.into_inner(),
+            });
         }
         self.upserts
-            .insert(id.clone(), PlannedUpsert { resource, source });
+            .insert(id.into_inner(), PlannedUpsert { resource, source });
         Ok(())
     }
 
     /// Register a cleanup against `id`. Calling after `add_upsert(id)`
     /// returns `UpsertCleanupOverlap`. Cleanup is idempotent.
-    fn add_cleanup(&mut self, id: ResourceId) -> Result<(), WritebackConflict> {
-        if self.upserts.contains_key(&id) {
-            return Err(WritebackConflict::UpsertCleanupOverlap { id });
+    fn add_cleanup(&mut self, id: ResolvedResourceId) -> Result<(), WritebackConflict> {
+        if self.upserts.contains_key(id.as_inner()) {
+            return Err(WritebackConflict::UpsertCleanupOverlap {
+                id: id.into_inner(),
+            });
         }
         self.cleanups.insert(id);
         Ok(())
@@ -752,19 +765,19 @@ impl<'a> WritebackPlan<'a> {
                 Ok(())
             }
             ReplacementOutcome::DeleteSucceededCreateAbsent(id) => {
-                self.upserts.shift_remove(&id);
+                self.upserts.shift_remove(id.as_inner());
                 self.add_cleanup(id)
             }
         }
     }
 
-    fn add_remove_deposed(&mut self, id: ResourceId, key: DeposedKey) {
+    fn add_remove_deposed(&mut self, id: ResolvedResourceId, key: DeposedKey) {
         self.remove_deposed.push(PlannedRemoveDeposed { id, key });
     }
 }
 
 struct ReplacementDeleteInput<'a> {
-    id: &'a ResourceId,
+    id: &'a ResolvedResourceId,
     identifier: &'a str,
     provider_instance: Option<String>,
     generation: &'a EffectGeneration,
@@ -776,12 +789,12 @@ static CURRENT_GENERATION: EffectGeneration = EffectGeneration::Current;
 
 fn delete_succeeded(
     successfully_deleted: &HashSet<DeletedInstanceKey>,
-    id: &ResourceId,
+    id: &ResolvedResourceId,
     generation: &EffectGeneration,
     identifier: &str,
 ) -> bool {
     successfully_deleted.contains(&DeletedInstanceKey::new(
-        id.clone(),
+        id.clone().into_inner(),
         generation.clone(),
         identifier.to_string(),
     ))
@@ -789,11 +802,11 @@ fn delete_succeeded(
 
 fn identifier_was_successfully_deleted(
     successfully_deleted: &HashSet<DeletedInstanceKey>,
-    id: &ResourceId,
+    id: &ResolvedResourceId,
     provider_instance: &Option<String>,
     identifier: &str,
 ) -> bool {
-    let mut delete_id = id.clone();
+    let mut delete_id = id.as_inner().clone();
     delete_id.provider_instance = provider_instance.clone();
     successfully_deleted.contains(&DeletedInstanceKey::current(
         delete_id,
@@ -849,7 +862,7 @@ fn classify_replacement_outcome(
 
 fn planned_depose(
     delete: ReplacementDeleteInput<'_>,
-    desired_resource: &Resource,
+    desired_resource: &ResolvedResource,
     schema: Option<&ResourceSchema>,
     state_file: &StateFile,
     current_states: &HashMap<ResourceId, State>,
@@ -857,9 +870,9 @@ fn planned_depose(
     let existing = state_file.find_resource(
         &delete.id.provider,
         &delete.id.resource_type,
-        delete.id.identity_or_empty(),
+        delete.id.identity_str(),
     );
-    let current = current_states.get(delete.id);
+    let current = current_states.get(delete.id.as_inner());
 
     let attributes = if let Some(existing) = existing
         && existing.identifier.as_deref() == Some(delete.identifier)
@@ -931,7 +944,7 @@ fn delete_input_from_effect<'a>(
         return None;
     };
     Some(ReplacementDeleteInput {
-        id: id.as_inner(),
+        id,
         identifier,
         provider_instance: id.as_inner().provider_instance.clone(),
         generation,
@@ -942,7 +955,7 @@ fn delete_input_from_effect<'a>(
 
 fn delete_input_from_deferred(delete: &DeferredReplaceDelete) -> ReplacementDeleteInput<'_> {
     ReplacementDeleteInput {
-        id: delete.id.as_inner(),
+        id: &delete.id,
         identifier: &delete.identifier,
         provider_instance: delete.id.as_inner().provider_instance.clone(),
         generation: &CURRENT_GENERATION,
@@ -989,16 +1002,19 @@ fn plan_displaced_identifier_deposes(
         if !create_side_ids.contains(id) {
             continue;
         }
+        let id = upsert.resource.resolved_id();
         let Some(existing) =
-            state_file.find_resource(&id.provider, &id.resource_type, id.identity_or_empty())
+            state_file.find_resource(&id.provider, &id.resource_type, id.identity_str())
         else {
             continue;
         };
         let Some(displaced_identifier) = existing.identifier.as_deref() else {
             continue;
         };
-        if !failed_refreshes.contains(id)
-            && current_states.get(id).is_some_and(|state| !state.exists)
+        if !failed_refreshes.contains(id.as_inner())
+            && current_states
+                .get(id.as_inner())
+                .is_some_and(|state| !state.exists)
         {
             continue;
         }
@@ -1008,14 +1024,14 @@ fn plan_displaced_identifier_deposes(
         }
         if identifier_was_successfully_deleted(
             successfully_deleted,
-            id,
+            &id,
             &existing.directives.provider_instance,
             displaced_identifier,
         ) {
             continue;
         }
         if wb.deposes.iter().any(|depose| {
-            &depose.id == id
+            depose.id == id
                 && depose.instance.identifier == displaced_identifier
                 && depose.instance.provider_instance == existing.directives.provider_instance
         }) {
@@ -1024,7 +1040,7 @@ fn plan_displaced_identifier_deposes(
 
         wb.deposes.push(planned_depose(
             ReplacementDeleteInput {
-                id,
+                id: &id,
                 identifier: displaced_identifier,
                 provider_instance: existing.directives.provider_instance.clone(),
                 generation: &EffectGeneration::Current,
@@ -1051,8 +1067,8 @@ fn plan_displaced_identifier_deposes(
 /// does **not** touch the `to` slot — that is Phase 1's job.
 struct DecomposeInput<'a, 's> {
     state_file: &'s StateFile,
-    sorted_resources: &'a [Resource],
-    runtime_synthesized_resources: &'a [Resource],
+    sorted_resources: &'a [ResolvedResource],
+    runtime_synthesized_resources: &'a [ResolvedResource],
     current_states: &'a HashMap<ResourceId, State>,
     applied_states: &'a HashMap<ResourceId, State>,
     plan: &'a Plan,
@@ -1086,7 +1102,7 @@ fn decompose<'a>(input: DecomposeInput<'a, '_>) -> Result<WritebackPlan<'a>, Wri
             if current.exists {
                 wb.add_upsert(resource, UpsertSource::CurrentState(current))?;
             } else {
-                wb.add_cleanup(resource.id.clone())?;
+                wb.add_cleanup(resource.resolved_id())?;
             }
         }
     }
@@ -1122,7 +1138,7 @@ fn decompose<'a>(input: DecomposeInput<'a, '_>) -> Result<WritebackPlan<'a>, Wri
         if let Effect::DeferredReplace(payload) = effect {
             for delete in &payload.deletes {
                 let delete = delete_input_from_deferred(delete);
-                let create_upsert = wb.upserts.get(delete.id);
+                let create_upsert = wb.upserts.get(delete.id.as_inner());
                 let outcome = classify_replacement_outcome(
                     delete,
                     create_upsert,
@@ -1142,9 +1158,9 @@ fn decompose<'a>(input: DecomposeInput<'a, '_>) -> Result<WritebackPlan<'a>, Wri
             generation: generation @ EffectGeneration::Deposed(key),
             ..
         } = effect
-            && delete_succeeded(successfully_deleted, id.as_inner(), generation, identifier)
+            && delete_succeeded(successfully_deleted, id, generation, identifier)
         {
-            wb.add_remove_deposed(id.clone().into_inner(), key.clone());
+            wb.add_remove_deposed(id.clone(), key.clone());
         }
 
         for id in effect.writeback_cleanup_ids(successfully_deleted) {
@@ -1194,7 +1210,9 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
 
     for (id, planned) in &writeback.upserts {
         let resource = planned.resource;
-        let existing = state.find_resource(&id.provider, &id.resource_type, id.identity_or_empty());
+        let existing = id
+            .identity_str()
+            .and_then(|identity| state.find_resource(&id.provider, &id.resource_type, identity));
         let write_only_keys: Vec<String> = schemas
             .get_for(resource)
             .map(|schema| {
@@ -1234,13 +1252,13 @@ pub(crate) fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateF
         state.remove_deposed_generation(
             &planned.id.provider,
             &planned.id.resource_type,
-            planned.id.identity_or_empty(),
+            planned.id.identity_str(),
             &planned.key,
         );
     }
 
     for id in &writeback.cleanups {
-        state.remove_resource(&id.provider, &id.resource_type, id.identity_or_empty());
+        state.remove_resource(&id.provider, &id.resource_type, id.identity_str());
     }
 
     Ok(state)
@@ -1251,7 +1269,7 @@ fn apply_planned_depose(state: &mut StateFile, planned: PlannedDepose) -> Result
     state.upsert_deposed_generation(
         &planned.id.provider,
         &planned.id.resource_type,
-        planned.id.identity_or_empty(),
+        planned.id.identity(),
         row_provider_instance,
         planned.instance,
     )?;
@@ -1270,14 +1288,14 @@ pub(crate) fn apply_destroy_to_state(
                 state.remove_resource(
                     &destroyed.id.provider,
                     &destroyed.id.resource_type,
-                    destroyed.id.identity_or_empty(),
+                    destroyed.id.identity_str(),
                 );
             }
             EffectGeneration::Deposed(key) => {
                 state.remove_deposed_generation(
                     &destroyed.id.provider,
                     &destroyed.id.resource_type,
-                    destroyed.id.identity_or_empty(),
+                    destroyed.id.identity_str(),
                     key,
                 );
             }
@@ -1288,7 +1306,7 @@ pub(crate) fn apply_destroy_to_state(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DestroyedInstance {
-    pub id: ResourceId,
+    pub id: ResolvedResourceId,
     pub generation: EffectGeneration,
 }
 
@@ -1297,9 +1315,12 @@ pub(crate) struct DestroyedInstance {
 /// This creates a Resource with attributes reconstructed from state data,
 /// including `_binding` and `_dependency_bindings` so that dependency ordering
 /// and tree display work correctly.
-pub(crate) fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceId) -> Resource {
+pub(crate) fn build_orphan_resource(
+    sf: &carina_state::StateFile,
+    id: &ResolvedResourceId,
+) -> Resource {
     let rs = sf
-        .find_resource(&id.provider, &id.resource_type, id.identity_or_empty())
+        .find_resource(&id.provider, &id.resource_type, id.identity_str())
         .expect("orphan must exist in state file");
     let attributes: HashMap<String, Value> = rs
         .attributes
@@ -1307,7 +1328,7 @@ pub(crate) fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceI
         .filter_map(|(k, v)| carina_core::value::json_to_dsl_value(v).map(|val| (k.clone(), val)))
         .collect();
     Resource {
-        id: id.clone(),
+        id: id.as_inner().clone(),
         attributes: attributes.into_iter().collect(),
         directives: rs.directives.clone(),
         prefixes: rs.prefixes.clone(),
@@ -1423,6 +1444,10 @@ mod apply_state_save_tests {
     use carina_core::value::SECRET_PREFIX;
     use carina_state::{DeposedInstance, DeposedKey, NameOverride};
 
+    fn resolved(resource: Resource) -> ResolvedResource {
+        ResolvedResource::new(resource)
+    }
+
     fn plan_with_name_override(id: &ResourceId, temp_value: &str, original_value: &str) -> Plan {
         serde_json::from_value(serde_json::json!({
             "effects": [],
@@ -1486,7 +1511,7 @@ mod apply_state_save_tests {
         .with_identifier("listener-id");
         let state = build_state_after_apply(ApplyStateSave {
             state_file: None,
-            sorted_resources: &[resource],
+            sorted_resources: &[resolved(resource)],
             runtime_synthesized_resources: &[],
             current_states: &HashMap::new(),
             applied_states: &HashMap::from([(id, applied_state)]),
@@ -1559,7 +1584,8 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(state_file),
-            sorted_resources: &sorted_resources,
+            sorted_resources: &ResolvedResource::collect_resolved(sorted_resources.clone())
+                .unwrap(),
             runtime_synthesized_resources: &[],
             current_states: &HashMap::new(),
             applied_states: &applied_states,
@@ -1608,7 +1634,8 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(state_file),
-            sorted_resources: &sorted_resources,
+            sorted_resources: &ResolvedResource::collect_resolved(sorted_resources.clone())
+                .unwrap(),
             runtime_synthesized_resources: &[],
             current_states: &HashMap::new(),
             applied_states: &applied_states,
@@ -1653,7 +1680,7 @@ mod apply_state_save_tests {
             sorted_resources: &[],
             current_states: &HashMap::new(),
             applied_states: &HashMap::from([(child_id.clone(), child_state)]),
-            runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
+            runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
             plan: &Plan::new(),
             successfully_deleted: &HashSet::new(),
             failed_refreshes: &HashSet::new(),
@@ -1667,7 +1694,7 @@ mod apply_state_save_tests {
                 .iter()
                 .any(|row| row.provider == child_id.provider
                     && row.resource_type == child_id.resource_type
-                    && row.identity == "validation_records[0]"),
+                    && row.identity.as_str() == "validation_records[0]"),
             "runtime-synthesized child must be persisted in state"
         );
     }
@@ -1880,6 +1907,7 @@ mod apply_state_save_tests {
         let failed_refreshes = HashSet::new();
         let schemas = SchemaRegistry::new();
 
+        let runtime_child = resolved(runtime_child);
         let wb = decompose(DecomposeInput {
             state_file: &StateFile::new(),
             sorted_resources: &[],
@@ -1950,7 +1978,7 @@ mod apply_state_save_tests {
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(state_file),
             sorted_resources: &[],
-            runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
+            runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
             current_states: &current_states,
             applied_states: &applied_states,
             plan: &plan,
@@ -2000,7 +2028,7 @@ mod apply_state_save_tests {
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(StateFile::new()),
             sorted_resources: &[],
-            runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
+            runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
             current_states: &current_states,
             applied_states: &applied_states,
             plan: &plan,
@@ -2061,7 +2089,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&desired),
+            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
             runtime_synthesized_resources: &[],
             current_states: &HashMap::new(),
             applied_states: &HashMap::from([(id, applied_state)]),
@@ -2114,7 +2142,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&desired),
+            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
             runtime_synthesized_resources: &[],
             current_states: &HashMap::new(),
             applied_states: &HashMap::from([(id, applied_state)]),
@@ -2173,7 +2201,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&desired),
+            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
             runtime_synthesized_resources: &[],
             current_states: &HashMap::from([(id.clone(), current_state)]),
             applied_states: &HashMap::from([(id, applied_state)]),
@@ -2227,7 +2255,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&desired),
+            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
             runtime_synthesized_resources: &[],
             current_states: &HashMap::new(),
             applied_states: &HashMap::from([(id, applied_state)]),
@@ -2321,7 +2349,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&desired),
+            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
             runtime_synthesized_resources: &[],
             current_states: &HashMap::new(),
             applied_states: &HashMap::from([(create_id, applied_state)]),
@@ -2379,7 +2407,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&desired),
+            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
             runtime_synthesized_resources: &[],
             current_states: &HashMap::new(),
             applied_states: &HashMap::from([(create_id, applied_state)]),
@@ -2476,7 +2504,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&desired),
+            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
             runtime_synthesized_resources: &[],
             current_states: &HashMap::new(),
             applied_states: &HashMap::from([(id, applied_state)]),
@@ -2588,7 +2616,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&desired),
+            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
             runtime_synthesized_resources: &[],
             current_states: &HashMap::new(),
             applied_states: &HashMap::from([(id, applied_state)]),
@@ -2651,7 +2679,7 @@ mod apply_state_save_tests {
 
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&desired),
+            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
             runtime_synthesized_resources: &[],
             current_states: &HashMap::from([(id, refreshed_state)]),
             applied_states: &HashMap::new(),
@@ -2714,7 +2742,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(ApplyStateSave {
             state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&desired),
+            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
             runtime_synthesized_resources: &[],
             current_states: &HashMap::new(),
             applied_states: &HashMap::from([(id.clone(), applied_state)]),
@@ -2737,7 +2765,7 @@ mod apply_state_save_tests {
         let plan_input_states =
             carina_core::resource::into_plan_input_map(current_states, &SchemaRegistry::new(), &[]);
         let second_plan = create_plan(
-            std::slice::from_ref(&desired),
+            std::slice::from_ref(&resolved(desired.clone())),
             &[],
             &ProviderRouter::new(),
             &plan_input_states,
@@ -2790,7 +2818,7 @@ mod apply_state_save_tests {
 
         let saved = build_state_after_apply(ApplyStateSave {
             state_file: Some(state_file),
-            sorted_resources: std::slice::from_ref(&desired),
+            sorted_resources: std::slice::from_ref(&resolved(desired.clone())),
             runtime_synthesized_resources: &[],
             current_states: &HashMap::new(),
             applied_states: &HashMap::from([(id.clone(), applied_state)]),
@@ -2814,7 +2842,7 @@ mod apply_state_save_tests {
         let plan_input_states =
             carina_core::resource::into_plan_input_map(current_states, &schemas, &[]);
         let second_plan = create_plan(
-            std::slice::from_ref(&desired),
+            std::slice::from_ref(&resolved(desired.clone())),
             &[],
             &ProviderRouter::new(),
             &plan_input_states,
@@ -2874,7 +2902,7 @@ mod apply_state_save_tests {
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(StateFile::new()),
             sorted_resources: &[],
-            runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
+            runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
             current_states: &current_states,
             applied_states: &applied_states,
             plan: &plan,
@@ -2956,7 +2984,7 @@ mod apply_state_save_tests {
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(state_file),
             sorted_resources: &[],
-            runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
+            runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
             current_states: &current_states,
             applied_states: &applied_states,
             plan: &plan,
@@ -3028,7 +3056,7 @@ mod apply_state_save_tests {
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(StateFile::new()),
             sorted_resources: &[],
-            runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
+            runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
             current_states: &current_states,
             applied_states: &applied_states,
             plan: &plan,
@@ -3070,7 +3098,7 @@ mod apply_state_save_tests {
         apply_planned_depose(
             &mut state,
             PlannedDepose {
-                id: id.clone(),
+                id: ResolvedResourceId::new(id.clone()),
                 instance: DeposedInstance {
                     key: DeposedKey::new_unique(),
                     identifier: "old-record-id".to_string(),
@@ -3124,7 +3152,7 @@ mod apply_state_save_tests {
         apply_planned_depose(
             &mut state,
             PlannedDepose {
-                id: id.clone(),
+                id: ResolvedResourceId::new(id.clone()),
                 instance: DeposedInstance {
                     key: west_key.clone(),
                     identifier: "old-record-id".to_string(),
@@ -3152,7 +3180,7 @@ mod apply_state_save_tests {
         apply_planned_depose(
             &mut state,
             PlannedDepose {
-                id,
+                id: ResolvedResourceId::new(id),
                 instance: DeposedInstance {
                     key: replacement_west_key.clone(),
                     identifier: "old-record-id".to_string(),
@@ -3226,7 +3254,7 @@ mod apply_state_save_tests {
         let state = build_state_after_apply(ApplyStateSave {
             state_file: Some(state_file),
             sorted_resources: &[],
-            runtime_synthesized_resources: std::slice::from_ref(&runtime_child),
+            runtime_synthesized_resources: std::slice::from_ref(&resolved(runtime_child)),
             current_states: &current_states,
             applied_states: &applied_states,
             plan: &plan,
@@ -3278,7 +3306,7 @@ mod apply_state_save_tests {
         .expect("delete-only half of DeferredReplace should still write cleanup");
 
         assert!(wb.upserts.is_empty());
-        assert_eq!(wb.cleanups, HashSet::from([id]));
+        assert_eq!(wb.cleanups, HashSet::from([ResolvedResourceId::new(id)]));
     }
 
     #[test]
@@ -3288,7 +3316,7 @@ mod apply_state_save_tests {
             Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
         );
         let id = resource.id.clone();
-        let sorted_resources = vec![resource];
+        let sorted_resources = vec![resolved(resource)];
         let current_state = State::existing(
             id.clone(),
             HashMap::from([(
@@ -3345,7 +3373,7 @@ mod apply_state_save_tests {
             wb.upserts.is_empty(),
             "stale current-state fallback must not be written after the old instance was deleted"
         );
-        assert_eq!(wb.cleanups, HashSet::from([id]));
+        assert_eq!(wb.cleanups, HashSet::from([ResolvedResourceId::new(id)]));
     }
 
     #[test]
@@ -3358,7 +3386,7 @@ mod apply_state_save_tests {
             );
         resource.directives.create_before_destroy = true;
         let id = resource.id.clone();
-        let sorted_resources = vec![resource];
+        let sorted_resources = vec![resolved(resource)];
         let current_state = State::existing(
             id.clone(),
             HashMap::from([(
@@ -3401,12 +3429,19 @@ mod apply_state_save_tests {
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let unresolved_upstreams: HashSet<&str> = HashSet::new();
 
+        let raw_sorted_resources: Vec<Resource> = sorted_resources
+            .iter()
+            .map(|resource| resource.as_resource().clone())
+            .collect();
         crate::wiring::add_state_block_effects(
             &mut plan,
             &state_blocks,
             &state_file_for_wiring,
-            &[(from_id.clone(), id.clone())],
-            &sorted_resources,
+            &[(
+                ResolvedResourceId::new(from_id.clone()),
+                ResolvedResourceId::new(id.clone()),
+            )],
+            &raw_sorted_resources,
             &bindings,
             &unresolved_upstreams,
         );
@@ -3495,6 +3530,7 @@ mod apply_state_save_tests {
         let failed_refreshes = HashSet::new();
         let schemas = SchemaRegistry::new();
 
+        let desired = resolved(desired);
         let result = decompose(DecomposeInput {
             state_file: &StateFile::new(),
             sorted_resources: std::slice::from_ref(&desired),

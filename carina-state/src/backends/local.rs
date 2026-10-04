@@ -239,7 +239,12 @@ impl StateBackend for LocalBackend {
             }
         };
 
-        let outcome = state::check_and_migrate(&content)?;
+        let state_location = self
+            .state_path
+            .canonicalize()
+            .unwrap_or_else(|_| self.state_path.clone());
+        let outcome = state::check_and_migrate(&content)
+            .map_err(|error| error.with_state_location(state_location.display().to_string()))?;
         let (state, migration) = outcome.into_parts();
         if let Some(info) = migration {
             log_state_migration_once(

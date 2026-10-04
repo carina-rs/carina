@@ -131,7 +131,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             &|provider, resource_type| {
                 sf.resources_by_type(provider, resource_type)
                     .into_iter()
-                    .map(|r| r.identity.clone())
+                    .map(|r| r.identity.to_string())
                     .collect()
             },
             &state_block_claims,
@@ -422,8 +422,17 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         wiring.schemas(),
         override_aware_resources.resources(),
     );
+    let resolved_resources = carina_core::resource::ResolvedResource::collect_resolved(
+        override_aware_resources.resources().iter().cloned(),
+    )
+    .expect("fixture resources must have assigned identities");
+    let unresolved_resources = carina_core::resource::ResolvedResource::collect_resolved(
+        override_aware_resources.paired_unresolved_resources(),
+    )
+    .expect("fixture unresolved resources must have paired identities");
     let mut plan = create_plan_with_cascades(
-        &override_aware_resources,
+        &resolved_resources,
+        &unresolved_resources,
         &data_sources_for_plan,
         &carina_core::provider::ProviderRouter::new(),
         &plan_input_states,
@@ -449,7 +458,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
 
     let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
         .iter()
-        .map(|(from, to)| (to.clone(), from.clone()))
+        .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
         .collect();
     let export_wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
         .wait_bindings

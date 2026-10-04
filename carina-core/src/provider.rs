@@ -115,7 +115,7 @@ impl std::fmt::Display for ProviderError {
                 f,
                 "[{}.{}] {}",
                 id.resource_type,
-                id.identity_or_empty(),
+                id.identity_display(),
                 detail.message
             )?;
         } else {

@@ -687,7 +687,7 @@ pub(super) async fn execute_basic_effect<'a>(
                 });
                 let secret_ctx = Some(SecretHashContext::new(
                     id.display_type(),
-                    id.identity_or_empty(),
+                    to.identity_str(),
                     key,
                 ));
                 let Some(comparison_value) =

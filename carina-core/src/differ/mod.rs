@@ -8,10 +8,40 @@ mod plan;
 
 use std::collections::HashMap;
 
-use crate::resource::{Resource, ResourceId, State, Value};
+use crate::resource::{ResolvedResource, Resource, ResourceId, State, Value};
 use crate::schema::ResourceSchema;
 
 pub use plan::{block_deletes_on_prior_consumer_updates, create_plan, create_plan_with_cascades};
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn create_plan_for_tests(
+    managed: &[Resource],
+    data_sources: &[crate::resource::DataSource],
+    provider: &dyn crate::provider::Provider,
+    current_states: &HashMap<ResourceId, crate::resource::PlanInputState>,
+    directives_map: &HashMap<ResourceId, crate::resource::Directives>,
+    registry: &crate::schema::SchemaRegistry,
+    saved_attrs: &crate::provider::LiftedSavedAttrs,
+    prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
+    orphan_dependencies: &HashMap<ResourceId, std::collections::BTreeSet<String>>,
+    wait_bindings: &[crate::parser::WaitBinding],
+) -> crate::plan::Plan {
+    let managed = ResolvedResource::collect_resolved(managed.iter().cloned())
+        .expect("differ test resources must have resolved identities");
+    plan::create_plan(
+        &managed,
+        data_sources,
+        provider,
+        current_states,
+        directives_map,
+        registry,
+        saved_attrs,
+        prev_explicit,
+        orphan_dependencies,
+        wait_bindings,
+    )
+}
 
 // Imports used by test submodules (accessible via `use super::*;`)
 #[cfg(test)]
@@ -85,24 +115,36 @@ impl Diff {
 /// previously wrote but no longer mentions.
 /// If `schema` is provided, type-aware comparison is used (e.g., Int/Float coercion,
 /// case-insensitive enum matching).
+///
+/// Pending resources cannot enter the differ:
+///
+/// ```compile_fail
+/// use carina_core::differ::diff;
+/// use carina_core::resource::{Resource, State};
+///
+/// let resource = Resource::pending("test.Resource");
+/// let state = State::not_found(resource.id.clone());
+/// let _ = diff(&resource, &state, None, None, None);
+/// ```
 pub fn diff(
-    desired: &Resource,
+    desired: &ResolvedResource,
     current: &State,
     saved: Option<&HashMap<String, Value>>,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> Diff {
     if !current.exists {
-        return Diff::Create(desired.clone());
+        return Diff::Create(desired.as_resource().clone());
     }
 
+    let desired_id = desired.resolved_id();
     let changed = comparison::find_changed_attributes(
         &desired.resolved_attributes(),
         &current.attributes,
         saved,
         prev_explicit,
         schema,
-        Some(&desired.id),
+        Some(&desired_id),
     );
 
     if changed.is_empty() {
@@ -111,10 +153,27 @@ pub fn diff(
         Diff::Update {
             id: desired.id.clone(),
             from: Box::new(current.clone()),
-            to: desired.clone(),
+            to: desired.as_resource().clone(),
             changed_attributes: changed,
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn diff_test(
+    desired: &Resource,
+    current: &State,
+    saved: Option<&HashMap<String, Value>>,
+    prev_explicit: Option<&crate::explicit::ExplicitFields>,
+    schema: Option<&ResourceSchema>,
+) -> Diff {
+    diff(
+        &ResolvedResource::new(desired.clone()),
+        current,
+        saved,
+        prev_explicit,
+        schema,
+    )
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::parser::{ResourceTypePath, TypeExpr};
-use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
 
 /// Dependency between resources
 #[derive(Debug, Clone)]
@@ -352,6 +352,13 @@ pub struct ModuleCallInfo {
     pub arguments: Vec<String>,
 }
 
+fn resource_graph_binding(resource: &Resource, declaration_index: usize) -> String {
+    resource
+        .binding
+        .clone()
+        .unwrap_or_else(|| format!("<anonymous:{declaration_index}>"))
+}
+
 impl RootConfigSignature {
     /// Build a root config signature from a parsed file
     pub fn from_parsed_file<E>(parsed: &crate::parser::File<E>, file_name: &str) -> Self {
@@ -369,11 +376,9 @@ impl RootConfigSignature {
         let mut creates: Vec<ResourceCreation> = Vec::new();
         let mut binding_types: HashMap<String, ResourceTypePath> = HashMap::new();
 
-        for resource in &parsed.resources {
-            let binding_name = resource
-                .binding
-                .clone()
-                .unwrap_or_else(|| resource.id.identity_or_empty().to_string());
+        let rs = parsed.resources.iter(); // allow: direct — topology (dependency sort)
+        for (declaration_index, resource) in rs.enumerate() {
+            let binding_name = resource_graph_binding(resource, declaration_index);
 
             let resource_type_str = resource
                 .attributes
@@ -413,11 +418,9 @@ impl RootConfigSignature {
         // Build typed dependency graph
         let mut typed_graph = TypedDependencyGraph::new();
 
-        for resource in &parsed.resources {
-            let binding_name = resource
-                .binding
-                .clone()
-                .unwrap_or_else(|| resource.id.identity_or_empty().to_string());
+        let rs = parsed.resources.iter(); // allow: direct — topology (dependency sort)
+        for (declaration_index, resource) in rs.enumerate() {
+            let binding_name = resource_graph_binding(resource, declaration_index);
 
             for (attr_key, value) in &resource.attributes {
                 if attr_key.starts_with('_') {
@@ -844,11 +847,9 @@ impl ModuleSignature {
         let mut creates: Vec<ResourceCreation> = Vec::new();
         let mut binding_types: HashMap<String, ResourceTypePath> = HashMap::new();
 
-        for resource in &parsed.resources {
-            let binding_name = resource
-                .binding
-                .clone()
-                .unwrap_or_else(|| resource.id.identity_or_empty().to_string());
+        let rs = parsed.resources.iter(); // allow: direct — topology (dependency sort)
+        for (declaration_index, resource) in rs.enumerate() {
+            let binding_name = resource_graph_binding(resource, declaration_index);
 
             let resource_type_str = resource
                 .attributes
@@ -877,11 +878,9 @@ impl ModuleSignature {
         // Build typed dependency graph from resource attributes
         let mut typed_graph = TypedDependencyGraph::new();
 
-        for resource in &parsed.resources {
-            let binding_name = resource
-                .binding
-                .clone()
-                .unwrap_or_else(|| resource.id.identity_or_empty().to_string());
+        let rs = parsed.resources.iter(); // allow: direct — topology (dependency sort)
+        for (declaration_index, resource) in rs.enumerate() {
+            let binding_name = resource_graph_binding(resource, declaration_index);
 
             for (attr_key, value) in &resource.attributes {
                 if attr_key.starts_with('_') {

@@ -8,7 +8,9 @@ use std::time::Instant;
 use crate::effect::deps::UnresolvedResource;
 use crate::effect::{DeletedInstanceKey, Effect};
 use crate::provider::Provider;
-use crate::resource::{Resource, ResourceId, Value};
+#[cfg(test)]
+use crate::resource::Resource;
+use crate::resource::{ResolvedResource, ResourceId, ResourceIdentity, Value};
 use crate::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
 #[cfg(test)]
@@ -230,7 +232,7 @@ pub(super) async fn execute_effects_sequential(
     let mut successfully_deleted: HashSet<DeletedInstanceKey> = HashSet::new();
     let permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
-    let mut runtime_synthesized_resources: Vec<Resource> = Vec::new();
+    let mut runtime_synthesized_resources: Vec<ResolvedResource> = Vec::new();
     let mut runtime_authored_resource_ids: HashSet<ResourceId> = HashSet::new();
     let module_gate = super::ModuleConstraintGate::new(input.compositions);
 
@@ -403,7 +405,7 @@ pub(super) async fn execute_effects_sequential(
                             let child_idx = effects.len();
                             if let Effect::Create(resource) = &child {
                                 runtime_authored_resource_ids.insert(resource.id.clone());
-                                runtime_synthesized_resources.push(resource.clone().into_inner());
+                                runtime_synthesized_resources.push(resource.clone());
                             }
                             if let Some(binding) = failure_binding_name(&child) {
                                 idx_to_binding.insert(child_idx, binding);
@@ -764,7 +766,8 @@ pub(super) async fn execute_effects_sequential(
                     // resolve_refs sees the same attribute map. Wait
                     // effects do not persist to the state file
                     // (handled by `state_writeback_should_skip`).
-                    let synthetic = ResourceId::with_identity("__wait", &binding);
+                    let synthetic =
+                        ResourceId::with_identity("__wait", ResourceIdentity::new(binding.clone()));
                     let attrs: HashMap<String, Value> = state
                         .attributes
                         .iter()
@@ -896,7 +899,7 @@ mod tests {
         ResolvedResource::new(resource)
     }
 
-    fn update_effect(binding: &str, reads: &[(&str, &str)], writes: &[&str]) -> Effect {
+    fn update_effect(binding: &'static str, reads: &[(&str, &str)], writes: &[&str]) -> Effect {
         let id = ResourceId::with_identity("test", binding);
         let mut to = Resource::new("test", binding);
         to.binding = Some(binding.to_string());
@@ -960,10 +963,10 @@ mod tests {
             self.create_log
                 .lock()
                 .unwrap()
-                .push(id.identity_or_empty().to_string());
+                .push(id.identity_str().expect("resolved identity").to_string());
             let id = id.clone();
             Box::pin(async move {
-                if id.identity_or_empty() == "alb" {
+                if id.identity_str().expect("resolved identity") == "alb" {
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                     Err(ProviderError::api_error("alb create failed"))
                 } else {
@@ -1438,7 +1441,9 @@ mod tests {
             ),
         );
         let virt = Composition {
-            id: ResourceId::with_provider_identity("_virtual", "_virtual", "module", None),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+                "_virtual", "_virtual", "module", None,
+            )),
             signature: crate::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: virt_attrs,
@@ -1533,7 +1538,12 @@ mod tests {
             ),
         );
         let virt = Composition {
-            id: ResourceId::with_provider_identity("_virtual", "_virtual", "bootstrap", None),
+            id: crate::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(
+                "_virtual",
+                "_virtual",
+                "bootstrap",
+                None,
+            )),
             signature: crate::resource::Signature {
                 arguments: indexmap::IndexMap::new(),
                 attributes: virt_attrs,

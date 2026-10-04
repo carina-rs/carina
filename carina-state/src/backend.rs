@@ -1,10 +1,86 @@
 //! State backend trait and error types
 
 use async_trait::async_trait;
+use carina_core::hint::ProjectCommand;
+use carina_core::resource::ResourceIdentityError;
+use std::path::Path;
 use thiserror::Error;
 
 use crate::lock::LockInfo;
 use crate::state::{LoadedState, StateFile};
+
+/// A persisted resource row whose identity cannot be represented by the
+/// resolved-only state model.
+#[derive(Debug)]
+pub struct InvalidResourceIdentityError {
+    resource_index: usize,
+    provider: String,
+    resource_type: String,
+    identifier: Option<String>,
+    state_location: Option<String>,
+    source: ResourceIdentityError,
+}
+
+impl InvalidResourceIdentityError {
+    pub(crate) fn new(
+        resource_index: usize,
+        provider: String,
+        resource_type: String,
+        identifier: Option<String>,
+        source: ResourceIdentityError,
+    ) -> Self {
+        Self {
+            resource_index,
+            provider,
+            resource_type,
+            identifier,
+            state_location: None,
+            source,
+        }
+    }
+
+    fn set_state_location(&mut self, location: String) {
+        self.state_location = Some(location);
+    }
+
+    /// Render the recovery steps with a command appropriate to the caller's
+    /// project context.
+    pub fn render_with_plan_command(&self, plan_command: &str) -> String {
+        let location = self
+            .state_location
+            .as_deref()
+            .map(|location| format!(" at {location}"))
+            .unwrap_or_default();
+        let identifier = self
+            .identifier
+            .as_ref()
+            .map(|identifier| format!(", identifier={identifier:?}"))
+            .unwrap_or_default();
+        format!(
+            "Invalid state file{location}: resources[{}] has an empty identity \
+             (provider={:?}, resource_type={:?}{identifier}). It was written by an older Carina \
+             version and is rejected because an empty identity can no longer be matched to a \
+             resource. Back up the state file, then remove this row. Run `{plan_command}`; the \
+             resource that owned it appears as a create with its newly assigned identity. Put the \
+             row back with `identity` set to that value (keep its `identifier` and attributes), \
+             or leave it removed if the resource is no longer managed.",
+            self.resource_index, self.provider, self.resource_type,
+        )
+    }
+}
+
+impl std::fmt::Display for InvalidResourceIdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let plan_command = ProjectCommand::new("plan", Path::new(".")).to_string();
+        f.write_str(&self.render_with_plan_command(&plan_command))
+    }
+}
+
+impl std::error::Error for InvalidResourceIdentityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 /// Errors that can occur when interacting with a state backend
 #[derive(Debug, Error)]
@@ -49,6 +125,18 @@ pub enum BackendError {
     #[error("Invalid state file: {0}")]
     InvalidState(String),
 
+    /// An identity transformation produced a value that cannot be represented.
+    #[error("Invalid state file: {context}: {source}")]
+    InvalidStateIdentity {
+        context: String,
+        #[source]
+        source: ResourceIdentityError,
+    },
+
+    /// A legacy state row contains an identity that can no longer be matched.
+    #[error("{0}")]
+    InvalidResourceIdentity(#[source] InvalidResourceIdentityError),
+
     /// The state file was written by a newer Carina than this binary supports
     #[error(
         "State file version {found} is newer than supported version {supported}. Please upgrade Carina."
@@ -80,6 +168,12 @@ pub enum BackendError {
     /// Serialization/deserialization error
     #[error("Serialization error: {0}")]
     Serialization(String),
+}
+
+impl From<InvalidResourceIdentityError> for BackendError {
+    fn from(error: InvalidResourceIdentityError) -> Self {
+        Self::InvalidResourceIdentity(error)
+    }
 }
 
 /// Structured context attached to a [`BackendError::Aws`].
@@ -360,6 +454,22 @@ impl BackendError {
     /// Create a configuration error
     pub fn configuration(message: impl Into<String>) -> Self {
         Self::Configuration(message.into())
+    }
+
+    /// Attach the concrete backend location to state-row validation errors.
+    pub fn with_state_location(mut self, location: impl Into<String>) -> Self {
+        if let Self::InvalidResourceIdentity(error) = &mut self {
+            error.set_state_location(location.into());
+        }
+        self
+    }
+
+    /// Return the typed legacy-row error when this is one.
+    pub fn invalid_resource_identity(&self) -> Option<&InvalidResourceIdentityError> {
+        match self {
+            Self::InvalidResourceIdentity(error) => Some(error),
+            _ => None,
+        }
     }
 }
 

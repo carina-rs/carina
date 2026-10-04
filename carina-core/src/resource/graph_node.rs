@@ -133,6 +133,7 @@ impl From<Composition> for GraphNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource::ResolvedResourceId;
 
     #[test]
     fn graph_node_from_resource_round_trip() {
@@ -162,7 +163,7 @@ mod tests {
         use indexmap::IndexMap;
         use std::collections::{BTreeSet, HashSet};
         let c = Composition {
-            id: ResourceId::with_identity("_virtual", "m"),
+            id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "m")),
             signature: super::super::Signature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),

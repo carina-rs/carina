@@ -129,7 +129,13 @@ fn assert_success(label: &str, output: &Output) {
 }
 
 fn mock_resource(name: &str, binding: &str) -> Resource {
-    Resource::with_provider("mock", "test.resource", name, None).with_binding(binding)
+    Resource::with_provider(
+        "mock",
+        "test.resource",
+        carina_core::resource::ResourceIdentity::try_from(name.to_string()).unwrap(),
+        None,
+    )
+    .with_binding(binding)
 }
 
 fn state_not_found(resource: &Resource) -> CurrentStateEntry {

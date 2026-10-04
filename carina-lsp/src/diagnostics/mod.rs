@@ -199,6 +199,13 @@ impl DiagnosticEngine {
         let merged = merged_result
             .as_ref()
             .map(|result| &result.directory.parsed);
+        if let Some(current_file) = doc.parsed() {
+            diagnostics.extend(self.attribute_derived_anonymous_resource_diagnostics(
+                doc,
+                current_file,
+                merged.unwrap_or(current_file),
+            ));
+        }
         let upstream_resolution = match (base_path, merged) {
             (Some(base), Some(merged)) => Some(
                 carina_core::upstream_exports::resolve_upstream_exports_with_schemas(
@@ -1122,12 +1129,18 @@ impl DiagnosticEngine {
                         .iter_all_resources()
                         .filter_map(|rref| rref.binding().map(str::to_string))
                         .collect();
-                    carina_core::validation::check_unused_bindings(merged)
-                        .into_iter()
-                        .filter(|b| current_file_bindings.contains(b))
-                        .collect()
+                    carina_core::validation::check_unused_bindings_with_identity_requirements(
+                        merged,
+                        &self.schemas,
+                    )
+                    .into_iter()
+                    .filter(|b| current_file_bindings.contains(b))
+                    .collect()
                 }
-                None => carina_core::validation::check_unused_bindings(parsed),
+                None => carina_core::validation::check_unused_bindings_with_identity_requirements(
+                    parsed,
+                    &self.schemas,
+                ),
             };
             diagnostics.extend(self.unused_binding_diagnostics(doc, unused_binding_names));
 
@@ -1659,6 +1672,13 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             100,
             DiagnosticSeverity::ERROR,
             message.clone(),
+        ),
+        ParseError::InvalidResourceIdentity { line, source } => carina_diagnostic(
+            (*line as u32).saturating_sub(1),
+            0,
+            100,
+            DiagnosticSeverity::ERROR,
+            source.to_string(),
         ),
         ParseError::UndefinedVariable(name) => carina_diagnostic_range(
             Range::default(),

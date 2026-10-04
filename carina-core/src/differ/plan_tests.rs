@@ -1,4 +1,4 @@
-use super::*;
+use super::{create_plan_for_tests as create_plan, *};
 
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashSet};
@@ -690,7 +690,7 @@ fn diff_detects_attribute_removal_with_prev_desired_keys() {
     // Previous desired state had both "region" and "tags"
     let prev_explicit = explicit_top_level(&["region", "tags"]);
 
-    let result = diff(&desired, &current, None, Some(&prev_explicit), None);
+    let result = diff_test(&desired, &current, None, Some(&prev_explicit), None);
     match result {
         Diff::Update {
             changed_attributes, ..
@@ -728,7 +728,7 @@ fn diff_ignores_attributes_not_in_prev_desired_keys() {
     // User previously only specified "region", not "arn"
     let prev_explicit = explicit_top_level(&["region"]);
 
-    let result = diff(&desired, &current, None, Some(&prev_explicit), None);
+    let result = diff_test(&desired, &current, None, Some(&prev_explicit), None);
     match result {
         Diff::Update {
             changed_attributes, ..
@@ -809,7 +809,7 @@ fn server_default_struct_field_does_not_appear_in_diff() {
         )]),
     };
 
-    let result = diff(&desired, &current, None, Some(&prev_explicit), None);
+    let result = diff_test(&desired, &current, None, Some(&prev_explicit), None);
     assert!(
         matches!(result, Diff::NoChange(_)),
         "Server-side default struct leaf must not surface in diff, got: {:?}",
@@ -853,7 +853,7 @@ fn nested_authored_field_removal_produces_update_patch_without_removed_field() {
         )]),
     };
 
-    let result = diff(
+    let result = diff_test(
         &desired,
         &current,
         saved_attrs.get(&desired.id),
@@ -917,7 +917,7 @@ fn saved_server_default_nested_field_not_authored_remains_no_change() {
         )]),
     };
 
-    let result = diff(
+    let result = diff_test(
         &desired,
         &current,
         Some(&current_attrs),
@@ -981,7 +981,7 @@ fn list_union_authoring_does_not_turn_provider_field_into_removal() {
         )]),
     };
 
-    let result = diff(
+    let result = diff_test(
         &desired,
         &current,
         Some(&current_attrs),
@@ -1066,7 +1066,7 @@ fn list_elements_authored_field_removal_produces_update_for_paired_element() {
         )))
     );
 
-    let result = diff(
+    let result = diff_test(
         &desired,
         &current,
         Some(&current_attrs),
@@ -1134,7 +1134,7 @@ fn unchanged_dsl_after_writeback_pairs_raw_saved_list_without_phantom_removal() 
     assert!(matches!(elements[1], ExplicitFields::Unrecorded));
 
     let current = State::existing(authored.id.clone(), saved_attributes.clone());
-    let result = diff(
+    let result = diff_test(
         &authored,
         &current,
         Some(&saved_attributes),
@@ -1173,7 +1173,7 @@ fn migrated_leaf_authoring_for_map_preserves_provider_nested_fields() {
         children: HashMap::from([("settings".to_string(), ExplicitFields::Leaf)]),
     };
 
-    let result = diff(
+    let result = diff_test(
         &desired,
         &current,
         Some(&current_attrs),
@@ -1528,7 +1528,7 @@ fn explicit_top_level_removal_still_detected() {
     );
 
     let prev_explicit = explicit_top_level(&["tags"]);
-    let result = diff(&desired, &current, None, Some(&prev_explicit), None);
+    let result = diff_test(&desired, &current, None, Some(&prev_explicit), None);
 
     match result {
         Diff::Update {
@@ -1569,7 +1569,7 @@ fn diff_no_change_without_prev_desired_keys() {
         current_attrs,
     );
 
-    let result = diff(&desired, &current, None, None, None);
+    let result = diff_test(&desired, &current, None, None, None);
     assert!(
         matches!(result, Diff::NoChange(_)),
         "Without prev_desired_keys, extra attributes in current should not trigger Update, got {:?}",
@@ -1805,7 +1805,7 @@ fn diff_skips_internal_attributes_in_removal_detection() {
 
     let prev_explicit = explicit_top_level(&["region", "_internal"]);
 
-    let result = diff(&desired, &current, None, Some(&prev_explicit), None);
+    let result = diff_test(&desired, &current, None, Some(&prev_explicit), None);
     assert!(
         matches!(result, Diff::NoChange(_)),
         "Should skip internal attributes starting with '_', got {:?}",

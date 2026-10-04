@@ -2,6 +2,291 @@ use super::*;
 use crate::backend::document_end_position;
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 
+const ATTRIBUTE_DERIVED_IDENTITY_ERROR: &str = "Anonymous resource identity is derived from \
+mutable attributes for multiple 'mock.test.resource' declarations using provider instance \
+'<default>' in the root scope. Use `let` bindings to give them distinct stable identities.";
+
+fn unused_binding_messages(diagnostics: &[Diagnostic]) -> Vec<&str> {
+    diagnostics
+        .iter()
+        .filter_map(|diagnostic| {
+            diagnostic
+                .message
+                .starts_with("Unused let binding")
+                .then_some(diagnostic.message.as_str())
+        })
+        .collect()
+}
+
+#[test]
+fn attribute_derived_bindings_required_across_sibling_files_are_not_unused() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let temp = tempfile::tempdir().unwrap();
+    let alpha = "let alpha = mock.test.resource {\n  name = \"alpha\"\n}\n";
+    let beta = "let beta = mock.test.resource {\n  name = \"beta\"\n}\n";
+    std::fs::write(temp.path().join("alpha.crn"), alpha).unwrap();
+    std::fs::write(temp.path().join("beta.crn"), beta).unwrap();
+
+    let alpha_diagnostics = engine.analyze_with_filename(
+        &create_document(alpha),
+        Some("alpha.crn"),
+        Some(temp.path()),
+    );
+    let beta_diagnostics =
+        engine.analyze_with_filename(&create_document(beta), Some("beta.crn"), Some(temp.path()));
+
+    assert!(
+        unused_binding_messages(&alpha_diagnostics).is_empty(),
+        "alpha diagnostics: {alpha_diagnostics:#?}",
+    );
+    assert!(
+        unused_binding_messages(&beta_diagnostics).is_empty(),
+        "beta diagnostics: {beta_diagnostics:#?}",
+    );
+}
+
+#[test]
+fn single_unused_attribute_derived_binding_still_warns() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let source = "let alpha = mock.test.resource {\n  name = \"alpha\"\n}\n";
+    let diagnostics = engine.analyze(&create_document(source), None);
+
+    assert_eq!(
+        unused_binding_messages(&diagnostics),
+        vec!["Unused let binding 'alpha'. Consider using an anonymous resource instead."],
+    );
+}
+
+#[test]
+fn unused_stable_binding_still_warns() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only()),
+    );
+    let engine = custom_engine(schemas);
+    let source = "let alpha = mock.test.resource {\n  name = \"alpha\"\n}\n";
+    let diagnostics = engine.analyze(&create_document(source), None);
+
+    assert_eq!(
+        unused_binding_messages(&diagnostics),
+        vec!["Unused let binding 'alpha'. Consider using an anonymous resource instead."],
+    );
+}
+
+#[test]
+fn attribute_derived_anonymous_identity_error_is_directory_scoped_and_anchored() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path();
+    let alpha = "mock.test.resource {\n  name = \"alpha\"\n}\n";
+    let beta = "\nmock.test.resource {\n  name = \"beta\"\n}\n";
+    std::fs::write(base.join("alpha.crn"), alpha).unwrap();
+    std::fs::write(base.join("beta.crn"), beta).unwrap();
+
+    let alpha_diagnostics =
+        engine.analyze_with_filename(&create_document(alpha), Some("alpha.crn"), Some(base));
+    let beta_diagnostics =
+        engine.analyze_with_filename(&create_document(beta), Some("beta.crn"), Some(base));
+
+    for (diagnostics, expected_line) in [(&alpha_diagnostics, 0), (&beta_diagnostics, 1)] {
+        let matching = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message == ATTRIBUTE_DERIVED_IDENTITY_ERROR)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "diagnostics: {diagnostics:#?}");
+        assert_eq!(matching[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(matching[0].range.start.line, expected_line);
+        assert_eq!(matching[0].range.start.character, 0);
+        assert_eq!(matching[0].range.end.line, expected_line);
+        assert_eq!(matching[0].range.end.character, 18);
+    }
+}
+
+#[test]
+fn attribute_derived_anonymous_identity_error_anchors_every_same_file_declaration() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let temp = tempfile::tempdir().unwrap();
+    let source = "mock.test.resource {\n  name = \"alpha\"\n}\n\nmock.test.resource {\n  name = \"beta\"\n}\n";
+    std::fs::write(temp.path().join("main.crn"), source).unwrap();
+
+    let diagnostics = engine.analyze_with_filename(
+        &create_document(source),
+        Some("main.crn"),
+        Some(temp.path()),
+    );
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("identity is derived from mutable attributes")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].range.start.line, 0);
+    assert_eq!(matching[1].range.start.line, 4);
+}
+
+#[test]
+fn attribute_derived_identity_diagnostics_ignore_for_generated_resources_when_anchoring() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let temp = tempfile::tempdir().unwrap();
+    let source = r#"let generated = for name in ["one", "two"] {
+  mock.test.resource {
+    name = name
+  }
+}
+
+mock.test.resource {
+  name = "p"
+}
+
+mock.test.resource {
+  name = "q"
+}
+"#;
+    std::fs::write(temp.path().join("main.crn"), source).unwrap();
+
+    let diagnostics = engine.analyze_with_filename(
+        &create_document(source),
+        Some("main.crn"),
+        Some(temp.path()),
+    );
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("identity is derived from mutable attributes")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].range.start.line, 6);
+    assert_eq!(matching[1].range.start.line, 10);
+}
+
+#[test]
+fn attribute_derived_identity_diagnostics_ignore_commented_resource_blocks() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let temp = tempfile::tempdir().unwrap();
+    let source = r#"# mock.test.resource {
+#   name = "commented"
+# }
+
+mock.test.resource {
+  name = "p"
+}
+
+mock.test.resource {
+  name = "q"
+}
+"#;
+    std::fs::write(temp.path().join("main.crn"), source).unwrap();
+
+    let diagnostics = engine.analyze_with_filename(
+        &create_document(source),
+        Some("main.crn"),
+        Some(temp.path()),
+    );
+    let matching = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("identity is derived from mutable attributes")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(matching.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert_eq!(matching[0].range.start.line, 4);
+    assert_eq!(matching[1].range.start.line, 8);
+}
+
+#[test]
+fn missing_provider_schema_suppresses_attribute_derived_identity_conflict() {
+    let engine = DiagnosticEngine::new(
+        std::sync::Arc::new(SchemaRegistry::new()),
+        vec![],
+        std::sync::Arc::new(vec![]),
+    );
+    let source = r#"awscc.iam.role {
+  role_name = "one"
+}
+
+awscc.iam.role {
+  role_name = "two"
+}
+"#;
+    let diagnostics = engine.analyze(&create_document(source), None);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("has no loaded schema")),
+        "the existing missing-schema diagnostic must still fire: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics.iter().all(|diagnostic| !diagnostic
+            .message
+            .contains("identity is derived from mutable attributes")),
+        "a missing schema must not also produce the identity-basis diagnostic: {diagnostics:#?}"
+    );
+}
+
 #[test]
 fn block_name_not_flagged_as_unknown() {
     let engine = test_engine();
@@ -3497,7 +3782,7 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
         }
     }
 
-    fn composition(binding: &str, call_binding: &str) -> Composition {
+    fn composition(binding: &'static str, call_binding: &str) -> Composition {
         let call = CompositionCall {
             module_name: "missing".to_string(),
             binding: Some(call_binding.to_string()),
@@ -3506,7 +3791,9 @@ fn composition_diagnostic_does_not_fall_back_to_unrelated_first_call() {
             module_directory: None,
         };
         Composition {
-            id: ResourceId::with_identity("_virtual", binding),
+            id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                "_virtual", binding,
+            )),
             signature: Signature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),

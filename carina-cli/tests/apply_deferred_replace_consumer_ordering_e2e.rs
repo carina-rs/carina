@@ -151,7 +151,13 @@ provider mock {}
 }
 
 fn mock_resource(name: &str, binding: &str) -> Resource {
-    Resource::with_provider("mock", "test.resource", name, None).with_binding(binding)
+    Resource::with_provider(
+        "mock",
+        "test.resource",
+        ResourceIdentity::try_from(name.to_string()).unwrap(),
+        None,
+    )
+    .with_binding(binding)
 }
 
 fn string(value: &str) -> Value {
@@ -159,9 +165,7 @@ fn string(value: &str) -> Value {
 }
 
 fn identity(value: &str) -> ResourceIdentity {
-    ResourceId::with_identity("test.resource", value)
-        .identity
-        .expect("fixture identity is non-empty")
+    ResourceIdentity::try_from(value.to_string()).unwrap()
 }
 
 fn state_not_found(resource: &Resource) -> CurrentStateEntry {

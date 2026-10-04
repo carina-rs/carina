@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::parser::{TypeExpr, ValidateExpr};
 
-use super::{AccessPath, DeferredValue, ResourceId, Value};
+use super::{AccessPath, DeferredValue, ResolvedResourceId, Value};
 
 /// How a [`Composition`]'s attribute is produced from the rest of the
 /// IR.
@@ -449,7 +449,7 @@ impl Eq for CompositionProvenance {}
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Composition {
-    pub id: ResourceId,
+    pub id: ResolvedResourceId,
     /// I/O surface of this composition: resolved call-site arguments
     /// + resolved module-output attributes. See [`Signature`].
     #[serde(default, flatten)]
@@ -501,7 +501,7 @@ impl Composition {
 mod tests {
     use super::*;
     use crate::parser::{CompareOp, ValidateExpr};
-    use crate::resource::ConcreteValue;
+    use crate::resource::{ConcreteValue, ResourceId};
 
     #[test]
     fn equality_ignores_provenance_but_compares_composition_fields() {
@@ -516,7 +516,7 @@ mod tests {
             Box::new(CompositionProvenance::expanded(call.clone(), call))
         };
         let left = Composition {
-            id: ResourceId::with_identity("_virtual", "call"),
+            id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "call")),
             signature: Signature {
                 arguments: IndexMap::new(),
                 attributes: IndexMap::new(),
@@ -703,7 +703,7 @@ mod tests {
             message: "password must contain at least 12 characters".to_string(),
         };
         let composition = Composition {
-            id: ResourceId::with_identity("_virtual", "secure"),
+            id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "secure")),
             signature: Signature {
                 arguments: IndexMap::from([(
                     "password".to_string(),

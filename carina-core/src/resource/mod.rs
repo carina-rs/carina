@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -40,10 +41,26 @@ impl<'a> EnumAttr<'a> {
 /// Opaque resource identity.
 ///
 /// Identity is independent from any schema `name` attribute. Empty
-/// strings are not valid identities; callers that do not yet have an
-/// identity must represent that as `None` on [`ResourceId`].
+/// strings are not valid identities.
+///
+/// Runtime strings must be validated before they can enter an
+/// identity-taking constructor:
+///
+/// ```compile_fail
+/// use carina_core::resource::ResourceId;
+///
+/// let identity = String::from("runtime-identity");
+/// let _ = ResourceId::with_identity("test.Resource", identity);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResourceIdentity(String);
+
+/// Error returned when a runtime value cannot be used as a resource identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ResourceIdentityError {
+    #[error("resource identity cannot be empty")]
+    Empty,
+}
 
 impl ResourceIdentity {
     pub(crate) fn new(s: impl Into<String>) -> Self {
@@ -54,6 +71,24 @@ impl ResourceIdentity {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl From<&'static str> for ResourceIdentity {
+    fn from(value: &'static str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for ResourceIdentity {
+    type Error = ResourceIdentityError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.is_empty() {
+            Err(ResourceIdentityError::Empty)
+        } else {
+            Ok(Self(value))
+        }
     }
 }
 
@@ -72,12 +107,84 @@ impl Serialize for ResourceIdentity {
 impl<'de> Deserialize<'de> for ResourceIdentity {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
-        if s.is_empty() {
-            return Err(serde::de::Error::custom(
-                "resource identity cannot be empty",
-            ));
+        Self::try_from(s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Process-local identity for a resource whose persistent identity has not
+/// been assigned yet.
+///
+/// The token deliberately has no public constructor, string projection,
+/// `Display`, or serde implementation. It participates only in equality and
+/// hashing while the resource remains in memory.
+#[derive(Debug)]
+struct PendingTokenMarker {
+    _value: u8,
+}
+
+#[derive(Clone)]
+pub struct PendingToken(Arc<PendingTokenMarker>);
+
+impl PendingToken {
+    fn new() -> Self {
+        Self(Arc::new(PendingTokenMarker { _value: 0 }))
+    }
+}
+
+impl PartialEq for PendingToken {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for PendingToken {}
+
+impl Hash for PendingToken {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::ptr::hash(Arc::as_ptr(&self.0), state);
+    }
+}
+
+impl fmt::Debug for PendingToken {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("PendingToken")
+    }
+}
+
+/// Whether a resource identity is still process-local or has been resolved to
+/// its persistent value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ResourceIdentityState {
+    Pending(PendingToken),
+    Resolved(ResourceIdentity),
+}
+
+impl ResourceIdentityState {
+    fn pending() -> Self {
+        Self::Pending(PendingToken::new())
+    }
+}
+
+impl Default for ResourceIdentityState {
+    fn default() -> Self {
+        Self::pending()
+    }
+}
+
+impl Serialize for ResourceIdentityState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Pending(_) => Err(serde::ser::Error::custom(
+                "pending resource identity cannot be serialized",
+            )),
+            Self::Resolved(identity) => identity.serialize(serializer),
         }
-        Ok(Self(s))
+    }
+}
+
+impl<'de> Deserialize<'de> for ResourceIdentityState {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        ResourceIdentity::deserialize(deserializer).map(Self::Resolved)
     }
 }
 
@@ -110,10 +217,10 @@ pub struct ResourceId {
     pub provider: String,
     /// Resource type (e.g., "s3.Bucket", "ec2.Instance")
     pub resource_type: String,
-    /// Resource identity. `None` means the parser has not assigned one
-    /// yet, which is only valid before the resolver boundary.
+    /// Resource identity state. Pending tokens are process-local and cannot be
+    /// serialized.
     #[serde(default, alias = "name")]
-    pub identity: Option<ResourceIdentity>,
+    identity: ResourceIdentityState,
     /// Binding name of the provider instance this resource is routed
     /// to. `None` resolves to the kind's default instance.
     /// Hash/Eq include the field so two resources differing only in
@@ -123,17 +230,25 @@ pub struct ResourceId {
 }
 
 impl ResourceId {
-    pub fn new(resource_type: impl Into<String>, identity: Option<ResourceIdentity>) -> Self {
+    pub fn pending(resource_type: impl Into<String>) -> Self {
         Self {
             provider: String::new(),
             resource_type: resource_type.into(),
-            identity,
+            identity: ResourceIdentityState::pending(),
             provider_instance: None,
         }
     }
 
-    pub fn with_identity(resource_type: impl Into<String>, identity: impl Into<String>) -> Self {
-        Self::new(resource_type, Some(ResourceIdentity::new(identity)))
+    pub fn with_identity(
+        resource_type: impl Into<String>,
+        identity: impl Into<ResourceIdentity>,
+    ) -> Self {
+        Self {
+            provider: String::new(),
+            resource_type: resource_type.into(),
+            identity: ResourceIdentityState::Resolved(identity.into()),
+            provider_instance: None,
+        }
     }
 
     /// Construct a `ResourceId` with explicit routing.
@@ -145,16 +260,15 @@ impl ResourceId {
     /// a sibling 3-arg constructor that silently sets `None`) forces
     /// every call site to consciously pick a routing target — the
     /// hidden default that caused carina#3038 is no longer expressible.
-    pub fn with_provider(
+    pub fn pending_with_provider(
         provider: impl Into<String>,
         resource_type: impl Into<String>,
-        identity: Option<ResourceIdentity>,
         provider_instance: Option<String>,
     ) -> Self {
         Self {
             provider: provider.into(),
             resource_type: resource_type.into(),
-            identity,
+            identity: ResourceIdentityState::pending(),
             provider_instance,
         }
     }
@@ -162,41 +276,62 @@ impl ResourceId {
     pub fn with_provider_identity(
         provider: impl Into<String>,
         resource_type: impl Into<String>,
-        identity: impl Into<String>,
+        identity: impl Into<ResourceIdentity>,
         provider_instance: Option<String>,
     ) -> Self {
-        Self::with_provider(
-            provider,
-            resource_type,
-            Some(ResourceIdentity::new(identity)),
+        Self {
+            provider: provider.into(),
+            resource_type: resource_type.into(),
+            identity: ResourceIdentityState::Resolved(identity.into()),
             provider_instance,
-        )
-    }
-
-    /// Construct from state/WIT strings where an empty name means "no identity".
-    pub fn with_provider_name_compat(
-        provider: impl Into<String>,
-        resource_type: impl Into<String>,
-        name: &str,
-        provider_instance: Option<String>,
-    ) -> Self {
-        if name.is_empty() {
-            Self::with_provider(provider, resource_type, None, provider_instance)
-        } else {
-            Self::with_provider_identity(provider, resource_type, name, provider_instance)
         }
     }
 
     pub fn identity_str(&self) -> Option<&str> {
-        self.identity.as_ref().map(ResourceIdentity::as_str)
+        match &self.identity {
+            ResourceIdentityState::Pending(_) => None,
+            ResourceIdentityState::Resolved(identity) => Some(identity.as_str()),
+        }
     }
 
-    pub fn identity_or_empty(&self) -> &str {
-        self.identity_str().unwrap_or("")
+    pub fn identity(&self) -> Option<&ResourceIdentity> {
+        match &self.identity {
+            ResourceIdentityState::Pending(_) => None,
+            ResourceIdentityState::Resolved(identity) => Some(identity),
+        }
+    }
+
+    pub fn identity_state(&self) -> &ResourceIdentityState {
+        &self.identity
+    }
+
+    pub fn identity_display(&self) -> ResourceIdentityDisplay<'_> {
+        ResourceIdentityDisplay(&self.identity)
     }
 
     pub fn set_identity(&mut self, identity: ResourceIdentity) {
-        self.identity = Some(identity);
+        self.identity = ResourceIdentityState::Resolved(identity);
+    }
+
+    fn instantiate_pending(&self) -> Self {
+        match &self.identity {
+            ResourceIdentityState::Pending(_) => Self {
+                provider: self.provider.clone(),
+                resource_type: self.resource_type.clone(),
+                identity: ResourceIdentityState::pending(),
+                provider_instance: self.provider_instance.clone(),
+            },
+            ResourceIdentityState::Resolved(_) => self.clone(),
+        }
+    }
+
+    fn instantiate_with_identity(&self, identity: ResourceIdentity) -> Self {
+        Self {
+            provider: self.provider.clone(),
+            resource_type: self.resource_type.clone(),
+            identity: ResourceIdentityState::Resolved(identity),
+            provider_instance: self.provider_instance.clone(),
+        }
     }
 
     /// Returns the display type including provider prefix if available
@@ -225,6 +360,18 @@ impl ResourceId {
     }
 }
 
+/// Display-only projection of a resource identity state.
+pub struct ResourceIdentityDisplay<'a>(&'a ResourceIdentityState);
+
+impl Display for ResourceIdentityDisplay<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            ResourceIdentityState::Pending(_) => f.write_str("<pending>"),
+            ResourceIdentityState::Resolved(identity) => identity.fmt(f),
+        }
+    }
+}
+
 /// Human-facing display wrapper for [`ResourceId`].
 ///
 /// Construct with [`ResourceId::human`]; renders via `Display` as
@@ -241,24 +388,30 @@ pub struct ResourceIdDisplay<'a>(&'a ResourceId);
 impl std::fmt::Display for ResourceIdDisplay<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let id = self.0;
-        match (id.provider.is_empty(), id.identity_str()) {
-            (true, Some(identity)) => write!(f, "{} {}", id.resource_type, identity),
-            (true, None) => write!(f, "{}", id.resource_type),
-            (false, Some(identity)) => {
-                write!(f, "{}.{} {}", id.provider, id.resource_type, identity)
-            }
-            (false, None) => write!(f, "{}.{}", id.provider, id.resource_type),
+        match id.provider.is_empty() {
+            true => write!(f, "{} {}", id.resource_type, id.identity_display()),
+            false => write!(
+                f,
+                "{}.{} {}",
+                id.provider,
+                id.resource_type,
+                id.identity_display()
+            ),
         }
     }
 }
 
 impl std::fmt::Display for ResourceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match (self.provider.is_empty(), self.identity_str()) {
-            (true, Some(id)) => write!(f, "{}.{}", self.resource_type, id),
-            (true, None) => write!(f, "{}", self.resource_type),
-            (false, Some(id)) => write!(f, "{}.{}.{}", self.provider, self.resource_type, id),
-            (false, None) => write!(f, "{}.{}", self.provider, self.resource_type),
+        match self.provider.is_empty() {
+            true => write!(f, "{}.{}", self.resource_type, self.identity_display()),
+            false => write!(
+                f,
+                "{}.{}.{}",
+                self.provider,
+                self.resource_type,
+                self.identity_display()
+            ),
         }
     }
 }
@@ -271,21 +424,41 @@ impl std::fmt::Display for ResourceId {
 pub struct ResolvedResourceId(ResourceId);
 
 impl ResolvedResourceId {
-    /// Construct from a `ResourceId`, panicking if identity is `None`.
+    pub fn with_identity(
+        resource_type: impl Into<String>,
+        identity: impl Into<ResourceIdentity>,
+    ) -> Self {
+        Self(ResourceId::with_identity(resource_type, identity))
+    }
+
+    pub fn with_provider_identity(
+        provider: impl Into<String>,
+        resource_type: impl Into<String>,
+        identity: impl Into<ResourceIdentity>,
+        provider_instance: Option<String>,
+    ) -> Self {
+        Self(ResourceId::with_provider_identity(
+            provider,
+            resource_type,
+            identity,
+            provider_instance,
+        ))
+    }
+
+    /// Construct from a `ResourceId`, panicking if identity is pending.
     pub fn new(id: ResourceId) -> Self {
         assert!(
-            id.identity.is_some(),
+            matches!(id.identity_state(), ResourceIdentityState::Resolved(_)),
             "ResolvedResourceId requires identity"
         );
         Self(id)
     }
 
-    /// Try to construct; returns `None` if identity is absent.
+    /// Try to construct; returns `None` if identity is pending.
     pub fn try_new(id: ResourceId) -> Option<Self> {
-        if id.identity.is_some() {
-            Some(Self(id))
-        } else {
-            None
+        match id.identity_state() {
+            ResourceIdentityState::Pending(_) => None,
+            ResourceIdentityState::Resolved(_) => Some(Self(id)),
         }
     }
 
@@ -301,19 +474,22 @@ impl ResolvedResourceId {
 
     /// The identity string (always present).
     pub fn identity_str(&self) -> &str {
-        self.0.identity_str().unwrap()
+        match self.0.identity_state() {
+            ResourceIdentityState::Pending(_) => {
+                unreachable!("ResolvedResourceId requires identity")
+            }
+            ResourceIdentityState::Resolved(identity) => identity.as_str(),
+        }
     }
 
     /// The resolved identity (always present).
     pub fn identity(&self) -> &ResourceIdentity {
-        self.0
-            .identity
-            .as_ref()
-            .expect("ResolvedResourceId requires identity")
-    }
-
-    pub fn identity_or_empty(&self) -> &str {
-        self.identity_str()
+        match self.0.identity_state() {
+            ResourceIdentityState::Pending(_) => {
+                unreachable!("ResolvedResourceId requires identity")
+            }
+            ResourceIdentityState::Resolved(identity) => identity,
+        }
     }
 
     pub fn display_type(&self) -> String {
@@ -322,6 +498,10 @@ impl ResolvedResourceId {
 
     pub fn human(&self) -> ResourceIdDisplay<'_> {
         self.0.human()
+    }
+
+    pub fn identity_display(&self) -> ResourceIdentityDisplay<'_> {
+        self.0.identity_display()
     }
 
     pub fn provider(&self) -> &str {
@@ -334,6 +514,10 @@ impl ResolvedResourceId {
 
     pub fn provider_instance(&self) -> Option<&str> {
         self.0.provider_instance.as_deref()
+    }
+
+    pub(crate) fn instantiate_with_identity(&self, identity: ResourceIdentity) -> Self {
+        Self(self.0.instantiate_with_identity(identity))
     }
 }
 
@@ -383,6 +567,12 @@ impl AsRef<ResourceId> for ResolvedResourceId {
     }
 }
 
+impl Borrow<ResourceId> for ResolvedResourceId {
+    fn borrow(&self) -> &ResourceId {
+        self.as_inner()
+    }
+}
+
 /// A [`Resource`] whose identity has been resolved.
 ///
 /// Downstream effect consumers hold this type to guarantee at compile
@@ -392,37 +582,68 @@ impl AsRef<ResourceId> for ResolvedResourceId {
 /// ```compile_fail
 /// use carina_core::resource::{ResolvedResource, Resource};
 ///
-/// let resource = Resource::new("test", "");
+/// let resource = Resource::pending("test");
 /// let _ = ResolvedResource(resource);
 /// ```
 ///
 /// ```compile_fail
 /// use carina_core::resource::{ResolvedResource, Resource};
 ///
-/// let resource = Resource::new("test", "");
+/// let resource = Resource::pending("test");
 /// let _: ResolvedResource = resource.into();
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "Resource", into = "Resource")]
 pub struct ResolvedResource(Resource);
 
+/// A resource reached a resolved-only pipeline boundary before its identity
+/// was assigned.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("resource '{id}' still has a pending identity")]
+pub struct PendingResourceIdentityError {
+    id: ResourceId,
+}
+
 impl ResolvedResource {
-    /// Construct from a [`Resource`], panicking if identity is `None`.
+    /// Construct a resource from an already-resolved id.
+    pub fn from_id(id: ResolvedResourceId) -> Self {
+        Self(Resource::from_id(id.into_inner()))
+    }
+
+    /// Construct from a [`Resource`], panicking if identity is pending.
     pub fn new(resource: Resource) -> Self {
         assert!(
-            resource.id.identity.is_some(),
+            matches!(
+                resource.id.identity_state(),
+                ResourceIdentityState::Resolved(_)
+            ),
             "ResolvedResource requires identity"
         );
         Self(resource)
     }
 
-    /// Try to construct; returns `None` if identity is absent.
+    /// Try to construct; returns `None` if identity is pending.
     pub fn try_new(resource: Resource) -> Option<Self> {
-        if resource.id.identity.is_some() {
-            Some(Self(resource))
-        } else {
-            None
+        match resource.id.identity_state() {
+            ResourceIdentityState::Pending(_) => None,
+            ResourceIdentityState::Resolved(_) => Some(Self(resource)),
         }
+    }
+
+    /// Convert a whole resource collection at the pipeline boundary where
+    /// identity assignment is complete.
+    pub fn collect_resolved(
+        resources: impl IntoIterator<Item = Resource>,
+    ) -> Result<Vec<Self>, PendingResourceIdentityError> {
+        resources
+            .into_iter()
+            .map(|resource| match resource.id.identity_state() {
+                ResourceIdentityState::Pending(_) => {
+                    Err(PendingResourceIdentityError { id: resource.id })
+                }
+                ResourceIdentityState::Resolved(_) => Ok(Self(resource)),
+            })
+            .collect()
     }
 
     /// Borrow the inner [`Resource`].
@@ -438,6 +659,28 @@ impl ResolvedResource {
     /// Consume and return the inner [`Resource`].
     pub fn into_inner(self) -> Resource {
         self.0
+    }
+
+    pub fn identity(&self) -> &ResourceIdentity {
+        match self.0.id.identity_state() {
+            ResourceIdentityState::Pending(_) => {
+                unreachable!("ResolvedResource requires identity")
+            }
+            ResourceIdentityState::Resolved(identity) => identity,
+        }
+    }
+
+    pub fn identity_str(&self) -> &str {
+        self.identity().as_str()
+    }
+
+    pub fn resolved_id(&self) -> ResolvedResourceId {
+        ResolvedResourceId(self.0.id.clone())
+    }
+
+    /// Set an attribute without weakening the resolved-identity invariant.
+    pub fn set_attr(&mut self, key: impl Into<String>, value: Value) {
+        self.0.set_attr(key, value);
     }
 }
 
@@ -466,15 +709,6 @@ impl TryFrom<Resource> for ResolvedResource {
 impl AsRef<Resource> for ResolvedResource {
     fn as_ref(&self) -> &Resource {
         self.as_inner()
-    }
-}
-
-pub(crate) fn identity_if_present(identity: impl Into<String>) -> Option<ResourceIdentity> {
-    let identity = identity.into();
-    if identity.is_empty() {
-        None
-    } else {
-        Some(ResourceIdentity::new(identity))
     }
 }
 
@@ -2563,8 +2797,94 @@ pub struct Directives {
     pub provider_instance: Option<String>,
 }
 
-/// Source of a resource (root or from a module)
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// The full expansion scope of a module-owned resource.
+///
+/// `key` is an internal, collision-resistant path used only when grouping
+/// anonymous resources for identity validation. `display` retains the
+/// authored call form so diagnostics never expose synthetic instance hashes.
+#[derive(Debug, Clone)]
+pub struct ModuleInstanceScope {
+    key: String,
+    display: ModuleInstanceScopeDisplay,
+}
+
+#[derive(Debug, Clone)]
+enum ModuleInstanceScopeDisplay {
+    Bound(String),
+    Anonymous(String),
+}
+
+impl ModuleInstanceScope {
+    pub(crate) fn for_call(
+        module_name: &str,
+        binding: Option<&str>,
+        instance_prefix: &str,
+    ) -> Self {
+        let display = match binding {
+            Some(binding) => ModuleInstanceScopeDisplay::Bound(binding.to_string()),
+            None => ModuleInstanceScopeDisplay::Anonymous(module_name.to_string()),
+        };
+        Self {
+            key: instance_prefix.to_string(),
+            display,
+        }
+    }
+
+    fn bound(instance: &str) -> Self {
+        Self {
+            key: instance.to_string(),
+            display: ModuleInstanceScopeDisplay::Bound(instance.to_string()),
+        }
+    }
+
+    pub(crate) fn with_child(&self, child: &Self) -> Self {
+        let display = match (&self.display, &child.display) {
+            (
+                ModuleInstanceScopeDisplay::Bound(parent),
+                ModuleInstanceScopeDisplay::Bound(child),
+            ) => ModuleInstanceScopeDisplay::Bound(format!("{parent}.{child}")),
+            (_, child) => child.clone(),
+        };
+        Self {
+            key: format!("{}.{}", self.key, child.key),
+            display,
+        }
+    }
+
+    pub(crate) fn remap_prefix(&self, from: &str, to: &str) -> Self {
+        let key = if self.key == from {
+            to.to_string()
+        } else if let Some(rest) = self.key.strip_prefix(&format!("{from}.")) {
+            format!("{to}.{rest}")
+        } else {
+            self.key.clone()
+        };
+        Self {
+            key,
+            display: self.display.clone(),
+        }
+    }
+
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub(crate) fn description(&self) -> String {
+        match &self.display {
+            ModuleInstanceScopeDisplay::Bound(path) => format!("module instance '{path}'"),
+            ModuleInstanceScopeDisplay::Anonymous(module_name) => {
+                format!("an anonymous call of module '{module_name}'")
+            }
+        }
+    }
+}
+
+/// Source of a resource (root or from a module).
+///
+/// `scope` is validation-only expansion provenance. It is excluded from
+/// serialization and from this type's equality/hash semantics so adding the
+/// full nested path changes only anonymous-identity conflict grouping.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ModuleSource {
     /// Resource defined at the root level
     Root,
@@ -2574,7 +2894,49 @@ pub enum ModuleSource {
         name: String,
         /// Instance binding name (e.g., "web")
         instance: String,
+        /// Full nested instance path plus its authored diagnostic form.
+        #[serde(skip)]
+        scope: Option<ModuleInstanceScope>,
     },
+}
+
+impl PartialEq for ModuleSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Root, Self::Root) => true,
+            (
+                Self::Module {
+                    name: left_name,
+                    instance: left_instance,
+                    ..
+                },
+                Self::Module {
+                    name: right_name,
+                    instance: right_instance,
+                    ..
+                },
+            ) => left_name == right_name && left_instance == right_instance,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ModuleSource {}
+
+impl Hash for ModuleSource {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Match the discriminant hashing emitted by the former derived `Hash`
+        // implementation byte-for-byte; fallback anonymous identities include
+        // `ModuleSource` in their input and therefore depend on this detail.
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Root => {}
+            Self::Module { name, instance, .. } => {
+                name.hash(state);
+                instance.hash(state);
+            }
+        }
+    }
 }
 
 impl ModuleSource {
@@ -2583,6 +2945,32 @@ impl ModuleSource {
         Self::Module {
             name: name.into(),
             instance: instance.into(),
+            scope: None,
+        }
+    }
+
+    pub(crate) fn expanded_module(
+        name: impl Into<String>,
+        instance: impl Into<String>,
+        scope: ModuleInstanceScope,
+    ) -> Self {
+        Self::Module {
+            name: name.into(),
+            instance: instance.into(),
+            scope: Some(scope),
+        }
+    }
+
+    pub(crate) fn identity_scope(&self) -> Option<ModuleInstanceScope> {
+        match self {
+            Self::Root => None,
+            Self::Module {
+                instance, scope, ..
+            } => Some(
+                scope
+                    .clone()
+                    .unwrap_or_else(|| ModuleInstanceScope::bound(instance)),
+            ),
         }
     }
 
@@ -2645,9 +3033,9 @@ pub struct Resource {
 }
 
 impl Resource {
-    pub fn new(resource_type: impl Into<String>, name: impl Into<String>) -> Self {
+    pub fn from_id(id: ResourceId) -> Self {
         Self {
-            id: ResourceId::new(resource_type, identity_if_present(name)),
+            id,
             attributes: IndexMap::new(),
             directives: Directives::default(),
             prefixes: HashMap::new(),
@@ -2656,6 +3044,14 @@ impl Resource {
             module_source: None,
             quoted_string_attrs: HashSet::new(),
         }
+    }
+
+    pub fn pending(resource_type: impl Into<String>) -> Self {
+        Self::from_id(ResourceId::pending(resource_type))
+    }
+
+    pub fn new(resource_type: impl Into<String>, identity: impl Into<ResourceIdentity>) -> Self {
+        Self::from_id(ResourceId::with_identity(resource_type, identity))
     }
 
     /// The resource's id wrapped as a [`PersistentId`] — i.e., an id
@@ -2671,24 +3067,39 @@ impl Resource {
     pub fn with_provider(
         provider: impl Into<String>,
         resource_type: impl Into<String>,
-        name: impl Into<String>,
+        identity: impl Into<ResourceIdentity>,
         provider_instance: Option<String>,
     ) -> Self {
-        Self {
-            id: ResourceId::with_provider(
-                provider,
-                resource_type,
-                identity_if_present(name),
-                provider_instance,
-            ),
-            attributes: IndexMap::new(),
-            directives: Directives::default(),
-            prefixes: HashMap::new(),
-            binding: None,
-            dependency_bindings: BTreeSet::new(),
-            module_source: None,
-            quoted_string_attrs: HashSet::new(),
-        }
+        Self::from_id(ResourceId::with_provider_identity(
+            provider,
+            resource_type,
+            identity,
+            provider_instance,
+        ))
+    }
+
+    pub fn pending_with_provider(
+        provider: impl Into<String>,
+        resource_type: impl Into<String>,
+        provider_instance: Option<String>,
+    ) -> Self {
+        Self::from_id(ResourceId::pending_with_provider(
+            provider,
+            resource_type,
+            provider_instance,
+        ))
+    }
+
+    pub(crate) fn instantiate(&self) -> Self {
+        let mut resource = self.clone();
+        resource.id = self.id.instantiate_pending();
+        resource
+    }
+
+    pub(crate) fn instantiate_with_identity(&self, identity: ResourceIdentity) -> Self {
+        let mut resource = self.clone();
+        resource.id = self.id.instantiate_with_identity(identity);
+        resource
     }
 
     /// Returns the attributes projected to a `HashMap<String, Value>`.

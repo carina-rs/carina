@@ -32,7 +32,7 @@ awscc.ec2.Vpc {
 }
 ```
 
-The resource type follows the pattern `<provider>.<service>.<resource_type>`. Carina derives the resource's identity from its `name` tag or other identifying attributes.
+The resource type follows the pattern `<provider>.<service>.<resource_type>`. Carina derives an anonymous resource's identity from configured create-only or provider identity attributes; when none are set, it uses the declaration's attributes for the single-resource fallback.
 
 ## Named resources with `let`
 
@@ -52,7 +52,7 @@ awscc.ec2.Subnet {
 
 The `let` binding gives the resource a name (`vpc`) so you can reference its attributes (like `vpc.vpc_id`) from other resources. Carina automatically determines the dependency order -- the subnet will be created after the VPC.
 
-Use anonymous resources when the binding is unused. Unnecessary `let` bindings add noise.
+Use anonymous resources when the binding is unused. Unnecessary `let` bindings add noise. However, two or more anonymous resources of the same type in one scope must each set a create-only or identity attribute; otherwise, give them `let` bindings so their identities stay stable.
 
 ## Attribute types
 

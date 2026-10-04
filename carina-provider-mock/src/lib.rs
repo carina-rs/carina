@@ -65,11 +65,10 @@ impl Drop for ReadOutcomeGuard {
 }
 
 impl ActiveUpdateGuard {
-    fn enter(id: &ResourceId) -> Self {
+    fn enter(resource: String) -> Self {
         let active = ACTIVE_UPDATES.fetch_add(1, Ordering::SeqCst) + 1;
         MAX_ACTIVE_UPDATES.fetch_max(active, Ordering::SeqCst);
         write_max_active();
-        let resource = MockProvider::resource_key(id);
         append_update_trace("start", &resource, Some(active));
         Self { resource }
     }
@@ -145,8 +144,17 @@ impl MockProvider {
         fs::write(&self.state_file, content)
     }
 
-    fn resource_key(id: &ResourceId) -> String {
-        format!("{}.{}", id.resource_type, id.identity_or_empty())
+    fn resource_key(id: &ResourceId) -> Option<String> {
+        id.identity_str()
+            .map(|identity| format!("{}.{}", id.resource_type, identity))
+    }
+
+    fn resolved_resource_key(id: &ResourceId) -> ProviderResult<String> {
+        Self::resource_key(id).ok_or_else(|| {
+            ProviderError::invalid_input(format!(
+                "mock provider operation requires a resolved resource identity for {id}"
+            ))
+        })
     }
 
     fn partial_create_config_for(&self, id: &ResourceId) -> Option<&PartialConfig> {
@@ -160,37 +168,38 @@ impl MockProvider {
     }
 
     fn partial_config_matches(config: &PartialConfig, id: &ResourceId) -> bool {
-        let full = format!(
-            "{}.{}.{}",
-            id.provider,
-            id.resource_type,
-            id.identity_or_empty()
-        );
-        let short = Self::resource_key(id);
+        let Some(identity) = id.identity_str() else {
+            return false;
+        };
+        let full = format!("{}.{}.{}", id.provider, id.resource_type, identity);
+        let Some(short) = Self::resource_key(id) else {
+            return false;
+        };
         config.resource_id_pattern == "*"
             || config.resource_id_pattern == full
             || config.resource_id_pattern == short
     }
 
-    fn append_delete_log(path: PathBuf, id: &ResourceId) -> Result<(), std::io::Error> {
+    fn append_delete_log(path: PathBuf, key: &str) -> Result<(), std::io::Error> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        file.write_all(format!("{}\n", Self::resource_key(id)).as_bytes())
+        file.write_all(format!("{key}\n").as_bytes())
     }
 
-    fn append_op_log(path: PathBuf, op: &str, id: &ResourceId) -> Result<(), std::io::Error> {
+    fn append_op_log(path: PathBuf, op: &str, key: &str) -> Result<(), std::io::Error> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        file.write_all(format!("{op} {}\n", Self::resource_key(id)).as_bytes())
+        file.write_all(format!("{op} {key}\n").as_bytes())
     }
 
     fn append_op_log_if_configured(op: &str, id: &ResourceId) -> ProviderResult<()> {
         if let Some(path) = env::var_os("CARINA_MOCK_OP_LOG").map(PathBuf::from) {
-            Self::append_op_log(path, op, id).map_err(|e| {
+            let key = Self::resolved_resource_key(id)?;
+            Self::append_op_log(path, op, &key).map_err(|e| {
                 ProviderError::internal("Failed to append operation log").with_cause(e)
             })?;
         }
@@ -199,7 +208,7 @@ impl MockProvider {
 
     fn create_fail_error_for(id: &ResourceId) -> Option<ProviderError> {
         let target = env::var("CARINA_MOCK_CREATE_FAIL_FOR").ok()?;
-        let key = Self::resource_key(id);
+        let key = Self::resource_key(id)?;
         (target == key).then(|| {
             ProviderError::internal(format!(
                 "CARINA_MOCK_CREATE_FAIL_FOR requested create failure for {key}"
@@ -209,13 +218,9 @@ impl MockProvider {
 
     fn delete_fail_error_for(id: &ResourceId, identifier: &str) -> Option<ProviderError> {
         let target = env::var("CARINA_MOCK_DELETE_FAIL_FOR").ok()?;
-        let full = format!(
-            "{}.{}.{}",
-            id.provider,
-            id.resource_type,
-            id.identity_or_empty()
-        );
-        let key = Self::resource_key(id);
+        let identity = id.identity_str()?;
+        let full = format!("{}.{}.{}", id.provider, id.resource_type, identity);
+        let key = Self::resource_key(id)?;
         if target != "*" && target != full && target != key {
             return None;
         }
@@ -230,9 +235,13 @@ impl MockProvider {
     }
 
     fn test_resource_identifier(id: &ResourceId, name: Option<&str>) -> Option<String> {
-        (id.resource_type == "test.resource"
-            && env::var_os("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA").is_some())
-        .then(|| format!("{}-id", name.unwrap_or_else(|| id.identity_or_empty())))
+        if id.resource_type != "test.resource"
+            || env::var_os("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA").is_none()
+        {
+            return None;
+        }
+        name.or_else(|| id.identity_str())
+            .map(|identity| format!("{identity}-id"))
     }
 
     fn populate_test_resource_identifier_json(
@@ -270,7 +279,7 @@ impl MockProvider {
 
     fn delete_delay_for(id: &ResourceId) -> Option<Duration> {
         let target = env::var("CARINA_MOCK_DELETE_DELAY_MS_FOR").ok()?;
-        if target != Self::resource_key(id) {
+        if Some(target) != Self::resource_key(id) {
             return None;
         }
         env::var("CARINA_MOCK_DELETE_DELAY_MS")
@@ -282,7 +291,7 @@ impl MockProvider {
 
     fn read_delay_for(id: &ResourceId) -> Option<Duration> {
         let target = env::var("CARINA_MOCK_READ_DELAY_MS_FOR").ok()?;
-        if target != Self::resource_key(id) {
+        if Some(target) != Self::resource_key(id) {
             return None;
         }
         env::var("CARINA_MOCK_READ_DELAY_MS")
@@ -294,7 +303,7 @@ impl MockProvider {
 
     fn create_delay_for(id: &ResourceId) -> Option<Duration> {
         let target = env::var("CARINA_MOCK_CREATE_DELAY_MS_FOR").ok()?;
-        if target != Self::resource_key(id) {
+        if Some(target) != Self::resource_key(id) {
             return None;
         }
         env::var("CARINA_MOCK_CREATE_DELAY_MS")
@@ -333,7 +342,7 @@ impl MockProvider {
         }
 
         let mut states = self.load_states();
-        let key = Self::resource_key(&id);
+        let key = Self::resolved_resource_key(&id)?;
 
         let mut attrs: HashMap<String, serde_json::Value> = resource
             .attributes
@@ -487,7 +496,9 @@ impl Provider for MockProvider {
             }
 
             let states = self.load_states();
-            let key = Self::resource_key(&id);
+            let Some(key) = Self::resource_key(&id) else {
+                return Ok(State::not_found(id));
+            };
 
             let state = if let Some(attrs) = states.get(&key) {
                 let attributes: HashMap<String, Value> = attrs
@@ -530,7 +541,8 @@ impl Provider for MockProvider {
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
         Box::pin(async move {
-            let _active = ActiveUpdateGuard::enter(&id);
+            let key = Self::resolved_resource_key(&id)?;
+            let _active = ActiveUpdateGuard::enter(key.clone());
             if update_trace_path().is_some() {
                 // This test hook is coupled to the executor's continuous-refill loop:
                 // it dispatches every currently ready future that fits before polling
@@ -562,7 +574,6 @@ impl Provider for MockProvider {
             }
 
             let mut states = self.load_states();
-            let key = Self::resource_key(&id);
             let partial_update = self.partial_update_config_for(&id);
             let mut attrs: HashMap<String, serde_json::Value> = attributes
                 .iter()
@@ -606,6 +617,7 @@ impl Provider for MockProvider {
         let id = id.clone();
         let identifier = identifier.to_string();
         Box::pin(async move {
+            let key = Self::resolved_resource_key(&id)?;
             if let Some(err) = Self::delete_fail_error_for(&id, &identifier) {
                 return Err(err);
             }
@@ -616,13 +628,12 @@ impl Provider for MockProvider {
             }
 
             if let Some(path) = env::var_os("CARINA_MOCK_DELETE_LOG").map(PathBuf::from) {
-                Self::append_delete_log(path, &id).map_err(|e| {
+                Self::append_delete_log(path, &key).map_err(|e| {
                     ProviderError::internal("Failed to append delete log").with_cause(e)
                 })?;
             }
 
             let mut states = self.load_states();
-            let key = Self::resource_key(&id);
 
             states.remove(&key);
             self.save_states(&states)
@@ -733,8 +744,16 @@ mod tests {
         let first = ResourceId::with_provider_identity("mock", "test.resource", "first", None);
         let second = ResourceId::with_provider_identity("mock", "test.resource", "second", None);
 
-        MockProvider::append_delete_log(log_path.clone(), &first).unwrap();
-        MockProvider::append_delete_log(log_path.clone(), &second).unwrap();
+        MockProvider::append_delete_log(
+            log_path.clone(),
+            &MockProvider::resolved_resource_key(&first).unwrap(),
+        )
+        .unwrap();
+        MockProvider::append_delete_log(
+            log_path.clone(),
+            &MockProvider::resolved_resource_key(&second).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(
             fs::read_to_string(log_path).unwrap(),

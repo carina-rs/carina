@@ -4,12 +4,15 @@
 //! reconciling prefixed names with state, and computing anonymous resource identifiers.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 #[cfg(test)]
 use crate::parser::ProviderConfig;
 use crate::parser::StateBlockAddress;
-use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, Value};
-use crate::schema::SchemaRegistry;
+use crate::resource::{
+    ConcreteValue, DeferredValue, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
+};
+use crate::schema::{ResourceSchema, SchemaRegistry};
 use crate::validation::is_string_compatible_type;
 use crate::value::CanonicalizedProviderConfigs;
 
@@ -39,19 +42,19 @@ impl StateBlockClaims {
     }
 
     pub fn claims_from(&self, provider: &str, resource_type: &str, name: &str) -> bool {
-        if self.from.is_empty() {
-            return false;
-        }
-        self.from
-            .contains(&StateBlockAddress::new(provider, resource_type, name))
+        self.from.iter().any(|address| {
+            address.provider == provider
+                && address.resource_type == resource_type
+                && address.name_str() == name
+        })
     }
 
     pub fn claims_to(&self, provider: &str, resource_type: &str, name: &str) -> bool {
-        if self.to.is_empty() {
-            return false;
-        }
-        self.to
-            .contains(&StateBlockAddress::new(provider, resource_type, name))
+        self.to.iter().any(|address| {
+            address.provider == provider
+                && address.resource_type == resource_type
+                && address.name_str() == name
+        })
     }
 }
 
@@ -60,6 +63,340 @@ pub fn generate_random_suffix() -> String {
     let uuid = uuid::Uuid::new_v4();
     let hex = uuid.as_simple().to_string();
     hex[..8].to_string()
+}
+
+fn fallback_hash_dependency_bindings(
+    resource: &Resource,
+    known_bindings: &HashSet<String>,
+) -> std::collections::BTreeSet<String> {
+    let Some(crate::resource::ModuleSource::Module { instance, .. }) = &resource.module_source
+    else {
+        // Preserve the historical hash input byte-for-byte for root resources.
+        return resource.dependency_bindings.clone();
+    };
+
+    let instance_prefix = format!("{instance}.");
+    resource
+        .dependency_bindings
+        .iter()
+        .map(|binding| {
+            if binding.starts_with(&instance_prefix) {
+                return binding.clone();
+            }
+
+            let expanded = format!("{instance_prefix}{binding}");
+            if known_bindings.contains(&expanded) {
+                expanded
+            } else {
+                // Module arguments and outer-scope bindings are not owned by
+                // this module instance and retain their historical spelling.
+                binding.clone()
+            }
+        })
+        .collect()
+}
+
+/// Build the late fallback identity for an anonymous resource.
+///
+/// The formatted value always contains at least the resource type and hash, so
+/// this constructor can establish non-emptiness without a fallible caller-side
+/// conversion.
+pub fn fallback_anonymous_identity(
+    resource: &Resource,
+    known_bindings: &HashSet<String>,
+) -> ResourceIdentity {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    resource.id.provider.hash(&mut hasher);
+    resource.id.resource_type.hash(&mut hasher);
+    resource.id.provider_instance.hash(&mut hasher);
+    resource.module_source.hash(&mut hasher);
+    for (key, value) in &resource.attributes {
+        key.hash(&mut hasher);
+        format!("{value:?}").hash(&mut hasher);
+    }
+    resource.directives.force_delete.hash(&mut hasher);
+    resource.directives.create_before_destroy.hash(&mut hasher);
+    resource.directives.prevent_destroy.hash(&mut hasher);
+    resource.directives.depends_on.hash(&mut hasher);
+    resource.directives.provider_instance.hash(&mut hasher);
+    for (key, value) in BTreeMap::from_iter(resource.prefixes.iter()) {
+        key.hash(&mut hasher);
+        value.hash(&mut hasher);
+    }
+    fallback_hash_dependency_bindings(resource, known_bindings).hash(&mut hasher);
+    let hash = format!("{:08x}", hasher.finish() & 0xffff_ffff);
+
+    let provider_snake = resource
+        .id
+        .provider
+        .split('.')
+        .map(crate::parser::pascal_to_snake)
+        .collect::<Vec<_>>()
+        .join("_");
+    let type_snake = resource
+        .id
+        .resource_type
+        .split('.')
+        .map(crate::parser::pascal_to_snake)
+        .collect::<Vec<_>>()
+        .join("_");
+    let bare_identifier = if provider_snake.is_empty() {
+        format!("{type_snake}_{hash}")
+    } else {
+        format!("{provider_snake}_{type_snake}_{hash}")
+    };
+    let identifier = match &resource.module_source {
+        Some(crate::resource::ModuleSource::Module { instance, .. }) => {
+            format!("{instance}.{bare_identifier}")
+        }
+        _ => bare_identifier,
+    };
+
+    ResourceIdentity::new(identifier)
+}
+
+/// Whether an anonymous resource's generated identity is anchored in schema
+/// fields that cannot change in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnonymousIdentityBasis {
+    /// At least one configured create-only or schema identity attribute is
+    /// set, so the normal identifier hash is based on immutable input.
+    Stable,
+    /// No stable schema attribute is set (or no schema is available), so the
+    /// identifier would be derived from mutable user attributes.
+    AttributeDerived,
+}
+
+/// Return the immutable schema inputs that participate in an anonymous
+/// resource's standard identity hash.
+///
+/// This is the single definition of both "stable identity basis" and the
+/// bytes hashed for that basis. An unresolved `<attribute>_prefix` is treated
+/// identically to the same prefix after [`resolve_attr_prefixes`] moves it into
+/// [`Resource::prefixes`].
+fn stable_anonymous_hash_inputs(
+    resource: &Resource,
+    schema: &ResourceSchema,
+) -> BTreeMap<String, String> {
+    let mut inputs = BTreeMap::new();
+    for attribute in schema
+        .create_only_attributes()
+        .into_iter()
+        .chain(schema.identity_attributes())
+    {
+        if inputs.contains_key(attribute) {
+            continue;
+        }
+
+        let hash_value = if let Some(prefix) = resource.prefixes.get(attribute) {
+            Some(format!("Prefix({prefix:?})"))
+        } else {
+            let unresolved_prefix = format!("{attribute}_prefix");
+            resource
+                .attributes
+                .get(&unresolved_prefix)
+                .map(|value| match value {
+                    Value::Concrete(ConcreteValue::String(prefix)) => {
+                        format!("Prefix({prefix:?})")
+                    }
+                    value => format!("Prefix({})", deterministic_value_string(value)),
+                })
+                .or_else(|| resource.get_attr(attribute).map(deterministic_value_string))
+        };
+
+        if let Some(hash_value) = hash_value {
+            inputs.insert(attribute.to_string(), hash_value);
+        }
+    }
+    inputs
+}
+
+/// Classify the identity basis for an anonymous resource.
+///
+/// Presence is what matters here, not whether a value is concrete yet. A
+/// deferred create-only or identity value will become concrete later but is
+/// still an immutable identity input.
+pub fn classify_anonymous_identity_basis(
+    resource: &Resource,
+    registry: &SchemaRegistry,
+) -> AnonymousIdentityBasis {
+    let Some(schema) = registry.get_for(resource) else {
+        return AnonymousIdentityBasis::AttributeDerived;
+    };
+
+    if stable_anonymous_hash_inputs(resource, schema).is_empty() {
+        AnonymousIdentityBasis::AttributeDerived
+    } else {
+        AnonymousIdentityBasis::Stable
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AnonymousResourceKind {
+    provider: String,
+    resource_type: String,
+    provider_instance: Option<String>,
+    module_scope_key: Option<String>,
+    module_scope_description: Option<String>,
+}
+
+impl PartialEq for AnonymousResourceKind {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for AnonymousResourceKind {}
+
+impl PartialOrd for AnonymousResourceKind {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AnonymousResourceKind {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            &self.provider,
+            &self.resource_type,
+            &self.provider_instance,
+            &self.module_scope_key,
+        )
+            .cmp(&(
+                &other.provider,
+                &other.resource_type,
+                &other.provider_instance,
+                &other.module_scope_key,
+            ))
+    }
+}
+
+impl AnonymousResourceKind {
+    fn of(resource: &Resource) -> Self {
+        let module_scope = resource
+            .module_source
+            .as_ref()
+            .and_then(crate::resource::ModuleSource::identity_scope);
+        Self {
+            provider: resource.id.provider.clone(),
+            resource_type: resource.id.resource_type.clone(),
+            provider_instance: resource.id.provider_instance.clone(),
+            module_scope_key: module_scope.as_ref().map(|scope| scope.key().to_string()),
+            module_scope_description: module_scope.map(|scope| scope.description()),
+        }
+    }
+
+    fn display_type(&self) -> String {
+        if self.provider.is_empty() {
+            self.resource_type.clone()
+        } else {
+            format!("{}.{}", self.provider, self.resource_type)
+        }
+    }
+}
+
+/// A group of anonymous resources whose identities would all be derived from
+/// mutable attributes within the same ownership scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeDerivedAnonymousResourceConflict {
+    kind: AnonymousResourceKind,
+}
+
+impl AttributeDerivedAnonymousResourceConflict {
+    /// Return whether `resource` is one of the declarations represented by
+    /// this conflict. This lets source-aware callers attach the shared error to
+    /// each declaration without reimplementing the grouping rule.
+    pub fn includes(&self, resource: &Resource, registry: &SchemaRegistry) -> bool {
+        resource.binding.is_none()
+            && classify_anonymous_identity_basis(resource, registry)
+                == AnonymousIdentityBasis::AttributeDerived
+            && AnonymousResourceKind::of(resource) == self.kind
+    }
+}
+
+impl std::fmt::Display for AttributeDerivedAnonymousResourceConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let display_type = self.kind.display_type();
+        let provider_instance = self
+            .kind
+            .provider_instance
+            .as_deref()
+            .unwrap_or("<default>");
+        let scope = self
+            .kind
+            .module_scope_description
+            .as_deref()
+            .unwrap_or("the root scope");
+        write!(
+            f,
+            "Anonymous resource identity is derived from mutable attributes for multiple \
+             '{display_type}' declarations using provider instance '{provider_instance}' in \
+             {scope}. Use `let` bindings to give them distinct stable identities."
+        )
+    }
+}
+
+impl std::error::Error for AttributeDerivedAnonymousResourceConflict {}
+
+/// Find ambiguous anonymous-resource groups before any generated identity is
+/// assigned. A mutable-attribute identity is safe to reconcile only when it is
+/// the sole anonymous declaration of its kind and ownership scope.
+pub fn check_attribute_derived_anonymous_resource_conflicts(
+    resources: &[Resource],
+    registry: &SchemaRegistry,
+) -> Vec<AttributeDerivedAnonymousResourceConflict> {
+    let mut counts = BTreeMap::<AnonymousResourceKind, usize>::new();
+    for resource in resources {
+        if resource.binding.is_some()
+            || classify_anonymous_identity_basis(resource, registry)
+                != AnonymousIdentityBasis::AttributeDerived
+        {
+            continue;
+        }
+        *counts
+            .entry(AnonymousResourceKind::of(resource))
+            .or_default() += 1;
+    }
+
+    counts
+        .into_iter()
+        .filter_map(|(kind, declaration_count)| {
+            (declaration_count >= 2).then_some(AttributeDerivedAnonymousResourceConflict { kind })
+        })
+        .collect()
+}
+
+/// Return bindings that are necessary to distinguish a group of resources
+/// whose anonymous identities would otherwise be derived from mutable
+/// attributes.
+///
+/// This uses the same identity-basis classifier and ownership key as the
+/// anonymous-resource conflict check. A group needs bindings when at least two
+/// resources of that kind share the attribute-derived basis; stable resources
+/// and singleton groups remain safe to anonymize.
+pub(crate) fn attribute_derived_identity_required_bindings(
+    resources: &[Resource],
+    registry: &SchemaRegistry,
+) -> HashSet<String> {
+    let mut resources_by_kind = BTreeMap::<AnonymousResourceKind, Vec<&Resource>>::new();
+    for resource in resources {
+        if classify_anonymous_identity_basis(resource, registry)
+            != AnonymousIdentityBasis::AttributeDerived
+        {
+            continue;
+        }
+        resources_by_kind
+            .entry(AnonymousResourceKind::of(resource))
+            .or_default()
+            .push(resource);
+    }
+
+    resources_by_kind
+        .into_values()
+        .filter(|resources| resources.len() >= 2)
+        .flatten()
+        .filter_map(|resource| resource.binding.clone())
+        .collect()
 }
 
 /// Resolve `<attr>_prefix` meta-attributes in resources.
@@ -164,13 +501,12 @@ pub fn reconcile_prefixed_names(
         if resource.prefixes.is_empty() {
             continue;
         }
+        let Some(identity) = resource.id.identity_str() else {
+            continue;
+        };
 
         // Find matching resource in state
-        let state_info = find_state(
-            &resource.id.provider,
-            &resource.id.resource_type,
-            resource.id.identity_or_empty(),
-        );
+        let state_info = find_state(&resource.id.provider, &resource.id.resource_type, identity);
         let state_info = match state_info {
             Some(si) => si,
             None => continue,
@@ -574,14 +910,13 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
     registry: &SchemaRegistry,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Result<(), String> {
-    use std::collections::BTreeMap;
     use std::hash::{Hash, Hasher};
 
     // First pass: compute identifiers and detect collisions
     let mut computed: Vec<(usize, String)> = Vec::new();
 
     for (idx, resource) in resources.iter().enumerate() {
-        if resource.id.identity.is_some() {
+        if resource.id.identity_str().is_some() {
             continue;
         }
 
@@ -594,9 +929,6 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
         let Some(schema) = registry.get_for(resource) else {
             continue;
         };
-
-        let create_only_attrs = schema.create_only_attributes();
-        let schema_identity_attrs = schema.identity_attributes();
 
         // Collect identity attribute values (e.g., region) from provider config
         let mut identity_values: BTreeMap<String, String> = BTreeMap::new();
@@ -613,33 +945,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
             }
         }
 
-        // Collect create-only values in sorted order for deterministic hashing.
-        // If no create-only properties exist or none are set, fall back to
-        // all user-specified attributes.
-        //
-        // For prefixed attributes (e.g., bucket_name_prefix -> bucket_name),
-        // hash the prefix value instead of the randomly generated name.
-        // This ensures the anonymous identifier is stable across runs.
-        let mut hash_values: BTreeMap<&str, String> = BTreeMap::new();
-        for attr_name in &create_only_attrs {
-            if let Some(prefix) = resource.prefixes.get(*attr_name) {
-                // Use the prefix for hashing to produce a stable identifier
-                hash_values.insert(attr_name, format!("Prefix({:?})", prefix));
-            } else if let Some(value) = resource.get_attr(attr_name) {
-                hash_values.insert(attr_name, deterministic_value_string(value));
-            }
-        }
-        // Also include schema-level identity attributes in the hash.
-        // These distinguish resources that share create-only values but differ
-        // in other key attributes (e.g., Route 53 RecordSet `type`).
-        for attr_name in &schema_identity_attrs {
-            if !hash_values.contains_key(attr_name)
-                && let Some(value) = resource.get_attr(attr_name)
-            {
-                hash_values.insert(attr_name, deterministic_value_string(value));
-            }
-        }
-
+        let hash_values = stable_anonymous_hash_inputs(resource, schema);
         let use_simhash = hash_values.is_empty();
 
         let hash_str = if use_simhash {
@@ -722,7 +1028,7 @@ pub fn compute_anonymous_identifiers_with_provider_configs(
         resources[idx].id = ResourceId::with_provider_identity(
             &provider,
             &resource_type,
-            identifier,
+            ResourceIdentity::new(identifier),
             provider_instance,
         );
     }
@@ -835,6 +1141,9 @@ pub fn reconcile_anonymous_identifiers(
     let mut renames: Vec<(String, String)> = Vec::new();
     let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
     for resource in resources.iter() {
+        let Some(identity) = resource.id.identity_str() else {
+            continue;
+        };
         let key = (
             resource.id.provider.clone(),
             resource.id.resource_type.clone(),
@@ -842,15 +1151,15 @@ pub fn reconcile_anonymous_identifiers(
         used_names
             .entry(key)
             .or_default()
-            .insert(resource.id.identity_or_empty().to_string());
+            .insert(identity.to_string());
     }
 
     let mut claimed_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
 
     for resource in resources.iter_mut() {
-        if resource.id.identity.is_none() {
+        let Some(resource_identity) = resource.id.identity_str().map(str::to_string) else {
             continue;
-        }
+        };
 
         // Skip let-bound (named) resources entirely. Reconciliation is only
         // meaningful for anonymous hash-derived identifiers. Named resources
@@ -862,7 +1171,7 @@ pub fn reconcile_anonymous_identifiers(
         if claims.claims_to(
             &resource.id.provider,
             &resource.id.resource_type,
-            resource.id.identity_or_empty(),
+            &resource_identity,
         ) {
             continue;
         }
@@ -879,10 +1188,7 @@ pub fn reconcile_anonymous_identifiers(
         );
 
         // If the resource's name already exists in state, no reconciliation is needed.
-        if state_entries
-            .iter()
-            .any(|e| e.name == resource.id.identity_or_empty())
-        {
+        if state_entries.iter().any(|e| e.name == resource_identity) {
             continue;
         }
 
@@ -901,14 +1207,14 @@ pub fn reconcile_anonymous_identifiers(
             // No create-only properties or none set: use SimHash-based Hamming distance
             // matching to find the closest state entry.
             let Some(AnonymousHashSuffix::SimHash(resource_hash)) =
-                extract_hash_from_identifier(resource.id.identity_or_empty())
+                extract_hash_from_identifier(&resource_identity)
             else {
                 continue;
             };
 
             let candidates = state_entries
                 .iter()
-                .filter(|entry| entry.name != resource.id.identity_or_empty())
+                .filter(|entry| entry.name != resource_identity)
                 .filter(|entry| {
                     !claims.claims_from(
                         &resource.id.provider,
@@ -936,10 +1242,7 @@ pub fn reconcile_anonymous_identifiers(
                 // pre-provider-prefix). Keep our freshly-computed new-format
                 // name on the resource and record a rename so the wiring
                 // layer can re-key the state entry.
-                renames.push((
-                    state_name.to_string(),
-                    resource.id.identity_or_empty().to_string(),
-                ));
+                renames.push((state_name.to_string(), resource_identity.clone()));
                 claimed_names
                     .entry(key)
                     .or_default()
@@ -959,7 +1262,7 @@ pub fn reconcile_anonymous_identifiers(
         let mut full_matches: Vec<&str> = Vec::new();
         let mut partial_matches: Vec<&str> = Vec::new();
         for entry in &state_entries {
-            if entry.name == resource.id.identity_or_empty() {
+            if entry.name == resource_identity {
                 // Same identifier, no reconciliation needed
                 continue;
             }
@@ -1011,7 +1314,7 @@ pub fn reconcile_anonymous_identifiers(
             resource.id = ResourceId::with_provider_identity(
                 &resource.id.provider,
                 &resource.id.resource_type,
-                matched_name,
+                ResourceIdentity::new(matched_name.to_string()),
                 resource.id.provider_instance.clone(),
             );
             claimed_names
@@ -1056,11 +1359,14 @@ pub fn detect_anonymous_to_named_renames(
     providers: &CanonicalizedProviderConfigs,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
-) -> Vec<(ResourceId, ResourceId)> {
+) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
     // Collect the set of resource names currently used in the DSL per
     // (provider, resource_type). Any state entry not in this set is an orphan.
     let mut used_names: HashMap<(String, String), HashSet<String>> = HashMap::new();
     for resource in resources {
+        let Some(identity) = resource.id.identity_str() else {
+            continue;
+        };
         let key = (
             resource.id.provider.clone(),
             resource.id.resource_type.clone(),
@@ -1068,20 +1374,23 @@ pub fn detect_anonymous_to_named_renames(
         used_names
             .entry(key)
             .or_default()
-            .insert(resource.id.identity_or_empty().to_string());
+            .insert(identity.to_string());
     }
 
-    let mut renames: Vec<(ResourceId, ResourceId)> = Vec::new();
+    let mut renames: Vec<(ResolvedResourceId, ResolvedResourceId)> = Vec::new();
 
     for resource in resources {
         // Only rename let-bound resources whose binding was previously anonymous.
         if resource.binding.is_none() {
             continue;
         }
+        let Some(resource_identity) = resource.id.identity_str() else {
+            continue;
+        };
         if claims.claims_to(
             &resource.id.provider,
             &resource.id.resource_type,
-            resource.id.identity_or_empty(),
+            resource_identity,
         ) {
             continue;
         }
@@ -1093,10 +1402,7 @@ pub fn detect_anonymous_to_named_renames(
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
 
         // Skip if the binding name already exists in state — nothing to rename.
-        if state_entries
-            .iter()
-            .any(|e| e.name == resource.id.identity_or_empty())
-        {
+        if state_entries.iter().any(|e| e.name == resource_identity) {
             continue;
         }
 
@@ -1171,13 +1477,16 @@ pub fn detect_anonymous_to_named_renames(
         };
 
         if let Some(name) = matched_name {
-            let from = ResourceId::with_provider_identity(
+            let from = ResolvedResourceId::with_provider_identity(
                 &resource.id.provider,
                 &resource.id.resource_type,
-                name,
+                ResourceIdentity::new(name.to_string()),
                 resource.id.provider_instance.clone(),
             );
-            renames.push((from, resource.id.clone()));
+            let Some(to) = ResolvedResourceId::try_new(resource.id.clone()) else {
+                continue;
+            };
+            renames.push((from, to));
         }
     }
 
@@ -1192,7 +1501,7 @@ pub fn detect_anonymous_to_named_renames_for_test(
     providers: &[ProviderConfig],
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
-) -> Vec<(ResourceId, ResourceId)> {
+) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
     let providers = CanonicalizedProviderConfigs::from_configs_for_test(providers.to_vec());
     detect_anonymous_to_named_renames(
         resources,

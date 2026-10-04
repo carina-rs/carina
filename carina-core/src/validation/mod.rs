@@ -1778,6 +1778,22 @@ pub fn check_unused_bindings<E: crate::parser::ExportParamLike>(
         .collect()
 }
 
+/// Check for unused bindings while retaining bindings that provide stable
+/// identities for otherwise-conflicting attribute-derived resources.
+pub fn check_unused_bindings_with_identity_requirements<E: crate::parser::ExportParamLike>(
+    parsed: &crate::parser::File<E>,
+    registry: &crate::schema::SchemaRegistry,
+) -> Vec<String> {
+    let identity_required = crate::identifier::attribute_derived_identity_required_bindings(
+        &parsed.resources,
+        registry,
+    );
+    check_unused_bindings(parsed)
+        .into_iter()
+        .filter(|binding| !identity_required.contains(binding))
+        .collect()
+}
+
 /// Validate a value against a TypeExpr, returning an error message if invalid.
 ///
 /// Shared validation logic used by both CLI module call validation and LSP diagnostics.

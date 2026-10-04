@@ -42,8 +42,8 @@ use crate::provider::{
     PartialReadDiagnostic, Provider, ProviderError, ProviderNormalizer, ProviderReadyDataSource,
 };
 use crate::resource::{
-    AccessPath, ConcreteValue, DataSource, DeferredValue, InterpolationPart, Resource, ResourceId,
-    State, UnknownReason, Value,
+    AccessPath, ConcreteValue, DataSource, DeferredValue, InterpolationPart, ResolvedResource,
+    Resource, ResourceId, State, UnknownReason, Value,
 };
 use crate::wait::WaitObservation;
 
@@ -317,7 +317,7 @@ pub struct ExecutionResult {
     pub partial_diagnostics: Vec<(ResourceId, PartialReadDiagnostic)>,
     pub skip_count: usize,
     pub applied_states: std::collections::HashMap<ResourceId, State>,
-    pub runtime_synthesized_resources: Vec<Resource>,
+    pub runtime_synthesized_resources: Vec<ResolvedResource>,
     pub successfully_deleted: HashSet<DeletedInstanceKey>,
     pub permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
     pub current_states: HashMap<ResourceId, State>,

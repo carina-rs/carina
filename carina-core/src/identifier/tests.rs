@@ -27,7 +27,7 @@ fn detect_anonymous_to_named_renames_for_test(
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
     providers: &[ProviderConfig],
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
-) -> Vec<(ResourceId, ResourceId)> {
+) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
     super::detect_anonymous_to_named_renames_for_test(
         resources,
         registry,
@@ -105,7 +105,7 @@ fn route53_record_set_schema() -> ResourceSchema {
 }
 
 fn route53_record_set_resource(record_type: &str) -> Resource {
-    let mut resource = Resource::with_provider("awscc", "route53.record_set", "", None);
+    let mut resource = Resource::pending_with_provider("awscc", "route53.record_set", None);
     resource.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs.dev".to_string())),
@@ -141,7 +141,7 @@ fn simhash_eip_schema() -> ResourceSchema {
 }
 
 fn simhash_eip_resource(tag_env: &str) -> Resource {
-    let mut resource = Resource::with_provider("awscc", "ec2.eip", "", None);
+    let mut resource = Resource::pending_with_provider("awscc", "ec2.eip", None);
     resource.set_attr(
         "domain".to_string(),
         Value::Concrete(ConcreteValue::String("vpc".to_string())),
@@ -165,6 +165,240 @@ fn simhash_suffix_for_test(identifier: &str) -> SimHash {
 }
 
 #[test]
+fn anonymous_identity_basis_is_attribute_derived_without_a_schema() {
+    let resource = Resource::pending_with_provider("mock", "test.resource", None);
+
+    assert_eq!(
+        classify_anonymous_identity_basis(&resource, &SchemaRegistry::new()),
+        AnonymousIdentityBasis::AttributeDerived,
+    );
+}
+
+#[test]
+fn anonymous_identity_basis_is_attribute_derived_when_no_stable_attribute_is_set() {
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("name", AttributeType::string()))
+        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).create_only());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    resource.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("alpha".to_string())),
+    );
+
+    assert_eq!(
+        classify_anonymous_identity_basis(&resource, &registry),
+        AnonymousIdentityBasis::AttributeDerived,
+    );
+}
+
+#[test]
+fn anonymous_identity_basis_is_stable_when_create_only_value_is_deferred() {
+    use crate::resource::AccessPath;
+
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).create_only());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    resource.set_attr(
+        "immutable_name".to_string(),
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("source", "name"),
+        }),
+    );
+
+    assert_eq!(
+        classify_anonymous_identity_basis(&resource, &registry),
+        AnonymousIdentityBasis::Stable,
+    );
+}
+
+#[test]
+fn anonymous_identity_basis_is_stable_when_identity_attribute_prefix_is_set() {
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).identity());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    resource
+        .prefixes
+        .insert("immutable_name".to_string(), "example-".to_string());
+
+    assert_eq!(
+        classify_anonymous_identity_basis(&resource, &registry),
+        AnonymousIdentityBasis::Stable,
+    );
+}
+
+#[test]
+fn anonymous_identity_basis_recognizes_unresolved_prefix_syntax() {
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).create_only());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+    let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
+    resource.set_attr(
+        "immutable_name_prefix".to_string(),
+        Value::Concrete(ConcreteValue::String("example-".to_string())),
+    );
+
+    assert_eq!(
+        classify_anonymous_identity_basis(&resource, &registry),
+        AnonymousIdentityBasis::Stable,
+    );
+}
+
+#[test]
+fn identity_attribute_prefix_values_produce_distinct_stable_identifiers() {
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).identity());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+    let mut alpha = Resource::pending_with_provider("mock", "test.resource", None);
+    alpha
+        .prefixes
+        .insert("immutable_name".to_string(), "alpha-".to_string());
+    let mut beta = Resource::pending_with_provider("mock", "test.resource", None);
+    beta.prefixes
+        .insert("immutable_name".to_string(), "beta-".to_string());
+    let mut resources = vec![alpha, beta];
+
+    let result =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new());
+
+    assert!(result.is_ok(), "prefixes must not collide: {result:?}");
+    assert_ne!(resources[0].id, resources[1].id);
+}
+
+#[test]
+fn unresolved_identity_prefix_values_produce_distinct_stable_identifiers() {
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).identity());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+    let mut alpha = Resource::pending_with_provider("mock", "test.resource", None);
+    alpha.set_attr(
+        "immutable_name_prefix".to_string(),
+        Value::Concrete(ConcreteValue::String("alpha-".to_string())),
+    );
+    let mut beta = Resource::pending_with_provider("mock", "test.resource", None);
+    beta.set_attr(
+        "immutable_name_prefix".to_string(),
+        Value::Concrete(ConcreteValue::String("beta-".to_string())),
+    );
+    let mut resources = vec![alpha, beta];
+
+    let result =
+        compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new());
+
+    assert!(
+        result.is_ok(),
+        "unresolved prefix inputs must be hashed: {result:?}"
+    );
+    assert_ne!(resources[0].id, resources[1].id);
+}
+
+#[test]
+fn unresolved_and_resolved_prefix_forms_hash_to_the_same_identity() {
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).identity());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+    let mut unresolved = Resource::pending_with_provider("mock", "test.resource", None);
+    unresolved.set_attr(
+        "immutable_name_prefix".to_string(),
+        Value::Concrete(ConcreteValue::String("same-".to_string())),
+    );
+    let mut resolved = Resource::pending_with_provider("mock", "test.resource", None);
+    resolved
+        .prefixes
+        .insert("immutable_name".to_string(), "same-".to_string());
+
+    let mut unresolved_resources = vec![unresolved];
+    let mut resolved_resources = vec![resolved];
+    compute_anonymous_identifiers_for_test(&mut unresolved_resources, &[], &registry, &|_| {
+        Vec::new()
+    })
+    .expect("unresolved prefix identity");
+    compute_anonymous_identifiers_for_test(&mut resolved_resources, &[], &registry, &|_| {
+        Vec::new()
+    })
+    .expect("resolved prefix identity");
+
+    assert_eq!(unresolved_resources[0].id, resolved_resources[0].id);
+}
+
+#[test]
+fn check_rejects_multiple_attribute_derived_anonymous_resources_in_one_kind() {
+    let resources = vec![
+        Resource::pending_with_provider("mock", "test.resource", None),
+        Resource::pending_with_provider("mock", "test.resource", None),
+    ];
+
+    let conflicts =
+        check_attribute_derived_anonymous_resource_conflicts(&resources, &SchemaRegistry::new());
+
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(
+        conflicts[0].to_string(),
+        "Anonymous resource identity is derived from mutable attributes for multiple \
+         'mock.test.resource' declarations using provider instance '<default>' in the root scope. \
+         Use `let` bindings to give them distinct stable identities."
+    );
+}
+
+#[test]
+fn check_keeps_default_and_named_provider_instances_in_separate_scopes() {
+    let resources = vec![
+        Resource::pending_with_provider("mock", "test.resource", None),
+        Resource::pending_with_provider("mock", "test.resource", Some("west".to_string())),
+    ];
+
+    let conflicts =
+        check_attribute_derived_anonymous_resource_conflicts(&resources, &SchemaRegistry::new());
+
+    assert!(conflicts.is_empty(), "unexpected conflicts: {conflicts:?}");
+}
+
+#[test]
+fn check_allows_stable_named_and_separate_module_instance_resources() {
+    use crate::resource::ModuleSource;
+
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).create_only());
+    let mut registry = SchemaRegistry::new();
+    registry.insert("mock", schema);
+
+    let mut stable_one = Resource::pending_with_provider("mock", "test.resource", None);
+    stable_one.set_attr(
+        "immutable_name".to_string(),
+        Value::Concrete(ConcreteValue::String("one".to_string())),
+    );
+    let mut stable_two = Resource::pending_with_provider("mock", "test.resource", None);
+    stable_two.set_attr(
+        "immutable_name".to_string(),
+        Value::Concrete(ConcreteValue::String("two".to_string())),
+    );
+
+    let mut named = Resource::pending_with_provider("mock", "other.resource", None);
+    named.binding = Some("named".to_string());
+
+    let module_one = Resource::pending_with_provider("mock", "other.resource", None)
+        .with_module_source(ModuleSource::module("fixture", "module_one"));
+    let module_two = Resource::pending_with_provider("mock", "other.resource", None)
+        .with_module_source(ModuleSource::module("fixture", "module_two"));
+
+    let conflicts = check_attribute_derived_anonymous_resource_conflicts(
+        &[stable_one, stable_two, named, module_one, module_two],
+        &registry,
+    );
+
+    assert!(conflicts.is_empty(), "unexpected conflicts: {conflicts:?}");
+}
+
+#[test]
 fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
     let schema = ResourceSchema::new("ec2.Route")
         .attribute(AttributeSchema::new(
@@ -180,7 +414,7 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
     let make_resource = || {
-        let mut resource = Resource::with_provider("awscc", "ec2.Route", "", None);
+        let mut resource = Resource::pending_with_provider("awscc", "ec2.Route", None);
         resource.set_attr(
             "route_table_id".to_string(),
             Value::Concrete(ConcreteValue::String("rtb-123".to_string())),
@@ -237,8 +471,14 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_identity() {
     .unwrap();
 
     assert_eq!(
-        resources_awscc[0].id.identity_or_empty(),
-        resources_aws[0].id.identity_or_empty()
+        resources_awscc[0]
+            .id
+            .identity_str()
+            .expect("resolved identity"),
+        resources_aws[0]
+            .id
+            .identity_str()
+            .expect("resolved identity")
     );
 }
 
@@ -252,7 +492,7 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_attribute() {
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
     let make_resource = |domain: &str| {
-        let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
+        let mut resource = Resource::pending_with_provider("awscc", "ec2.Eip", None);
         resource.set_attr(
             "domain".to_string(),
             Value::Concrete(ConcreteValue::CanonicalEnum(canonical_eip_domain(
@@ -280,8 +520,14 @@ fn test_anonymous_id_stable_across_provider_namespace_change_in_attribute() {
         .unwrap();
 
     assert_eq!(
-        resources_awscc[0].id.identity_or_empty(),
-        resources_aws[0].id.identity_or_empty()
+        resources_awscc[0]
+            .id
+            .identity_str()
+            .expect("resolved identity"),
+        resources_aws[0]
+            .id
+            .identity_str()
+            .expect("resolved identity")
     );
 }
 
@@ -304,7 +550,7 @@ fn test_anonymous_id_stable_for_nested_canonical_enum_create_only_values() {
         let enum_value = Value::Concrete(ConcreteValue::CanonicalEnum(canonical_eip_domain(
             provider, raw,
         )));
-        let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
+        let mut resource = Resource::pending_with_provider("awscc", "ec2.Eip", None);
         resource.set_attr(
             "domains".to_string(),
             Value::Concrete(ConcreteValue::List(vec![enum_value.clone()])),
@@ -331,8 +577,14 @@ fn test_anonymous_id_stable_for_nested_canonical_enum_create_only_values() {
         .unwrap();
 
     assert_eq!(
-        resources_awscc[0].id.identity_or_empty(),
-        resources_aws[0].id.identity_or_empty()
+        resources_awscc[0]
+            .id
+            .identity_str()
+            .expect("resolved identity"),
+        resources_aws[0]
+            .id
+            .identity_str()
+            .expect("resolved identity")
     );
 }
 
@@ -347,7 +599,7 @@ fn test_reconcile_anonymous_id_after_provider_namespace_change() {
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
     let make_resource = |domain: &str, pool: &str| {
-        let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
+        let mut resource = Resource::pending_with_provider("awscc", "ec2.Eip", None);
         resource.set_attr(
             "domain".to_string(),
             Value::Concrete(ConcreteValue::CanonicalEnum(canonical_eip_domain(
@@ -369,7 +621,11 @@ fn test_reconcile_anonymous_id_after_provider_namespace_change() {
     let mut old_resources = vec![make_resource("awscc.ec2.Eip.Domain.vpc", "pool-a")];
     compute_anonymous_identifiers_for_test(&mut old_resources, &providers, &schemas, &identity_fn)
         .unwrap();
-    let state_name = old_resources[0].id.identity_or_empty().to_string();
+    let state_name = old_resources[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
 
     let mut desired_resources = vec![make_resource("aws.ec2.Eip.Domain.vpc", "pool-b")];
     compute_anonymous_identifiers_for_test(
@@ -379,7 +635,13 @@ fn test_reconcile_anonymous_id_after_provider_namespace_change() {
         &identity_fn,
     )
     .unwrap();
-    assert_ne!(state_name, desired_resources[0].id.identity_or_empty());
+    assert_ne!(
+        state_name,
+        desired_resources[0]
+            .id
+            .identity_str()
+            .expect("resolved identity")
+    );
 
     let state_entries = vec![AnonymousIdStateInfo {
         name: state_name.clone(),
@@ -397,7 +659,13 @@ fn test_reconcile_anonymous_id_after_provider_namespace_change() {
         &|_binding| Vec::new(),
     );
 
-    assert_eq!(desired_resources[0].id.identity_or_empty(), state_name);
+    assert_eq!(
+        desired_resources[0]
+            .id
+            .identity_str()
+            .expect("resolved identity"),
+        state_name
+    );
 }
 
 #[test]
@@ -412,7 +680,7 @@ fn test_reconcile_anonymous_id_after_nested_enum_create_only_hash_migration() {
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
     let make_old_resource = |pool: &str| {
-        let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
+        let mut resource = Resource::pending_with_provider("awscc", "ec2.Eip", None);
         resource.set_attr(
             "domains".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -432,7 +700,7 @@ fn test_reconcile_anonymous_id_after_nested_enum_create_only_hash_migration() {
                 "aws.ec2.Eip.Domain.vpc",
             ))
             .unwrap();
-        let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
+        let mut resource = Resource::pending_with_provider("awscc", "ec2.Eip", None);
         resource.set_attr(
             "domains".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -449,7 +717,11 @@ fn test_reconcile_anonymous_id_after_nested_enum_create_only_hash_migration() {
     let mut old_resources = vec![make_old_resource("pool-a")];
     compute_anonymous_identifiers_for_test(&mut old_resources, &providers, &schemas, &identity_fn)
         .unwrap();
-    let state_name = old_resources[0].id.identity_or_empty().to_string();
+    let state_name = old_resources[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
 
     let mut desired_resources = vec![make_new_resource("pool-b")];
     compute_anonymous_identifiers_for_test(
@@ -459,7 +731,13 @@ fn test_reconcile_anonymous_id_after_nested_enum_create_only_hash_migration() {
         &identity_fn,
     )
     .unwrap();
-    assert_ne!(state_name, desired_resources[0].id.identity_or_empty());
+    assert_ne!(
+        state_name,
+        desired_resources[0]
+            .id
+            .identity_str()
+            .expect("resolved identity")
+    );
 
     let state_entries = vec![AnonymousIdStateInfo {
         name: state_name.clone(),
@@ -480,7 +758,13 @@ fn test_reconcile_anonymous_id_after_nested_enum_create_only_hash_migration() {
         &|_binding| Vec::new(),
     );
 
-    assert_eq!(desired_resources[0].id.identity_or_empty(), state_name);
+    assert_eq!(
+        desired_resources[0]
+            .id
+            .identity_str()
+            .expect("resolved identity"),
+        state_name
+    );
 }
 
 #[test]
@@ -495,7 +779,7 @@ fn test_reconcile_anonymous_id_after_nested_enum_no_edit_upgrade_full_match() {
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
     let make_old_resource = || {
-        let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
+        let mut resource = Resource::pending_with_provider("awscc", "ec2.Eip", None);
         resource.set_attr(
             "domains".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -515,7 +799,7 @@ fn test_reconcile_anonymous_id_after_nested_enum_no_edit_upgrade_full_match() {
                 "aws.ec2.Eip.Domain.vpc",
             ))
             .unwrap();
-        let mut resource = Resource::with_provider("awscc", "ec2.Eip", "", None);
+        let mut resource = Resource::pending_with_provider("awscc", "ec2.Eip", None);
         resource.set_attr(
             "domains".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -532,7 +816,11 @@ fn test_reconcile_anonymous_id_after_nested_enum_no_edit_upgrade_full_match() {
     let mut old_resources = vec![make_old_resource()];
     compute_anonymous_identifiers_for_test(&mut old_resources, &providers, &schemas, &identity_fn)
         .unwrap();
-    let state_name = old_resources[0].id.identity_or_empty().to_string();
+    let state_name = old_resources[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
 
     let mut desired_resources = vec![make_new_resource()];
     compute_anonymous_identifiers_for_test(
@@ -542,7 +830,13 @@ fn test_reconcile_anonymous_id_after_nested_enum_no_edit_upgrade_full_match() {
         &identity_fn,
     )
     .unwrap();
-    assert_ne!(state_name, desired_resources[0].id.identity_or_empty());
+    assert_ne!(
+        state_name,
+        desired_resources[0]
+            .id
+            .identity_str()
+            .expect("resolved identity")
+    );
 
     let state_entries = vec![AnonymousIdStateInfo {
         name: state_name.clone(),
@@ -563,7 +857,13 @@ fn test_reconcile_anonymous_id_after_nested_enum_no_edit_upgrade_full_match() {
         &|_binding| Vec::new(),
     );
 
-    assert_eq!(desired_resources[0].id.identity_or_empty(), state_name);
+    assert_eq!(
+        desired_resources[0]
+            .id
+            .identity_str()
+            .expect("resolved identity"),
+        state_name
+    );
 }
 
 #[test]
@@ -592,7 +892,11 @@ fn test_reconcile_anonymous_id_nested_enum_full_match_ambiguous_skips() {
         "public_ipv4_pool".to_string(),
         Value::Concrete(ConcreteValue::String("pool-a".to_string())),
     );
-    let original_id = resource.id.identity_or_empty().to_string();
+    let original_id = resource
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
     let mut resources = vec![resource];
 
     let create_only_values: HashMap<String, String> = vec![
@@ -621,7 +925,10 @@ fn test_reconcile_anonymous_id_nested_enum_full_match_ambiguous_skips() {
         &|_binding| Vec::new(),
     );
 
-    assert_eq!(resources[0].id.identity_or_empty(), original_id);
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        original_id
+    );
 }
 
 #[test]
@@ -661,7 +968,10 @@ fn test_reconcile_anonymous_id_mixed_string_and_enum_identifier_for_enum_attribu
         &|_binding| Vec::new(),
     );
 
-    assert_eq!(resources[0].id.identity_or_empty(), state_name);
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        state_name
+    );
 }
 
 #[test]
@@ -868,7 +1178,7 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
     // Step 1: compute identifier with path="/"
-    let mut r1 = Resource::with_provider("awscc", "iam.role", "", None);
+    let mut r1 = Resource::pending_with_provider("awscc", "iam.role", None);
     r1.set_attr(
         "role_name".to_string(),
         Value::Concrete(ConcreteValue::String("my-role".to_string())),
@@ -880,10 +1190,14 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
     let mut resources1 = vec![r1];
     compute_anonymous_identifiers_for_test(&mut resources1, &providers, &schemas, &identity_fn)
         .unwrap();
-    let step1_id = resources1[0].id.identity_or_empty().to_string();
+    let step1_id = resources1[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
 
     // Step 2: compute identifier with path="/carina/" (changed create-only)
-    let mut r2 = Resource::with_provider("awscc", "iam.role", "", None);
+    let mut r2 = Resource::pending_with_provider("awscc", "iam.role", None);
     r2.set_attr(
         "role_name".to_string(),
         Value::Concrete(ConcreteValue::String("my-role".to_string())),
@@ -895,7 +1209,11 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
     let mut resources2 = vec![r2];
     compute_anonymous_identifiers_for_test(&mut resources2, &providers, &schemas, &identity_fn)
         .unwrap();
-    let step2_id = resources2[0].id.identity_or_empty().to_string();
+    let step2_id = resources2[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
 
     // Hash includes path, so identifiers differ
     assert_ne!(step1_id, step2_id);
@@ -918,7 +1236,10 @@ fn test_reconcile_anonymous_id_partial_create_only_match() {
     );
 
     // After reconciliation, step2 resource should have step1's identifier
-    assert_eq!(resources2[0].id.identity_or_empty(), step1_id);
+    assert_eq!(
+        resources2[0].id.identity_str().expect("resolved identity"),
+        step1_id
+    );
 }
 
 #[test]
@@ -940,7 +1261,11 @@ fn test_reconcile_anonymous_id_no_match_when_all_differ() {
         Value::Concrete(ConcreteValue::String("/new/".to_string())),
     );
 
-    let original_id = resource.id.identity_or_empty().to_string();
+    let original_id = resource
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
     let mut resources = vec![resource];
 
     // State has completely different values
@@ -961,7 +1286,10 @@ fn test_reconcile_anonymous_id_no_match_when_all_differ() {
     );
 
     // Identifier should remain unchanged
-    assert_eq!(resources[0].id.identity_or_empty(), original_id);
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        original_id
+    );
 }
 
 #[test]
@@ -1003,7 +1331,10 @@ fn test_reconcile_anonymous_id_unique_full_match_rebinds() {
         &|_binding| Vec::new(),
     );
 
-    assert_eq!(resources[0].id.identity_or_empty(), "iam_role_11223344");
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        "iam_role_11223344"
+    );
 }
 
 #[test]
@@ -1021,7 +1352,11 @@ fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
         Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
     );
 
-    let original_id = resource.id.identity_or_empty().to_string();
+    let original_id = resource
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
     let mut resources = vec![resource];
 
     let state_entries = vec![AnonymousIdStateInfo {
@@ -1038,7 +1373,10 @@ fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
     );
 
     // No reconciliation: only one create-only prop and it changed
-    assert_eq!(resources[0].id.identity_or_empty(), original_id);
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        original_id
+    );
 }
 
 /// Anonymous resources declared inside a module instantiation must
@@ -1071,7 +1409,7 @@ fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
-    let mut r = Resource::with_provider("awscc", "iam.RolePolicy", "", None);
+    let mut r = Resource::pending_with_provider("awscc", "iam.RolePolicy", None);
     r.set_attr(
         "policy_name".to_string(),
         Value::Concrete(ConcreteValue::String("inline".to_string())),
@@ -1079,13 +1417,14 @@ fn test_anonymous_resource_inside_module_keeps_instance_prefix() {
     r.module_source = Some(ModuleSource::Module {
         name: "github_oidc".to_string(),
         instance: "bootstrap".to_string(),
+        scope: None,
     });
 
     let mut resources = vec![r];
     compute_anonymous_identifiers_for_test(&mut resources, &providers, &schemas, &identity_fn)
         .unwrap();
 
-    let name = resources[0].id.identity_or_empty();
+    let name = resources[0].id.identity_str().expect("resolved identity");
     assert!(
         name.starts_with("bootstrap."),
         "expected `bootstrap.<hash>` prefix, got {:?}",
@@ -1126,7 +1465,7 @@ fn test_anonymous_resource_no_create_only_properties() {
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
-    let mut r = Resource::with_provider("awscc", "ec2.eip", "", None);
+    let mut r = Resource::pending_with_provider("awscc", "ec2.eip", None);
     r.set_attr(
         "domain".to_string(),
         Value::Concrete(ConcreteValue::String("vpc".to_string())),
@@ -1137,7 +1476,13 @@ fn test_anonymous_resource_no_create_only_properties() {
         .unwrap();
 
     // Should have computed an identifier
-    assert!(!resources[0].id.identity_or_empty().is_empty());
+    assert!(
+        !resources[0]
+            .id
+            .identity_str()
+            .expect("resolved identity")
+            .is_empty()
+    );
     assert!(
         resources[0]
             .id
@@ -1172,7 +1517,7 @@ fn test_anonymous_resource_no_create_only_deterministic() {
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
     let make_resource = || {
-        let mut r = Resource::with_provider("awscc", "ec2.eip", "", None);
+        let mut r = Resource::pending_with_provider("awscc", "ec2.eip", None);
         r.set_attr(
             "domain".to_string(),
             Value::Concrete(ConcreteValue::String("vpc".to_string())),
@@ -1188,8 +1533,8 @@ fn test_anonymous_resource_no_create_only_deterministic() {
         .unwrap();
 
     assert_eq!(
-        resources1[0].id.identity_or_empty(),
-        resources2[0].id.identity_or_empty()
+        resources1[0].id.identity_str().expect("resolved identity"),
+        resources2[0].id.identity_str().expect("resolved identity")
     );
 }
 
@@ -1212,13 +1557,13 @@ fn test_anonymous_resource_no_create_only_collision() {
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
-    let mut r1 = Resource::with_provider("awscc", "ec2.eip", "", None);
+    let mut r1 = Resource::pending_with_provider("awscc", "ec2.eip", None);
     r1.set_attr(
         "domain".to_string(),
         Value::Concrete(ConcreteValue::String("vpc".to_string())),
     );
 
-    let mut r2 = Resource::with_provider("awscc", "ec2.eip", "", None);
+    let mut r2 = Resource::pending_with_provider("awscc", "ec2.eip", None);
     r2.set_attr(
         "domain".to_string(),
         Value::Concrete(ConcreteValue::String("vpc".to_string())),
@@ -1261,7 +1606,7 @@ fn test_identity_attribute_prevents_collision() {
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
-    let mut r1 = Resource::with_provider("awscc", "route53.record_set", "", None);
+    let mut r1 = Resource::pending_with_provider("awscc", "route53.record_set", None);
     r1.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs.dev".to_string())),
@@ -1275,7 +1620,7 @@ fn test_identity_attribute_prevents_collision() {
         Value::Concrete(ConcreteValue::String("A".to_string())),
     );
 
-    let mut r2 = Resource::with_provider("awscc", "route53.record_set", "", None);
+    let mut r2 = Resource::pending_with_provider("awscc", "route53.record_set", None);
     r2.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs.dev".to_string())),
@@ -1294,12 +1639,24 @@ fn test_identity_attribute_prevents_collision() {
         .expect("should not collide when identity attrs differ");
 
     // Both should have identifiers assigned
-    assert!(!resources[0].id.identity_or_empty().is_empty());
-    assert!(!resources[1].id.identity_or_empty().is_empty());
+    assert!(
+        !resources[0]
+            .id
+            .identity_str()
+            .expect("resolved identity")
+            .is_empty()
+    );
+    assert!(
+        !resources[1]
+            .id
+            .identity_str()
+            .expect("resolved identity")
+            .is_empty()
+    );
     // Identifiers should be different
     assert_ne!(
-        resources[0].id.identity_or_empty(),
-        resources[1].id.identity_or_empty(),
+        resources[0].id.identity_str().expect("resolved identity"),
+        resources[1].id.identity_str().expect("resolved identity"),
         "different identity attr values should produce different identifiers"
     );
 }
@@ -1319,8 +1676,14 @@ fn test_reconcile_anonymous_id_full_match_claims_state_entry_once() {
         .expect("identity attrs should produce distinct Route53 record identifiers");
 
     let old_state_name = "route53_record_set_11223344";
-    assert_ne!(resources[0].id.identity_or_empty(), old_state_name);
-    assert_ne!(resources[1].id.identity_or_empty(), old_state_name);
+    assert_ne!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        old_state_name
+    );
+    assert_ne!(
+        resources[1].id.identity_str().expect("resolved identity"),
+        old_state_name
+    );
 
     let state_entries = vec![route53_state_entry(old_state_name)];
     reconcile_anonymous_identifiers(
@@ -1330,12 +1693,15 @@ fn test_reconcile_anonymous_id_full_match_claims_state_entry_once() {
         &|_binding| Vec::new(),
     );
 
-    let names: HashSet<&str> = resources.iter().map(|r| r.id.identity_or_empty()).collect();
+    let names: HashSet<&str> = resources
+        .iter()
+        .map(|r| r.id.identity_str().expect("resolved identity"))
+        .collect();
     assert_eq!(names.len(), 2, "reconcile must not duplicate ResourceIds");
     assert_eq!(
         resources
             .iter()
-            .filter(|r| r.id.identity_or_empty() == old_state_name)
+            .filter(|r| r.id.identity_str().expect("resolved identity") == old_state_name)
             .count(),
         1,
         "only one resource may claim the migrated state entry"
@@ -1356,8 +1722,16 @@ fn test_reconcile_anonymous_id_full_match_does_not_steal_live_entry() {
     compute_anonymous_identifiers_for_test(&mut resources, &providers, &schemas, &identity_fn)
         .expect("identity attrs should produce distinct Route53 record identifiers");
 
-    let live_a_name = resources[0].id.identity_or_empty().to_string();
-    let new_aaaa_name = resources[1].id.identity_or_empty().to_string();
+    let live_a_name = resources[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
+    let new_aaaa_name = resources[1]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
     let state_entries = vec![route53_state_entry(&live_a_name)];
 
     reconcile_anonymous_identifiers(
@@ -1367,9 +1741,12 @@ fn test_reconcile_anonymous_id_full_match_does_not_steal_live_entry() {
         &|_binding| Vec::new(),
     );
 
-    assert_eq!(resources[0].id.identity_or_empty(), live_a_name);
     assert_eq!(
-        resources[1].id.identity_or_empty(),
+        resources[0].id.identity_str().expect("resolved identity"),
+        live_a_name
+    );
+    assert_eq!(
+        resources[1].id.identity_str().expect("resolved identity"),
         new_aaaa_name,
         "new AAAA record must not steal the live A record state entry"
     );
@@ -1447,7 +1824,7 @@ fn subnet_route_table_association_schema() -> ResourceSchema {
 }
 
 fn subnet_route_table_association_resource(
-    name: &str,
+    name: &'static str,
     route_table_binding: &str,
     subnet_binding: &str,
 ) -> Resource {
@@ -1503,13 +1880,14 @@ fn association_state_entry(
     }
 }
 
-fn route_with_deferred_route_table(name: &str, route_table_binding: &str) -> Resource {
+fn route_with_deferred_route_table(name: &'static str, route_table_binding: &str) -> Resource {
     use crate::resource::{AccessPath, ModuleSource};
 
     let mut resource = Resource::with_provider("awscc", "ec2.Route", name, None);
     resource.module_source = Some(ModuleSource::Module {
         name: "mymod".to_string(),
         instance: "inst".to_string(),
+        scope: None,
     });
     resource.set_attr(
         "route_table_id".to_string(),
@@ -1579,7 +1957,7 @@ fn test_reconcile_does_not_hamming_match_standard_hash_names() {
     assert_eq!(
         resources
             .iter()
-            .map(|r| r.id.identity_or_empty())
+            .map(|r| r.id.identity_str().expect("resolved identity"))
             .collect::<Vec<_>>(),
         original_names
     );
@@ -1640,7 +2018,7 @@ fn test_reconcile_resolves_deferred_create_only_via_state_bindings() {
     assert_eq!(
         resources
             .iter()
-            .map(|resource| resource.id.identity_or_empty())
+            .map(|resource| resource.id.identity_str().expect("resolved identity"))
             .collect::<Vec<_>>(),
         state_names
     );
@@ -1721,7 +2099,10 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
     );
     assert!(create_only_renames.is_empty());
     assert_eq!(
-        create_only_resources[0].id.identity_or_empty(),
+        create_only_resources[0]
+            .id
+            .identity_str()
+            .expect("resolved identity"),
         "awscc_ec2_route_aaaaaaaa",
         "claimed moved.from state row must be excluded from create-only full matches"
     );
@@ -1761,7 +2142,7 @@ fn test_reconcile_skips_desired_name_claimed_by_moved_to() {
     );
 
     assert_eq!(
-        resources[0].id.identity_or_empty(),
+        resources[0].id.identity_str().expect("resolved identity"),
         desired_name,
         "desired name claimed as moved.to must skip heuristic reconciliation"
     );
@@ -1813,7 +2194,10 @@ fn test_reconcile_deferred_create_only_ambiguous_refuses() {
     );
 
     assert!(renames.is_empty());
-    assert_eq!(resources[0].id.identity_or_empty(), original_name);
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        original_name
+    );
 }
 
 #[test]
@@ -1854,7 +2238,10 @@ fn test_reconcile_deferred_binding_ambiguous_yields_no_value() {
     );
 
     assert!(renames.is_empty());
-    assert_eq!(resources[0].id.identity_or_empty(), original_name);
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        original_name
+    );
 }
 
 #[test]
@@ -1886,7 +2273,10 @@ fn test_reconcile_module_argument_passed_root_binding_resolves() {
     );
 
     assert!(renames.is_empty());
-    assert_eq!(resources[0].id.identity_or_empty(), state_name);
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        state_name
+    );
 }
 
 #[test]
@@ -1918,7 +2308,10 @@ fn test_reconcile_module_intra_module_binding_resolves() {
     );
 
     assert!(renames.is_empty());
-    assert_eq!(resources[0].id.identity_or_empty(), state_name);
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        state_name
+    );
 }
 
 #[test]
@@ -1950,7 +2343,10 @@ fn test_reconcile_bare_binding_does_not_resolve_module_prefixed_state_entry() {
     );
 
     assert!(renames.is_empty());
-    assert_eq!(resources[0].id.identity_or_empty(), desired_name);
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        desired_name
+    );
 }
 
 #[test]
@@ -1985,7 +2381,10 @@ fn test_reconcile_simhash_tie_refused() {
     );
 
     assert!(renames.is_empty());
-    assert_eq!(resources[0].id.identity_or_empty(), original_name);
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        original_name
+    );
 }
 
 #[test]
@@ -2086,7 +2485,7 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
     // Step 1: compute identifier with tag_env="production"
-    let mut r1 = Resource::with_provider("awscc", "ec2.eip", "", None);
+    let mut r1 = Resource::pending_with_provider("awscc", "ec2.eip", None);
     r1.set_attr(
         "domain".to_string(),
         Value::Concrete(ConcreteValue::String("vpc".to_string())),
@@ -2102,10 +2501,14 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
     let mut resources1 = vec![r1];
     compute_anonymous_identifiers_for_test(&mut resources1, &providers, &schemas, &identity_fn)
         .unwrap();
-    let old_id = resources1[0].id.identity_or_empty().to_string();
+    let old_id = resources1[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
 
     // Step 2: compute identifier with tag_env="staging" (one attribute changed)
-    let mut r2 = Resource::with_provider("awscc", "ec2.eip", "", None);
+    let mut r2 = Resource::pending_with_provider("awscc", "ec2.eip", None);
     r2.set_attr(
         "domain".to_string(),
         Value::Concrete(ConcreteValue::String("vpc".to_string())),
@@ -2121,7 +2524,11 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
     let mut resources2 = vec![r2];
     compute_anonymous_identifiers_for_test(&mut resources2, &providers, &schemas, &identity_fn)
         .unwrap();
-    let new_id = resources2[0].id.identity_or_empty().to_string();
+    let new_id = resources2[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
 
     // Identifiers should differ (different attributes)
     assert_ne!(old_id, new_id);
@@ -2144,7 +2551,10 @@ fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
     // resource.id with the state's old name) was changed when the
     // provider prefix was introduced — the rename path is now the
     // only mechanism for legacy state name reuse.
-    assert_eq!(resources2[0].id.identity_or_empty(), new_id);
+    assert_eq!(
+        resources2[0].id.identity_str().expect("resolved identity"),
+        new_id
+    );
     assert_eq!(renames, vec![(old_id.clone(), new_id.clone())]);
 }
 
@@ -2161,8 +2571,16 @@ fn test_reconcile_anonymous_id_simhash_does_not_steal_live_entry() {
     ];
     compute_anonymous_identifiers_for_test(&mut resources, &providers, &schemas, &identity_fn)
         .unwrap();
-    let live_name = resources[0].id.identity_or_empty().to_string();
-    let new_name = resources[1].id.identity_or_empty().to_string();
+    let live_name = resources[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
+    let new_name = resources[1]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
 
     let state_entries = vec![AnonymousIdStateInfo {
         name: live_name.clone(),
@@ -2175,8 +2593,14 @@ fn test_reconcile_anonymous_id_simhash_does_not_steal_live_entry() {
         &|_binding| Vec::new(),
     );
 
-    assert_eq!(resources[0].id.identity_or_empty(), live_name);
-    assert_eq!(resources[1].id.identity_or_empty(), new_name);
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        live_name
+    );
+    assert_eq!(
+        resources[1].id.identity_str().expect("resolved identity"),
+        new_name
+    );
     assert!(
         renames.is_empty(),
         "SimHash reconcile must not rename a live state row already used by another resource"
@@ -2193,7 +2617,11 @@ fn test_reconcile_anonymous_id_simhash_claims_state_entry_once() {
     let mut old_resources = vec![simhash_eip_resource("production")];
     compute_anonymous_identifiers_for_test(&mut old_resources, &providers, &schemas, &identity_fn)
         .unwrap();
-    let old_name = old_resources[0].id.identity_or_empty().to_string();
+    let old_name = old_resources[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
     let old_hash = simhash_suffix_for_test(&old_name);
 
     let mut nearby_resources: Vec<Resource> = Vec::new();
@@ -2209,8 +2637,9 @@ fn test_reconcile_anonymous_id_simhash_claims_state_entry_once() {
         let mut candidate = vec![simhash_eip_resource(tag_env)];
         compute_anonymous_identifiers_for_test(&mut candidate, &providers, &schemas, &identity_fn)
             .unwrap();
-        let candidate_hash = simhash_suffix_for_test(candidate[0].id.identity_or_empty());
-        if candidate[0].id.identity_or_empty() != old_name
+        let candidate_hash =
+            simhash_suffix_for_test(candidate[0].id.identity_str().expect("resolved identity"));
+        if candidate[0].id.identity_str().expect("resolved identity") != old_name
             && old_hash.distance(candidate_hash) < SIMHASH_HAMMING_THRESHOLD
         {
             nearby_resources.push(candidate.remove(0));
@@ -2260,7 +2689,11 @@ fn test_reconcile_anonymous_id_no_create_only_no_match_when_distant() {
         Value::Concrete(ConcreteValue::String("vpc".to_string())),
     );
 
-    let original_id = resource.id.identity_or_empty().to_string();
+    let original_id = resource
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
     let mut resources = vec![resource];
 
     // State has a very different hash (flipped many bits)
@@ -2276,7 +2709,10 @@ fn test_reconcile_anonymous_id_no_create_only_no_match_when_distant() {
     );
 
     // Identifier should remain unchanged (too distant)
-    assert_eq!(resources[0].id.identity_or_empty(), original_id);
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        original_id
+    );
 }
 
 #[test]
@@ -2301,7 +2737,7 @@ fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
     // Compute identifier without setting the create-only property
-    let mut r1 = Resource::with_provider("awscc", "ec2.eip", "", None);
+    let mut r1 = Resource::pending_with_provider("awscc", "ec2.eip", None);
     r1.set_attr(
         "domain".to_string(),
         Value::Concrete(ConcreteValue::String("vpc".to_string())),
@@ -2311,7 +2747,13 @@ fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
         .unwrap();
 
     // Should have computed an identifier (not errored)
-    assert!(!resources[0].id.identity_or_empty().is_empty());
+    assert!(
+        !resources[0]
+            .id
+            .identity_str()
+            .expect("resolved identity")
+            .is_empty()
+    );
     assert!(
         resources[0]
             .id
@@ -2321,7 +2763,11 @@ fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
     );
 
     // Reconciliation should use Hamming distance (create-only values empty)
-    let current_id = resources[0].id.identity_or_empty().to_string();
+    let current_id = resources[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
     let state_id = current_id.clone(); // Same id in state = no reconciliation needed
     let state_entries = vec![AnonymousIdStateInfo {
         name: state_id,
@@ -2335,7 +2781,10 @@ fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
     );
 
     // Same identifier in state, no change needed
-    assert_eq!(resources[0].id.identity_or_empty(), current_id);
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        current_id
+    );
 }
 
 // ==================== SimHash acceptance tests ====================
@@ -2498,7 +2947,7 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
 
     // Compute 3 identifiers with different attributes
     let make_resource = |env: &str, team: &str| {
-        let mut r = Resource::with_provider("awscc", "ec2.eip", "", None);
+        let mut r = Resource::pending_with_provider("awscc", "ec2.eip", None);
         r.set_attr(
             "domain".to_string(),
             Value::Concrete(ConcreteValue::String("vpc".to_string())),
@@ -2581,7 +3030,10 @@ fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
     // points from the closest state entry to the new identifier so the wiring
     // layer can re-key the legacy state row.
     assert_eq!(
-        resources_current[0].id.identity_or_empty(),
+        resources_current[0]
+            .id
+            .identity_str()
+            .expect("resolved identity"),
         current_id_before,
         "Resource should retain its freshly-computed identifier",
     );
@@ -2630,7 +3082,7 @@ fn test_reconcile_no_create_only_same_id_in_state_no_change() {
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
-    let mut r = Resource::with_provider("awscc", "ec2.eip", "", None);
+    let mut r = Resource::pending_with_provider("awscc", "ec2.eip", None);
     r.set_attr(
         "domain".to_string(),
         Value::Concrete(ConcreteValue::String("vpc".to_string())),
@@ -2638,7 +3090,11 @@ fn test_reconcile_no_create_only_same_id_in_state_no_change() {
     let mut resources = vec![r];
     compute_anonymous_identifiers_for_test(&mut resources, &providers, &schemas, &identity_fn)
         .unwrap();
-    let id = resources[0].id.identity_or_empty().to_string();
+    let id = resources[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
 
     // State has the exact same identifier
     let state_entries = vec![AnonymousIdStateInfo {
@@ -2653,7 +3109,10 @@ fn test_reconcile_no_create_only_same_id_in_state_no_change() {
     );
 
     // Should remain unchanged
-    assert_eq!(resources[0].id.identity_or_empty(), id);
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        id
+    );
 }
 
 #[test]
@@ -2670,7 +3129,11 @@ fn test_reconcile_no_create_only_empty_state() {
         "domain".to_string(),
         Value::Concrete(ConcreteValue::String("vpc".to_string())),
     );
-    let original_id = resource.id.identity_or_empty().to_string();
+    let original_id = resource
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
     let mut resources = vec![resource];
 
     reconcile_anonymous_identifiers(
@@ -2680,7 +3143,10 @@ fn test_reconcile_no_create_only_empty_state() {
         &|_binding| Vec::new(),
     );
 
-    assert_eq!(resources[0].id.identity_or_empty(), original_id);
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        original_id
+    );
 }
 
 #[test]
@@ -2705,7 +3171,7 @@ fn test_compute_anonymous_id_uses_simhash_for_no_create_only() {
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
     let make_resource = |env: &str| {
-        let mut r = Resource::with_provider("awscc", "ec2.internet_gateway", "", None);
+        let mut r = Resource::pending_with_provider("awscc", "ec2.internet_gateway", None);
         r.set_attr(
             "tag_name".to_string(),
             Value::Concrete(ConcreteValue::String("my-igw".to_string())),
@@ -2727,11 +3193,14 @@ fn test_compute_anonymous_id_uses_simhash_for_no_create_only() {
     compute_anonymous_identifiers_for_test(&mut r2, &providers, &schemas, &identity_fn).unwrap();
 
     // Different identifiers
-    assert_ne!(r1[0].id.identity_or_empty(), r2[0].id.identity_or_empty());
+    assert_ne!(
+        r1[0].id.identity_str().expect("resolved identity"),
+        r2[0].id.identity_str().expect("resolved identity")
+    );
 
     // But nearby (SimHash locality-sensitive property)
-    let hash1 = simhash_suffix_for_test(r1[0].id.identity_or_empty());
-    let hash2 = simhash_suffix_for_test(r2[0].id.identity_or_empty());
+    let hash1 = simhash_suffix_for_test(r1[0].id.identity_str().expect("resolved identity"));
+    let hash2 = simhash_suffix_for_test(r2[0].id.identity_str().expect("resolved identity"));
     let distance = hash1.distance(hash2);
     assert!(
         distance < SIMHASH_HAMMING_THRESHOLD,
@@ -2766,7 +3235,7 @@ fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
-    let mut vpc = Resource::with_provider("awscc", "ec2.Vpc", "", None);
+    let mut vpc = Resource::pending_with_provider("awscc", "ec2.Vpc", None);
     vpc.set_attr(
         "cidr_block".to_string(),
         Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
@@ -2776,7 +3245,7 @@ fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
         Value::Concrete(ConcreteValue::String("my-vpc".to_string())),
     );
 
-    let mut eip = Resource::with_provider("awscc", "ec2.eip", "", None);
+    let mut eip = Resource::pending_with_provider("awscc", "ec2.eip", None);
     eip.set_attr(
         "domain".to_string(),
         Value::Concrete(ConcreteValue::String("vpc".to_string())),
@@ -2846,7 +3315,11 @@ fn test_reconcile_create_only_path_unaffected_by_simhash_changes() {
         Value::Concrete(ConcreteValue::String("/new/".to_string())),
     );
 
-    let original_id = resource.id.identity_or_empty().to_string();
+    let original_id = resource
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
     let mut resources = vec![resource];
 
     // State with partial match (role_name matches, path differs)
@@ -2868,8 +3341,14 @@ fn test_reconcile_create_only_path_unaffected_by_simhash_changes() {
     );
 
     // Should reconcile via partial create-only match (not Hamming distance)
-    assert_eq!(resources[0].id.identity_or_empty(), "iam_role_11223344");
-    assert_ne!(resources[0].id.identity_or_empty(), original_id);
+    assert_eq!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        "iam_role_11223344"
+    );
+    assert_ne!(
+        resources[0].id.identity_str().expect("resolved identity"),
+        original_id
+    );
 }
 
 #[test]
@@ -2895,7 +3374,7 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
 
     // Simulate two runs with different random suffixes but same prefix
     let make_resource = |generated_name: &str| {
-        let mut r = Resource::with_provider("awscc", "s3.Bucket", "", None);
+        let mut r = Resource::pending_with_provider("awscc", "s3.Bucket", None);
         r.set_attr(
             "bucket_name".to_string(),
             Value::Concrete(ConcreteValue::String(generated_name.to_string())),
@@ -2912,8 +3391,8 @@ fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
 
     // Same prefix should produce the same anonymous identifier
     assert_eq!(
-        r1[0].id.identity_or_empty(),
-        r2[0].id.identity_or_empty(),
+        r1[0].id.identity_str().expect("resolved identity"),
+        r2[0].id.identity_str().expect("resolved identity"),
         "Prefixed create-only attributes should produce stable identifiers"
     );
 }
@@ -2938,7 +3417,7 @@ fn test_compute_anonymous_id_different_prefix_produces_different_id() {
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
     let make_resource = |prefix: &str, generated_name: &str| {
-        let mut r = Resource::with_provider("awscc", "s3.Bucket", "", None);
+        let mut r = Resource::pending_with_provider("awscc", "s3.Bucket", None);
         r.set_attr(
             "bucket_name".to_string(),
             Value::Concrete(ConcreteValue::String(generated_name.to_string())),
@@ -2955,8 +3434,8 @@ fn test_compute_anonymous_id_different_prefix_produces_different_id() {
 
     // Different prefixes should produce different identifiers
     assert_ne!(
-        r1[0].id.identity_or_empty(),
-        r2[0].id.identity_or_empty(),
+        r1[0].id.identity_str().expect("resolved identity"),
+        r2[0].id.identity_str().expect("resolved identity"),
         "Different prefixes should produce different identifiers"
     );
 }
@@ -3013,7 +3492,7 @@ fn test_reconcile_skips_let_bound_resources() {
 
     // Named resource must keep its original name
     assert_eq!(
-        resources[0].id.identity_or_empty(),
+        resources[0].id.identity_str().expect("resolved identity"),
         "ingress_new",
         "let-bound resource should not be reconciled"
     );
@@ -3051,7 +3530,11 @@ fn test_reconcile_skips_when_multiple_partial_matches() {
         Value::Concrete(ConcreteValue::String("Allow gRPC".to_string())),
     );
 
-    let original_id = new_rule.id.identity_or_empty().to_string();
+    let original_id = new_rule
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
     let mut resources = vec![new_rule];
 
     // State has TWO entries that partially match (same cidr_ip + ip_protocol,
@@ -3088,7 +3571,7 @@ fn test_reconcile_skips_when_multiple_partial_matches() {
 
     // With multiple partial matches, reconciliation should be skipped
     assert_eq!(
-        resources[0].id.identity_or_empty(),
+        resources[0].id.identity_str().expect("resolved identity"),
         original_id,
         "ambiguous partial matches should not reconcile"
     );
@@ -3134,7 +3617,7 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
     let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
     // Step 1: Create EIP with tags Environment=acceptance-test
-    let mut r1 = Resource::with_provider("awscc", "ec2.eip", "", None);
+    let mut r1 = Resource::pending_with_provider("awscc", "ec2.eip", None);
     r1.set_attr(
         "domain".to_string(),
         Value::Concrete(ConcreteValue::String("vpc".to_string())),
@@ -3156,10 +3639,14 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
     let mut resources1 = vec![r1];
     compute_anonymous_identifiers_for_test(&mut resources1, &providers, &schemas, &identity_fn)
         .unwrap();
-    let step1_id = resources1[0].id.identity_or_empty().to_string();
+    let step1_id = resources1[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
 
     // Step 2: Change tag Environment=staging (only tags changed)
-    let mut r2 = Resource::with_provider("awscc", "ec2.eip", "", None);
+    let mut r2 = Resource::pending_with_provider("awscc", "ec2.eip", None);
     r2.set_attr(
         "domain".to_string(),
         Value::Concrete(ConcreteValue::String("vpc".to_string())),
@@ -3181,7 +3668,11 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
     let mut resources2 = vec![r2];
     compute_anonymous_identifiers_for_test(&mut resources2, &providers, &schemas, &identity_fn)
         .unwrap();
-    let step2_id = resources2[0].id.identity_or_empty().to_string();
+    let step2_id = resources2[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
 
     // Identifiers should differ (different tag values)
     assert_ne!(step1_id, step2_id);
@@ -3203,7 +3694,7 @@ fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
     // entry from step1's name to step2's name. This produces an
     // in-place update on the same state row instead of delete+create.
     assert_eq!(
-        resources2[0].id.identity_or_empty(),
+        resources2[0].id.identity_str().expect("resolved identity"),
         step2_id,
         "Resource should retain its freshly-computed identifier"
     );
@@ -3295,12 +3786,12 @@ fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
 
     // Names must remain unchanged - no swapping
     assert_eq!(
-        resources[0].id.identity_or_empty(),
+        resources[0].id.identity_str().expect("resolved identity"),
         "ingress_http",
         "ingress_http should not be renamed to ingress_https"
     );
     assert_eq!(
-        resources[1].id.identity_or_empty(),
+        resources[1].id.identity_str().expect("resolved identity"),
         "ingress_https",
         "ingress_https should not be renamed to ingress_http"
     );
@@ -3346,11 +3837,8 @@ fn test_detect_rename_unique_match_by_create_only_attrs() {
     );
 
     assert_eq!(renames.len(), 1);
-    assert_eq!(
-        renames[0].0.identity_or_empty(),
-        "sso_instance_0ac0620303071530"
-    );
-    assert_eq!(renames[0].1.identity_or_empty(), "sso");
+    assert_eq!(renames[0].0.identity_str(), "sso_instance_0ac0620303071530");
+    assert_eq!(renames[0].1.identity_str(), "sso");
 }
 
 #[test]
@@ -3469,7 +3957,7 @@ fn test_reconcile_skips_state_entry_claimed_by_removed_from() {
     );
 
     assert_eq!(
-        resources[0].id.identity_or_empty(),
+        resources[0].id.identity_str().expect("resolved identity"),
         "awscc_ec2_route_aaaaaaaa",
         "effective removed.from state row must be excluded from heuristic matching"
     );
@@ -3626,7 +4114,7 @@ fn test_detect_rename_no_create_only_matches_by_simhash() {
 
     // Step 1: generate the anonymous ID the previous `apply` would have
     // written to state, using the same inputs and the same code path.
-    let mut anon = Resource::with_provider("awscc", "sso.Instance", "", None);
+    let mut anon = Resource::pending_with_provider("awscc", "sso.Instance", None);
     anon.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
@@ -3634,7 +4122,11 @@ fn test_detect_rename_no_create_only_matches_by_simhash() {
     let mut anon_vec = vec![anon];
     compute_anonymous_identifiers_for_test(&mut anon_vec, &providers, &schemas, &identity_fn)
         .unwrap();
-    let anonymous_name = anon_vec[0].id.identity_or_empty().to_string();
+    let anonymous_name = anon_vec[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
     assert!(
         anonymous_name.starts_with("awscc_sso_instance_"),
         "expected hash-derived name, got {anonymous_name}"
@@ -3665,8 +4157,8 @@ fn test_detect_rename_no_create_only_matches_by_simhash() {
     );
 
     assert_eq!(renames.len(), 1, "expected one rename, got {:?}", renames);
-    assert_eq!(renames[0].0.identity_or_empty(), anonymous_name);
-    assert_eq!(renames[0].1.identity_or_empty(), "sso");
+    assert_eq!(renames[0].0.identity_str(), anonymous_name);
+    assert_eq!(renames[0].1.identity_str(), "sso");
 }
 
 #[test]
@@ -3680,7 +4172,7 @@ fn test_detect_rename_no_create_only_skips_when_attributes_differ_too_much() {
     let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
 
     // Anonymous snapshot with many attributes.
-    let mut anon = Resource::with_provider("awscc", "sso.Instance", "", None);
+    let mut anon = Resource::pending_with_provider("awscc", "sso.Instance", None);
     anon.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("old-name".to_string())),
@@ -3701,7 +4193,11 @@ fn test_detect_rename_no_create_only_skips_when_attributes_differ_too_much() {
     let mut anon_vec = vec![anon];
     compute_anonymous_identifiers_for_test(&mut anon_vec, &providers, &schemas, &identity_fn)
         .unwrap();
-    let anonymous_name = anon_vec[0].id.identity_or_empty().to_string();
+    let anonymous_name = anon_vec[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
 
     // Let-bound resource with wildly different attributes.
     let mut let_bound = Resource::with_provider("awscc", "sso.Instance", "sso", None);
@@ -3758,7 +4254,7 @@ fn test_detect_rename_no_create_only_picks_closest_among_multiple_candidates() {
     let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
 
     // Compute the exact-match name.
-    let mut anon = Resource::with_provider("awscc", "sso.Instance", "", None);
+    let mut anon = Resource::pending_with_provider("awscc", "sso.Instance", None);
     anon.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
@@ -3766,7 +4262,11 @@ fn test_detect_rename_no_create_only_picks_closest_among_multiple_candidates() {
     let mut anon_vec = vec![anon];
     compute_anonymous_identifiers_for_test(&mut anon_vec, &providers, &schemas, &identity_fn)
         .unwrap();
-    let exact_name = anon_vec[0].id.identity_or_empty().to_string();
+    let exact_name = anon_vec[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
 
     // Construct a "close but not equal" orphan by flipping the last hex
     // char of the SimHash — guarantees a small nonzero Hamming distance
@@ -3808,7 +4308,7 @@ fn test_detect_rename_no_create_only_picks_closest_among_multiple_candidates() {
 
     assert_eq!(renames.len(), 1);
     assert_eq!(
-        renames[0].0.identity_or_empty(),
+        renames[0].0.identity_str(),
         exact_name,
         "should prefer the exact SimHash match over the nearby one"
     );
@@ -3860,7 +4360,7 @@ fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
     let identity_fn = |_: &str| -> Vec<String> { Vec::new() };
 
     // Compute the target SimHash.
-    let mut anon = Resource::with_provider("awscc", "sso.Instance", "", None);
+    let mut anon = Resource::pending_with_provider("awscc", "sso.Instance", None);
     anon.set_attr(
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
@@ -3868,7 +4368,11 @@ fn test_detect_rename_no_create_only_skips_when_two_orphans_tie_on_distance() {
     let mut anon_vec = vec![anon];
     compute_anonymous_identifiers_for_test(&mut anon_vec, &providers, &schemas, &identity_fn)
         .unwrap();
-    let anonymous_name = anon_vec[0].id.identity_or_empty().to_string();
+    let anonymous_name = anon_vec[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
 
     // Two state entries with the exact same name hash → same distance (0).
     let state_entries = vec![
@@ -3922,7 +4426,7 @@ fn anonymous_identifier_includes_provider_prefix() {
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
-    let mut r = Resource::with_provider("awscc", "iam.RolePolicy", "", None);
+    let mut r = Resource::pending_with_provider("awscc", "iam.RolePolicy", None);
     r.set_attr(
         "policy_name".to_string(),
         Value::Concrete(ConcreteValue::String("foo".to_string())),
@@ -3931,7 +4435,7 @@ fn anonymous_identifier_includes_provider_prefix() {
     compute_anonymous_identifiers_for_test(&mut resources, &providers, &schemas, &identity_fn)
         .unwrap();
 
-    let name = resources[0].id.identity_or_empty();
+    let name = resources[0].id.identity_str().expect("resolved identity");
     assert!(
         name.starts_with("awscc_"),
         "identifier should begin with the provider prefix, got: {name}"
@@ -3960,7 +4464,7 @@ fn anonymous_identifier_provider_prefix_for_aws_provider() {
     }];
     let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
-    let mut r = Resource::with_provider("aws", "s3.Bucket", "", None);
+    let mut r = Resource::pending_with_provider("aws", "s3.Bucket", None);
     r.set_attr(
         "bucket_name".to_string(),
         Value::Concrete(ConcreteValue::String("example".to_string())),
@@ -3975,7 +4479,7 @@ fn anonymous_identifier_provider_prefix_for_aws_provider() {
             .unwrap_or("")
             .starts_with("aws_s3_bucket_"),
         "identifier should begin with `aws_s3_bucket_`, got: {}",
-        resources[0].id.identity_or_empty()
+        resources[0].id.identity_str().expect("resolved identity")
     );
 }
 
@@ -4000,7 +4504,7 @@ fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_rename() {
 
     // Build a resource and let compute_anonymous_identifiers assign its
     // freshly-computed new-format name.
-    let mut r = Resource::with_provider("awscc", "iam.RolePolicy", "", None);
+    let mut r = Resource::pending_with_provider("awscc", "iam.RolePolicy", None);
     r.set_attr(
         "policy_name".to_string(),
         Value::Concrete(ConcreteValue::String("inline".to_string())),
@@ -4008,7 +4512,11 @@ fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_rename() {
     let mut resources = vec![r];
     compute_anonymous_identifiers_for_test(&mut resources, &providers, &schemas, &identity_fn)
         .unwrap();
-    let new_name = resources[0].id.identity_or_empty().to_string();
+    let new_name = resources[0]
+        .id
+        .identity_str()
+        .expect("resolved identity")
+        .to_string();
     assert!(new_name.starts_with("awscc_iam_role_policy_"));
 
     // Strip the provider prefix to simulate a state entry written under the
@@ -4030,7 +4538,7 @@ fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_rename() {
     );
 
     assert_eq!(
-        resources[0].id.identity_or_empty(),
+        resources[0].id.identity_str().expect("resolved identity"),
         new_name,
         "resource id should retain the new-format identifier",
     );

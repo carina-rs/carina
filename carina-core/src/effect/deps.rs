@@ -608,7 +608,7 @@ mod tests {
         State::not_found(id.clone())
     }
 
-    fn update_effect(binding: &str, refs: &[(&str, &str)], changed: &[&str]) -> Effect {
+    fn update_effect(binding: &'static str, refs: &[(&str, &str)], changed: &[&str]) -> Effect {
         let mut resource = Resource::new("test", binding);
         resource.binding = Some(binding.to_string());
         for (dep, attr) in refs {
@@ -624,13 +624,17 @@ mod tests {
         }
     }
 
-    fn create_effect(binding: &str) -> Effect {
+    fn create_effect(binding: &'static str) -> Effect {
         let mut resource = Resource::new("test", binding);
         resource.binding = Some(binding.to_string());
         Effect::Create(ResolvedResource::new(resource))
     }
 
-    fn delete_effect(identity: &str, dependencies: &[&str], blocked_by_updates: &[&str]) -> Effect {
+    fn delete_effect(
+        identity: &'static str,
+        dependencies: &[&str],
+        blocked_by_updates: &[&str],
+    ) -> Effect {
         Effect::Delete {
             id: ResolvedResourceId::new(ResourceId::with_identity("test", identity)),
             identifier: format!("{identity}-id"),
@@ -650,7 +654,7 @@ mod tests {
         }
     }
 
-    fn deposed_delete_effect(identity: &str, dependencies: &[&str]) -> Effect {
+    fn deposed_delete_effect(identity: &'static str, dependencies: &[&str]) -> Effect {
         let mut effect = delete_effect(identity, dependencies, &[]);
         if let Effect::Delete { generation, .. } = &mut effect {
             *generation =

@@ -121,9 +121,7 @@ pub(in crate::parser) fn parse_moved_block(
         });
     }
 
-    let from_name = from.name_str().to_string();
-    let to_name = to.name_str().to_string();
     Ok(StateBlock::Moved {
-        addresses: MovedAddresses::new(from.provider, from.resource_type, from_name, to_name),
+        addresses: MovedAddresses::new(from.provider, from.resource_type, from.name, to.name),
     })
 }
