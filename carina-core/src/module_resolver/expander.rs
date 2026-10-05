@@ -1252,8 +1252,14 @@ pub fn reconcile_anonymous_module_instances(
     let mut claimed_state_by_module: HashMap<String, HashSet<SimHash>> = HashMap::new();
 
     for (provider, resource_type) in &touched_types {
-        for name in find_state_names_by_type(provider, resource_type) {
-            let Some((prefix, _)) = split_instance_prefix(&name) else {
+        let state_names = claims.screen_entries(
+            provider,
+            resource_type,
+            find_state_names_by_type(provider, resource_type),
+            |name| name,
+        );
+        for name in state_names.all() {
+            let Some((prefix, _)) = split_instance_prefix(name) else {
                 continue;
             };
             let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix) else {
@@ -1263,12 +1269,18 @@ pub fn reconcile_anonymous_module_instances(
                 .entry(module.to_string())
                 .or_default()
                 .insert(simhash);
-            if claims.claims_from(provider, resource_type, &name) {
-                claimed_state_by_module
-                    .entry(module.to_string())
-                    .or_default()
-                    .insert(simhash);
-            }
+        }
+        for name in state_names.claimed() {
+            let Some((prefix, _)) = split_instance_prefix(name) else {
+                continue;
+            };
+            let Some((module, simhash)) = parse_synthetic_instance_prefix(prefix) else {
+                continue;
+            };
+            claimed_state_by_module
+                .entry(module.to_string())
+                .or_default()
+                .insert(simhash);
         }
     }
 

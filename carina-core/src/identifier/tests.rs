@@ -12,12 +12,21 @@ fn reconcile_anonymous_identifiers(
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
 ) -> Vec<(String, String)> {
+    let claims = StateBlockClaims::empty();
+    let find_screened_state_by_type = |provider: &str, resource_type: &str| {
+        claims.screen_entries(
+            provider,
+            resource_type,
+            find_state_by_type(provider, resource_type),
+            |entry| entry.name.as_str(),
+        )
+    };
     super::reconcile_anonymous_identifiers(
         resources,
         registry,
-        find_state_by_type,
+        &find_screened_state_by_type,
         find_state_by_binding,
-        &StateBlockClaims::empty(),
+        &claims,
     )
 }
 
@@ -28,13 +37,22 @@ fn detect_anonymous_to_named_renames_for_test(
     providers: &[ProviderConfig],
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
 ) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
+    let claims = StateBlockClaims::empty();
+    let find_screened_state_by_type = |provider: &str, resource_type: &str| {
+        claims.screen_entries(
+            provider,
+            resource_type,
+            find_state_by_type(provider, resource_type),
+            |entry| entry.name.as_str(),
+        )
+    };
     super::detect_anonymous_to_named_renames_for_test(
         resources,
         registry,
-        find_state_by_type,
+        &find_screened_state_by_type,
         providers,
         identity_attributes_fn,
-        &StateBlockClaims::empty(),
+        &claims,
     )
 }
 
@@ -2052,7 +2070,11 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
     let simhash_renames = super::reconcile_anonymous_identifiers(
         &mut simhash_resources,
         &simhash_schemas,
-        &|_, _| simhash_state.clone(),
+        &|provider, resource_type| {
+            claims.screen_entries(provider, resource_type, simhash_state.clone(), |entry| {
+                entry.name.as_str()
+            })
+        },
         &|_| Vec::new(),
         &claims,
     );
@@ -2087,7 +2109,14 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
     let create_only_renames = super::reconcile_anonymous_identifiers(
         &mut create_only_resources,
         &create_only_schemas,
-        &|_, _| create_only_state.clone(),
+        &|provider, resource_type| {
+            claims.screen_entries(
+                provider,
+                resource_type,
+                create_only_state.clone(),
+                |entry| entry.name.as_str(),
+            )
+        },
         &|binding| {
             binding_entries
                 .iter()
@@ -2130,7 +2159,11 @@ fn test_reconcile_skips_desired_name_claimed_by_moved_to() {
     super::reconcile_anonymous_identifiers(
         &mut resources,
         &schemas,
-        &|_, _| state_entries.clone(),
+        &|provider, resource_type| {
+            claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {
+                entry.name.as_str()
+            })
+        },
         &|binding| {
             binding_entries
                 .iter()
@@ -3869,7 +3902,11 @@ fn test_detect_anonymous_to_named_skips_claimed_from() {
     let renames = super::detect_anonymous_to_named_renames_for_test(
         &resources,
         &schemas,
-        &|_provider, _rt| state_entries.clone(),
+        &|provider, resource_type| {
+            claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {
+                entry.name.as_str()
+            })
+        },
         &[],
         &|_provider| Vec::new(),
         &claims,
@@ -3908,7 +3945,11 @@ fn test_detect_anonymous_to_named_skips_claimed_to() {
     let renames = super::detect_anonymous_to_named_renames_for_test(
         &resources,
         &schemas,
-        &|_provider, _rt| state_entries.clone(),
+        &|provider, resource_type| {
+            claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {
+                entry.name.as_str()
+            })
+        },
         &[],
         &|_provider| Vec::new(),
         &claims,
@@ -3945,7 +3986,11 @@ fn test_reconcile_skips_state_entry_claimed_by_removed_from() {
     super::reconcile_anonymous_identifiers(
         &mut resources,
         &schemas,
-        &|_, _| state_entries.clone(),
+        &|provider, resource_type| {
+            claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {
+                entry.name.as_str()
+            })
+        },
         &|binding| {
             binding_entries
                 .iter()
@@ -3960,6 +4005,62 @@ fn test_reconcile_skips_state_entry_claimed_by_removed_from() {
         resources[0].id.identity_str().expect("resolved identity"),
         "awscc_ec2_route_aaaaaaaa",
         "effective removed.from state row must be excluded from heuristic matching"
+    );
+}
+
+#[test]
+fn test_reconcile_existing_removed_from_identity_does_not_repoint_to_orphan() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("awscc", subnet_route_table_association_schema());
+    let desired_name = "awscc_ec2_subnet_route_table_association_aaaaaaaa";
+    let orphan_name = "awscc_ec2_subnet_route_table_association_bbbbbbbb";
+    let mut resource = Resource::with_provider(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        desired_name,
+        None,
+    );
+    resource.set_attr(
+        "route_table_id".to_string(),
+        Value::Concrete(ConcreteValue::String("rtb-private".to_string())),
+    );
+    resource.set_attr(
+        "subnet_id".to_string(),
+        Value::Concrete(ConcreteValue::String("subnet-current".to_string())),
+    );
+    let mut resources = vec![resource];
+    let state_entries = vec![
+        association_state_entry(desired_name, "rtb-private", "subnet-current"),
+        association_state_entry(orphan_name, "rtb-private", "subnet-orphan"),
+    ];
+    let claims = StateBlockClaims::new(
+        [StateBlockAddress::new(
+            "awscc",
+            "ec2.SubnetRouteTableAssociation",
+            desired_name,
+        )]
+        .into_iter()
+        .collect(),
+        HashSet::new(),
+    );
+
+    let renames = super::reconcile_anonymous_identifiers(
+        &mut resources,
+        &schemas,
+        &|provider, resource_type| {
+            claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {
+                entry.name.as_str()
+            })
+        },
+        &|_| Vec::new(),
+        &claims,
+    );
+
+    assert!(renames.is_empty());
+    assert_eq!(
+        resources[0].id.identity_str(),
+        Some(desired_name),
+        "an existing removed.from-claimed identity must remain visible to the existence check",
     );
 }
 
@@ -3991,6 +4092,59 @@ fn test_detect_rename_skips_when_binding_already_in_state() {
         &|_provider| Vec::new(),
     );
     assert!(renames.is_empty());
+}
+
+#[test]
+fn test_detect_rename_existing_removed_from_binding_does_not_use_orphan() {
+    let schemas = make_sso_instance_registry();
+    let binding_name = "sso";
+    let orphan_name = "sso_instance_0ac0620303071530";
+    let mut resource = Resource::with_provider("awscc", "sso.Instance", binding_name, None);
+    resource.binding = Some(binding_name.to_string());
+    resource.set_attr(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("carina-rs".to_string())),
+    );
+    let resources = vec![resource];
+    let state_entries = vec![
+        AnonymousIdStateInfo {
+            name: binding_name.to_string(),
+            create_only_values: HashMap::from([("name".to_string(), "carina-rs".to_string())]),
+        },
+        AnonymousIdStateInfo {
+            name: orphan_name.to_string(),
+            create_only_values: HashMap::from([("name".to_string(), "carina-rs".to_string())]),
+        },
+    ];
+    let claims = StateBlockClaims::new(
+        [StateBlockAddress::new(
+            "awscc",
+            "sso.Instance",
+            binding_name,
+        )]
+        .into_iter()
+        .collect(),
+        HashSet::new(),
+    );
+
+    let renames = super::detect_anonymous_to_named_renames_for_test(
+        &resources,
+        &schemas,
+        &|provider, resource_type| {
+            claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {
+                entry.name.as_str()
+            })
+        },
+        &[],
+        &|_| Vec::new(),
+        &claims,
+    );
+
+    assert!(
+        renames.is_empty(),
+        "an existing removed.from-claimed binding must suppress orphan rename detection",
+    );
+    assert_eq!(resources[0].id.identity_str(), Some(binding_name));
 }
 
 #[test]

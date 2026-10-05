@@ -1610,12 +1610,6 @@ async fn run_apply_locked(
     })
     .await?;
     sorted_resources = resorted;
-    crate::wiring::validate_plan_time_state_block_collisions(
-        &sorted_resources,
-        &moved_pairs,
-        &resolved_state_block_targets,
-        &state_file,
-    )?;
     // Expansion borrows `parsed` immutably (expands a clone), so
     // `parsed.deferred_for_expressions` is NOT drained of resolved
     // loops the way the old `&mut self` call drained it. `print_plan`
@@ -1723,7 +1717,7 @@ async fn run_apply_locked(
         render_plan_errors_and_abort(&plan)?;
         unreachable!("render_plan_errors_and_abort returns an error for an invalid plan");
     }
-    reconcile_late_anonymous_identities(
+    let resolved_desired_ids = reconcile_late_anonymous_identities(
         ctx,
         LateAnonymousIdentityInputs {
             resources: &mut override_aware_resources,
@@ -1735,6 +1729,12 @@ async fn run_apply_locked(
             prev_explicit: &mut prev_explicit,
             providers: &parsed.providers,
         },
+    )?;
+    crate::wiring::validate_plan_time_state_block_collisions(
+        &resolved_desired_ids,
+        &moved_pairs,
+        &resolved_state_block_targets,
+        &state_file,
     )?;
     let paired_unresolved_resources = override_aware_resources
         .paired_unresolved_resources_with_binding_sources(&unresolved_override_aware_resources);

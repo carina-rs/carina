@@ -22,10 +22,9 @@ use carina_state::{StateFile, check_and_migrate};
 
 use crate::commands::validate_and_resolve_with_config;
 use crate::wiring::{
-    PlanPreprocessor, WiringContext, add_deferred_create_effects,
-    adopt_unique_state_identity_for_unresolved_anonymous,
-    assign_fallback_identities_for_unresolved_anonymous, compute_anonymous_identifiers_with_ctx,
-    expand_same_config_deferred_for, reconcile_anonymous_identifiers_with_ctx,
+    LateAnonymousIdentityInputs, PlanPreprocessor, WiringContext, add_deferred_create_effects,
+    compute_anonymous_identifiers_with_ctx, expand_same_config_deferred_for,
+    reconcile_anonymous_identifiers_with_ctx, reconcile_late_anonymous_identities,
     reconcile_prefixed_names,
 };
 
@@ -326,42 +325,20 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             expansion_trace: parsed.expansion_trace,
         };
     }
-    {
-        let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
-            override_aware_resources.resources_mut(),
-            wiring.schemas(),
-        );
-        let errors =
-            compute_anonymous_identifiers_with_ctx(&wiring, canonical_resources, &parsed.providers);
-        assert!(errors.is_empty(), "{errors:?}");
-    }
-    if let Some(sf) = state_file.as_mut() {
-        reconcile_anonymous_identifiers_with_ctx(
-            &wiring,
-            override_aware_resources.resources_mut(),
-            sf,
-            &state_block_claims,
-        )
-        .expect("fixture state identities must remain unique");
-        adopt_unique_state_identity_for_unresolved_anonymous(
-            override_aware_resources.resources_mut(),
-            sf,
-        );
-    }
-    let fallback_renames = assign_fallback_identities_for_unresolved_anonymous(
-        override_aware_resources.resources_mut(),
-        &data_sources_for_plan,
-    );
-    for (from, to) in &fallback_renames {
-        if let Some(mut state) = current_states.remove(from) {
-            state.id = to.clone();
-            current_states.insert(to.clone(), state);
-        }
-        saved_attrs.remap_resource_id(from, to.clone());
-        if let Some(explicit) = prev_explicit.remove(from) {
-            prev_explicit.insert(to.clone(), explicit);
-        }
-    }
+    let resolved_desired_ids = reconcile_late_anonymous_identities(
+        &wiring,
+        LateAnonymousIdentityInputs {
+            resources: &mut override_aware_resources,
+            data_sources: &data_sources_for_plan,
+            state_file: state_file.as_ref(),
+            state_block_claims: &state_block_claims,
+            current_states: &mut current_states,
+            saved_attrs: &mut saved_attrs,
+            prev_explicit: &mut prev_explicit,
+            providers: &parsed.providers,
+        },
+    )
+    .expect("fixture late anonymous identities must resolve uniquely");
 
     let orphan_dependencies = if let Some(sf) = state_file.as_ref() {
         let desired_ids: HashSet<ResourceId> = override_aware_resources
@@ -382,7 +359,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &state_file,
     );
     crate::wiring::validate_plan_time_state_block_collisions(
-        &sorted_resources,
+        &resolved_desired_ids,
         &moved_pairs,
         &resolved_state_block_targets,
         &state_file,

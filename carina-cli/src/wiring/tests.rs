@@ -1251,6 +1251,10 @@ fn bucket_resource(name: &str) -> Resource {
     Resource::with_provider("awscc", "s3.Bucket", test_identity(name), None)
 }
 
+fn resolved_desired_ids(resources: &[Resource]) -> ResolvedDesiredIds {
+    ResolvedDesiredIds::from_resources(resources).expect("test desired identities must be resolved")
+}
+
 fn bucket_state_file(names: &[&str]) -> carina_state::state::StateFile {
     use carina_state::state::{ResourceState, StateFile};
 
@@ -1432,7 +1436,7 @@ fn test_plan_fails_on_two_moves_to_same_target() {
 
     assert_collision_contains(
         validate_plan_time_state_block_collisions(
-            &desired,
+            &resolved_desired_ids(&desired),
             &moved_pairs,
             &ResolvedStateBlockTargets::default(),
             &state_file,
@@ -1452,7 +1456,7 @@ fn test_plan_fails_on_two_moves_from_same_source() {
 
     assert_collision_contains(
         validate_plan_time_state_block_collisions(
-            &desired,
+            &resolved_desired_ids(&desired),
             &moved_pairs,
             &ResolvedStateBlockTargets::default(),
             &state_file,
@@ -1463,21 +1467,57 @@ fn test_plan_fails_on_two_moves_from_same_source() {
 
 #[test]
 fn test_plan_fails_on_removed_from_colliding_with_desired() {
-    let desired = vec![bucket_resource("live")];
-    let state_file = Some(bucket_state_file(&["live"]));
-    let blocks = vec![StateBlock::Removed {
-        from: StateBlockAddress::new("awscc", "s3.Bucket", "live"),
-    }];
-    let resolution = resolve_state_blocks(
-        &blocks,
-        &state_file,
-        &desired,
-        &carina_core::schema::SchemaRegistry::new(),
+    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)]);
+    let desired_name = "awscc_ec2_subnet_route_table_association_aaaaaaaa";
+    let orphan_name = "awscc_ec2_subnet_route_table_association_bbbbbbbb";
+    let mut resource = Resource::with_provider(
+        "awscc",
+        "ec2.SubnetRouteTableAssociation",
+        desired_name,
+        None,
     );
+    resource.set_attr(
+        "route_table_id".to_string(),
+        Value::Concrete(ConcreteValue::String("rtb-private".to_string())),
+    );
+    resource.set_attr(
+        "subnet_id".to_string(),
+        Value::Concrete(ConcreteValue::String("subnet-current".to_string())),
+    );
+    let mut desired = vec![resource];
+    let mut state = StateFile::new();
+    state
+        .upsert_resource(association_state(
+            desired_name,
+            "rtb-private",
+            "subnet-current",
+        ))
+        .expect("test state setup must be valid");
+    state
+        .upsert_resource(association_state(
+            orphan_name,
+            "rtb-private",
+            "subnet-orphan",
+        ))
+        .expect("test state setup must be valid");
+    let state_file = Some(state.clone());
+    let blocks = vec![StateBlock::Removed {
+        from: StateBlockAddress::new("awscc", "ec2.SubnetRouteTableAssociation", desired_name),
+    }];
+    let resolution = resolve_state_blocks(&blocks, &state_file, &desired, ctx.schemas());
+    reconcile_anonymous_identifiers_with_ctx(&ctx, &mut desired, &mut state, &resolution.claims)
+        .expect("test state identities must remain unique");
+
+    assert_eq!(desired[0].id.identity_str(), Some(desired_name));
 
     assert_collision_contains(
-        validate_plan_time_state_block_collisions(&desired, &[], &resolution.targets, &state_file),
-        "removed block from awscc.s3.Bucket live collides with desired resource awscc.s3.Bucket live",
+        validate_plan_time_state_block_collisions(
+            &resolved_desired_ids(&desired),
+            &[],
+            &resolution.targets,
+            &state_file,
+        ),
+        "removed block from awscc.ec2.SubnetRouteTableAssociation awscc_ec2_subnet_route_table_association_aaaaaaaa collides with desired resource awscc.ec2.SubnetRouteTableAssociation awscc_ec2_subnet_route_table_association_aaaaaaaa",
     );
 }
 
@@ -1489,7 +1529,7 @@ fn test_plan_fails_on_move_onto_occupied_state_entry() {
 
     assert_collision_contains(
         validate_plan_time_state_block_collisions(
-            &desired,
+            &resolved_desired_ids(&desired),
             &moved_pairs,
             &ResolvedStateBlockTargets::default(),
             &state_file,
@@ -1525,7 +1565,7 @@ fn test_plan_allows_from_absent_to_present_idempotent_noop() {
     );
 
     validate_plan_time_state_block_collisions(
-        &desired,
+        &resolved_desired_ids(&desired),
         &moved_pairs,
         &ResolvedStateBlockTargets::default(),
         &state_file,
@@ -1543,7 +1583,7 @@ fn test_plan_fails_on_synthesized_rename_colliding_with_moved_to() {
 
     assert_collision_contains(
         validate_plan_time_state_block_collisions(
-            &desired,
+            &resolved_desired_ids(&desired),
             &moved_pairs,
             &ResolvedStateBlockTargets::default(),
             &state_file,
@@ -1560,7 +1600,7 @@ fn test_plan_fails_on_orphan_self_move() {
 
     assert_collision_contains(
         validate_plan_time_state_block_collisions(
-            &desired,
+            &resolved_desired_ids(&desired),
             &moved_pairs,
             &ResolvedStateBlockTargets::default(),
             &state_file,
@@ -1580,7 +1620,7 @@ fn test_plan_fails_on_rotation_shape() {
 
     assert_collision_contains(
         validate_plan_time_state_block_collisions(
-            &desired,
+            &resolved_desired_ids(&desired),
             &moved_pairs,
             &ResolvedStateBlockTargets::default(),
             &state_file,
@@ -1735,11 +1775,20 @@ fn assert_claimed_association_stays_orphaned_after_reconcile() {
         &resources,
         ctx.schemas(),
     );
-
     assert!(
-        claims.claims_from("awscc", "ec2.SubnetRouteTableAssociation", old_name),
+        claims
+            .screen_entries(
+                "awscc",
+                "ec2.SubnetRouteTableAssociation",
+                [old_name],
+                |name| name,
+            )
+            .candidates()
+            .next()
+            .is_none(),
         "effective removed block must claim its state entry"
     );
+
     reconcile_anonymous_identifiers_with_ctx(&ctx, &mut resources, &mut state_file, &claims)
         .expect("test state identities must remain unique");
 
@@ -3036,6 +3085,102 @@ fn anonymous_route_resource() -> Resource {
         Value::Concrete(ConcreteValue::String("rtb-123".to_string())),
     );
     resource
+}
+
+#[test]
+fn unresolved_anonymous_adoption_only_sees_unclaimed_state_entries() {
+    use carina_state::ResourceState;
+
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(ResourceState::new("test.claimed", "claimed-row", "mock"))
+        .expect("insert claimed state entry");
+    state_file
+        .upsert_resource(ResourceState::new(
+            "test.unclaimed",
+            "unclaimed-row",
+            "mock",
+        ))
+        .expect("insert unclaimed state entry");
+    let claims = StateBlockClaims::new(
+        HashSet::from([StateBlockAddress::new(
+            "mock",
+            "test.claimed",
+            "claimed-row",
+        )]),
+        HashSet::new(),
+    );
+    let mut resources = vec![
+        Resource::pending_with_provider("mock", "test.claimed", None),
+        Resource::pending_with_provider("mock", "test.unclaimed", None),
+    ];
+
+    adopt_unique_state_identity_for_unresolved_anonymous(
+        &mut resources,
+        &|provider, resource_type| {
+            claims.screen_entries(
+                provider,
+                resource_type,
+                state_file.resources_by_type(provider, resource_type),
+                |entry| entry.identity.as_str(),
+            )
+        },
+    );
+
+    assert_eq!(
+        resources[0].id.identity_str(),
+        None,
+        "a removed.from-claimed entry must not be available for adoption"
+    );
+    assert_eq!(
+        resources[1].id.identity_str(),
+        Some("unclaimed-row"),
+        "the sole unclaimed entry must still be adopted"
+    );
+}
+
+#[test]
+fn removed_from_claimed_entry_does_not_count_toward_adoption_uniqueness() {
+    use carina_state::ResourceState;
+
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(ResourceState::new("test.resource", "claimed-row", "mock"))
+        .expect("insert claimed state entry");
+    state_file
+        .upsert_resource(ResourceState::new("test.resource", "unclaimed-row", "mock"))
+        .expect("insert unclaimed state entry");
+    let claims = StateBlockClaims::new(
+        HashSet::from([StateBlockAddress::new(
+            "mock",
+            "test.resource",
+            "claimed-row",
+        )]),
+        HashSet::new(),
+    );
+    let mut resources = vec![Resource::pending_with_provider(
+        "mock",
+        "test.resource",
+        None,
+    )];
+
+    adopt_unique_state_identity_for_unresolved_anonymous(
+        &mut resources,
+        &|provider, resource_type| {
+            claims.screen_entries(
+                provider,
+                resource_type,
+                state_file.resources_by_type(provider, resource_type),
+                |entry| entry.identity.as_str(),
+            )
+        },
+    );
+
+    assert_eq!(
+        resources[0].id.identity_str(),
+        Some("unclaimed-row"),
+        "the claimed entry must not make the sole unclaimed candidate appear non-unique"
+    );
 }
 
 #[test]
