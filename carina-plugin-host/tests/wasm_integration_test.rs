@@ -7,7 +7,9 @@ use carina_core::effect::PlanOp;
 use carina_core::provider::{
     CreateRequest, DeleteRequest, Provider, ProviderFactory, ReadRequest, SavedAttrs, UpdateRequest,
 };
-use carina_core::resource::{ConcreteValue, DataSource, Resource, ResourceId, State, Value};
+use carina_core::resource::{
+    ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, State, Value,
+};
 use carina_plugin_host::WasmProviderFactory;
 
 async fn create_request_for_test(resource: Resource) -> CreateRequest {
@@ -377,6 +379,85 @@ async fn test_wasm_mock_provider_normalizer() {
         ))),
         "the second pending state must receive its own normalized WASM result"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_normalize_desired_preserves_secret() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &indexmap::IndexMap::new())
+        .await;
+
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("normalize-secret-plaintext".to_string()),
+    ))));
+    let mut resource = Resource::with_provider("mock", "test.resource", "secret-normalize", None);
+    resource
+        .attributes
+        .insert("api_key".to_string(), secret.clone());
+    let mut resources = vec![resource];
+
+    normalizer.normalize_desired(&mut resources).await;
+
+    assert_eq!(resources[0].get_attr("api_key"), Some(&secret));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_merge_default_tags_restores_secret_into_two_resources() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &indexmap::IndexMap::new())
+        .await;
+
+    let resource_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("resource-secret-plaintext".to_string()),
+    ))));
+    let default_tag_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("default-tag-secret-plaintext".to_string()),
+    ))));
+    let mut resources: Vec<_> = ["first-secret-tags", "second-secret-tags"]
+        .into_iter()
+        .map(|identity| {
+            let mut resource = Resource::with_provider("mock", "test.resource", identity, None);
+            resource
+                .attributes
+                .insert("api_key".to_string(), resource_secret.clone());
+            resource
+        })
+        .collect();
+    let default_tags =
+        indexmap::IndexMap::from([("Token".to_string(), default_tag_secret.clone())]);
+
+    normalizer
+        .merge_default_tags(
+            &mut resources,
+            &default_tags,
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .await;
+
+    for resource in &resources {
+        assert_eq!(
+            resource.get_attr("api_key"),
+            Some(&resource_secret),
+            "resource secrets must survive the merge_default_tags round-trip"
+        );
+        let Some(Value::Concrete(ConcreteValue::List(echoed_tags))) =
+            resource.get_attr("__mock_merged_default_tags__")
+        else {
+            panic!("expected each resource to receive the mock provider's echoed default tags");
+        };
+        let Some(Value::Concrete(ConcreteValue::Map(echoed_tag))) = echoed_tags.first() else {
+            panic!("expected one echoed default tag");
+        };
+        assert_eq!(
+            echoed_tag.get("v"),
+            Some(&default_tag_secret),
+            "each copied default tag secret must be restored"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

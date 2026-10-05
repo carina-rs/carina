@@ -1,6 +1,8 @@
 pub mod wasm_convert;
 pub mod wasm_factory;
 
+mod secret_seal;
+
 pub mod wasm_bindings {
     wasmtime::component::bindgen!({
         path: "../carina-plugin-wit/wit",
