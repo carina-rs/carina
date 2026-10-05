@@ -1777,7 +1777,7 @@ fn assert_claimed_association_stays_orphaned_after_reconcile() {
     );
     assert!(
         claims
-            .screen_rows(
+            .screen_entries(
                 "awscc",
                 "ec2.SubnetRouteTableAssociation",
                 [old_name],
@@ -3088,20 +3088,20 @@ fn anonymous_route_resource() -> Resource {
 }
 
 #[test]
-fn unresolved_anonymous_adoption_only_sees_unclaimed_state_rows() {
+fn unresolved_anonymous_adoption_only_sees_unclaimed_state_entries() {
     use carina_state::ResourceState;
 
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(ResourceState::new("test.claimed", "claimed-row", "mock"))
-        .expect("insert claimed state row");
+        .expect("insert claimed state entry");
     state_file
         .upsert_resource(ResourceState::new(
             "test.unclaimed",
             "unclaimed-row",
             "mock",
         ))
-        .expect("insert unclaimed state row");
+        .expect("insert unclaimed state entry");
     let claims = StateBlockClaims::new(
         HashSet::from([StateBlockAddress::new(
             "mock",
@@ -3118,11 +3118,11 @@ fn unresolved_anonymous_adoption_only_sees_unclaimed_state_rows() {
     adopt_unique_state_identity_for_unresolved_anonymous(
         &mut resources,
         &|provider, resource_type| {
-            claims.screen_rows(
+            claims.screen_entries(
                 provider,
                 resource_type,
                 state_file.resources_by_type(provider, resource_type),
-                |row| row.identity.as_str(),
+                |entry| entry.identity.as_str(),
             )
         },
     );
@@ -3130,26 +3130,26 @@ fn unresolved_anonymous_adoption_only_sees_unclaimed_state_rows() {
     assert_eq!(
         resources[0].id.identity_str(),
         None,
-        "a removed.from-claimed row must not be available for adoption"
+        "a removed.from-claimed entry must not be available for adoption"
     );
     assert_eq!(
         resources[1].id.identity_str(),
         Some("unclaimed-row"),
-        "the sole unclaimed row must still be adopted"
+        "the sole unclaimed entry must still be adopted"
     );
 }
 
 #[test]
-fn removed_from_claimed_row_does_not_count_toward_adoption_uniqueness() {
+fn removed_from_claimed_entry_does_not_count_toward_adoption_uniqueness() {
     use carina_state::ResourceState;
 
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(ResourceState::new("test.resource", "claimed-row", "mock"))
-        .expect("insert claimed state row");
+        .expect("insert claimed state entry");
     state_file
         .upsert_resource(ResourceState::new("test.resource", "unclaimed-row", "mock"))
-        .expect("insert unclaimed state row");
+        .expect("insert unclaimed state entry");
     let claims = StateBlockClaims::new(
         HashSet::from([StateBlockAddress::new(
             "mock",
@@ -3167,11 +3167,11 @@ fn removed_from_claimed_row_does_not_count_toward_adoption_uniqueness() {
     adopt_unique_state_identity_for_unresolved_anonymous(
         &mut resources,
         &|provider, resource_type| {
-            claims.screen_rows(
+            claims.screen_entries(
                 provider,
                 resource_type,
                 state_file.resources_by_type(provider, resource_type),
-                |row| row.identity.as_str(),
+                |entry| entry.identity.as_str(),
             )
         },
     );
@@ -3179,7 +3179,7 @@ fn removed_from_claimed_row_does_not_count_toward_adoption_uniqueness() {
     assert_eq!(
         resources[0].id.identity_str(),
         Some("unclaimed-row"),
-        "the claimed row must not make the sole unclaimed candidate appear non-unique"
+        "the claimed entry must not make the sole unclaimed candidate appear non-unique"
     );
 }
 

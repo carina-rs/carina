@@ -1252,7 +1252,7 @@ pub fn reconcile_anonymous_module_instances(
     let mut claimed_state_by_module: HashMap<String, HashSet<SimHash>> = HashMap::new();
 
     for (provider, resource_type) in &touched_types {
-        let state_names = claims.screen_rows(
+        let state_names = claims.screen_entries(
             provider,
             resource_type,
             find_state_names_by_type(provider, resource_type),

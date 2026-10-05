@@ -24,7 +24,7 @@ use carina_core::executor::normalized::{
 };
 use carina_core::executor::{UnresolvedDataSourceInput, unresolved_data_source_inputs};
 use carina_core::identifier::{
-    self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, ScreenedStateRows,
+    self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, ScreenedStateEntries,
     StateBlockClaims,
 };
 use carina_core::module_resolver;
@@ -687,7 +687,7 @@ pub fn apply_anonymous_to_named_renames(
                 )
                 .map(|s| s.create_only_attributes())
                 .unwrap_or_default();
-            let rows = sf
+            let state_entries = sf
                 .resources_by_type(provider, resource_type)
                 .into_iter()
                 .map(|sr| {
@@ -705,7 +705,9 @@ pub fn apply_anonymous_to_named_renames(
                         create_only_values,
                     }
                 });
-            claims.screen_rows(provider, resource_type, rows, |row| row.name.as_str())
+            claims.screen_entries(provider, resource_type, state_entries, |entry| {
+                entry.name.as_str()
+            })
         },
         &canonical_providers,
         &|name| identity_attributes_for_provider(ctx, name),
@@ -771,7 +773,7 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
                 .map(|s| s.create_only_attributes())
                 .unwrap_or_default();
 
-            let rows = state_file
+            let state_entries = state_file
                 .resources_by_type(provider, resource_type)
                 .into_iter()
                 .map(|sr| {
@@ -789,7 +791,9 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
                         create_only_values,
                     }
                 });
-            claims.screen_rows(provider, resource_type, rows, |row| row.name.as_str())
+            claims.screen_entries(provider, resource_type, state_entries, |entry| {
+                entry.name.as_str()
+            })
         },
         &|binding| state_by_binding.get(binding).cloned().unwrap_or_default(),
         claims,
@@ -803,7 +807,7 @@ pub(crate) fn adopt_unique_state_identity_for_unresolved_anonymous<'state>(
     find_state_by_type: &dyn Fn(
         &str,
         &str,
-    ) -> ScreenedStateRows<&'state carina_state::ResourceState>,
+    ) -> ScreenedStateEntries<&'state carina_state::ResourceState>,
 ) {
     type ResourceKind = (String, String, Option<String>);
 
@@ -832,8 +836,8 @@ pub(crate) fn adopt_unique_state_identity_for_unresolved_anonymous<'state>(
             resource.id.resource_type.clone(),
             resource.id.provider_instance.clone(),
         );
-        let state_rows = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
-        let candidates: Vec<_> = state_rows
+        let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
+        let candidates: Vec<_> = state_entries
             .candidates()
             .copied()
             .filter(|state| state.directives.provider_instance == resource.id.provider_instance)
@@ -933,11 +937,11 @@ pub(crate) fn reconcile_late_anonymous_identities(
         adopt_unique_state_identity_for_unresolved_anonymous(
             inputs.resources.resources_mut(),
             &|provider, resource_type| {
-                inputs.state_block_claims.screen_rows(
+                inputs.state_block_claims.screen_entries(
                     provider,
                     resource_type,
                     sf.resources_by_type(provider, resource_type),
-                    |row| row.identity.as_str(),
+                    |entry| entry.identity.as_str(),
                 )
             },
         );

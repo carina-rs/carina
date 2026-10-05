@@ -14,11 +14,11 @@ fn reconcile_anonymous_identifiers(
 ) -> Vec<(String, String)> {
     let claims = StateBlockClaims::empty();
     let find_screened_state_by_type = |provider: &str, resource_type: &str| {
-        claims.screen_rows(
+        claims.screen_entries(
             provider,
             resource_type,
             find_state_by_type(provider, resource_type),
-            |row| row.name.as_str(),
+            |entry| entry.name.as_str(),
         )
     };
     super::reconcile_anonymous_identifiers(
@@ -39,11 +39,11 @@ fn detect_anonymous_to_named_renames_for_test(
 ) -> Vec<(ResolvedResourceId, ResolvedResourceId)> {
     let claims = StateBlockClaims::empty();
     let find_screened_state_by_type = |provider: &str, resource_type: &str| {
-        claims.screen_rows(
+        claims.screen_entries(
             provider,
             resource_type,
             find_state_by_type(provider, resource_type),
-            |row| row.name.as_str(),
+            |entry| entry.name.as_str(),
         )
     };
     super::detect_anonymous_to_named_renames_for_test(
@@ -2071,8 +2071,8 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
         &mut simhash_resources,
         &simhash_schemas,
         &|provider, resource_type| {
-            claims.screen_rows(provider, resource_type, simhash_state.clone(), |row| {
-                row.name.as_str()
+            claims.screen_entries(provider, resource_type, simhash_state.clone(), |entry| {
+                entry.name.as_str()
             })
         },
         &|_| Vec::new(),
@@ -2110,9 +2110,12 @@ fn test_reconcile_skips_state_entry_claimed_by_moved_from() {
         &mut create_only_resources,
         &create_only_schemas,
         &|provider, resource_type| {
-            claims.screen_rows(provider, resource_type, create_only_state.clone(), |row| {
-                row.name.as_str()
-            })
+            claims.screen_entries(
+                provider,
+                resource_type,
+                create_only_state.clone(),
+                |entry| entry.name.as_str(),
+            )
         },
         &|binding| {
             binding_entries
@@ -2157,8 +2160,8 @@ fn test_reconcile_skips_desired_name_claimed_by_moved_to() {
         &mut resources,
         &schemas,
         &|provider, resource_type| {
-            claims.screen_rows(provider, resource_type, state_entries.clone(), |row| {
-                row.name.as_str()
+            claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {
+                entry.name.as_str()
             })
         },
         &|binding| {
@@ -3900,8 +3903,8 @@ fn test_detect_anonymous_to_named_skips_claimed_from() {
         &resources,
         &schemas,
         &|provider, resource_type| {
-            claims.screen_rows(provider, resource_type, state_entries.clone(), |row| {
-                row.name.as_str()
+            claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {
+                entry.name.as_str()
             })
         },
         &[],
@@ -3943,8 +3946,8 @@ fn test_detect_anonymous_to_named_skips_claimed_to() {
         &resources,
         &schemas,
         &|provider, resource_type| {
-            claims.screen_rows(provider, resource_type, state_entries.clone(), |row| {
-                row.name.as_str()
+            claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {
+                entry.name.as_str()
             })
         },
         &[],
@@ -3984,8 +3987,8 @@ fn test_reconcile_skips_state_entry_claimed_by_removed_from() {
         &mut resources,
         &schemas,
         &|provider, resource_type| {
-            claims.screen_rows(provider, resource_type, state_entries.clone(), |row| {
-                row.name.as_str()
+            claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {
+                entry.name.as_str()
             })
         },
         &|binding| {
@@ -4045,8 +4048,8 @@ fn test_reconcile_existing_removed_from_identity_does_not_repoint_to_orphan() {
         &mut resources,
         &schemas,
         &|provider, resource_type| {
-            claims.screen_rows(provider, resource_type, state_entries.clone(), |row| {
-                row.name.as_str()
+            claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {
+                entry.name.as_str()
             })
         },
         &|_| Vec::new(),
@@ -4128,8 +4131,8 @@ fn test_detect_rename_existing_removed_from_binding_does_not_use_orphan() {
         &resources,
         &schemas,
         &|provider, resource_type| {
-            claims.screen_rows(provider, resource_type, state_entries.clone(), |row| {
-                row.name.as_str()
+            claims.screen_entries(provider, resource_type, state_entries.clone(), |entry| {
+                entry.name.as_str()
             })
         },
         &[],

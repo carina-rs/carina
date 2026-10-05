@@ -402,7 +402,7 @@ fn claimed_named_row_is_not_adopted_by_the_single_attribute_derived_anonymous_re
 }
 
 #[test]
-fn removed_row_is_not_adopted_by_an_unresolved_anonymous_resource() {
+fn removed_entry_is_not_adopted_by_an_unresolved_anonymous_resource() {
     let scenario = Scenario::new();
     scenario.write_main(ALPHA);
 
@@ -413,19 +413,19 @@ fn removed_row_is_not_adopted_by_an_unresolved_anonymous_resource() {
     );
 
     let initial_state = scenario.state();
-    let old_row = initial_state
+    let old_entry = initial_state
         .resources()
         .iter()
-        .find(|row| row.provider == "mock" && row.resource_type == "test.resource")
-        .expect("alpha state row");
+        .find(|entry| entry.provider == "mock" && entry.resource_type == "test.resource")
+        .expect("alpha state entry");
     assert_eq!(
-        old_row
+        old_entry
             .attributes
             .get("name")
             .and_then(serde_json::Value::as_str),
         Some("alpha")
     );
-    let old_identity = old_row.identity.as_str().to_string();
+    let old_identity = old_entry.identity.as_str().to_string();
 
     scenario.write_main(&format!(
         r#"mock.test.resource {{
@@ -454,8 +454,9 @@ removed {{
     let final_names = final_state
         .resources()
         .iter()
-        .filter_map(|row| {
-            row.attributes
+        .filter_map(|entry| {
+            entry
+                .attributes
                 .get("name")
                 .and_then(serde_json::Value::as_str)
         })
@@ -470,10 +471,10 @@ removed {{
             && replan.status.success()
             && replan_stdout.contains("No changes")
             && final_names == ["gamma"],
-        "a removed row must not be adopted by the replacement anonymous resource\n\
+        "a removed entry must not be adopted by the replacement anonymous resource\n\
          old identity: {old_identity}\nplan status: {}\nplan stdout:\n{plan_stdout}\n\
          plan stderr:\n{}\ncreates gamma: {plan_creates_gamma}\n\
-         removes old row: {plan_removes_old}\nno updates: {plan_has_no_updates}\n\
+         removes old entry: {plan_removes_old}\nno updates: {plan_has_no_updates}\n\
          apply status: {}\napply stdout:\n{}\napply stderr:\n{}\n\
          replan status: {}\nreplan stdout:\n{replan_stdout}\nreplan stderr:\n{}\n\
          final state names: {final_names:?}",
@@ -501,12 +502,12 @@ fn assert_kept_anonymous_resource_state_block_collision(
     );
 
     let initial_state = scenario.state();
-    let initial_row = initial_state
+    let initial_entry = initial_state
         .resources()
         .iter()
-        .find(|row| row.provider == "mock" && row.resource_type == "test.resource")
-        .expect("alpha state row");
-    let initial_identity = initial_row.identity.as_str().to_string();
+        .find(|entry| entry.provider == "mock" && entry.resource_type == "test.resource")
+        .expect("alpha state entry");
+    let initial_identity = initial_entry.identity.as_str().to_string();
     let initial_state_bytes =
         fs::read(scenario.project.join("carina.state.json")).expect("read initial state bytes");
     let collision = expected_collision(&initial_identity);

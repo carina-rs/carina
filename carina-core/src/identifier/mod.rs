@@ -29,28 +29,28 @@ pub struct StateBlockClaims {
     to: HashSet<StateBlockAddress>,
 }
 
-/// State rows screened against state-block `from` claims for one provider and
-/// resource type, retaining both the complete row set and the safe heuristic
+/// State entries screened against state-block `from` claims for one provider and
+/// resource type, retaining both the complete entry set and the safe heuristic
 /// candidate subset.
-pub struct ScreenedStateRows<T> {
-    rows: Vec<(T, bool)>,
+pub struct ScreenedStateEntries<T> {
+    entries: Vec<(T, bool)>,
 }
 
-impl<T> ScreenedStateRows<T> {
+impl<T> ScreenedStateEntries<T> {
     pub fn candidates(&self) -> impl Iterator<Item = &T> {
-        self.rows
+        self.entries
             .iter()
-            .filter_map(|(row, claimed)| (!claimed).then_some(row))
+            .filter_map(|(entry, claimed)| (!claimed).then_some(entry))
     }
 
     pub(crate) fn all(&self) -> impl Iterator<Item = &T> {
-        self.rows.iter().map(|(row, _)| row)
+        self.entries.iter().map(|(entry, _)| entry)
     }
 
     pub(crate) fn claimed(&self) -> impl Iterator<Item = &T> {
-        self.rows
+        self.entries
             .iter()
-            .filter_map(|(row, claimed)| claimed.then_some(row))
+            .filter_map(|(entry, claimed)| claimed.then_some(entry))
     }
 }
 
@@ -66,19 +66,19 @@ impl StateBlockClaims {
         Self::default()
     }
 
-    pub fn screen_rows<T>(
+    pub fn screen_entries<T>(
         &self,
         provider: &str,
         resource_type: &str,
-        rows: impl IntoIterator<Item = T>,
+        entries: impl IntoIterator<Item = T>,
         name_of: impl Fn(&T) -> &str,
-    ) -> ScreenedStateRows<T> {
-        ScreenedStateRows {
-            rows: rows
+    ) -> ScreenedStateEntries<T> {
+        ScreenedStateEntries {
+            entries: entries
                 .into_iter()
-                .map(|row| {
-                    let claimed = self.claims_from(provider, resource_type, name_of(&row));
-                    (row, claimed)
+                .map(|entry| {
+                    let claimed = self.claims_from(provider, resource_type, name_of(&entry));
+                    (entry, claimed)
                 })
                 .collect(),
         }
@@ -1159,7 +1159,7 @@ fn canonical_or_resolved_create_only_value_string(
 ///
 /// `find_state_by_type` takes (provider, resource_type) and returns screened
 /// state entries for that resource type with their create-only attribute
-/// values. Existence checks inspect every row, while heuristic matching only
+/// values. Existence checks inspect every entry, while heuristic matching only
 /// inspects unclaimed candidates.
 /// `find_state_by_binding` takes a binding name and returns state entries
 /// carrying that binding across resource types, for resolving single-hop
@@ -1181,7 +1181,7 @@ fn canonical_or_resolved_create_only_value_string(
 pub fn reconcile_anonymous_identifiers(
     resources: &mut [Resource],
     registry: &SchemaRegistry,
-    find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateRows<AnonymousIdStateInfo>,
+    find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     claims: &StateBlockClaims,
 ) -> Vec<(String, String)> {
@@ -1390,7 +1390,7 @@ pub fn reconcile_anonymous_identifiers(
 pub fn detect_anonymous_to_named_renames(
     resources: &[Resource],
     registry: &SchemaRegistry,
-    find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateRows<AnonymousIdStateInfo>,
+    find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
     providers: &CanonicalizedProviderConfigs,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
@@ -1522,7 +1522,7 @@ pub fn detect_anonymous_to_named_renames(
 pub fn detect_anonymous_to_named_renames_for_test(
     resources: &[Resource],
     registry: &SchemaRegistry,
-    find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateRows<AnonymousIdStateInfo>,
+    find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateEntries<AnonymousIdStateInfo>,
     providers: &[ProviderConfig],
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
