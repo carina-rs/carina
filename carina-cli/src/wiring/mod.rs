@@ -24,7 +24,8 @@ use carina_core::executor::normalized::{
 };
 use carina_core::executor::{UnresolvedDataSourceInput, unresolved_data_source_inputs};
 use carina_core::identifier::{
-    self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
+    self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, ScreenedStateRows,
+    StateBlockClaims,
 };
 use carina_core::module_resolver;
 use carina_core::override_aware::OverrideAwareResources;
@@ -686,7 +687,8 @@ pub fn apply_anonymous_to_named_renames(
                 )
                 .map(|s| s.create_only_attributes())
                 .unwrap_or_default();
-            sf.resources_by_type(provider, resource_type)
+            let rows = sf
+                .resources_by_type(provider, resource_type)
                 .into_iter()
                 .map(|sr| {
                     let create_only_values = create_only_attrs
@@ -702,8 +704,8 @@ pub fn apply_anonymous_to_named_renames(
                         name: sr.identity.to_string(),
                         create_only_values,
                     }
-                })
-                .collect()
+                });
+            claims.screen_rows(provider, resource_type, rows, |row| row.name.as_str())
         },
         &canonical_providers,
         &|name| identity_attributes_for_provider(ctx, name),
@@ -769,7 +771,7 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
                 .map(|s| s.create_only_attributes())
                 .unwrap_or_default();
 
-            state_file
+            let rows = state_file
                 .resources_by_type(provider, resource_type)
                 .into_iter()
                 .map(|sr| {
@@ -786,8 +788,8 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
                         name: sr.identity.to_string(),
                         create_only_values,
                     }
-                })
-                .collect()
+                });
+            claims.screen_rows(provider, resource_type, rows, |row| row.name.as_str())
         },
         &|binding| state_by_binding.get(binding).cloned().unwrap_or_default(),
         claims,
@@ -796,9 +798,12 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
     state_file.rename_resource_identities(&renames)
 }
 
-pub(crate) fn adopt_unique_state_identity_for_unresolved_anonymous(
+pub(crate) fn adopt_unique_state_identity_for_unresolved_anonymous<'state>(
     resources: &mut [Resource],
-    state_file: &StateFile,
+    find_state_by_type: &dyn Fn(
+        &str,
+        &str,
+    ) -> ScreenedStateRows<&'state carina_state::ResourceState>,
 ) {
     type ResourceKind = (String, String, Option<String>);
 
@@ -827,9 +832,10 @@ pub(crate) fn adopt_unique_state_identity_for_unresolved_anonymous(
             resource.id.resource_type.clone(),
             resource.id.provider_instance.clone(),
         );
-        let candidates: Vec<_> = state_file
-            .resources_by_type(&resource.id.provider, &resource.id.resource_type)
-            .into_iter()
+        let state_rows = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
+        let candidates: Vec<_> = state_rows
+            .candidates()
+            .copied()
             .filter(|state| state.directives.provider_instance == resource.id.provider_instance)
             .filter(|state| {
                 !claimed_state_identities
@@ -888,10 +894,25 @@ pub(crate) struct LateAnonymousIdentityInputs<'a> {
     pub providers: &'a [ProviderConfig],
 }
 
+/// Desired resource identities captured only after late identity resolution.
+pub struct ResolvedDesiredIds {
+    ids: HashSet<ResolvedResourceId>,
+}
+
+impl ResolvedDesiredIds {
+    fn from_resources(resources: &[Resource]) -> Result<Self, AppError> {
+        let ids = ResolvedResource::collect_resolved(resources.iter().cloned())?
+            .into_iter()
+            .map(|resource| resource.resolved_id())
+            .collect();
+        Ok(Self { ids })
+    }
+}
+
 pub(crate) fn reconcile_late_anonymous_identities(
     ctx: &WiringContext,
     inputs: LateAnonymousIdentityInputs<'_>,
-) -> Result<(), AppError> {
+) -> Result<ResolvedDesiredIds, AppError> {
     let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
         inputs.resources.resources_mut(),
         ctx.schemas(),
@@ -909,7 +930,17 @@ pub(crate) fn reconcile_late_anonymous_identities(
             &mut state_for_late_reconcile,
             inputs.state_block_claims,
         )?;
-        adopt_unique_state_identity_for_unresolved_anonymous(inputs.resources.resources_mut(), sf);
+        adopt_unique_state_identity_for_unresolved_anonymous(
+            inputs.resources.resources_mut(),
+            &|provider, resource_type| {
+                inputs.state_block_claims.screen_rows(
+                    provider,
+                    resource_type,
+                    sf.resources_by_type(provider, resource_type),
+                    |row| row.identity.as_str(),
+                )
+            },
+        );
     }
 
     let fallback_renames = assign_fallback_identities_for_unresolved_anonymous(
@@ -934,7 +965,7 @@ pub(crate) fn reconcile_late_anonymous_identities(
         }
     }
 
-    Ok(())
+    ResolvedDesiredIds::from_resources(inputs.resources.resources())
 }
 
 pub fn compute_anonymous_identifiers_with_ctx(
@@ -2752,12 +2783,6 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         &orphan_refreshed_ids,
     )?;
     sorted_resources = resorted;
-    validate_plan_time_state_block_collisions(
-        &sorted_resources,
-        &moved_pairs,
-        resolved_state_block_targets,
-        state_file,
-    )?;
 
     // A printed `⚠` warning is newline-terminated and is written on top of
     // indicatif's open spinner bar line, so it closes the bar region the
@@ -2932,7 +2957,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // have made those create-only values concrete. Keep this late pass local to
     // the desired resources; the earlier mutable-state reconciliation still
     // owns state-file rename migration.
-    reconcile_late_anonymous_identities(
+    let resolved_desired_ids = reconcile_late_anonymous_identities(
         ctx,
         LateAnonymousIdentityInputs {
             resources: &mut override_aware_resources,
@@ -2944,6 +2969,12 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             prev_explicit: &mut prev_explicit,
             providers: &parsed.providers,
         },
+    )?;
+    validate_plan_time_state_block_collisions(
+        &resolved_desired_ids,
+        &moved_pairs,
+        resolved_state_block_targets,
+        state_file,
     )?;
 
     // Build orphan dependency bindings from state file for tree structure
@@ -3235,16 +3266,13 @@ pub fn resolve_state_blocks(
 }
 
 pub fn validate_plan_time_state_block_collisions(
-    desired: &[Resource],
+    desired: &ResolvedDesiredIds,
     moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
     resolved_targets: &ResolvedStateBlockTargets,
     state_file: &Option<StateFile>,
 ) -> Result<(), AppError> {
-    let desired_ids: HashSet<ResourceId> =
-        desired.iter().map(|resource| resource.id.clone()).collect();
-
     for (from, _to) in moved_pairs {
-        if desired_ids.contains(from.as_inner()) {
+        if desired.ids.contains(from) {
             return Err(AppError::Validation(format!(
                 "moved/rename pair from {} collides with a desired resource: applying this plan would both upsert and clean up the same resource id",
                 from.human()
@@ -3253,7 +3281,7 @@ pub fn validate_plan_time_state_block_collisions(
     }
 
     for from in &resolved_targets.removed_from {
-        if desired_ids.contains(from) {
+        if desired.ids.contains(from) {
             return Err(AppError::Validation(format!(
                 "removed block from {} collides with desired resource {}: applying this plan would both upsert and clean up the same resource id",
                 from.human(),

@@ -1,4 +1,4 @@
-//! End-to-end regression coverage for carina#3826.
+//! End-to-end regression coverage for carina#3826 and carina#3829.
 //!
 //! Anonymous resources must never collapse while their identities are still
 //! pending. Schema-stable and let-bound resources both reach the real plan;
@@ -398,6 +398,184 @@ fn claimed_named_row_is_not_adopted_by_the_single_attribute_derived_anonymous_re
         String::from_utf8_lossy(&apply.stdout),
         String::from_utf8_lossy(&apply.stderr),
         String::from_utf8_lossy(&replan.stderr),
+    );
+}
+
+#[test]
+fn removed_row_is_not_adopted_by_an_unresolved_anonymous_resource() {
+    let scenario = Scenario::new();
+    scenario.write_main(ALPHA);
+
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+    assert_success(
+        "apply alpha",
+        &scenario.carina(&["apply", "--auto-approve", "."]),
+    );
+
+    let initial_state = scenario.state();
+    let old_row = initial_state
+        .resources()
+        .iter()
+        .find(|row| row.provider == "mock" && row.resource_type == "test.resource")
+        .expect("alpha state row");
+    assert_eq!(
+        old_row
+            .attributes
+            .get("name")
+            .and_then(serde_json::Value::as_str),
+        Some("alpha")
+    );
+    let old_identity = old_row.identity.as_str().to_string();
+
+    scenario.write_main(&format!(
+        r#"mock.test.resource {{
+  name = "gamma"
+}}
+
+removed {{
+  from = mock.test.resource '{old_identity}'
+}}
+"#,
+    ));
+
+    let plan = scenario.carina(&["plan", "--refresh=false", "."]);
+    let plan_stdout = String::from_utf8_lossy(&plan.stdout);
+    let expected_removal = format!("~ mock.test.resource {old_identity} (remove from state)");
+    let plan_creates_gamma =
+        plan_stdout.contains("+ mock.test.resource ") && plan_stdout.contains("name: \"gamma\"");
+    let plan_removes_old = plan_stdout.contains(&expected_removal);
+    let plan_has_no_updates =
+        plan_stdout.contains("Plan: 1 to add, 0 to change, 0 to destroy, 1 to remove from state.");
+
+    let apply = scenario.carina(&["apply", "--auto-approve", "."]);
+    let replan = scenario.carina(&["plan", "."]);
+    let replan_stdout = String::from_utf8_lossy(&replan.stdout);
+    let final_state = scenario.state();
+    let final_names = final_state
+        .resources()
+        .iter()
+        .filter_map(|row| {
+            row.attributes
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        plan.status.success()
+            && plan_creates_gamma
+            && plan_removes_old
+            && plan_has_no_updates
+            && apply.status.success()
+            && replan.status.success()
+            && replan_stdout.contains("No changes")
+            && final_names == ["gamma"],
+        "a removed row must not be adopted by the replacement anonymous resource\n\
+         old identity: {old_identity}\nplan status: {}\nplan stdout:\n{plan_stdout}\n\
+         plan stderr:\n{}\ncreates gamma: {plan_creates_gamma}\n\
+         removes old row: {plan_removes_old}\nno updates: {plan_has_no_updates}\n\
+         apply status: {}\napply stdout:\n{}\napply stderr:\n{}\n\
+         replan status: {}\nreplan stdout:\n{replan_stdout}\nreplan stderr:\n{}\n\
+         final state names: {final_names:?}",
+        plan.status,
+        String::from_utf8_lossy(&plan.stderr),
+        apply.status,
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr),
+        replan.status,
+        String::from_utf8_lossy(&replan.stderr),
+    );
+}
+
+fn assert_kept_anonymous_resource_state_block_collision(
+    state_block: impl FnOnce(&str) -> String,
+    expected_collision: impl FnOnce(&str) -> String,
+) {
+    let scenario = Scenario::new();
+    scenario.write_main(ALPHA);
+
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+    assert_success(
+        "apply alpha",
+        &scenario.carina(&["apply", "--auto-approve", "."]),
+    );
+
+    let initial_state = scenario.state();
+    let initial_row = initial_state
+        .resources()
+        .iter()
+        .find(|row| row.provider == "mock" && row.resource_type == "test.resource")
+        .expect("alpha state row");
+    let initial_identity = initial_row.identity.as_str().to_string();
+    let initial_state_bytes =
+        fs::read(scenario.project.join("carina.state.json")).expect("read initial state bytes");
+    let collision = expected_collision(&initial_identity);
+
+    scenario.write_main(&format!("{ALPHA}\n{}", state_block(&initial_identity)));
+
+    let plan = scenario.carina(&["plan", "--refresh=false", "."]);
+    let plan_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&plan.stdout),
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    assert!(
+        !plan.status.success() && plan_output.contains(&collision),
+        "plan must reject a state-block source that is also a late-resolved desired identity\n\
+         expected collision: {collision}\nstatus: {}\noutput:\n{plan_output}",
+        plan.status,
+    );
+
+    let apply = scenario.carina(&["apply", "--auto-approve", "."]);
+    let apply_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let final_state_bytes =
+        fs::read(scenario.project.join("carina.state.json")).expect("read final state bytes");
+    let final_state = scenario.state();
+    assert!(
+        !apply.status.success()
+            && apply_output.contains(&collision)
+            && !apply_output.lines().any(|line| line.contains("Create"))
+            && final_state_bytes == initial_state_bytes
+            && final_state.resources().len() == 1
+            && final_state.resources()[0].identity.as_str() == initial_identity,
+        "apply must reject the collision before provider mutation or state write\n\
+         expected collision: {collision}\nstatus: {}\noutput:\n{apply_output}\n\
+         initial state:\n{}\nfinal state:\n{}",
+        apply.status,
+        String::from_utf8_lossy(&initial_state_bytes),
+        String::from_utf8_lossy(&final_state_bytes),
+    );
+}
+
+#[test]
+fn moved_from_kept_anonymous_resource_fails_before_create() {
+    assert_kept_anonymous_resource_state_block_collision(
+        |identity| {
+            format!(
+                "moved {{\n  from = mock.test.resource '{identity}'\n  to = mock.test.resource 'other'\n}}\n"
+            )
+        },
+        |identity| {
+            format!(
+                "moved/rename pair from mock.test.resource {identity} collides with a desired resource"
+            )
+        },
+    );
+}
+
+#[test]
+fn removed_from_kept_anonymous_resource_fails_before_create() {
+    assert_kept_anonymous_resource_state_block_collision(
+        |identity| format!("removed {{\n  from = mock.test.resource '{identity}'\n}}\n"),
+        |identity| {
+            format!(
+                "removed block from mock.test.resource {identity} collides with desired resource mock.test.resource {identity}"
+            )
+        },
     );
 }
 

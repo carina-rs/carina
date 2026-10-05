@@ -29,6 +29,31 @@ pub struct StateBlockClaims {
     to: HashSet<StateBlockAddress>,
 }
 
+/// State rows screened against state-block `from` claims for one provider and
+/// resource type, retaining both the complete row set and the safe heuristic
+/// candidate subset.
+pub struct ScreenedStateRows<T> {
+    rows: Vec<(T, bool)>,
+}
+
+impl<T> ScreenedStateRows<T> {
+    pub fn candidates(&self) -> impl Iterator<Item = &T> {
+        self.rows
+            .iter()
+            .filter_map(|(row, claimed)| (!claimed).then_some(row))
+    }
+
+    pub(crate) fn all(&self) -> impl Iterator<Item = &T> {
+        self.rows.iter().map(|(row, _)| row)
+    }
+
+    pub(crate) fn claimed(&self) -> impl Iterator<Item = &T> {
+        self.rows
+            .iter()
+            .filter_map(|(row, claimed)| claimed.then_some(row))
+    }
+}
+
 impl StateBlockClaims {
     pub fn new(from: HashSet<StateBlockAddress>, to: HashSet<StateBlockAddress>) -> Self {
         Self { from, to }
@@ -41,7 +66,25 @@ impl StateBlockClaims {
         Self::default()
     }
 
-    pub fn claims_from(&self, provider: &str, resource_type: &str, name: &str) -> bool {
+    pub fn screen_rows<T>(
+        &self,
+        provider: &str,
+        resource_type: &str,
+        rows: impl IntoIterator<Item = T>,
+        name_of: impl Fn(&T) -> &str,
+    ) -> ScreenedStateRows<T> {
+        ScreenedStateRows {
+            rows: rows
+                .into_iter()
+                .map(|row| {
+                    let claimed = self.claims_from(provider, resource_type, name_of(&row));
+                    (row, claimed)
+                })
+                .collect(),
+        }
+    }
+
+    fn claims_from(&self, provider: &str, resource_type: &str, name: &str) -> bool {
         self.from.iter().any(|address| {
             address.provider == provider
                 && address.resource_type == resource_type
@@ -1114,8 +1157,10 @@ fn canonical_or_resolved_create_only_value_string(
 /// when at least one create-only property matches (partial match), allowing the
 /// differ to generate a Replace effect instead of Create+Delete.
 ///
-/// `find_state_by_type` takes (provider, resource_type) and returns all state
-/// entries for that resource type with their create-only attribute values.
+/// `find_state_by_type` takes (provider, resource_type) and returns screened
+/// state entries for that resource type with their create-only attribute
+/// values. Existence checks inspect every row, while heuristic matching only
+/// inspects unclaimed candidates.
 /// `find_state_by_binding` takes a binding name and returns state entries
 /// carrying that binding across resource types, for resolving single-hop
 /// deferred create-only refs of the exact form `binding.attr`. Binding
@@ -1124,6 +1169,8 @@ fn canonical_or_resolved_create_only_value_string(
 /// cases yield no value and are not errors. Dotted bindings are already
 /// module-qualified by their binding string, while bare bindings only resolve
 /// against dot-free root state entry names.
+/// Binding lookup reads an exact address's attributes; it does not select an
+/// identity to adopt or re-key, so it is not an identity-candidate source.
 ///
 /// Returns a list of `(old_state_name, new_resource_name)` pairs that the
 /// caller should apply to state-keyed maps. These are emitted when a SimHash
@@ -1134,7 +1181,7 @@ fn canonical_or_resolved_create_only_value_string(
 pub fn reconcile_anonymous_identifiers(
     resources: &mut [Resource],
     registry: &SchemaRegistry,
-    find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
+    find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateRows<AnonymousIdStateInfo>,
     find_state_by_binding: &dyn Fn(&str) -> Vec<AnonymousIdBindingStateInfo>,
     claims: &StateBlockClaims,
 ) -> Vec<(String, String)> {
@@ -1188,7 +1235,7 @@ pub fn reconcile_anonymous_identifiers(
         );
 
         // If the resource's name already exists in state, no reconciliation is needed.
-        if state_entries.iter().any(|e| e.name == resource_identity) {
+        if state_entries.all().any(|e| e.name == resource_identity) {
             continue;
         }
 
@@ -1213,15 +1260,8 @@ pub fn reconcile_anonymous_identifiers(
             };
 
             let candidates = state_entries
-                .iter()
+                .candidates()
                 .filter(|entry| entry.name != resource_identity)
-                .filter(|entry| {
-                    !claims.claims_from(
-                        &resource.id.provider,
-                        &resource.id.resource_type,
-                        &entry.name,
-                    )
-                })
                 .filter(|entry| {
                     !used_names
                         .get(&key)
@@ -1261,7 +1301,7 @@ pub fn reconcile_anonymous_identifiers(
         // so two resources cannot collapse onto the same state row.
         let mut full_matches: Vec<&str> = Vec::new();
         let mut partial_matches: Vec<&str> = Vec::new();
-        for entry in &state_entries {
+        for entry in state_entries.candidates() {
             if entry.name == resource_identity {
                 // Same identifier, no reconciliation needed
                 continue;
@@ -1272,11 +1312,6 @@ pub fn reconcile_anonymous_identifiers(
                 || claimed_names
                     .get(&key)
                     .is_some_and(|names| names.contains(&entry.name))
-                || claims.claims_from(
-                    &resource.id.provider,
-                    &resource.id.resource_type,
-                    &entry.name,
-                )
             {
                 continue;
             }
@@ -1355,7 +1390,7 @@ pub fn reconcile_anonymous_identifiers(
 pub fn detect_anonymous_to_named_renames(
     resources: &[Resource],
     registry: &SchemaRegistry,
-    find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
+    find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateRows<AnonymousIdStateInfo>,
     providers: &CanonicalizedProviderConfigs,
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
@@ -1402,7 +1437,7 @@ pub fn detect_anonymous_to_named_renames(
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
 
         // Skip if the binding name already exists in state — nothing to rename.
-        if state_entries.iter().any(|e| e.name == resource_identity) {
+        if state_entries.all().any(|e| e.name == resource_identity) {
             continue;
         }
 
@@ -1427,15 +1462,8 @@ pub fn detect_anonymous_to_named_renames(
         let matched_name: Option<&str> = if !resource_co_values.is_empty() {
             // Create-only path: find orphaned entries whose create-only values all match.
             let mut matches: Vec<&str> = Vec::new();
-            for entry in &state_entries {
+            for entry in state_entries.candidates() {
                 if used_in_dsl.contains(&entry.name) {
-                    continue;
-                }
-                if claims.claims_from(
-                    &resource.id.provider,
-                    &resource.id.resource_type,
-                    &entry.name,
-                ) {
                     continue;
                 }
                 if extract_hash_from_identifier(&entry.name).is_none() {
@@ -1463,11 +1491,8 @@ pub fn detect_anonymous_to_named_renames(
             let resource_hash =
                 compute_resource_simhash(resource, providers, identity_attributes_fn);
             let candidates = state_entries
-                .iter()
+                .candidates()
                 .filter(|e| !used_in_dsl.contains(&e.name))
-                .filter(|e| {
-                    !claims.claims_from(&resource.id.provider, &resource.id.resource_type, &e.name)
-                })
                 .filter_map(|e| match extract_hash_from_identifier(&e.name) {
                     Some(AnonymousHashSuffix::SimHash(hash)) => Some((e.name.as_str(), hash)),
                     _ => None,
@@ -1497,7 +1522,7 @@ pub fn detect_anonymous_to_named_renames(
 pub fn detect_anonymous_to_named_renames_for_test(
     resources: &[Resource],
     registry: &SchemaRegistry,
-    find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
+    find_state_by_type: &dyn Fn(&str, &str) -> ScreenedStateRows<AnonymousIdStateInfo>,
     providers: &[ProviderConfig],
     identity_attributes_fn: &dyn Fn(&str) -> Vec<String>,
     claims: &StateBlockClaims,
