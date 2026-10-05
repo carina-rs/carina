@@ -37,7 +37,7 @@ use carina_core::wait::predicate::AttrPath;
 
 use crate::wasm_bindings::CarinaProvider;
 use crate::wasm_bindings_http::CarinaProviderWithHttp;
-use crate::wasm_convert;
+use crate::{secret_seal, wasm_convert};
 
 /// Wrap a `SerializationError` from a sync `core_to_wit_*` call site
 /// into the matching async `BoxFuture` shape that `Provider` trait
@@ -1497,20 +1497,24 @@ impl WasmBindings {
     async fn call_normalize_desired(
         &self,
         store: &mut Store<HostState>,
-        resources: &[wit_types::ResourceDef],
-    ) -> wasmtime::Result<Vec<wit_types::ResourceDef>> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_normalize_desired(store, resources)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_normalize_desired(store, resources)
-                    .await
-            }
-        }
+        desired: &secret_seal::SealedDesired,
+    ) -> wasmtime::Result<secret_seal::GuestDesired> {
+        desired
+            .send(|resources, _| async move {
+                match self {
+                    WasmBindings::Basic(b) => {
+                        b.carina_provider_provider()
+                            .call_normalize_desired(store, resources)
+                            .await
+                    }
+                    WasmBindings::Http(b) => {
+                        b.carina_provider_provider()
+                            .call_normalize_desired(store, resources)
+                            .await
+                    }
+                }
+            })
+            .await
     }
 
     async fn call_normalize_state(
@@ -1555,21 +1559,24 @@ impl WasmBindings {
     async fn call_merge_default_tags(
         &self,
         store: &mut Store<HostState>,
-        resources: &[wit_types::ResourceDef],
-        default_tags: &[(String, wit_types::Value)],
-    ) -> wasmtime::Result<Vec<wit_types::ResourceDef>> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_merge_default_tags(store, resources, default_tags)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_merge_default_tags(store, resources, default_tags)
-                    .await
-            }
-        }
+        desired: &secret_seal::SealedDesired,
+    ) -> wasmtime::Result<secret_seal::GuestDesired> {
+        desired
+            .send(|resources, default_tags| async move {
+                match self {
+                    WasmBindings::Basic(b) => {
+                        b.carina_provider_provider()
+                            .call_merge_default_tags(store, resources, default_tags)
+                            .await
+                    }
+                    WasmBindings::Http(b) => {
+                        b.carina_provider_provider()
+                            .call_merge_default_tags(store, resources, default_tags)
+                            .await
+                    }
+                }
+            })
+            .await
     }
 }
 
@@ -2840,13 +2847,8 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         resources: &'a mut [Resource],
     ) -> carina_core::provider::BoxFuture<'a, ()> {
         Box::pin(async move {
-            let wit_resources: Vec<_> = expect_unresolvable_absent(
-                resources
-                    .iter()
-                    .map(wasm_convert::core_to_wit_resource)
-                    .collect::<Result<Vec<_>, _>>(),
-                "normalize_desired",
-            );
+            let (sealed, unsealer) =
+                expect_unresolvable_absent(secret_seal::seal(resources, None), "normalize_desired");
 
             // Plain `.await` on the store lock, not a nested `block_on`:
             // the guard is acquired and dropped within this one polled
@@ -2857,7 +2859,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                 store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
                 self.instance
                     .bindings
-                    .call_normalize_desired(&mut store, &wit_resources)
+                    .call_normalize_desired(&mut store, &sealed)
                     .await
             };
 
@@ -2866,16 +2868,10 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                     // `PlanPreprocessor::prepare` strips every attribute that
                     // recursively contains `Value::Deferred(DeferredValue::ResourceRef)` (alongside
                     // `Value::Deferred(DeferredValue::Unknown)`) before this normalizer runs and
-                    // restores them afterwards (#2387), so we can blindly
-                    // accept everything the WASM normalizer returns — the
-                    // pre-#2387 `contains_resource_ref` overwrite-skip
-                    // workaround is no longer reachable.
-                    for (core_res, wit_res) in resources.iter_mut().zip(result.iter()) {
-                        let resolved = wasm_convert::wit_to_core_value_map(&wit_res.attributes);
-                        for (key, value) in resolved {
-                            core_res.attributes.insert(key, value);
-                        }
-                    }
+                    // restores them afterwards (#2387). Secret restoration
+                    // filters mangled attributes before guest values are
+                    // written back.
+                    unsealer.restore(result).apply_to(resources);
                 }
                 Err(e) => log::error!("WASM trap in normalize_desired: {e}"),
             }
@@ -3078,27 +3074,10 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                 return;
             }
 
-            let wit_resources: Vec<_> = expect_unresolvable_absent(
-                resources
-                    .iter()
-                    .map(wasm_convert::core_to_wit_resource)
-                    .collect::<Result<Vec<_>, _>>(),
+            let (sealed, unsealer) = expect_unresolvable_absent(
+                secret_seal::seal(resources, Some(default_tags)),
                 "merge_default_tags",
             );
-
-            // Per-key skip on serialize failure (vs. `core_to_wit_value_map`'s
-            // all-or-nothing) — one bad default tag must not nuke the whole
-            // merge for a multi-resource plan.
-            let wit_default_tags: Vec<(String, wit_types::Value)> = default_tags
-                .iter()
-                .filter_map(|(k, v)| match wasm_convert::core_to_wit_value(v) {
-                    Ok(wit_value) => Some((k.clone(), wit_value)),
-                    Err(e) => {
-                        log::error!("Skipping default_tag '{k}' with unresolvable value: {e}");
-                        None
-                    }
-                })
-                .collect();
 
             // Plain `.await`, not a nested `block_on` — see `normalize_desired`.
             let result = {
@@ -3106,7 +3085,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                 store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
                 self.instance
                     .bindings
-                    .call_merge_default_tags(&mut store, &wit_resources, &wit_default_tags)
+                    .call_merge_default_tags(&mut store, &sealed)
                     .await
             };
 
@@ -3114,12 +3093,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                 Ok(result) => {
                     // Guest preserves resource order; zip and overwrite
                     // attributes (merge may add `tags` and `_default_tag_keys`).
-                    for (core_res, wit_res) in resources.iter_mut().zip(result.iter()) {
-                        let resolved = wasm_convert::wit_to_core_value_map(&wit_res.attributes);
-                        for (key, value) in resolved {
-                            core_res.attributes.insert(key, value);
-                        }
-                    }
+                    unsealer.restore(result).apply_to(resources);
                 }
                 Err(e) => log::error!("WASM trap in merge_default_tags: {e}"),
             }

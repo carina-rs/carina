@@ -165,14 +165,13 @@ macro_rules! export_provider {
                                 .collect(),
                         )
                     }
-                    // The host marks an attribute as a secret with this
-                    // variant (carina#2390). `proto::Value` does not yet
-                    // carry a `Secret` arm, so we decode the JSON-encoded
-                    // inner value here and surface it to the provider as
-                    // an opaque value — providers MUST NOT log or persist
-                    // values that arrived in attributes the host marked
-                    // as secret. Adding `proto::Value::Secret` to preserve
-                    // the signal end-to-end is tracked separately.
+                    // Desired-state round trips (`normalize_desired` and
+                    // `merge_default_tags`) are host-sealed and never carry
+                    // `SecretVal` (carina#3800). This lossy decode therefore
+                    // applies only to CRUD inputs, where the provider needs
+                    // the plaintext: `proto::Value` has no `Secret` arm, so
+                    // decode the JSON-encoded inner value into an ordinary
+                    // provider value. Providers MUST NOT log or persist it.
                     wit_types::Value::SecretVal(json) => {
                         let inner: serde_json::Value =
                             serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
@@ -767,14 +766,13 @@ macro_rules! export_provider {
                                 .collect(),
                         )
                     }
-                    // The host marks an attribute as a secret with this
-                    // variant (carina#2390). `proto::Value` does not yet
-                    // carry a `Secret` arm, so we decode the JSON-encoded
-                    // inner value here and surface it to the provider as
-                    // an opaque value — providers MUST NOT log or persist
-                    // values that arrived in attributes the host marked
-                    // as secret. Adding `proto::Value::Secret` to preserve
-                    // the signal end-to-end is tracked separately.
+                    // Desired-state round trips (`normalize_desired` and
+                    // `merge_default_tags`) are host-sealed and never carry
+                    // `SecretVal` (carina#3800). This lossy decode therefore
+                    // applies only to CRUD inputs, where the provider needs
+                    // the plaintext: `proto::Value` has no `Secret` arm, so
+                    // decode the JSON-encoded inner value into an ordinary
+                    // provider value. Providers MUST NOT log or persist it.
                     wit_types::Value::SecretVal(json) => {
                         let inner: serde_json::Value =
                             serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
