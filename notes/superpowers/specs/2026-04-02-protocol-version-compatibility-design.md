@@ -1,5 +1,11 @@
 # Protocol Version Compatibility Design
 
+> Historical note (2026-10): the examples below describe the original v1
+> rollout. The current protocol and minimum supported protocol are both v3.
+> Protocol v3 changes the four normalizer exports to return structured
+> `provider-error` results and rejects v1/v2 components before typed WIT
+> binding.
+
 ## Problem
 
 Carina's plugin protocol (JSON-RPC over stdin/stdout between carina-cli and external provider plugins) has no version negotiation mechanism. As the protocol evolves during this experimental phase, there is no way to detect or communicate incompatibilities between Carina and provider plugins.

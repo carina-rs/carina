@@ -14,8 +14,8 @@ use carina_core::resource::{ConcreteValue, DeferredValue, Resource, Value};
 use carina_core::value::SerializationError;
 use indexmap::IndexMap;
 
-use crate::wasm_bindings::carina::provider::types as wit;
 use crate::wasm_convert;
+use crate::wasm_factory::version_checked_bindings::wit_types as wit;
 
 const TOKEN_NAMESPACE: &str = "carina-sealed-secret";
 
@@ -25,13 +25,16 @@ pub(crate) struct SealedDesired {
 }
 
 impl SealedDesired {
-    pub(crate) async fn send<'a, E, F, Fut>(&'a self, call: F) -> Result<GuestDesired, E>
+    pub(crate) async fn send<'a, E, P, F, Fut>(
+        &'a self,
+        call: F,
+    ) -> Result<Result<GuestDesired, P>, E>
     where
         F: FnOnce(&'a [wit::ResourceDef], &'a [(String, wit::Value)]) -> Fut,
-        Fut: Future<Output = Result<Vec<wit::ResourceDef>, E>>,
+        Fut: Future<Output = Result<Result<Vec<wit::ResourceDef>, P>, E>>,
     {
-        let resources = call(&self.resources, &self.default_tags).await?;
-        Ok(GuestDesired::new(resources))
+        let result = call(&self.resources, &self.default_tags).await?;
+        Ok(result.map(GuestDesired::new))
     }
 }
 

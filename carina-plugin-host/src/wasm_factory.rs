@@ -35,8 +35,6 @@ use carina_core::value::SerializationError;
 use carina_core::wait::BindingPattern;
 use carina_core::wait::predicate::AttrPath;
 
-use crate::wasm_bindings::CarinaProvider;
-use crate::wasm_bindings_http::CarinaProviderWithHttp;
 use crate::{secret_seal, wasm_convert};
 
 /// Lift a `SerializationError` from a synchronous `core_to_wit_*` call into
@@ -587,11 +585,14 @@ impl fmt::Display for PrecompiledComponentDeserializationError {
 impl std::error::Error for PrecompiledComponentDeserializationError {}
 
 /// Failure while creating a credentialed per-binding runtime instance.
-/// Instantiation remains typed until the `ProviderFactory` trait boundary;
-/// provider initialization rejections retain their existing verbatim message.
+/// Instantiation and `info` guest-call failures remain typed until the
+/// `ProviderFactory` trait boundary; protocol and provider initialization
+/// rejections retain their existing verbatim messages.
 #[derive(Debug)]
 enum WasmProviderInstanceError {
     Instantiation(ProviderInstantiationError),
+    InfoCall(wasmtime::Error),
+    ProtocolVersion(String),
     Other(String),
 }
 
@@ -607,6 +608,10 @@ impl WasmProviderInstanceError {
     fn into_provider_error_with(self, mapper: &ProviderInstantiationErrorMapper) -> ProviderError {
         match self {
             WasmProviderInstanceError::Instantiation(error) => mapper(error),
+            WasmProviderInstanceError::InfoCall(error) => {
+                wasm_trap_provider_error("info", error, WasmTrapContext::ProviderOperation)
+            }
+            WasmProviderInstanceError::ProtocolVersion(message) => ProviderError::internal(message),
             WasmProviderInstanceError::Other(message) => ProviderError::invalid_input(message),
         }
     }
@@ -616,12 +621,26 @@ impl fmt::Display for WasmProviderInstanceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WasmProviderInstanceError::Instantiation(error) => error.fmt(f),
-            WasmProviderInstanceError::Other(message) => f.write_str(message),
+            WasmProviderInstanceError::InfoCall(error) => {
+                write!(f, "Failed to call info(): ")?;
+                write_error_chain(f, error)
+            }
+            WasmProviderInstanceError::ProtocolVersion(message)
+            | WasmProviderInstanceError::Other(message) => f.write_str(message),
         }
     }
 }
 
-impl std::error::Error for WasmProviderInstanceError {}
+impl std::error::Error for WasmProviderInstanceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WasmProviderInstanceError::InfoCall(error) => Some(error.as_ref()),
+            WasmProviderInstanceError::Instantiation(_)
+            | WasmProviderInstanceError::ProtocolVersion(_)
+            | WasmProviderInstanceError::Other(_) => None,
+        }
+    }
+}
 
 impl From<String> for WasmProviderInstanceError {
     fn from(message: String) -> Self {
@@ -1297,415 +1316,571 @@ impl WasiHttpView for HostState {
 
 // -- Helper: create a new Store + CarinaProvider instance --
 
-/// Bindings enum wrapping both non-HTTP and HTTP WASM component bindings.
-/// Both worlds export the same `carina:provider/provider` interface.
-enum WasmBindings {
-    Basic(CarinaProvider),
-    Http(CarinaProviderWithHttp),
+enum WasmBindingCreationError {
+    Instantiation(wasmtime::Error),
+    InfoCall(wasmtime::Error),
+    ProtocolVersion(String),
 }
 
-use crate::wasm_bindings::carina::provider::types as wit_types;
-
-impl WasmBindings {
-    async fn call_info(&self, store: &mut Store<HostState>) -> wasmtime::Result<String> {
+impl WasmBindingCreationError {
+    fn instantiation_context(self, context: &'static str) -> Self {
         match self {
-            WasmBindings::Basic(b) => b.carina_provider_provider().call_info(store).await,
-            WasmBindings::Http(b) => b.carina_provider_provider().call_info(store).await,
+            Self::Instantiation(error) => Self::Instantiation(error.context(context)),
+            Self::InfoCall(error) => Self::InfoCall(error),
+            Self::ProtocolVersion(message) => Self::ProtocolVersion(message),
         }
-    }
-
-    async fn call_schemas(&self, store: &mut Store<HostState>) -> wasmtime::Result<String> {
-        match self {
-            WasmBindings::Basic(b) => b.carina_provider_provider().call_schemas(store).await,
-            WasmBindings::Http(b) => b.carina_provider_provider().call_schemas(store).await,
-        }
-    }
-
-    async fn call_provider_config_attribute_types(
-        &self,
-        store: &mut Store<HostState>,
-    ) -> wasmtime::Result<String> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_provider_config_attribute_types(store)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_provider_config_attribute_types(store)
-                    .await
-            }
-        }
-    }
-
-    async fn call_provider_config_completions(
-        &self,
-        store: &mut Store<HostState>,
-    ) -> wasmtime::Result<String> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_provider_config_completions(store)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_provider_config_completions(store)
-                    .await
-            }
-        }
-    }
-
-    async fn call_identity_attributes(
-        &self,
-        store: &mut Store<HostState>,
-    ) -> wasmtime::Result<Vec<String>> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_identity_attributes(store)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_identity_attributes(store)
-                    .await
-            }
-        }
-    }
-
-    async fn call_get_enum_aliases(
-        &self,
-        store: &mut Store<HostState>,
-    ) -> wasmtime::Result<String> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_get_enum_aliases(store)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_get_enum_aliases(store)
-                    .await
-            }
-        }
-    }
-
-    async fn call_validate_config(
-        &self,
-        store: &mut Store<HostState>,
-        attrs: &[(String, wit_types::Value)],
-    ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_validate_config(store, attrs)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_validate_config(store, attrs)
-                    .await
-            }
-        }
-    }
-
-    async fn call_validate_custom_type(
-        &self,
-        store: &mut Store<HostState>,
-        identity: &wit_types::TypeIdentity,
-        value: &str,
-    ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_validate_custom_type(store, identity, value)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_validate_custom_type(store, identity, value)
-                    .await
-            }
-        }
-    }
-
-    async fn call_initialize(
-        &self,
-        store: &mut Store<HostState>,
-        attrs: &[(String, wit_types::Value)],
-    ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_initialize(store, attrs)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_initialize(store, attrs)
-                    .await
-            }
-        }
-    }
-
-    async fn call_read(
-        &self,
-        store: &mut Store<HostState>,
-        id: &wit_types::ResourceId,
-        identifier: Option<&str>,
-        request: wit_types::ReadRequest,
-    ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_read(store, id, identifier, request)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_read(store, id, identifier, request)
-                    .await
-            }
-        }
-    }
-
-    async fn call_read_data_source(
-        &self,
-        store: &mut Store<HostState>,
-        resource: &wit_types::ResourceDef,
-    ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_read_data_source(store, resource)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_read_data_source(store, resource)
-                    .await
-            }
-        }
-    }
-
-    async fn call_create(
-        &self,
-        store: &mut Store<HostState>,
-        id: &wit_types::ResourceId,
-        request: &wit_types::CreateRequest,
-    ) -> wasmtime::Result<Result<wit_types::CreateOutcome, wit_types::ProviderError>> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_create(store, id, request)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_create(store, id, request)
-                    .await
-            }
-        }
-    }
-
-    async fn call_update(
-        &self,
-        store: &mut Store<HostState>,
-        id: &wit_types::ResourceId,
-        identifier: &str,
-        request: &wit_types::UpdateRequest,
-    ) -> wasmtime::Result<Result<wit_types::UpdateOutcome, wit_types::ProviderError>> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_update(store, id, identifier, request)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_update(store, id, identifier, request)
-                    .await
-            }
-        }
-    }
-
-    async fn call_delete(
-        &self,
-        store: &mut Store<HostState>,
-        id: &wit_types::ResourceId,
-        identifier: &str,
-        request: wit_types::DeleteRequest,
-    ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_delete(store, id, identifier, request)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_delete(store, id, identifier, request)
-                    .await
-            }
-        }
-    }
-
-    async fn call_required_permissions(
-        &self,
-        store: &mut Store<HostState>,
-        id: &wit_types::ResourceId,
-        operation: PlanOp,
-    ) -> wasmtime::Result<Vec<String>> {
-        match self {
-            WasmBindings::Basic(b) => {
-                let operation = match operation {
-                    PlanOp::Create => {
-                        crate::wasm_bindings::exports::carina::provider::provider::PlanOp::Create
-                    }
-                    PlanOp::Read => {
-                        crate::wasm_bindings::exports::carina::provider::provider::PlanOp::Read
-                    }
-                    PlanOp::Update => {
-                        crate::wasm_bindings::exports::carina::provider::provider::PlanOp::Update
-                    }
-                    PlanOp::Delete => {
-                        crate::wasm_bindings::exports::carina::provider::provider::PlanOp::Delete
-                    }
-                };
-                b.carina_provider_provider()
-                    .call_required_permissions(store, id, operation)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                let operation = match operation {
-                    PlanOp::Create => {
-                        crate::wasm_bindings_http::exports::carina::provider::provider::PlanOp::Create
-                    }
-                    PlanOp::Read => {
-                        crate::wasm_bindings_http::exports::carina::provider::provider::PlanOp::Read
-                    }
-                    PlanOp::Update => {
-                        crate::wasm_bindings_http::exports::carina::provider::provider::PlanOp::Update
-                    }
-                    PlanOp::Delete => {
-                        crate::wasm_bindings_http::exports::carina::provider::provider::PlanOp::Delete
-                    }
-                };
-                b.carina_provider_provider()
-                    .call_required_permissions(store, id, operation)
-                    .await
-            }
-        }
-    }
-
-    async fn call_satisfier_hint(
-        &self,
-        store: &mut Store<HostState>,
-        target_id: &wit_types::ResourceId,
-        attr_path: &[String],
-    ) -> wasmtime::Result<Vec<wit_types::BindingPattern>> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_satisfier_hint(store, target_id, attr_path)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_satisfier_hint(store, target_id, attr_path)
-                    .await
-            }
-        }
-    }
-
-    async fn call_normalize_desired(
-        &self,
-        store: &mut Store<HostState>,
-        desired: &secret_seal::SealedDesired,
-    ) -> wasmtime::Result<secret_seal::GuestDesired> {
-        desired
-            .send(|resources, _| async move {
-                match self {
-                    WasmBindings::Basic(b) => {
-                        b.carina_provider_provider()
-                            .call_normalize_desired(store, resources)
-                            .await
-                    }
-                    WasmBindings::Http(b) => {
-                        b.carina_provider_provider()
-                            .call_normalize_desired(store, resources)
-                            .await
-                    }
-                }
-            })
-            .await
-    }
-
-    async fn call_normalize_state(
-        &self,
-        store: &mut Store<HostState>,
-        states: &[(String, wit_types::State)],
-    ) -> wasmtime::Result<Vec<(String, wit_types::State)>> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_normalize_state(store, states)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_normalize_state(store, states)
-                    .await
-            }
-        }
-    }
-
-    async fn call_hydrate_read_state(
-        &self,
-        store: &mut Store<HostState>,
-        states: &[(String, wit_types::State)],
-        saved_attrs: &[(String, Vec<(String, wit_types::Value)>)],
-    ) -> wasmtime::Result<Vec<(String, wit_types::State)>> {
-        match self {
-            WasmBindings::Basic(b) => {
-                b.carina_provider_provider()
-                    .call_hydrate_read_state(store, states, saved_attrs)
-                    .await
-            }
-            WasmBindings::Http(b) => {
-                b.carina_provider_provider()
-                    .call_hydrate_read_state(store, states, saved_attrs)
-                    .await
-            }
-        }
-    }
-
-    async fn call_merge_default_tags(
-        &self,
-        store: &mut Store<HostState>,
-        desired: &secret_seal::SealedDesired,
-    ) -> wasmtime::Result<secret_seal::GuestDesired> {
-        desired
-            .send(|resources, default_tags| async move {
-                match self {
-                    WasmBindings::Basic(b) => {
-                        b.carina_provider_provider()
-                            .call_merge_default_tags(store, resources, default_tags)
-                            .await
-                    }
-                    WasmBindings::Http(b) => {
-                        b.carina_provider_provider()
-                            .call_merge_default_tags(store, resources, default_tags)
-                            .await
-                    }
-                }
-            })
-            .await
     }
 }
+
+use version_checked_bindings::wit_types;
+
+/// Owns all generated world bindings and enforces protocol preflight before
+/// any typed binding can be constructed. Only shared WIT value/interface type
+/// modules are visible elsewhere in the crate; the world structs stay private.
+pub(crate) mod version_checked_bindings {
+    use super::*;
+
+    mod basic {
+        wasmtime::component::bindgen!({
+            path: "../carina-plugin-wit/wit",
+            world: "carina-provider",
+            require_store_data_send: true,
+            exports: { default: async },
+        });
+    }
+
+    mod http {
+        wasmtime::component::bindgen!({
+            path: "../carina-plugin-wit/wit",
+            world: "carina-provider-with-http",
+            require_store_data_send: true,
+            exports: { default: async },
+            with: {
+                "carina:provider/types": super::basic::carina::provider::types,
+                "carina:provider/provider": super::basic::exports::carina::provider::provider,
+                "wasi:http": wasmtime_wasi_http::p2::bindings::http,
+                "wasi:io": wasmtime_wasi::p2::bindings::io,
+            },
+        });
+    }
+
+    pub(crate) use basic::carina::provider::types as wit_types;
+    pub(crate) use basic::exports::carina::provider::provider::PlanOp as WitPlanOp;
+
+    use basic::CarinaProvider;
+    use http::CarinaProviderWithHttp;
+
+    const PROVIDER_INTERFACE_EXPORT: &str = "carina:provider/provider@0.1.0";
+
+    // Wasmtime 43 generates types owned by an exported interface separately
+    // for each world, even when `with` shares that interface for referenced
+    // types. Keep the unavoidable world-to-world conversion private here.
+    fn http_plan_op(operation: WitPlanOp) -> http::exports::carina::provider::provider::PlanOp {
+        use http::exports::carina::provider::provider::PlanOp as HttpPlanOp;
+
+        match operation {
+            WitPlanOp::Create => HttpPlanOp::Create,
+            WitPlanOp::Read => HttpPlanOp::Read,
+            WitPlanOp::Update => HttpPlanOp::Update,
+            WitPlanOp::Delete => HttpPlanOp::Delete,
+        }
+    }
+
+    /// Raw typed bindings are private to this module. The parent module can
+    /// obtain [`WasmBindings`] only through `instantiate_basic` or
+    /// `instantiate_http`, both of which perform the stable `info` preflight
+    /// and protocol-version check before constructing these bindings.
+    enum RawWasmBindings {
+        Basic(CarinaProvider),
+        Http(CarinaProviderWithHttp),
+    }
+
+    pub(super) struct WasmBindings {
+        raw: RawWasmBindings,
+        info_json: String,
+    }
+
+    struct ProtocolCheckedInstance {
+        instance: wasmtime::component::Instance,
+        info_json: String,
+    }
+
+    impl ProtocolCheckedInstance {
+        async fn instantiate(
+            store: &mut Store<HostState>,
+            component: &Component,
+            linker: &Linker<HostState>,
+        ) -> Result<Self, WasmBindingCreationError> {
+            let pre = linker
+                .instantiate_pre(component)
+                .map_err(WasmBindingCreationError::Instantiation)?;
+            let instance = pre
+                .instantiate_async(&mut *store)
+                .await
+                .map_err(WasmBindingCreationError::Instantiation)?;
+            let info = untyped_info_func(store, &instance)
+                .map_err(WasmBindingCreationError::Instantiation)?;
+            let (info_json,) = info
+                .call_async(&mut *store, ())
+                .await
+                .map_err(WasmBindingCreationError::InfoCall)?;
+            wasm_convert::check_protocol_version(&info_json)
+                .map_err(WasmBindingCreationError::ProtocolVersion)?;
+            Ok(Self {
+                instance,
+                info_json,
+            })
+        }
+    }
+
+    fn untyped_info_func(
+        store: &mut Store<HostState>,
+        instance: &wasmtime::component::Instance,
+    ) -> wasmtime::Result<wasmtime::component::TypedFunc<(), (String,)>> {
+        let provider = instance
+            .get_export_index(&mut *store, None, PROVIDER_INTERFACE_EXPORT)
+            .ok_or_else(|| {
+                wasmtime::Error::msg(format!(
+                    "no exported instance named `{PROVIDER_INTERFACE_EXPORT}`"
+                ))
+            })?;
+        let info = instance
+            .get_export_index(&mut *store, Some(&provider), "info")
+            .ok_or_else(|| {
+                wasmtime::Error::msg(format!(
+                    "instance export `{PROVIDER_INTERFACE_EXPORT}` does not have export `info`"
+                ))
+            })?;
+        instance.get_typed_func::<(), (String,)>(&mut *store, &info)
+    }
+
+    impl WasmBindings {
+        pub(super) async fn instantiate_basic(
+            store: &mut Store<HostState>,
+            component: &Component,
+            linker: &Linker<HostState>,
+        ) -> Result<Self, WasmBindingCreationError> {
+            let checked = ProtocolCheckedInstance::instantiate(store, component, linker).await?;
+            let bindings = CarinaProvider::new(&mut *store, &checked.instance)
+                .map_err(WasmBindingCreationError::Instantiation)?;
+            Ok(Self {
+                raw: RawWasmBindings::Basic(bindings),
+                info_json: checked.info_json,
+            })
+        }
+
+        pub(super) async fn instantiate_http(
+            store: &mut Store<HostState>,
+            component: &Component,
+            linker: &Linker<HostState>,
+        ) -> Result<Self, WasmBindingCreationError> {
+            let checked = ProtocolCheckedInstance::instantiate(store, component, linker).await?;
+            let bindings = CarinaProviderWithHttp::new(&mut *store, &checked.instance)
+                .map_err(WasmBindingCreationError::Instantiation)?;
+            Ok(Self {
+                raw: RawWasmBindings::Http(bindings),
+                info_json: checked.info_json,
+            })
+        }
+
+        pub(super) fn info_json(&self) -> &str {
+            &self.info_json
+        }
+
+        pub(super) async fn call_schemas(
+            &self,
+            store: &mut Store<HostState>,
+        ) -> wasmtime::Result<String> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => b.carina_provider_provider().call_schemas(store).await,
+                RawWasmBindings::Http(b) => b.carina_provider_provider().call_schemas(store).await,
+            }
+        }
+
+        pub(super) async fn call_provider_config_attribute_types(
+            &self,
+            store: &mut Store<HostState>,
+        ) -> wasmtime::Result<String> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_provider_config_attribute_types(store)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_provider_config_attribute_types(store)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_provider_config_completions(
+            &self,
+            store: &mut Store<HostState>,
+        ) -> wasmtime::Result<String> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_provider_config_completions(store)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_provider_config_completions(store)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_identity_attributes(
+            &self,
+            store: &mut Store<HostState>,
+        ) -> wasmtime::Result<Vec<String>> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_identity_attributes(store)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_identity_attributes(store)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_get_enum_aliases(
+            &self,
+            store: &mut Store<HostState>,
+        ) -> wasmtime::Result<String> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_get_enum_aliases(store)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_get_enum_aliases(store)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_validate_config(
+            &self,
+            store: &mut Store<HostState>,
+            attrs: &[(String, wit_types::Value)],
+        ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_validate_config(store, attrs)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_validate_config(store, attrs)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_validate_custom_type(
+            &self,
+            store: &mut Store<HostState>,
+            identity: &wit_types::TypeIdentity,
+            value: &str,
+        ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_validate_custom_type(store, identity, value)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_validate_custom_type(store, identity, value)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_initialize(
+            &self,
+            store: &mut Store<HostState>,
+            attrs: &[(String, wit_types::Value)],
+        ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_initialize(store, attrs)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_initialize(store, attrs)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_read(
+            &self,
+            store: &mut Store<HostState>,
+            id: &wit_types::ResourceId,
+            identifier: Option<&str>,
+            request: wit_types::ReadRequest,
+        ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_read(store, id, identifier, request)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_read(store, id, identifier, request)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_read_data_source(
+            &self,
+            store: &mut Store<HostState>,
+            resource: &wit_types::ResourceDef,
+        ) -> wasmtime::Result<Result<wit_types::State, wit_types::ProviderError>> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_read_data_source(store, resource)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_read_data_source(store, resource)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_create(
+            &self,
+            store: &mut Store<HostState>,
+            id: &wit_types::ResourceId,
+            request: &wit_types::CreateRequest,
+        ) -> wasmtime::Result<Result<wit_types::CreateOutcome, wit_types::ProviderError>> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_create(store, id, request)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_create(store, id, request)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_update(
+            &self,
+            store: &mut Store<HostState>,
+            id: &wit_types::ResourceId,
+            identifier: &str,
+            request: &wit_types::UpdateRequest,
+        ) -> wasmtime::Result<Result<wit_types::UpdateOutcome, wit_types::ProviderError>> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_update(store, id, identifier, request)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_update(store, id, identifier, request)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_delete(
+            &self,
+            store: &mut Store<HostState>,
+            id: &wit_types::ResourceId,
+            identifier: &str,
+            request: wit_types::DeleteRequest,
+        ) -> wasmtime::Result<Result<(), wit_types::ProviderError>> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_delete(store, id, identifier, request)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_delete(store, id, identifier, request)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_required_permissions(
+            &self,
+            store: &mut Store<HostState>,
+            id: &wit_types::ResourceId,
+            operation: PlanOp,
+        ) -> wasmtime::Result<Vec<String>> {
+            let operation = wasm_convert::core_to_wit_plan_op(operation);
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_required_permissions(store, id, operation)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_required_permissions(store, id, http_plan_op(operation))
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_satisfier_hint(
+            &self,
+            store: &mut Store<HostState>,
+            target_id: &wit_types::ResourceId,
+            attr_path: &[String],
+        ) -> wasmtime::Result<Vec<wit_types::BindingPattern>> {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_satisfier_hint(store, target_id, attr_path)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_satisfier_hint(store, target_id, attr_path)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_normalize_desired(
+            &self,
+            store: &mut Store<HostState>,
+            desired: &secret_seal::SealedDesired,
+        ) -> wasmtime::Result<Result<secret_seal::GuestDesired, wit_types::ProviderError>> {
+            desired
+                .send(|resources, _| async move {
+                    match &self.raw {
+                        RawWasmBindings::Basic(b) => {
+                            b.carina_provider_provider()
+                                .call_normalize_desired(store, resources)
+                                .await
+                        }
+                        RawWasmBindings::Http(b) => {
+                            b.carina_provider_provider()
+                                .call_normalize_desired(store, resources)
+                                .await
+                        }
+                    }
+                })
+                .await
+        }
+
+        #[cfg(test)]
+        pub(super) async fn call_normalize_desired_raw(
+            &self,
+            store: &mut Store<HostState>,
+            resources: &[wit_types::ResourceDef],
+        ) -> wasmtime::Result<Result<Vec<wit_types::ResourceDef>, wit_types::ProviderError>>
+        {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_normalize_desired(store, resources)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_normalize_desired(store, resources)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_normalize_state(
+            &self,
+            store: &mut Store<HostState>,
+            states: &[(String, wit_types::State)],
+        ) -> wasmtime::Result<Result<Vec<(String, wit_types::State)>, wit_types::ProviderError>>
+        {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_normalize_state(store, states)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_normalize_state(store, states)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_hydrate_read_state(
+            &self,
+            store: &mut Store<HostState>,
+            states: &[(String, wit_types::State)],
+            saved_attrs: &[(String, Vec<(String, wit_types::Value)>)],
+        ) -> wasmtime::Result<Result<Vec<(String, wit_types::State)>, wit_types::ProviderError>>
+        {
+            match &self.raw {
+                RawWasmBindings::Basic(b) => {
+                    b.carina_provider_provider()
+                        .call_hydrate_read_state(store, states, saved_attrs)
+                        .await
+                }
+                RawWasmBindings::Http(b) => {
+                    b.carina_provider_provider()
+                        .call_hydrate_read_state(store, states, saved_attrs)
+                        .await
+                }
+            }
+        }
+
+        pub(super) async fn call_merge_default_tags(
+            &self,
+            store: &mut Store<HostState>,
+            desired: &secret_seal::SealedDesired,
+        ) -> wasmtime::Result<Result<secret_seal::GuestDesired, wit_types::ProviderError>> {
+            desired
+                .send(|resources, default_tags| async move {
+                    match &self.raw {
+                        RawWasmBindings::Basic(b) => {
+                            b.carina_provider_provider()
+                                .call_merge_default_tags(store, resources, default_tags)
+                                .await
+                        }
+                        RawWasmBindings::Http(b) => {
+                            b.carina_provider_provider()
+                                .call_merge_default_tags(store, resources, default_tags)
+                                .await
+                        }
+                    }
+                })
+                .await
+        }
+    }
+}
+
+use version_checked_bindings::WasmBindings;
 
 /// Build `StoreLimits` used for every WASM plugin store.
 ///
@@ -1769,7 +1944,7 @@ async fn create_instance(
     engine: &Engine,
     component: &Component,
     provider_kind: Option<&str>,
-) -> wasmtime::Result<(Store<HostState>, WasmBindings)> {
+) -> Result<(Store<HostState>, WasmBindings), WasmBindingCreationError> {
     let wasi_ctx = build_sandboxed_wasi_ctx(provider_kind);
     let host_state = HostState {
         wasi_ctx,
@@ -1783,14 +1958,15 @@ async fn create_instance(
     store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
 
     let mut linker = Linker::new(engine);
-    add_wasi_sans_sockets_to_linker(&mut linker)
-        .map_err(|error| error.context("Failed to add WASI to linker"))?;
+    add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
+        WasmBindingCreationError::Instantiation(error.context("Failed to add WASI to linker"))
+    })?;
 
-    let bindings = CarinaProvider::instantiate_async(&mut store, component, &linker)
+    let bindings = WasmBindings::instantiate_basic(&mut store, component, &linker)
         .await
-        .map_err(|error| error.context("Failed to instantiate WASM component"))?;
+        .map_err(|error| error.instantiation_context("Failed to instantiate WASM component"))?;
 
-    Ok((store, WasmBindings::Basic(bindings)))
+    Ok((store, bindings))
 }
 
 /// Environment variables exposed to **every** WASM guest, regardless of
@@ -1918,7 +2094,7 @@ async fn create_instance_with_http(
     engine: &Engine,
     component: &Component,
     provider_kind: Option<&str>,
-) -> wasmtime::Result<(Store<HostState>, WasmBindings)> {
+) -> Result<(Store<HostState>, WasmBindings), WasmBindingCreationError> {
     let wasi_ctx = build_sandboxed_wasi_ctx(provider_kind);
     let host_state = HostState {
         wasi_ctx,
@@ -1932,16 +2108,20 @@ async fn create_instance_with_http(
     store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
 
     let mut linker = Linker::new(engine);
-    add_wasi_sans_sockets_to_linker(&mut linker)
-        .map_err(|error| error.context("Failed to add WASI to linker"))?;
-    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
-        .map_err(|error| error.context("Failed to add wasi:http to linker"))?;
+    add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
+        WasmBindingCreationError::Instantiation(error.context("Failed to add WASI to linker"))
+    })?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker).map_err(|error| {
+        WasmBindingCreationError::Instantiation(error.context("Failed to add wasi:http to linker"))
+    })?;
 
-    let bindings = CarinaProviderWithHttp::instantiate_async(&mut store, component, &linker)
+    let bindings = WasmBindings::instantiate_http(&mut store, component, &linker)
         .await
-        .map_err(|error| error.context("Failed to instantiate WASM component (HTTP)"))?;
+        .map_err(|error| {
+            error.instantiation_context("Failed to instantiate WASM component (HTTP)")
+        })?;
 
-    Ok((store, WasmBindings::Http(bindings)))
+    Ok((store, bindings))
 }
 
 /// Instantiate exactly the world selected when the factory was loaded.
@@ -1954,33 +2134,42 @@ async fn create_runtime_instance(
     component: &Component,
     provider_kind: Option<&str>,
     world: InstantiationWorld,
-) -> Result<(Store<HostState>, WasmBindings), ProviderInstantiationError> {
+) -> Result<(Store<HostState>, WasmBindings), WasmProviderInstanceError> {
     let result = match world {
         InstantiationWorld::HttpEnabled => {
             create_instance_with_http(engine, component, provider_kind).await
         }
         InstantiationWorld::Basic => create_instance(engine, component, provider_kind).await,
     };
-    result.map_err(|failure| {
-        ProviderInstantiationError::from_single_attempt(engine, component, world, failure)
+    result.map_err(|failure| match failure {
+        WasmBindingCreationError::Instantiation(failure) => {
+            WasmProviderInstanceError::Instantiation(
+                ProviderInstantiationError::from_single_attempt(engine, component, world, failure),
+            )
+        }
+        WasmBindingCreationError::InfoCall(error) => WasmProviderInstanceError::InfoCall(error),
+        WasmBindingCreationError::ProtocolVersion(message) => {
+            WasmProviderInstanceError::ProtocolVersion(message)
+        }
     })
 }
 
 /// Output of `create_instance_auto`: the instantiated store, the
 /// bindings, and whether the HTTP-enabled world was used.
-type CreateInstanceResult =
-    Result<(Store<HostState>, WasmBindings, bool), ProviderInstantiationError>;
+type CreateInstanceResult = Result<(Store<HostState>, WasmBindings, bool), WasmProviderLoadError>;
 
 /// Try HTTP instantiation first, then basic. On double failure, retain the
 /// complete HTTP-path error and component-derived compatibility context. The
 /// basic failure is omitted when the component imports wasi:http because that
 /// linker deliberately cannot satisfy it and therefore carries no diagnostic
-/// signal.
+/// signal. If the HTTP attempt instantiates successfully but its stable `info`
+/// call fails or its reported protocol version is incompatible, that preflight
+/// failure is definitive and returns immediately without trying the basic
+/// world.
 ///
 /// Returns a boxed future (not `async fn`) to erase the future type at
 /// this call site. Inlining this helper as a plain `async fn` composes
-/// `CarinaProviderWithHttp::instantiate_async` and
-/// `CarinaProvider::instantiate_async` into one anonymous future,
+/// the HTTP and basic instantiation paths into one anonymous future,
 /// which combined with the deep call chain from `carina-cli` trips
 /// rustc's layout-computation query depth limit on recent stable
 /// toolchains (observed in `cargo check --all-features` CI).
@@ -1992,12 +2181,29 @@ fn create_instance_auto<'a>(
     Box::pin(async move {
         match create_instance_with_http(engine, component, provider_kind).await {
             Ok((store, bindings)) => Ok((store, bindings, true)),
-            Err(http_err) => match create_instance(engine, component, provider_kind).await {
-                Ok((store, bindings)) => Ok((store, bindings, false)),
-                Err(basic_err) => Err(ProviderInstantiationError::from_attempts(
-                    engine, component, http_err, basic_err,
-                )),
-            },
+            Err(WasmBindingCreationError::InfoCall(error)) => Err(WasmProviderLoadError::metadata(
+                "Failed to call info()",
+                WasmGuestCallError { source: error },
+            )),
+            Err(WasmBindingCreationError::ProtocolVersion(message)) => Err(message.into()),
+            Err(WasmBindingCreationError::Instantiation(http_err)) => {
+                match create_instance(engine, component, provider_kind).await {
+                    Ok((store, bindings)) => Ok((store, bindings, false)),
+                    Err(WasmBindingCreationError::InfoCall(error)) => {
+                        Err(WasmProviderLoadError::metadata(
+                            "Failed to call info()",
+                            WasmGuestCallError { source: error },
+                        ))
+                    }
+                    Err(WasmBindingCreationError::ProtocolVersion(message)) => Err(message.into()),
+                    Err(WasmBindingCreationError::Instantiation(basic_err)) => {
+                        Err(ProviderInstantiationError::from_attempts(
+                            engine, component, http_err, basic_err,
+                        )
+                        .into())
+                    }
+                }
+            }
         }
     })
 }
@@ -2343,11 +2549,7 @@ impl WasmProviderFactory {
     ) -> Result<Self, WasmProviderLoadError> {
         let (mut store, bindings, enable_http) =
             create_instance_auto(&engine, &component, None).await?;
-        let info_json = bindings
-            .call_info(&mut store)
-            .await
-            .map_err(|e| format!("Failed to call info(): {e}"))?;
-        wasm_convert::check_protocol_version(&info_json)?;
+        let info_json = bindings.info_json().to_owned();
 
         let schemas_json = bindings
             .call_schemas(&mut store)
@@ -2540,9 +2742,7 @@ impl WasmProviderFactory {
             InstantiationWorld::Basic
         };
         let (mut store, bindings) =
-            create_runtime_instance(&self.engine, &self.component, kind, world)
-                .await
-                .map_err(WasmProviderInstanceError::Instantiation)?;
+            create_runtime_instance(&self.engine, &self.component, kind, world).await?;
         let wit_attrs =
             wasm_convert::core_to_wit_value_map(attributes).map_err(|e| e.to_string())?;
         bindings
@@ -3210,6 +3410,22 @@ fn finish_guest_call<T>(
     }
 }
 
+fn finish_normalizer_guest_call<T>(
+    instance: &SharedWasmInstance,
+    operation: &'static str,
+    locked: &mut LockedStore<'_>,
+    call: wasmtime::Result<Result<T, wit_types::ProviderError>>,
+) -> ProviderResult<T> {
+    finish_guest_call(
+        instance,
+        operation,
+        WasmTrapContext::Normalizer,
+        locked,
+        call,
+    )?
+    .map_err(wasm_convert::wit_to_core_provider_error)
+}
+
 impl ProviderNormalizer for WasmProviderNormalizer {
     fn normalize_desired<'a>(
         &'a self,
@@ -3230,13 +3446,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                     .bindings
                     .call_normalize_desired(locked.store(), &sealed)
                     .await;
-                finish_guest_call(
-                    &self.instance,
-                    "normalize_desired",
-                    WasmTrapContext::Normalizer,
-                    &mut locked,
-                    call,
-                )
+                finish_normalizer_guest_call(&self.instance, "normalize_desired", &mut locked, call)
             };
             let result = result?;
             // `PlanPreprocessor::prepare` strips every attribute that
@@ -3304,10 +3514,9 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                         .bindings
                         .call_normalize_state(locked.store(), &resolved_wit_states)
                         .await;
-                    finish_guest_call(
+                    finish_normalizer_guest_call(
                         &self.instance,
                         "normalize_state",
-                        WasmTrapContext::Normalizer,
                         &mut locked,
                         call,
                     )
@@ -3334,10 +3543,9 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                         .bindings
                         .call_normalize_state(locked.store(), &[(key, wit_state)])
                         .await;
-                    finish_guest_call(
+                    finish_normalizer_guest_call(
                         &self.instance,
                         "normalize_state",
-                        WasmTrapContext::Normalizer,
                         &mut locked,
                         call,
                     )
@@ -3429,10 +3637,9 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                             &resolved_wit_saved,
                         )
                         .await;
-                    finish_guest_call(
+                    finish_normalizer_guest_call(
                         &self.instance,
                         "hydrate_read_state",
-                        WasmTrapContext::Normalizer,
                         &mut locked,
                         call,
                     )
@@ -3460,10 +3667,9 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                         .bindings
                         .call_hydrate_read_state(locked.store(), &[(key, wit_state)], &wit_saved)
                         .await;
-                    finish_guest_call(
+                    finish_normalizer_guest_call(
                         &self.instance,
                         "hydrate_read_state",
-                        WasmTrapContext::Normalizer,
                         &mut locked,
                         call,
                     )
@@ -3503,10 +3709,9 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                     .bindings
                     .call_merge_default_tags(locked.store(), &sealed)
                     .await;
-                finish_guest_call(
+                finish_normalizer_guest_call(
                     &self.instance,
                     "merge_default_tags",
-                    WasmTrapContext::Normalizer,
                     &mut locked,
                     call,
                 )
@@ -3641,14 +3846,129 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn normalizer_guest_boundary_decode_error_is_structured_and_reentrant() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let wasm_path = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
+            .into_iter()
+            .map(|name| workspace_root.join("target/wasm32-wasip2/debug").join(name))
+            .find(|path| path.exists());
+        let Some(wasm_path) = wasm_path else {
+            eprintln!(
+                "SKIP: WASM binary not found. Build with: cargo build -p \
+                 carina-provider-mock --target wasm32-wasip2"
+            );
+            return;
+        };
+
+        let factory = WasmProviderFactory::new_uncached(wasm_path)
+            .await
+            .expect("mock WASM provider should load");
+        let instance = factory
+            .get_or_create_shared_instance(None, &IndexMap::new())
+            .await
+            .expect("mock WASM provider should initialize");
+        let malformed = wit_types::ResourceDef {
+            id: wit_types::ResourceId {
+                provider: "mock".to_string(),
+                resource_type: "test.resource".to_string(),
+                identity: "malformed-boundary".to_string(),
+            },
+            attributes: vec![(
+                "settings".to_string(),
+                wit_types::Value::ListVal("not-json".to_string()),
+            )],
+        };
+        let mut locked = LockedStore::acquire(&instance, "normalize_desired")
+            .await
+            .expect("fresh instance should be usable");
+        let call = instance
+            .bindings
+            .call_normalize_desired_raw(locked.store(), &[malformed])
+            .await;
+        let error = finish_normalizer_guest_call(&instance, "normalize_desired", &mut locked, call)
+            .expect_err("malformed guest input must return provider-error");
+        drop(locked);
+
+        assert_eq!(error.variant_name(), "internal");
+        assert_eq!(
+            error.detail().operation.as_deref(),
+            Some("normalize_desired"),
+            "the guest boundary error must retain its export operation"
+        );
+        assert!(
+            error.message().contains("normalize_desired"),
+            "the guest boundary error message must name its export: {error}"
+        );
+        assert!(
+            error.message().contains("WASM boundary decode error"),
+            "the guest boundary error message must be preserved: {error}"
+        );
+        assert!(
+            error.message().contains("invalid JSON"),
+            "the guest decode detail must be preserved: {error}"
+        );
+        assert!(
+            !instance.poisoned.load(Ordering::Acquire),
+            "a returned boundary provider-error must not poison the instance"
+        );
+
+        let malformed_saved_attrs = [(
+            "mock.test.resource.malformed-boundary".to_string(),
+            vec![(
+                "settings".to_string(),
+                wit_types::Value::ListVal("not-json".to_string()),
+            )],
+        )];
+        let mut locked = LockedStore::acquire(&instance, "hydrate_read_state")
+            .await
+            .expect("the decode error must leave the instance usable");
+        let call = instance
+            .bindings
+            .call_hydrate_read_state(locked.store(), &[], &malformed_saved_attrs)
+            .await;
+        let error =
+            finish_normalizer_guest_call(&instance, "hydrate_read_state", &mut locked, call)
+                .expect_err("malformed saved attributes must return provider-error");
+        drop(locked);
+
+        assert_eq!(error.variant_name(), "internal");
+        assert_eq!(
+            error.detail().operation.as_deref(),
+            Some("hydrate_read_state"),
+            "the structured operation must be the bare export name"
+        );
+        assert!(
+            error
+                .message()
+                .contains("hydrate_read_state saved attributes"),
+            "the boundary error message must retain its failing sub-part: {error}"
+        );
+        assert!(
+            !instance.poisoned.load(Ordering::Acquire),
+            "a returned saved-attribute decode error must not poison the instance"
+        );
+
+        let normalizer = WasmProviderNormalizer { instance };
+        let mut resources = vec![Resource::with_provider(
+            "mock",
+            "test.resource",
+            "after-boundary-error",
+            None,
+        )];
+        normalizer
+            .normalize_desired(&mut resources)
+            .await
+            .expect("the same instance must accept a later normalizer call");
+    }
+
     #[test]
     fn rendered_decode_provider_error_contains_serde_detail_once() {
         use std::error::Error as _;
 
-        let decode_error = wasm_convert::wit_to_core_value(
-            &crate::wasm_bindings::carina::provider::types::Value::ListVal("[".to_string()),
-        )
-        .expect_err("malformed JSON must fail");
+        let decode_error =
+            wasm_convert::wit_to_core_value(&wit_types::Value::ListVal("[".to_string()))
+                .expect_err("malformed JSON must fail");
         let serde_detail = decode_error
             .source()
             .expect("syntax errors retain serde source")
@@ -3660,7 +3980,7 @@ mod tests {
 
     #[test]
     fn malformed_normalized_state_output_is_atomic() {
-        use crate::wasm_bindings::carina::provider::types::Value as WitValue;
+        use wit_types::Value as WitValue;
 
         let first_id = Resource::with_provider("mock", "test.resource", "first", None).id;
         let second_id = Resource::with_provider("mock", "test.resource", "second", None).id;
@@ -4543,6 +4863,34 @@ mod tests {
         assert!(rendered.contains("Host wasi:http version: 0.2.6"));
         assert!(rendered.contains("These wasi:http versions are compatible"));
         assert!(rendered.contains("Single runtime instantiation attempt"));
+    }
+
+    #[test]
+    fn runtime_info_interrupt_uses_guest_timeout_classification() {
+        let mapper: ProviderInstantiationErrorMapper =
+            Arc::new(default_provider_instantiation_error_mapper);
+        let provider_error = WasmProviderInstanceError::InfoCall(
+            wasmtime::Error::new(wasmtime::Trap::Interrupt)
+                .context("error while calling provider info"),
+        )
+        .into_provider_error_with(&mapper);
+
+        assert_eq!(provider_error.variant_name(), "timeout");
+        assert_eq!(
+            provider_error.message(),
+            format!(
+                "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in info (check AWS credentials)"
+            )
+        );
+        let cause = std::error::Error::source(&provider_error)
+            .expect("info timeout must retain the typed guest-call cause");
+        assert!(cause.downcast_ref::<WasmGuestCallError>().is_some());
+        assert!(
+            cause.source().is_some_and(|source| source
+                .to_string()
+                .contains("error while calling provider info")),
+            "the typed guest-call wrapper must retain the Wasmtime cause chain"
+        );
     }
 
     #[test]

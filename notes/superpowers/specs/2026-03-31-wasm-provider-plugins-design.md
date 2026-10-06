@@ -162,8 +162,8 @@ interface provider {
     update: func(id: resource-id, identifier: string, from: state, to: resource) -> result<state, provider-error>;
     delete: func(id: resource-id, identifier: string, lifecycle: lifecycle-config) -> result<_, provider-error>;
 
-    normalize-desired: func(resources: list<resource>) -> list<resource>;
-    normalize-state: func(states: list<tuple<resource-id, state>>) -> list<tuple<resource-id, state>>;
+    normalize-desired: func(resources: list<resource>) -> result<list<resource>, provider-error>;
+    normalize-state: func(states: list<tuple<resource-id, state>>) -> result<list<tuple<resource-id, state>>, provider-error>;
 }
 
 world carina-provider {

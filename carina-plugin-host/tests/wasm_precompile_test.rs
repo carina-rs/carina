@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use carina_core::provider::ProviderFactory;
 use carina_plugin_host::{WasmProviderFactory, WasmProviderLoadError};
+use wit_component::{ComponentEncoder, StringEncoding};
+use wit_parser::{ManglingAndAbi, Resolve};
 
 /// A valid component that cannot be brought up as a Carina provider because
 /// neither host world can satisfy its imported interface.
@@ -87,6 +89,80 @@ fn wasm_path() -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn build_protocol_v2_component() -> Vec<u8> {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let current_wit = workspace_root.join("carina-plugin-wit/wit");
+    let temp = tempfile::tempdir().expect("create old-protocol WIT dir");
+    let wit_dir = temp.path().join("wit");
+    std::fs::create_dir(&wit_dir).expect("create WIT package dir");
+
+    std::fs::copy(current_wit.join("types.wit"), wit_dir.join("types.wit"))
+        .expect("copy provider types");
+    let mut provider_wit =
+        std::fs::read_to_string(current_wit.join("provider.wit")).expect("read provider WIT");
+    let resource_result = ") -> result<list<resource-def>, provider-error>;";
+    let state_result = ") -> result<list<tuple<string, state>>, provider-error>;";
+    assert_eq!(
+        provider_wit.matches(resource_result).count(),
+        2,
+        "v3 WIT must have result channels for both resource normalizers"
+    );
+    assert_eq!(
+        provider_wit.matches(state_result).count(),
+        2,
+        "v3 WIT must have result channels for both state normalizers"
+    );
+    provider_wit = provider_wit
+        .replace(resource_result, ") -> list<resource-def>;")
+        .replace(state_result, ") -> list<tuple<string, state>>;");
+    std::fs::write(wit_dir.join("provider.wit"), provider_wit).expect("write v2 provider WIT");
+    std::fs::write(
+        wit_dir.join("world.wit"),
+        "package carina:provider@0.1.0;\n\nworld carina-provider {\n    export provider;\n}\n",
+    )
+    .expect("write v2 provider world");
+
+    let mut resolve = Resolve::new();
+    let (package, _) = resolve.push_dir(&wit_dir).expect("parse v2 WIT package");
+    let world = resolve
+        .select_world(&[package], Some("carina-provider"))
+        .expect("select v2 provider world");
+    let module = wit_component::dummy_module(&resolve, world, ManglingAndAbi::Standard32);
+    let mut module_wat = wasmprinter::print_bytes(module).expect("print dummy provider module");
+
+    let info_json = r#"{"name":"old-v2","display_name":"Old v2 Provider","capabilities":[],"version":"2.0.0","protocol_version":2}"#;
+    let escaped_info = info_json.replace('\\', "\\\\").replace('"', "\\\"");
+    let old_info_body = "  (func (;0;) (type 0) (result i32)\n    unreachable\n  )";
+    let new_info_body = format!(
+        "  (func (;0;) (type 0) (result i32)\n    i32.const 0\n    i32.const 8\n    i32.store\n    i32.const 4\n    i32.const {}\n    i32.store\n    i32.const 0\n  )",
+        info_json.len()
+    );
+    assert!(
+        module_wat.contains("(export \"cm32p2|carina:provider/provider@0.1|info\" (func 0))"),
+        "the dummy module must export info as its first function"
+    );
+    assert!(
+        module_wat.contains(old_info_body),
+        "the dummy info implementation shape changed"
+    );
+    module_wat = module_wat.replacen(old_info_body, &new_info_body, 1);
+    module_wat = module_wat.replacen(
+        "  (memory (;0;) 0)",
+        &format!("  (memory (;0;) 1)\n  (data (i32.const 8) \"{escaped_info}\")"),
+        1,
+    );
+
+    let mut module = wat::parse_str(&module_wat).expect("assemble v2 dummy provider module");
+    wit_component::embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8)
+        .expect("embed v2 component metadata");
+    ComponentEncoder::default()
+        .module(&module)
+        .expect("configure v2 component encoder")
+        .validate(true)
+        .encode()
+        .expect("encode v2 provider component")
 }
 
 macro_rules! skip_if_no_wasm {
@@ -306,6 +382,36 @@ async fn warm_cache_protocol_version_failure_preserves_precompiled_artifact() {
     );
 
     assert_cache_artifact_preserved(&cwasm_path, &artifact_before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn protocol_v2_is_rejected_before_v3_export_signature_binding() {
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+    let wasm_path = source_dir.path().join("protocol-v2.wasm");
+    std::fs::write(&wasm_path, build_protocol_v2_component()).expect("write protocol-v2 component");
+    let cache_dir = tempfile::tempdir().expect("create cache temp dir");
+
+    let error = match WasmProviderFactory::new_with_cache_dir(wasm_path, cache_dir.path()).await {
+        Ok(_) => panic!("a protocol-v2 component must be rejected"),
+        Err(error) => error,
+    };
+    let rendered = error.to_string();
+
+    assert!(
+        matches!(error, WasmProviderLoadError::Other(_)),
+        "protocol rejection must not be classified as typed instantiation failure: {rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "provider 'old-v2' was built against protocol version 2 but this host requires at least version 3"
+        ),
+        "the stable info preflight must report the protocol mismatch: {rendered}"
+    );
+    assert!(
+        !rendered.contains("failed to convert function to given type")
+            && !rendered.contains("normalize-desired"),
+        "v3 signature binding must not run before the version check: {rendered}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
