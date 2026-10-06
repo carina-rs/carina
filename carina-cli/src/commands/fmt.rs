@@ -119,7 +119,7 @@ where
     // one-line application here is the remaining integration seam because the
     // workspace mock WASM exports no schemas for a real conversion end-to-end.
     let (factories, load_errors) = build_factories(&config.providers, directory);
-    let ctx = WiringContext::new(factories);
+    let ctx = WiringContext::new(factories, &config.providers);
     DirectoryBlockNames {
         block_names: collect_all_block_names(ctx.schemas()),
         provider_load_diagnostics: load_errors,

@@ -24,8 +24,7 @@ use carina_core::executor::normalized::{
 };
 use carina_core::executor::{UnresolvedDataSourceInput, unresolved_data_source_inputs};
 use carina_core::identifier::{
-    self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, ScreenedStateEntries,
-    StateBlockClaims,
+    self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
 };
 use carina_core::module_resolver;
 use carina_core::override_aware::OverrideAwareResources;
@@ -41,12 +40,13 @@ use carina_core::resource::{
     Composition, ConcreteValue, DataSource, DeferredValue, ResolvedResource, ResolvedResourceId,
     Resource, ResourceId, ResourceIdentity, ResourceIdentityError, State, Value,
 };
+#[cfg(test)]
+use carina_core::schema::{AttributeSchema, AttributeType};
 use carina_core::schema::{
-    AttributeSchema, AttributeType, CustomTypeLookup, ResourceSchema, SchemaRegistry, StructField,
-    TypeError, resolve_block_names,
+    CustomTypeLookup, ResourceSchema, SchemaRegistry, TypeError, resolve_block_names,
 };
 use carina_core::validation;
-use carina_provider_mock::MockProvider;
+use carina_provider_mock::{BUILTIN_PROVIDER_NAME, MockProvider};
 use carina_state::{BackendError, StateFile};
 
 use crate::commands::shared::progress::{RefreshProgress, refresh_multi_progress};
@@ -118,6 +118,8 @@ pub struct StateBlockResolution {
 pub struct WiringContext {
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
     schemas: SchemaRegistry,
+    known_providers: HashSet<String>,
+    uses_builtin_mock: bool,
 }
 
 /// Provider factories paired with provider-specific load diagnostics.
@@ -159,42 +161,57 @@ pub(crate) type FormattingFactoryLoad = (
 );
 
 impl WiringContext {
-    pub fn new(factories: Vec<Box<dyn ProviderFactory>>) -> Self {
-        let mut schemas = provider_mod::collect_schemas(&factories);
-        if std::env::var_os("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA").is_some() {
-            schemas.insert(
-                "mock",
-                ResourceSchema::new("test.resource")
-                    .attribute(
-                        AttributeSchema::new("name", AttributeType::string())
-                            .required()
-                            .create_only(),
-                    )
-                    .attribute(AttributeSchema::new(
-                        "tags",
-                        AttributeType::map(AttributeType::string()),
-                    ))
-                    .attribute(
-                        AttributeSchema::new(
-                            "rules",
-                            AttributeType::list(AttributeType::struct_(
-                                "Rule",
-                                vec![StructField::new("action", AttributeType::string())],
-                            )),
-                        )
-                        .with_block_name("rule"),
-                    )
-                    .attribute(
-                        AttributeSchema::new("identifier", AttributeType::string()).read_only(),
-                    )
-                    .attribute(AttributeSchema::new("comment", AttributeType::string()))
-                    .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string()))
-                    .with_unique_name_attribute("name"),
-            );
+    pub fn new(
+        factories: Vec<Box<dyn ProviderFactory>>,
+        provider_configs: &[ProviderConfig],
+    ) -> Self {
+        Self::new_with_additional_schemas(factories, provider_configs, std::iter::empty())
+    }
+
+    pub(crate) fn new_with_additional_schemas(
+        factories: Vec<Box<dyn ProviderFactory>>,
+        provider_configs: &[ProviderConfig],
+        additional_schemas: impl IntoIterator<Item = (String, ResourceSchema)>,
+    ) -> Self {
+        let uses_builtin_mock =
+            carina_provider_mock::uses_builtin_provider(provider_configs, |provider_name| {
+                factories
+                    .iter()
+                    .any(|factory| factory.name() == provider_name)
+            });
+        let mut schemas = SchemaRegistry::new();
+        for (provider, schema) in additional_schemas {
+            schemas.insert(provider, schema);
+        }
+        for factory in &factories {
+            for schema in factory.schemas() {
+                schemas.insert(factory.name(), schema);
+            }
+        }
+        if uses_builtin_mock {
+            for schema in carina_provider_mock::builtin_schemas() {
+                let already_registered = if schema.is_data_source() {
+                    schemas.has_data_source(BUILTIN_PROVIDER_NAME, &schema.resource_type)
+                } else {
+                    schemas.has_managed(BUILTIN_PROVIDER_NAME, &schema.resource_type)
+                };
+                if !already_registered {
+                    schemas.insert(BUILTIN_PROVIDER_NAME, schema);
+                }
+            }
+        }
+        let mut known_providers = factories
+            .iter()
+            .map(|factory| factory.name().to_string())
+            .collect::<HashSet<_>>();
+        if uses_builtin_mock {
+            known_providers.insert(BUILTIN_PROVIDER_NAME.to_string());
         }
         Self {
             factories: Arc::new(factories),
             schemas,
+            known_providers,
+            uses_builtin_mock,
         }
     }
 
@@ -208,6 +225,14 @@ impl WiringContext {
 
     pub fn schemas(&self) -> &SchemaRegistry {
         &self.schemas
+    }
+
+    pub fn known_providers(&self) -> &HashSet<String> {
+        &self.known_providers
+    }
+
+    fn uses_builtin_mock(&self) -> bool {
+        self.uses_builtin_mock
     }
 }
 
@@ -415,15 +440,10 @@ pub fn validate_resources_with_ctx<E>(
     parsed: &carina_core::parser::File<E>,
     provider_context: &carina_core::parser::ProviderContext,
 ) -> Vec<AppError> {
-    let known_providers: HashSet<String> = ctx
-        .factories()
-        .iter()
-        .map(|f| f.name().to_string())
-        .collect();
     lift_validation_result(validation::validate_resources(
         parsed,
         ctx.schemas(),
-        &known_providers,
+        ctx.known_providers(),
         provider_context,
     ))
 }
@@ -802,99 +822,10 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
     state_file.rename_resource_identities(&renames)
 }
 
-pub(crate) fn adopt_unique_state_identity_for_unresolved_anonymous<'state>(
-    resources: &mut [Resource],
-    find_state_by_type: &dyn Fn(
-        &str,
-        &str,
-    ) -> ScreenedStateEntries<&'state carina_state::ResourceState>,
-) {
-    type ResourceKind = (String, String, Option<String>);
-
-    let mut claimed_state_identities = HashMap::<ResourceKind, HashSet<ResourceIdentity>>::new();
-    for resource in resources.iter() {
-        let Some(identity) = resource.id.identity() else {
-            continue;
-        };
-        claimed_state_identities
-            .entry((
-                resource.id.provider.clone(),
-                resource.id.resource_type.clone(),
-                resource.id.provider_instance.clone(),
-            ))
-            .or_default()
-            .insert(identity.clone());
-    }
-
-    for resource in resources {
-        if resource.id.identity_str().is_some() || resource.binding.is_some() {
-            continue;
-        }
-
-        let kind = (
-            resource.id.provider.clone(),
-            resource.id.resource_type.clone(),
-            resource.id.provider_instance.clone(),
-        );
-        let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
-        let candidates: Vec<_> = state_entries
-            .candidates()
-            .copied()
-            .filter(|state| state.directives.provider_instance == resource.id.provider_instance)
-            .filter(|state| {
-                !claimed_state_identities
-                    .get(&kind)
-                    .is_some_and(|claimed| claimed.contains(&state.identity))
-            })
-            .collect();
-        let [state] = candidates.as_slice() else {
-            continue;
-        };
-
-        resource.id.set_identity(state.identity.clone());
-        claimed_state_identities
-            .entry(kind)
-            .or_default()
-            .insert(state.identity.clone());
-    }
-}
-
-pub(crate) fn assign_fallback_identities_for_unresolved_anonymous(
-    resources: &mut [Resource],
-    data_sources: &[DataSource],
-) -> Vec<(ResourceId, ResourceId)> {
-    let known_bindings: HashSet<String> = resources
-        .iter()
-        .filter_map(|resource| resource.binding.clone())
-        .chain(
-            data_sources
-                .iter()
-                .filter_map(|data_source| data_source.binding.clone()),
-        )
-        .collect();
-    let mut renames = Vec::new();
-
-    for resource in resources.iter_mut() {
-        if resource.id.identity_str().is_some() || resource.binding.is_some() {
-            continue;
-        }
-
-        let old_id = resource.id.clone();
-        let identity = identifier::fallback_anonymous_identity(resource, &known_bindings);
-        resource.id.set_identity(identity);
-        renames.push((old_id, resource.id.clone()));
-    }
-    renames
-}
-
 pub(crate) struct LateAnonymousIdentityInputs<'a> {
     pub resources: &'a mut OverrideAwareResources,
-    pub data_sources: &'a [DataSource],
     pub state_file: Option<&'a StateFile>,
     pub state_block_claims: &'a StateBlockClaims,
-    pub current_states: &'a mut HashMap<ResourceId, State>,
-    pub saved_attrs: &'a mut LiftedSavedAttrs,
-    pub prev_explicit: &'a mut HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     pub providers: &'a [ProviderConfig],
 }
 
@@ -934,40 +865,28 @@ pub(crate) fn reconcile_late_anonymous_identities(
             &mut state_for_late_reconcile,
             inputs.state_block_claims,
         )?;
-        adopt_unique_state_identity_for_unresolved_anonymous(
-            inputs.resources.resources_mut(),
-            &|provider, resource_type| {
-                inputs.state_block_claims.screen_entries(
-                    provider,
-                    resource_type,
-                    sf.resources_by_type(provider, resource_type),
-                    |entry| entry.identity.as_str(),
-                )
-            },
-        );
     }
 
-    let fallback_renames = assign_fallback_identities_for_unresolved_anonymous(
-        inputs.resources.resources_mut(),
-        inputs.data_sources,
+    let unavailable_schema_errors = validation::validate_anonymous_resource_schemas(
+        inputs.resources.resources(),
+        ctx.schemas(),
+        ctx.known_providers(),
     );
-    // Every pending identity is now assigned. Validate the resolved-key
-    // invariant at this seam so two separately scoped module leaves that map
-    // to the same state-visible identity return the existing typed error
-    // instead of reaching map construction or execution as duplicates.
-    inputs.resources.unresolved_by_resolved_id()?;
-    for (from, to) in &fallback_renames {
-        if let Some(mut state) = inputs.current_states.remove(from) {
-            inputs.current_states.entry(to.clone()).or_insert_with(|| {
-                state.id = to.clone();
-                state
-            });
-        }
-        inputs.saved_attrs.remap_resource_id(from, to.clone());
-        if let Some(explicit) = inputs.prev_explicit.remove(from) {
-            inputs.prev_explicit.insert(to.clone(), explicit);
-        }
+    if !unavailable_schema_errors.is_empty() {
+        return Err(AppError::Config(
+            unavailable_schema_errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
     }
+
+    // Validate the resolved-key invariant at this seam so two separately
+    // scoped module leaves that map to the same state-visible identity return
+    // the existing typed error instead of reaching map construction or
+    // execution as duplicates.
+    inputs.resources.unresolved_by_resolved_id()?;
 
     ResolvedDesiredIds::from_resources(inputs.resources.resources())
 }
@@ -1648,7 +1567,7 @@ pub async fn get_provider_with_ctx<E>(
         .await?;
     }
 
-    if router.is_empty() {
+    if router.is_empty() && ctx.uses_builtin_mock() {
         // Use mock provider for other cases.
         // Register the kind's default instance with empty kind to match
         // resources without a provider prefix.
@@ -1760,7 +1679,7 @@ async fn instantiate_provider_into_router(
                 .await,
         );
         router.add_provider_instance(provider_config.name.clone(), binding, provider);
-    } else if provider_config.name == "mock" {
+    } else if ctx.uses_builtin_mock() && provider_config.name == BUILTIN_PROVIDER_NAME {
         println!("{}", "Using mock provider".cyan());
         router.add_provider_instance(
             provider_config.name.clone(),
@@ -1901,7 +1820,7 @@ pub async fn create_providers_from_configs(
     base_dir: &Path,
 ) -> Result<(ProviderRouter, WiringContext), AppError> {
     let (factories, _) = build_factories_from_providers(configs, base_dir)?;
-    let ctx = WiringContext::new(factories);
+    let ctx = WiringContext::new(factories, configs);
     let mut router = ProviderRouter::new();
 
     // Same two-pass shape as `get_provider_with_ctx`: default instances
@@ -1926,7 +1845,7 @@ pub async fn create_providers_from_configs(
         .await?;
     }
 
-    if router.is_empty() {
+    if router.is_empty() && ctx.uses_builtin_mock() {
         println!("{}", "Using mock provider".cyan());
         router.add_provider(String::new(), Box::new(MockProvider::new()));
     }
@@ -2407,7 +2326,7 @@ pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
-    let ctx = WiringContext::new(factories);
+    let ctx = WiringContext::new(factories, &parsed.providers);
     create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
         parsed,
@@ -2965,12 +2884,8 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         ctx,
         LateAnonymousIdentityInputs {
             resources: &mut override_aware_resources,
-            data_sources: &data_sources_for_plan,
             state_file: state_file.as_ref(),
             state_block_claims,
-            current_states: &mut current_states,
-            saved_attrs: &mut saved_attrs,
-            prev_explicit: &mut prev_explicit,
             providers: &parsed.providers,
         },
     )?;
@@ -4170,7 +4085,7 @@ pub(crate) fn prepare_data_sources_for_plan(
 #[cfg(test)]
 pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
     use carina_core::parser::ParsedFile;
-    let ctx = WiringContext::new(vec![]);
+    let ctx = WiringContext::new(vec![], &[]);
     let parsed = ParsedFile {
         resources: resources.to_vec(),
         ..ParsedFile::default()
@@ -4184,13 +4099,13 @@ pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
 
 #[cfg(test)]
 pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
-    let ctx = WiringContext::new(vec![]);
+    let ctx = WiringContext::new(vec![], &[]);
     errors_to_legacy_result(resolve_names_with_ctx(&ctx, resources))
 }
 
 #[cfg(test)]
 pub fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), AppError> {
-    let ctx = WiringContext::new(vec![]);
+    let ctx = WiringContext::new(vec![], &[]);
     errors_to_legacy_result(resolve_attr_prefixes_with_ctx(&ctx, resources))
 }
 
@@ -4199,7 +4114,7 @@ pub fn compute_anonymous_identifiers(
     resources: &mut [Resource],
     providers: &[ProviderConfig],
 ) -> Result<(), AppError> {
-    let ctx = WiringContext::new(vec![]);
+    let ctx = WiringContext::new(vec![], providers);
     let canonical_resources =
         carina_core::value::canonicalize_resources_with_schemas(resources, ctx.schemas());
     let errors = compute_anonymous_identifiers_with_ctx(&ctx, canonical_resources, providers);
@@ -4231,7 +4146,7 @@ fn errors_to_legacy_result(errors: Vec<AppError>) -> Result<(), AppError> {
 
 #[cfg(test)]
 pub fn resolve_enum_aliases(resources: &mut [Resource]) {
-    let ctx = WiringContext::new(vec![]);
+    let ctx = WiringContext::new(vec![], &[]);
     carina_core::value::resolve_enum_aliases_for_resources(resources, ctx.factories())
 }
 

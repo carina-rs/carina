@@ -132,7 +132,6 @@ provider mock {}
             .arg("apply")
             .arg(plan_path)
             .args(["--parallelism", "8", "--auto-approve", "--lock=false"])
-            .env("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1")
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state_path)
             .env("CARINA_MOCK_OP_LOG", &self.op_log_path)
             .env("CARINA_MOCK_UPDATE_DELAY_MS", UPDATE_DELAY_MS)

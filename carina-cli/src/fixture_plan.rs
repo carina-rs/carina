@@ -31,6 +31,77 @@ use crate::wiring::{
 /// Fixture root path relative to the `carina-cli` crate manifest.
 const FIXTURE_SUBPATH: &str = "tests/fixtures/plan_display";
 
+/// Minimal schema catalog for provider-less plan fixtures.
+///
+/// These schemas intentionally model the immutable inputs needed for anonymous
+/// identity plus the schema-sensitive fields used by fixture diffing. Richer
+/// provider-specific formatting/validation fixtures add local schemas below,
+/// which take precedence over matching entries in this catalog.
+fn fixture_schemas() -> Vec<(String, ResourceSchema)> {
+    let create_only_string =
+        |name| AttributeSchema::new(name, AttributeType::string()).create_only();
+    let aws = |schema| ("aws".to_string(), schema);
+    let awscc = |schema| ("awscc".to_string(), schema);
+    vec![
+        aws(ResourceSchema::new("acm.Certificate").attribute(create_only_string("domain_name"))),
+        aws(ResourceSchema::new("acm.CertificateValidation")
+            .attribute(create_only_string("certificate_arn"))
+            .attribute(create_only_string("validation_record_id"))),
+        aws(ResourceSchema::new("iam.Role").attribute(create_only_string("role_name"))),
+        aws(ResourceSchema::new("route53.RecordSet")
+            .attribute(create_only_string("hosted_zone_id"))
+            .attribute(create_only_string("name"))
+            .attribute(create_only_string("type"))),
+        aws(ResourceSchema::new("s3.Bucket").attribute(create_only_string("bucket_name"))),
+        awscc(ResourceSchema::new("ec2.RouteTable").attribute(create_only_string("vpc_id"))),
+        awscc(
+            ResourceSchema::new("ec2.SecurityGroup")
+                .attribute(create_only_string("group_name"))
+                .attribute(create_only_string("vpc_id")),
+        ),
+        awscc(
+            ResourceSchema::new("ec2.Subnet")
+                .attribute(create_only_string("availability_zone"))
+                .attribute(create_only_string("cidr_block"))
+                .attribute(create_only_string("vpc_id")),
+        ),
+        awscc(
+            ResourceSchema::new("ec2.Vpc")
+                .attribute(create_only_string("cidr_block"))
+                .attribute(AttributeSchema::new(
+                    "enable_dns_support",
+                    AttributeType::bool(),
+                ))
+                .attribute(AttributeSchema::new(
+                    "tags",
+                    AttributeType::map(AttributeType::string()),
+                )),
+        ),
+        awscc(ResourceSchema::new("iam.Role").attribute(create_only_string("role_name"))),
+        awscc(
+            ResourceSchema::new("iam.RolePolicy")
+                .attribute(create_only_string("policy_name"))
+                .attribute(create_only_string("role_name"))
+                .attribute(AttributeSchema::new(
+                    "policy_document",
+                    AttributeType::string(),
+                )),
+        ),
+        awscc(ResourceSchema::new("logs.LogGroup").attribute(create_only_string("log_group_name"))),
+        awscc(ResourceSchema::new("s3.Bucket").attribute(create_only_string("bucket_name"))),
+        awscc(
+            ResourceSchema::new("sso.Assignment")
+                .attribute(create_only_string("instance_arn"))
+                .attribute(create_only_string("permission_set_arn"))
+                .attribute(create_only_string("principal_id"))
+                .attribute(create_only_string("principal_type"))
+                .attribute(create_only_string("target_id"))
+                .attribute(create_only_string("target_type")),
+        ),
+        awscc(ResourceSchema::new("test.Widget").attribute(create_only_string("external_name"))),
+    ]
+}
+
 /// Complete output of fixture-based plan construction.
 pub struct FixturePlan {
     pub plan: Plan,
@@ -98,7 +169,11 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         None
     };
 
-    let wiring = WiringContext::new(fixture_provider_factories(&fixture_pathbuf));
+    let wiring = WiringContext::new_with_additional_schemas(
+        fixture_provider_factories(&fixture_pathbuf),
+        &parsed.providers,
+        fixture_schemas(),
+    );
     if fixture_pathbuf
         .file_name()
         .is_some_and(|name| name == "moved_claims_precede_heuristics")
@@ -329,12 +404,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &wiring,
         LateAnonymousIdentityInputs {
             resources: &mut override_aware_resources,
-            data_sources: &data_sources_for_plan,
             state_file: state_file.as_ref(),
             state_block_claims: &state_block_claims,
-            current_states: &mut current_states,
-            saved_attrs: &mut saved_attrs,
-            prev_explicit: &mut prev_explicit,
             providers: &parsed.providers,
         },
     )
@@ -581,8 +652,16 @@ impl ProviderFactory for BestFirstPairingFixtureFactory {
         ));
         vec![
             ResourceSchema::new("iam.RolePolicy")
-                .attribute(AttributeSchema::new("policy_name", AttributeType::string()).required())
-                .attribute(AttributeSchema::new("role_name", AttributeType::string()).required())
+                .attribute(
+                    AttributeSchema::new("policy_name", AttributeType::string())
+                        .required()
+                        .create_only(),
+                )
+                .attribute(
+                    AttributeSchema::new("role_name", AttributeType::string())
+                        .required()
+                        .create_only(),
+                )
                 .attribute(AttributeSchema::new("statement", statement).required()),
         ]
     }
@@ -738,7 +817,11 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
         );
         vec![
             ResourceSchema::new("ec2.Vpc")
-                .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).required())
+                .attribute(
+                    AttributeSchema::new("cidr_block", AttributeType::string())
+                        .required()
+                        .create_only(),
+                )
                 .attribute(AttributeSchema::new("instance_tenancy", tenancy).required()),
         ]
     }

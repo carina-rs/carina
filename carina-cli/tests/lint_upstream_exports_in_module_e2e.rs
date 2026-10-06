@@ -7,7 +7,6 @@ const EXPORTS_RULE: &str = "exports blocks are not allowed inside modules";
 fn run_lint(caller: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_carina"))
         .args(["lint", caller.to_str().expect("UTF-8 caller path")])
-        .env("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1")
         .output()
         .expect("run carina lint")
 }

@@ -83,7 +83,7 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
     }
 
     let (provider_factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
-    let ctx = WiringContext::new(provider_factories);
+    let ctx = WiringContext::new(provider_factories, &parsed.providers);
     let schemas = ctx.schemas();
 
     // Collect source texts for each .crn file

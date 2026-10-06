@@ -165,7 +165,7 @@ async fn run_destroy_locked(
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
-    let ctx = WiringContext::new(factories);
+    let ctx = WiringContext::new(factories, &parsed.providers);
 
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the destroy lock before any short-circuit

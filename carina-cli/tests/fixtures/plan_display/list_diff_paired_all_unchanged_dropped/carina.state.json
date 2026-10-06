@@ -12,6 +12,7 @@
       "attributes": {
         "policy_name": "test-inline",
         "role_name": "test-role",
+        "policy_document": "{}",
         "statement": [
           {
             "sid": "AllowS3Read",
@@ -35,6 +36,9 @@
             "kind": "leaf"
           },
           "role_name": {
+            "kind": "leaf"
+          },
+          "policy_document": {
             "kind": "leaf"
           },
           "statement": {

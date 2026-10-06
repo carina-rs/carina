@@ -76,6 +76,7 @@ fn init_project(body: &str) -> TempDir {
 fn plan_keeps_cursor_hidden_for_whole_command_no_flicker_on_pty() {
     let tmp = init_project(
         "backend local { path = \"carina.state.json\" }\n\
+         provider mock {}\n\
          mock.test.resource { name = \"r1\" }\n",
     );
 

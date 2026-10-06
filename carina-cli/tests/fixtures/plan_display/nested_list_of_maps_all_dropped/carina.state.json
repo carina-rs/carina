@@ -11,6 +11,7 @@
       "identifier": "vpc-0123456789abcdef0",
       "attributes": {
         "cidr_block": "10.0.0.0/16",
+        "enable_dns_support": false,
         "vpc_id": "vpc-0123456789abcdef0",
         "config": {
           "settings": {
@@ -34,6 +35,9 @@
         "kind": "struct",
         "children": {
           "cidr_block": {
+            "kind": "leaf"
+          },
+          "enable_dns_support": {
             "kind": "leaf"
           },
           "config": {

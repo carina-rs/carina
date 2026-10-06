@@ -102,6 +102,7 @@ fn execution_plan_has_blank_line_after_refresh_block() {
     init_project(
         tmp.path(),
         r#"backend local { path = "carina.state.json" }
+provider mock {}
 mock.test.resource { name = "r1" }
 "#,
     );
@@ -129,6 +130,7 @@ fn refresh_false_has_no_separator_blank_line() {
     init_project(
         tmp.path(),
         r#"backend local { path = "carina.state.json" }
+provider mock {}
 mock.test.resource { name = "r1" }
 "#,
     );

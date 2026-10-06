@@ -6,7 +6,6 @@ fn run_fmt(project: &Path, args: &[&str]) -> Output {
         .current_dir(project)
         .env("NO_COLOR", "1")
         .env_remove("CLICOLOR_FORCE")
-        .env_remove("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA")
         .arg("fmt")
         .args(args)
         .output()

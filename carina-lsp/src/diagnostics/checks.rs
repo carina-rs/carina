@@ -263,9 +263,9 @@ impl DiagnosticEngine {
             };
 
             // The general schema diagnostic below is the actionable error in
-            // this situation. Without a schema, LSP cannot truthfully classify
-            // the resource's identity basis even though CLI intentionally
-            // treats genuinely schema-less providers as attribute-derived.
+            // this situation. Without a schema, the identity-basis classifier
+            // returns no classification, so LSP must not infer an
+            // attribute-derived conflict while provider schemas are unloaded.
             if self.schemas.get_for(resource).is_none() {
                 continue;
             }

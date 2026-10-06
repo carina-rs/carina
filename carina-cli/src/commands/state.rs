@@ -922,7 +922,7 @@ async fn run_state_bucket_delete(
         .ok_or("Backend does not specify a resource type")?;
     let base_dir = get_base_dir(path);
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
-    let ctx = WiringContext::new(factories);
+    let ctx = WiringContext::new(factories, &parsed.providers);
     let factory = provider_mod::find_factory(ctx.factories(), backend_provider_name)
         .ok_or_else(|| format!("No provider factory found for '{}'", backend_provider_name))?;
 
@@ -1063,7 +1063,7 @@ pub(crate) async fn run_state_refresh_locked(
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
-    let ctx = WiringContext::new(factories);
+    let ctx = WiringContext::new(factories, &parsed.providers);
 
     run_state_refresh_locked_with_ctx(parsed, backend, lock, base_dir, cancel, &ctx).await
 }
@@ -2274,9 +2274,12 @@ mod tests {
             .unwrap();
         let backend = ModuleConstraintRefreshBackend { state };
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ctx = WiringContext::new(vec![Box::new(ModuleConstraintRefreshFactory {
-            reads: reads.clone(),
-        })]);
+        let ctx = WiringContext::new(
+            vec![Box::new(ModuleConstraintRefreshFactory {
+                reads: reads.clone(),
+            })],
+            &parsed.providers,
+        );
         let temp = tempfile::tempdir().unwrap();
 
         let error = run_state_refresh_locked_with_ctx(

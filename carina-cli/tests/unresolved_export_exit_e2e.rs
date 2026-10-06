@@ -122,7 +122,6 @@ let broken = mock.test.resource {
         command
             .current_dir(&self.project)
             .env("NO_COLOR", "1")
-            .env("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1")
             .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
             .env_remove("CLICOLOR_FORCE");
         command

@@ -7,12 +7,106 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use carina_core::effect::PlanOp;
+use carina_core::parser::ProviderConfig;
 use carina_core::provider::{
     BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, PatchOpKind, Provider, ProviderError,
     ProviderResult, ReadRequest, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 use carina_core::value::{json_to_dsl_value, value_to_json};
+
+pub const BUILTIN_PROVIDER_NAME: &str = "mock";
+
+/// Return whether Carina selects its built-in mock provider.
+///
+/// This is the single selection rule shared by provider routing and schema
+/// registration. The built-in implementation is selected either for the
+/// legacy no-provider fallback, or for an explicit source-less default
+/// `provider mock {}` whose provider factory was not loaded. A sourced mock
+/// always belongs to the plugin path, including when that plugin failed to
+/// load.
+pub fn uses_builtin_provider<'a>(
+    provider_configs: impl IntoIterator<Item = &'a ProviderConfig>,
+    provider_is_loaded: impl FnOnce(&str) -> bool,
+) -> bool {
+    let mut provider_configs = provider_configs.into_iter().peekable();
+    if provider_configs.peek().is_none() {
+        return true;
+    }
+
+    provider_configs.any(|config| {
+        config.is_default() && config.name == BUILTIN_PROVIDER_NAME && config.source.is_none()
+    }) && !provider_is_loaded(BUILTIN_PROVIDER_NAME)
+}
+
+/// Schemas exposed by Carina's built-in `provider mock {}` implementation.
+pub fn builtin_schemas() -> Vec<ResourceSchema> {
+    vec![
+        ResourceSchema::new("test.resource")
+            .attribute(
+                AttributeSchema::new("name", AttributeType::string())
+                    .required()
+                    .create_only(),
+            )
+            .attribute(AttributeSchema::new(
+                "tags",
+                AttributeType::map(AttributeType::string()),
+            ))
+            .attribute(
+                AttributeSchema::new(
+                    "rules",
+                    AttributeType::list(AttributeType::struct_(
+                        "Rule",
+                        vec![StructField::new("action", AttributeType::string())],
+                    )),
+                )
+                .with_block_name("rule"),
+            )
+            .attribute(AttributeSchema::new("identifier", AttributeType::string()).read_only())
+            .attribute(AttributeSchema::new("comment", AttributeType::string()))
+            .attribute(AttributeSchema::new("web_acl_arn", AttributeType::string()))
+            .attribute(AttributeSchema::new("parent", AttributeType::string()))
+            .attribute(AttributeSchema::new("parent_name", AttributeType::string()))
+            .with_unique_name_attribute("name"),
+        ResourceSchema::new("compute.Instance")
+            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only())
+            .attribute(AttributeSchema::new("cluster_name", AttributeType::string()).create_only())
+            .attribute(AttributeSchema::new("arn", AttributeType::string()).read_only()),
+        ResourceSchema::new("example.thing")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+        ResourceSchema::new("example.consumer")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("plain", AttributeType::string()))
+            .attribute(AttributeSchema::new("ref_only", AttributeType::string()))
+            .attribute(AttributeSchema::new("prefix", AttributeType::string()))
+            .attribute(AttributeSchema::new(
+                "nested",
+                AttributeType::map(AttributeType::string()),
+            ))
+            .attribute(AttributeSchema::new(
+                "list",
+                AttributeType::list(AttributeType::string()),
+            )),
+        ResourceSchema::new("iam.Role")
+            .attribute(AttributeSchema::new("role_name", AttributeType::string()).create_only())
+            .attribute(AttributeSchema::new("path", AttributeType::string()).create_only())
+            .attribute(
+                AttributeSchema::new("max_session_duration", AttributeType::int()).create_only(),
+            )
+            .attribute(AttributeSchema::new("description", AttributeType::string())),
+        ResourceSchema::new("iam.Roles")
+            .attribute(AttributeSchema::new("name_regex", AttributeType::string()))
+            .attribute(AttributeSchema::new(
+                "names",
+                AttributeType::list(AttributeType::string()),
+            ))
+            .as_data_source(),
+        ResourceSchema::new("test.Thing")
+            .attribute(AttributeSchema::new("name", AttributeType::string()).required())
+            .with_unique_name_attribute("name"),
+    ]
+}
 
 pub struct MockProvider {
     state_file: PathBuf,
@@ -235,9 +329,7 @@ impl MockProvider {
     }
 
     fn test_resource_identifier(id: &ResourceId, name: Option<&str>) -> Option<String> {
-        if id.resource_type != "test.resource"
-            || env::var_os("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA").is_none()
-        {
+        if id.resource_type != "test.resource" {
             return None;
         }
         name.or_else(|| id.identity_str())
@@ -699,6 +791,40 @@ mod tests {
 
     fn string_value(value: impl Into<String>) -> Value {
         Value::Concrete(ConcreteValue::String(value.into()))
+    }
+
+    fn mock_provider_config() -> ProviderConfig {
+        carina_core::parser::parse(
+            "provider mock {}\n",
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .unwrap()
+        .providers
+        .into_iter()
+        .next()
+        .unwrap()
+    }
+
+    #[test]
+    fn builtin_provider_selection_is_shared_by_implicit_and_explicit_mock_paths() {
+        assert!(uses_builtin_provider(&[], |_| {
+            panic!("the implicit fallback does not depend on loaded factories")
+        }));
+
+        let source_less = mock_provider_config();
+        assert!(uses_builtin_provider([&source_less], |_| false));
+        assert!(!uses_builtin_provider([&source_less], |_| true));
+
+        let mut sourced = source_less.clone();
+        sourced.source = Some("file:///missing/mock.wasm".to_string());
+        assert!(!uses_builtin_provider([&sourced], |_| false));
+
+        let mut named = source_less.clone();
+        named.binding = Some("secondary".to_string());
+        assert!(
+            !uses_builtin_provider([&sourced, &named], |_| false),
+            "a named instance's absent source must not override its sourced kind default",
+        );
     }
 
     // Pin the byte-level shape so MockProvider's state file matches

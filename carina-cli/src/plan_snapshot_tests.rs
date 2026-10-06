@@ -228,7 +228,7 @@ fn snapshot_module_constraint_plan_error() {
 }
 
 #[test]
-fn non_module_anonymous_dependency_keeps_historical_fallback_identity() {
+fn non_module_anonymous_dependency_uses_schema_derived_identity() {
     let (plan, _schemas, _moved) = build_plan_from_fixture("all_create");
     let route_table = plan
         .effects()
@@ -241,8 +241,8 @@ fn non_module_anonymous_dependency_keeps_historical_fallback_identity() {
             .resource_id()
             .identity_str()
             .expect("resolved identity"),
-        "awscc_ec2_route_table_8710819e",
-        "top-level dependency metadata must retain its byte-for-byte legacy hash input"
+        "awscc_ec2_route_table_634bd335",
+        "the route table identity must be derived from its schema's create-only vpc_id"
     );
 }
 

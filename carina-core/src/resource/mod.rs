@@ -2925,9 +2925,8 @@ impl Eq for ModuleSource {}
 
 impl Hash for ModuleSource {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Match the discriminant hashing emitted by the former derived `Hash`
-        // implementation byte-for-byte; fallback anonymous identities include
-        // `ModuleSource` in their input and therefore depend on this detail.
+        // Keep hashing aligned with `PartialEq`: module scope is display-only,
+        // while module name and instance define the grouping key.
         std::mem::discriminant(self).hash(state);
         match self {
             Self::Root => {}

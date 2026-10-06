@@ -6,17 +6,19 @@
 # headers vanish; the attribute is absorbed into the trailing
 # unchanged-attributes count.
 #
-# `cidr_block` is renamed to force an Update; `config.settings.rules`
-# is the list-of-maps where every desired key matches state but state
-# carries an extra `provider_default_field` (mimics awscc#206).
+# `enable_dns_support` is changed to force an in-place Update;
+# `config.settings.rules` is the list-of-maps where every desired key
+# matches state but state carries an extra `provider_default_field`
+# (mimics awscc#206).
 
 provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
 let vpc = awscc.ec2.Vpc {
-  cidr_block = '10.1.0.0/16'
-  config = {
+  cidr_block         = '10.0.0.0/16'
+  enable_dns_support = true
+  config             = {
     settings = {
       rules = [
         {
