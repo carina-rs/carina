@@ -436,7 +436,7 @@ fn test_resolve_enum_aliases_aws_provider() {
 #[ignore = "requires provider binary for enum alias resolution"]
 fn test_resolve_enum_aliases_in_states() {
     // Current states should also have aliases resolved
-    let ctx = WiringContext::new(vec![]);
+    let ctx = WiringContext::new(vec![], &[]);
     let id =
         ResourceId::with_provider_identity("awscc", "ec2.security_group_egress", "test-rule", None);
     let mut attrs = HashMap::new();
@@ -523,7 +523,7 @@ fn test_resolve_enum_aliases_in_struct_field() {
 fn test_normalize_state_prevents_false_enum_diff() {
     use carina_core::resource::Directives;
 
-    let ctx = WiringContext::new(vec![]);
+    let ctx = WiringContext::new(vec![], &[]);
 
     // Desired resource with normalized DSL enum value (after normalize_desired)
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "test-vpc", None);
@@ -694,7 +694,7 @@ fn test_merge_default_tags_prevents_false_diff() {
     );
 
     // After merge_default_tags, desired resource gains the default tags → no diff
-    let ctx = WiringContext::new(vec![]);
+    let ctx = WiringContext::new(vec![], &[]);
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("failed to build tokio runtime");
@@ -1467,7 +1467,7 @@ fn test_plan_fails_on_two_moves_from_same_source() {
 
 #[test]
 fn test_plan_fails_on_removed_from_colliding_with_desired() {
-    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)]);
+    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
     let desired_name = "awscc_ec2_subnet_route_table_association_aaaaaaaa";
     let orphan_name = "awscc_ec2_subnet_route_table_association_bbbbbbbb";
     let mut resource = Resource::with_provider(
@@ -1755,7 +1755,7 @@ fn desired_association(name: &str, route_table_binding: &str, subnet_id: &str) -
 fn assert_claimed_association_stays_orphaned_after_reconcile() {
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)]);
+    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
     let old_name = "ec2_subnet_route_table_association_11111111";
     let desired_name = "ec2_subnet_route_table_association_aaaaaaaa";
     let mut state_file = StateFile::new();
@@ -1819,7 +1819,7 @@ fn claimed_state_entry_survives_orphan_reconcile_for_destroy_and_refresh() {
 fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_state_bindings() {
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)]);
+    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(route_table_state("private_rtb", "rtb-private"))
@@ -1894,7 +1894,7 @@ fn reconcile_anonymous_identifiers_with_ctx_resolves_deferred_create_only_from_s
 fn test_stale_moved_block_releases_claims() {
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)]);
+    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(route_table_state("private_rtb", "rtb-private"))
@@ -1950,7 +1950,7 @@ fn moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames() {
     use carina_core::resource::{ResourceId, State};
     use carina_state::state::StateFile;
 
-    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)]);
+    let ctx = WiringContext::new(vec![Box::new(AssociationCreateOnlyFactory)], &[]);
     let mut state_file = StateFile::new();
     let mut resources = Vec::new();
     let mut state_blocks = Vec::new();
@@ -2106,7 +2106,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         }
     "#;
 
-    let ctx = WiringContext::new(vec![Box::new(CascadeAwsccFactory)]);
+    let ctx = WiringContext::new(vec![Box::new(CascadeAwsccFactory)], &[]);
     let mut parsed = parse(source, &ProviderContext::default()).expect("parse fixture");
     let mut unresolved_parsed = parsed.clone();
     compute_initial_anonymous_ids(&ctx, &mut parsed);
@@ -2936,7 +2936,7 @@ async fn invalid_data_source_preparation_keeps_typed_error_chain() {
 // the driver can accumulate diagnostics across validators.
 #[test]
 fn validate_resources_with_ctx_returns_each_error_as_app_error() {
-    let ctx = WiringContext::new(vec![]);
+    let ctx = WiringContext::new(vec![], &[]);
 
     // Empty provider string sidesteps the "unknown provider, skip"
     // escape hatch (`known_providers` is empty), so each bad resource
@@ -2961,7 +2961,7 @@ fn validate_resources_with_ctx_returns_each_error_as_app_error() {
 // type. A regression back to `Result` fails to compile here.
 #[test]
 fn dependency_chain_wrappers_return_vec_app_error() {
-    let ctx = WiringContext::new(vec![]);
+    let ctx = WiringContext::new(vec![], &[]);
     let mut resources: Vec<Resource> = Vec::new();
     let providers: Vec<ProviderConfig> = Vec::new();
 
@@ -3060,7 +3060,7 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
 }
 
 fn region_identity_ctx() -> WiringContext {
-    WiringContext::new(vec![Box::new(RegionIdentityFactory)])
+    WiringContext::new(vec![Box::new(RegionIdentityFactory)], &[])
 }
 
 fn region_provider_config(raw_region: &str) -> ProviderConfig {
@@ -3088,125 +3088,53 @@ fn anonymous_route_resource() -> Resource {
 }
 
 #[test]
-fn unresolved_anonymous_adoption_only_sees_unclaimed_state_entries() {
-    use carina_state::ResourceState;
+fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas() {
+    let ctx = WiringContext::new(vec![], &[]);
+    let mut resources = OverrideAwareResources::build(
+        vec![
+            Resource::pending_with_provider("aws", "s3.Bucket", None),
+            Resource::pending_with_provider("aws", "s3.Bucket", None),
+            Resource::pending_with_provider("awscc", "ec2.Vpc", Some("secondary".to_string())),
+        ],
+        None::<&StateFile>,
+        PreApplyInputs {
+            managed: &[],
+            compositions: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        },
+    )
+    .expect("schema-less test resource has no references to resolve");
+    let claims = StateBlockClaims::empty();
 
-    let mut state_file = StateFile::new();
-    state_file
-        .upsert_resource(ResourceState::new("test.claimed", "claimed-row", "mock"))
-        .expect("insert claimed state entry");
-    state_file
-        .upsert_resource(ResourceState::new(
-            "test.unclaimed",
-            "unclaimed-row",
-            "mock",
-        ))
-        .expect("insert unclaimed state entry");
-    let claims = StateBlockClaims::new(
-        HashSet::from([StateBlockAddress::new(
-            "mock",
-            "test.claimed",
-            "claimed-row",
-        )]),
-        HashSet::new(),
-    );
-    let mut resources = vec![
-        Resource::pending_with_provider("mock", "test.claimed", None),
-        Resource::pending_with_provider("mock", "test.unclaimed", None),
-    ];
-
-    adopt_unique_state_identity_for_unresolved_anonymous(
-        &mut resources,
-        &|provider, resource_type| {
-            claims.screen_entries(
-                provider,
-                resource_type,
-                state_file.resources_by_type(provider, resource_type),
-                |entry| entry.identity.as_str(),
-            )
+    let result = reconcile_late_anonymous_identities(
+        &ctx,
+        LateAnonymousIdentityInputs {
+            resources: &mut resources,
+            state_file: None,
+            state_block_claims: &claims,
+            providers: &[],
         },
     );
 
+    let error = match result {
+        Ok(_) => panic!("schema-less anonymous resource must not receive a fallback identity"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, AppError::Config(_)), "got {error:?}");
     assert_eq!(
-        resources[0].id.identity_str(),
-        None,
-        "a removed.from-claimed entry must not be available for adoption"
+        error.to_string(),
+        "2 anonymous aws.s3.Bucket resources need provider 'aws', which is not declared or could not be loaded; declare provider 'aws' so its schema is available\n\
+         anonymous awscc.ec2.Vpc resource needs provider instance 'secondary' of 'awscc', which is not declared or could not be loaded; declare provider 'awscc' so its schema is available",
     );
-    assert_eq!(
-        resources[1].id.identity_str(),
-        Some("unclaimed-row"),
-        "the sole unclaimed entry must still be adopted"
-    );
-}
-
-#[test]
-fn removed_from_claimed_entry_does_not_count_toward_adoption_uniqueness() {
-    use carina_state::ResourceState;
-
-    let mut state_file = StateFile::new();
-    state_file
-        .upsert_resource(ResourceState::new("test.resource", "claimed-row", "mock"))
-        .expect("insert claimed state entry");
-    state_file
-        .upsert_resource(ResourceState::new("test.resource", "unclaimed-row", "mock"))
-        .expect("insert unclaimed state entry");
-    let claims = StateBlockClaims::new(
-        HashSet::from([StateBlockAddress::new(
-            "mock",
-            "test.resource",
-            "claimed-row",
-        )]),
-        HashSet::new(),
-    );
-    let mut resources = vec![Resource::pending_with_provider(
-        "mock",
-        "test.resource",
-        None,
-    )];
-
-    adopt_unique_state_identity_for_unresolved_anonymous(
-        &mut resources,
-        &|provider, resource_type| {
-            claims.screen_entries(
-                provider,
-                resource_type,
-                state_file.resources_by_type(provider, resource_type),
-                |entry| entry.identity.as_str(),
-            )
-        },
-    );
-
-    assert_eq!(
-        resources[0].id.identity_str(),
-        Some("unclaimed-row"),
-        "the claimed entry must not make the sole unclaimed candidate appear non-unique"
-    );
-}
-
-#[test]
-fn fallback_anonymous_identity_is_stable_when_dependency_bindings_are_prefixed() {
-    fn module_resources(dependency: &str) -> Vec<Resource> {
-        let target = Resource::with_provider("mock", "iam.Role", "registry_publish.target", None)
-            .with_binding("registry_publish.target");
-        let mut resource = Resource::pending_with_provider("mock", "iam.Role", None);
-        resource.module_source = Some(carina_core::resource::ModuleSource::Module {
-            name: "registry".to_string(),
-            instance: "registry_publish".to_string(),
-            scope: None,
-        });
-        resource.dependency_bindings.insert(dependency.to_string());
-        vec![target, resource]
-    }
-
-    let mut unprefixed = module_resources("target");
-    let mut prefixed = module_resources("registry_publish.target");
-
-    assign_fallback_identities_for_unresolved_anonymous(&mut unprefixed, &[]);
-    assign_fallback_identities_for_unresolved_anonymous(&mut prefixed, &[]);
-
-    assert_eq!(
-        unprefixed[1].id, prefixed[1].id,
-        "derived dependency metadata must not change an anonymous resource's persistent identity"
+    assert!(
+        resources
+            .resources()
+            .iter()
+            .all(|resource| resource.id.identity_str().is_none()),
+        "the error path must leave every anonymous identity pending",
     );
 }
 
@@ -3310,7 +3238,7 @@ fn apply_anonymous_to_named_renames_canonicalizes_provider_config_identity_enums
 // back to `Result` fails to compile here.
 #[test]
 fn module_and_provider_wrappers_return_vec_app_error() {
-    let ctx = WiringContext::new(vec![]);
+    let ctx = WiringContext::new(vec![], &[]);
     let parsed = ParsedFile::default();
     let provider_ctx = carina_core::parser::ProviderContext::default();
 
@@ -5197,7 +5125,10 @@ mod wait_until_enum_alias {
     /// resource's `(provider, resource_type)` and the factory alias map.
     #[test]
     fn helper_resolves_until_rhs_enum_alias_to_canonical() {
-        let ctx = WiringContext::new(vec![Box::new(AcmAliasFactory) as Box<dyn ProviderFactory>]);
+        let ctx = WiringContext::new(
+            vec![Box::new(AcmAliasFactory) as Box<dyn ProviderFactory>],
+            &[],
+        );
         let mut waits = vec![enum_wait_binding()];
         let resources = vec![cert_resource()];
 
@@ -5217,7 +5148,10 @@ mod wait_until_enum_alias {
     /// plan path uses.
     #[test]
     fn create_plan_elides_already_satisfied_wait_after_enum_alias_resolution() {
-        let ctx = WiringContext::new(vec![Box::new(AcmAliasFactory) as Box<dyn ProviderFactory>]);
+        let ctx = WiringContext::new(
+            vec![Box::new(AcmAliasFactory) as Box<dyn ProviderFactory>],
+            &[],
+        );
         let resources = vec![cert_resource(), changed_consumer()];
         let states = cert_state();
 
@@ -5908,7 +5842,7 @@ mod resolved_value_constraint_gate {
         producer_value: Value,
         normalizer: &RewritingNormalizer,
     ) -> Result<(), Vec<carina_core::plan::PlanError>> {
-        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)]);
+        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)], &[]);
         let (mut resources, origins) = managed_resources(consumer_type, producer_value);
         let compositions = Vec::new();
         let module_gate = carina_core::executor::ModuleConstraintGate::new(&compositions);
@@ -5973,7 +5907,7 @@ mod resolved_value_constraint_gate {
         producer_values: Vec<(&str, Value)>,
         composition: &mut Composition,
     ) -> Result<(), Vec<carina_core::plan::PlanError>> {
-        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)]);
+        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)], &[]);
         let mut producer =
             Resource::with_provider("test", "source", "producer", None).with_binding("producer");
         for (name, value) in producer_values {
@@ -6114,7 +6048,7 @@ mod resolved_value_constraint_gate {
 
     #[tokio::test]
     async fn resolved_data_source_input_uses_the_same_gate() {
-        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)]);
+        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)], &[]);
         let normalizer = RewritingNormalizer::default();
         let mut resources = OverrideAwareResources::build(
             Vec::new(),
@@ -6226,9 +6160,12 @@ mod resolved_value_constraint_gate {
         parsed.compositions.push(composition);
         parsed.data_sources.push(data_source);
         let reads = Arc::new(AtomicUsize::new(0));
-        let ctx = WiringContext::new(vec![Box::new(RecordingDataSourceFactory {
-            reads: reads.clone(),
-        })]);
+        let ctx = WiringContext::new(
+            vec![Box::new(RecordingDataSourceFactory {
+                reads: reads.clone(),
+            })],
+            &[],
+        );
         let temp = tempfile::tempdir().unwrap();
 
         let plan = create_plan_from_parsed_with_upstream_with_ctx(

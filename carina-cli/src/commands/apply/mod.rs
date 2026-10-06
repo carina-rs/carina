@@ -970,7 +970,7 @@ async fn run_apply_with_observer_factory(
 
     let base_dir = get_base_dir(path);
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
-    let ctx = WiringContext::new(factories);
+    let ctx = WiringContext::new(factories, &parsed.providers);
     crate::commands::validate_and_resolve_with_config(
         &mut parsed,
         base_dir,
@@ -1721,12 +1721,8 @@ async fn run_apply_locked(
         ctx,
         LateAnonymousIdentityInputs {
             resources: &mut override_aware_resources,
-            data_sources: &data_sources_for_plan,
             state_file: state_file.as_ref(),
             state_block_claims: &state_block_claims,
-            current_states: &mut current_states,
-            saved_attrs: &mut saved_attrs,
-            prev_explicit: &mut prev_explicit,
             providers: &parsed.providers,
         },
     )?;
@@ -2529,7 +2525,7 @@ async fn run_apply_from_plan_locked(
 
     // Build schemas for write-only attribute persistence
     let (factories, _) = build_factories_from_providers(&plan_file.provider_configs, project_dir)?;
-    let ctx = WiringContext::new(factories);
+    let ctx = WiringContext::new(factories, &plan_file.provider_configs);
 
     let skipped_exports = finalize_after_execute(
         |persistence| {

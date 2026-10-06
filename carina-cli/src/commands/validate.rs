@@ -302,7 +302,7 @@ pub fn run_validate(
     }
 
     let (factories, load_errors) = build_factories_from_providers(&parsed.providers, base_dir)?;
-    let ctx = WiringContext::new(factories);
+    let ctx = WiringContext::new(factories, &parsed.providers);
     let validation_errors = super::validate_and_resolve_errors_with_context(
         &mut parsed,
         base_dir,

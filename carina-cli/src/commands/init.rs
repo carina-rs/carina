@@ -52,7 +52,13 @@ pub async fn run_init(
         .parsed
         .providers
         .iter()
-        .filter(|p| p.is_default() && p.source.is_none() && p.name != "mock")
+        .filter(|provider| {
+            provider.is_default()
+                && provider.source.is_none()
+                && !carina_provider_mock::uses_builtin_provider(std::iter::once(*provider), |_| {
+                    false
+                })
+        })
         .map(|p| crate::commands::missing_provider_source_message(&p.name))
         .collect();
     if !missing_source.is_empty() {

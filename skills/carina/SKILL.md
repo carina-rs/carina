@@ -31,13 +31,15 @@ provider aws {
 
 ### Resource Definition
 
-Anonymous resource (ID derived from configured create-only or provider identity attributes, with a single-resource attribute fallback):
+Anonymous resource (requires a declared, loaded provider so its schema is available):
 
 ```crn
 aws.s3.Bucket {
   name = "my-bucket"
 }
 ```
+
+Carina derives anonymous identity from configured create-only or provider identity attributes. When the schema is available but none of those attributes is set, identity is derived from the declaration's attributes; only one such anonymous declaration of the same resource kind and provider instance is allowed in a scope. Use `let` bindings to disambiguate additional declarations.
 
 Named resource with `let` binding (enables references between resources):
 

@@ -464,7 +464,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     );
     assert!(errs.is_empty(), "expand stage must succeed: {errs:?}");
 
-    let ctx = WiringContext::new(factories);
+    let ctx = WiringContext::new(factories, &parsed.providers);
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources).expect("topo sort");
 
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();

@@ -137,6 +137,7 @@ fn init_project(body: &str) -> TempDir {
 fn execution_plan_separated_from_refresh_bars_on_pty() {
     let tmp = init_project(
         "backend local { path = \"carina.state.json\" }\n\
+         provider mock {}\n\
          mock.test.resource { name = \"r1\" }\n",
     );
 
@@ -196,6 +197,7 @@ fn execution_plan_separated_from_refresh_bars_on_pty() {
 fn refresh_false_has_no_separator_on_pty() {
     let tmp = init_project(
         "backend local { path = \"carina.state.json\" }\n\
+         provider mock {}\n\
          mock.test.resource { name = \"r1\" }\n",
     );
 
@@ -246,6 +248,7 @@ fn warning_after_bars_yields_single_blank_line_on_pty() {
     // immediately (no deferred-for child refresh phase).
     let tmp = init_project(
         "backend local { path = \"carina.state.json\" }\n\
+         provider mock {}\n\
          mock.test.resource { name = \"r1\" }\n\
          for x in [\"a\", \"b\"] {\n\
          \u{20}\u{20}mock.test.resource { name = \"static\" }\n\

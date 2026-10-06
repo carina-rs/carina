@@ -61,6 +61,7 @@ pub(crate) fn carina_diagnostic_range(
 pub struct DiagnosticEngine {
     schemas: Arc<SchemaRegistry>,
     provider_names: Vec<String>,
+    known_provider_names: HashSet<String>,
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
     /// Providers that failed to load: name -> error reason.
     provider_errors: HashMap<String, String>,
@@ -73,6 +74,15 @@ impl DiagnosticEngine {
         schemas: Arc<SchemaRegistry>,
         provider_names: Vec<String>,
         factories: Arc<Vec<Box<dyn ProviderFactory>>>,
+    ) -> Self {
+        Self::new_with_known_providers(schemas, provider_names, factories, HashSet::new())
+    }
+
+    pub(crate) fn new_with_known_providers(
+        schemas: Arc<SchemaRegistry>,
+        provider_names: Vec<String>,
+        factories: Arc<Vec<Box<dyn ProviderFactory>>>,
+        known_provider_names: HashSet<String>,
     ) -> Self {
         let factories_clone = Arc::clone(&factories);
         // carina#3239 gate: the strict "unknown custom type in type
@@ -112,6 +122,7 @@ impl DiagnosticEngine {
         Self {
             schemas,
             provider_names,
+            known_provider_names,
             factories,
             provider_errors: HashMap::new(),
             provider_context,
@@ -533,6 +544,24 @@ impl DiagnosticEngine {
                                 end_col,
                                 DiagnosticSeverity::INFORMATION,
                                 format!("Provider '{}' is not loaded: {}", provider, reason),
+                            ));
+                        }
+                    } else if self.known_provider_names.contains(provider) {
+                        if let Some((line, col)) = self.find_resource_type_position(
+                            doc,
+                            provider,
+                            &resource_id.resource_type,
+                        ) {
+                            let end_col = col
+                                + resource_id.resource_type.len() as u32
+                                + provider.len() as u32
+                                + 1;
+                            diagnostics.push(carina_diagnostic(
+                                line,
+                                col,
+                                end_col,
+                                DiagnosticSeverity::ERROR,
+                                format!("Unknown resource type: {full_resource_type}"),
                             ));
                         }
                     } else if !provider_loaded {

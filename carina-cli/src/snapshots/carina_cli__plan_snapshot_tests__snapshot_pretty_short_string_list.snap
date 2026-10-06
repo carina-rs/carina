@@ -4,7 +4,7 @@ expression: output
 ---
 Execution Plan:
 
-  + awscc.iam.Role awscc_iam_role_b7a54912
+  + awscc.iam.Role awscc_iam_role_dae1177d
       role_name: "short-list-test"
       short_tags: ["a", "b", "c"]
 

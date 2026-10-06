@@ -6176,6 +6176,8 @@ fn binding_referenced_only_from_sibling_list_literal_is_not_unused() {
 // the binding at all.
 #[test]
 fn unreferenced_binding_is_still_flagged_unused() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().join("downstream");
     std::fs::create_dir_all(&base).unwrap();
@@ -6188,7 +6190,19 @@ fn unreferenced_binding_is_still_flagged_unused() {
     )
     .unwrap();
 
-    let engine = test_engine();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        ResourceSchema::new("ec2.Vpc")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::string()).create_only()),
+    );
+    schemas.insert(
+        "awscc",
+        ResourceSchema::new("s3.Bucket")
+            .attribute(AttributeSchema::new("name", AttributeType::string()).create_only()),
+    );
+    let engine = custom_engine(schemas);
     let diagnostics = analyze_with_buffer(&engine, &base, "main.crn", main);
 
     assert!(

@@ -47,7 +47,6 @@ fn sigint_then_sigterm_flushes_completed_state_releases_lock_and_exits_130() {
         .current_dir(project)
         .args(["apply", ".", "--auto-approve", "--parallelism", "1"])
         .env("NO_COLOR", "1")
-        .env("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1")
         .env("CARINA_MOCK_STATE_FILE", &provider_state_path)
         .env("CARINA_MOCK_CREATE_DELAY_MS_FOR", "test.resource.z_blocked")
         .env("CARINA_MOCK_CREATE_DELAY_MS", "60000")

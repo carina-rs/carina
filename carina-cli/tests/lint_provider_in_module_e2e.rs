@@ -7,7 +7,6 @@ const BLOCK_SYNTAX_RULE: &str = "Prefer block syntax for 'rules'";
 fn run_lint(caller: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_carina"))
         .args(["lint", caller.to_str().expect("UTF-8 caller path")])
-        .env("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1")
         .output()
         .expect("run carina lint")
 }
@@ -67,7 +66,9 @@ fn provider_finding_deliberately_suspends_expansion_dependent_block_syntax_check
     std::fs::create_dir(&module).expect("module directory");
     std::fs::write(
         caller.join("main.crn"),
-        r#"let component = use { source = '../module' }
+        r#"provider mock {}
+
+let component = use { source = '../module' }
 
 let instance = component {
   rules = [{ action = "allow" }]

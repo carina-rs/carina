@@ -31,26 +31,13 @@ impl Scenario {
     }
 
     fn carina(&self, args: &[&str]) -> Output {
-        self.carina_with_schema(args, false)
-    }
-
-    fn carina_with_stable_schema(&self, args: &[&str]) -> Output {
-        self.carina_with_schema(args, true)
-    }
-
-    fn carina_with_schema(&self, args: &[&str], stable_schema: bool) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_carina"));
-        command
+        Command::new(env!("CARGO_BIN_EXE_carina"))
             .current_dir(&self.project)
             .env("NO_COLOR", "1")
             .env_remove("CLICOLOR_FORCE")
-            .args(args);
-        if stable_schema {
-            command.env("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1");
-        } else {
-            command.env_remove("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA");
-        }
-        command.output().expect("run carina")
+            .args(args)
+            .output()
+            .expect("run carina")
     }
 
     fn write_main(&self, resources: &str) {
@@ -92,6 +79,15 @@ mock.test.resource {
 }
 "#;
 
+const ATTRIBUTE_DERIVED_ALPHA_AND_BETA: &str = r#"mock.test.Thing {
+  name = "alpha"
+}
+
+mock.test.Thing {
+  name = "beta"
+}
+"#;
+
 const LET_ALPHA_AND_BETA: &str = r#"let alpha = mock.test.resource {
   name = "alpha"
 }
@@ -101,33 +97,15 @@ let beta = mock.test.resource {
 }
 "#;
 
-const LET_ALPHA_AND_ANONYMOUS_BETA: &str = r#"let alpha = mock.test.resource {
-  name = "alpha"
-}
-
-mock.test.resource {
-  name = "beta"
-}
-"#;
-
-const LET_ALPHA_AND_ANONYMOUS_BETA2: &str = r#"let alpha = mock.test.resource {
-  name = "alpha"
-}
-
-mock.test.resource {
-  name = "beta2"
-}
-"#;
-
 const ATTRIBUTE_DERIVED_IDENTITY_ERROR: &str = "Anonymous resource identity is derived from \
-mutable attributes for multiple 'mock.test.resource' declarations using provider instance \
+mutable attributes for multiple 'mock.test.Thing' declarations using provider instance \
 '<default>' in the root scope. Use `let` bindings to give them distinct stable identities.";
 
 const ONE_RESOURCE_MODULE: &str = r#"arguments {
   n: String
 }
 
-mock.test.resource {
+mock.test.Thing {
   name = n
 }
 "#;
@@ -136,11 +114,11 @@ const TWO_RESOURCE_MODULE: &str = r#"arguments {
   n: String
 }
 
-mock.test.resource {
+mock.test.Thing {
   name = "${n}-1"
 }
 
-mock.test.resource {
+mock.test.Thing {
   name = "${n}-2"
 }
 "#;
@@ -188,8 +166,133 @@ fn unused_binding_warning(binding: &str) -> String {
 }
 
 #[test]
+fn unknown_anonymous_mock_type_is_rejected_before_plan_and_creates_nothing() {
+    let scenario = Scenario::new();
+    scenario.write_main(
+        r#"let bootstrap = mock.test.resource {
+  name = "bootstrap"
+}
+"#,
+    );
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+
+    scenario.write_main(
+        r#"mock.unknown.Widget {
+  name = "must-not-be-created"
+}
+"#,
+    );
+
+    for command in ["validate", "plan"] {
+        let output = scenario.carina(&[command, "."]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success()
+                && stderr.contains("Unknown resource type: mock.unknown.Widget"),
+            "carina {command} must reject an unknown built-in mock resource type\n\
+             status: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status,
+        );
+    }
+
+    assert!(
+        !scenario.project.join("carina.state.json").exists()
+            && !scenario.project.join(".carina/state.json").exists(),
+        "validation and planning must not create either backend or mock-provider state",
+    );
+}
+
+#[test]
+fn providerless_mock_resource_uses_builtin_provider_and_catalog_consistently() {
+    let scenario = Scenario::new();
+    fs::write(
+        scenario.project.join("main.crn"),
+        r#"backend local { path = "carina.state.json" }
+
+mock.test.resource {
+  name = "a"
+}
+"#,
+    )
+    .expect("write provider-less mock configuration");
+
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+    assert_success("carina validate", &scenario.carina(&["validate", "."]));
+
+    let plan = scenario.carina(&["plan", "--refresh=false", "."]);
+    assert_success("carina plan", &plan);
+    let stdout = String::from_utf8_lossy(&plan.stdout);
+    let stderr = String::from_utf8_lossy(&plan.stderr);
+    assert!(
+        stdout.contains("Using mock provider") && stdout.contains("Execution Plan:"),
+        "provider-less mock resources must be served and planned by the built-in provider\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("has no schema"),
+        "routing and schema activation must not disagree\nstderr:\n{stderr}",
+    );
+}
+
+#[test]
+fn validate_rejects_anonymous_resources_whose_provider_schema_is_unavailable() {
+    let cases = [
+        (
+            "undeclared provider",
+            "# provider intentionally not declared\n",
+            r#"aws.s3.Bucket {
+  bucket = "x"
+}
+"#,
+            "anonymous aws.s3.Bucket resource needs provider 'aws', which is not declared or could not be loaded; declare provider 'aws' so its schema is available",
+        ),
+        (
+            "different declared provider",
+            "provider mock {}\n",
+            r#"aws.s3.Bucket {
+  bucket = "x"
+}
+"#,
+            "anonymous aws.s3.Bucket resource needs provider 'aws', which is not declared or could not be loaded; declare provider 'aws' so its schema is available",
+        ),
+        (
+            "named provider without kind default",
+            "let secondary = provider mock {}\n",
+            r#"mock.test.resource {
+  name = "x"
+
+  directives {
+    provider = secondary
+  }
+}
+"#,
+            "anonymous mock.test.resource resource needs provider instance 'secondary' of 'mock', which is not declared or could not be loaded; declare provider 'mock' so its schema is available",
+        ),
+    ];
+
+    for (label, provider_source, resource_source, expected) in cases {
+        let scenario = Scenario::new();
+        fs::write(scenario.project.join("providers.crn"), provider_source)
+            .expect("write sibling provider configuration");
+        fs::write(scenario.project.join("main.crn"), resource_source)
+            .expect("write repro resource configuration");
+
+        let validate = scenario.carina(&["validate", "."]);
+        let stdout = String::from_utf8_lossy(&validate.stdout);
+        let stderr = String::from_utf8_lossy(&validate.stderr);
+        assert!(
+            !validate.status.success() && stderr.contains(expected),
+            "{label}: validate must reject the schema-less anonymous resource\n\
+             expected: {expected}\nstatus: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            validate.status,
+        );
+    }
+}
+
+#[test]
 fn validate_rejects_multiple_attribute_derived_anonymous_resources() {
     let scenario = Scenario::new();
+    scenario.write_main(ATTRIBUTE_DERIVED_ALPHA_AND_BETA);
 
     let init = scenario.carina(&["init", "."]);
     assert_success("carina init", &init);
@@ -209,14 +312,14 @@ fn validate_rejects_multiple_attribute_derived_anonymous_resources() {
 fn validate_does_not_warn_for_attribute_derived_bindings_required_across_sibling_files() {
     let scenario = Scenario::new();
     scenario.write_main(
-        r#"let alpha = mock.test.resource {
+        r#"let alpha = mock.test.Thing {
   name = "alpha"
 }
 "#,
     );
     fs::write(
         scenario.project.join("beta.crn"),
-        r#"let beta = mock.test.resource {
+        r#"let beta = mock.test.Thing {
   name = "beta"
 }
 "#,
@@ -239,7 +342,7 @@ fn validate_does_not_warn_for_attribute_derived_bindings_required_across_sibling
 fn validate_still_warns_for_single_unused_attribute_derived_binding() {
     let scenario = Scenario::new();
     scenario.write_main(
-        r#"let alpha = mock.test.resource {
+        r#"let alpha = mock.test.Thing {
   name = "alpha"
 }
 "#,
@@ -266,11 +369,8 @@ fn validate_still_warns_for_unused_stable_binding() {
 "#,
     );
 
-    assert_success(
-        "carina init",
-        &scenario.carina_with_stable_schema(&["init", "."]),
-    );
-    let validate = scenario.carina_with_stable_schema(&["validate", "."]);
+    assert_success("carina init", &scenario.carina(&["init", "."]));
+    let validate = scenario.carina(&["validate", "."]);
     assert_success("carina validate", &validate);
     let stdout = String::from_utf8_lossy(&validate.stdout);
 
@@ -283,6 +383,7 @@ fn validate_still_warns_for_unused_stable_binding() {
 #[test]
 fn plan_rejects_multiple_attribute_derived_anonymous_resources() {
     let scenario = Scenario::new();
+    scenario.write_main(ATTRIBUTE_DERIVED_ALPHA_AND_BETA);
 
     let init = scenario.carina(&["init", "."]);
     assert_success("carina init", &init);
@@ -302,11 +403,10 @@ fn plan_rejects_multiple_attribute_derived_anonymous_resources() {
 fn stable_anonymous_resources_both_reach_the_plan() {
     let scenario = Scenario::new();
 
-    let init = scenario.carina_with_stable_schema(&["init", "."]);
+    let init = scenario.carina(&["init", "."]);
     assert_success("carina init", &init);
 
-    let plan =
-        scenario.carina_with_stable_schema(&["plan", "--refresh=false", "--out", "plan.json", "."]);
+    let plan = scenario.carina(&["plan", "--refresh=false", "--out", "plan.json", "."]);
     assert_success("carina plan", &plan);
 
     let stdout = String::from_utf8(plan.stdout).expect("plan stdout is UTF-8");
@@ -333,17 +433,17 @@ fn apply_two_anonymous_resources_then_plan_is_clean_and_destroy_removes_both() {
     let scenario = Scenario::new();
     scenario.write_main(ALPHA_AND_BETA);
 
-    let init = scenario.carina_with_stable_schema(&["init", "."]);
+    let init = scenario.carina(&["init", "."]);
     assert_success("carina init", &init);
 
-    let apply = scenario.carina_with_stable_schema(&["apply", "--auto-approve", "."]);
+    let apply = scenario.carina(&["apply", "--auto-approve", "."]);
     assert_success("initial carina apply", &apply);
 
-    let plan = scenario.carina_with_stable_schema(&["plan", "."]);
+    let plan = scenario.carina(&["plan", "."]);
     let plan_stdout = String::from_utf8_lossy(&plan.stdout);
     let plan_stderr = String::from_utf8_lossy(&plan.stderr);
 
-    let destroy = scenario.carina_with_stable_schema(&["destroy", "--auto-approve", "."]);
+    let destroy = scenario.carina(&["destroy", "--auto-approve", "."]);
     let state = scenario.state();
 
     assert!(
@@ -357,134 +457,6 @@ fn apply_two_anonymous_resources_then_plan_is_clean_and_destroy_removes_both() {
         String::from_utf8_lossy(&destroy.stdout),
         String::from_utf8_lossy(&destroy.stderr),
         state.resources().len(),
-    );
-}
-
-#[test]
-fn claimed_named_row_is_not_adopted_by_the_single_attribute_derived_anonymous_resource() {
-    let scenario = Scenario::new();
-    scenario.write_main(LET_ALPHA_AND_ANONYMOUS_BETA);
-
-    let init = scenario.carina(&["init", "."]);
-    assert_success("carina init", &init);
-    let first_apply = scenario.carina(&["apply", "--auto-approve", "."]);
-    assert_success("apply alpha and beta", &first_apply);
-
-    scenario.write_main(LET_ALPHA_AND_ANONYMOUS_BETA2);
-    let plan = scenario.carina(&["plan", "--refresh=false", "."]);
-    let apply = scenario.carina(&["apply", "--auto-approve", "."]);
-    let lock_path = scenario.project.join("carina.state.lock");
-    let lock_remains = lock_path.exists();
-    let replan = scenario.carina(&["plan", "."]);
-
-    let plan_stdout = String::from_utf8_lossy(&plan.stdout);
-    let replan_stdout = String::from_utf8_lossy(&replan.stdout);
-    let state_rows = scenario.state().resources().len();
-    assert!(
-        plan.status.success()
-            && plan_stdout.contains("Plan: 0 to add, 1 to change, 0 to destroy.")
-            && apply.status.success()
-            && !lock_remains
-            && replan.status.success()
-            && replan_stdout.contains("No changes")
-            && state_rows == 2,
-        "editing the sole anonymous resource must update it in place without claiming the named row\n\
-         plan stdout:\n{plan_stdout}\nplan stderr:\n{}\n\
-         apply status: {}\napply stdout:\n{}\napply stderr:\n{}\n\
-         lock remains: {lock_remains}\nreplan stdout:\n{replan_stdout}\n\
-         replan stderr:\n{}\nstate rows: {state_rows}",
-        String::from_utf8_lossy(&plan.stderr),
-        apply.status,
-        String::from_utf8_lossy(&apply.stdout),
-        String::from_utf8_lossy(&apply.stderr),
-        String::from_utf8_lossy(&replan.stderr),
-    );
-}
-
-#[test]
-fn removed_entry_is_not_adopted_by_an_unresolved_anonymous_resource() {
-    let scenario = Scenario::new();
-    scenario.write_main(ALPHA);
-
-    assert_success("carina init", &scenario.carina(&["init", "."]));
-    assert_success(
-        "apply alpha",
-        &scenario.carina(&["apply", "--auto-approve", "."]),
-    );
-
-    let initial_state = scenario.state();
-    let old_entry = initial_state
-        .resources()
-        .iter()
-        .find(|entry| entry.provider == "mock" && entry.resource_type == "test.resource")
-        .expect("alpha state entry");
-    assert_eq!(
-        old_entry
-            .attributes
-            .get("name")
-            .and_then(serde_json::Value::as_str),
-        Some("alpha")
-    );
-    let old_identity = old_entry.identity.as_str().to_string();
-
-    scenario.write_main(&format!(
-        r#"mock.test.resource {{
-  name = "gamma"
-}}
-
-removed {{
-  from = mock.test.resource '{old_identity}'
-}}
-"#,
-    ));
-
-    let plan = scenario.carina(&["plan", "--refresh=false", "."]);
-    let plan_stdout = String::from_utf8_lossy(&plan.stdout);
-    let expected_removal = format!("~ mock.test.resource {old_identity} (remove from state)");
-    let plan_creates_gamma =
-        plan_stdout.contains("+ mock.test.resource ") && plan_stdout.contains("name: \"gamma\"");
-    let plan_removes_old = plan_stdout.contains(&expected_removal);
-    let plan_has_no_updates =
-        plan_stdout.contains("Plan: 1 to add, 0 to change, 0 to destroy, 1 to remove from state.");
-
-    let apply = scenario.carina(&["apply", "--auto-approve", "."]);
-    let replan = scenario.carina(&["plan", "."]);
-    let replan_stdout = String::from_utf8_lossy(&replan.stdout);
-    let final_state = scenario.state();
-    let final_names = final_state
-        .resources()
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .attributes
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-        })
-        .collect::<Vec<_>>();
-
-    assert!(
-        plan.status.success()
-            && plan_creates_gamma
-            && plan_removes_old
-            && plan_has_no_updates
-            && apply.status.success()
-            && replan.status.success()
-            && replan_stdout.contains("No changes")
-            && final_names == ["gamma"],
-        "a removed entry must not be adopted by the replacement anonymous resource\n\
-         old identity: {old_identity}\nplan status: {}\nplan stdout:\n{plan_stdout}\n\
-         plan stderr:\n{}\ncreates gamma: {plan_creates_gamma}\n\
-         removes old entry: {plan_removes_old}\nno updates: {plan_has_no_updates}\n\
-         apply status: {}\napply stdout:\n{}\napply stderr:\n{}\n\
-         replan status: {}\nreplan stdout:\n{replan_stdout}\nreplan stderr:\n{}\n\
-         final state names: {final_names:?}",
-        plan.status,
-        String::from_utf8_lossy(&plan.stderr),
-        apply.status,
-        String::from_utf8_lossy(&apply.stdout),
-        String::from_utf8_lossy(&apply.stderr),
-        replan.status,
-        String::from_utf8_lossy(&replan.stderr),
     );
 }
 
@@ -649,7 +621,7 @@ let x = outer { n = "a" }
             && identities.len() == 2
             && identities
                 .iter()
-                .all(|identity| identity.starts_with("x.mock_test_resource_")),
+                .all(|identity| identity.starts_with("x.mock_test_thing_")),
         "x.i1 and x.i2 must be distinct conflict scopes\nstatus: {}\nstdout:\n{stdout}\nstderr:\n{}",
         plan.status,
         String::from_utf8_lossy(&plan.stderr),
@@ -675,47 +647,13 @@ let x = outer { n = "a" }
 
     assert!(
         !plan.status.success()
-            && stderr.contains("duplicate resolved id")
+            && stderr.contains("Anonymous resource identifier collision")
             && !String::from_utf8_lossy(&plan.stdout).contains("Plan:")
             && !stderr.contains("panicked"),
         "identical nested identities must return a typed plan error without dropping a resource\n\
          status: {}\nstdout:\n{}\nstderr:\n{stderr}",
         plan.status,
         String::from_utf8_lossy(&plan.stdout),
-    );
-}
-
-#[test]
-fn anonymous_module_argument_edit_plans_an_in_place_update() {
-    let scenario = Scenario::new();
-    scenario.write_module("module", ONE_RESOURCE_MODULE);
-    scenario.write_main(
-        r#"let m = use { source = "./module" }
-
-m { n = "a" }
-"#,
-    );
-
-    let init = scenario.carina(&["init", "."]);
-    assert_success("carina init", &init);
-    let apply = scenario.carina(&["apply", "--auto-approve", "."]);
-    assert_success("initial carina apply", &apply);
-
-    scenario.write_main(
-        r#"let m = use { source = "./module" }
-
-m { n = "b" }
-"#,
-    );
-    let plan = scenario.carina(&["plan", "--refresh=false", "."]);
-    let stdout = String::from_utf8_lossy(&plan.stdout);
-
-    assert!(
-        plan.status.success() && stdout.contains("Plan: 0 to add, 1 to change, 0 to destroy."),
-        "an anonymous module argument edit must preserve the adopted state identity\n\
-         status: {}\nstdout:\n{stdout}\nstderr:\n{}",
-        plan.status,
-        String::from_utf8_lossy(&plan.stderr),
     );
 }
 
@@ -733,7 +671,7 @@ let x = m { n = "a" }
     let bound_plan = bound.carina(&["plan", "--refresh=false", "."]);
     let bound_stderr = String::from_utf8_lossy(&bound_plan.stderr);
     let bound_error = "Anonymous resource identity is derived from mutable attributes for \
-multiple 'mock.test.resource' declarations using provider instance '<default>' in module instance \
+multiple 'mock.test.Thing' declarations using provider instance '<default>' in module instance \
 'x'. Use `let` bindings to give them distinct stable identities.";
 
     let anonymous = Scenario::new();
@@ -748,7 +686,7 @@ m { n = "a" }
     let anonymous_plan = anonymous.carina(&["plan", "--refresh=false", "."]);
     let anonymous_stderr = String::from_utf8_lossy(&anonymous_plan.stderr);
     let anonymous_error = "Anonymous resource identity is derived from mutable attributes for \
-multiple 'mock.test.resource' declarations using provider instance '<default>' in an anonymous \
+multiple 'mock.test.Thing' declarations using provider instance '<default>' in an anonymous \
 call of module 'm'. Use `let` bindings to give them distinct stable identities.";
 
     assert!(

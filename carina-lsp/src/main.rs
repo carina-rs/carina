@@ -84,9 +84,15 @@ fn build_factories(providers: &[(PathBuf, ProviderConfig)]) -> FactoryBuildResul
             Ok(installed) => installed,
             Err(rejection) => {
                 // Named instances inherit the kind default's source. Their
-                // missing source is deliberate; every other rejection is a
-                // diagnostic produced directly from this one resolution.
-                if config.is_default() || rejection != InstallRejection::MissingSource {
+                // missing source is deliberate. The source-less default mock
+                // is also deliberate: it selects Carina's built-in provider.
+                // Every other rejection is a diagnostic produced directly
+                // from this one resolution.
+                let uses_builtin_mock =
+                    carina_provider_mock::uses_builtin_provider(std::iter::once(config), |_| false);
+                if !uses_builtin_mock
+                    && (config.is_default() || rejection != InstallRejection::MissingSource)
+                {
                     errors.insert(config.name.clone(), rejection.to_string());
                 }
                 fingerprint.push((config.name.clone(), false));
@@ -220,6 +226,20 @@ mod tests {
              carina#3023. errors: {:?}",
             errors
         );
+    }
+
+    #[test]
+    fn source_less_mock_uses_builtin_provider_without_load_error() {
+        let providers = vec![cfg("mock", None, None)];
+
+        let (factories, errors, fingerprint) = build_factories(&providers);
+
+        assert!(factories.is_empty());
+        assert!(
+            !errors.contains_key("mock"),
+            "source-less mock is handled by the built-in provider, not reported as a failed plugin load: {errors:?}",
+        );
+        assert_eq!(fingerprint, vec![("mock".to_string(), false)]);
     }
 
     #[test]

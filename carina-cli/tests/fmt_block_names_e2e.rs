@@ -283,24 +283,19 @@ impl FormattingClient {
     }
 }
 
-fn run_fmt_with_args(project: &Path, mock_schema: bool, args: &[&str]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_carina"));
-    command
+fn run_fmt_with_args(project: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_carina"))
         .current_dir(project)
         .env("NO_COLOR", "1")
         .env_remove("CLICOLOR_FORCE")
         .arg("fmt")
-        .args(args);
-    if mock_schema {
-        command.env("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1");
-    } else {
-        command.env_remove("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA");
-    }
-    command.output().expect("run carina fmt")
+        .args(args)
+        .output()
+        .expect("run carina fmt")
 }
 
-fn run_fmt(project: &Path, mock_schema: bool) -> Output {
-    run_fmt_with_args(project, mock_schema, &["."])
+fn run_fmt(project: &Path) -> Output {
+    run_fmt_with_args(project, &["."])
 }
 
 fn assert_success(output: &Output) {
@@ -325,11 +320,9 @@ async fn real_cli_and_lsp_schema_acquisition_produce_byte_identical_formatting()
     client.open_document(&uri, INPUT).await;
     let lsp_formatted = client.format_document(&uri).await;
 
-    // This pins real CLI/LSP formatting parity, but not production WASM schema
-    // acquisition: the environment flag injects the mock schema even with no
-    // factories. The block_names_for_dir and wiring tests cover builder-to-name
-    // collection and production factory loading as separate seams.
-    let output = run_fmt(project.path(), true);
+    // The CLI side uses the built-in mock schema catalog while the LSP side
+    // loads the equivalent test factory schema.
+    let output = run_fmt(project.path());
 
     assert_success(&output);
     let cli_formatted = std::fs::read_to_string(main).unwrap();
@@ -364,7 +357,7 @@ async fn recursive_fmt_uses_each_files_directory_and_matches_lsp() {
     client.open_document(&uri_a, INPUT).await;
     let lsp_formatted_a = client.format_document(&uri_a).await;
 
-    let output = run_fmt_with_args(project.path(), true, &[".", "--recursive"]);
+    let output = run_fmt_with_args(project.path(), &[".", "--recursive"]);
 
     assert_success(&output);
     let cli_formatted_a = std::fs::read_to_string(main_a).unwrap();
@@ -413,7 +406,7 @@ let imported = use {
     client.open_document(&uri, INPUT_WITHOUT_PROVIDER).await;
     let lsp_formatted = client.format_document(&uri).await;
 
-    let output = run_fmt_with_args(&root, true, &[".", "--recursive"]);
+    let output = run_fmt_with_args(&root, &[".", "--recursive"]);
 
     assert_success(&output);
     let cli_formatted = std::fs::read_to_string(module_resource).unwrap();
@@ -439,7 +432,7 @@ broken.test.resource {
     )
     .unwrap();
 
-    let output = run_fmt(project.path(), false);
+    let output = run_fmt(project.path());
 
     assert_success(&output);
     assert!(
@@ -468,7 +461,7 @@ broken.test.resource {
     )
     .unwrap();
 
-    let dirty_check = run_fmt_with_args(project.path(), false, &[".", "--check"]);
+    let dirty_check = run_fmt_with_args(project.path(), &[".", "--check"]);
 
     assert!(!dirty_check.status.success());
     assert_eq!(
@@ -479,11 +472,11 @@ broken.test.resource {
     );
     assert!(!String::from_utf8_lossy(&dirty_check.stdout).contains(PROVIDER_WARNING));
 
-    let format = run_fmt(project.path(), false);
+    let format = run_fmt(project.path());
     assert_success(&format);
     assert!(format.stderr.is_empty());
 
-    let clean_check = run_fmt_with_args(project.path(), false, &[".", "--check"]);
+    let clean_check = run_fmt_with_args(project.path(), &[".", "--check"]);
 
     assert!(
         clean_check.status.success(),
@@ -514,7 +507,7 @@ broken.test.resource {
 "#;
     std::fs::write(&main, original).unwrap();
 
-    let dirty_diff = run_fmt_with_args(project.path(), false, &["--diff"]);
+    let dirty_diff = run_fmt_with_args(project.path(), &["--diff"]);
 
     assert_success(&dirty_diff);
     assert_eq!(std::fs::read_to_string(&main).unwrap(), original);
@@ -529,11 +522,11 @@ broken.test.resource {
     );
     assert!(!String::from_utf8_lossy(&dirty_diff.stdout).contains(PROVIDER_WARNING));
 
-    let format = run_fmt(project.path(), false);
+    let format = run_fmt(project.path());
     assert_success(&format);
     assert!(format.stderr.is_empty());
 
-    let clean_diff = run_fmt_with_args(project.path(), false, &["--diff"]);
+    let clean_diff = run_fmt_with_args(project.path(), &["--diff"]);
 
     assert_success(&clean_diff);
     assert_eq!(
@@ -570,9 +563,9 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
     )
     .unwrap();
 
-    let format = run_fmt(project.path(), false);
+    let format = run_fmt(project.path());
     assert_success(&format);
-    let output = run_fmt_with_args(project.path(), false, &[".", "--check"]);
+    let output = run_fmt_with_args(project.path(), &[".", "--check"]);
 
     assert_success(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -597,14 +590,14 @@ fn check_does_not_warn_for_sourceless_provider() {
     let main = project.path().join("main.crn");
     std::fs::write(&main, INPUT).unwrap();
 
-    let format = run_fmt(project.path(), true);
+    let format = run_fmt(project.path());
     assert_success(&format);
     assert!(format.stderr.is_empty());
     let formatted = std::fs::read_to_string(main).unwrap();
     assert!(formatted.contains("  rule {\n"));
     assert!(!formatted.contains("rules = ["));
 
-    let output = run_fmt_with_args(project.path(), true, &[".", "--check"]);
+    let output = run_fmt_with_args(project.path(), &[".", "--check"]);
 
     assert_success(&output);
     assert!(
@@ -633,11 +626,11 @@ fn recursive_check_warns_once_for_multiple_unavailable_provider_directories() {
         .unwrap();
     }
 
-    let format = run_fmt_with_args(project.path(), false, &[".", "--recursive"]);
+    let format = run_fmt_with_args(project.path(), &[".", "--recursive"]);
     assert_success(&format);
     assert!(format.stderr.is_empty());
 
-    let check = run_fmt_with_args(project.path(), false, &[".", "--recursive", "--check"]);
+    let check = run_fmt_with_args(project.path(), &[".", "--recursive", "--check"]);
 
     assert_success(&check);
     assert_eq!(

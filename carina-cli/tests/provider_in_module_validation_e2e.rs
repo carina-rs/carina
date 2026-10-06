@@ -64,6 +64,16 @@ fn write_provider(dir: &Path) {
     write(dir, "providers.crn", "provider mock { }\n");
 }
 
+fn run_validate(directory: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_carina"))
+        .current_dir(directory)
+        .env("NO_COLOR", "1")
+        .env_remove("CLICOLOR_FORCE")
+        .args(["validate", "."])
+        .output()
+        .expect("run carina validate")
+}
+
 #[test]
 fn provider_in_sibling_module_file_is_rejected() {
     // Before the validation-walk gate, the resolver rejected this only during
@@ -116,6 +126,81 @@ fn module_without_provider_is_allowed() {
     assert!(
         diagnostics.is_empty(),
         "module without a provider must remain valid: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn standalone_module_with_anonymous_resource_does_not_require_caller_provider() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    write(
+        temp.path(),
+        "arguments.crn",
+        r#"arguments {
+  n: String
+}
+"#,
+    );
+    write(
+        temp.path(),
+        "resources.crn",
+        r#"aws.s3.Bucket {
+  bucket_name = n
+}
+"#,
+    );
+
+    let output = run_validate(temp.path());
+
+    assert!(
+        output.status.success(),
+        "a standalone module cannot declare its caller-owned provider\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn caller_without_provider_rejects_expanded_anonymous_module_resource() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let caller = temp.path().join("caller");
+    let module = temp.path().join("module");
+    std::fs::create_dir(&caller).expect("caller directory");
+    std::fs::create_dir(&module).expect("module directory");
+    write(
+        &caller,
+        "main.crn",
+        r#"let component = use { source = '../module' }
+
+let instance = component { n = "x" }
+"#,
+    );
+    write(
+        &module,
+        "arguments.crn",
+        r#"arguments {
+  n: String
+}
+"#,
+    );
+    write(
+        &module,
+        "resources.crn",
+        r#"aws.s3.Bucket {
+  bucket_name = n
+}
+"#,
+    );
+
+    let output = run_validate(&caller);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success()
+            && stderr.contains(
+                "anonymous aws.s3.Bucket resource needs provider 'aws', which is not declared or could not be loaded; declare provider 'aws' so its schema is available",
+            ),
+        "the caller must validate the expanded module resource against its provider set\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout),
     );
 }
 
@@ -208,7 +293,6 @@ fn state_refresh_uses_resolver_backstop_when_validation_walk_is_skipped() {
     let output = Command::new(env!("CARGO_BIN_EXE_carina"))
         .current_dir(&fixture.caller)
         .env("NO_COLOR", "1")
-        .env("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1")
         .env_remove("CLICOLOR_FORCE")
         .args(["state", "refresh", "--lock=false", "."])
         .output()

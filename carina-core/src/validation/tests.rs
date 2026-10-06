@@ -620,6 +620,22 @@ let vpc = awscc.ec2.Vpc {
 }
 
 #[test]
+fn schema_less_resource_binding_is_conservatively_identity_required() {
+    let input = r#"
+provider foo {}
+
+let a = foo.x.Y {}
+"#;
+    let parsed = crate::parser::parse(input, &ProviderContext::default()).unwrap();
+
+    assert!(
+        check_unused_bindings_with_identity_requirements(&parsed, &SchemaRegistry::new())
+            .is_empty(),
+        "a schema-less resource cannot safely discard its explicit identity binding",
+    );
+}
+
+#[test]
 fn binding_used_inside_for_body_is_not_flagged_as_unused() {
     use crate::parser::parse;
 

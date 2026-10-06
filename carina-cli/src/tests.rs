@@ -1145,148 +1145,6 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     );
 }
 
-/// Simulate plan-verify for an anonymous flow_log with ResourceRef create-only attributes.
-/// ec2_flow_log/s3 test uses ResourceRef values (vpc.vpc_id, bucket.arn) in create-only
-/// attributes, which must produce the same hash across runs.
-#[test]
-fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
-    let providers = vec![make_awscc_provider("awscc.Region.ap_northeast_1")];
-
-    // --- First run ---
-    let mut resource_run1 = Resource::pending_with_provider("awscc", "ec2.flow_log", None);
-    resource_run1.set_attr(
-        "resource_id".to_string(),
-        Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-    );
-    resource_run1.set_attr(
-        "resource_type".to_string(),
-        Value::Concrete(ConcreteValue::String("VPC".to_string())),
-    );
-    resource_run1.set_attr(
-        "traffic_type".to_string(),
-        Value::Concrete(ConcreteValue::String("ALL".to_string())),
-    );
-    resource_run1.set_attr(
-        "log_destination_type".to_string(),
-        Value::Concrete(ConcreteValue::String("s3".to_string())),
-    );
-    resource_run1.set_attr(
-        "log_destination".to_string(),
-        Value::resource_ref("bucket".to_string(), "arn".to_string(), vec![]),
-    );
-    resource_run1.set_attr(
-        "destination_options".to_string(),
-        Value::Concrete(ConcreteValue::Map(
-            vec![
-                (
-                    "file_format".to_string(),
-                    Value::Concrete(ConcreteValue::String("plain-text".to_string())),
-                ),
-                (
-                    "hive_compatible_partitions".to_string(),
-                    Value::Concrete(ConcreteValue::Bool(false)),
-                ),
-                (
-                    "per_hour_partition".to_string(),
-                    Value::Concrete(ConcreteValue::Bool(false)),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        )),
-    );
-
-    let mut resources_run1 = vec![resource_run1];
-    compute_anonymous_identifiers(&mut resources_run1, &providers).unwrap();
-    crate::wiring::assign_fallback_identities_for_unresolved_anonymous(&mut resources_run1, &[]);
-    let run1_name = resources_run1[0]
-        .id
-        .identity_str()
-        .unwrap_or("")
-        .to_string();
-
-    // Simulate state after apply
-    let applied_state = State::existing(resources_run1[0].id.clone(), HashMap::new())
-        .with_identifier("fl-12345678");
-
-    let resource_state = ResourceState::from_provider_state_for_resource_and_schema(
-        &ResolvedResource::new(resources_run1[0].clone()),
-        &applied_state,
-        None,
-        None,
-    )
-    .unwrap();
-    let mut state_file = StateFile::new();
-    state_file
-        .upsert_resource(resource_state)
-        .expect("test state setup must be valid");
-
-    // --- Second run ---
-    let mut resource_run2 = Resource::pending_with_provider("awscc", "ec2.flow_log", None);
-    resource_run2.set_attr(
-        "resource_id".to_string(),
-        Value::resource_ref("vpc".to_string(), "vpc_id".to_string(), vec![]),
-    );
-    resource_run2.set_attr(
-        "resource_type".to_string(),
-        Value::Concrete(ConcreteValue::String("VPC".to_string())),
-    );
-    resource_run2.set_attr(
-        "traffic_type".to_string(),
-        Value::Concrete(ConcreteValue::String("ALL".to_string())),
-    );
-    resource_run2.set_attr(
-        "log_destination_type".to_string(),
-        Value::Concrete(ConcreteValue::String("s3".to_string())),
-    );
-    resource_run2.set_attr(
-        "log_destination".to_string(),
-        Value::resource_ref("bucket".to_string(), "arn".to_string(), vec![]),
-    );
-    resource_run2.set_attr(
-        "destination_options".to_string(),
-        Value::Concrete(ConcreteValue::Map(
-            vec![
-                (
-                    "file_format".to_string(),
-                    Value::Concrete(ConcreteValue::String("plain-text".to_string())),
-                ),
-                (
-                    "hive_compatible_partitions".to_string(),
-                    Value::Concrete(ConcreteValue::Bool(false)),
-                ),
-                (
-                    "per_hour_partition".to_string(),
-                    Value::Concrete(ConcreteValue::Bool(false)),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        )),
-    );
-
-    let mut resources_run2 = vec![resource_run2];
-    compute_anonymous_identifiers(&mut resources_run2, &providers).unwrap();
-    crate::wiring::assign_fallback_identities_for_unresolved_anonymous(&mut resources_run2, &[]);
-    let run2_name = resources_run2[0]
-        .id
-        .identity_str()
-        .unwrap_or("")
-        .to_string();
-
-    assert_eq!(
-        run1_name, run2_name,
-        "Flow log anonymous identifier should be stable across runs"
-    );
-
-    let identifier = state_file.get_identifier_for_resource(&resources_run2[0]);
-    assert_eq!(
-        identifier,
-        Some("fl-12345678".to_string()),
-        "Should find flow_log identifier in state for plan-verify (issue #535)"
-    );
-}
-
 #[tokio::test]
 async fn detect_drift_errors_when_resource_missing_from_planned_states() {
     let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None);
@@ -2078,22 +1936,28 @@ async fn finalize_apply_without_lock_uses_write_state() {
     );
 }
 
-/// Test that WiringContext constructed with empty factories works correctly.
-/// With dynamic provider loading, factories come from provider binaries at runtime.
-/// When no factories are provided, schemas and factories are empty.
+/// Test that WiringContext activates the built-in mock catalog when the
+/// provider is declared but no factory was loaded.
 #[test]
 fn wiring_context_constructs_factories_and_schemas_once() {
-    let ctx = WiringContext::new(vec![]);
+    let parsed = carina_core::parser::parse(
+        "provider mock {}\n",
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .unwrap();
+    let ctx = WiringContext::new(vec![], &parsed.providers);
 
-    // With no factories provided, both should be empty
     assert!(
         ctx.factories().is_empty(),
         "Should have no factories when none are provided"
     );
     assert!(
-        ctx.schemas().is_empty(),
-        "Should have no schemas when no factories are provided"
+        ctx.schemas().has_managed("mock", "test.resource")
+            && ctx.schemas().has_managed("mock", "compute.Instance")
+            && ctx.schemas().has_data_source("mock", "iam.Roles"),
+        "built-in mock schemas must be registered for a declared mock provider without a factory"
     );
+    assert!(ctx.known_providers().contains("mock"));
 
     // Calling schemas() again should return the same data (cached, not rebuilt)
     let schemas_a = ctx.schemas();
@@ -2103,6 +1967,15 @@ fn wiring_context_constructs_factories_and_schemas_once() {
         schemas_b.len(),
         "Schemas should be consistent across calls"
     );
+}
+
+#[test]
+fn wiring_context_activates_builtin_mock_for_implicit_fallback() {
+    let ctx = WiringContext::new(vec![], &[]);
+
+    assert!(ctx.known_providers().contains("mock"));
+    assert!(ctx.schemas().has_managed("mock", "test.resource"));
+    assert!(ctx.schemas().has_data_source("mock", "iam.Roles"));
 }
 
 /// Issue #931: orphaned resources that no longer exist in infrastructure should not

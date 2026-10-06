@@ -2,17 +2,19 @@
 # desired (mimics awscc#206-style upstream drift). The paired
 # statement element has zero changed desired keys, so the IR drops
 # it and the statement attribute is absorbed into the trailing
-# unchanged-attributes count. `policy_name` is renamed only to force
-# an Update effect — without it the differ short-circuits before
-# reaching the renderer.
+# unchanged-attributes count. `policy_document` is changed only to force
+# an Update effect — unlike `policy_name`, Cloud Control can update this
+# property in place. Without it the differ short-circuits before reaching
+# the renderer.
 
 provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
 let policy = awscc.iam.RolePolicy {
-  policy_name = 'test-inline-renamed'
-  role_name   = 'test-role'
+  policy_name     = 'test-inline'
+  role_name       = 'test-role'
+  policy_document = '{"Version":"2012-10-17"}'
   statement = [
     {
       sid    = 'AllowS3Read'

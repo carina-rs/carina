@@ -183,12 +183,26 @@ fn simhash_suffix_for_test(identifier: &str) -> SimHash {
 }
 
 #[test]
-fn anonymous_identity_basis_is_attribute_derived_without_a_schema() {
+fn anonymous_identity_basis_is_unavailable_without_a_schema() {
     let resource = Resource::pending_with_provider("mock", "test.resource", None);
 
     assert_eq!(
         classify_anonymous_identity_basis(&resource, &SchemaRegistry::new()),
-        AnonymousIdentityBasis::AttributeDerived,
+        None,
+    );
+}
+
+#[test]
+fn schema_less_anonymous_resources_do_not_create_attribute_derived_conflicts() {
+    let resources = vec![
+        Resource::pending_with_provider("mock", "unknown.Widget", None),
+        Resource::pending_with_provider("mock", "unknown.Widget", None),
+    ];
+
+    assert!(
+        check_attribute_derived_anonymous_resource_conflicts(&resources, &SchemaRegistry::new(),)
+            .is_empty(),
+        "an unknown identity basis must not be guessed as attribute-derived",
     );
 }
 
@@ -207,7 +221,7 @@ fn anonymous_identity_basis_is_attribute_derived_when_no_stable_attribute_is_set
 
     assert_eq!(
         classify_anonymous_identity_basis(&resource, &registry),
-        AnonymousIdentityBasis::AttributeDerived,
+        Some(AnonymousIdentityBasis::AttributeDerived),
     );
 }
 
@@ -229,7 +243,7 @@ fn anonymous_identity_basis_is_stable_when_create_only_value_is_deferred() {
 
     assert_eq!(
         classify_anonymous_identity_basis(&resource, &registry),
-        AnonymousIdentityBasis::Stable,
+        Some(AnonymousIdentityBasis::Stable),
     );
 }
 
@@ -246,7 +260,7 @@ fn anonymous_identity_basis_is_stable_when_identity_attribute_prefix_is_set() {
 
     assert_eq!(
         classify_anonymous_identity_basis(&resource, &registry),
-        AnonymousIdentityBasis::Stable,
+        Some(AnonymousIdentityBasis::Stable),
     );
 }
 
@@ -264,7 +278,7 @@ fn anonymous_identity_basis_recognizes_unresolved_prefix_syntax() {
 
     assert_eq!(
         classify_anonymous_identity_basis(&resource, &registry),
-        AnonymousIdentityBasis::Stable,
+        Some(AnonymousIdentityBasis::Stable),
     );
 }
 
@@ -350,13 +364,18 @@ fn unresolved_and_resolved_prefix_forms_hash_to_the_same_identity() {
 
 #[test]
 fn check_rejects_multiple_attribute_derived_anonymous_resources_in_one_kind() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
     let resources = vec![
         Resource::pending_with_provider("mock", "test.resource", None),
         Resource::pending_with_provider("mock", "test.resource", None),
     ];
 
-    let conflicts =
-        check_attribute_derived_anonymous_resource_conflicts(&resources, &SchemaRegistry::new());
+    let conflicts = check_attribute_derived_anonymous_resource_conflicts(&resources, &registry);
 
     assert_eq!(conflicts.len(), 1);
     assert_eq!(
@@ -369,13 +388,18 @@ fn check_rejects_multiple_attribute_derived_anonymous_resources_in_one_kind() {
 
 #[test]
 fn check_keeps_default_and_named_provider_instances_in_separate_scopes() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
     let resources = vec![
         Resource::pending_with_provider("mock", "test.resource", None),
         Resource::pending_with_provider("mock", "test.resource", Some("west".to_string())),
     ];
 
-    let conflicts =
-        check_attribute_derived_anonymous_resource_conflicts(&resources, &SchemaRegistry::new());
+    let conflicts = check_attribute_derived_anonymous_resource_conflicts(&resources, &registry);
 
     assert!(conflicts.is_empty(), "unexpected conflicts: {conflicts:?}");
 }
@@ -388,6 +412,11 @@ fn check_allows_stable_named_and_separate_module_instance_resources() {
         .attribute(AttributeSchema::new("immutable_name", AttributeType::string()).create_only());
     let mut registry = SchemaRegistry::new();
     registry.insert("mock", schema);
+    registry.insert(
+        "mock",
+        ResourceSchema::new("other.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
 
     let mut stable_one = Resource::pending_with_provider("mock", "test.resource", None);
     stable_one.set_attr(

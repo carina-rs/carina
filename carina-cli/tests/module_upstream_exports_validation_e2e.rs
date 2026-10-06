@@ -110,7 +110,6 @@ fn state_refresh_stderr(fixture: &Fixture) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_carina"))
         .current_dir(&fixture.caller)
         .env("NO_COLOR", "1")
-        .env("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1")
         .env_remove("CLICOLOR_FORCE")
         .args(["state", "refresh", "--lock=false", "."])
         .output()

@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -69,8 +69,26 @@ impl ProviderState {
         prober: Option<ProviderInstallProber>,
         install_fingerprint: Vec<(String, bool)>,
     ) -> Self {
-        let schemas = Arc::new(provider_mod::collect_schemas(&factories));
-        let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
+        let use_builtin_mock = carina_provider_mock::uses_builtin_provider(
+            configs.iter().map(|(_, config)| config),
+            |provider_name| {
+                factories
+                    .iter()
+                    .any(|factory| factory.name() == provider_name)
+            },
+        );
+        let mut schemas = provider_mod::collect_schemas(&factories);
+        let mut provider_names: Vec<String> =
+            factories.iter().map(|f| f.name().to_string()).collect();
+        let mut known_provider_names = HashSet::new();
+        if use_builtin_mock {
+            for schema in carina_provider_mock::builtin_schemas() {
+                schemas.insert(carina_provider_mock::BUILTIN_PROVIDER_NAME, schema);
+            }
+            provider_names.push(carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string());
+            known_provider_names.insert(carina_provider_mock::BUILTIN_PROVIDER_NAME.to_string());
+        }
+        let schemas = Arc::new(schemas);
         let region_completions: Vec<CompletionValue> = factories
             .iter()
             .flat_map(|f| f.config_completions().remove("region").unwrap_or_default())
@@ -86,10 +104,11 @@ impl ProviderState {
         let factories_arc = Arc::new(factories);
         Self {
             schemas: Arc::clone(&schemas),
-            diagnostic_engine: DiagnosticEngine::new(
+            diagnostic_engine: DiagnosticEngine::new_with_known_providers(
                 Arc::clone(&schemas),
                 provider_names.clone(),
                 factories_arc,
+                known_provider_names,
             )
             .with_provider_errors(provider_errors),
             completion_provider: CompletionProvider::new(
@@ -921,10 +940,19 @@ mod tests {
     }
 
     fn provider_state(block_name: &'static str) -> ProviderState {
+        let config = carina_core::parser::parse(
+            "provider mock {}\n",
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .unwrap()
+        .providers
+        .into_iter()
+        .next()
+        .unwrap();
         ProviderState::new(
             vec![Box::new(BlockSchemaFactory { block_name })],
             HashMap::new(),
-            vec![],
+            vec![(PathBuf::new(), config)],
             None,
             vec![],
         )
@@ -944,6 +972,133 @@ mod tests {
         let actual = format_document_with_schemas(input, &config, &schemas).unwrap();
 
         assert_eq!(actual.as_bytes(), expected.as_bytes());
+    }
+
+    #[test]
+    fn builtin_mock_diagnostics_match_validate_across_sibling_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let providers = "provider mock {}\n";
+        let main = r#"mock.unknown.Widget {}
+
+mock.test.resource {}
+
+mock.test.Thing {
+  name = "alpha"
+}
+
+mock.test.Thing {
+  name = "beta"
+}
+"#;
+        std::fs::write(temp.path().join("providers.crn"), providers).unwrap();
+        std::fs::write(temp.path().join("main.crn"), main).unwrap();
+
+        let discovered = workspace::discover_providers_by_dir(temp.path());
+        let configs = discovered[temp.path()]
+            .iter()
+            .cloned()
+            .map(|config| (temp.path().to_path_buf(), config))
+            .collect();
+        let state = ProviderState::new(
+            vec![],
+            HashMap::new(),
+            configs,
+            None,
+            vec![("mock".to_string(), false)],
+        );
+        let document = Document::new(
+            main.to_string(),
+            Arc::new(carina_core::parser::ProviderContext::default()),
+        );
+
+        let diagnostics = state.diagnostic_engine.analyze_with_filename(
+            &document,
+            Some("main.crn"),
+            Some(temp.path()),
+        );
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            messages.contains(&"Unknown resource type: mock.unknown.Widget"),
+            "LSP must report the same unknown mock resource type as `carina validate`: {messages:#?}",
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("Required attribute 'name' is missing")),
+            "LSP must validate required attributes from the built-in mock catalog: {messages:#?}",
+        );
+        assert!(
+            messages.iter().any(|message| {
+                message.contains("multiple 'mock.test.Thing' declarations")
+                    && message.contains("Use `let` bindings")
+            }),
+            "LSP must run attribute-derived identity conflict checks with mock schemas: {messages:#?}",
+        );
+    }
+
+    #[test]
+    fn sourced_mock_load_failure_does_not_activate_builtin_catalog_across_sibling_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let providers = r#"provider mock {
+  source = "file:///definitely-missing/mock.wasm"
+}
+"#;
+        let main = "mock.test.resource {}\n";
+        std::fs::write(temp.path().join("providers.crn"), providers).unwrap();
+        std::fs::write(temp.path().join("main.crn"), main).unwrap();
+
+        let discovered = workspace::discover_providers_by_dir(temp.path());
+        let configs = discovered[temp.path()]
+            .iter()
+            .cloned()
+            .map(|config| (temp.path().to_path_buf(), config))
+            .collect();
+        let state = ProviderState::new(
+            vec![],
+            HashMap::from([(
+                "mock".to_string(),
+                "provider artifact is missing".to_string(),
+            )]),
+            configs,
+            None,
+            vec![("mock".to_string(), false)],
+        );
+        let document = Document::new(
+            main.to_string(),
+            Arc::new(carina_core::parser::ProviderContext::default()),
+        );
+
+        let diagnostics = state.diagnostic_engine.analyze_with_filename(
+            &document,
+            Some("main.crn"),
+            Some(temp.path()),
+        );
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            !state.schemas.has_managed("mock", "test.resource"),
+            "a sourced mock whose plugin failed to load must not silently receive the built-in catalog",
+        );
+        assert!(
+            messages.iter().any(|message| {
+                message.contains("Provider 'mock' is not loaded")
+                    && message.contains("provider artifact is missing")
+            }),
+            "LSP must report the provider load failure, matching CLI's failure outcome: {messages:#?}",
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("Required attribute 'name' is missing")),
+            "the built-in schema must not validate a sourced provider that failed to load: {messages:#?}",
+        );
     }
 
     #[test]

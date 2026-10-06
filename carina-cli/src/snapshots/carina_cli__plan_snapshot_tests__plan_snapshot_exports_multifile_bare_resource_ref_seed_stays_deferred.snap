@@ -6,6 +6,7 @@ Execution Plan:
 
   + mock.compute.Instance inst.resource_binding
       name: "fixture-instance"
+      arn: (known after apply)
 
 Exports:
 

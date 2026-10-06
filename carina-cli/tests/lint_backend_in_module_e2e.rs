@@ -27,7 +27,6 @@ fn lint_collects_path_prefixed_backend_in_module_once() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_carina"))
         .args(["lint", caller.to_str().expect("UTF-8 caller path")])
-        .env("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1")
         .output()
         .expect("run carina lint");
     let stdout = String::from_utf8_lossy(&output.stdout);

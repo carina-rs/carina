@@ -16,7 +16,7 @@ use crate::parser::{
 };
 use crate::provider::ProviderFactory;
 use crate::resource::{
-    CompositionCall, ConcreteValue, DeferredValue, ReferencePath, ReferencePathRef, Value,
+    CompositionCall, ConcreteValue, DeferredValue, ReferencePath, ReferencePathRef, Resource, Value,
 };
 use crate::schema::{AttributeType, SchemaRegistry, Shape, TypeIdentity};
 
@@ -779,6 +779,91 @@ pub fn validate_composition_ref_types_with_bindings(
     errors
 }
 
+/// Identity shared by anonymous resources with the same missing schema.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AnonymousResourceSchemaKey {
+    provider: String,
+    resource_type: String,
+    provider_instance: Option<String>,
+}
+
+/// A grouped diagnostic for anonymous resources whose schema is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnonymousResourceSchemaError {
+    key: AnonymousResourceSchemaKey,
+    count: usize,
+}
+
+impl std::fmt::Display for AnonymousResourceSchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let provider = if self.key.provider.is_empty() {
+            "<default>"
+        } else {
+            &self.key.provider
+        };
+        let resource_type = if self.key.provider.is_empty() {
+            self.key.resource_type.clone()
+        } else {
+            format!("{}.{}", self.key.provider, self.key.resource_type)
+        };
+
+        if self.count == 1 {
+            write!(f, "anonymous {resource_type} resource needs ")?;
+        } else {
+            write!(
+                f,
+                "{} anonymous {resource_type} resources need ",
+                self.count
+            )?;
+        }
+
+        match &self.key.provider_instance {
+            Some(instance) => write!(f, "provider instance '{instance}' of '{provider}'")?,
+            None => write!(f, "provider '{provider}'")?,
+        }
+        write!(
+            f,
+            ", which is not declared or could not be loaded; declare provider '{provider}' so its schema is available"
+        )
+    }
+}
+
+impl std::error::Error for AnonymousResourceSchemaError {}
+
+/// Report every anonymous managed resource whose identity is still pending
+/// because its provider schema is unavailable.
+///
+/// A known provider with no matching resource type is deliberately excluded:
+/// [`validate_resources`] reports that case as `Unknown resource type` for
+/// bound and anonymous resources alike. This check covers the distinct case
+/// where the provider was not declared or could not be loaded, and therefore
+/// no schema exists from which to derive an anonymous identity.
+pub fn validate_anonymous_resource_schemas<'a>(
+    resources: impl IntoIterator<Item = &'a Resource>,
+    registry: &SchemaRegistry,
+    known_providers: &HashSet<String>,
+) -> Vec<AnonymousResourceSchemaError> {
+    let mut grouped = IndexMap::<AnonymousResourceSchemaKey, usize>::new();
+    for resource in resources.into_iter().filter(|resource| {
+        resource.binding.is_none()
+            && resource.id.identity_str().is_none()
+            && registry.get_for(resource).is_none()
+            && !known_providers.contains(&resource.id.provider)
+    }) {
+        let key = AnonymousResourceSchemaKey {
+            provider: resource.id.provider.clone(),
+            resource_type: resource.id.resource_type.clone(),
+            provider_instance: resource.id.provider_instance.clone(),
+        };
+        *grouped.entry(key).or_default() += 1;
+    }
+
+    grouped
+        .into_iter()
+        .map(|(key, count)| AnonymousResourceSchemaError { key, count })
+        .collect()
+}
+
 /// Validate resources against their schemas.
 ///
 /// Two-sided check: a `read` resource requires a `DataSource` registry entry,
@@ -793,6 +878,28 @@ pub fn validate_resources<E>(
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
     let lookup = crate::parser::provider_context_lookup(provider_context);
+
+    // A standalone module receives its providers from the caller, so schema
+    // availability cannot be decided until its resources are expanded into a
+    // root configuration. Keep every other schema/type check below active for
+    // modules; only defer this provider-availability diagnostic.
+    if !is_module_definition(parsed) {
+        all_errors.extend(
+            validate_anonymous_resource_schemas(
+                parsed
+                    .iter_all_resources()
+                    .filter_map(|resource| match resource {
+                        ResourceRef::Resource(resource)
+                        | ResourceRef::Deferred { resource, .. } => Some(resource),
+                        ResourceRef::Composition(_) | ResourceRef::DataSource(_) => None,
+                    }),
+                registry,
+                known_providers,
+            )
+            .into_iter()
+            .map(|error| error.to_string()),
+        );
+    }
 
     // Classify per kind via the typed `ResourceRef` arms instead of
     // runtime `is_virtual()` / `is_data_source()` calls (carina#3180 /
@@ -1462,13 +1569,22 @@ fn collect_unknown_simple_types_in(
     }
 }
 
+/// Return whether a merged configuration directory is a module definition.
+///
+/// This is the classification used by the root-owned-block validators: a
+/// top-level `arguments` or `attributes` block marks the directory as a
+/// module whose provider configuration comes from its caller.
+#[must_use]
+pub fn is_module_definition<E>(parsed: &crate::parser::File<E>) -> bool {
+    !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty()
+}
+
 /// Check that a module file does not contain provider blocks.
 ///
 /// Provider configuration should only be defined at the root configuration level,
 /// not inside modules (files with `arguments` or `attributes` blocks).
 pub fn validate_no_provider_in_module<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
-    let is_module = !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty();
-    if is_module && !parsed.providers.is_empty() {
+    if is_module_definition(parsed) && !parsed.providers.is_empty() {
         return Err(
             "provider blocks are not allowed inside modules. Define providers at the root configuration level.".to_string(),
         );
@@ -1483,8 +1599,7 @@ pub fn validate_no_provider_in_module<E>(parsed: &crate::parser::File<E>) -> Res
 pub fn validate_no_state_blocks_in_module<E>(
     parsed: &crate::parser::File<E>,
 ) -> Result<(), String> {
-    let is_module = !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty();
-    if is_module && !parsed.state_blocks.is_empty() {
+    if is_module_definition(parsed) && !parsed.state_blocks.is_empty() {
         return Err(
             "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.".to_string(),
         );
@@ -1497,8 +1612,7 @@ pub fn validate_no_state_blocks_in_module<E>(
 /// Backend configuration should only be defined at the root configuration
 /// level, not inside modules (files with `arguments` or `attributes` blocks).
 pub fn validate_no_backend_in_module<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
-    let is_module = !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty();
-    if is_module && parsed.backend.is_some() {
+    if is_module_definition(parsed) && parsed.backend.is_some() {
         return Err(
             "backend blocks are not allowed inside modules. Define the backend at the root configuration level.".to_string(),
         );
@@ -1514,8 +1628,7 @@ pub fn validate_no_backend_in_module<E>(parsed: &crate::parser::File<E>) -> Resu
 pub fn validate_no_upstream_states_in_module<E>(
     parsed: &crate::parser::File<E>,
 ) -> Result<(), String> {
-    let is_module = !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty();
-    if is_module && !parsed.upstream_states.is_empty() {
+    if is_module_definition(parsed) && !parsed.upstream_states.is_empty() {
         return Err(
             "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.".to_string(),
         );
@@ -1528,8 +1641,7 @@ pub fn validate_no_upstream_states_in_module<E>(
 /// State exports should only be defined at the root configuration level, not
 /// inside modules (files with `arguments` or `attributes` blocks).
 pub fn validate_no_exports_in_module<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
-    let is_module = !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty();
-    if is_module && !parsed.export_params.is_empty() {
+    if is_module_definition(parsed) && !parsed.export_params.is_empty() {
         return Err(
             "exports blocks are not allowed inside modules. Define exports at the root configuration level.".to_string(),
         );
@@ -1784,10 +1896,8 @@ pub fn check_unused_bindings_with_identity_requirements<E: crate::parser::Export
     parsed: &crate::parser::File<E>,
     registry: &crate::schema::SchemaRegistry,
 ) -> Vec<String> {
-    let identity_required = crate::identifier::attribute_derived_identity_required_bindings(
-        &parsed.resources,
-        registry,
-    );
+    let identity_required =
+        crate::identifier::identity_required_bindings(&parsed.resources, registry);
     check_unused_bindings(parsed)
         .into_iter()
         .filter(|binding| !identity_required.contains(binding))

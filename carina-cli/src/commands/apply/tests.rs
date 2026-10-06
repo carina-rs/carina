@@ -643,9 +643,12 @@ async fn run_apply_cascade_fixture(
     fixture: &ApplyCancellationFixture,
     shared: &ApplyCascadeShared,
 ) -> Result<Option<Duration>, AppError> {
-    let ctx = WiringContext::new(vec![Box::new(ApplyCascadeAwsccFactory {
-        shared: shared.clone(),
-    })]);
+    let ctx = WiringContext::new(
+        vec![Box::new(ApplyCascadeAwsccFactory {
+            shared: shared.clone(),
+        })],
+        &[],
+    );
     let loaded = load_configuration_with_config(
         fixture.config_path(),
         fixture.provider_context(),
@@ -989,9 +992,12 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         "module resolution must prefix the data-source binding"
     );
 
-    let ctx = WiringContext::new(vec![Box::new(ApplyTimeReadFactory {
-        shared: shared.clone(),
-    })]);
+    let ctx = WiringContext::new(
+        vec![Box::new(ApplyTimeReadFactory {
+            shared: shared.clone(),
+        })],
+        &[],
+    );
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
         &parsed,
@@ -1046,9 +1052,12 @@ async fn apply_reads_module_data_source_and_resolves_consumer_interpolation() {
     let (fixture, shared) = module_data_source_fixture();
     let (mut parsed, unresolved_parsed) =
         load_and_resolve_module_data_source_fixture(&fixture, &shared);
-    let ctx = WiringContext::new(vec![Box::new(ApplyTimeReadFactory {
-        shared: shared.clone(),
-    })]);
+    let ctx = WiringContext::new(
+        vec![Box::new(ApplyTimeReadFactory {
+            shared: shared.clone(),
+        })],
+        &[],
+    );
     let observer_factory = fixture.observer_factory();
 
     run_apply_locked(
@@ -1201,7 +1210,6 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
 
     unsafe {
         std::env::set_var("CARINA_MOCK_STATE_FILE", &mock_state_path);
-        std::env::set_var("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1");
     }
 
     let target_id = ResourceId::with_provider_identity("mock", "test.resource", "target", None);
@@ -1319,7 +1327,6 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
 
     unsafe {
         std::env::remove_var("CARINA_MOCK_STATE_FILE");
-        std::env::remove_var("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA");
     }
 
     result.expect("saved-plan apply should execute the deferred read before consumer create");
@@ -1345,7 +1352,6 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 
     unsafe {
         std::env::set_var("CARINA_MOCK_STATE_FILE", &mock_state_path);
-        std::env::set_var("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA", "1");
         std::env::set_var("CARINA_MOCK_OP_LOG", &op_log_path);
     }
 
@@ -1434,7 +1440,6 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
 
     unsafe {
         std::env::remove_var("CARINA_MOCK_STATE_FILE");
-        std::env::remove_var("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA");
         std::env::remove_var("CARINA_MOCK_OP_LOG");
     }
 
@@ -1515,7 +1520,7 @@ async fn live_apply_noop_rejects_unconsumed_module_constraint() {
         ..Default::default()
     };
     let unresolved_parsed = carina_core::parser::ParsedFile::default();
-    let ctx = WiringContext::new(Vec::new());
+    let ctx = WiringContext::new(Vec::new(), &[]);
     let observer_factory = fixture.observer_factory();
 
     let error = run_apply_locked(
@@ -1865,7 +1870,6 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
     let _env_guard = MOCK_PROVIDER_ENV_LOCK.lock().await;
     unsafe {
         std::env::remove_var("CARINA_MOCK_STATE_FILE");
-        std::env::remove_var("CARINA_MOCK_ENABLE_TEST_RESOURCE_SCHEMA");
     }
     let fixture = ApplyCancellationFixture::new()
         .with_resources_and_exports(["a", "b"], &[("ax", "a.name"), ("bx", "b.id")]);
@@ -1891,7 +1895,7 @@ async fn run_apply_locked_with_create_failure_persists_resolved_export_only() {
         validation_errors.is_empty(),
         "fixture must validate, got: {validation_errors:?}"
     );
-    let ctx = WiringContext::new(vec![Box::new(FailBCreateFactory)]);
+    let ctx = WiringContext::new(vec![Box::new(FailBCreateFactory)], &[]);
     let observer_factory = fixture.observer_factory();
     let err = run_apply_locked(
         &ctx,
@@ -1964,9 +1968,12 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
         validation_errors.is_empty(),
         "fixture must validate, got: {validation_errors:?}"
     );
-    let ctx = WiringContext::new(vec![Box::new(ApplyTimeReadFactory {
-        shared: shared.clone(),
-    })]);
+    let ctx = WiringContext::new(
+        vec![Box::new(ApplyTimeReadFactory {
+            shared: shared.clone(),
+        })],
+        &[],
+    );
     let observer_factory = fixture.observer_factory();
 
     run_apply_locked(
@@ -2026,9 +2033,12 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_fails() {
     let fixture = fixture.with_raw_config(crn);
     let shared = ApplyCascadeShared::default();
     shared.fail_delete_identifier("vpc-old");
-    let ctx = WiringContext::new(vec![Box::new(ApplyCascadeAwsccFactory {
-        shared: shared.clone(),
-    })]);
+    let ctx = WiringContext::new(
+        vec![Box::new(ApplyCascadeAwsccFactory {
+            shared: shared.clone(),
+        })],
+        &[],
+    );
 
     let loaded = load_configuration_with_config(
         fixture.config_path(),
@@ -2093,9 +2103,12 @@ async fn run_apply_locked_deposes_old_cbd_instance_when_delete_is_skipped_by_dep
     let fixture = fixture.with_raw_config(crn);
     let shared = ApplyCascadeShared::default();
     shared.fail_delete_identifier("subnet-old");
-    let ctx = WiringContext::new(vec![Box::new(ApplyCascadeAwsccFactory {
-        shared: shared.clone(),
-    })]);
+    let ctx = WiringContext::new(
+        vec![Box::new(ApplyCascadeAwsccFactory {
+            shared: shared.clone(),
+        })],
+        &[],
+    );
 
     let loaded = load_configuration_with_config(
         fixture.config_path(),
@@ -2296,9 +2309,12 @@ awscc.ec2.Subnet {{
     );
     let fixture = fixture.with_raw_config(crn);
     let shared = ApplyCascadeShared::default();
-    let ctx = WiringContext::new(vec![Box::new(ApplyCascadeAwsccFactory {
-        shared: shared.clone(),
-    })]);
+    let ctx = WiringContext::new(
+        vec![Box::new(ApplyCascadeAwsccFactory {
+            shared: shared.clone(),
+        })],
+        &[],
+    );
 
     let loaded = load_configuration_with_config(
         fixture.config_path(),
@@ -2412,9 +2428,12 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         validation_errors.is_empty(),
         "fixture must validate, got: {validation_errors:?}"
     );
-    let ctx = WiringContext::new(vec![Box::new(ApplyTimeReadFactory {
-        shared: shared.clone(),
-    })]);
+    let ctx = WiringContext::new(
+        vec![Box::new(ApplyTimeReadFactory {
+            shared: shared.clone(),
+        })],
+        &[],
+    );
     let observer_factory = fixture.observer_factory();
 
     run_apply_locked(
@@ -2558,9 +2577,12 @@ let consumer = mock.iam.Role {{
         validation_errors.is_empty(),
         "fixture must validate, got: {validation_errors:?}"
     );
-    let ctx = WiringContext::new(vec![Box::new(ApplyTimeReadFactory {
-        shared: shared.clone(),
-    })]);
+    let ctx = WiringContext::new(
+        vec![Box::new(ApplyTimeReadFactory {
+            shared: shared.clone(),
+        })],
+        &[],
+    );
     let observer_factory = fixture.observer_factory();
 
     run_apply_locked(

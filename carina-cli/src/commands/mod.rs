@@ -354,7 +354,7 @@ pub fn validate_and_resolve_errors_with_factories(
     prior_inference_errors: &[ExportInferenceError],
     duplicate_declarations: &[DuplicateDeclaration],
 ) -> Vec<AppError> {
-    let ctx = WiringContext::new(factories);
+    let ctx = WiringContext::new(factories, &parsed.providers);
     validate_and_resolve_errors_with_context(
         parsed,
         base_dir,
@@ -415,10 +415,10 @@ pub(crate) fn validate_and_resolve_errors_with_context(
         ))
     }));
 
-    // `arguments` is a module-input declaration; the CLI only ever feeds
-    // root configurations into this function (modules go through
-    // `module_resolver::load_module`), so any `arguments` block reaching
-    // here is misplaced (#2198).
+    // A directly validated directory may be either a root configuration or a
+    // standalone module. The shared validator permits module input
+    // declarations unless root-only provider/backend blocks prove that the
+    // directory is a root configuration (#2198).
     if let Err(msg) = carina_core::validation::validate_no_arguments_in_root(parsed) {
         errors.push(AppError::Validation(msg));
     }
@@ -433,13 +433,20 @@ pub(crate) fn validate_and_resolve_errors_with_context(
     if !skip_resource_validation {
         for provider in &parsed.providers {
             let loaded = ctx.factories().iter().any(|f| f.name() == provider.name);
+            let uses_builtin_provider = carina_provider_mock::uses_builtin_provider(
+                std::iter::once(provider),
+                |provider_name| {
+                    ctx.factories()
+                        .iter()
+                        .any(|factory| factory.name() == provider_name)
+                },
+            );
             if loaded {
                 continue;
             }
             if let Some(reason) = load_errors.get(&provider.name) {
                 errors.push(AppError::Validation(reason.clone()));
-            } else if provider.is_default() && provider.source.is_none() && provider.name != "mock"
-            {
+            } else if provider.is_default() && provider.source.is_none() && !uses_builtin_provider {
                 errors.push(AppError::Validation(missing_provider_source_message(
                     &provider.name,
                 )));

@@ -32,7 +32,7 @@ awscc.ec2.Vpc {
 }
 ```
 
-The resource type follows the pattern `<provider>.<service>.<resource_type>`. Carina derives an anonymous resource's identity from configured create-only or provider identity attributes; when none are set, it uses the declaration's attributes for the single-resource fallback.
+The resource type follows the pattern `<provider>.<service>.<resource_type>`. Anonymous resources need their provider declared and loaded so its schema is available. Carina derives identity from configured create-only or provider identity attributes. When the schema is available but none of those attributes is set, identity is derived from the declaration's attributes; only one such anonymous declaration of the same resource kind and provider instance is allowed in a scope. Use `let` bindings to disambiguate additional declarations.
 
 ## Named resources with `let`
 

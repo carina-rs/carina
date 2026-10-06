@@ -5,7 +5,7 @@ expression: output
 Execution Plan:
 
   ~ awscc.iam.RolePolicy policy
-      policy_name: "test-inline" → "test-inline-renamed"
-      # (2 unchanged attributes hidden)
+      policy_document: "{}" → "{"Version":"2012-10-17"}"
+      # (3 unchanged attributes hidden)
 
 Plan: 0 to add, 1 to change, 0 to destroy.
