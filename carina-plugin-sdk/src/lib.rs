@@ -6,7 +6,7 @@
 pub use carina_provider_protocol as protocol;
 pub use carina_provider_protocol::types;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 #[doc(hidden)]
 pub mod wasm_guest;
 
@@ -171,7 +171,11 @@ pub trait CarinaProvider {
 
     /// Permissions this provider needs to perform `op` on `id`.
     /// Empty vec means the provider declares no permissions for this resource/op pair.
-    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> Vec<String>;
+    fn required_permissions(
+        &self,
+        id: &ResourceId,
+        op: PlanOp,
+    ) -> Result<Vec<String>, ProviderError>;
 
     /// Binding-name patterns for resources that can satisfy a wait on `target_id.attr_path`.
     /// Empty vec means the provider declares no satisfier hint for this target attribute.
@@ -179,8 +183,8 @@ pub trait CarinaProvider {
         &self,
         _target_id: &ResourceId,
         _attr_path: &[String],
-    ) -> Vec<BindingPattern> {
-        Vec::new()
+    ) -> Result<Vec<BindingPattern>, ProviderError> {
+        Ok(Vec::new())
     }
 
     /// Return provider config attribute completions.
@@ -211,13 +215,16 @@ pub trait CarinaProvider {
     }
 
     /// Normalize desired resources (optional).
-    fn normalize_desired(&self, resources: Vec<Resource>) -> Vec<Resource> {
-        resources
+    fn normalize_desired(&self, resources: Vec<Resource>) -> Result<Vec<Resource>, ProviderError> {
+        Ok(resources)
     }
 
     /// Normalize read-back state (optional).
-    fn normalize_state(&self, states: HashMap<String, State>) -> HashMap<String, State> {
-        states
+    fn normalize_state(
+        &self,
+        states: HashMap<String, State>,
+    ) -> Result<HashMap<String, State>, ProviderError> {
+        Ok(states)
     }
 
     /// Hydrate read state with saved attributes that APIs don't return.
@@ -225,8 +232,9 @@ pub trait CarinaProvider {
         &self,
         states: &mut HashMap<String, State>,
         saved_attrs: &HashMap<String, HashMap<String, Value>>,
-    ) {
+    ) -> Result<(), ProviderError> {
         let _ = (states, saved_attrs);
+        Ok(())
     }
 
     /// Merge provider default_tags into resources.
@@ -235,8 +243,9 @@ pub trait CarinaProvider {
         resources: &mut Vec<Resource>,
         default_tags: &HashMap<String, Value>,
         schemas: &Vec<ResourceSchema>,
-    ) {
+    ) -> Result<(), ProviderError> {
         let _ = (resources, default_tags, schemas);
+        Ok(())
     }
 }
 
@@ -385,8 +394,12 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            let resources = provider.normalize_desired(params.resources);
-            Response::success(id, methods::NormalizeDesiredResult { resources })
+            match provider.normalize_desired(params.resources) {
+                Ok(resources) => {
+                    Response::success(id, methods::NormalizeDesiredResult { resources })
+                }
+                Err(e) => Response::error(id, -1, e.message),
+            }
         }
 
         "normalize_state" => {
@@ -394,8 +407,10 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Ok(p) => p,
                 Err(e) => return Response::error(id, -32602, e),
             };
-            let states = provider.normalize_state(params.states);
-            Response::success(id, methods::NormalizeStateResult { states })
+            match provider.normalize_state(params.states) {
+                Ok(states) => Response::success(id, methods::NormalizeStateResult { states }),
+                Err(e) => Response::error(id, -1, e.message),
+            }
         }
 
         "hydrate_read_state" => {
@@ -404,8 +419,10 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Err(e) => return Response::error(id, -32602, e),
             };
             let mut states = params.states;
-            provider.hydrate_read_state(&mut states, &params.saved_attrs);
-            Response::success(id, methods::HydrateReadStateResult { states })
+            match provider.hydrate_read_state(&mut states, &params.saved_attrs) {
+                Ok(()) => Response::success(id, methods::HydrateReadStateResult { states }),
+                Err(e) => Response::error(id, -1, e.message),
+            }
         }
 
         "merge_default_tags" => {
@@ -414,8 +431,11 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
                 Err(e) => return Response::error(id, -32602, e),
             };
             let mut resources = params.resources;
-            provider.merge_default_tags(&mut resources, &params.default_tags, &params.schemas);
-            Response::success(id, methods::MergeDefaultTagsResult { resources })
+            match provider.merge_default_tags(&mut resources, &params.default_tags, &params.schemas)
+            {
+                Ok(()) => Response::success(id, methods::MergeDefaultTagsResult { resources }),
+                Err(e) => Response::error(id, -1, e.message),
+            }
         }
 
         "shutdown" => Response::success(id, serde_json::json!({"ok": true})),

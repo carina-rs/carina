@@ -41,6 +41,7 @@ fn create_plan_for_tests(
         orphan_dependencies,
         wait_bindings,
     )
+    .expect("differ test provider hints should succeed")
 }
 
 // Imports used by test submodules (accessible via `use super::*;`)

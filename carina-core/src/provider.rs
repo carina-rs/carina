@@ -916,7 +916,7 @@ pub trait Provider: Send + Sync {
 
     /// Permissions this provider needs to perform `op` on `id`.
     /// Empty vec means the provider declares no permissions for this resource/op pair.
-    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> Vec<String>;
+    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> ProviderResult<Vec<String>>;
 
     /// Binding-name patterns for resources that can satisfy a wait on `target_id.attr_path`.
     /// Empty vec means the provider declares no satisfier hint for this target attribute.
@@ -924,8 +924,8 @@ pub trait Provider: Send + Sync {
         &self,
         _target_id: &ResourceId,
         _attr_path: &AttrPath,
-    ) -> Vec<BindingPattern> {
-        Vec::new()
+    ) -> ProviderResult<Vec<BindingPattern>> {
+        Ok(Vec::new())
     }
 }
 
@@ -936,8 +936,8 @@ pub trait Provider: Send + Sync {
 /// normalize this" implementation returns this explicitly — keeping the
 /// no-op a deliberate, visible choice rather than a silent default
 /// (the hazard that caused carina-rs/carina-provider-awscc#192).
-pub fn ready_noop<'a>() -> BoxFuture<'a, ()> {
-    Box::pin(async {})
+pub fn ready_noop<'a>() -> BoxFuture<'a, ProviderResult<()>> {
+    Box::pin(async { Ok(()) })
 }
 
 /// Plan-time normalizer for a provider.
@@ -951,8 +951,9 @@ pub fn ready_noop<'a>() -> BoxFuture<'a, ()> {
 /// backend — e.g. `WasmProviderNormalizer` `.await`ing the WASM guest's
 /// store lock — does so directly, without a synchronous method bridging
 /// to async via a nested `block_on` (the self-deadlock fixed by
-/// carina#3112). Each method mutates its arguments in place and returns
-/// nothing; the returned future borrows the arguments for `'a`, so
+/// carina#3112). Each method mutates its arguments in place and returns a
+/// [`ProviderResult`] so boundary and provider failures cannot be silently
+/// converted into unnormalized values. The returned future borrows the arguments for `'a`, so
 /// callers must `.await` it before the borrow ends (they always do —
 /// the futures are never run concurrently).
 pub trait ProviderNormalizer: Send + Sync {
@@ -962,7 +963,10 @@ pub trait ProviderNormalizer: Send + Sync {
     /// `Tier.advanced` into fully-qualified DSL format like
     /// `awscc.ec2_ipam.Tier.advanced` based on schema definitions.
     /// Providers without enum types return [`ready_noop`].
-    fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()>;
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [Resource],
+    ) -> BoxFuture<'a, ProviderResult<()>>;
 
     /// Normalize current state values before diffing.
     ///
@@ -975,7 +979,7 @@ pub trait ProviderNormalizer: Send + Sync {
     fn normalize_state<'a>(
         &'a self,
         current_states: &'a mut HashMap<ResourceId, State>,
-    ) -> BoxFuture<'a, ()>;
+    ) -> BoxFuture<'a, ProviderResult<()>>;
 
     /// Hydrate read state with saved attributes that APIs don't return.
     ///
@@ -988,7 +992,7 @@ pub trait ProviderNormalizer: Send + Sync {
         &'a self,
         current_states: &'a mut HashMap<ResourceId, State>,
         saved_attrs: &'a SavedAttrs,
-    ) -> BoxFuture<'a, ()>;
+    ) -> BoxFuture<'a, ProviderResult<()>>;
 
     /// Merge default tags from provider configuration into resources that support tags.
     ///
@@ -1009,21 +1013,24 @@ pub trait ProviderNormalizer: Send + Sync {
         resources: &'a mut [Resource],
         default_tags: &'a IndexMap<String, Value>,
         registry: &'a SchemaRegistry,
-    ) -> BoxFuture<'a, ()>;
+    ) -> BoxFuture<'a, ProviderResult<()>>;
 }
 
 /// A no-op normalizer for providers that don't need plan-time normalization.
 #[derive(Debug, Clone, Copy)]
 pub struct NoopNormalizer;
 impl ProviderNormalizer for NoopNormalizer {
-    fn normalize_desired<'a>(&'a self, _resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+    fn normalize_desired<'a>(
+        &'a self,
+        _resources: &'a mut [Resource],
+    ) -> BoxFuture<'a, ProviderResult<()>> {
         ready_noop()
     }
 
     fn normalize_state<'a>(
         &'a self,
         _current_states: &'a mut HashMap<ResourceId, State>,
-    ) -> BoxFuture<'a, ()> {
+    ) -> BoxFuture<'a, ProviderResult<()>> {
         ready_noop()
     }
 
@@ -1031,7 +1038,7 @@ impl ProviderNormalizer for NoopNormalizer {
         &'a self,
         _current_states: &'a mut HashMap<ResourceId, State>,
         _saved_attrs: &'a SavedAttrs,
-    ) -> BoxFuture<'a, ()> {
+    ) -> BoxFuture<'a, ProviderResult<()>> {
         ready_noop()
     }
 
@@ -1040,7 +1047,7 @@ impl ProviderNormalizer for NoopNormalizer {
         _resources: &'a mut [Resource],
         _default_tags: &'a IndexMap<String, Value>,
         _registry: &'a SchemaRegistry,
-    ) -> BoxFuture<'a, ()> {
+    ) -> BoxFuture<'a, ProviderResult<()>> {
         ready_noop()
     }
 }
@@ -1126,7 +1133,7 @@ pub fn merge_default_tags_for_provider(
 ///   `directives { provider = <name> }`.
 pub struct ProviderRouter {
     providers: HashMap<(String, Option<String>), Box<dyn Provider>>,
-    normalizers: Vec<Box<dyn ProviderNormalizer>>,
+    normalizers: Vec<(String, Box<dyn ProviderNormalizer>)>,
 }
 
 impl Default for ProviderRouter {
@@ -1161,8 +1168,12 @@ impl ProviderRouter {
         self.providers.insert((kind, binding), provider);
     }
 
-    pub fn add_normalizer(&mut self, ext: Box<dyn ProviderNormalizer>) {
-        self.normalizers.push(ext);
+    pub fn add_normalizer(
+        &mut self,
+        provider_name: impl Into<String>,
+        ext: Box<dyn ProviderNormalizer>,
+    ) {
+        self.normalizers.push((provider_name.into(), ext));
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1245,41 +1256,52 @@ impl Provider for ProviderRouter {
         }
     }
 
-    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> Vec<String> {
-        match self.get_provider_or_error(id) {
-            Ok(provider) => provider.required_permissions(id, op),
-            Err(_) => Vec::new(),
-        }
+    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> ProviderResult<Vec<String>> {
+        self.get_provider_or_error(id)?
+            .required_permissions(id, op)
+            .map_err(|error| error.for_provider(id.provider.clone()))
     }
 
-    fn satisfier_hint(&self, target_id: &ResourceId, attr_path: &AttrPath) -> Vec<BindingPattern> {
-        match self.get_provider_or_error(target_id) {
-            Ok(provider) => provider.satisfier_hint(target_id, attr_path),
-            Err(_) => Vec::new(),
-        }
+    fn satisfier_hint(
+        &self,
+        target_id: &ResourceId,
+        attr_path: &AttrPath,
+    ) -> ProviderResult<Vec<BindingPattern>> {
+        self.get_provider_or_error(target_id)?
+            .satisfier_hint(target_id, attr_path)
+            .map_err(|error| error.for_provider(target_id.provider.clone()))
     }
 }
 
 impl ProviderNormalizer for ProviderRouter {
-    fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [Resource],
+    ) -> BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
             // Sequential, never concurrent: normalizers are not
             // commutative, and `resources` is re-borrowed per iteration
             // across the `.await`.
-            for ext in &self.normalizers {
-                ext.normalize_desired(resources).await;
+            for (provider_name, ext) in &self.normalizers {
+                ext.normalize_desired(resources)
+                    .await
+                    .map_err(|error| error.for_provider(provider_name.clone()))?;
             }
+            Ok(())
         })
     }
 
     fn normalize_state<'a>(
         &'a self,
         current_states: &'a mut HashMap<ResourceId, State>,
-    ) -> BoxFuture<'a, ()> {
+    ) -> BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
-            for ext in &self.normalizers {
-                ext.normalize_state(current_states).await;
+            for (provider_name, ext) in &self.normalizers {
+                ext.normalize_state(current_states)
+                    .await
+                    .map_err(|error| error.for_provider(provider_name.clone()))?;
             }
+            Ok(())
         })
     }
 
@@ -1287,11 +1309,14 @@ impl ProviderNormalizer for ProviderRouter {
         &'a self,
         current_states: &'a mut HashMap<ResourceId, State>,
         saved_attrs: &'a SavedAttrs,
-    ) -> BoxFuture<'a, ()> {
+    ) -> BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
-            for ext in &self.normalizers {
-                ext.hydrate_read_state(current_states, saved_attrs).await;
+            for (provider_name, ext) in &self.normalizers {
+                ext.hydrate_read_state(current_states, saved_attrs)
+                    .await
+                    .map_err(|error| error.for_provider(provider_name.clone()))?;
             }
+            Ok(())
         })
     }
 
@@ -1300,12 +1325,14 @@ impl ProviderNormalizer for ProviderRouter {
         resources: &'a mut [Resource],
         default_tags: &'a IndexMap<String, Value>,
         registry: &'a SchemaRegistry,
-    ) -> BoxFuture<'a, ()> {
+    ) -> BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
-            for ext in &self.normalizers {
+            for (provider_name, ext) in &self.normalizers {
                 ext.merge_default_tags(resources, default_tags, registry)
-                    .await;
+                    .await
+                    .map_err(|error| error.for_provider(provider_name.clone()))?;
             }
+            Ok(())
         })
     }
 }
@@ -1375,15 +1402,15 @@ pub trait ProviderFactory: Send + Sync {
     /// Create a normalizer instance from configuration attributes.
     ///
     /// `binding` semantics match [`create_provider`]: `Some(name)` for
-    /// a named instance, `None` for the kind's default. Returns a
-    /// [`NoopNormalizer`] by default. Providers that need plan-time
-    /// normalization or state hydration should override this.
+    /// a named instance, `None` for the kind's default. Returns an explicit
+    /// [`NoopNormalizer`] by default. Provider and boundary failures must be
+    /// returned rather than replaced with a no-op implementation.
     fn create_normalizer(
         &self,
         _binding: Option<&str>,
         _attributes: &IndexMap<String, Value>,
-    ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
-        Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
+        Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
 
     /// Get all resource schemas for this provider.
@@ -1668,11 +1695,15 @@ impl Provider for Box<dyn Provider> {
         (**self).delete(id, identifier, request)
     }
 
-    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> Vec<String> {
+    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> ProviderResult<Vec<String>> {
         (**self).required_permissions(id, op)
     }
 
-    fn satisfier_hint(&self, target_id: &ResourceId, attr_path: &AttrPath) -> Vec<BindingPattern> {
+    fn satisfier_hint(
+        &self,
+        target_id: &ResourceId,
+        attr_path: &AttrPath,
+    ) -> ProviderResult<Vec<BindingPattern>> {
         (**self).satisfier_hint(target_id, attr_path)
     }
 }
@@ -2105,8 +2136,12 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
-        fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
-            Vec::new()
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: PlanOp,
+        ) -> ProviderResult<Vec<String>> {
+            Ok(Vec::new())
         }
     }
 
@@ -2201,7 +2236,9 @@ mod tests {
         let provider = MockProvider;
         let id = ResourceId::with_identity("test", "example");
         assert_eq!(
-            provider.satisfier_hint(&id, &AttrPath::single("status")),
+            provider
+                .satisfier_hint(&id, &AttrPath::single("status"))
+                .expect("the default satisfier hint should succeed"),
             Vec::new()
         );
     }
@@ -2274,8 +2311,12 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
-        fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
-            Vec::new()
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: PlanOp,
+        ) -> ProviderResult<Vec<String>> {
+            Ok(Vec::new())
         }
     }
 
@@ -2387,6 +2428,54 @@ mod tests {
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
         let state = router.read(&id, None, ReadRequest).await.unwrap();
         assert!(!state.exists);
+    }
+
+    #[tokio::test]
+    async fn provider_router_attaches_provider_context_to_normalizer_errors() {
+        struct FailingNormalizer;
+
+        impl ProviderNormalizer for FailingNormalizer {
+            fn normalize_desired<'a>(
+                &'a self,
+                _resources: &'a mut [Resource],
+            ) -> BoxFuture<'a, ProviderResult<()>> {
+                ready_noop()
+            }
+
+            fn normalize_state<'a>(
+                &'a self,
+                _current_states: &'a mut HashMap<ResourceId, State>,
+            ) -> BoxFuture<'a, ProviderResult<()>> {
+                Box::pin(async { Err(ProviderError::internal("normalization failed")) })
+            }
+
+            fn hydrate_read_state<'a>(
+                &'a self,
+                _current_states: &'a mut HashMap<ResourceId, State>,
+                _saved_attrs: &'a SavedAttrs,
+            ) -> BoxFuture<'a, ProviderResult<()>> {
+                ready_noop()
+            }
+
+            fn merge_default_tags<'a>(
+                &'a self,
+                _resources: &'a mut [Resource],
+                _default_tags: &'a IndexMap<String, Value>,
+                _registry: &'a SchemaRegistry,
+            ) -> BoxFuture<'a, ProviderResult<()>> {
+                ready_noop()
+            }
+        }
+
+        let mut router = ProviderRouter::new();
+        router.add_normalizer("awscc", Box::new(FailingNormalizer));
+
+        let error = router
+            .normalize_state(&mut HashMap::new())
+            .await
+            .expect_err("normalizer failure must propagate");
+
+        assert_eq!(error.detail().provider_name.as_deref(), Some("awscc"));
     }
 
     #[tokio::test]
@@ -2934,8 +3023,12 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
-        fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
-            Vec::new()
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: PlanOp,
+        ) -> ProviderResult<Vec<String>> {
+            Ok(Vec::new())
         }
     }
 
@@ -3143,7 +3236,10 @@ mod tests {
         struct SchemaOnlyProvider;
 
         impl ProviderNormalizer for SchemaOnlyProvider {
-            fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+            fn normalize_desired<'a>(
+                &'a self,
+                resources: &'a mut [Resource],
+            ) -> BoxFuture<'a, ProviderResult<()>> {
                 Box::pin(async move {
                     // Prefix all string attribute values with "normalized:"
                     for resource in resources.iter_mut() {
@@ -3153,13 +3249,14 @@ mod tests {
                             }
                         }
                     }
+                    Ok(())
                 })
             }
 
             fn normalize_state<'a>(
                 &'a self,
                 _current_states: &'a mut HashMap<ResourceId, State>,
-            ) -> BoxFuture<'a, ()> {
+            ) -> BoxFuture<'a, ProviderResult<()>> {
                 ready_noop()
             }
 
@@ -3167,7 +3264,7 @@ mod tests {
                 &'a self,
                 states: &'a mut HashMap<ResourceId, State>,
                 saved: &'a SavedAttrs,
-            ) -> BoxFuture<'a, ()> {
+            ) -> BoxFuture<'a, ProviderResult<()>> {
                 Box::pin(async move {
                     for (id, saved_attrs) in saved {
                         if let Some(state) = states.get_mut(id) {
@@ -3179,6 +3276,7 @@ mod tests {
                             }
                         }
                     }
+                    Ok(())
                 })
             }
 
@@ -3187,7 +3285,7 @@ mod tests {
                 _resources: &'a mut [Resource],
                 _default_tags: &'a IndexMap<String, Value>,
                 _registry: &'a SchemaRegistry,
-            ) -> BoxFuture<'a, ()> {
+            ) -> BoxFuture<'a, ProviderResult<()>> {
                 ready_noop()
             }
         }
@@ -3198,7 +3296,7 @@ mod tests {
             "key",
             Value::Concrete(ConcreteValue::String("value".to_string())),
         )];
-        ext.normalize_desired(&mut resources).await;
+        ext.normalize_desired(&mut resources).await.unwrap();
         assert_eq!(
             resources[0].get_attr("key"),
             Some(&Value::Concrete(ConcreteValue::String(
@@ -3218,7 +3316,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("data".to_string())),
             )]),
         );
-        ext.hydrate_read_state(&mut states, &saved).await;
+        ext.hydrate_read_state(&mut states, &saved).await.unwrap();
         assert_eq!(
             states.get(&id).unwrap().attributes.get("restored"),
             Some(&Value::Concrete(ConcreteValue::String("data".to_string())))
@@ -3289,15 +3387,22 @@ mod tests {
                 Box::pin(async { Ok(()) })
             }
 
-            fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
-                Vec::new()
+            fn required_permissions(
+                &self,
+                _id: &ResourceId,
+                _op: PlanOp,
+            ) -> ProviderResult<Vec<String>> {
+                Ok(Vec::new())
             }
         }
 
         // Separate schema ext struct for the router
         struct TestNormalizer;
         impl ProviderNormalizer for TestNormalizer {
-            fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+            fn normalize_desired<'a>(
+                &'a self,
+                resources: &'a mut [Resource],
+            ) -> BoxFuture<'a, ProviderResult<()>> {
                 Box::pin(async move {
                     for resource in resources.iter_mut() {
                         if resource.id.provider == "normalizing" {
@@ -3308,13 +3413,14 @@ mod tests {
                             }
                         }
                     }
+                    Ok(())
                 })
             }
 
             fn normalize_state<'a>(
                 &'a self,
                 _current_states: &'a mut HashMap<ResourceId, State>,
-            ) -> BoxFuture<'a, ()> {
+            ) -> BoxFuture<'a, ProviderResult<()>> {
                 ready_noop()
             }
 
@@ -3322,7 +3428,7 @@ mod tests {
                 &'a self,
                 _current_states: &'a mut HashMap<ResourceId, State>,
                 _saved_attrs: &'a SavedAttrs,
-            ) -> BoxFuture<'a, ()> {
+            ) -> BoxFuture<'a, ProviderResult<()>> {
                 ready_noop()
             }
 
@@ -3331,14 +3437,14 @@ mod tests {
                 _resources: &'a mut [Resource],
                 _default_tags: &'a IndexMap<String, Value>,
                 _registry: &'a SchemaRegistry,
-            ) -> BoxFuture<'a, ()> {
+            ) -> BoxFuture<'a, ProviderResult<()>> {
                 ready_noop()
             }
         }
 
         let mut router = ProviderRouter::new();
         router.add_provider("normalizing".to_string(), Box::new(NormalizingProvider));
-        router.add_normalizer(Box::new(TestNormalizer));
+        router.add_normalizer("normalizing", Box::new(TestNormalizer));
 
         let mut resources = vec![
             Resource::with_provider("normalizing", "test", "example", None).with_attribute(
@@ -3346,7 +3452,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("val".to_string())),
             ),
         ];
-        router.normalize_desired(&mut resources).await;
+        router.normalize_desired(&mut resources).await.unwrap();
         assert_eq!(
             resources[0].get_attr("key"),
             Some(&Value::Concrete(ConcreteValue::String(

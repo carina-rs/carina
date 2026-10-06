@@ -736,8 +736,8 @@ impl Provider for MockProvider {
         })
     }
 
-    fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
-        Vec::new()
+    fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -858,7 +858,9 @@ mod tests {
         let provider = MockProvider::default();
         let id = ResourceId::with_provider_identity("mock", "foo", "example", None);
         assert_eq!(
-            provider.required_permissions(&id, carina_core::effect::PlanOp::Create),
+            provider
+                .required_permissions(&id, carina_core::effect::PlanOp::Create)
+                .expect("mock permissions should succeed"),
             Vec::<String>::new()
         );
     }

@@ -1,6 +1,6 @@
 //! WasmProviderFactory loads a WASM component and implements ProviderFactory.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -39,35 +39,90 @@ use crate::wasm_bindings::CarinaProvider;
 use crate::wasm_bindings_http::CarinaProviderWithHttp;
 use crate::{secret_seal, wasm_convert};
 
-/// Wrap a `SerializationError` from a sync `core_to_wit_*` call site
-/// into the matching async `BoxFuture` shape that `Provider` trait
-/// methods return. Pulls the `e.to_string()` allocation out of the
-/// async block so the future is `'static`.
-fn early_provider_err<T: 'static>(e: SerializationError) -> BoxFuture<'static, ProviderResult<T>> {
-    let msg = e.to_string();
-    Box::pin(async move { Err(ProviderError::internal(msg)) })
+/// Lift a `SerializationError` from a synchronous `core_to_wit_*` call into
+/// the async `BoxFuture` shape used by `Provider`, preserving its typed cause.
+fn early_provider_err<T: 'static>(
+    operation: &'static str,
+    error: SerializationError,
+) -> BoxFuture<'static, ProviderResult<T>> {
+    Box::pin(async move { Err(wasm_value_encode_provider_error(operation, error)) })
 }
 
-/// Unwrap a `core_to_wit_*` result that **must** succeed by invariant.
-/// `core_to_wit_*` rejects every `Value` variant the WASM provider
-/// boundary cannot serialize — `Unknown`, `ResourceRef`,
-/// `Interpolation`, and `FunctionCall`. State and saved attrs are
-/// post-apply concrete values, and `normalize_desired` runs after
-/// `PlanPreprocessor::prepare`'s strip-and-restore pass, so reaching
-/// any of these arms is a producer-side bug. Embeds the failing
-/// `SerializationError` in the panic message so the regression
-/// surfaces with the actual variant + context.
-fn expect_unresolvable_absent<T>(r: Result<T, SerializationError>, what: &'static str) -> T {
-    r.unwrap_or_else(|e| panic!("{what} must not see an unserializable Value ({e})"))
+fn wasm_value_decode_provider_error<E>(operation: &'static str, error: E) -> ProviderError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    ProviderError::internal(format!(
+        "WASM provider returned an invalid boundary value during {operation}"
+    ))
+    .with_cause(error)
+}
+
+fn wasm_value_encode_provider_error<E>(operation: &'static str, error: E) -> ProviderError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    ProviderError::internal(format!(
+        "failed to encode a WASM provider boundary value during {operation}"
+    ))
+    .with_cause(error)
+}
+
+#[derive(Debug)]
+struct WasmGuestCallError {
+    source: wasmtime::Error,
+}
+
+impl fmt::Display for WasmGuestCallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WASM guest call failed")
+    }
+}
+
+impl std::error::Error for WasmGuestCallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WasmTrapContext {
+    ProviderOperation,
+    Normalizer,
+}
+
+fn wasm_trap_provider_error(
+    operation: &'static str,
+    error: wasmtime::Error,
+    context: WasmTrapContext,
+) -> ProviderError {
+    let timed_out = error.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::Interrupt);
+    let cause = WasmGuestCallError { source: error };
+    if timed_out {
+        let credential_hint = match context {
+            WasmTrapContext::ProviderOperation => " (check AWS credentials)",
+            WasmTrapContext::Normalizer => "",
+        };
+        ProviderError::timeout(format!(
+            "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in {operation}{credential_hint}"
+        ))
+        .with_cause(cause)
+    } else {
+        let message = format!("WASM trap in {operation}");
+        ProviderError::internal(message).with_cause(cause)
+    }
 }
 
 fn provider_schema_decode_error(
     provider_name: &str,
     provider_version: &str,
     detail: wasm_convert::SchemaDecodeError,
-) -> String {
-    format!(
-        "provider '{provider_name}' {provider_version} emitted schema metadata this host cannot decode: {detail}; the provider revision may predate this host"
+) -> WasmProviderLoadError {
+    WasmProviderLoadError::metadata(
+        format!(
+            "provider '{provider_name}' {provider_version} emitted schema metadata this host cannot decode; the provider revision may predate this host"
+        ),
+        detail,
     )
 }
 
@@ -441,6 +496,11 @@ pub enum WasmProviderLoadError {
     PrecompiledDeserialization(PrecompiledComponentDeserializationError),
     /// The component could not be instantiated as a Carina provider.
     Instantiation(ProviderInstantiationError),
+    /// A provider metadata export trapped or returned malformed data.
+    Metadata {
+        context: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// Any other engine, component-load, or provider bring-up failure.
     Other(String),
 }
@@ -450,12 +510,45 @@ impl fmt::Display for WasmProviderLoadError {
         match self {
             WasmProviderLoadError::PrecompiledDeserialization(error) => error.fmt(f),
             WasmProviderLoadError::Instantiation(error) => error.fmt(f),
+            WasmProviderLoadError::Metadata { context, source } => {
+                // ProviderArtifactLoadError is the terminal rendering surface
+                // and does not walk `source()`, so render this typed chain once
+                // here while still exposing it through Error::source.
+                write!(f, "{context}")?;
+                let mut current: Option<&(dyn std::error::Error + 'static)> = Some(source.as_ref());
+                while let Some(error) = current {
+                    write!(f, ": {error}")?;
+                    current = error.source();
+                }
+                Ok(())
+            }
             WasmProviderLoadError::Other(message) => f.write_str(message),
         }
     }
 }
 
-impl std::error::Error for WasmProviderLoadError {}
+impl std::error::Error for WasmProviderLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WasmProviderLoadError::Metadata { source, .. } => Some(source.as_ref()),
+            WasmProviderLoadError::PrecompiledDeserialization(_)
+            | WasmProviderLoadError::Instantiation(_)
+            | WasmProviderLoadError::Other(_) => None,
+        }
+    }
+}
+
+impl WasmProviderLoadError {
+    fn metadata(
+        context: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Metadata {
+            context: context.into(),
+            source: Box::new(source),
+        }
+    }
+}
 
 impl From<ProviderInstantiationError> for WasmProviderLoadError {
     fn from(error: ProviderInstantiationError) -> Self {
@@ -666,11 +759,6 @@ impl Drop for EpochTicker {
     }
 }
 
-/// Returns `true` if the error message looks like a wasmtime epoch interruption trap.
-fn is_epoch_trap_message(msg: &str) -> bool {
-    msg.contains("interrupt") || msg.contains("epoch")
-}
-
 /// Wall-clock backstop for a single WASM provider operation.
 ///
 /// Epoch interruption ([`WASM_OPERATION_TIMEOUT_SECS`] via
@@ -712,14 +800,52 @@ const WASM_OPERATION_HARD_TIMEOUT: std::time::Duration = std::time::Duration::fr
 
 /// If `poisoned` is set, return the fail-fast error a poisoned instance
 /// must give for `operation`; otherwise `None` and the caller may proceed.
-fn poisoned_guard(poisoned: &AtomicBool, operation: &str) -> Option<ProviderError> {
-    poisoned.load(Ordering::Acquire).then(|| {
-        ProviderError::internal(format!(
+/// Component traps retain their originating operation and top-level cause;
+/// cancellation/timeouts retain the legacy generic diagnostic.
+fn poisoned_guard(
+    poisoned: &AtomicBool,
+    poisoned_reason: &OnceLock<String>,
+    operation: &str,
+) -> Option<ProviderError> {
+    if !poisoned.load(Ordering::Acquire) {
+        return None;
+    }
+
+    Some(match poisoned_reason.get() {
+        Some(reason) => ProviderError::internal(format!(
+            "{reason} (operation '{operation}'); re-run the command"
+        )),
+        None => ProviderError::internal(format!(
             "WASM provider is unusable: a prior operation timed out and left \
              the plugin instance in an undefined state (operation \
              '{operation}'); re-run the command"
-        ))
+        )),
     })
+}
+
+fn poison_after_trap(
+    poisoned: &AtomicBool,
+    poisoned_reason: &OnceLock<String>,
+    operation: &'static str,
+    error: &wasmtime::Error,
+) {
+    let root_cause = error.root_cause().to_string();
+    let root_cause = root_cause.lines().next().unwrap_or("unknown WASM trap");
+    let cause = match error.downcast_ref::<wasmtime::Trap>() {
+        Some(trap) => {
+            let trap = trap.to_string();
+            if trap == root_cause {
+                trap
+            } else {
+                format!("{trap}: {root_cause}")
+            }
+        }
+        None => root_cause.to_string(),
+    };
+    let _ = poisoned_reason.set(format!(
+        "WASM provider instance unusable after trap in {operation}: {cause}"
+    ));
+    poisoned.store(true, Ordering::Release);
 }
 
 /// Run `op` against `instance` under [`WASM_OPERATION_HARD_TIMEOUT`].
@@ -727,9 +853,9 @@ fn poisoned_guard(poisoned: &AtomicBool, operation: &str) -> Option<ProviderErro
 /// `operation` names the call for the error message (e.g. `"create"`).
 ///
 /// Three outcomes:
-/// - `instance` already poisoned by a prior timeout → fail fast without
-///   touching the store (a cancelled wasmtime async call leaves the
-///   shared `Store` unreusable; see [`SharedWasmInstance::poisoned`]).
+/// - `instance` already poisoned by a prior timeout/cancellation or component
+///   trap → fail fast without touching the store (either leaves the shared
+///   component instance unreusable; see [`SharedWasmInstance::poisoned`]).
 /// - `op` completes within budget → its result, untouched.
 /// - the deadline elapses → `op` is dropped; the poisoning is done by
 ///   [`LockedStore`]'s drop while it still holds the store lock (not
@@ -740,7 +866,7 @@ async fn with_operation_timeout<T>(
     operation: &str,
     op: impl std::future::Future<Output = ProviderResult<T>>,
 ) -> ProviderResult<T> {
-    if let Some(err) = poisoned_guard(&instance.poisoned, operation) {
+    if let Some(err) = poisoned_guard(&instance.poisoned, &instance.poisoned_reason, operation) {
         return Err(err);
     }
     match tokio::time::timeout(WASM_OPERATION_HARD_TIMEOUT, op).await {
@@ -764,8 +890,8 @@ async fn with_operation_timeout<T>(
 /// **while the store `Mutex` is still held**, closing the window where a
 /// sibling operation already queued on the lock could otherwise acquire
 /// the freed-but-not-yet-flagged store and call into the unusable
-/// wasmtime `Store` (carina#3106). A normal completion calls
-/// [`disarm`](Self::disarm) so a successful op does not poison.
+/// wasmtime `Store` (carina#3106). A returned guest call is disarmed; returned
+/// component traps are then poisoned explicitly with their origin preserved.
 struct LockedStore<'a> {
     poison: PoisonOnDrop<'a>,
     store: tokio::sync::MutexGuard<'a, Store<HostState>>,
@@ -789,15 +915,15 @@ impl Drop for PoisonOnDrop<'_> {
 impl<'a> LockedStore<'a> {
     /// Acquire the store lock for `operation`, re-checking the poison
     /// flag *after* the lock is held (an op queued on the `Mutex` when a
-    /// sibling timed out passed [`with_operation_timeout`]'s pre-flight
-    /// check while the flag was still clear), then arm the epoch
-    /// deadline.
+    /// sibling poisoned the instance passed an earlier pre-flight check while
+    /// the flag was still clear), then arm the epoch deadline.
     async fn acquire(
         instance: &'a SharedWasmInstance,
         operation: &str,
     ) -> ProviderResult<LockedStore<'a>> {
         let mut store = instance.store.lock().await;
-        if let Some(err) = poisoned_guard(&instance.poisoned, operation) {
+        if let Some(err) = poisoned_guard(&instance.poisoned, &instance.poisoned_reason, operation)
+        {
             return Err(err);
         }
         store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
@@ -810,8 +936,9 @@ impl<'a> LockedStore<'a> {
         })
     }
 
-    /// The guest call completed (success *or* a clean provider error, not
-    /// a cancellation); do not poison the instance.
+    /// The guest call returned rather than being cancelled. Disable automatic
+    /// cancellation poisoning; a caller handling a returned component trap can
+    /// still mark the instance explicitly before releasing the store lock.
     fn disarm(&mut self) {
         self.poison.armed = false;
     }
@@ -1883,16 +2010,17 @@ fn create_instance_auto<'a>(
 struct SharedWasmInstance {
     store: Mutex<Store<HostState>>,
     bindings: WasmBindings,
-    /// Set once an operation against this instance times out. A
-    /// `tokio::time::timeout` that fires drops the in-flight future while
-    /// it is suspended *inside* a `wasmtime` async call; that does not
-    /// unwind the WASM guest, so the shared `Store` is left holding a
-    /// half-executed call frame. wasmtime does not guarantee such a
-    /// `Store` is reusable, so once this is set every subsequent
-    /// operation fails fast with a clear error instead of touching the
-    /// poisoned store and producing silent, non-deterministic corruption
-    /// across the remaining resources in the plan/apply (carina#3106).
+    /// Set once a timeout/cancellation or a component trap leaves the shared
+    /// component instance unusable. Once set, every subsequent operation fails
+    /// fast instead of touching the instance and producing a secondary,
+    /// misleading trap or silent corruption across the remaining resources in
+    /// the plan/apply (carina#3106).
     poisoned: AtomicBool,
+    /// Stable diagnostic for a trap that made the component instance
+    /// non-reentrant. Timeouts retain the legacy generic poisoned message;
+    /// component traps record their originating operation and cause so a
+    /// later CRUD call cannot misattribute the failure to itself.
+    poisoned_reason: OnceLock<String>,
 }
 
 // Safety: The Store is behind a Mutex, so concurrent access is serialized.
@@ -1907,6 +2035,9 @@ enum CachedComponentAcquisition {
     Miss,
 }
 
+type ProviderConfigCompletions = HashMap<String, Vec<CompletionValue>>;
+type ProviderEnumAliases = HashMap<String, HashMap<String, HashMap<String, String>>>;
+
 pub struct WasmProviderFactory {
     engine: Engine,
     component: Component,
@@ -1916,9 +2047,9 @@ pub struct WasmProviderFactory {
     display_name: String,
     version: String,
     schemas: Vec<ResourceSchema>,
-    cached_config_completions: HashMap<String, Vec<CompletionValue>>,
+    cached_config_completions: ProviderConfigCompletions,
     cached_identity_attributes: Vec<String>,
-    cached_enum_aliases: HashMap<String, HashMap<String, HashMap<String, String>>>,
+    cached_enum_aliases: ProviderEnumAliases,
     /// Provider config attribute types (e.g., `region` → `AttributeType::Enum`).
     /// Used by `ProviderFactory::provider_config_attribute_types()` so the host
     /// validates provider attributes against these types using its own carina-core,
@@ -1947,6 +2078,68 @@ pub struct WasmProviderFactory {
     _epoch_ticker: EpochTicker,
 }
 
+#[derive(Debug)]
+struct WasmMetadataCallError {
+    source: wasmtime::Error,
+}
+
+impl fmt::Display for WasmMetadataCallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl std::error::Error for WasmMetadataCallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        let source: &(dyn std::error::Error + 'static) = self.source.as_ref();
+        source.source()
+    }
+}
+
+fn metadata_call_error(
+    provider_name: &str,
+    provider_version: &str,
+    export: &'static str,
+    source: wasmtime::Error,
+) -> WasmProviderLoadError {
+    WasmProviderLoadError::metadata(
+        format!(
+            "provider '{provider_name}' {provider_version} failed to call metadata export {export}"
+        ),
+        WasmMetadataCallError { source },
+    )
+}
+
+fn decode_config_completions_json(
+    json: &str,
+    provider_name: &str,
+    provider_version: &str,
+) -> Result<ProviderConfigCompletions, WasmProviderLoadError> {
+    serde_json::from_str(json).map_err(|source| {
+        WasmProviderLoadError::metadata(
+            format!(
+                "provider '{provider_name}' {provider_version} emitted malformed provider config completions JSON"
+            ),
+            source,
+        )
+    })
+}
+
+fn decode_enum_aliases_json(
+    json: &str,
+    provider_name: &str,
+    provider_version: &str,
+) -> Result<ProviderEnumAliases, WasmProviderLoadError> {
+    serde_json::from_str(json).map_err(|source| {
+        WasmProviderLoadError::metadata(
+            format!(
+                "provider '{provider_name}' {provider_version} emitted malformed enum aliases JSON"
+            ),
+            source,
+        )
+    })
+}
+
 impl WasmProviderFactory {
     /// Compute the default cache directory (`~/.carina/cache/`).
     /// Returns `None` if the home directory cannot be determined.
@@ -1954,8 +2147,10 @@ impl WasmProviderFactory {
         dirs::home_dir().map(|h| h.join(".carina").join("cache"))
     }
 
-    /// Load provider metadata from WIT functions. Optional endpoints still default on call/JSON
-    /// failures, but type decode failures are reported with provider context.
+    /// Load provider metadata from WIT functions.
+    ///
+    /// Every export and decode is required to succeed. Substituting empty
+    /// metadata here changes provider behavior, including resource identity.
     async fn load_metadata(
         bindings: &WasmBindings,
         store: &mut Store<HostState>,
@@ -1963,39 +2158,73 @@ impl WasmProviderFactory {
         provider_version: &str,
     ) -> Result<
         (
-            HashMap<String, Vec<CompletionValue>>,
+            ProviderConfigCompletions,
             Vec<String>,
-            HashMap<String, HashMap<String, HashMap<String, String>>>,
+            ProviderEnumAliases,
             HashMap<String, carina_core::schema::AttributeType>,
         ),
-        String,
+        WasmProviderLoadError,
     > {
         let config_completions_json = bindings
             .call_provider_config_completions(store)
             .await
-            .unwrap_or_else(|_| "{}".to_string());
-        let config_completions: HashMap<String, Vec<CompletionValue>> =
-            serde_json::from_str(&config_completions_json).unwrap_or_default();
+            .map_err(|source| {
+                metadata_call_error(
+                    provider_name,
+                    provider_version,
+                    "provider-config-completions",
+                    source,
+                )
+            })?;
+        let config_completions = decode_config_completions_json(
+            &config_completions_json,
+            provider_name,
+            provider_version,
+        )?;
 
-        let identity_attributes = bindings
-            .call_identity_attributes(store)
-            .await
-            .unwrap_or_default();
+        let identity_attributes =
+            bindings
+                .call_identity_attributes(store)
+                .await
+                .map_err(|source| {
+                    metadata_call_error(
+                        provider_name,
+                        provider_version,
+                        "identity-attributes",
+                        source,
+                    )
+                })?;
 
         let enum_aliases_json = bindings
             .call_get_enum_aliases(store)
             .await
-            .unwrap_or_else(|_| "{}".to_string());
-        let enum_aliases: HashMap<String, HashMap<String, HashMap<String, String>>> =
-            serde_json::from_str(&enum_aliases_json).unwrap_or_default();
+            .map_err(|source| {
+                metadata_call_error(provider_name, provider_version, "get-enum-aliases", source)
+            })?;
+        let enum_aliases =
+            decode_enum_aliases_json(&enum_aliases_json, provider_name, provider_version)?;
 
         let provider_config_types_json = bindings
             .call_provider_config_attribute_types(store)
             .await
-            .unwrap_or_else(|_| "{}".to_string());
+            .map_err(|source| {
+                metadata_call_error(
+                    provider_name,
+                    provider_version,
+                    "provider-config-attribute-types",
+                    source,
+                )
+            })?;
         let provider_config_types =
             wasm_convert::json_to_attribute_types(&provider_config_types_json)
-                .map_err(|e| provider_schema_decode_error(provider_name, provider_version, e))?;
+                .map_err(|source| {
+                    WasmProviderLoadError::metadata(
+                        format!(
+                            "provider '{provider_name}' {provider_version} emitted provider config attribute types this host cannot decode"
+                        ),
+                        source,
+                    )
+                })?;
 
         Ok((
             config_completions,
@@ -2125,7 +2354,10 @@ impl WasmProviderFactory {
             .await
             .map_err(|e| format!("Failed to call schemas(): {e}"))?;
 
-        let (name, display_name, version) = wasm_convert::json_to_provider_info(&info_json);
+        let (name, display_name, version) = wasm_convert::json_to_provider_info(&info_json)
+            .map_err(|source| {
+                WasmProviderLoadError::metadata("Failed to decode provider info", source)
+            })?;
         let schemas: Vec<ResourceSchema> = wasm_convert::json_to_schemas(&schemas_json)
             .map_err(|e| provider_schema_decode_error(&name, &version, e))?;
 
@@ -2349,6 +2581,7 @@ impl WasmProviderFactory {
             store: Mutex::new(store),
             bindings,
             poisoned: AtomicBool::new(false),
+            poisoned_reason: OnceLock::new(),
         });
         guard.insert(key, Arc::clone(&instance));
         Ok(instance)
@@ -2508,23 +2741,17 @@ impl ProviderFactory for WasmProviderFactory {
         &self,
         binding: Option<&str>,
         attributes: &IndexMap<String, Value>,
-    ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         let attrs = attributes.clone();
         let binding = binding.map(|s| s.to_string());
         Box::pin(async move {
-            match self
+            let instance = self
                 .get_or_create_shared_instance(binding.as_deref(), &attrs)
                 .await
-            {
-                Ok(instance) => {
-                    Box::new(WasmProviderNormalizer { instance }) as Box<dyn ProviderNormalizer>
-                }
-                Err(error) => {
-                    let error = error.into_provider_error_with(&self.instantiation_error_mapper);
-                    log::error!("Failed to create WASM normalizer instance: {error}");
-                    Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>
-                }
-            }
+                .map_err(|error| {
+                    error.into_provider_error_with(&self.instantiation_error_mapper)
+                })?;
+            Ok(Box::new(WasmProviderNormalizer { instance }) as Box<dyn ProviderNormalizer>)
         })
     }
 
@@ -2567,23 +2794,19 @@ impl Provider for WasmProvider {
                 .bindings
                 .call_read(locked.store(), &wit_id, identifier.as_deref(), wit_request)
                 .await;
-            // The guest call returned (success or trap, not a
-            // cancellation): the store is in a defined state, so do not
-            // poison it.
-            locked.disarm();
-            let result = call.map_err(|e| {
-                let msg = format!("{e}");
-                if is_epoch_trap_message(&msg) {
-                    ProviderError::timeout(format!(
-                        "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in read \
-                         (check AWS credentials)"
-                    ))
-                } else {
-                    ProviderError::internal(format!("WASM trap in read: {e}"))
-                }
-            })?;
+            let result = finish_guest_call(
+                &self.instance,
+                "read",
+                WasmTrapContext::ProviderOperation,
+                &mut locked,
+                call,
+            )?;
             match result {
-                Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
+                Ok(wit_state) => {
+                    wasm_convert::wit_to_core_state(&wit_state, &id).map_err(|error| {
+                        wasm_value_decode_provider_error("read", error).for_resource(id.clone())
+                    })
+                }
                 Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
             }
         }))
@@ -2595,7 +2818,7 @@ impl Provider for WasmProvider {
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let wit_resource = match wasm_convert::core_data_source_to_wit_resource(resource) {
             Ok(v) => v,
-            Err(e) => return early_provider_err(e),
+            Err(e) => return early_provider_err("read_data_source", e),
         };
         let id = resource.id.clone();
         Box::pin(with_operation_timeout(
@@ -2608,20 +2831,20 @@ impl Provider for WasmProvider {
                     .bindings
                     .call_read_data_source(locked.store(), &wit_resource)
                     .await;
-                locked.disarm();
-                let result = call.map_err(|e| {
-                    let msg = format!("{e}");
-                    if is_epoch_trap_message(&msg) {
-                        ProviderError::timeout(format!(
-                            "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in \
-                             read_data_source (check AWS credentials)"
-                        ))
-                    } else {
-                        ProviderError::internal(format!("WASM trap in read_data_source: {e}"))
-                    }
-                })?;
+                let result = finish_guest_call(
+                    &self.instance,
+                    "read_data_source",
+                    WasmTrapContext::ProviderOperation,
+                    &mut locked,
+                    call,
+                )?;
                 match result {
-                    Ok(wit_state) => Ok(wasm_convert::wit_to_core_state(&wit_state, &id)),
+                    Ok(wit_state) => {
+                        wasm_convert::wit_to_core_state(&wit_state, &id).map_err(|error| {
+                            wasm_value_decode_provider_error("read_data_source", error)
+                                .for_resource(id.clone())
+                        })
+                    }
                     Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
                 }
             },
@@ -2636,7 +2859,7 @@ impl Provider for WasmProvider {
         let wit_id = wasm_convert::core_to_wit_resource_id(id);
         let wit_request = match wasm_convert::core_to_wit_create_request(&request) {
             Ok(v) => v,
-            Err(e) => return early_provider_err(e),
+            Err(e) => return early_provider_err("create", e),
         };
         let id = id.clone();
         Box::pin(with_operation_timeout(
@@ -2649,22 +2872,19 @@ impl Provider for WasmProvider {
                     .bindings
                     .call_create(locked.store(), &wit_id, &wit_request)
                     .await;
-                locked.disarm();
-                let result = call.map_err(|e| {
-                    let msg = format!("{e}");
-                    if is_epoch_trap_message(&msg) {
-                        ProviderError::timeout(format!(
-                            "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in create \
-                             (check AWS credentials)"
-                        ))
-                    } else {
-                        ProviderError::internal(format!("WASM trap in create: {e}"))
-                    }
-                })?;
+                let result = finish_guest_call(
+                    &self.instance,
+                    "create",
+                    WasmTrapContext::ProviderOperation,
+                    &mut locked,
+                    call,
+                )?;
                 match result {
-                    Ok(wit_outcome) => {
-                        Ok(wasm_convert::wit_to_core_create_outcome(wit_outcome, &id))
-                    }
+                    Ok(wit_outcome) => wasm_convert::wit_to_core_create_outcome(wit_outcome, &id)
+                        .map_err(|error| {
+                            wasm_value_decode_provider_error("create", error)
+                                .for_resource(id.clone())
+                        }),
                     Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
                 }
             },
@@ -2681,7 +2901,7 @@ impl Provider for WasmProvider {
         let identifier = identifier.to_string();
         let wit_request = match wasm_convert::core_to_wit_update_request(&request) {
             Ok(v) => v,
-            Err(e) => return early_provider_err(e),
+            Err(e) => return early_provider_err("update", e),
         };
         let id = id.clone();
         Box::pin(with_operation_timeout(
@@ -2694,22 +2914,19 @@ impl Provider for WasmProvider {
                     .bindings
                     .call_update(locked.store(), &wit_id, &identifier, &wit_request)
                     .await;
-                locked.disarm();
-                let result = call.map_err(|e| {
-                    let msg = format!("{e}");
-                    if is_epoch_trap_message(&msg) {
-                        ProviderError::timeout(format!(
-                            "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in update \
-                             (check AWS credentials)"
-                        ))
-                    } else {
-                        ProviderError::internal(format!("WASM trap in update: {e}"))
-                    }
-                })?;
+                let result = finish_guest_call(
+                    &self.instance,
+                    "update",
+                    WasmTrapContext::ProviderOperation,
+                    &mut locked,
+                    call,
+                )?;
                 match result {
-                    Ok(wit_outcome) => {
-                        Ok(wasm_convert::wit_to_core_update_outcome(wit_outcome, &id))
-                    }
+                    Ok(wit_outcome) => wasm_convert::wit_to_core_update_outcome(wit_outcome, &id)
+                        .map_err(|error| {
+                            wasm_value_decode_provider_error("update", error)
+                                .for_resource(id.clone())
+                        }),
                     Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
                 }
             },
@@ -2735,18 +2952,13 @@ impl Provider for WasmProvider {
                     .bindings
                     .call_delete(locked.store(), &wit_id, &identifier, wit_request)
                     .await;
-                locked.disarm();
-                let result = call.map_err(|e| {
-                    let msg = format!("{e}");
-                    if is_epoch_trap_message(&msg) {
-                        ProviderError::timeout(format!(
-                            "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in delete \
-                             (check AWS credentials)"
-                        ))
-                    } else {
-                        ProviderError::internal(format!("WASM trap in delete: {e}"))
-                    }
-                })?;
+                let result = finish_guest_call(
+                    &self.instance,
+                    "delete",
+                    WasmTrapContext::ProviderOperation,
+                    &mut locked,
+                    call,
+                )?;
                 match result {
                     Ok(()) => Ok(()),
                     Err(wit_err) => Err(wasm_convert::wit_to_core_provider_error(wit_err)),
@@ -2755,77 +2967,58 @@ impl Provider for WasmProvider {
         ))
     }
 
-    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> Vec<String> {
+    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> ProviderResult<Vec<String>> {
         let wit_id = wasm_convert::core_to_wit_resource_id(id);
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let mut locked =
-                    match LockedStore::acquire(&self.instance, "required_permissions").await {
-                        Ok(locked) => locked,
-                        Err(e) => {
-                            log::error!("WASM required_permissions lock failed: {e}");
-                            return Vec::new();
-                        }
-                    };
+                    LockedStore::acquire(&self.instance, "required_permissions").await?;
                 let call = self
                     .instance
                     .bindings
                     .call_required_permissions(locked.store(), &wit_id, op)
                     .await;
-                locked.disarm();
-                match call {
-                    Ok(permissions) => permissions,
-                    Err(e) => {
-                        log::error!("WASM trap in required_permissions: {e}");
-                        Vec::new()
-                    }
-                }
+                finish_guest_call(
+                    &self.instance,
+                    "required_permissions",
+                    WasmTrapContext::ProviderOperation,
+                    &mut locked,
+                    call,
+                )
             })
         })
     }
 
-    fn satisfier_hint(&self, target_id: &ResourceId, attr_path: &AttrPath) -> Vec<BindingPattern> {
+    fn satisfier_hint(
+        &self,
+        target_id: &ResourceId,
+        attr_path: &AttrPath,
+    ) -> ProviderResult<Vec<BindingPattern>> {
         let wit_id = wasm_convert::core_to_wit_resource_id(target_id);
         let wit_attr_path = attr_path.segments().to_vec();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let mut locked = match LockedStore::acquire(&self.instance, "satisfier_hint").await
-                {
-                    Ok(locked) => locked,
-                    Err(e) => {
-                        log::error!("WASM satisfier_hint lock failed: {e}");
-                        return Vec::new();
-                    }
-                };
+                let mut locked = LockedStore::acquire(&self.instance, "satisfier_hint").await?;
                 let call = self
                     .instance
                     .bindings
                     .call_satisfier_hint(locked.store(), &wit_id, &wit_attr_path)
                     .await;
-                locked.disarm();
-                match call {
-                    Ok(patterns) => patterns
-                        .into_iter()
-                        .filter_map(|p| match wasm_convert::wit_to_core_binding_pattern(p) {
-                            Ok(pattern) => Some(pattern),
-                            Err(err) => {
-                                log::warn!(
-                                    target: "carina_plugin_host::wasm_factory",
-                                    "provider '{}' returned invalid satisfier-hint pattern for {} (attr: {}); skipping: {}",
-                                    self.name,
-                                    target_id,
-                                    attr_path.segments().join("."),
-                                    err
-                                );
-                                None
-                            }
-                        })
-                        .collect(),
-                    Err(e) => {
-                        log::error!("WASM trap in satisfier_hint: {e}");
-                        Vec::new()
-                    }
-                }
+                let patterns = finish_guest_call(
+                    &self.instance,
+                    "satisfier_hint",
+                    WasmTrapContext::ProviderOperation,
+                    &mut locked,
+                    call,
+                )?;
+                patterns
+                    .into_iter()
+                    .map(wasm_convert::wit_to_core_binding_pattern)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        wasm_value_decode_provider_error("satisfier_hint", error)
+                            .for_resource(target_id.clone())
+                    })
             })
         })
     }
@@ -2841,125 +3034,320 @@ pub struct WasmProviderNormalizer {
 unsafe impl Send for WasmProviderNormalizer {}
 unsafe impl Sync for WasmProviderNormalizer {}
 
+#[derive(Debug)]
+struct WasmNormalizerResultKeysError {
+    missing: BTreeSet<String>,
+    unexpected: BTreeSet<String>,
+    duplicates: BTreeSet<String>,
+}
+
+impl fmt::Display for WasmNormalizerResultKeysError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("returned a mismatched state key set")?;
+        if !self.missing.is_empty() {
+            write!(
+                f,
+                "; missing: {}",
+                self.missing.iter().cloned().collect::<Vec<_>>().join(", ")
+            )?;
+        }
+        if !self.unexpected.is_empty() {
+            write!(
+                f,
+                "; unexpected: {}",
+                self.unexpected
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
+        }
+        if !self.duplicates.is_empty() {
+            write!(
+                f,
+                "; duplicate: {}",
+                self.duplicates
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for WasmNormalizerResultKeysError {}
+
+#[derive(Debug)]
+struct WasmNormalizerResultCountError {
+    actual: usize,
+}
+
+impl fmt::Display for WasmNormalizerResultCountError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "returned {} state entries for a single-resource call; expected exactly one",
+            self.actual
+        )
+    }
+}
+
+impl std::error::Error for WasmNormalizerResultCountError {}
+
+type WitStateAttributeUpdate = (ResourceId, Vec<(String, wit_types::Value)>);
+
+fn validate_wit_state_result_keys(
+    operation: &'static str,
+    expected_ids_by_key: &HashMap<String, ResourceId>,
+    results: Vec<(String, wit_types::State)>,
+) -> ProviderResult<Vec<WitStateAttributeUpdate>> {
+    let expected_keys = expected_ids_by_key.keys().cloned().collect::<BTreeSet<_>>();
+    let mut returned = HashMap::with_capacity(results.len());
+    let mut duplicates = BTreeSet::new();
+    for (key, state) in results {
+        if returned.insert(key.clone(), state).is_some() {
+            duplicates.insert(key);
+        }
+    }
+    let returned_keys = returned.keys().cloned().collect::<BTreeSet<_>>();
+    let missing = expected_keys.difference(&returned_keys).cloned().collect();
+    let unexpected = returned_keys.difference(&expected_keys).cloned().collect();
+    let error = WasmNormalizerResultKeysError {
+        missing,
+        unexpected,
+        duplicates,
+    };
+    if !error.missing.is_empty() || !error.unexpected.is_empty() || !error.duplicates.is_empty() {
+        return Err(ProviderError::internal(format!(
+            "WASM provider returned invalid state keys during {operation}"
+        ))
+        .with_cause(error));
+    }
+
+    Ok(expected_ids_by_key
+        .iter()
+        .map(|(key, id)| {
+            let state = returned
+                .remove(key)
+                .expect("validated result contains every expected key");
+            (id.clone(), state.attributes)
+        })
+        .collect())
+}
+
+fn take_single_wit_state_result(
+    operation: &'static str,
+    id: ResourceId,
+    results: Vec<(String, wit_types::State)>,
+) -> ProviderResult<WitStateAttributeUpdate> {
+    if results.len() != 1 {
+        return Err(ProviderError::internal(format!(
+            "WASM provider returned an invalid state count during {operation}"
+        ))
+        .with_cause(WasmNormalizerResultCountError {
+            actual: results.len(),
+        })
+        .for_resource(id));
+    }
+
+    let (_, state) = results
+        .into_iter()
+        .next()
+        .expect("validated single-resource result contains one entry");
+    Ok((id, state.attributes))
+}
+
+fn apply_wit_state_attribute_updates(
+    operation: &'static str,
+    current_states: &mut HashMap<ResourceId, State>,
+    updates: Vec<WitStateAttributeUpdate>,
+) -> ProviderResult<()> {
+    let decoded = updates
+        .into_iter()
+        .map(|(id, attributes)| {
+            wasm_convert::wit_to_core_value_map(&attributes)
+                .map(|attributes| (id.clone(), attributes))
+                .map_err(|error| {
+                    wasm_value_decode_provider_error(operation, error).for_resource(id)
+                })
+        })
+        .collect::<ProviderResult<Vec<_>>>()?;
+
+    for (id, attributes) in decoded {
+        if let Some(state) = current_states.get_mut(&id) {
+            state.attributes = attributes;
+        }
+    }
+    Ok(())
+}
+
+fn finish_guest_call<T>(
+    instance: &SharedWasmInstance,
+    operation: &'static str,
+    context: WasmTrapContext,
+    locked: &mut LockedStore<'_>,
+    call: wasmtime::Result<T>,
+) -> ProviderResult<T> {
+    // A returned `Result` means the async wasmtime call was not cancelled, so
+    // dropping the store guard must not apply the timeout/cancellation poison.
+    locked.disarm();
+    match call {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            // A component trap still makes this instance non-reentrant. Record
+            // the originating operation while the store lock remains held so
+            // queued calls fail fast with the real cause.
+            poison_after_trap(
+                &instance.poisoned,
+                &instance.poisoned_reason,
+                operation,
+                &error,
+            );
+            Err(wasm_trap_provider_error(operation, error, context))
+        }
+    }
+}
+
 impl ProviderNormalizer for WasmProviderNormalizer {
     fn normalize_desired<'a>(
         &'a self,
         resources: &'a mut [Resource],
-    ) -> carina_core::provider::BoxFuture<'a, ()> {
+    ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
-            let (sealed, unsealer) =
-                expect_unresolvable_absent(secret_seal::seal(resources, None), "normalize_desired");
+            let (sealed, unsealer) = secret_seal::seal(resources, None)
+                .map_err(|error| wasm_value_encode_provider_error("normalize_desired", error))?;
 
-            // Plain `.await` on the store lock, not a nested `block_on`:
-            // the guard is acquired and dropped within this one polled
-            // future, so the apply-path `renormalize` calling this once
-            // per resource cannot self-deadlock (carina#3112).
+            // Plain `.await`, not a nested `block_on`: the guarded store is
+            // acquired and dropped within this one polled future, so the
+            // apply-path `renormalize` calling this once per resource cannot
+            // self-deadlock (carina#3112).
             let result = {
-                let mut store = self.instance.store.lock().await;
-                store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
-                self.instance
+                let mut locked = LockedStore::acquire(&self.instance, "normalize_desired").await?;
+                let call = self
+                    .instance
                     .bindings
-                    .call_normalize_desired(&mut store, &sealed)
-                    .await
+                    .call_normalize_desired(locked.store(), &sealed)
+                    .await;
+                finish_guest_call(
+                    &self.instance,
+                    "normalize_desired",
+                    WasmTrapContext::Normalizer,
+                    &mut locked,
+                    call,
+                )
             };
-
-            match result {
-                Ok(result) => {
-                    // `PlanPreprocessor::prepare` strips every attribute that
-                    // recursively contains `Value::Deferred(DeferredValue::ResourceRef)` (alongside
-                    // `Value::Deferred(DeferredValue::Unknown)`) before this normalizer runs and
-                    // restores them afterwards (#2387). Secret restoration
-                    // filters mangled attributes before guest values are
-                    // written back.
-                    unsealer.restore(result).apply_to(resources);
-                }
-                Err(e) => log::error!("WASM trap in normalize_desired: {e}"),
-            }
+            let result = result?;
+            // `PlanPreprocessor::prepare` strips every attribute that
+            // recursively contains `Value::Deferred(DeferredValue::ResourceRef)` (alongside
+            // `Value::Deferred(DeferredValue::Unknown)`) before this normalizer runs and
+            // restores them afterwards (#2387). Secret restoration
+            // filters mangled attributes before guest values are
+            // written back.
+            let restored = unsealer
+                .try_restore(result)
+                .map_err(|error| wasm_value_decode_provider_error("normalize_desired", error))?;
+            restored.apply_to(resources);
+            Ok(())
         })
     }
 
     fn normalize_state<'a>(
         &'a self,
         current_states: &'a mut HashMap<ResourceId, State>,
-    ) -> carina_core::provider::BoxFuture<'a, ()> {
+    ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
-            let mut resolved_ids_by_key = HashMap::new();
-            let mut resolved_wit_states = Vec::new();
-            let mut pending_wit_states = Vec::new();
+            let mut resolved_by_key = HashMap::new();
+            let mut colliding_keys = HashSet::new();
+            let mut single_wit_states = Vec::new();
+            let mut updates = Vec::new();
 
             for (id, state) in current_states.iter() {
                 let key = wasm_convert::resource_id_wire_key(id);
-                let wit = expect_unresolvable_absent(
-                    wasm_convert::core_to_wit_state(state),
-                    "normalize_state",
-                );
+                let wit = wasm_convert::core_to_wit_state(state)
+                    .map_err(|error| wasm_value_encode_provider_error("normalize_state", error))?;
                 match id.identity_state() {
                     ResourceIdentityState::Pending(_) => {
-                        pending_wit_states.push((id.clone(), key, wit));
+                        single_wit_states.push((id.clone(), key, wit));
                     }
                     ResourceIdentityState::Resolved(_) => {
-                        resolved_ids_by_key.insert(key.clone(), id.clone());
-                        resolved_wit_states.push((key, wit));
+                        if colliding_keys.contains(&key) {
+                            single_wit_states.push((id.clone(), key, wit));
+                        } else if let Some((previous_id, previous_wit)) =
+                            resolved_by_key.remove(&key)
+                        {
+                            colliding_keys.insert(key.clone());
+                            single_wit_states.push((previous_id, key.clone(), previous_wit));
+                            single_wit_states.push((id.clone(), key, wit));
+                        } else {
+                            resolved_by_key.insert(key, (id.clone(), wit));
+                        }
                     }
                 }
+            }
+
+            let mut resolved_ids_by_key = HashMap::with_capacity(resolved_by_key.len());
+            let mut resolved_wit_states = Vec::with_capacity(resolved_by_key.len());
+            for (key, (id, state)) in resolved_by_key {
+                resolved_ids_by_key.insert(key.clone(), id);
+                resolved_wit_states.push((key, state));
             }
 
             if !resolved_wit_states.is_empty() {
                 // Plain `.await`, not a nested `block_on` — see `normalize_desired`.
                 let result = {
-                    let mut store = self.instance.store.lock().await;
-                    store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
-                    self.instance
+                    let mut locked =
+                        LockedStore::acquire(&self.instance, "normalize_state").await?;
+                    let call = self
+                        .instance
                         .bindings
-                        .call_normalize_state(&mut store, &resolved_wit_states)
-                        .await
+                        .call_normalize_state(locked.store(), &resolved_wit_states)
+                        .await;
+                    finish_guest_call(
+                        &self.instance,
+                        "normalize_state",
+                        WasmTrapContext::Normalizer,
+                        &mut locked,
+                        call,
+                    )
                 };
-
-                match result {
-                    Ok(result) => {
-                        for (key, wit_state) in &result {
-                            let Some(id) = resolved_ids_by_key.get(key) else {
-                                continue;
-                            };
-                            let Some(state) = current_states.get_mut(id) else {
-                                continue;
-                            };
-                            state.attributes =
-                                wasm_convert::wit_to_core_value_map(&wit_state.attributes);
-                        }
-                    }
-                    Err(e) => log::error!("WASM trap in normalize_state: {e}"),
-                }
+                let result = result?;
+                updates.extend(validate_wit_state_result_keys(
+                    "normalize_state",
+                    &resolved_ids_by_key,
+                    result,
+                )?);
             }
 
-            // Pending IDs intentionally share their legacy wire key. Send one
-            // per call so the guest's key-parsing HashMap cannot collapse
-            // distinct host IDs, and ignore the guest's re-rendered key when
-            // correlating the single result.
-            for (id, key, wit_state) in pending_wit_states {
+            // Pending IDs and resolved IDs that differ only by provider
+            // instance can share a legacy wire key. Send one per call so the
+            // guest's key-parsing HashMap cannot collapse distinct host IDs,
+            // and ignore the guest's re-rendered key when correlating the
+            // single result.
+            for (id, key, wit_state) in single_wit_states {
                 let result = {
-                    let mut store = self.instance.store.lock().await;
-                    store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
-                    self.instance
+                    let mut locked =
+                        LockedStore::acquire(&self.instance, "normalize_state").await?;
+                    let call = self
+                        .instance
                         .bindings
-                        .call_normalize_state(&mut store, &[(key, wit_state)])
-                        .await
+                        .call_normalize_state(locked.store(), &[(key, wit_state)])
+                        .await;
+                    finish_guest_call(
+                        &self.instance,
+                        "normalize_state",
+                        WasmTrapContext::Normalizer,
+                        &mut locked,
+                        call,
+                    )
                 };
-
-                match result {
-                    Ok(result) => {
-                        let Some((_, wit_state)) = result.into_iter().next() else {
-                            continue;
-                        };
-                        let Some(state) = current_states.get_mut(&id) else {
-                            continue;
-                        };
-                        state.attributes =
-                            wasm_convert::wit_to_core_value_map(&wit_state.attributes);
-                    }
-                    Err(e) => log::error!("WASM trap in normalize_state: {e}"),
-                }
+                let result = result?;
+                updates.push(take_single_wit_state_result("normalize_state", id, result)?);
             }
+
+            apply_wit_state_attribute_updates("normalize_state", current_states, updates)?;
+            Ok(())
         })
     }
 
@@ -2967,99 +3355,129 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         &'a self,
         current_states: &'a mut HashMap<ResourceId, State>,
         saved_attrs: &'a SavedAttrs,
-    ) -> carina_core::provider::BoxFuture<'a, ()> {
+    ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
-            let mut resolved_ids_by_key = HashMap::new();
-            let mut resolved_wit_states = Vec::new();
-            let mut resolved_wit_saved = Vec::new();
-            let mut pending_batches = Vec::new();
+            let mut resolved_by_key = HashMap::new();
+            let mut colliding_keys = HashSet::new();
+            let mut single_batches = Vec::new();
+            let mut updates = Vec::new();
 
             for (id, state) in current_states.iter() {
                 let key = wasm_convert::resource_id_wire_key(id);
-                let wit_state = expect_unresolvable_absent(
-                    wasm_convert::core_to_wit_state(state),
-                    "hydrate_read_state (current_states)",
-                );
-                let wit_saved = saved_attrs.get(id).map(|attrs| {
-                    expect_unresolvable_absent(
-                        wasm_convert::core_to_wit_value_map(attrs),
-                        "hydrate_read_state (saved_attrs)",
-                    )
-                });
+                let wit_state = wasm_convert::core_to_wit_state(state).map_err(|error| {
+                    wasm_value_encode_provider_error("hydrate_read_state current state", error)
+                })?;
+                let wit_saved = saved_attrs
+                    .get(id)
+                    .map(|attrs| {
+                        wasm_convert::core_to_wit_value_map(attrs).map_err(|error| {
+                            wasm_value_encode_provider_error(
+                                "hydrate_read_state saved attributes",
+                                error,
+                            )
+                        })
+                    })
+                    .transpose()?;
 
                 match id.identity_state() {
                     ResourceIdentityState::Pending(_) => {
-                        pending_batches.push((id.clone(), key, wit_state, wit_saved));
+                        single_batches.push((id.clone(), key, wit_state, wit_saved));
                     }
                     ResourceIdentityState::Resolved(_) => {
-                        resolved_ids_by_key.insert(key.clone(), id.clone());
-                        resolved_wit_states.push((key.clone(), wit_state));
-                        if let Some(wit_saved) = wit_saved {
-                            resolved_wit_saved.push((key, wit_saved));
+                        if colliding_keys.contains(&key) {
+                            single_batches.push((id.clone(), key, wit_state, wit_saved));
+                        } else if let Some((previous_id, previous_state, previous_saved)) =
+                            resolved_by_key.remove(&key)
+                        {
+                            colliding_keys.insert(key.clone());
+                            single_batches.push((
+                                previous_id,
+                                key.clone(),
+                                previous_state,
+                                previous_saved,
+                            ));
+                            single_batches.push((id.clone(), key, wit_state, wit_saved));
+                        } else {
+                            resolved_by_key.insert(key, (id.clone(), wit_state, wit_saved));
                         }
                     }
+                }
+            }
+
+            let mut resolved_ids_by_key = HashMap::with_capacity(resolved_by_key.len());
+            let mut resolved_wit_states = Vec::with_capacity(resolved_by_key.len());
+            let mut resolved_wit_saved = Vec::new();
+            for (key, (id, state, saved)) in resolved_by_key {
+                resolved_ids_by_key.insert(key.clone(), id);
+                resolved_wit_states.push((key.clone(), state));
+                if let Some(saved) = saved {
+                    resolved_wit_saved.push((key, saved));
                 }
             }
 
             if !resolved_wit_states.is_empty() {
                 // Plain `.await`, not a nested `block_on` — see `normalize_desired`.
                 let result = {
-                    let mut store = self.instance.store.lock().await;
-                    store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
-                    self.instance
+                    let mut locked =
+                        LockedStore::acquire(&self.instance, "hydrate_read_state").await?;
+                    let call = self
+                        .instance
                         .bindings
                         .call_hydrate_read_state(
-                            &mut store,
+                            locked.store(),
                             &resolved_wit_states,
                             &resolved_wit_saved,
                         )
-                        .await
+                        .await;
+                    finish_guest_call(
+                        &self.instance,
+                        "hydrate_read_state",
+                        WasmTrapContext::Normalizer,
+                        &mut locked,
+                        call,
+                    )
                 };
-
-                match result {
-                    Ok(result) => {
-                        for (key, wit_state) in &result {
-                            let Some(id) = resolved_ids_by_key.get(key) else {
-                                continue;
-                            };
-                            let Some(state) = current_states.get_mut(id) else {
-                                continue;
-                            };
-                            state.attributes =
-                                wasm_convert::wit_to_core_value_map(&wit_state.attributes);
-                        }
-                    }
-                    Err(e) => log::error!("WASM trap in hydrate_read_state: {e}"),
-                }
+                let result = result?;
+                updates.extend(validate_wit_state_result_keys(
+                    "hydrate_read_state",
+                    &resolved_ids_by_key,
+                    result,
+                )?);
             }
 
-            for (id, key, wit_state, wit_saved) in pending_batches {
+            // As in `normalize_state`, one-resource calls avoid both pending-ID
+            // and provider-instance wire-key collisions. Correlate the single
+            // result by position and ignore the guest's re-rendered key.
+            for (id, key, wit_state, wit_saved) in single_batches {
                 let wit_saved = wit_saved
                     .map(|attrs| vec![(key.clone(), attrs)])
                     .unwrap_or_default();
                 let result = {
-                    let mut store = self.instance.store.lock().await;
-                    store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
-                    self.instance
+                    let mut locked =
+                        LockedStore::acquire(&self.instance, "hydrate_read_state").await?;
+                    let call = self
+                        .instance
                         .bindings
-                        .call_hydrate_read_state(&mut store, &[(key, wit_state)], &wit_saved)
-                        .await
+                        .call_hydrate_read_state(locked.store(), &[(key, wit_state)], &wit_saved)
+                        .await;
+                    finish_guest_call(
+                        &self.instance,
+                        "hydrate_read_state",
+                        WasmTrapContext::Normalizer,
+                        &mut locked,
+                        call,
+                    )
                 };
-
-                match result {
-                    Ok(result) => {
-                        let Some((_, wit_state)) = result.into_iter().next() else {
-                            continue;
-                        };
-                        let Some(state) = current_states.get_mut(&id) else {
-                            continue;
-                        };
-                        state.attributes =
-                            wasm_convert::wit_to_core_value_map(&wit_state.attributes);
-                    }
-                    Err(e) => log::error!("WASM trap in hydrate_read_state: {e}"),
-                }
+                let result = result?;
+                updates.push(take_single_wit_state_result(
+                    "hydrate_read_state",
+                    id,
+                    result,
+                )?);
             }
+
+            apply_wit_state_attribute_updates("hydrate_read_state", current_states, updates)?;
+            Ok(())
         })
     }
 
@@ -3068,35 +3486,39 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         resources: &'a mut [Resource],
         default_tags: &'a IndexMap<String, Value>,
         _registry: &'a carina_core::schema::SchemaRegistry,
-    ) -> carina_core::provider::BoxFuture<'a, ()> {
+    ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
             if default_tags.is_empty() {
-                return;
+                return Ok(());
             }
 
-            let (sealed, unsealer) = expect_unresolvable_absent(
-                secret_seal::seal(resources, Some(default_tags)),
-                "merge_default_tags",
-            );
+            let (sealed, unsealer) = secret_seal::seal(resources, Some(default_tags))
+                .map_err(|error| wasm_value_encode_provider_error("merge_default_tags", error))?;
 
             // Plain `.await`, not a nested `block_on` — see `normalize_desired`.
             let result = {
-                let mut store = self.instance.store.lock().await;
-                store.set_epoch_deadline(WASM_OPERATION_TIMEOUT_SECS);
-                self.instance
+                let mut locked = LockedStore::acquire(&self.instance, "merge_default_tags").await?;
+                let call = self
+                    .instance
                     .bindings
-                    .call_merge_default_tags(&mut store, &sealed)
-                    .await
+                    .call_merge_default_tags(locked.store(), &sealed)
+                    .await;
+                finish_guest_call(
+                    &self.instance,
+                    "merge_default_tags",
+                    WasmTrapContext::Normalizer,
+                    &mut locked,
+                    call,
+                )
             };
-
-            match result {
-                Ok(result) => {
-                    // Guest preserves resource order; zip and overwrite
-                    // attributes (merge may add `tags` and `_default_tag_keys`).
-                    unsealer.restore(result).apply_to(resources);
-                }
-                Err(e) => log::error!("WASM trap in merge_default_tags: {e}"),
-            }
+            let result = result?;
+            // Guest preserves resource order; zip and overwrite
+            // attributes (merge may add `tags` and `_default_tag_keys`).
+            let restored = unsealer
+                .try_restore(result)
+                .map_err(|error| wasm_value_decode_provider_error("merge_default_tags", error))?;
+            restored.apply_to(resources);
+            Ok(())
         })
     }
 }
@@ -3104,6 +3526,227 @@ impl ProviderNormalizer for WasmProviderNormalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_config_completions_metadata_is_rejected() {
+        let error = decode_config_completions_json("not json", "mock", "1.0.0")
+            .expect_err("malformed config completions must fail provider loading");
+
+        assert!(error.to_string().contains("provider config completions"));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn malformed_enum_aliases_metadata_is_rejected() {
+        let error = decode_enum_aliases_json("not json", "mock", "1.0.0")
+            .expect_err("malformed enum aliases must fail provider loading");
+
+        assert!(error.to_string().contains("enum aliases"));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn shared_trap_mapper_preserves_provider_operation_messages() {
+        let trap = wasm_trap_provider_error(
+            "read",
+            wasmtime::Error::msg("guest trap"),
+            WasmTrapContext::ProviderOperation,
+        );
+        assert_eq!(trap.message(), "WASM trap in read");
+        assert_eq!(trap.to_string().matches("guest trap").count(), 1);
+        assert!(std::error::Error::source(&trap).is_some());
+
+        let timeout = wasm_trap_provider_error(
+            "read",
+            wasmtime::Error::new(wasmtime::Trap::Interrupt)
+                .context("error while executing at wasm backtrace:\n    0: test-frame"),
+            WasmTrapContext::ProviderOperation,
+        );
+        assert_eq!(
+            timeout.message(),
+            format!(
+                "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in read (check AWS credentials)"
+            )
+        );
+
+        let normalizer_timeout = wasm_trap_provider_error(
+            "normalize_state",
+            wasmtime::Error::new(wasmtime::Trap::Interrupt)
+                .context("error while executing at wasm backtrace:\n    0: test-frame"),
+            WasmTrapContext::Normalizer,
+        );
+        assert_eq!(
+            normalizer_timeout.message(),
+            format!(
+                "WASM plugin timed out after {WASM_OPERATION_TIMEOUT_SECS}s in normalize_state"
+            )
+        );
+    }
+
+    #[test]
+    fn timeout_classification_uses_the_typed_trap_not_message_text() {
+        let nested = wasmtime::Error::msg("epoch deadline reached").context("outer guest trap");
+
+        let error = wasm_trap_provider_error("read", nested, WasmTrapContext::ProviderOperation);
+
+        assert_eq!(error.variant_name(), "internal");
+    }
+
+    #[tokio::test]
+    async fn real_engine_epoch_interrupt_maps_to_provider_timeout() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let wasm_path = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
+            .into_iter()
+            .map(|name| workspace_root.join("target/wasm32-wasip2/debug").join(name))
+            .find(|path| path.exists());
+        let Some(wasm_path) = wasm_path else {
+            eprintln!(
+                "SKIP: WASM binary not found. Build with: cargo build -p \
+                 carina-provider-mock --target wasm32-wasip2"
+            );
+            return;
+        };
+
+        let factory = WasmProviderFactory::new_uncached(wasm_path)
+            .await
+            .expect("mock WASM provider should load");
+        let instance = factory
+            .get_or_create_shared_instance(None, &IndexMap::new())
+            .await
+            .expect("mock WASM provider should initialize");
+        let id = ResourceId::with_provider_identity("mock", "test.resource", "epoch-timeout", None);
+        let wit_id = wasm_convert::core_to_wit_resource_id(&id);
+        let mut locked = LockedStore::acquire(&instance, "required_permissions")
+            .await
+            .expect("fresh instance should be usable");
+
+        locked.store().set_epoch_deadline(1);
+        factory.engine.increment_epoch();
+        let call = instance
+            .bindings
+            .call_required_permissions(locked.store(), &wit_id, PlanOp::Read)
+            .await;
+        let error = finish_guest_call(
+            &instance,
+            "required_permissions",
+            WasmTrapContext::ProviderOperation,
+            &mut locked,
+            call,
+        )
+        .expect_err("the elapsed real engine epoch deadline must trap");
+
+        assert!(
+            matches!(error, ProviderError::Timeout(_)),
+            "the real epoch interrupt must map to a timeout: {error}"
+        );
+    }
+
+    #[test]
+    fn rendered_decode_provider_error_contains_serde_detail_once() {
+        use std::error::Error as _;
+
+        let decode_error = wasm_convert::wit_to_core_value(
+            &crate::wasm_bindings::carina::provider::types::Value::ListVal("[".to_string()),
+        )
+        .expect_err("malformed JSON must fail");
+        let serde_detail = decode_error
+            .source()
+            .expect("syntax errors retain serde source")
+            .to_string();
+        let rendered = wasm_value_decode_provider_error("read", decode_error).to_string();
+
+        assert_eq!(rendered.matches(&serde_detail).count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn malformed_normalized_state_output_is_atomic() {
+        use crate::wasm_bindings::carina::provider::types::Value as WitValue;
+
+        let first_id = Resource::with_provider("mock", "test.resource", "first", None).id;
+        let second_id = Resource::with_provider("mock", "test.resource", "second", None).id;
+        let original_value = Value::Concrete(carina_core::resource::ConcreteValue::String(
+            "original".to_string(),
+        ));
+        let mut states = HashMap::from([
+            (
+                first_id.clone(),
+                State::existing(
+                    first_id.clone(),
+                    HashMap::from([("value".to_string(), original_value.clone())]),
+                ),
+            ),
+            (
+                second_id.clone(),
+                State::existing(
+                    second_id.clone(),
+                    HashMap::from([("value".to_string(), original_value)]),
+                ),
+            ),
+        ]);
+        let before = states.clone();
+        let updates = vec![
+            (
+                first_id,
+                vec![("value".to_string(), WitValue::StrVal("changed".to_string()))],
+            ),
+            (
+                second_id.clone(),
+                vec![(
+                    "settings".to_string(),
+                    WitValue::MapVal("not json".to_string()),
+                )],
+            ),
+        ];
+
+        let error = apply_wit_state_attribute_updates("normalize_state", &mut states, updates)
+            .expect_err("malformed guest output must fail normalization");
+
+        assert!(error.to_string().contains("map-val"));
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(
+            error.detail().resource_id.as_deref(),
+            Some(&second_id),
+            "decode errors must identify the state whose attributes were malformed"
+        );
+        assert_eq!(
+            states, before,
+            "decode failure must not partially mutate state"
+        );
+    }
+
+    #[test]
+    fn invalid_state_key_error_names_the_operation_once() {
+        let id = Resource::with_provider("mock", "test.resource", "only", None).id;
+        let expected = HashMap::from([("expected".to_string(), id)]);
+
+        let error = validate_wit_state_result_keys("normalize_state", &expected, Vec::new())
+            .expect_err("a missing state key must fail");
+        let rendered = error.to_string();
+
+        assert_eq!(rendered.matches("normalize_state").count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn single_state_result_rejects_more_than_one_entry() {
+        let id = Resource::with_provider("mock", "test.resource", "only", None).id;
+        let state = wit_types::State {
+            identifier: None,
+            attributes: Vec::new(),
+            exists: true,
+        };
+
+        let error = take_single_wit_state_result(
+            "normalize_state",
+            id,
+            vec![
+                ("first".to_string(), state.clone()),
+                ("second".to_string(), state),
+            ],
+        )
+        .expect_err("a single-resource call returning two states must fail");
+
+        assert!(error.to_string().contains("expected exactly one"));
+    }
 
     #[test]
     fn test_aws_partition_contains_required_vars() {
@@ -3194,7 +3837,7 @@ mod tests {
             }]"#,
         )
         .unwrap_err();
-        let err = provider_schema_decode_error("bad-provider", "9.9.9", detail);
+        let err = provider_schema_decode_error("bad-provider", "9.9.9", detail).to_string();
 
         assert!(err.contains("provider 'bad-provider' 9.9.9"), "{err}");
         assert!(err.contains("schema JSON parse error"), "{err}");
@@ -3460,14 +4103,6 @@ mod tests {
                 "timeout too long to be useful"
             );
         }
-    }
-
-    #[test]
-    fn test_is_epoch_trap_detection() {
-        assert!(is_epoch_trap_message("wasm trap: interrupt"));
-        assert!(is_epoch_trap_message("epoch deadline reached"));
-        assert!(!is_epoch_trap_message("out of memory"));
-        assert!(!is_epoch_trap_message("unreachable code"));
     }
 
     #[test]
@@ -3977,7 +4612,8 @@ mod tests {
     #[test]
     fn poisoned_guard_allows_a_fresh_instance() {
         let flag = AtomicBool::new(false);
-        assert!(poisoned_guard(&flag, "create").is_none());
+        let reason = OnceLock::new();
+        assert!(poisoned_guard(&flag, &reason, "create").is_none());
     }
 
     /// Dropping an *armed* `PoisonOnDrop` (the carina#3106 cancellation
@@ -3988,6 +4624,7 @@ mod tests {
     #[test]
     fn armed_drop_poisons_then_guard_fails_fast_naming_the_operation() {
         let flag = AtomicBool::new(false);
+        let reason = OnceLock::new();
 
         // Operation cancelled before completion: the armed guard is
         // dropped and must poison the instance.
@@ -4003,7 +4640,7 @@ mod tests {
         );
 
         // A later operation on the same (now poisoned) instance fails fast.
-        let guard_err = poisoned_guard(&flag, "delete")
+        let guard_err = poisoned_guard(&flag, &reason, "delete")
             .expect("a poisoned instance must reject subsequent operations");
         assert!(
             matches!(guard_err, ProviderError::Internal(_)),
@@ -4016,12 +4653,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn trap_poison_names_the_origin_and_keeps_only_the_structured_cause() {
+        let flag = AtomicBool::new(false);
+        let reason = OnceLock::new();
+        let trap = wasmtime::Error::new(wasmtime::Trap::UnreachableCodeReached)
+            .context("error while executing at wasm backtrace:\n    0: test-frame");
+
+        poison_after_trap(&flag, &reason, "normalize_state", &trap);
+
+        let error = poisoned_guard(&flag, &reason, "create")
+            .expect("the later operation must reject a trap-poisoned instance");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(
+                "WASM provider instance unusable after trap in normalize_state: wasm trap: wasm `unreachable` instruction executed"
+            ),
+            "the original trap must remain actionable: {rendered}"
+        );
+        assert!(
+            !rendered.contains("wasm backtrace") && !rendered.contains("test-frame"),
+            "later errors must not repeat the original trap backtrace: {rendered}"
+        );
+        assert!(
+            rendered.contains("operation 'create'"),
+            "the rejected follow-up operation should remain visible: {rendered}"
+        );
+        assert!(
+            !rendered.contains("prior operation timed out"),
+            "component traps must not be mislabeled as timeouts: {rendered}"
+        );
+    }
+
     /// A completed guest call disarms the guard, so a normal operation
     /// (success *or* a clean provider error — both mean the wasmtime call
     /// returned, not a cancellation) must NOT poison the instance.
     #[test]
     fn disarmed_drop_does_not_poison() {
         let flag = AtomicBool::new(false);
+        let reason = OnceLock::new();
         {
             let mut guard = PoisonOnDrop {
                 poisoned: &flag,
@@ -4034,7 +4704,7 @@ mod tests {
             "a disarmed PoisonOnDrop must not poison the instance"
         );
         assert!(
-            poisoned_guard(&flag, "read").is_none(),
+            poisoned_guard(&flag, &reason, "read").is_none(),
             "an un-poisoned instance must keep accepting operations"
         );
     }

@@ -303,6 +303,9 @@ pub enum ProviderPreparationError {
     /// A pending module argument constraint became decidable and failed.
     #[error(transparent)]
     ModuleConstraint(#[from] ModuleConstraintGateError),
+    /// Provider-specific normalization failed before dispatch.
+    #[error(transparent)]
+    Provider(#[from] crate::provider::ProviderError),
 }
 
 /// Typed collection of schema failures from one provider-boundary check.
@@ -426,7 +429,7 @@ async fn prepare_provider_ready_resource_with_value_check(
         context.factories,
         context.schemas,
     )
-    .await;
+    .await?;
     let resource = normalized.into_resource();
     crate::resource::assert_resource_fully_resolved(&resource)?;
     Ok(ProviderReady(ResolvedResource::new(resource)))

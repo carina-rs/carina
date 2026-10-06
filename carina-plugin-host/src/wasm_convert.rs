@@ -35,11 +35,12 @@ use crate::wasm_bindings::exports::carina::provider::provider as wit_provider;
 /// External provider metadata is version-gated but still untrusted at this
 /// boundary; carina#3459 makes unsupported wire shapes explicit errors instead
 /// of panics so callers can attach provider context.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct SchemaDecodeError {
     detail: String,
     resource_type: Option<String>,
     attribute_path: Vec<String>,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 impl SchemaDecodeError {
@@ -48,15 +49,35 @@ impl SchemaDecodeError {
             detail: detail.into(),
             resource_type: None,
             attribute_path: vec![],
+            source: None,
         }
     }
 
     fn schema_json_parse(err: serde_json::Error) -> Self {
-        Self::new(format!("schema JSON parse error: {err}"))
+        Self {
+            detail: "schema JSON parse error".to_string(),
+            resource_type: None,
+            attribute_path: vec![],
+            source: Some(Box::new(err)),
+        }
     }
 
     fn schema_default_value_encode(err: serde_json::Error) -> Self {
-        Self::new(format!("schema default value conversion error: {err}"))
+        Self {
+            detail: "schema default value conversion error".to_string(),
+            resource_type: None,
+            attribute_path: vec![],
+            source: Some(Box::new(err)),
+        }
+    }
+
+    fn schema_default_value_decode(err: WasmValueDecodeError) -> Self {
+        Self {
+            detail: "schema default value conversion error".to_string(),
+            resource_type: None,
+            attribute_path: vec![],
+            source: Some(Box::new(err)),
+        }
     }
 
     fn conflicting_input_mode() -> Self {
@@ -87,21 +108,122 @@ impl fmt::Display for SchemaDecodeError {
             if !self.attribute_path.is_empty() {
                 write!(f, " attribute '{}'", self.attribute_path.join("."))?;
             }
-            write!(f, ": {}", self.detail)
+            write!(f, ": {}", self.detail)?;
         } else if self.attribute_path.is_empty() {
-            f.write_str(&self.detail)
+            f.write_str(&self.detail)?;
         } else {
             write!(
                 f,
                 "attribute '{}': {}",
                 self.attribute_path.join("."),
                 self.detail
-            )
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SchemaDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// Failure to decode a JSON-backed recursive value at the WIT boundary.
+///
+/// The payload itself is deliberately not retained: `secret-val` may contain
+/// plaintext credentials. JSON syntax failures keep the structured serde
+/// source so callers can preserve the error chain without exposing the input.
+#[derive(Debug)]
+pub struct WasmValueDecodeError {
+    wit_variant: WitValueVariant,
+    attribute_path: Vec<String>,
+    kind: WasmValueDecodeErrorKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WitValueVariant {
+    StringListVal,
+    ListVal,
+    MapVal,
+    SecretVal,
+    SchemaDefault,
+}
+
+impl fmt::Display for WitValueVariant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::StringListVal => "string-list-val",
+            Self::ListVal => "list-val",
+            Self::MapVal => "map-val",
+            Self::SecretVal => "secret-val",
+            Self::SchemaDefault => "schema-default",
+        })
+    }
+}
+
+#[derive(Debug)]
+enum WasmValueDecodeErrorKind {
+    InvalidJson(serde_json::Error),
+    ExpectedArray,
+    ExpectedObject,
+    ExpectedString { index: usize },
+    Null,
+    UnsupportedNumber,
+}
+
+impl WasmValueDecodeError {
+    fn new(wit_variant: WitValueVariant, kind: WasmValueDecodeErrorKind) -> Self {
+        Self {
+            wit_variant,
+            attribute_path: Vec::new(),
+            kind,
+        }
+    }
+
+    fn prepend_attribute(mut self, name: &str) -> Self {
+        self.attribute_path.insert(0, name.to_string());
+        self
+    }
+}
+
+impl fmt::Display for WasmValueDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "failed to decode WIT {}", self.wit_variant)?;
+        if !self.attribute_path.is_empty() {
+            write!(f, " attribute '{}'", self.attribute_path.join("."))?;
+        }
+        match &self.kind {
+            WasmValueDecodeErrorKind::InvalidJson(_) => f.write_str(": invalid JSON"),
+            WasmValueDecodeErrorKind::ExpectedArray => f.write_str(": expected a JSON array"),
+            WasmValueDecodeErrorKind::ExpectedObject => f.write_str(": expected a JSON object"),
+            WasmValueDecodeErrorKind::ExpectedString { index } => {
+                write!(f, ": expected a JSON string at array index {index}")
+            }
+            WasmValueDecodeErrorKind::Null => {
+                f.write_str(": JSON null is not supported by the value protocol")
+            }
+            WasmValueDecodeErrorKind::UnsupportedNumber => {
+                f.write_str(": JSON number cannot be represented by the value protocol")
+            }
         }
     }
 }
 
-impl std::error::Error for SchemaDecodeError {}
+impl std::error::Error for WasmValueDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            WasmValueDecodeErrorKind::InvalidJson(source) => Some(source),
+            WasmValueDecodeErrorKind::ExpectedArray
+            | WasmValueDecodeErrorKind::ExpectedObject
+            | WasmValueDecodeErrorKind::ExpectedString { .. }
+            | WasmValueDecodeErrorKind::Null
+            | WasmValueDecodeErrorKind::UnsupportedNumber => None,
+        }
+    }
+}
 
 // -- Value --
 
@@ -220,42 +342,81 @@ pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError
 }
 
 /// Convert a WIT Value to a core Value.
-pub fn wit_to_core_value(v: &wit::Value) -> CoreValue {
+pub fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDecodeError> {
     match v {
-        wit::Value::StrVal(s) => CoreValue::Concrete(ConcreteValue::String(s.clone())),
-        wit::Value::IntVal(i) => CoreValue::Concrete(ConcreteValue::Int(*i)),
-        wit::Value::FloatVal(f) => CoreValue::Concrete(ConcreteValue::Float(*f)),
-        wit::Value::BoolVal(b) => CoreValue::Concrete(ConcreteValue::Bool(*b)),
+        wit::Value::StrVal(s) => Ok(CoreValue::Concrete(ConcreteValue::String(s.clone()))),
+        wit::Value::IntVal(i) => Ok(CoreValue::Concrete(ConcreteValue::Int(*i))),
+        wit::Value::FloatVal(f) => Ok(CoreValue::Concrete(ConcreteValue::Float(*f))),
+        wit::Value::BoolVal(b) => Ok(CoreValue::Concrete(ConcreteValue::Bool(*b))),
         wit::Value::StringListVal(json) => {
-            let items: Vec<String> = serde_json::from_str(json).unwrap_or_default();
-            CoreValue::Concrete(ConcreteValue::StringList(items))
+            let value: serde_json::Value = serde_json::from_str(json).map_err(|source| {
+                WasmValueDecodeError::new(
+                    WitValueVariant::StringListVal,
+                    WasmValueDecodeErrorKind::InvalidJson(source),
+                )
+            })?;
+            let serde_json::Value::Array(items) = value else {
+                return Err(WasmValueDecodeError::new(
+                    WitValueVariant::StringListVal,
+                    WasmValueDecodeErrorKind::ExpectedArray,
+                ));
+            };
+            let items = items
+                .into_iter()
+                .enumerate()
+                .map(|(index, item)| match item {
+                    serde_json::Value::String(item) => Ok(item),
+                    _ => Err(WasmValueDecodeError::new(
+                        WitValueVariant::StringListVal,
+                        WasmValueDecodeErrorKind::ExpectedString { index },
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(CoreValue::Concrete(ConcreteValue::StringList(items)))
         }
         wit::Value::ListVal(json) => {
-            let items: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
-            CoreValue::Concrete(ConcreteValue::List(
-                items.iter().map(json_to_core_value).collect(),
-            ))
+            let value: serde_json::Value = serde_json::from_str(json).map_err(|source| {
+                WasmValueDecodeError::new(
+                    WitValueVariant::ListVal,
+                    WasmValueDecodeErrorKind::InvalidJson(source),
+                )
+            })?;
+            if !value.is_array() {
+                return Err(WasmValueDecodeError::new(
+                    WitValueVariant::ListVal,
+                    WasmValueDecodeErrorKind::ExpectedArray,
+                ));
+            }
+            json_to_core_value(&value, WitValueVariant::ListVal)
         }
         wit::Value::MapVal(json) => {
-            let map: serde_json::Map<String, serde_json::Value> =
-                serde_json::from_str(json).unwrap_or_default();
-            CoreValue::Concrete(ConcreteValue::Map(
-                map.iter()
-                    .map(|(k, v)| (k.clone(), json_to_core_value(v)))
-                    .collect(),
-            ))
+            let value: serde_json::Value = serde_json::from_str(json).map_err(|source| {
+                WasmValueDecodeError::new(
+                    WitValueVariant::MapVal,
+                    WasmValueDecodeErrorKind::InvalidJson(source),
+                )
+            })?;
+            if !value.is_object() {
+                return Err(WasmValueDecodeError::new(
+                    WitValueVariant::MapVal,
+                    WasmValueDecodeErrorKind::ExpectedObject,
+                ));
+            }
+            json_to_core_value(&value, WitValueVariant::MapVal)
         }
         wit::Value::SecretVal(json) => {
             // Decode the JSON-encoded inner value the same way `ListVal` /
-            // `MapVal` decode theirs, then re-wrap in `Value::Deferred(DeferredValue::Secret)` so the
-            // host's secret-tracking machinery (state hashing, plan
-            // redaction) keeps working. A malformed encoding falls back to
-            // an empty string secret rather than panicking — the WASM
-            // provider produced this, so we treat it as untrusted input.
-            let inner_json: serde_json::Value =
-                serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
-            let inner = json_to_core_value(&inner_json);
-            CoreValue::Deferred(DeferredValue::Secret(Box::new(inner)))
+            // `MapVal` decode theirs, then re-wrap in `Secret` so the host's
+            // secret-tracking machinery (state hashing, plan redaction) keeps
+            // working. Malformed input is a boundary error, never a value.
+            let inner_json: serde_json::Value = serde_json::from_str(json).map_err(|source| {
+                WasmValueDecodeError::new(
+                    WitValueVariant::SecretVal,
+                    WasmValueDecodeErrorKind::InvalidJson(source),
+                )
+            })?;
+            let inner = json_to_core_value(&inner_json, WitValueVariant::SecretVal)?;
+            Ok(CoreValue::Deferred(DeferredValue::Secret(Box::new(inner))))
         }
     }
 }
@@ -317,9 +478,12 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
             Ok(serde_json::Value::String(c.api_value().to_string()))
         }
         CoreValue::Concrete(ConcreteValue::Int(i)) => Ok(serde_json::Value::Number((*i).into())),
-        CoreValue::Concrete(ConcreteValue::Float(f)) => Ok(serde_json::Number::from_f64(*f)
+        CoreValue::Concrete(ConcreteValue::Float(f)) => serde_json::Number::from_f64(*f)
             .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null)),
+            .ok_or(SerializationError::NonFiniteFloat {
+                value: *f,
+                context: SerializationContext::WasmBoundary,
+            }),
         CoreValue::Concrete(ConcreteValue::Bool(b)) => Ok(serde_json::Value::Bool(*b)),
         CoreValue::Concrete(ConcreteValue::Duration(d)) => {
             Ok(serde_json::Value::Number((d.as_secs() as i64).into()))
@@ -383,28 +547,47 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
 }
 
 /// Helper: convert a serde_json::Value to a core Value.
-fn json_to_core_value(v: &serde_json::Value) -> CoreValue {
+fn json_to_core_value(
+    v: &serde_json::Value,
+    wit_variant: WitValueVariant,
+) -> Result<CoreValue, WasmValueDecodeError> {
     match v {
-        serde_json::Value::String(s) => CoreValue::Concrete(ConcreteValue::String(s.clone())),
+        serde_json::Value::String(s) => Ok(CoreValue::Concrete(ConcreteValue::String(s.clone()))),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                CoreValue::Concrete(ConcreteValue::Int(i))
+                Ok(CoreValue::Concrete(ConcreteValue::Int(i)))
             } else if let Some(f) = n.as_f64() {
-                CoreValue::Concrete(ConcreteValue::Float(f))
+                Ok(CoreValue::Concrete(ConcreteValue::Float(f)))
             } else {
-                CoreValue::Concrete(ConcreteValue::String(n.to_string()))
+                Err(WasmValueDecodeError::new(
+                    wit_variant,
+                    WasmValueDecodeErrorKind::UnsupportedNumber,
+                ))
             }
         }
-        serde_json::Value::Bool(b) => CoreValue::Concrete(ConcreteValue::Bool(*b)),
-        serde_json::Value::Array(items) => CoreValue::Concrete(ConcreteValue::List(
-            items.iter().map(json_to_core_value).collect(),
+        serde_json::Value::Bool(b) => Ok(CoreValue::Concrete(ConcreteValue::Bool(*b))),
+        serde_json::Value::Array(items) => {
+            let items = items
+                .iter()
+                .map(|item| json_to_core_value(item, wit_variant))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(CoreValue::Concrete(ConcreteValue::List(items)))
+        }
+        serde_json::Value::Object(map) => {
+            let map = map
+                .iter()
+                .map(|(key, value)| {
+                    json_to_core_value(value, wit_variant)
+                        .map(|value| (key.clone(), value))
+                        .map_err(|error| error.prepend_attribute(key))
+                })
+                .collect::<Result<indexmap::IndexMap<_, _>, _>>()?;
+            Ok(CoreValue::Concrete(ConcreteValue::Map(map)))
+        }
+        serde_json::Value::Null => Err(WasmValueDecodeError::new(
+            wit_variant,
+            WasmValueDecodeErrorKind::Null,
         )),
-        serde_json::Value::Object(map) => CoreValue::Concrete(ConcreteValue::Map(
-            map.iter()
-                .map(|(k, v)| (k.clone(), json_to_core_value(v)))
-                .collect(),
-        )),
-        serde_json::Value::Null => CoreValue::Concrete(ConcreteValue::String(String::new())),
     }
 }
 
@@ -419,10 +602,16 @@ where
         .collect()
 }
 
-pub fn wit_to_core_value_map(entries: &[(String, wit::Value)]) -> HashMap<String, CoreValue> {
+pub fn wit_to_core_value_map(
+    entries: &[(String, wit::Value)],
+) -> Result<HashMap<String, CoreValue>, WasmValueDecodeError> {
     entries
         .iter()
-        .map(|(k, v)| (k.clone(), wit_to_core_value(v)))
+        .map(|(key, value)| {
+            wit_to_core_value(value)
+                .map(|value| (key.clone(), value))
+                .map_err(|error| error.prepend_attribute(key))
+        })
         .collect()
 }
 
@@ -491,47 +680,50 @@ pub fn core_to_wit_state(state: &CoreState) -> Result<wit::State, SerializationE
     })
 }
 
-pub fn wit_to_core_state(state: &wit::State, id: &CoreResourceId) -> CoreState {
+pub fn wit_to_core_state(
+    state: &wit::State,
+    id: &CoreResourceId,
+) -> Result<CoreState, WasmValueDecodeError> {
+    let attributes = wit_to_core_value_map(&state.attributes)?;
     if !state.exists {
-        return CoreState::not_found(id.clone());
+        return Ok(CoreState::not_found(id.clone()));
     }
-    let attributes = wit_to_core_value_map(&state.attributes);
     let mut core_state = CoreState::existing(id.clone(), attributes);
     if let Some(ref ident) = state.identifier {
         core_state = core_state.with_identifier(ident);
     }
-    core_state
+    Ok(core_state)
 }
 
 pub fn wit_to_core_create_outcome(
     outcome: wit::CreateOutcome,
     id: &CoreResourceId,
-) -> CoreCreateOutcome {
+) -> Result<CoreCreateOutcome, WasmValueDecodeError> {
     match outcome {
-        wit::CreateOutcome::Success(state) => CoreCreateOutcome::Success {
-            state: wit_to_core_state(&state, id),
-        },
-        wit::CreateOutcome::PartialSuccess(partial) => CoreCreateOutcome::partial_success(
-            wit_to_core_state(&partial.state, id),
+        wit::CreateOutcome::Success(state) => Ok(CoreCreateOutcome::Success {
+            state: wit_to_core_state(&state, id)?,
+        }),
+        wit::CreateOutcome::PartialSuccess(partial) => Ok(CoreCreateOutcome::partial_success(
+            wit_to_core_state(&partial.state, id)?,
             partial.diagnostic.reason,
             partial.diagnostic.missing_attributes,
-        ),
+        )),
     }
 }
 
 pub fn wit_to_core_update_outcome(
     outcome: wit::UpdateOutcome,
     id: &CoreResourceId,
-) -> CoreUpdateOutcome {
+) -> Result<CoreUpdateOutcome, WasmValueDecodeError> {
     match outcome {
-        wit::UpdateOutcome::Success(state) => CoreUpdateOutcome::Success {
-            state: wit_to_core_state(&state, id),
-        },
-        wit::UpdateOutcome::PartialSuccess(partial) => CoreUpdateOutcome::partial_success(
-            wit_to_core_state(&partial.state, id),
+        wit::UpdateOutcome::Success(state) => Ok(CoreUpdateOutcome::Success {
+            state: wit_to_core_state(&state, id)?,
+        }),
+        wit::UpdateOutcome::PartialSuccess(partial) => Ok(CoreUpdateOutcome::partial_success(
+            wit_to_core_state(&partial.state, id)?,
             partial.diagnostic.reason,
             partial.diagnostic.missing_attributes,
-        ),
+        )),
     }
 }
 
@@ -561,22 +753,15 @@ pub fn core_data_source_to_wit_resource(
     })
 }
 
-pub fn wit_to_core_resource(resource: &wit::ResourceDef) -> CoreResource {
+pub fn wit_to_core_resource(
+    resource: &wit::ResourceDef,
+) -> Result<CoreResource, WasmValueDecodeError> {
     let id = wit_to_core_resource_id(&resource.id);
     let mut core_resource = CoreResource::from_id(id);
-    core_resource.attributes = resource
-        .attributes
-        .iter()
-        .map(|(k, v)| (k.clone(), wit_to_core_value(v)))
+    core_resource.attributes = wit_to_core_value_map(&resource.attributes)?
+        .into_iter()
         .collect();
-    core_resource
-}
-
-// -- JSON passthrough functions for provider-specific types --
-
-/// Serialize Directives to JSON string for the WIT boundary.
-pub fn directives_to_json(directives: &Directives) -> String {
-    serde_json::to_string(directives).unwrap_or_else(|_| "{}".to_string())
+    Ok(core_resource)
 }
 
 // -- ProviderError --
@@ -738,16 +923,16 @@ pub fn core_to_wit_patch_op(op: &CorePatchOp) -> Result<wit::PatchOp, Serializat
 }
 
 /// Convert a [`wit::PatchOp`] to a host-side [`CorePatchOp`].
-pub fn wit_to_core_patch_op(op: &wit::PatchOp) -> CorePatchOp {
-    CorePatchOp {
+pub fn wit_to_core_patch_op(op: &wit::PatchOp) -> Result<CorePatchOp, WasmValueDecodeError> {
+    Ok(CorePatchOp {
         kind: match op.kind {
             wit::PatchOpKind::Add => CorePatchOpKind::Add,
             wit::PatchOpKind::Replace => CorePatchOpKind::Replace,
             wit::PatchOpKind::Remove => CorePatchOpKind::Remove,
         },
         key: op.key.clone(),
-        value: op.value.as_ref().map(wit_to_core_value),
-    }
+        value: op.value.as_ref().map(wit_to_core_value).transpose()?,
+    })
 }
 
 /// Convert a host-side [`carina_core::schema::TypeIdentity`] to the
@@ -767,16 +952,9 @@ pub fn core_type_identity_to_wit(
 }
 
 /// Deserialize JSON to (name, display_name, version) tuple from ProviderInfo.
-pub fn json_to_provider_info(json: &str) -> (String, String, String) {
-    if let Ok(info) = serde_json::from_str::<proto::ProviderInfo>(json) {
-        (info.name, info.display_name, info.version)
-    } else {
-        (
-            "unknown".to_string(),
-            "Unknown Provider".to_string(),
-            "0.0.0".to_string(),
-        )
-    }
+pub fn json_to_provider_info(json: &str) -> Result<(String, String, String), serde_json::Error> {
+    let info = serde_json::from_str::<proto::ProviderInfo>(json)?;
+    Ok((info.name, info.display_name, info.version))
 }
 
 /// Reject a provider whose protocol is outside this host's supported range.
@@ -820,7 +998,7 @@ pub fn json_to_attribute_types(
     json: &str,
 ) -> Result<HashMap<String, CoreAttributeType>, SchemaDecodeError> {
     let proto_types: HashMap<String, proto::AttributeType> =
-        serde_json::from_str(json).unwrap_or_default();
+        serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
     proto_types
         .into_iter()
         .map(|(k, v)| proto_attr_type_to_core(&v).map(|attr_type| (k, attr_type)))
@@ -984,9 +1162,10 @@ fn proto_attr_schema_to_core(
     let default = default
         .as_ref()
         .map(|value| {
-            serde_json::to_value(value)
-                .map(|json| json_to_core_value(&json))
-                .map_err(SchemaDecodeError::schema_default_value_encode)
+            let json = serde_json::to_value(value)
+                .map_err(SchemaDecodeError::schema_default_value_encode)?;
+            json_to_core_value(&json, WitValueVariant::SchemaDefault)
+                .map_err(SchemaDecodeError::schema_default_value_decode)
         })
         .transpose()
         .map_err(|error| error.prepend_attribute(name))?;
@@ -1742,13 +1921,127 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn malformed_json_container_values_are_rejected() {
+        let values = [
+            (
+                wit::Value::StringListVal("not json".to_string()),
+                "string-list-val",
+            ),
+            (wit::Value::ListVal("not json".to_string()), "list-val"),
+            (wit::Value::MapVal("not json".to_string()), "map-val"),
+            (wit::Value::SecretVal("not json".to_string()), "secret-val"),
+        ];
+
+        for (value, variant) in values {
+            let error = wit_to_core_value(&value)
+                .expect_err("malformed JSON must not decode to a substitute value");
+            assert!(error.to_string().contains(variant));
+            assert!(std::error::Error::source(&error).is_some());
+        }
+
+        assert!(wit_to_core_value(&wit::Value::ListVal("{}".to_string())).is_err());
+        assert!(wit_to_core_value(&wit::Value::MapVal("[]".to_string())).is_err());
+    }
+
+    #[test]
+    fn null_json_container_values_are_rejected() {
+        let values = [
+            wit::Value::ListVal("[null]".to_string()),
+            wit::Value::MapVal(r#"{"key":null}"#.to_string()),
+            wit::Value::SecretVal("null".to_string()),
+        ];
+
+        for value in values {
+            assert!(
+                wit_to_core_value(&value).is_err(),
+                "{value:?} must not decode JSON null"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_secret_error_does_not_expose_payload() {
+        let plaintext = "boundary-secret-do-not-log";
+        let error = wit_to_core_value(&wit::Value::SecretVal(format!("\"{plaintext}")))
+            .expect_err("unterminated secret JSON must fail");
+
+        assert!(!error.to_string().contains(plaintext));
+        assert!(!format!("{error:?}").contains(plaintext));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn wrong_container_shapes_do_not_expose_payloads() {
+        let plaintext = "wrong-shape-secret-do-not-log";
+        let scalar = serde_json::to_string(plaintext).unwrap();
+        let values = [
+            wit::Value::StringListVal(scalar.clone()),
+            wit::Value::ListVal(scalar.clone()),
+            wit::Value::MapVal(scalar),
+            wit::Value::StringListVal(format!(r#"[{{"secret":"{plaintext}"}}]"#)),
+        ];
+
+        for value in values {
+            let error = wit_to_core_value(&value).expect_err("wrong container shape must fail");
+            assert!(!error.to_string().contains(plaintext), "{error}");
+            assert!(!format!("{error:?}").contains(plaintext), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn schema_default_decode_preserves_the_typed_value_error() {
+        let value_error = wit_to_core_value(&wit::Value::ListVal("not json".to_string()))
+            .expect_err("invalid schema default must fail value decoding");
+        let error = SchemaDecodeError::schema_default_value_decode(value_error);
+
+        assert!(
+            std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<WasmValueDecodeError>())
+                .is_some(),
+            "the schema wrapper must preserve WasmValueDecodeError as its source"
+        );
+    }
+
+    #[test]
+    fn provider_read_state_with_malformed_map_is_rejected() {
+        let id = CoreResourceId::with_provider_identity("mock", "test.resource", "example", None);
+        let state = wit::State {
+            identifier: Some("provider-id".to_string()),
+            attributes: vec![(
+                "settings".to_string(),
+                wit::Value::MapVal("not json".to_string()),
+            )],
+            exists: true,
+        };
+
+        let error = wit_to_core_state(&state, &id).expect_err("malformed state must be rejected");
+        assert!(error.to_string().contains("map-val"));
+        assert!(error.to_string().contains("settings"));
+    }
+
+    #[test]
+    fn non_finite_float_nested_in_list_is_rejected_at_wasm_boundary() {
+        let value = CoreValue::Concrete(ConcreteValue::List(vec![CoreValue::Concrete(
+            ConcreteValue::Float(f64::NAN),
+        )]));
+
+        assert!(matches!(
+            core_to_wit_value(&value),
+            Err(SerializationError::NonFiniteFloat {
+                context: SerializationContext::WasmBoundary,
+                ..
+            })
+        ));
+    }
+
     // -- Value roundtrips --
 
     #[test]
     fn test_scalar_bool_roundtrip() {
         let core = CoreValue::Concrete(ConcreteValue::Bool(true));
         let wit = core_to_wit_value(&core).unwrap();
-        let back = wit_to_core_value(&wit);
+        let back = wit_to_core_value(&wit).unwrap();
         assert_eq!(core, back);
     }
 
@@ -1756,7 +2049,7 @@ mod tests {
     fn test_scalar_int_roundtrip() {
         let core = CoreValue::Concrete(ConcreteValue::Int(42));
         let wit = core_to_wit_value(&core).unwrap();
-        let back = wit_to_core_value(&wit);
+        let back = wit_to_core_value(&wit).unwrap();
         assert_eq!(core, back);
     }
 
@@ -1764,7 +2057,7 @@ mod tests {
     fn test_scalar_float_roundtrip() {
         let core = CoreValue::Concrete(ConcreteValue::Float(2.78));
         let wit = core_to_wit_value(&core).unwrap();
-        let back = wit_to_core_value(&wit);
+        let back = wit_to_core_value(&wit).unwrap();
         assert_eq!(core, back);
     }
 
@@ -1772,7 +2065,7 @@ mod tests {
     fn test_scalar_string_roundtrip() {
         let core = CoreValue::Concrete(ConcreteValue::String("hello".into()));
         let wit = core_to_wit_value(&core).unwrap();
-        let back = wit_to_core_value(&wit);
+        let back = wit_to_core_value(&wit).unwrap();
         assert_eq!(core, back);
     }
 
@@ -1785,7 +2078,7 @@ mod tests {
         ]));
         let wit = core_to_wit_value(&core).unwrap();
         assert!(matches!(wit, wit::Value::ListVal(_)));
-        let back = wit_to_core_value(&wit);
+        let back = wit_to_core_value(&wit).unwrap();
         assert_eq!(core, back);
     }
 
@@ -1797,7 +2090,7 @@ mod tests {
         ]));
         let wit = core_to_wit_value(&core).unwrap();
         assert!(matches!(wit, wit::Value::StringListVal(_)));
-        let back = wit_to_core_value(&wit);
+        let back = wit_to_core_value(&wit).unwrap();
         assert_eq!(core, back);
     }
 
@@ -1819,7 +2112,7 @@ mod tests {
         ));
         let wit = core_to_wit_value(&core).unwrap();
         assert!(matches!(wit, wit::Value::MapVal(_)));
-        let back = wit_to_core_value(&wit);
+        let back = wit_to_core_value(&wit).unwrap();
         assert_eq!(core, back);
     }
 
@@ -1841,7 +2134,7 @@ mod tests {
         ));
         let core = CoreValue::Concrete(ConcreteValue::List(vec![inner_map.clone(), inner_map]));
         let wit = core_to_wit_value(&core).unwrap();
-        let back = wit_to_core_value(&wit);
+        let back = wit_to_core_value(&wit).unwrap();
         assert_eq!(core, back);
     }
 
@@ -1868,7 +2161,7 @@ mod tests {
             .collect(),
         ));
         let wit = core_to_wit_value(&core).unwrap();
-        let back = wit_to_core_value(&wit);
+        let back = wit_to_core_value(&wit).unwrap();
         assert_eq!(core, back);
     }
 
@@ -1987,7 +2280,7 @@ mod tests {
             ConcreteValue::String("hunter2".into()),
         ))));
         let wit_v = core_to_wit_value(&original).unwrap();
-        let back = wit_to_core_value(&wit_v);
+        let back = wit_to_core_value(&wit_v).unwrap();
         match back {
             CoreValue::Deferred(DeferredValue::Secret(inner)) => match *inner {
                 CoreValue::Concrete(ConcreteValue::String(s)) => assert_eq!(s, "hunter2"),
@@ -2092,7 +2385,7 @@ mod tests {
         let core = CoreState::existing(id.clone(), attrs);
 
         let wit = core_to_wit_state(&core).unwrap();
-        let back = wit_to_core_state(&wit, &id);
+        let back = wit_to_core_state(&wit, &id).unwrap();
 
         assert_eq!(back.id, core.id);
         assert_eq!(back.attributes, core.attributes);
@@ -2110,7 +2403,7 @@ mod tests {
 
         let wit = core_to_wit_state(&core).unwrap();
         assert_eq!(wit.identifier, Some("vpc-12345".into()));
-        let back = wit_to_core_state(&wit, &id);
+        let back = wit_to_core_state(&wit, &id).unwrap();
         assert_eq!(back.identifier, Some("vpc-12345".into()));
     }
 
@@ -2129,7 +2422,7 @@ mod tests {
         .collect();
 
         let wit = core_to_wit_value_map(&map).unwrap();
-        let back = wit_to_core_value_map(&wit);
+        let back = wit_to_core_value_map(&wit).unwrap();
         assert_eq!(map, back);
     }
 
@@ -2154,28 +2447,10 @@ mod tests {
         assert_eq!(wit.id.resource_type, "s3.Bucket");
         assert_eq!(wit.id.identity, "my-bucket");
 
-        let back = wit_to_core_resource(&wit);
+        let back = wit_to_core_resource(&wit).unwrap();
         assert_eq!(back.id, resource.id);
         // Compare resolved attributes
         assert_eq!(back.resolved_attributes(), resource.resolved_attributes());
-    }
-
-    // -- JSON passthrough tests --
-
-    #[test]
-    fn test_directives_to_json() {
-        let directives = Directives {
-            force_delete: true,
-            create_before_destroy: false,
-            prevent_destroy: false,
-            depends_on: Vec::new(),
-            ..Directives::default()
-        };
-        let json = directives_to_json(&directives);
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["force_delete"], true);
-        assert_eq!(parsed["create_before_destroy"], false);
-        assert_eq!(parsed["prevent_destroy"], false);
     }
 
     #[test]
@@ -2303,7 +2578,12 @@ mod tests {
         .await
         .expect("checked request should be prepared");
         let wit_patch = core_to_wit_update_patch(request.patch()).unwrap();
-        let back: Vec<_> = wit_patch.ops.iter().map(wit_to_core_patch_op).collect();
+        let back: Vec<_> = wit_patch
+            .ops
+            .iter()
+            .map(wit_to_core_patch_op)
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(back.len(), 3);
         assert_eq!(back[0].kind, CorePatchOpKind::Add);
         assert_eq!(back[0].key, "a");
@@ -2317,20 +2597,21 @@ mod tests {
     #[test]
     fn test_json_to_provider_info_valid() {
         let json = r#"{"name":"aws","display_name":"AWS Provider","version":"1.0.0"}"#;
-        let (name, display, version) = json_to_provider_info(json);
+        let (name, display, version) = json_to_provider_info(json).unwrap();
         assert_eq!(name, "aws");
         assert_eq!(display, "AWS Provider");
         assert_eq!(version, "1.0.0");
     }
 
     #[test]
-    fn test_json_to_provider_info_missing_version_falls_back() {
-        // When version is missing entirely (complete parse failure), fall back to "0.0.0"
+    fn test_json_to_provider_info_missing_required_version_is_rejected() {
         let json = r#"{"name":"old","display_name":"Old Provider"}"#;
-        let (name, display, version) = json_to_provider_info(json);
-        assert_eq!(name, "unknown");
-        assert_eq!(display, "Unknown Provider");
-        assert_eq!(version, "0.0.0");
+        assert!(json_to_provider_info(json).is_err());
+    }
+
+    #[test]
+    fn test_json_to_provider_info_malformed_json_is_rejected() {
+        assert!(json_to_provider_info("not json").is_err());
     }
 
     #[test]
@@ -2419,16 +2700,22 @@ mod tests {
                 "unique_name_attribute":{"type":"attribute"}
             }]"#,
         )
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        let mut rendered = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            use std::fmt::Write as _;
+            write!(rendered, ": {error}").unwrap();
+            source = error.source();
+        }
 
         assert!(
-            err.contains("schema JSON parse error"),
-            "error should identify schema JSON parsing: {err}"
+            rendered.contains("schema JSON parse error"),
+            "error should identify schema JSON parsing: {rendered}"
         );
         assert!(
-            err.contains("missing field `value`"),
-            "error should include serde detail: {err}"
+            rendered.contains("missing field `value`"),
+            "error should include serde detail: {rendered}"
         );
     }
 
@@ -2661,6 +2948,12 @@ mod tests {
     }
 
     #[test]
+    fn json_to_attribute_types_rejects_malformed_json() {
+        let error = json_to_attribute_types("not json").unwrap_err();
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
     fn test_deeply_nested_list_map_roundtrip() {
         let policy_document = CoreValue::Concrete(ConcreteValue::Map(
             vec![
@@ -2712,7 +3005,7 @@ mod tests {
         )]));
 
         let wit = core_to_wit_value(&policies).unwrap();
-        let back = wit_to_core_value(&wit);
+        let back = wit_to_core_value(&wit).unwrap();
         assert_eq!(policies, back);
     }
 

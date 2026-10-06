@@ -2775,7 +2775,8 @@ mod apply_state_save_tests {
             &HashMap::new(),
             &HashMap::new(),
             &[],
-        );
+        )
+        .expect("test provider hints should succeed");
 
         assert_eq!(
             second_plan.mutation_count(),
@@ -2852,7 +2853,8 @@ mod apply_state_save_tests {
             &HashMap::new(),
             &HashMap::new(),
             &[],
-        );
+        )
+        .expect("test provider hints should succeed");
 
         assert_eq!(
             second_plan.mutation_count(),
@@ -3349,7 +3351,8 @@ mod apply_state_save_tests {
             &HashMap::new(),
             &HashMap::new(),
             &[],
-        );
+        )
+        .expect("test provider hints should succeed");
         assert_eq!(plan.replace_display_info().count(), 1);
         let applied_states = HashMap::new();
         let successfully_deleted =
@@ -3418,7 +3421,8 @@ mod apply_state_save_tests {
             &HashMap::new(),
             &HashMap::new(),
             &[],
-        );
+        )
+        .expect("test provider hints should succeed");
         let replacement = plan
             .replace_display_info()
             .next()

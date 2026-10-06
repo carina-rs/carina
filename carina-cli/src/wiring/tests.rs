@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use carina_core::effect::PlanOp;
@@ -52,6 +52,7 @@ fn create_plan(
         orphan_dependencies,
         wait_bindings,
     )
+    .expect("test provider hints should succeed")
 }
 
 fn test_identity(value: impl Into<String>) -> ResourceIdentity {
@@ -68,6 +69,164 @@ struct NoopExecutionObserver;
 
 impl ExecutionObserver for NoopExecutionObserver {
     fn on_event(&self, _event: &ExecutionEvent) {}
+}
+
+#[tokio::test]
+async fn plan_preprocessor_propagates_normalizer_failure() {
+    struct FailingNormalizer {
+        state_called: Arc<AtomicBool>,
+    }
+
+    impl ProviderNormalizer for FailingNormalizer {
+        fn normalize_desired<'a>(
+            &'a self,
+            _resources: &'a mut [Resource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            Box::pin(async { Err(ProviderError::internal("plan normalization failed")) })
+        }
+
+        fn normalize_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            Box::pin(async move {
+                self.state_called.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn hydrate_read_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+            _saved_attrs: &'a carina_core::provider::SavedAttrs,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            carina_core::provider::ready_noop()
+        }
+
+        fn merge_default_tags<'a>(
+            &'a self,
+            _resources: &'a mut [Resource],
+            _default_tags: &'a IndexMap<String, Value>,
+            _registry: &'a SchemaRegistry,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            carina_core::provider::ready_noop()
+        }
+    }
+
+    let state_called = Arc::new(AtomicBool::new(false));
+    let normalizer = FailingNormalizer {
+        state_called: Arc::clone(&state_called),
+    };
+    let ctx = WiringContext::new(Vec::new(), &[]);
+    let mut resources = OverrideAwareResources::build(
+        Vec::new(),
+        None::<&StateFile>,
+        carina_core::binding_index::PreApplyInputs {
+            managed: &[],
+            compositions: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        },
+    )
+    .unwrap();
+    let module_gate = carina_core::executor::ModuleConstraintGate::new(&[]);
+
+    let error = PlanPreprocessor::new(&normalizer, &ctx)
+        .prepare(
+            &mut resources,
+            &[],
+            &module_gate,
+            &mut HashMap::new(),
+            &[],
+            &mut [],
+            &[],
+            &mut [],
+        )
+        .await
+        .expect_err("normalizer failure must abort plan preprocessing");
+
+    match error {
+        PlanPreparationError::Provider(error) => {
+            assert_eq!(error.message(), "plan normalization failed");
+        }
+        PlanPreparationError::Plan(errors) => panic!("unexpected plan errors: {errors:#?}"),
+    }
+    assert!(
+        !state_called.load(Ordering::SeqCst),
+        "state normalization must not run after desired normalization fails"
+    );
+}
+
+#[tokio::test]
+async fn instantiate_provider_into_router_propagates_normalizer_creation_failure() {
+    struct FailingNormalizerFactory;
+
+    impl ProviderFactory for FailingNormalizerFactory {
+        fn name(&self) -> &str {
+            "failing"
+        }
+
+        fn display_name(&self) -> &str {
+            "Failing normalizer factory"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "test-region".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _attributes: &IndexMap<String, Value>,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            Box::pin(async { Ok(Box::new(MockProvider::new()) as Box<dyn Provider>) })
+        }
+
+        fn create_normalizer(
+            &self,
+            _binding: Option<&str>,
+            _attributes: &IndexMap<String, Value>,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
+            Box::pin(async { Err(ProviderError::internal("normalizer initialization failed")) })
+        }
+
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            Vec::new()
+        }
+    }
+
+    let ctx = WiringContext::new(vec![Box::new(FailingNormalizerFactory)], &[]);
+    let config = ProviderConfig {
+        name: "failing".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    };
+    let mut router = ProviderRouter::new();
+    let error =
+        instantiate_provider_into_router(&ctx, &mut router, &config, Path::new("."), None, None)
+            .await
+            .expect_err("normalizer creation failure must abort provider router setup");
+
+    let AppError::Provider(error) = error else {
+        panic!("expected provider error, got {error}");
+    };
+    assert_eq!(error.message(), "normalizer initialization failed");
+    assert_eq!(error.detail().provider_name.as_deref(), Some("failing"));
 }
 
 struct CascadeAwsccFactory;
@@ -220,8 +379,8 @@ impl Provider for CascadeCreateProvider {
         Box::pin(async { Ok(()) })
     }
 
-    fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
-        Vec::new()
+    fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -315,8 +474,8 @@ impl Provider for ReadWithRetryProvider {
         Box::pin(async move { Ok(()) })
     }
 
-    fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
-        Vec::new()
+    fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -574,7 +733,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
     );
 
     // After normalize_state, state values match desired values → no diff
-    normalize_state_with_ctx(&ctx, &mut current_states);
+    normalize_state_with_ctx(&ctx, &mut current_states).unwrap();
     let resources_with = vec![resource];
     let plan_with = create_plan(
         &resources_with,
@@ -701,10 +860,15 @@ fn test_merge_default_tags_prevents_false_diff() {
     let mut router = ProviderRouter::new();
     for factory in ctx.factories() {
         let attrs = IndexMap::new();
-        router.add_normalizer(rt.block_on(factory.create_normalizer(None, &attrs)));
+        router.add_normalizer(
+            factory.name(),
+            rt.block_on(factory.create_normalizer(None, &attrs))
+                .expect("test normalizer should be created"),
+        );
     }
     let mut resources_with = vec![resource];
-    rt.block_on(router.merge_default_tags(&mut resources_with, &default_tags, &schemas));
+    rt.block_on(router.merge_default_tags(&mut resources_with, &default_tags, &schemas))
+        .unwrap();
 
     // After merging, desired now has tags matching state → no diff
     let plan_with = create_plan(
@@ -1671,11 +1835,13 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
         &self,
         _binding: Option<&str>,
         _attributes: &IndexMap<String, Value>,
-    ) -> carina_core::provider::BoxFuture<'_, Box<dyn carina_core::provider::ProviderNormalizer>>
-    {
+    ) -> carina_core::provider::BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>,
+    > {
         Box::pin(async {
-            Box::new(carina_core::provider::NoopNormalizer)
-                as Box<dyn carina_core::provider::ProviderNormalizer>
+            Ok(Box::new(carina_core::provider::NoopNormalizer)
+                as Box<dyn carina_core::provider::ProviderNormalizer>)
         })
     }
 
@@ -3035,11 +3201,13 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
         &self,
         _binding: Option<&str>,
         _attributes: &IndexMap<String, Value>,
-    ) -> carina_core::provider::BoxFuture<'_, Box<dyn carina_core::provider::ProviderNormalizer>>
-    {
+    ) -> carina_core::provider::BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>,
+    > {
         Box::pin(async {
-            Box::new(carina_core::provider::NoopNormalizer)
-                as Box<dyn carina_core::provider::ProviderNormalizer>
+            Ok(Box::new(carina_core::provider::NoopNormalizer)
+                as Box<dyn carina_core::provider::ProviderNormalizer>)
         })
     }
 
@@ -3577,8 +3745,8 @@ mod read_with_retry_identifier_tests {
             &self,
             _id: &ResourceId,
             _op: carina_core::effect::PlanOp,
-        ) -> Vec<String> {
-            Vec::new()
+        ) -> ProviderResult<Vec<String>> {
+            Ok(Vec::new())
         }
     }
 
@@ -4968,8 +5136,8 @@ mod wait_until_enum_alias {
             &self,
             _b: Option<&str>,
             _a: &IndexMap<String, Value>,
-        ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
-            Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
+            Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
         }
         fn schemas(&self) -> Vec<ResourceSchema> {
             vec![
@@ -4998,8 +5166,8 @@ mod wait_until_enum_alias {
         }
     }
 
-    // The provider is never instantiated. These methods exist only to satisfy
-    // the trait and are unreachable in these tests.
+    // The plan-seam test uses this provider only for its default empty
+    // satisfier hint. CRUD methods remain unreachable.
     struct StubProvider;
     impl Provider for StubProvider {
         fn name(&self) -> &str {
@@ -5059,8 +5227,8 @@ mod wait_until_enum_alias {
             &self,
             _id: &ResourceId,
             _op: carina_core::effect::PlanOp,
-        ) -> Vec<String> {
-            Vec::new()
+        ) -> ProviderResult<Vec<String>> {
+            Ok(Vec::new())
         }
     }
 
@@ -5161,7 +5329,7 @@ mod wait_until_enum_alias {
         let plan_raw = carina_core::differ::create_plan(
             &resolved_resources,
             &[],
-            &carina_core::provider::ProviderRouter::new(),
+            &StubProvider,
             &carina_core::resource::into_plan_input_map(
                 states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
@@ -5173,7 +5341,8 @@ mod wait_until_enum_alias {
             &HashMap::new(),
             &HashMap::new(),
             &raw_waits,
-        );
+        )
+        .expect("test provider hints should succeed");
         assert!(
             plan_raw.effects().iter().any(|e| e.is_wait()),
             "precondition: with the raw enum RHS the differ emits the no-op \
@@ -5187,7 +5356,7 @@ mod wait_until_enum_alias {
         let plan_fixed = carina_core::differ::create_plan(
             &resolved_resources,
             &[],
-            &carina_core::provider::ProviderRouter::new(),
+            &StubProvider,
             &carina_core::resource::into_plan_input_map(
                 states.clone(),
                 &carina_core::schema::SchemaRegistry::new(),
@@ -5199,7 +5368,8 @@ mod wait_until_enum_alias {
             &HashMap::new(),
             &HashMap::new(),
             &waits,
-        );
+        )
+        .expect("test provider hints should succeed");
         assert!(
             !plan_fixed.effects().iter().any(|e| e.is_wait()),
             "carina#3358: after enum-alias resolution the already-satisfied \
@@ -5625,9 +5795,9 @@ mod resolved_value_constraint_gate {
             &self,
             _binding: Option<&str>,
             _attributes: &IndexMap<String, Value>,
-        ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
             Box::pin(async {
-                Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>
+                Ok(Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>)
             })
         }
 
@@ -5752,8 +5922,12 @@ mod resolved_value_constraint_gate {
             Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
         }
 
-        fn required_permissions(&self, _id: &ResourceId, _op: PlanOp) -> Vec<String> {
-            Vec::new()
+        fn required_permissions(
+            &self,
+            _id: &ResourceId,
+            _op: PlanOp,
+        ) -> ProviderResult<Vec<String>> {
+            Ok(Vec::new())
         }
     }
 
@@ -5763,7 +5937,10 @@ mod resolved_value_constraint_gate {
     }
 
     impl ProviderNormalizer for RewritingNormalizer {
-        fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+        fn normalize_desired<'a>(
+            &'a self,
+            resources: &'a mut [Resource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             self.desired_calls.fetch_add(1, Ordering::SeqCst);
             for resource in resources {
                 if resource.attributes.contains_key("target") {
@@ -5776,7 +5953,7 @@ mod resolved_value_constraint_gate {
         fn normalize_state<'a>(
             &'a self,
             _current_states: &'a mut HashMap<ResourceId, State>,
-        ) -> BoxFuture<'a, ()> {
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
 
@@ -5784,7 +5961,7 @@ mod resolved_value_constraint_gate {
             &'a self,
             _current_states: &'a mut HashMap<ResourceId, State>,
             _saved_attrs: &'a carina_core::provider::SavedAttrs,
-        ) -> BoxFuture<'a, ()> {
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
 
@@ -5793,7 +5970,7 @@ mod resolved_value_constraint_gate {
             _resources: &'a mut [Resource],
             _default_tags: &'a IndexMap<String, Value>,
             _registry: &'a SchemaRegistry,
-        ) -> BoxFuture<'a, ()> {
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
     }
@@ -5802,6 +5979,15 @@ mod resolved_value_constraint_gate {
         Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("producer", "value"),
         })
+    }
+
+    fn into_plan_errors(error: PlanPreparationError) -> Vec<carina_core::plan::PlanError> {
+        match error {
+            PlanPreparationError::Plan(errors) => errors,
+            PlanPreparationError::Provider(error) => {
+                panic!("test normalizer unexpectedly failed: {error}")
+            }
+        }
     }
 
     fn managed_resources(
@@ -5863,6 +6049,7 @@ mod resolved_value_constraint_gate {
                 &mut wait_bindings,
             )
             .await
+            .map_err(into_plan_errors)
     }
 
     fn pending_composition(
@@ -5950,6 +6137,7 @@ mod resolved_value_constraint_gate {
                 &mut waits,
             )
             .await
+            .map_err(into_plan_errors)
     }
 
     fn assert_resolved_error(
@@ -6086,6 +6274,7 @@ mod resolved_value_constraint_gate {
             )
             .await
             .expect_err("invalid resolved data-source input must fail planning");
+        let errors = into_plan_errors(errors);
 
         assert_resolved_error(&errors, "lookup.Pattern", "required pattern");
         assert_eq!(normalizer.desired_calls.load(Ordering::SeqCst), 0);

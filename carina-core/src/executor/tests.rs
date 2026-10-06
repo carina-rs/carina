@@ -247,8 +247,12 @@ impl Provider for MockProvider {
         Box::pin(async move { result })
     }
 
-    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
-        Vec::new()
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: crate::effect::PlanOp,
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -462,7 +466,7 @@ impl crate::provider::ProviderNormalizer for CanonicalizingNormalizer {
     fn normalize_desired<'a>(
         &'a self,
         resources: &'a mut [Resource],
-    ) -> crate::provider::BoxFuture<'a, ()> {
+    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         Box::pin(async move {
             for r in resources.iter_mut() {
                 let keys: Vec<String> = r.attributes.keys().cloned().collect();
@@ -474,13 +478,14 @@ impl crate::provider::ProviderNormalizer for CanonicalizingNormalizer {
                     }
                 }
             }
+            Ok(())
         })
     }
 
     fn normalize_state<'a>(
         &'a self,
         _current_states: &'a mut HashMap<ResourceId, State>,
-    ) -> crate::provider::BoxFuture<'a, ()> {
+    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
 
@@ -488,7 +493,7 @@ impl crate::provider::ProviderNormalizer for CanonicalizingNormalizer {
         &'a self,
         _current_states: &'a mut HashMap<ResourceId, State>,
         _saved_attrs: &'a crate::provider::SavedAttrs,
-    ) -> crate::provider::BoxFuture<'a, ()> {
+    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
 
@@ -497,7 +502,7 @@ impl crate::provider::ProviderNormalizer for CanonicalizingNormalizer {
         _resources: &'a mut [Resource],
         _default_tags: &'a indexmap::IndexMap<String, Value>,
         _registry: &'a crate::schema::SchemaRegistry,
-    ) -> crate::provider::BoxFuture<'a, ()> {
+    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
 }
@@ -508,14 +513,14 @@ impl crate::provider::ProviderNormalizer for DefaultTagsNormalizer {
     fn normalize_desired<'a>(
         &'a self,
         _resources: &'a mut [Resource],
-    ) -> crate::provider::BoxFuture<'a, ()> {
+    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
 
     fn normalize_state<'a>(
         &'a self,
         _current_states: &'a mut HashMap<ResourceId, State>,
-    ) -> crate::provider::BoxFuture<'a, ()> {
+    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
 
@@ -523,7 +528,7 @@ impl crate::provider::ProviderNormalizer for DefaultTagsNormalizer {
         &'a self,
         _current_states: &'a mut HashMap<ResourceId, State>,
         _saved_attrs: &'a crate::provider::SavedAttrs,
-    ) -> crate::provider::BoxFuture<'a, ()> {
+    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
 
@@ -532,7 +537,7 @@ impl crate::provider::ProviderNormalizer for DefaultTagsNormalizer {
         resources: &'a mut [Resource],
         default_tags: &'a indexmap::IndexMap<String, Value>,
         _registry: &'a crate::schema::SchemaRegistry,
-    ) -> crate::provider::BoxFuture<'a, ()> {
+    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         Box::pin(async move {
             for resource in resources {
                 let mut tags = match resource.get_attr("tags") {
@@ -544,6 +549,7 @@ impl crate::provider::ProviderNormalizer for DefaultTagsNormalizer {
                 }
                 resource.set_attr("tags", Value::Concrete(ConcreteValue::Map(tags)));
             }
+            Ok(())
         })
     }
 }
@@ -554,7 +560,7 @@ impl crate::provider::ProviderNormalizer for SecretListToScalarNormalizer {
     fn normalize_desired<'a>(
         &'a self,
         resources: &'a mut [Resource],
-    ) -> crate::provider::BoxFuture<'a, ()> {
+    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         Box::pin(async move {
             for resource in resources {
                 if let Some(Value::Concrete(ConcreteValue::List(items))) =
@@ -567,13 +573,14 @@ impl crate::provider::ProviderNormalizer for SecretListToScalarNormalizer {
                     );
                 }
             }
+            Ok(())
         })
     }
 
     fn normalize_state<'a>(
         &'a self,
         _current_states: &'a mut HashMap<ResourceId, State>,
-    ) -> crate::provider::BoxFuture<'a, ()> {
+    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
 
@@ -581,7 +588,7 @@ impl crate::provider::ProviderNormalizer for SecretListToScalarNormalizer {
         &'a self,
         _current_states: &'a mut HashMap<ResourceId, State>,
         _saved_attrs: &'a crate::provider::SavedAttrs,
-    ) -> crate::provider::BoxFuture<'a, ()> {
+    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
 
@@ -590,7 +597,7 @@ impl crate::provider::ProviderNormalizer for SecretListToScalarNormalizer {
         _resources: &'a mut [Resource],
         _default_tags: &'a indexmap::IndexMap<String, Value>,
         _registry: &'a crate::schema::SchemaRegistry,
-    ) -> crate::provider::BoxFuture<'a, ()> {
+    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
 }
@@ -912,8 +919,12 @@ impl Provider for DelayedCountingProvider {
         })
     }
 
-    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
-        Vec::new()
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: crate::effect::PlanOp,
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -994,8 +1005,12 @@ impl Provider for PendingWaitProvider {
         Box::pin(async { Err(ProviderError::internal("delete not used")) })
     }
 
-    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
-        Vec::new()
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: crate::effect::PlanOp,
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -1209,8 +1224,12 @@ impl Provider for PendingRefreshProvider {
         Box::pin(async { Err(ProviderError::internal("delete not used")) })
     }
 
-    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
-        Vec::new()
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: crate::effect::PlanOp,
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -1310,8 +1329,12 @@ impl Provider for ControlledReadyCreateProvider {
         Box::pin(async { Err(ProviderError::internal("delete not used")) })
     }
 
-    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
-        Vec::new()
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: crate::effect::PlanOp,
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -1535,14 +1558,14 @@ impl crate::provider::ProviderNormalizer for MustNotNormalizeInvalidValue {
     fn normalize_desired<'a>(
         &'a self,
         _resources: &'a mut [Resource],
-    ) -> crate::provider::BoxFuture<'a, ()> {
+    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         Box::pin(async { panic!("normalizer ran before the value-constraint gate") })
     }
 
     fn normalize_state<'a>(
         &'a self,
         _current_states: &'a mut HashMap<ResourceId, State>,
-    ) -> crate::provider::BoxFuture<'a, ()> {
+    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
 
@@ -1550,7 +1573,7 @@ impl crate::provider::ProviderNormalizer for MustNotNormalizeInvalidValue {
         &'a self,
         _current_states: &'a mut HashMap<ResourceId, State>,
         _saved_attrs: &'a crate::provider::SavedAttrs,
-    ) -> crate::provider::BoxFuture<'a, ()> {
+    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
 
@@ -1559,7 +1582,7 @@ impl crate::provider::ProviderNormalizer for MustNotNormalizeInvalidValue {
         _resources: &'a mut [Resource],
         _default_tags: &'a indexmap::IndexMap<String, Value>,
         _registry: &'a crate::schema::SchemaRegistry,
-    ) -> crate::provider::BoxFuture<'a, ()> {
+    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
 }
@@ -4671,7 +4694,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
         fn normalize_desired<'a>(
             &'a self,
             resources: &'a mut [Resource],
-        ) -> crate::provider::BoxFuture<'a, ()> {
+        ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
             Box::pin(async move {
                 let mut guard = self.store.lock().await;
                 *guard += 1;
@@ -4683,13 +4706,14 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
                         Value::Concrete(ConcreteValue::String(n.to_string())),
                     );
                 }
+                Ok(())
             })
         }
 
         fn normalize_state<'a>(
             &'a self,
             _current_states: &'a mut HashMap<ResourceId, State>,
-        ) -> crate::provider::BoxFuture<'a, ()> {
+        ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
             crate::provider::ready_noop()
         }
 
@@ -4697,7 +4721,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
             &'a self,
             _current_states: &'a mut HashMap<ResourceId, State>,
             _saved_attrs: &'a crate::provider::SavedAttrs,
-        ) -> crate::provider::BoxFuture<'a, ()> {
+        ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
             crate::provider::ready_noop()
         }
 
@@ -4706,7 +4730,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
             _resources: &'a mut [Resource],
             _default_tags: &'a indexmap::IndexMap<String, Value>,
             _registry: &'a crate::schema::SchemaRegistry,
-        ) -> crate::provider::BoxFuture<'a, ()> {
+        ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
             crate::provider::ready_noop()
         }
     }
@@ -5281,8 +5305,8 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
             &self,
             _id: &ResourceId,
             _op: crate::effect::PlanOp,
-        ) -> Vec<String> {
-            Vec::new()
+        ) -> ProviderResult<Vec<String>> {
+            Ok(Vec::new())
         }
     }
 
@@ -5442,8 +5466,12 @@ impl Provider for YieldingUpdateProvider {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 
-    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
-        Vec::new()
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: crate::effect::PlanOp,
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -5835,7 +5863,8 @@ fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
         &HashMap::new(),
         &HashMap::new(),
         &[],
-    );
+    )
+    .expect("test provider hints should succeed");
 
     let update_idx = plan
         .effects()
@@ -6195,8 +6224,12 @@ impl Provider for RecordingMockProvider {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
 
-    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
-        Vec::new()
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: crate::effect::PlanOp,
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -6314,8 +6347,12 @@ impl Provider for CascadeReplaceProvider {
         Box::pin(async { Ok(()) })
     }
 
-    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
-        Vec::new()
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: crate::effect::PlanOp,
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -6430,7 +6467,8 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         &HashMap::new(),
         &HashMap::new(),
         &[],
-    );
+    )
+    .expect("test provider hints should succeed");
     assert_eq!(plan.replace_display_info().count(), 2);
 
     let unresolved_resources = override_aware
@@ -7279,8 +7317,12 @@ impl Provider for IdentifierAwareProvider {
         Box::pin(async move { Ok(()) })
     }
 
-    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
-        Vec::new()
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: crate::effect::PlanOp,
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -7734,7 +7776,10 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
     }
 
     impl crate::provider::ProviderNormalizer for LockOrderNormalizer {
-        fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+        fn normalize_desired<'a>(
+            &'a self,
+            resources: &'a mut [Resource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 let is_alb = resources.iter().any(|resource| {
                     resource.id.identity_str().expect("resolved identity") == "alb"
@@ -7749,13 +7794,14 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
                 }
                 let _awscc = self.scenario.awscc_shared.lock().await;
                 tokio::task::yield_now().await;
+                Ok(())
             })
         }
 
         fn normalize_state<'a>(
             &'a self,
             _current_states: &'a mut HashMap<ResourceId, State>,
-        ) -> BoxFuture<'a, ()> {
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             crate::provider::ready_noop()
         }
 
@@ -7763,7 +7809,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             &'a self,
             _current_states: &'a mut HashMap<ResourceId, State>,
             _saved_attrs: &'a crate::provider::SavedAttrs,
-        ) -> BoxFuture<'a, ()> {
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             crate::provider::ready_noop()
         }
 
@@ -7772,7 +7818,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             _resources: &'a mut [Resource],
             _default_tags: &'a indexmap::IndexMap<String, Value>,
             _registry: &'a crate::schema::SchemaRegistry,
-        ) -> BoxFuture<'a, ()> {
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             crate::provider::ready_noop()
         }
     }
@@ -7872,8 +7918,8 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             &self,
             _id: &ResourceId,
             _op: crate::effect::PlanOp,
-        ) -> Vec<String> {
-            Vec::new()
+        ) -> ProviderResult<Vec<String>> {
+            Ok(Vec::new())
         }
     }
 

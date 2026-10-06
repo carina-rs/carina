@@ -97,16 +97,20 @@ impl crate::provider::Provider for HintProvider {
         Box::pin(async { panic!("unexpected delete") })
     }
 
-    fn required_permissions(&self, _id: &ResourceId, _op: crate::effect::PlanOp) -> Vec<String> {
-        Vec::new()
+    fn required_permissions(
+        &self,
+        _id: &ResourceId,
+        _op: crate::effect::PlanOp,
+    ) -> crate::provider::ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 
     fn satisfier_hint(
         &self,
         _target_id: &ResourceId,
         _attr_path: &crate::wait::predicate::AttrPath,
-    ) -> Vec<crate::wait::BindingPattern> {
-        self.hints.clone()
+    ) -> crate::provider::ProviderResult<Vec<crate::wait::BindingPattern>> {
+        Ok(self.hints.clone())
     }
 }
 
@@ -2191,7 +2195,7 @@ fn wait_binding_lowers_to_wait_effect() {
     let plan = create_plan(
         &resources,
         &[],
-        &crate::provider::ProviderRouter::new(),
+        &HintProvider { hints: Vec::new() },
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -2265,7 +2269,7 @@ fn create_plan_records_error_for_empty_predicate_attr_path() {
     let plan = create_plan(
         &resources,
         &[],
-        &crate::provider::ProviderRouter::new(),
+        &HintProvider { hints: Vec::new() },
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -2451,7 +2455,7 @@ fn wait_uses_schema_default_timeout_when_omitted() {
     let plan = create_plan(
         &resources,
         &[],
-        &crate::provider::ProviderRouter::new(),
+        &HintProvider { hints: Vec::new() },
         &HashMap::new(),
         &HashMap::new(),
         &schemas,
@@ -2496,7 +2500,7 @@ fn wait_with_unknown_target_emits_plan_error() {
     let plan = create_plan(
         &resources,
         &[],
-        &crate::provider::ProviderRouter::new(),
+        &HintProvider { hints: Vec::new() },
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -2567,7 +2571,7 @@ fn wait_omitted_when_all_consumers_unchanged() {
     let plan = create_plan(
         &resources,
         &[],
-        &crate::provider::ProviderRouter::new(),
+        &HintProvider { hints: Vec::new() },
         &crate::resource::into_plan_input_map(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
@@ -2620,7 +2624,7 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
     let plan = create_plan(
         &resources,
         &[],
-        &crate::provider::ProviderRouter::new(),
+        &HintProvider { hints: Vec::new() },
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -2697,7 +2701,7 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
     let plan = create_plan(
         &resources,
         &[],
-        &crate::provider::ProviderRouter::new(),
+        &HintProvider { hints: Vec::new() },
         &crate::resource::into_plan_input_map(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
@@ -2753,7 +2757,7 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
     let plan = create_plan(
         &resources,
         &[],
-        &crate::provider::ProviderRouter::new(),
+        &HintProvider { hints: Vec::new() },
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -2833,7 +2837,7 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
     let plan = create_plan(
         &resources,
         &[],
-        &crate::provider::ProviderRouter::new(),
+        &HintProvider { hints: Vec::new() },
         &crate::resource::into_plan_input_map(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),

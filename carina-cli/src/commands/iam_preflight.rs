@@ -6,7 +6,7 @@ use aws_sdk_iam::operation::simulate_principal_policy::SimulatePrincipalPolicyEr
 use aws_sdk_iam::types::PolicyEvaluationDecisionType;
 use carina_core::effect::{Effect, PlanOp};
 use carina_core::plan::Plan;
-use carina_core::provider::Provider;
+use carina_core::provider::{Provider, ProviderResult};
 use carina_core::resource::{ResolvedResource, ResourceId};
 use colored::Colorize;
 use serde_json::Value as JsonValue;
@@ -189,15 +189,15 @@ pub(crate) async fn run_iam_preflight(
     plan: &Plan,
     provider: &dyn Provider,
     strict: bool,
-) -> IamPreflightResult {
-    let required = collect_required_actions(plan, provider);
+) -> ProviderResult<IamPreflightResult> {
+    let required = collect_required_actions(plan, provider)?;
     if required.is_empty() {
-        return IamPreflightResult::Checked(IamPreflightReport {
+        return Ok(IamPreflightResult::Checked(IamPreflightReport {
             actor_arn: String::new(),
             method: IamCheckMethod::SimulatePrincipalPolicy,
             source_providers: plan_provider_names(plan),
             missing_by_effect: Vec::new(),
-        });
+        }));
     }
 
     let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
@@ -205,11 +205,11 @@ pub(crate) async fn run_iam_preflight(
     let actor_arn = match resolve_actor_arn(&sts_client).await {
         Ok(actor) => actor,
         Err(e) => {
-            return IamPreflightResult::Skipped(IamPreflightSkipped {
+            return Ok(IamPreflightResult::Skipped(IamPreflightSkipped {
                 reason: format!(
                     "Warning: IAM preflight check skipped because AWS caller identity could not be resolved ({e})."
                 ),
-            });
+            }));
         }
     };
 
@@ -233,7 +233,7 @@ pub(crate) async fn run_iam_preflight(
                     (IamCheckMethod::DocumentFallback, missing)
                 }
                 Err(e) => {
-                    return IamPreflightResult::Skipped(IamPreflightSkipped {
+                    return Ok(IamPreflightResult::Skipped(IamPreflightSkipped {
                         reason: format!(
                             "Warning: IAM preflight check skipped for actor {} because IAM policy simulation was denied and IAM policies could not be read for fallback ({e}). \
                              The actor needs `iam:SimulatePrincipalPolicy` (with `Resource = {}`) OR `iam:GetRolePolicy` + `iam:ListAttachedRolePolicies` for the fallback path. \
@@ -241,16 +241,16 @@ pub(crate) async fn run_iam_preflight(
                             actor_arn.as_str(),
                             actor_arn.as_str(),
                         ),
-                    });
+                    }));
                 }
             }
         }
         Err(SimulateError::Other(e)) => {
-            return IamPreflightResult::Skipped(IamPreflightSkipped {
+            return Ok(IamPreflightResult::Skipped(IamPreflightSkipped {
                 reason: format!(
                     "Warning: IAM preflight check skipped because IAM policy simulation failed ({e})."
                 ),
-            });
+            }));
         }
     };
 
@@ -262,20 +262,20 @@ pub(crate) async fn run_iam_preflight(
     };
 
     if strict && !report.missing_by_effect.is_empty() {
-        return IamPreflightResult::Checked(report);
+        return Ok(IamPreflightResult::Checked(report));
     }
 
-    IamPreflightResult::Checked(report)
+    Ok(IamPreflightResult::Checked(report))
 }
 
 pub(crate) fn collect_required_actions(
     plan: &Plan,
     provider: &dyn Provider,
-) -> Vec<RequiredAction> {
+) -> ProviderResult<Vec<RequiredAction>> {
     let mut required = Vec::new();
     for effect in plan.effects() {
         for (id, op) in effect_required_ops(effect) {
-            let actions = provider.required_permissions(&id, op);
+            let actions = provider.required_permissions(&id, op)?;
             for action in actions {
                 required.push(RequiredAction {
                     effect: EffectAddress {
@@ -287,7 +287,7 @@ pub(crate) fn collect_required_actions(
             }
         }
     }
-    required
+    Ok(required)
 }
 
 fn effect_required_ops(effect: &Effect) -> Vec<(ResourceId, PlanOp)> {
@@ -766,7 +766,9 @@ mod tests {
         ResolvedDataSource::new(resource)
     }
 
-    struct PermissionProvider;
+    struct PermissionProvider {
+        fail: bool,
+    }
 
     impl Provider for PermissionProvider {
         fn name(&self) -> &str {
@@ -816,8 +818,17 @@ mod tests {
             Box::pin(async { Err(ProviderError::internal("unused")) })
         }
 
-        fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> Vec<String> {
-            vec![format!("test:{}:{}", plan_op_label(op), id.resource_type)]
+        fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> ProviderResult<Vec<String>> {
+            if self.fail {
+                return Err(ProviderError::internal(
+                    "intentional permission lookup failure",
+                ));
+            }
+            Ok(vec![format!(
+                "test:{}:{}",
+                plan_op_label(op),
+                id.resource_type
+            )])
         }
     }
 
@@ -887,7 +898,8 @@ mod tests {
             )),
         });
 
-        let entries = collect_required_actions(&plan, &PermissionProvider);
+        let entries = collect_required_actions(&plan, &PermissionProvider { fail: false })
+            .expect("permission lookup should succeed");
         let actions: Vec<_> = entries.into_iter().map(|entry| entry.action).collect();
 
         assert_eq!(
@@ -929,10 +941,29 @@ mod tests {
             }),
         });
 
-        let entries = collect_required_actions(&plan, &PermissionProvider);
+        let entries = collect_required_actions(&plan, &PermissionProvider { fail: false })
+            .expect("permission lookup should succeed");
         let actions: Vec<_> = entries.into_iter().map(|entry| entry.action).collect();
 
         assert_eq!(actions, vec!["test:create:route53.RecordSet"]);
+    }
+
+    #[test]
+    fn collect_required_actions_propagates_provider_failure() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resolved(Resource::with_provider(
+            "awscc", "ec2.Vpc", "main", None,
+        ))));
+
+        let error = collect_required_actions(&plan, &PermissionProvider { fail: true })
+            .expect_err("permission lookup failures must abort IAM preflight");
+
+        assert!(
+            error
+                .to_string()
+                .contains("intentional permission lookup failure"),
+            "the provider error must be preserved: {error}"
+        );
     }
 
     #[test]

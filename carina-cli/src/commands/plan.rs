@@ -950,7 +950,7 @@ pub async fn run_plan(
     let iam_preflight_result = if check_iam {
         let result =
             crate::commands::iam_preflight::run_iam_preflight(&ctx.plan, &ctx.provider, strict_iam)
-                .await;
+                .await?;
         Some(result)
     } else {
         None

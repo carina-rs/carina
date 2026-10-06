@@ -124,8 +124,8 @@ impl Provider for TestProvider {
         &self,
         _id: &ResourceId,
         _op: carina_core::effect::PlanOp,
-    ) -> Vec<String> {
-        Vec::new()
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -1324,7 +1324,8 @@ fn orphaned_state_resource_produces_delete_effect() {
         &prev_explicit,
         &HashMap::new(),
         &[],
-    );
+    )
+    .expect("test provider hints should succeed");
 
     // The plan should contain a Delete effect for "removed-bucket"
     let delete_effects: Vec<_> = plan
@@ -2044,7 +2045,8 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
         &prev_explicit,
         &HashMap::new(),
         &[],
-    );
+    )
+    .expect("test provider hints should succeed");
 
     let delete_effects: Vec<_> = plan
         .effects()
@@ -2137,7 +2139,8 @@ fn refresh_false_uses_cached_state_from_state_file() {
         &prev_explicit,
         &HashMap::new(),
         &[],
-    );
+    )
+    .expect("test provider hints should succeed");
 
     // No changes expected since desired matches cached state
     assert_eq!(
@@ -2192,7 +2195,8 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
         &prev_explicit,
         &HashMap::new(),
         &[],
-    );
+    )
+    .expect("test provider hints should succeed");
 
     // With refresh=false, orphaned resources are assumed to still exist,
     // so a Delete effect should be generated
@@ -2243,7 +2247,8 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
         &HashMap::new(),
         &HashMap::new(),
         &[],
-    );
+    )
+    .expect("test provider hints should succeed");
 
     let create_effects: Vec<_> = plan
         .effects()
@@ -2500,7 +2505,8 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
         &HashMap::new(),
         &HashMap::new(),
         &[],
-    );
+    )
+    .expect("test provider hints should succeed");
     assert!(
         plan.effects().is_empty(),
         "typed enum state JSON must reload as CanonicalEnum, got effects: {:?}",

@@ -106,8 +106,8 @@ impl ProviderFactory for FailBCreateFactory {
         &self,
         _binding: Option<&str>,
         _attributes: &IndexMap<String, Value>,
-    ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
-        Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
+        Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
 
     fn schemas(&self) -> Vec<ResourceSchema> {
@@ -186,8 +186,8 @@ impl Provider for FailBCreateProvider {
         &self,
         _id: &ResourceId,
         _op: carina_core::effect::PlanOp,
-    ) -> Vec<String> {
-        Vec::new()
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -237,8 +237,8 @@ impl ProviderFactory for ApplyTimeReadFactory {
         &self,
         _binding: Option<&str>,
         _attributes: &IndexMap<String, Value>,
-    ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
-        Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
+        Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
 
     fn schemas(&self) -> Vec<ResourceSchema> {
@@ -331,8 +331,8 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
         &self,
         _binding: Option<&str>,
         _attributes: &IndexMap<String, Value>,
-    ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
-        Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
+        Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
 
     fn schemas(&self) -> Vec<ResourceSchema> {
@@ -500,8 +500,8 @@ impl Provider for ApplyCascadeProvider {
         &self,
         _id: &ResourceId,
         _op: carina_core::effect::PlanOp,
-    ) -> Vec<String> {
-        Vec::new()
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -846,8 +846,8 @@ impl Provider for ApplyTimeReadProvider {
         &self,
         _id: &ResourceId,
         _op: carina_core::effect::PlanOp,
-    ) -> Vec<String> {
-        Vec::new()
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -2713,8 +2713,8 @@ impl Provider for BootstrapRecordingProvider {
         &self,
         _id: &ResourceId,
         _op: carina_core::effect::PlanOp,
-    ) -> Vec<String> {
-        Vec::new()
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -5182,7 +5182,8 @@ mod saved_plan_version_tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &[],
-        );
+        )
+        .expect("test provider hints should succeed");
         assert_eq!(plan.replace_display_info().count(), 1);
         let plan_file = crate::commands::plan::PlanFile {
             version: crate::commands::plan::PlanFile::CURRENT_VERSION,

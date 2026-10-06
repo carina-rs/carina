@@ -153,8 +153,8 @@ impl Provider for MockProvider {
         &self,
         _id: &ResourceId,
         _op: carina_core::effect::PlanOp,
-    ) -> Vec<String> {
-        Vec::new()
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -273,7 +273,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
-        &carina_core::provider::ProviderRouter::new(),
+        &MockProvider,
         &carina_core::resource::into_plan_input_map(
             current_states.clone(),
             &carina_core::schema::SchemaRegistry::new(),
@@ -285,7 +285,8 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         &HashMap::new(),
         &HashMap::new(),
         &parsed.wait_bindings,
-    );
+    )
+    .expect("test provider hints should succeed");
 
     assert!(
         plan.effects().iter().any(|e| matches!(
@@ -444,7 +445,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
-        &carina_core::provider::ProviderRouter::new(),
+        &MockProvider,
         &carina_core::resource::into_plan_input_map(
             current_states.clone(),
             &carina_core::schema::SchemaRegistry::new(),
@@ -456,7 +457,8 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         &HashMap::new(),
         &HashMap::new(),
         &parsed.wait_bindings,
-    );
+    )
+    .expect("test provider hints should succeed");
     assert!(
         plan.effects().iter().any(|e| matches!(
             e,
@@ -623,7 +625,7 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     let plan = create_plan(
         &resolved_resources_for_plan,
         &[],
-        &carina_core::provider::ProviderRouter::new(),
+        &MockProvider,
         &carina_core::resource::into_plan_input_map(
             current_states.clone(),
             &carina_core::schema::SchemaRegistry::new(),
@@ -635,7 +637,8 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         &HashMap::new(),
         &HashMap::new(),
         &parsed.wait_bindings,
-    );
+    )
+    .expect("test provider hints should succeed");
     assert!(
         plan.effects().iter().any(|e| matches!(
             e,

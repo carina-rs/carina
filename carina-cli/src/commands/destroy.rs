@@ -2164,8 +2164,8 @@ mod tests {
             &self,
             _id: &ResourceId,
             _op: carina_core::effect::PlanOp,
-        ) -> Vec<String> {
-            Vec::new()
+        ) -> ProviderResult<Vec<String>> {
+            Ok(Vec::new())
         }
     }
 

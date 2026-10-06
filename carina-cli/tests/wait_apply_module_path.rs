@@ -97,8 +97,8 @@ impl ProviderFactory for AwsStub {
         &self,
         _b: Option<&str>,
         _a: &IndexMap<String, Value>,
-    ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
-        Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
+        Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
     fn schemas(&self) -> Vec<ResourceSchema> {
         vec![
@@ -237,8 +237,8 @@ impl Provider for NoopProvider {
         &self,
         _id: &carina_core::resource::ResourceId,
         _op: carina_core::effect::PlanOp,
-    ) -> Vec<String> {
-        Vec::new()
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -539,7 +539,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let plan = create_plan(
         &resolved_resources_for_plan,
         &parsed.data_sources,
-        &carina_core::provider::ProviderRouter::new(),
+        &provider,
         &carina_core::resource::into_plan_input_map(
             current_states.clone(),
             ctx.schemas(),
@@ -551,7 +551,8 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         &HashMap::new(),
         &HashMap::new(),
         &wait_bindings,
-    );
+    )
+    .expect("test provider hints should succeed");
 
     let has_wait = plan.effects().iter().any(|e| {
         matches!(e, carina_core::effect::Effect::Wait { identity, .. } if identity.as_str() == "r.cert_issued")

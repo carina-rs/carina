@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use indexmap::IndexMap;
@@ -10,7 +11,8 @@ use crate::executor::normalized::{
 };
 use crate::parser::ProviderConfig;
 use crate::provider::{
-    BoxFuture, NoopNormalizer, ProviderFactory, ProviderNormalizer, ProviderResult, ready_noop,
+    BoxFuture, NoopNormalizer, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
+    ready_noop,
 };
 use crate::resource::{
     AccessPath, ConcreteValue, DeferredValue, InterpolationPart, Resource, ResourceId, State,
@@ -36,19 +38,23 @@ impl RecordingNormalizer {
 }
 
 impl ProviderNormalizer for RecordingNormalizer {
-    fn normalize_desired<'a>(&'a self, _resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+    fn normalize_desired<'a>(
+        &'a self,
+        _resources: &'a mut [Resource],
+    ) -> BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
             self.calls
                 .lock()
                 .unwrap()
                 .push("normalize_desired".to_string());
+            Ok(())
         })
     }
 
     fn normalize_state<'a>(
         &'a self,
         _current_states: &'a mut HashMap<ResourceId, State>,
-    ) -> BoxFuture<'a, ()> {
+    ) -> BoxFuture<'a, ProviderResult<()>> {
         ready_noop()
     }
 
@@ -56,7 +62,7 @@ impl ProviderNormalizer for RecordingNormalizer {
         &'a self,
         _current_states: &'a mut HashMap<ResourceId, State>,
         _saved_attrs: &'a crate::provider::SavedAttrs,
-    ) -> BoxFuture<'a, ()> {
+    ) -> BoxFuture<'a, ProviderResult<()>> {
         ready_noop()
     }
 
@@ -65,12 +71,13 @@ impl ProviderNormalizer for RecordingNormalizer {
         _resources: &'a mut [Resource],
         _default_tags: &'a IndexMap<String, Value>,
         _registry: &'a SchemaRegistry,
-    ) -> BoxFuture<'a, ()> {
+    ) -> BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
             self.calls
                 .lock()
                 .unwrap()
                 .push("merge_default_tags".to_string());
+            Ok(())
         })
     }
 }
@@ -90,6 +97,73 @@ fn provider_config(default_tags: IndexMap<String, Value>) -> ProviderConfig {
 
 fn string_value(value: &str) -> Value {
     Value::Concrete(ConcreteValue::String(value.to_string()))
+}
+
+#[tokio::test]
+async fn normalization_error_stops_later_stages() {
+    struct FailingNormalizer {
+        merge_called: Arc<AtomicBool>,
+    }
+
+    impl ProviderNormalizer for FailingNormalizer {
+        fn normalize_desired<'a>(
+            &'a self,
+            _resources: &'a mut [Resource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            Box::pin(async { Err(ProviderError::internal("normalization failed")) })
+        }
+
+        fn normalize_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            ready_noop()
+        }
+
+        fn hydrate_read_state<'a>(
+            &'a self,
+            _current_states: &'a mut HashMap<ResourceId, State>,
+            _saved_attrs: &'a crate::provider::SavedAttrs,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            ready_noop()
+        }
+
+        fn merge_default_tags<'a>(
+            &'a self,
+            _resources: &'a mut [Resource],
+            _default_tags: &'a IndexMap<String, Value>,
+            _registry: &'a SchemaRegistry,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            Box::pin(async move {
+                self.merge_called.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    let merge_called = Arc::new(AtomicBool::new(false));
+    let normalizer = FailingNormalizer {
+        merge_called: Arc::clone(&merge_called),
+    };
+    let mut default_tags = IndexMap::new();
+    default_tags.insert("ManagedBy".to_string(), string_value("carina"));
+    let mut resources = vec![Resource::new("test", "thing")];
+
+    let error = run_desired_normalization_stages(
+        &mut resources,
+        &[provider_config(default_tags)],
+        &normalizer,
+        &[],
+        &SchemaRegistry::new(),
+    )
+    .await
+    .expect_err("normalizer error must propagate");
+
+    assert_eq!(error.message(), "normalization failed");
+    assert!(
+        !merge_called.load(Ordering::SeqCst),
+        "later normalization stages must not run after an error"
+    );
 }
 
 struct AliasFactory;
@@ -180,7 +254,10 @@ async fn desired_normalization_runs_stages_in_order() {
     }
 
     impl ProviderNormalizer for OrderNormalizer {
-        fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+        fn normalize_desired<'a>(
+            &'a self,
+            resources: &'a mut [Resource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 let subjects = resources[0].get_attr("subjects").cloned();
                 self.calls
@@ -188,13 +265,14 @@ async fn desired_normalization_runs_stages_in_order() {
                     .unwrap()
                     .push(format!("normalize_desired:{subjects:?}"));
                 resources[0].set_attr("mode", string_value("Mode.friendly"));
+                Ok(())
             })
         }
 
         fn normalize_state<'a>(
             &'a self,
             _current_states: &'a mut HashMap<ResourceId, State>,
-        ) -> BoxFuture<'a, ()> {
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
 
@@ -202,7 +280,7 @@ async fn desired_normalization_runs_stages_in_order() {
             &'a self,
             _current_states: &'a mut HashMap<ResourceId, State>,
             _saved_attrs: &'a crate::provider::SavedAttrs,
-        ) -> BoxFuture<'a, ()> {
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
 
@@ -211,13 +289,14 @@ async fn desired_normalization_runs_stages_in_order() {
             resources: &'a mut [Resource],
             _default_tags: &'a IndexMap<String, Value>,
             _registry: &'a SchemaRegistry,
-        ) -> BoxFuture<'a, ()> {
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 let mode = resources[0].get_attr("mode").cloned();
                 self.calls
                     .lock()
                     .unwrap()
                     .push(format!("merge_default_tags:{mode:?}"));
+                Ok(())
             })
         }
     }
@@ -240,7 +319,8 @@ async fn desired_normalization_runs_stages_in_order() {
         &factories,
         &schemas,
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(
         calls.lock().unwrap().clone(),
@@ -282,7 +362,8 @@ async fn merge_default_tags_runs_only_for_non_empty_provider_default_tags() {
         &[],
         &SchemaRegistry::new(),
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(
         normalizer
@@ -303,7 +384,9 @@ async fn in_place_desired_normalization_does_not_canonicalize_resources() {
     let mut resources = vec![resource];
     let schemas = order_schema();
 
-    run_desired_normalization_stages(&mut resources, &[], &normalizer, &[], &schemas).await;
+    run_desired_normalization_stages(&mut resources, &[], &normalizer, &[], &schemas)
+        .await
+        .unwrap();
 
     assert_eq!(
         resources[0].get_attr("subjects"),
@@ -317,19 +400,23 @@ async fn apply_desired_normalization_strips_and_restores_deferred_resource_refs(
     struct RefRejectingNormalizer;
 
     impl ProviderNormalizer for RefRejectingNormalizer {
-        fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+        fn normalize_desired<'a>(
+            &'a self,
+            resources: &'a mut [Resource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 assert!(
                     resources[0].get_attr("role_arn").is_none(),
                     "deferred resource refs must be stripped before provider normalization"
                 );
+                Ok(())
             })
         }
 
         fn normalize_state<'a>(
             &'a self,
             _current_states: &'a mut HashMap<ResourceId, State>,
-        ) -> BoxFuture<'a, ()> {
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
 
@@ -337,7 +424,7 @@ async fn apply_desired_normalization_strips_and_restores_deferred_resource_refs(
             &'a self,
             _current_states: &'a mut HashMap<ResourceId, State>,
             _saved_attrs: &'a crate::provider::SavedAttrs,
-        ) -> BoxFuture<'a, ()> {
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
 
@@ -346,7 +433,7 @@ async fn apply_desired_normalization_strips_and_restores_deferred_resource_refs(
             _resources: &'a mut [Resource],
             _default_tags: &'a IndexMap<String, Value>,
             _registry: &'a SchemaRegistry,
-        ) -> BoxFuture<'a, ()> {
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
     }
@@ -362,7 +449,8 @@ async fn apply_desired_normalization_strips_and_restores_deferred_resource_refs(
         &[],
         &SchemaRegistry::new(),
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(
         normalized.as_resource().get_attr("role_arn"),
@@ -378,7 +466,10 @@ async fn desired_normalization_slice_canonicalizes_strips_stages_and_restores_re
     }
 
     impl ProviderNormalizer for RefRejectingNormalizer {
-        fn normalize_desired<'a>(&'a self, resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
+        fn normalize_desired<'a>(
+            &'a self,
+            resources: &'a mut [Resource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 assert!(
                     resources[0].get_attr("ref_subjects").is_none(),
@@ -389,13 +480,14 @@ async fn desired_normalization_slice_canonicalizes_strips_stages_and_restores_re
                     .unwrap()
                     .push("normalize_desired".to_string());
                 resources[0].set_attr("mode", string_value("Mode.friendly"));
+                Ok(())
             })
         }
 
         fn normalize_state<'a>(
             &'a self,
             _current_states: &'a mut HashMap<ResourceId, State>,
-        ) -> BoxFuture<'a, ()> {
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
 
@@ -403,7 +495,7 @@ async fn desired_normalization_slice_canonicalizes_strips_stages_and_restores_re
             &'a self,
             _current_states: &'a mut HashMap<ResourceId, State>,
             _saved_attrs: &'a crate::provider::SavedAttrs,
-        ) -> BoxFuture<'a, ()> {
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             ready_noop()
         }
 
@@ -412,7 +504,7 @@ async fn desired_normalization_slice_canonicalizes_strips_stages_and_restores_re
             resources: &'a mut [Resource],
             _default_tags: &'a IndexMap<String, Value>,
             _registry: &'a SchemaRegistry,
-        ) -> BoxFuture<'a, ()> {
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 assert!(
                     resources[0].get_attr("ref_subjects").is_none(),
@@ -422,6 +514,7 @@ async fn desired_normalization_slice_canonicalizes_strips_stages_and_restores_re
                     .lock()
                     .unwrap()
                     .push("merge_default_tags".to_string());
+                Ok(())
             })
         }
     }
@@ -451,7 +544,8 @@ async fn desired_normalization_slice_canonicalizes_strips_stages_and_restores_re
         &factories,
         &schemas,
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(
         calls.lock().unwrap().clone(),
@@ -853,7 +947,8 @@ async fn apply_desired_normalization_is_idempotent() {
 
     let first =
         apply_desired_normalization(resource, &[], &NoopNormalizer, &[], &SchemaRegistry::new())
-            .await;
+            .await
+            .unwrap();
     let second = apply_desired_normalization(
         first.as_resource().clone(),
         &[],
@@ -861,7 +956,8 @@ async fn apply_desired_normalization_is_idempotent() {
         &[],
         &SchemaRegistry::new(),
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(first.as_resource(), second.as_resource());
 }

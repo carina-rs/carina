@@ -12,7 +12,7 @@ use crate::plan::{
     PreventDestroyAction, ReplacementCannotCoexistError, ReplacementDelete, ReplacementGroup,
     SchemaNotRegisteredError,
 };
-use crate::provider::{LiftedSavedAttrs, Provider};
+use crate::provider::{LiftedSavedAttrs, Provider, ProviderResult};
 use crate::resource::{
     ConcreteValue, DataSource, Directives, PlanInputState, ResolvedDataSource, ResolvedResource,
     ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
@@ -308,7 +308,7 @@ pub fn create_plan(
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
     wait_bindings: &[WaitBinding],
-) -> Plan {
+) -> ProviderResult<Plan> {
     let mut build = create_plan_parts(
         managed,
         data_sources,
@@ -320,10 +320,10 @@ pub fn create_plan(
         prev_explicit,
         orphan_dependencies,
         wait_bindings,
-    );
+    )?;
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces);
     block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
-    build.plan
+    Ok(build.plan)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -339,7 +339,7 @@ pub fn create_plan_with_cascades(
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
     wait_bindings: &[WaitBinding],
-) -> Plan {
+) -> ProviderResult<Plan> {
     let mut build = create_plan_parts(
         managed,
         data_sources,
@@ -351,7 +351,7 @@ pub fn create_plan_with_cascades(
         prev_explicit,
         orphan_dependencies,
         wait_bindings,
-    );
+    )?;
     cascade_dependent_updates(
         &mut build.plan,
         &mut build.pending_replaces,
@@ -361,7 +361,7 @@ pub fn create_plan_with_cascades(
     );
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces);
     block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
-    build.plan
+    Ok(build.plan)
 }
 
 struct PlanBuild {
@@ -381,7 +381,7 @@ fn create_plan_parts(
     prev_explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
     orphan_dependencies: &HashMap<ResourceId, BTreeSet<String>>,
     wait_bindings: &[WaitBinding],
-) -> PlanBuild {
+) -> ProviderResult<PlanBuild> {
     let mut plan = Plan::new();
     let mut pending_replaces = HashMap::new();
     let known_bindings = known_binding_names(managed, data_sources);
@@ -713,7 +713,7 @@ fn create_plan_parts(
             &target_id,
             &attr,
             &known_bindings,
-        ));
+        )?);
 
         plan.add(Effect::Wait {
             identity: ResourceIdentity::new(wb.binding.as_str()),
@@ -726,10 +726,10 @@ fn create_plan_parts(
         });
     }
 
-    PlanBuild {
+    Ok(PlanBuild {
         plan,
         pending_replaces,
-    }
+    })
 }
 
 /// Add apply-time ordering from consumer updates to deletes using each consumer's prior

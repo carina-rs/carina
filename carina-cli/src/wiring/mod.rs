@@ -929,6 +929,14 @@ pub struct PlanPreprocessor<'a> {
     ctx: &'a WiringContext,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum PlanPreparationError {
+    #[error("plan validation failed")]
+    Plan(Vec<PlanError>),
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+}
+
 fn type_error_attribute(error: &TypeError) -> Option<&str> {
     match error {
         TypeError::InvalidEnumVariant { attribute, .. }
@@ -1124,7 +1132,7 @@ impl<'a> PlanPreprocessor<'a> {
         data_sources: &mut [DataSource],
         data_source_origins: &[DataSource],
         wait_bindings: &mut [carina_core::parser::WaitBinding],
-    ) -> Result<(), Vec<PlanError>> {
+    ) -> Result<(), PlanPreparationError> {
         let schemas = self.ctx.schemas();
         let mut errors = validate_resolved_value_constraints(
             self.ctx,
@@ -1137,7 +1145,7 @@ impl<'a> PlanPreprocessor<'a> {
             errors.extend(module_constraint_plan_errors(error));
         }
         if !errors.is_empty() {
-            return Err(errors);
+            return Err(PlanPreparationError::Plan(errors));
         }
 
         let resources = resources.resources_mut();
@@ -1161,7 +1169,7 @@ impl<'a> PlanPreprocessor<'a> {
             !states_contain_unknown(current_states),
             "Value::Deferred(DeferredValue::Unknown) found in current_states — RFC #2371 constraint b violated"
         );
-        run_desired_normalization_stages(
+        let desired_result = run_desired_normalization_stages(
             resources,
             provider_configs,
             self.normalizer,
@@ -1169,7 +1177,14 @@ impl<'a> PlanPreprocessor<'a> {
             schemas,
         )
         .await;
-        self.normalizer.normalize_state(current_states).await;
+        if let Err(error) = desired_result {
+            restore_stripped_attributes(resources, stripped);
+            return Err(PlanPreparationError::Provider(error));
+        }
+        if let Err(error) = self.normalizer.normalize_state(current_states).await {
+            restore_stripped_attributes(resources, stripped);
+            return Err(PlanPreparationError::Provider(error));
+        }
         resolve_enum_aliases_in_states(self.ctx, current_states);
         // carina#3358: the `until` predicate RHS is the third enum-alias
         // axis. Resolve it here, beside the resource/state passes, so the
@@ -1191,17 +1206,20 @@ impl<'a> PlanPreprocessor<'a> {
 pub fn normalize_state_with_ctx(
     ctx: &WiringContext,
     current_states: &mut HashMap<ResourceId, State>,
-) {
+) -> Result<(), ProviderError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("failed to build tokio runtime for normalize_state");
     let mut router = ProviderRouter::new();
     for factory in ctx.factories() {
         let attrs = indexmap::IndexMap::new();
-        router.add_normalizer(rt.block_on(factory.create_normalizer(None, &attrs)));
+        router.add_normalizer(
+            factory.name(),
+            rt.block_on(factory.create_normalizer(None, &attrs))?,
+        );
     }
     // Outermost runtime: not nested.
-    rt.block_on(router.normalize_state(current_states));
+    rt.block_on(router.normalize_state(current_states))
 }
 
 /// Resolve enum alias values in current states to their canonical AWS form.
@@ -1674,9 +1692,11 @@ async fn instantiate_provider_into_router(
             .await
             .map_err(|e| e.for_provider(provider_config.name.clone()))?;
         router.add_normalizer(
+            provider_config.name.clone(),
             factory
                 .create_normalizer(binding.as_deref(), &provider_config.attributes)
-                .await,
+                .await
+                .map_err(|e| e.for_provider(provider_config.name.clone()))?,
         );
         router.add_provider_instance(provider_config.name.clone(), binding, provider);
     } else if ctx.uses_builtin_mock() && provider_config.name == BUILTIN_PROVIDER_NAME {
@@ -1720,7 +1740,13 @@ async fn try_add_source_provider(
                 format_provider_using_line(&name, &region, None, Some(source)).cyan()
             );
             router.add_provider(name, provider);
-            router.add_normalizer(factory.create_normalizer(None, &config.attributes).await);
+            router.add_normalizer(
+                config.name.clone(),
+                factory
+                    .create_normalizer(None, &config.attributes)
+                    .await
+                    .map_err(|e| AppError::Provider(e.for_provider(config.name.clone())))?,
+            );
             Ok(())
         }
         Err(LoadSourceError::Provider(e)) => {
@@ -2265,7 +2291,7 @@ pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNorm
                 inputs.current_states,
                 inputs.saved_attrs.as_provider_saved_attrs(),
             )
-            .await;
+            .await?;
     }
 
     // Phase 3: lift Enums on the post-expansion slice. Both
@@ -2516,7 +2542,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         // available when building the binding map (#1685).
         provider
             .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
-            .await;
+            .await?;
         if let Some(sf) = state_file.as_ref() {
             sf.restore_partial_read_markers(&mut current_states);
         }
@@ -2642,7 +2668,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             // under their current binding names (#1685).
             provider
                 .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
-                .await;
+                .await?;
             if let Some(sf) = state_file.as_ref() {
                 sf.restore_partial_read_markers(&mut current_states);
             }
@@ -2739,7 +2765,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             .await?;
             provider
                 .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
-                .await;
+                .await?;
             if let Some(sf) = state_file.as_ref() {
                 sf.restore_partial_read_markers(&mut current_states);
             }
@@ -2754,7 +2780,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             }
             provider
                 .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
-                .await;
+                .await?;
         } else {
             for resource in children() {
                 current_states.insert(resource.id.clone(), State::not_found(resource.id.clone()));
@@ -2848,9 +2874,13 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             )
             .await
     } else {
-        Err(refresh_module_constraint_errors)
+        Err(PlanPreparationError::Plan(refresh_module_constraint_errors))
     };
-    if let Err(errors) = preparation {
+    if let Err(error) = preparation {
+        let errors = match error {
+            PlanPreparationError::Plan(errors) => errors,
+            PlanPreparationError::Provider(error) => return Err(AppError::Provider(error)),
+        };
         let mut plan = Plan::new();
         for error in errors {
             plan.add_error(error);
@@ -2939,7 +2969,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         &prev_explicit,
         &orphan_dependencies,
         &wait_bindings,
-    );
+    )?;
     add_deposed_delete_effects(&mut plan, state_file);
     block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
 
