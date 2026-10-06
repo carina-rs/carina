@@ -68,6 +68,18 @@ impl CarinaProvider for MockProcessProvider {
         _identifier: Option<&str>,
         _request: ReadRequest,
     ) -> Result<State, ProviderError> {
+        if id.identity == "__mock_non_finite_read__" {
+            return Ok(State {
+                id: id.clone(),
+                identifier: Some("mock-id".into()),
+                attributes: HashMap::from([(
+                    "values".to_string(),
+                    Value::List(vec![Value::Float(f64::NAN)]),
+                )]),
+                exists: true,
+            });
+        }
+
         let states = self.states.lock().unwrap();
         let key = Self::resource_key(id);
 
@@ -108,6 +120,23 @@ impl CarinaProvider for MockProcessProvider {
         id: &ResourceId,
         request: CreateRequest,
     ) -> Result<CreateOutcome, ProviderError> {
+        if id.identity == "__mock_create_trap__" {
+            panic!("intentional mock create trap");
+        }
+        if id.identity == "__mock_create_error__" {
+            return Err(ProviderError {
+                kind: ProviderErrorKind::Internal,
+                message: "intentional mock create error".to_string(),
+                resource_id: Some(id.clone()),
+                cause: None,
+                provider_name: None,
+                operation: None,
+                status: None,
+                code: None,
+                request_id: None,
+            });
+        }
+
         let mut states = self.states.lock().unwrap();
         let key = Self::resource_key(id);
         let resource = request.resource;
@@ -187,14 +216,68 @@ impl CarinaProvider for MockProcessProvider {
 
     fn required_permissions(
         &self,
-        _id: &ResourceId,
+        id: &ResourceId,
         _op: carina_plugin_sdk::PlanOp,
-    ) -> Vec<String> {
-        Vec::new()
+    ) -> Result<Vec<String>, ProviderError> {
+        if id.identity == "__mock_required_permissions_trap__" {
+            panic!("intentional mock required_permissions trap");
+        }
+        Ok(Vec::new())
     }
 
-    fn normalize_state(&self, states: HashMap<String, State>) -> HashMap<String, State> {
-        states
+    fn satisfier_hint(
+        &self,
+        target_id: &ResourceId,
+        _attr_path: &[String],
+    ) -> Result<Vec<carina_plugin_sdk::BindingPattern>, ProviderError> {
+        if target_id.identity == "__mock_invalid_satisfier_hint__" {
+            return Ok(vec![carina_plugin_sdk::BindingPattern::AttributeMatch {
+                resource_type: "test.resource".to_string(),
+                attr: Vec::new(),
+                from: vec!["source".to_string()],
+            }]);
+        }
+        Ok(Vec::new())
+    }
+
+    fn normalize_state(
+        &self,
+        states: HashMap<String, State>,
+    ) -> Result<HashMap<String, State>, ProviderError> {
+        let rekey_single_result = states
+            .values()
+            .any(|state| state.attributes.contains_key("__mock_rekey_state_result__"));
+        let drop_single_result = states
+            .values()
+            .any(|state| state.attributes.contains_key("__mock_drop_state_result__"));
+        let special_id = states
+            .values()
+            .map(|state| state.id.clone())
+            .find(|id| id.identity.starts_with("__mock_normalize_state_"));
+        if special_id
+            .as_ref()
+            .is_some_and(|id| id.identity == "__mock_normalize_state_trap__")
+        {
+            panic!("intentional mock normalize_state trap");
+        }
+        if special_id
+            .as_ref()
+            .is_some_and(|id| id.identity == "__mock_normalize_state_error__")
+        {
+            return Err(ProviderError {
+                kind: ProviderErrorKind::Internal,
+                message: "intentional mock normalize_state error".to_string(),
+                resource_id: special_id,
+                cause: None,
+                provider_name: None,
+                operation: None,
+                status: None,
+                code: None,
+                request_id: None,
+            });
+        }
+
+        let mut normalized: HashMap<_, _> = states
             .into_values()
             .map(|mut state| {
                 if let Some(marker) = state.attributes.get("__mock_normalize_state__").cloned() {
@@ -205,14 +288,49 @@ impl CarinaProvider for MockProcessProvider {
                 let key = Self::resource_id_wire_key(&state.id);
                 (key, state)
             })
-            .collect()
+            .collect();
+
+        if let Some(id) = special_id {
+            if id.identity == "__mock_normalize_state_missing_key__" {
+                normalized.remove(&Self::resource_id_wire_key(&id));
+            } else if id.identity == "__mock_normalize_state_extra_key__" {
+                let state = normalized
+                    .values()
+                    .next()
+                    .expect("mock extra-key hook requires one state")
+                    .clone();
+                normalized.insert("__mock_unexpected_state_key__".to_string(), state);
+            }
+        }
+
+        if drop_single_result {
+            normalized.clear();
+        } else if rekey_single_result && normalized.len() == 1 {
+            let state = normalized
+                .into_values()
+                .next()
+                .expect("single-result re-key hook requires one state");
+            normalized = HashMap::from([("__mock_guest_rekeyed_state__".to_string(), state)]);
+        }
+
+        Ok(normalized)
     }
 
     fn hydrate_read_state(
         &self,
         states: &mut HashMap<String, State>,
         saved_attrs: &HashMap<String, HashMap<String, Value>>,
-    ) {
+    ) -> Result<(), ProviderError> {
+        let rekey_single_result = states
+            .values()
+            .any(|state| state.attributes.contains_key("__mock_rekey_state_result__"));
+        let drop_single_result = states
+            .values()
+            .any(|state| state.attributes.contains_key("__mock_drop_state_result__"));
+        let special_id = states
+            .values()
+            .map(|state| state.id.clone())
+            .find(|id| id.identity.starts_with("__mock_hydrate_state_"));
         *states = std::mem::take(states)
             .into_iter()
             .map(|(input_key, mut state)| {
@@ -228,6 +346,30 @@ impl CarinaProvider for MockProcessProvider {
                 (Self::resource_id_wire_key(&state.id), state)
             })
             .collect();
+
+        if let Some(id) = special_id {
+            if id.identity == "__mock_hydrate_state_missing_key__" {
+                states.remove(&Self::resource_id_wire_key(&id));
+            } else if id.identity == "__mock_hydrate_state_extra_key__" {
+                let state = states
+                    .values()
+                    .next()
+                    .expect("mock extra-key hook requires one state")
+                    .clone();
+                states.insert("__mock_unexpected_hydrate_key__".to_string(), state);
+            }
+        }
+
+        if drop_single_result {
+            states.clear();
+        } else if rekey_single_result && states.len() == 1 {
+            let state = std::mem::take(states)
+                .into_values()
+                .next()
+                .expect("single-result re-key hook requires one state");
+            states.insert("__mock_guest_rekeyed_state__".to_string(), state);
+        }
+        Ok(())
     }
 
     /// Echo the host-provided `default_tags` back into each resource's
@@ -240,7 +382,7 @@ impl CarinaProvider for MockProcessProvider {
         resources: &mut Vec<Resource>,
         default_tags: &HashMap<String, Value>,
         _schemas: &Vec<ResourceSchema>,
-    ) {
+    ) -> Result<(), ProviderError> {
         let snapshot: Vec<Value> = default_tags
             .iter()
             .map(|(k, v)| {
@@ -256,6 +398,7 @@ impl CarinaProvider for MockProcessProvider {
                 Value::List(snapshot.clone()),
             );
         }
+        Ok(())
     }
 }
 

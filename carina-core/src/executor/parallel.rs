@@ -999,8 +999,8 @@ mod tests {
             &self,
             _id: &ResourceId,
             _op: crate::effect::PlanOp,
-        ) -> Vec<String> {
-            Vec::new()
+        ) -> ProviderResult<Vec<String>> {
+            Ok(Vec::new())
         }
     }
 

@@ -12,7 +12,9 @@ use carina_core::effect::Effect;
 use carina_core::executor::UnresolvedDataSourceInput;
 use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
-use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, RawSavedAttrs};
+use carina_core::provider::{
+    self as provider_mod, Provider, ProviderError, ProviderNormalizer, RawSavedAttrs,
+};
 use carina_core::resource::{
     ConcreteValue, DataSource, ResolvedDataSource, ResolvedResource, ResolvedResourceId,
     ResourceId, ResourceIdentity, State, Value,
@@ -1346,7 +1348,7 @@ async fn run_state_refresh_locked_with_ctx(
     let saved_attrs = saved_attrs_for_expansion;
     provider
         .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
-        .await;
+        .await?;
     // awscc#251: also lift the provider-read `current_states` (not just
     // `saved_attrs`) — the values read at the refresh loop above arrive
     // as plain `String` for IAM enum fields and must be lifted before
@@ -1725,7 +1727,7 @@ where
             &mut fresh_state,
             schemas,
         )
-        .await;
+        .await?;
         match cancel.phase() {
             ShutdownPhase::Running => {}
             ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
@@ -1830,7 +1832,8 @@ async fn normalize_deposed_read_state<P>(
     resource: &ResolvedResource,
     fresh_state: &mut State,
     schemas: &carina_core::schema::SchemaRegistry,
-) where
+) -> Result<(), ProviderError>
+where
     P: ProviderNormalizer + ?Sized,
 {
     let mut states = HashMap::from([(target.id.as_inner().clone(), fresh_state.clone())]);
@@ -1838,12 +1841,13 @@ async fn normalize_deposed_read_state<P>(
     let saved_attrs = deposed_saved_attrs(target).lift(schemas);
     provider
         .hydrate_read_state(&mut states, saved_attrs.as_provider_saved_attrs())
-        .await;
+        .await?;
     carina_core::utils::lift_current_state_enum_leaves(&mut states, resources, schemas);
 
     if let Some(normalized) = states.remove(target.id.as_inner()) {
         *fresh_state = normalized;
     }
+    Ok(())
 }
 
 fn deposed_saved_attrs(target: &DeposedRefreshTarget) -> RawSavedAttrs {
@@ -2211,8 +2215,8 @@ mod tests {
             &self,
             _id: &ResourceId,
             _op: carina_core::effect::PlanOp,
-        ) -> Vec<String> {
-            Vec::new()
+        ) -> ProviderResult<Vec<String>> {
+            Ok(Vec::new())
         }
     }
 
@@ -2409,31 +2413,34 @@ mod tests {
             &self,
             _id: &ResourceId,
             _op: carina_core::effect::PlanOp,
-        ) -> Vec<String> {
-            Vec::new()
+        ) -> ProviderResult<Vec<String>> {
+            Ok(Vec::new())
         }
     }
 
     impl ProviderNormalizer for DeposedRefreshTestProvider {
-        fn normalize_desired<'a>(&'a self, _resources: &'a mut [Resource]) -> BoxFuture<'a, ()> {
-            Box::pin(async {})
+        fn normalize_desired<'a>(
+            &'a self,
+            _resources: &'a mut [Resource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            Box::pin(async { Ok(()) })
         }
 
         fn normalize_state<'a>(
             &'a self,
             _current_states: &'a mut HashMap<ResourceId, State>,
-        ) -> BoxFuture<'a, ()> {
-            Box::pin(async {})
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            Box::pin(async { Ok(()) })
         }
 
         fn hydrate_read_state<'a>(
             &'a self,
             current_states: &'a mut HashMap<ResourceId, State>,
             saved_attrs: &'a carina_core::provider::SavedAttrs,
-        ) -> BoxFuture<'a, ()> {
+        ) -> BoxFuture<'a, ProviderResult<()>> {
             Box::pin(async move {
                 if !self.hydrate_saved_attrs {
-                    return;
+                    return Ok(());
                 }
                 for (id, state) in current_states.iter_mut() {
                     let Some(saved) = saved_attrs.get(id) else {
@@ -2450,6 +2457,7 @@ mod tests {
                             .push(value.clone());
                     }
                 }
+                Ok(())
             })
         }
 
@@ -2458,8 +2466,8 @@ mod tests {
             _resources: &'a mut [Resource],
             _default_tags: &'a indexmap::IndexMap<String, Value>,
             _registry: &'a SchemaRegistry,
-        ) -> BoxFuture<'a, ()> {
-            Box::pin(async {})
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            Box::pin(async { Ok(()) })
         }
     }
 

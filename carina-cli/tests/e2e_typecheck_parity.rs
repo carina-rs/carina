@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use carina_core::provider::{
-    BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer,
+    BoxFuture, NoopNormalizer, Provider, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
 use carina_core::resource::{ConcreteValue, State, Value};
 use carina_core::schema::{
@@ -419,8 +419,8 @@ impl ProviderFactory for TestProviderFactory {
         &self,
         _binding: Option<&str>,
         _attributes: &IndexMap<String, Value>,
-    ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
-        Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
+        Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
 
     fn schemas(&self) -> Vec<ResourceSchema> {
@@ -478,8 +478,8 @@ impl Provider for NoopProvider {
         &self,
         _id: &carina_core::resource::ResourceId,
         _op: carina_core::effect::PlanOp,
-    ) -> Vec<String> {
-        Vec::new()
+    ) -> ProviderResult<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
@@ -1173,8 +1173,8 @@ impl ProviderFactory for WasmStyleProviderFactory {
         &self,
         _binding: Option<&str>,
         _attributes: &IndexMap<String, Value>,
-    ) -> BoxFuture<'_, Box<dyn ProviderNormalizer>> {
-        Box::pin(async { Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer> })
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
+        Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
     fn schemas(&self) -> Vec<ResourceSchema> {
         self.schemas.clone()

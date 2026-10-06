@@ -1141,11 +1141,15 @@ exports {
             &self,
             _binding: Option<&str>,
             _attributes: &IndexMap<String, Value>,
-        ) -> carina_core::provider::BoxFuture<'_, Box<dyn carina_core::provider::ProviderNormalizer>>
-        {
+        ) -> carina_core::provider::BoxFuture<
+            '_,
+            carina_core::provider::ProviderResult<
+                Box<dyn carina_core::provider::ProviderNormalizer>,
+            >,
+        > {
             Box::pin(async {
-                Box::new(carina_core::provider::NoopNormalizer)
-                    as Box<dyn carina_core::provider::ProviderNormalizer>
+                Ok(Box::new(carina_core::provider::NoopNormalizer)
+                    as Box<dyn carina_core::provider::ProviderNormalizer>)
             })
         }
 

@@ -183,6 +183,30 @@ async fn test_wasm_mock_provider_create_and_read() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_guest_read_reports_nested_non_finite_float_as_provider_error() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &indexmap::IndexMap::new())
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "__mock_non_finite_read__",
+        None,
+    );
+
+    let error = provider
+        .read(&id, Some("mock-id"), ReadRequest)
+        .await
+        .expect_err("guest output containing nested NaN must be a provider error");
+
+    assert!(error.message().contains("WASM boundary encode error"));
+    assert!(error.message().contains("non-finite float NaN"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_mock_provider_update_and_delete() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
@@ -291,7 +315,8 @@ async fn test_wasm_mock_provider_normalizer() {
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
         .create_normalizer(None, &indexmap::IndexMap::new())
-        .await;
+        .await
+        .expect("normalizer should initialize");
 
     // normalize_desired: mock provider returns resources unchanged
     let mut resources = vec![{
@@ -303,7 +328,7 @@ async fn test_wasm_mock_provider_normalizer() {
         r
     }];
     let original_attrs = resources[0].resolved_attributes();
-    normalizer.normalize_desired(&mut resources).await;
+    normalizer.normalize_desired(&mut resources).await.unwrap();
     assert_eq!(resources[0].resolved_attributes(), original_attrs);
 
     // normalize_state: mock provider returns states unchanged
@@ -320,7 +345,7 @@ async fn test_wasm_mock_provider_normalizer() {
     ]);
     let state = carina_core::resource::State::existing(id.clone(), attrs.clone());
     let mut states = HashMap::from([(id.clone(), state)]);
-    normalizer.normalize_state(&mut states).await;
+    normalizer.normalize_state(&mut states).await.unwrap();
     let result_state = states.values().next().unwrap();
     assert_eq!(
         result_state.attributes.get("key"),
@@ -360,7 +385,10 @@ async fn test_wasm_mock_provider_normalizer() {
         ),
     ]);
 
-    normalizer.normalize_state(&mut pending_states).await;
+    normalizer
+        .normalize_state(&mut pending_states)
+        .await
+        .unwrap();
 
     assert_eq!(pending_states.len(), 2);
     assert_eq!(
@@ -382,12 +410,660 @@ async fn test_wasm_mock_provider_normalizer() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_results() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &indexmap::IndexMap::new())
+        .await
+        .expect("normalizer should initialize");
+
+    let rekeyed_id = ResourceId::pending_with_provider("mock", "test.resource", None);
+    let mut rekeyed_states = HashMap::from([(
+        rekeyed_id.clone(),
+        State::existing(
+            rekeyed_id.clone(),
+            HashMap::from([
+                (
+                    "__mock_rekey_state_result__".to_string(),
+                    Value::Concrete(ConcreteValue::Bool(true)),
+                ),
+                (
+                    "__mock_normalize_state__".to_string(),
+                    Value::Concrete(ConcreteValue::String("rekeyed".to_string())),
+                ),
+            ]),
+        ),
+    )]);
+
+    normalizer
+        .normalize_state(&mut rekeyed_states)
+        .await
+        .expect("a single pending result is correlated by position, not guest key");
+    assert_eq!(
+        rekeyed_states[&rekeyed_id]
+            .attributes
+            .get("__mock_normalized_state__"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "rekeyed".to_string()
+        )))
+    );
+
+    let dropped_id = ResourceId::pending_with_provider("mock", "test.resource", None);
+    let mut dropped_states = HashMap::from([(
+        dropped_id.clone(),
+        State::existing(
+            dropped_id,
+            HashMap::from([(
+                "__mock_drop_state_result__".to_string(),
+                Value::Concrete(ConcreteValue::Bool(true)),
+            )]),
+        ),
+    )]);
+    assert!(
+        normalizer
+            .normalize_state(&mut dropped_states)
+            .await
+            .is_err(),
+        "a pending call returning zero entries must fail"
+    );
+
+    let hydrate_id = ResourceId::pending_with_provider("mock", "test.resource", None);
+    let mut hydrate_states = HashMap::from([(
+        hydrate_id.clone(),
+        State::existing(
+            hydrate_id.clone(),
+            HashMap::from([(
+                "__mock_rekey_state_result__".to_string(),
+                Value::Concrete(ConcreteValue::Bool(true)),
+            )]),
+        ),
+    )]);
+    let saved_attrs = SavedAttrs::from([(
+        hydrate_id.clone(),
+        HashMap::from([(
+            "__mock_hydrate_read_state__".to_string(),
+            Value::Concrete(ConcreteValue::String("hydrated".to_string())),
+        )]),
+    )]);
+    normalizer
+        .hydrate_read_state(&mut hydrate_states, &saved_attrs)
+        .await
+        .expect("a single pending hydrate result is correlated by position, not guest key");
+    assert_eq!(
+        hydrate_states[&hydrate_id]
+            .attributes
+            .get("__mock_hydrated_read_state__"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "hydrated".to_string()
+        )))
+    );
+
+    let dropped_hydrate_id = ResourceId::pending_with_provider("mock", "test.resource", None);
+    let mut dropped_hydrate_states = HashMap::from([(
+        dropped_hydrate_id.clone(),
+        State::existing(
+            dropped_hydrate_id,
+            HashMap::from([(
+                "__mock_drop_state_result__".to_string(),
+                Value::Concrete(ConcreteValue::Bool(true)),
+            )]),
+        ),
+    )]);
+    assert!(
+        normalizer
+            .hydrate_read_state(&mut dropped_hydrate_states, &SavedAttrs::new())
+            .await
+            .is_err(),
+        "a pending hydrate call returning zero entries must fail"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_resolved_wire_key_collisions_are_normalized_one_at_a_time() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &indexmap::IndexMap::new())
+        .await
+        .expect("normalizer should initialize");
+
+    let first_id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "same-identity",
+        Some("first".to_string()),
+    );
+    let second_id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "same-identity",
+        Some("second".to_string()),
+    );
+    let mut states = HashMap::from([
+        (
+            first_id.clone(),
+            State::existing(
+                first_id.clone(),
+                HashMap::from([(
+                    "__mock_normalize_state__".to_string(),
+                    Value::Concrete(ConcreteValue::String("first".to_string())),
+                )]),
+            ),
+        ),
+        (
+            second_id.clone(),
+            State::existing(
+                second_id.clone(),
+                HashMap::from([(
+                    "__mock_normalize_state__".to_string(),
+                    Value::Concrete(ConcreteValue::String("second".to_string())),
+                )]),
+            ),
+        ),
+    ]);
+
+    normalizer.normalize_state(&mut states).await.unwrap();
+
+    for (id, expected) in [(&first_id, "first"), (&second_id, "second")] {
+        assert_eq!(
+            states[id].attributes.get("__mock_normalized_state__"),
+            Some(&Value::Concrete(ConcreteValue::String(
+                expected.to_string()
+            ))),
+            "every host state sharing a wire key must be normalized"
+        );
+    }
+
+    let mut hydrate_states = HashMap::from([
+        (
+            first_id.clone(),
+            State::existing(first_id.clone(), HashMap::new()),
+        ),
+        (
+            second_id.clone(),
+            State::existing(second_id.clone(), HashMap::new()),
+        ),
+    ]);
+    let saved_attrs = SavedAttrs::from([
+        (
+            first_id.clone(),
+            HashMap::from([(
+                "__mock_hydrate_read_state__".to_string(),
+                Value::Concrete(ConcreteValue::String("first".to_string())),
+            )]),
+        ),
+        (
+            second_id.clone(),
+            HashMap::from([(
+                "__mock_hydrate_read_state__".to_string(),
+                Value::Concrete(ConcreteValue::String("second".to_string())),
+            )]),
+        ),
+    ]);
+
+    normalizer
+        .hydrate_read_state(&mut hydrate_states, &saved_attrs)
+        .await
+        .unwrap();
+
+    for (id, expected) in [(&first_id, "first"), (&second_id, "second")] {
+        assert_eq!(
+            hydrate_states[id]
+                .attributes
+                .get("__mock_hydrated_read_state__"),
+            Some(&Value::Concrete(ConcreteValue::String(
+                expected.to_string()
+            ))),
+            "every host state sharing a wire key must be hydrated"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_create_normalizer_propagates_instance_initialization_failure() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let attributes = indexmap::IndexMap::from([(
+        "bad".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Float(f64::INFINITY),
+        )])),
+    )]);
+
+    let result = factory
+        .create_normalizer(Some("bad-normalizer"), &attributes)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "normalizer instance failures must not become NoopNormalizer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &indexmap::IndexMap::new())
+        .await
+        .expect("normalizer should initialize");
+
+    for identity in [
+        "__mock_normalize_state_missing_key__",
+        "__mock_normalize_state_extra_key__",
+    ] {
+        let id = ResourceId::with_provider_identity("mock", "test.resource", identity, None);
+        let update_id =
+            ResourceId::with_provider_identity("mock", "test.resource", "would-update", None);
+        let mut states = HashMap::from([
+            (
+                id.clone(),
+                State::existing(
+                    id,
+                    HashMap::from([(
+                        "original".to_string(),
+                        Value::Concrete(ConcreteValue::String("value".to_string())),
+                    )]),
+                ),
+            ),
+            (
+                update_id.clone(),
+                State::existing(
+                    update_id,
+                    HashMap::from([(
+                        "__mock_normalize_state__".to_string(),
+                        Value::Concrete(ConcreteValue::String("would-change".to_string())),
+                    )]),
+                ),
+            ),
+        ]);
+        let before = states.clone();
+
+        let result = normalizer.normalize_state(&mut states).await;
+
+        assert!(result.is_err(), "{identity} must be rejected");
+        assert_eq!(states, before, "key mismatches must be atomic");
+    }
+
+    for identity in [
+        "__mock_hydrate_state_missing_key__",
+        "__mock_hydrate_state_extra_key__",
+    ] {
+        let id = ResourceId::with_provider_identity("mock", "test.resource", identity, None);
+        let update_id =
+            ResourceId::with_provider_identity("mock", "test.resource", "would-update", None);
+        let mut states = HashMap::from([
+            (
+                id.clone(),
+                State::existing(
+                    id,
+                    HashMap::from([(
+                        "original".to_string(),
+                        Value::Concrete(ConcreteValue::String("value".to_string())),
+                    )]),
+                ),
+            ),
+            (
+                update_id.clone(),
+                State::existing(update_id.clone(), HashMap::new()),
+            ),
+        ]);
+        let before = states.clone();
+        let saved_attrs = SavedAttrs::from([(
+            update_id,
+            HashMap::from([(
+                "__mock_hydrate_read_state__".to_string(),
+                Value::Concrete(ConcreteValue::String("would-change".to_string())),
+            )]),
+        )]);
+
+        let result = normalizer
+            .hydrate_read_state(&mut states, &saved_attrs)
+            .await;
+
+        assert!(result.is_err(), "{identity} must be rejected");
+        assert_eq!(states, before, "key mismatches must be atomic");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_normalize_state_trap_is_an_error_and_does_not_mutate_state() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let attributes = indexmap::IndexMap::new();
+    let provider = factory
+        .create_provider(None, &attributes)
+        .await
+        .expect("provider should initialize");
+    let normalizer = factory
+        .create_normalizer(None, &attributes)
+        .await
+        .expect("normalizer should initialize");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "__mock_normalize_state_trap__",
+        None,
+    );
+    let mut states = HashMap::from([(
+        id.clone(),
+        State::existing(
+            id,
+            HashMap::from([(
+                "original".to_string(),
+                Value::Concrete(ConcreteValue::String("value".to_string())),
+            )]),
+        ),
+    )]);
+    let before = states.clone();
+
+    let error = normalizer
+        .normalize_state(&mut states)
+        .await
+        .expect_err("a bare-list guest trap must become a normalizer error");
+
+    assert!(error.to_string().contains("normalize_state"));
+    assert_eq!(states, before, "guest traps must be atomic");
+
+    let create_id = ResourceId::with_provider_identity("mock", "test.resource", "after-trap", None);
+    let resource = Resource::with_provider("mock", "test.resource", "after-trap", None);
+    let error = provider
+        .create(&create_id, create_request_for_test(resource).await)
+        .await
+        .expect_err("the shared provider instance must remain poisoned after a normalizer trap");
+    let rendered = error.to_string();
+
+    assert!(
+        rendered.contains("provider instance unusable after trap in normalize_state"),
+        "the follow-up CRUD error must name the normalizer trap: {rendered}"
+    );
+    assert!(
+        !rendered.contains("WASM trap in create")
+            && !rendered.contains("cannot enter component instance"),
+        "the follow-up CRUD error must not misattribute the poisoned instance: {rendered}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_crud_trap_poisons_instance_with_original_operation() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &indexmap::IndexMap::new())
+        .await
+        .expect("provider should initialize");
+    let trap_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "__mock_create_trap__", None);
+    let trap_resource =
+        Resource::with_provider("mock", "test.resource", "__mock_create_trap__", None);
+
+    let initial_error = provider
+        .create(&trap_id, create_request_for_test(trap_resource).await)
+        .await
+        .expect_err("the mock create hook must trap");
+    assert!(
+        initial_error.to_string().contains("WASM trap in create"),
+        "the initial error must name the trapping operation: {initial_error}"
+    );
+
+    let followup_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "after-create-trap", None);
+    let followup_error = provider
+        .read(&followup_id, None, ReadRequest)
+        .await
+        .expect_err("the shared instance must remain poisoned after a CRUD trap");
+    let rendered = followup_error.to_string();
+
+    assert!(
+        rendered.contains("provider instance unusable after trap in create")
+            && rendered.contains("wasm `unreachable` instruction executed"),
+        "the follow-up error must name the original operation and typed trap cause: {rendered}"
+    );
+    assert!(
+        !rendered.contains("WASM trap in read")
+            && !rendered.contains("cannot enter component instance")
+            && !rendered.contains("wasm backtrace"),
+        "the follow-up error must not be attributed to the later read: {rendered}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_provider_returned_error_does_not_poison_instance() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &indexmap::IndexMap::new())
+        .await
+        .expect("provider should initialize");
+    let error_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "__mock_create_error__", None);
+    let error_resource =
+        Resource::with_provider("mock", "test.resource", "__mock_create_error__", None);
+
+    let error = provider
+        .create(&error_id, create_request_for_test(error_resource).await)
+        .await
+        .expect_err("the mock create hook must return a provider error");
+    assert!(error.to_string().contains("intentional mock create error"));
+
+    let followup_id =
+        ResourceId::with_provider_identity("mock", "test.resource", "after-create-error", None);
+    let state = provider
+        .read(&followup_id, None, ReadRequest)
+        .await
+        .expect("a provider-returned error must not poison the shared instance");
+    assert!(!state.exists);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_provider_normalizer_error_traps_and_does_not_mutate_state() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &indexmap::IndexMap::new())
+        .await
+        .expect("normalizer should initialize");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "__mock_normalize_state_error__",
+        None,
+    );
+    let mut states = HashMap::from([(
+        id.clone(),
+        State::existing(
+            id,
+            HashMap::from([(
+                "original".to_string(),
+                Value::Concrete(ConcreteValue::String("value".to_string())),
+            )]),
+        ),
+    )]);
+    let before = states.clone();
+
+    let error = normalizer
+        .normalize_state(&mut states)
+        .await
+        .expect_err("an SDK normalizer error must trap across the bare-list WIT export");
+
+    assert!(error.to_string().contains("normalize_state"), "{error}");
+    assert_eq!(states, before, "provider normalizer errors must be atomic");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_normalizer_rejects_nested_non_finite_float_without_mutating_resource() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &indexmap::IndexMap::new())
+        .await
+        .expect("normalizer should initialize");
+
+    let mut resource = Resource::with_provider("mock", "test.resource", "non-finite", None);
+    resource.attributes.insert(
+        "values".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Float(f64::INFINITY),
+        )])),
+    );
+    let mut resources = vec![resource];
+    let before = resources.clone();
+
+    let error = normalizer
+        .normalize_desired(&mut resources)
+        .await
+        .expect_err("nested non-finite floats must be provider errors, not panics");
+
+    assert!(error.to_string().contains("non-finite float"));
+    assert!(std::error::Error::source(&error).is_some());
+    assert_eq!(resources, before, "failed encoding must be atomic");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_normalizer_rejects_non_finite_default_tag_without_mutating_resource() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &indexmap::IndexMap::new())
+        .await
+        .expect("normalizer should initialize");
+    let mut resources = vec![Resource::with_provider(
+        "mock",
+        "test.resource",
+        "non-finite-tag",
+        None,
+    )];
+    let before = resources.clone();
+    let default_tags = indexmap::IndexMap::from([(
+        "Bad".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Float(f64::NEG_INFINITY),
+        )])),
+    )]);
+
+    let error = normalizer
+        .merge_default_tags(
+            &mut resources,
+            &default_tags,
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .await
+        .expect_err("non-finite default tags must fail boundary encoding");
+
+    assert!(error.to_string().contains("non-finite float"));
+    assert!(error.to_string().contains("Bad"));
+    assert_eq!(resources, before, "failed encoding must be atomic");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_normalizer_skips_unresolved_default_tag_and_continues() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &indexmap::IndexMap::new())
+        .await
+        .expect("normalizer should initialize");
+    let mut resources = vec![Resource::with_provider(
+        "mock",
+        "test.resource",
+        "deferred-tag",
+        None,
+    )];
+    let default_tags = indexmap::IndexMap::from([(
+        "Owner".to_string(),
+        Value::Deferred(DeferredValue::Unknown(
+            carina_core::resource::UnknownReason::ForValue,
+        )),
+    )]);
+
+    normalizer
+        .merge_default_tags(
+            &mut resources,
+            &default_tags,
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .await
+        .expect("an unresolved default tag must be skipped without aborting plan normalization");
+
+    assert_eq!(
+        resources[0].get_attr("__mock_merged_default_tags__"),
+        Some(&Value::Concrete(ConcreteValue::List(Vec::new()))),
+        "the provider should run with only encodable default tags"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_normalize_state_rejects_nested_non_finite_float_without_mutation() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &indexmap::IndexMap::new())
+        .await
+        .expect("normalizer should initialize");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "bad-state", None);
+    let mut states = HashMap::from([(
+        id.clone(),
+        State::existing(
+            id,
+            HashMap::from([(
+                "values".to_string(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::Float(f64::INFINITY),
+                )])),
+            )]),
+        ),
+    )]);
+    let before = states.clone();
+
+    let error = normalizer
+        .normalize_state(&mut states)
+        .await
+        .expect_err("non-finite state values must fail boundary encoding");
+
+    assert!(error.to_string().contains("non-finite float"));
+    assert_eq!(states, before, "failed encoding must be atomic");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_hydrate_rejects_non_finite_saved_attribute_without_mutation() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let normalizer = factory
+        .create_normalizer(None, &indexmap::IndexMap::new())
+        .await
+        .expect("normalizer should initialize");
+    let id = ResourceId::with_provider_identity("mock", "test.resource", "bad-saved", None);
+    let mut states = HashMap::from([(id.clone(), State::existing(id.clone(), HashMap::new()))]);
+    let before = states.clone();
+    let saved_attrs = SavedAttrs::from([(
+        id,
+        HashMap::from([(
+            "values".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Float(f64::NEG_INFINITY),
+            )])),
+        )]),
+    )]);
+
+    let error = normalizer
+        .hydrate_read_state(&mut states, &saved_attrs)
+        .await
+        .expect_err("non-finite saved attributes must fail boundary encoding");
+
+    assert!(error.to_string().contains("non-finite float"));
+    assert_eq!(states, before, "failed encoding must be atomic");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_normalize_desired_preserves_secret() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
         .create_normalizer(None, &indexmap::IndexMap::new())
-        .await;
+        .await
+        .expect("normalizer should initialize");
 
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("normalize-secret-plaintext".to_string()),
@@ -398,7 +1074,7 @@ async fn test_wasm_normalize_desired_preserves_secret() {
         .insert("api_key".to_string(), secret.clone());
     let mut resources = vec![resource];
 
-    normalizer.normalize_desired(&mut resources).await;
+    normalizer.normalize_desired(&mut resources).await.unwrap();
 
     assert_eq!(resources[0].get_attr("api_key"), Some(&secret));
 }
@@ -409,7 +1085,8 @@ async fn test_wasm_merge_default_tags_restores_secret_into_two_resources() {
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
         .create_normalizer(None, &indexmap::IndexMap::new())
-        .await;
+        .await
+        .expect("normalizer should initialize");
 
     let resource_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("resource-secret-plaintext".to_string()),
@@ -436,7 +1113,8 @@ async fn test_wasm_merge_default_tags_restores_secret_into_two_resources() {
             &default_tags,
             &carina_core::schema::SchemaRegistry::new(),
         )
-        .await;
+        .await
+        .unwrap();
 
     for resource in &resources {
         assert_eq!(
@@ -466,7 +1144,8 @@ async fn test_wasm_mock_provider_hydrate_read_state_preserves_host_ids() {
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
         .create_normalizer(None, &indexmap::IndexMap::new())
-        .await;
+        .await
+        .expect("normalizer should initialize");
 
     let resolved = ResourceId::with_provider_identity("mock", "test.resource", "resolved", None);
     let first_pending = ResourceId::pending_with_provider("mock", "test.resource", None);
@@ -497,7 +1176,8 @@ async fn test_wasm_mock_provider_hydrate_read_state_preserves_host_ids() {
 
     normalizer
         .hydrate_read_state(&mut states, &saved_attrs)
-        .await;
+        .await
+        .unwrap();
 
     assert_eq!(states.len(), ids.len());
     for (index, id) in ids.iter().enumerate() {
@@ -526,7 +1206,8 @@ async fn test_wasm_mock_provider_merge_default_tags_dispatches_through_wit() {
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
         .create_normalizer(None, &indexmap::IndexMap::new())
-        .await;
+        .await
+        .expect("normalizer should initialize");
 
     let registry = carina_core::schema::SchemaRegistry::new();
     let mut resources = vec![Resource::with_provider(
@@ -548,7 +1229,8 @@ async fn test_wasm_mock_provider_merge_default_tags_dispatches_through_wit() {
 
     normalizer
         .merge_default_tags(&mut resources, &default_tags, &registry)
-        .await;
+        .await
+        .unwrap();
 
     let echoed = resources[0]
         .get_attr("__mock_merged_default_tags__")
@@ -567,7 +1249,8 @@ async fn test_wasm_mock_provider_merge_default_tags_empty_short_circuits() {
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
         .create_normalizer(None, &indexmap::IndexMap::new())
-        .await;
+        .await
+        .expect("normalizer should initialize");
 
     let registry = carina_core::schema::SchemaRegistry::new();
     let mut resources = vec![Resource::with_provider(
@@ -580,7 +1263,8 @@ async fn test_wasm_mock_provider_merge_default_tags_empty_short_circuits() {
 
     normalizer
         .merge_default_tags(&mut resources, &default_tags, &registry)
-        .await;
+        .await
+        .unwrap();
 
     assert!(
         resources[0]
@@ -598,7 +1282,8 @@ async fn test_wasm_mock_provider_merge_default_tags_preserves_order() {
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
         .create_normalizer(None, &indexmap::IndexMap::new())
-        .await;
+        .await
+        .expect("normalizer should initialize");
 
     let registry = carina_core::schema::SchemaRegistry::new();
     let mut resources = vec![
@@ -613,7 +1298,8 @@ async fn test_wasm_mock_provider_merge_default_tags_preserves_order() {
 
     normalizer
         .merge_default_tags(&mut resources, &default_tags, &registry)
-        .await;
+        .await
+        .unwrap();
 
     assert_eq!(
         resources[0].id.identity_str().expect("resolved identity"),
@@ -714,7 +1400,62 @@ async fn test_wasm_mock_provider_required_permissions_dispatches_through_wit() {
     let id = ResourceId::with_provider_identity("mock", "test.resource", "example", None);
 
     assert_eq!(
-        provider.required_permissions(&id, PlanOp::Create),
+        provider
+            .required_permissions(&id, PlanOp::Create)
+            .expect("required_permissions should succeed"),
         Vec::<String>::new()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_required_permissions_trap_is_not_an_empty_permission_set() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &indexmap::IndexMap::new())
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "__mock_required_permissions_trap__",
+        None,
+    );
+
+    let error = provider
+        .required_permissions(&id, PlanOp::Create)
+        .expect_err("a guest trap must be returned to the caller");
+
+    assert!(
+        error.to_string().contains("required_permissions"),
+        "the error must name the trapping export: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_invalid_satisfier_hint_is_not_silently_dropped() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let provider = factory
+        .create_provider(None, &indexmap::IndexMap::new())
+        .await
+        .expect("provider should init");
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "__mock_invalid_satisfier_hint__",
+        None,
+    );
+
+    let error = provider
+        .satisfier_hint(
+            &id,
+            &carina_core::wait::predicate::AttrPath::single("status"),
+        )
+        .expect_err("an invalid guest pattern must be returned to the caller");
+
+    assert!(
+        error.to_string().contains("satisfier_hint"),
+        "the error must name the malformed export: {error}"
     );
 }

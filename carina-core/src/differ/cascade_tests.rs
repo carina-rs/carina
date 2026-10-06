@@ -125,6 +125,7 @@ fn plan_for(
         &HashMap::new(),
         &[],
     )
+    .expect("test provider hints should succeed")
 }
 
 fn standard_states() -> HashMap<ResourceId, State> {

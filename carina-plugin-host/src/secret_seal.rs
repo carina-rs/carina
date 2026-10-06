@@ -7,6 +7,7 @@
 //! tokens and isolates attributes containing mangled ones.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 
 use carina_core::resource::{ConcreteValue, DeferredValue, Resource, Value};
@@ -35,7 +36,7 @@ impl SealedDesired {
 }
 
 // The field stays private so a desired-state caller cannot feed raw guest
-// attributes to `wasm_convert`; only `Unsealer::restore` can consume them.
+// attributes to `wasm_convert`; only `Unsealer::try_restore` can consume them.
 pub(crate) struct GuestDesired {
     resources: Vec<wit::ResourceDef>,
 }
@@ -49,6 +50,72 @@ impl GuestDesired {
 pub(crate) struct Unsealer {
     nonce_prefix: String,
     secrets: Vec<Value>,
+    expected_resource_count: usize,
+}
+
+#[derive(Debug)]
+pub(crate) enum SealError {
+    ResourceValue(SerializationError),
+    DefaultTag {
+        key: String,
+        source: SerializationError,
+    },
+}
+
+impl fmt::Display for SealError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResourceValue(_) => f.write_str("failed to encode sealed resource value"),
+            Self::DefaultTag { key, .. } => write!(f, "failed to encode default tag '{key}'"),
+        }
+    }
+}
+
+impl std::error::Error for SealError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ResourceValue(source) | Self::DefaultTag { source, .. } => Some(source),
+        }
+    }
+}
+
+impl From<SerializationError> for SealError {
+    fn from(source: SerializationError) -> Self {
+        Self::ResourceValue(source)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RestoreError {
+    ResourceCountMismatch { expected: usize, actual: usize },
+    ValueDecode(wasm_convert::WasmValueDecodeError),
+}
+
+impl fmt::Display for RestoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResourceCountMismatch { expected, actual } => write!(
+                f,
+                "WASM guest returned {actual} normalized resources; expected {expected}"
+            ),
+            Self::ValueDecode(_) => f.write_str("failed to decode normalized resource values"),
+        }
+    }
+}
+
+impl std::error::Error for RestoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ValueDecode(source) => Some(source),
+            Self::ResourceCountMismatch { .. } => None,
+        }
+    }
+}
+
+impl From<wasm_convert::WasmValueDecodeError> for RestoreError {
+    fn from(error: wasm_convert::WasmValueDecodeError) -> Self {
+        Self::ValueDecode(error)
+    }
 }
 
 pub(crate) struct RestoredDesired {
@@ -79,7 +146,7 @@ impl RestoredDesired {
 pub(crate) fn seal(
     resources: &[Resource],
     default_tags: Option<&IndexMap<String, Value>>,
-) -> Result<(SealedDesired, Unsealer), SerializationError> {
+) -> Result<(SealedDesired, Unsealer), SealError> {
     let nonce_prefix = format!("{TOKEN_NAMESPACE}:{}:", uuid::Uuid::new_v4().simple());
     let mut sealer = Sealer {
         nonce_prefix: nonce_prefix.clone(),
@@ -95,31 +162,44 @@ pub(crate) fn seal(
             wasm_convert::core_to_wit_resource(&sealed)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let default_tags = default_tags
-        .into_iter()
-        .flatten()
-        .filter_map(|(key, value)| {
-            let checkpoint = sealer.secrets.len();
-            let sealed = sealer.seal_value(value);
-            match wasm_convert::core_to_wit_value(&sealed) {
-                Ok(value) => Some((key.clone(), value)),
-                Err(error) => {
-                    sealer.secrets.truncate(checkpoint);
-                    log::error!("Skipping default_tag '{key}' with unresolvable value: {error}");
-                    None
+    let mut encoded_default_tags = Vec::new();
+    for (key, value) in default_tags.into_iter().flatten() {
+        let checkpoint = sealer.secrets.len();
+        let sealed = sealer.seal_value(value);
+        match wasm_convert::core_to_wit_value(&sealed) {
+            Ok(value) => encoded_default_tags.push((key.clone(), value)),
+            Err(error) => {
+                sealer.secrets.truncate(checkpoint);
+                match &error {
+                    SerializationError::UnknownNotAllowed { .. }
+                    | SerializationError::UnresolvedResourceRef { .. }
+                    | SerializationError::UnresolvedInterpolation { .. }
+                    | SerializationError::UnresolvedFunctionCall { .. } => {
+                        log::error!(
+                            "Skipping default_tag '{key}' with unresolvable value: {error}"
+                        );
+                    }
+                    SerializationError::NonFiniteFloat { .. } => {
+                        return Err(SealError::DefaultTag {
+                            key: key.clone(),
+                            source: error,
+                        });
+                    }
                 }
             }
-        })
-        .collect();
+        }
+    }
+    let expected_resource_count = resources.len();
 
     Ok((
         SealedDesired {
             resources,
-            default_tags,
+            default_tags: encoded_default_tags,
         },
         Unsealer {
             nonce_prefix,
             secrets: sealer.secrets,
+            expected_resource_count,
         },
     ))
 }
@@ -161,11 +241,17 @@ enum TokenIndex {
 }
 
 impl Unsealer {
-    pub(crate) fn restore(self, guest: GuestDesired) -> RestoredDesired {
+    pub(crate) fn try_restore(self, guest: GuestDesired) -> Result<RestoredDesired, RestoreError> {
+        if guest.resources.len() != self.expected_resource_count {
+            return Err(RestoreError::ResourceCountMismatch {
+                expected: self.expected_resource_count,
+                actual: guest.resources.len(),
+            });
+        }
         let mut resources = Vec::with_capacity(guest.resources.len());
 
         for resource in guest.resources {
-            let guest_attributes = wasm_convert::wit_to_core_value_map(&resource.attributes);
+            let guest_attributes = wasm_convert::wit_to_core_value_map(&resource.attributes)?;
             let mut attributes = HashMap::with_capacity(guest_attributes.len());
             let mut skipped_attributes = Vec::new();
             for (key, mut value) in guest_attributes {
@@ -183,7 +269,13 @@ impl Unsealer {
             });
         }
 
-        RestoredDesired { resources }
+        Ok(RestoredDesired { resources })
+    }
+
+    #[cfg(test)]
+    fn restore(self, guest: GuestDesired) -> RestoredDesired {
+        self.try_restore(guest)
+            .expect("test guest values must be valid WIT boundary payloads")
     }
 
     fn restore_value(&self, value: &mut Value) -> bool {
@@ -368,6 +460,74 @@ mod tests {
             resources[0].get_attr("sibling"),
             Some(&string("guest-sibling"))
         );
+    }
+
+    #[test]
+    fn restore_rejects_a_different_guest_resource_count_before_mutation() {
+        for return_extra_resource in [false, true] {
+            let resources = vec![
+                resource_with_attribute("value", string("first")),
+                resource_with_attribute("value", string("second")),
+            ];
+            let (mut payload, unsealer) = seal(&resources, None).expect("seal should succeed");
+
+            if return_extra_resource {
+                payload.resources.push(payload.resources[0].clone());
+            } else {
+                payload.resources.pop();
+            }
+
+            let result = unsealer.try_restore(take_guest_resources(&mut payload));
+
+            assert!(
+                result.is_err(),
+                "a guest resource count mismatch must be a boundary error"
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_default_tag_is_skipped() {
+        let resources = vec![Resource::with_provider(
+            "mock",
+            "test.resource",
+            "test",
+            None,
+        )];
+        let default_tags = IndexMap::from([(
+            "Owner".to_string(),
+            Value::Deferred(DeferredValue::Unknown(
+                carina_core::resource::UnknownReason::ForValue,
+            )),
+        )]);
+
+        let (payload, _) =
+            seal(&resources, Some(&default_tags)).expect("unresolved tags must be skipped");
+
+        assert!(payload.default_tags.is_empty());
+    }
+
+    #[test]
+    fn non_finite_default_tag_error_names_the_tag_key() {
+        let resources = vec![Resource::with_provider(
+            "mock",
+            "test.resource",
+            "test",
+            None,
+        )];
+        let default_tags = IndexMap::from([(
+            "InvalidFloatTag".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Float(f64::NAN),
+            )])),
+        )]);
+
+        let error = match seal(&resources, Some(&default_tags)) {
+            Ok(_) => panic!("non-finite default tags must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("InvalidFloatTag"), "{error}");
     }
 
     #[test]

@@ -66,7 +66,7 @@
 use std::collections::HashMap;
 
 use crate::parser::ProviderConfig;
-use crate::provider::{ProviderFactory, ProviderNormalizer};
+use crate::provider::{ProviderFactory, ProviderNormalizer, ProviderResult};
 use crate::resource::{
     ConcreteValue, DeferredValue, InterpolationPart, Resource, ResourceId, State, Value,
     contains_resource_ref,
@@ -97,12 +97,12 @@ pub async fn apply_desired_normalization(
     normalizer: &dyn ProviderNormalizer,
     factories: &[Box<dyn ProviderFactory>],
     schemas: &SchemaRegistry,
-) -> NormalizedResource {
+) -> ProviderResult<NormalizedResource> {
     let mut one = [resource];
     apply_desired_normalization_slice(&mut one, provider_configs, normalizer, factories, schemas)
-        .await;
+        .await?;
     let [resource] = one;
-    NormalizedResource(resource)
+    Ok(NormalizedResource(resource))
 }
 
 /// Apply the full desired-side pipeline to a resource slice in place:
@@ -118,12 +118,19 @@ pub async fn apply_desired_normalization_slice(
     normalizer: &dyn ProviderNormalizer,
     factories: &[Box<dyn ProviderFactory>],
     schemas: &SchemaRegistry,
-) {
+) -> ProviderResult<()> {
     crate::value::canonicalize_resources_with_schemas(resources, schemas);
     let stripped = strip_provider_boundary_attributes(resources);
-    run_desired_normalization_stages(resources, provider_configs, normalizer, factories, schemas)
-        .await;
+    let result = run_desired_normalization_stages(
+        resources,
+        provider_configs,
+        normalizer,
+        factories,
+        schemas,
+    )
+    .await;
     restore_stripped_attributes(resources, stripped);
+    result
 }
 
 /// Run the desired-side normalization stages on a slice that has already been
@@ -168,16 +175,17 @@ pub async fn run_desired_normalization_stages(
     normalizer: &dyn ProviderNormalizer,
     factories: &[Box<dyn ProviderFactory>],
     schemas: &SchemaRegistry,
-) {
-    normalizer.normalize_desired(resources).await;
+) -> ProviderResult<()> {
+    normalizer.normalize_desired(resources).await?;
     for config in provider_configs {
         if !config.default_tags.is_empty() {
             normalizer
                 .merge_default_tags(resources, &config.default_tags, schemas)
-                .await;
+                .await?;
         }
     }
     crate::value::resolve_enum_aliases_for_resources(resources, factories);
+    Ok(())
 }
 
 /// One stripped attribute retained so it can be reinserted at its original

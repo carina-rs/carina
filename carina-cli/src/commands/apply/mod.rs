@@ -1041,7 +1041,7 @@ async fn run_apply_with_observer_factory(
                     .await?;
                 let bucket_normalizer = factory
                     .create_normalizer(None, &provider_config_attrs)
-                    .await;
+                    .await?;
                 // Module expansion can place a module-owned state-bucket
                 // resource in `parsed.resources`; `find_resource_by_attr`
                 // does not imply top-level ownership. Gate bootstrap with
@@ -1462,7 +1462,7 @@ async fn run_apply_locked(
     // renames (#1685), then run phase 2 against the consolidated state.
     provider
         .hydrate_read_state(&mut current_states, saved_attrs.as_provider_saved_attrs())
-        .await;
+        .await?;
     if let Some(sf) = state_file.as_ref() {
         sf.restore_partial_read_markers(&mut current_states);
     }
@@ -1709,7 +1709,13 @@ async fn run_apply_locked(
             &mut wait_bindings,
         )
         .await;
-    if let Err(errors) = preparation {
+    if let Err(error) = preparation {
+        let errors = match error {
+            crate::wiring::PlanPreparationError::Plan(errors) => errors,
+            crate::wiring::PlanPreparationError::Provider(error) => {
+                return Err(AppError::Provider(error));
+            }
+        };
         let mut plan = Plan::new();
         for error in errors {
             plan.add_error(error);
@@ -1761,7 +1767,7 @@ async fn run_apply_locked(
         &prev_explicit,
         &orphan_dependencies,
         &wait_bindings,
-    );
+    )?;
     crate::wiring::add_deposed_delete_effects(&mut plan, &state_file);
     block_deletes_on_prior_consumer_updates(&mut plan, &directives_map);
 

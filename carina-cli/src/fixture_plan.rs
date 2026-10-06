@@ -22,10 +22,10 @@ use carina_state::{StateFile, check_and_migrate};
 
 use crate::commands::validate_and_resolve_with_config;
 use crate::wiring::{
-    LateAnonymousIdentityInputs, PlanPreprocessor, WiringContext, add_deferred_create_effects,
-    compute_anonymous_identifiers_with_ctx, expand_same_config_deferred_for,
-    reconcile_anonymous_identifiers_with_ctx, reconcile_late_anonymous_identities,
-    reconcile_prefixed_names,
+    LateAnonymousIdentityInputs, PlanPreparationError, PlanPreprocessor, WiringContext,
+    add_deferred_create_effects, compute_anonymous_identifiers_with_ctx,
+    expand_same_config_deferred_for, reconcile_anonymous_identifiers_with_ctx,
+    reconcile_late_anonymous_identities, reconcile_prefixed_names,
 };
 
 /// Fixture root path relative to the `carina-cli` crate manifest.
@@ -362,16 +362,24 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let prepared_compositions = parsed.compositions.clone();
     let module_gate = carina_core::executor::ModuleConstraintGate::new(&prepared_compositions);
     let mut wait_bindings = parsed.wait_bindings.clone();
+    let mut provider_router = ProviderRouter::new();
     let preparation = {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("failed to build tokio runtime for plan preprocessing");
-        let mut router = ProviderRouter::new();
         for factory in wiring.factories() {
             let attrs = indexmap::IndexMap::new();
-            router.add_normalizer(rt.block_on(factory.create_normalizer(None, &attrs)));
+            provider_router.add_normalizer(
+                factory.name(),
+                rt.block_on(factory.create_normalizer(None, &attrs))
+                    .expect("fixture normalizer creation unexpectedly failed"),
+            );
+            provider_router.add_provider(
+                factory.name().to_string(),
+                Box::new(carina_provider_mock::MockProvider::new()),
+            );
         }
-        rt.block_on(PlanPreprocessor::new(&router, &wiring).prepare(
+        rt.block_on(PlanPreprocessor::new(&provider_router, &wiring).prepare(
             &mut override_aware_resources,
             &constraint_origin_resources,
             &module_gate,
@@ -382,7 +390,13 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             &mut wait_bindings,
         ))
     };
-    if let Err(errors) = preparation {
+    if let Err(error) = preparation {
+        let errors = match error {
+            PlanPreparationError::Plan(errors) => errors,
+            PlanPreparationError::Provider(error) => {
+                panic!("fixture no-op normalizer unexpectedly failed: {error}")
+            }
+        };
         let mut plan = Plan::new();
         for error in errors {
             plan.add_error(error);
@@ -482,7 +496,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &resolved_resources,
         &unresolved_resources,
         &data_sources_for_plan,
-        &carina_core::provider::ProviderRouter::new(),
+        &provider_router,
         &plan_input_states,
         &directives_map,
         wiring.schemas(),
@@ -490,7 +504,8 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &prev_explicit,
         &orphan_dependencies,
         &wait_bindings,
-    );
+    )
+    .expect("fixture providers must return valid satisfier hints");
     crate::wiring::add_deposed_delete_effects(&mut plan, &state_file);
 
     crate::wiring::add_state_block_effects(
