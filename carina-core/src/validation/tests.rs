@@ -5110,7 +5110,7 @@ impl crate::provider::ProviderFactory for RecordingFactory {
     fn create_provider(
         &self,
         _binding: Option<&str>,
-        _attributes: &IndexMap<String, Value>,
+        _config: &crate::provider::ProviderReadyConfig,
     ) -> futures::future::BoxFuture<
         '_,
         crate::provider::ProviderResult<Box<dyn crate::provider::Provider>>,

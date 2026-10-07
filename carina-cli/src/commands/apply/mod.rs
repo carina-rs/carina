@@ -14,7 +14,7 @@ use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
 use carina_core::executor::{
     DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
-    ProviderCheckInputs, UnresolvedResource,
+    ProviderCheckInputs, UnresolvedResource, prepare_provider_ready_config,
 };
 use carina_core::override_aware::OverrideAwareResources;
 use carina_core::plan::Plan;
@@ -1036,12 +1036,13 @@ async fn run_apply_with_observer_factory(
                     .find(|p| p.name == backend_provider_name)
                     .map(|p| p.attributes.clone())
                     .unwrap_or_default();
-                let bucket_provider = factory
-                    .create_provider(None, &provider_config_attrs)
-                    .await?;
-                let bucket_normalizer = factory
-                    .create_normalizer(None, &provider_config_attrs)
-                    .await?;
+                let provider_config = prepare_provider_ready_config(
+                    factory,
+                    backend_provider_name,
+                    &provider_config_attrs,
+                )?;
+                let bucket_provider = factory.create_provider(None, &provider_config).await?;
+                let bucket_normalizer = factory.create_normalizer(None, &provider_config).await?;
                 // Module expansion can place a module-owned state-bucket
                 // resource in `parsed.resources`; `find_resource_by_attr`
                 // does not imply top-level ownership. Gate bootstrap with

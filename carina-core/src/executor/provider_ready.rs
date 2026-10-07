@@ -10,6 +10,7 @@ use std::fmt;
 use std::ops::Deref;
 use std::sync::Mutex;
 
+use indexmap::IndexMap;
 use thiserror::Error;
 
 use crate::binding_index::ResolvedBindings;
@@ -61,6 +62,43 @@ pub type ProviderReadyResource = ProviderReady<ResolvedResource>;
 
 /// A fully resolved data source whose known input constraints have run.
 pub type ProviderReadyDataSource = ProviderReady<ResolvedDataSource>;
+
+/// Provider configuration that passed every provider-boundary check.
+///
+/// The attributes remain private so a provider instance cannot be created
+/// from unchecked values. There is no `new`, `From`, `Default`, or
+/// deserialization path; [`prepare_provider_ready_config`] is the sole
+/// constructor.
+///
+/// ```compile_fail
+/// use carina_core::provider::ProviderReadyConfig;
+/// use indexmap::IndexMap;
+///
+/// let _ready = ProviderReadyConfig { attributes: IndexMap::new() };
+/// ```
+///
+/// A raw attribute map cannot cross the provider construction boundary.
+///
+/// ```compile_fail
+/// use carina_core::provider::ProviderFactory;
+/// use carina_core::resource::Value;
+/// use indexmap::IndexMap;
+///
+/// fn bypass(factory: &dyn ProviderFactory, attributes: &IndexMap<String, Value>) {
+///     let _ = factory.create_provider(None, attributes);
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderReadyConfig {
+    attributes: IndexMap<String, Value>,
+}
+
+impl ProviderReadyConfig {
+    /// Borrow the checked provider configuration attributes.
+    pub fn attributes(&self) -> &IndexMap<String, Value> {
+        &self.attributes
+    }
+}
 
 /// Dependencies shared by every checked provider-boundary preparation.
 ///
@@ -306,6 +344,110 @@ pub enum ProviderPreparationError {
     /// Provider-specific normalization failed before dispatch.
     #[error(transparent)]
     Provider(#[from] crate::provider::ProviderError),
+}
+
+/// Provider-specific configuration validation failure.
+///
+/// This wrapper lets [`ProviderConfigPreparationError`] retain a typed source
+/// for the string-based [`ProviderFactory::validate_config`] contract.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct ProviderConfigValidationError {
+    message: String,
+}
+
+/// Failure while preparing configuration for provider construction.
+#[derive(Debug, Error)]
+pub enum ProviderConfigPreparationError {
+    /// A deferred placeholder survived provider attribute resolution.
+    #[error("provider {provider}: {attribute}: {source}")]
+    UnresolvedAttribute {
+        provider: String,
+        attribute: String,
+        #[source]
+        source: Box<SerializationError>,
+    },
+    /// A concrete attribute violates its host-side type schema.
+    #[error("provider {provider}: {attribute}: {source}")]
+    InvalidAttribute {
+        provider: String,
+        attribute: String,
+        #[source]
+        source: Box<TypeError>,
+    },
+    /// The provider rejected cross-attribute or provider-specific semantics.
+    #[error("provider {provider}: {source}")]
+    ProviderValidation {
+        provider: String,
+        #[source]
+        source: ProviderConfigValidationError,
+    },
+}
+
+/// Prepare provider configuration for construction and normalization.
+///
+/// Checks run in boundary order: every value must be fully resolved, each
+/// known attribute must satisfy the provider's host-side schema, and finally
+/// the provider-specific configuration validator must accept the complete
+/// map. This is the sole constructor for [`ProviderReadyConfig`].
+pub fn prepare_provider_ready_config(
+    factory: &dyn ProviderFactory,
+    provider_name: &str,
+    attributes: &IndexMap<String, Value>,
+) -> Result<ProviderReadyConfig, ProviderConfigPreparationError> {
+    for (attribute, value) in attributes {
+        crate::resource::assert_value_fully_resolved(value).map_err(|source| {
+            ProviderConfigPreparationError::UnresolvedAttribute {
+                provider: provider_name.to_string(),
+                attribute: attribute.clone(),
+                source: Box::new(source),
+            }
+        })?;
+    }
+
+    validate_provider_config_attributes(factory, provider_name, attributes)?;
+
+    factory.validate_config(attributes).map_err(|message| {
+        let message = if attributes.values().any(crate::value::contains_secret) {
+            "configuration containing a secret failed validation".to_string()
+        } else {
+            message
+        };
+        ProviderConfigPreparationError::ProviderValidation {
+            provider: provider_name.to_string(),
+            source: ProviderConfigValidationError { message },
+        }
+    })?;
+
+    Ok(ProviderReadyConfig {
+        attributes: attributes.clone(),
+    })
+}
+
+/// Run the host-owned provider configuration type checks.
+///
+/// The static validation phase calls this directly because unresolved values
+/// are intentionally allowed there. Provider construction calls it only after
+/// proving the complete map resolved.
+pub(crate) fn validate_provider_config_attributes(
+    factory: &dyn ProviderFactory,
+    provider_name: &str,
+    attributes: &IndexMap<String, Value>,
+) -> Result<(), ProviderConfigPreparationError> {
+    let attr_types = factory.provider_config_attribute_types();
+    let schema_view = crate::schema::Schema::with_defs(std::collections::BTreeMap::new());
+    for (attribute, value) in attributes {
+        if let Some(attr_type) = attr_types.get(attribute) {
+            schema_view
+                .validate_attr(attr_type, value)
+                .map_err(|source| ProviderConfigPreparationError::InvalidAttribute {
+                    provider: provider_name.to_string(),
+                    attribute: attribute.clone(),
+                    source: Box::new(source),
+                })?;
+        }
+    }
+    Ok(())
 }
 
 /// Typed collection of schema failures from one provider-boundary check.
@@ -593,5 +735,170 @@ fn unwrap_secret(value: Value) -> Value {
                 .collect(),
         )),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod provider_config_tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::future::BoxFuture;
+    use indexmap::IndexMap;
+
+    use super::*;
+    use crate::provider::{Provider, ProviderResult};
+    use crate::resource::{AccessPath, ConcreteValue};
+    use crate::schema::AttributeType;
+
+    struct ConfigFactory {
+        validate_calls: AtomicUsize,
+        plugin_error: Option<&'static str>,
+    }
+
+    impl ConfigFactory {
+        fn successful() -> Self {
+            Self {
+                validate_calls: AtomicUsize::new(0),
+                plugin_error: None,
+            }
+        }
+
+        fn failing(message: &'static str) -> Self {
+            Self {
+                validate_calls: AtomicUsize::new(0),
+                plugin_error: Some(message),
+            }
+        }
+    }
+
+    impl ProviderFactory for ConfigFactory {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn display_name(&self) -> &str {
+            "provider config preparation test provider"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::from([(
+                "region".to_string(),
+                AttributeType::refined_string(None, Some(r"^good-[a-z]+$".to_string()), None, None),
+            )])
+        }
+
+        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+            self.validate_calls.fetch_add(1, Ordering::SeqCst);
+            match self.plugin_error {
+                Some(message) => Err(message.to_string()),
+                None => Ok(()),
+            }
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "test".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _config: &ProviderReadyConfig,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            unreachable!("config preparation tests do not create providers")
+        }
+
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            Vec::new()
+        }
+    }
+
+    fn config(value: Value) -> IndexMap<String, Value> {
+        IndexMap::from([("region".to_string(), value)])
+    }
+
+    #[test]
+    fn prepare_provider_ready_config_accepts_valid_attributes() {
+        let factory = ConfigFactory::successful();
+        let attributes = config(Value::Concrete(ConcreteValue::String(
+            "good-tokyo".to_string(),
+        )));
+
+        let ready = prepare_provider_ready_config(&factory, "test", &attributes)
+            .expect("valid provider config must be prepared");
+
+        assert_eq!(ready.attributes(), &attributes);
+        assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn prepare_provider_ready_config_rejects_pattern_violation() {
+        let factory = ConfigFactory::successful();
+        let attributes = config(Value::Concrete(ConcreteValue::String("bad".to_string())));
+
+        let error = prepare_provider_ready_config(&factory, "test", &attributes)
+            .expect_err("pattern mismatch must fail preparation");
+        let message = error.to_string();
+
+        assert!(message.contains("provider test"), "{message}");
+        assert!(message.contains("region"), "{message}");
+        assert!(message.contains(r"^good-[a-z]+$"), "{message}");
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn prepare_provider_ready_config_rejects_unresolved_reference() {
+        let factory = ConfigFactory::successful();
+        let attributes = config(Value::Deferred(DeferredValue::ResourceRef {
+            path: AccessPath::new("upstream", "region"),
+        }));
+
+        let error = prepare_provider_ready_config(&factory, "test", &attributes)
+            .expect_err("unresolved provider config must fail preparation");
+        let message = error.to_string();
+
+        assert!(message.contains("provider test"), "{message}");
+        assert!(message.contains("region"), "{message}");
+        assert!(message.contains("upstream.region"), "{message}");
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn prepare_provider_ready_config_rejects_plugin_validation_failure() {
+        let factory = ConfigFactory::failing("configured account is forbidden");
+        let attributes = config(Value::Concrete(ConcreteValue::String(
+            "good-tokyo".to_string(),
+        )));
+
+        let error = prepare_provider_ready_config(&factory, "test", &attributes)
+            .expect_err("plugin config validation must fail preparation");
+        let message = error.to_string();
+
+        assert!(message.contains("provider test"), "{message}");
+        assert!(
+            message.contains("configured account is forbidden"),
+            "{message}"
+        );
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn prepare_provider_ready_config_masks_plugin_errors_for_secrets() {
+        let plaintext = "plaintext-must-not-leak";
+        let factory = ConfigFactory::failing(plaintext);
+        let attributes = config(Value::Deferred(DeferredValue::Secret(Box::new(
+            Value::Concrete(ConcreteValue::String("good-secret".to_string())),
+        ))));
+
+        let error = prepare_provider_ready_config(&factory, "test", &attributes)
+            .expect_err("plugin config validation must fail preparation");
+        let message = error.to_string();
+
+        assert!(message.contains("provider test"), "{message}");
+        assert!(message.contains("secret"), "{message}");
+        assert!(!message.contains(plaintext), "{message}");
     }
 }

@@ -97,7 +97,7 @@ impl ProviderFactory for FailBCreateFactory {
     fn create_provider(
         &self,
         _binding: Option<&str>,
-        _attributes: &IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async { Ok(Box::new(FailBCreateProvider) as Box<dyn Provider>) })
     }
@@ -105,7 +105,7 @@ impl ProviderFactory for FailBCreateFactory {
     fn create_normalizer(
         &self,
         _binding: Option<&str>,
-        _attributes: &IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -227,7 +227,7 @@ impl ProviderFactory for ApplyTimeReadFactory {
     fn create_provider(
         &self,
         _binding: Option<&str>,
-        _attributes: &IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         let shared = self.shared.clone();
         Box::pin(async move { Ok(Box::new(ApplyTimeReadProvider { shared }) as Box<dyn Provider>) })
@@ -236,7 +236,7 @@ impl ProviderFactory for ApplyTimeReadFactory {
     fn create_normalizer(
         &self,
         _binding: Option<&str>,
-        _attributes: &IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -321,7 +321,7 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
     fn create_provider(
         &self,
         _binding: Option<&str>,
-        _attributes: &IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         let shared = self.shared.clone();
         Box::pin(async move { Ok(Box::new(ApplyCascadeProvider { shared }) as Box<dyn Provider>) })
@@ -330,7 +330,7 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
     fn create_normalizer(
         &self,
         _binding: Option<&str>,
-        _attributes: &IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }

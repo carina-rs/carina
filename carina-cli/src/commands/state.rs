@@ -9,7 +9,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::effect::Effect;
-use carina_core::executor::UnresolvedDataSourceInput;
+use carina_core::executor::{UnresolvedDataSourceInput, prepare_provider_ready_config};
 use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::provider::{
@@ -935,9 +935,9 @@ async fn run_state_bucket_delete(
         .find(|p| p.name == backend_provider_name)
         .map(|p| p.attributes.clone())
         .unwrap_or_default();
-    let bucket_provider = factory
-        .create_provider(None, &provider_config_attrs)
-        .await?;
+    let provider_config =
+        prepare_provider_ready_config(factory, backend_provider_name, &provider_config_attrs)?;
+    let bucket_provider = factory.create_provider(None, &provider_config).await?;
 
     // First, try to empty the bucket (delete all objects and versions)
     println!();
@@ -2148,7 +2148,7 @@ mod tests {
         fn create_provider(
             &self,
             _binding: Option<&str>,
-            _attributes: &IndexMap<String, Value>,
+            _config: &carina_core::provider::ProviderReadyConfig,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
             let reads = self.reads.clone();
             Box::pin(async move {

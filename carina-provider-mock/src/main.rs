@@ -76,6 +76,13 @@ impl CarinaProvider for MockProcessProvider {
         Ok(())
     }
 
+    fn initialize(&mut self, attrs: &HashMap<String, Value>) -> Result<(), String> {
+        if attrs.contains_key("__mock_initialize_error__") {
+            return Err("intentional mock initialization failure".to_string());
+        }
+        Ok(())
+    }
+
     fn read(
         &self,
         id: &ResourceId,

@@ -921,7 +921,7 @@ mod tests {
         fn create_provider(
             &self,
             _binding: Option<&str>,
-            _attributes: &IndexMap<String, Value>,
+            _config: &carina_core::provider::ProviderReadyConfig,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
             Box::pin(async { unreachable!("formatting tests do not instantiate providers") })
         }

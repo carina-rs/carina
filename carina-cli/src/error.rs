@@ -271,6 +271,10 @@ pub enum AppError {
     #[error(transparent)]
     ProviderPreparation(#[from] ResourceProviderPreparationError),
 
+    /// Provider configuration failed its construction-boundary checks.
+    #[error(transparent)]
+    ProviderConfigPreparation(#[from] carina_core::executor::ProviderConfigPreparationError),
+
     /// State-backend bootstrap preparation failed before provider dispatch.
     #[error(transparent)]
     StateBucketPreparation(StateBucketPreparationError),

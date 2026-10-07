@@ -364,14 +364,27 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
     let mut wait_bindings = parsed.wait_bindings.clone();
     let mut provider_router = ProviderRouter::new();
     let preparation = {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        // Provider config validation may use `block_in_place` to bridge a
+        // synchronous factory hook to async WASM calls. Keep both preparation
+        // and normalizer creation inside a compatible runtime.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .build()
             .expect("failed to build tokio runtime for plan preprocessing");
         for factory in wiring.factories() {
             let attrs = indexmap::IndexMap::new();
+            let config = rt
+                .block_on(async {
+                    carina_core::executor::prepare_provider_ready_config(
+                        factory.as_ref(),
+                        factory.name(),
+                        &attrs,
+                    )
+                })
+                .expect("fixture provider config unexpectedly failed validation");
             provider_router.add_normalizer(
                 factory.name(),
-                rt.block_on(factory.create_normalizer(None, &attrs))
+                rt.block_on(factory.create_normalizer(None, &config))
                     .expect("fixture normalizer creation unexpectedly failed"),
             );
             provider_router.add_provider(
@@ -604,7 +617,7 @@ impl ProviderFactory for ResolvedValueConstraintFixtureFactory {
     fn create_provider(
         &self,
         _binding: Option<&str>,
-        _attributes: &indexmap::IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
@@ -650,7 +663,7 @@ impl ProviderFactory for BestFirstPairingFixtureFactory {
     fn create_provider(
         &self,
         _binding: Option<&str>,
-        _attributes: &indexmap::IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
@@ -711,7 +724,7 @@ impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
     fn create_provider(
         &self,
         _binding: Option<&str>,
-        _attributes: &indexmap::IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
@@ -763,7 +776,7 @@ impl ProviderFactory for MovedClaimsPrecedeHeuristicsFixtureFactory {
     fn create_provider(
         &self,
         _binding: Option<&str>,
-        _attributes: &indexmap::IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
@@ -813,7 +826,7 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
     fn create_provider(
         &self,
         _binding: Option<&str>,
-        _attributes: &indexmap::IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
@@ -871,7 +884,7 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
     fn create_provider(
         &self,
         _binding: Option<&str>,
-        _attributes: &indexmap::IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
@@ -924,7 +937,7 @@ impl ProviderFactory for Route53HostedZoneFixtureFactory {
     fn create_provider(
         &self,
         _binding: Option<&str>,
-        _attributes: &indexmap::IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }

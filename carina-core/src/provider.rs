@@ -21,7 +21,7 @@ use crate::wait::BindingPattern;
 use crate::wait::predicate::AttrPath;
 
 pub use crate::executor::provider_ready::{
-    ProviderReady, ProviderReadyDataSource, ProviderReadyResource,
+    ProviderReady, ProviderReadyConfig, ProviderReadyDataSource, ProviderReadyResource,
 };
 
 /// Contextual metadata attached to every [`ProviderError`] variant.
@@ -1392,11 +1392,13 @@ pub trait ProviderFactory: Send + Sync {
     /// Returns `Err(ProviderError)` when the provider rejects the
     /// supplied configuration (e.g., an `allowed_account_ids` mismatch
     /// detected during `init`). Callers MUST surface the inner message
-    /// verbatim — it is the user-facing error text.
+    /// verbatim — it is the user-facing error text. The sealed
+    /// [`ProviderReadyConfig`] proves that resolution, host-side schema
+    /// validation, and [`ProviderFactory::validate_config`] already ran.
     fn create_provider(
         &self,
         binding: Option<&str>,
-        attributes: &IndexMap<String, Value>,
+        config: &ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>>;
 
     /// Create a normalizer instance from configuration attributes.
@@ -1404,11 +1406,12 @@ pub trait ProviderFactory: Send + Sync {
     /// `binding` semantics match [`create_provider`]: `Some(name)` for
     /// a named instance, `None` for the kind's default. Returns an explicit
     /// [`NoopNormalizer`] by default. Provider and boundary failures must be
-    /// returned rather than replaced with a no-op implementation.
+    /// returned rather than replaced with a no-op implementation. The same
+    /// checked configuration witness is required as for provider creation.
     fn create_normalizer(
         &self,
         _binding: Option<&str>,
-        _attributes: &IndexMap<String, Value>,
+        _config: &ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -3112,7 +3115,7 @@ mod tests {
             fn create_provider(
                 &self,
                 _binding: Option<&str>,
-                _attrs: &IndexMap<String, Value>,
+                _config: &ProviderReadyConfig,
             ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
                 Box::pin(async {
                     Err(ProviderError::invalid_input(
@@ -3128,7 +3131,11 @@ mod tests {
         }
 
         let factory = FailingFactory;
-        let result = factory.create_provider(None, &IndexMap::new()).await;
+        let attributes = IndexMap::new();
+        let config =
+            crate::executor::prepare_provider_ready_config(&factory, factory.name(), &attributes)
+                .unwrap();
+        let result = factory.create_provider(None, &config).await;
         let err = match result {
             Ok(_) => panic!("create_provider must surface the init error"),
             Err(e) => e,
@@ -3192,7 +3199,7 @@ mod tests {
             fn create_provider(
                 &self,
                 binding: Option<&str>,
-                _attrs: &IndexMap<String, Value>,
+                _config: &ProviderReadyConfig,
             ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
                 self.calls
                     .lock()
@@ -3206,16 +3213,14 @@ mod tests {
         }
 
         let factory = BindingCapturingFactory::default();
+        let attributes = IndexMap::new();
+        let config =
+            crate::executor::prepare_provider_ready_config(&factory, factory.name(), &attributes)
+                .unwrap();
+        let _ = factory.create_provider(None, &config).await.unwrap();
+        let _ = factory.create_provider(Some("us"), &config).await.unwrap();
         let _ = factory
-            .create_provider(None, &IndexMap::new())
-            .await
-            .unwrap();
-        let _ = factory
-            .create_provider(Some("us"), &IndexMap::new())
-            .await
-            .unwrap();
-        let _ = factory
-            .create_provider(Some("tokyo"), &IndexMap::new())
+            .create_provider(Some("tokyo"), &config)
             .await
             .unwrap();
 
