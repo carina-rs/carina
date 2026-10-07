@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
-    CreateRequest, DeleteRequest, Provider, ProviderFactory, ReadRequest, SavedAttrs, UpdateRequest,
+    CreateRequest, DeleteRequest, Provider, ProviderFactory, ProviderReadyConfig, ReadRequest,
+    SavedAttrs, UpdateRequest,
 };
 use carina_core::resource::{
     ConcreteValue, DataSource, DeferredValue, Resource, ResourceId, State, Value,
@@ -92,6 +93,14 @@ async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile:
     (factory, cache)
 }
 
+fn ready_config(
+    factory: &dyn ProviderFactory,
+    attributes: &indexmap::IndexMap<String, Value>,
+) -> ProviderReadyConfig {
+    carina_core::executor::prepare_provider_ready_config(factory, factory.name(), attributes)
+        .expect("test provider config should pass preparation")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_mock_provider_factory() {
     let path = skip_if_no_wasm!();
@@ -110,7 +119,7 @@ async fn test_wasm_mock_provider_create_and_read() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &indexmap::IndexMap::new())
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
 
@@ -187,7 +196,7 @@ async fn test_wasm_guest_read_reports_nested_non_finite_float_as_provider_error(
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &indexmap::IndexMap::new())
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -211,7 +220,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &indexmap::IndexMap::new())
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
 
@@ -314,7 +323,7 @@ async fn test_wasm_mock_provider_normalizer() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &indexmap::IndexMap::new())
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -414,7 +423,7 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &indexmap::IndexMap::new())
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -524,7 +533,7 @@ async fn test_wasm_resolved_wire_key_collisions_are_normalized_one_at_a_time() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &indexmap::IndexMap::new())
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -621,7 +630,7 @@ async fn test_wasm_resolved_wire_key_collisions_are_normalized_one_at_a_time() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_wasm_create_normalizer_propagates_instance_initialization_failure() {
+async fn test_wasm_provider_config_preparation_propagates_boundary_encoding_failure() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let attributes = indexmap::IndexMap::from([(
@@ -631,13 +640,38 @@ async fn test_wasm_create_normalizer_propagates_instance_initialization_failure(
         )])),
     )]);
 
-    let result = factory
-        .create_normalizer(Some("bad-normalizer"), &attributes)
-        .await;
+    let result =
+        carina_core::executor::prepare_provider_ready_config(&factory, factory.name(), &attributes);
 
     assert!(
         result.is_err(),
-        "normalizer instance failures must not become NoopNormalizer"
+        "provider config encoding failures must stop construction"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wasm_create_normalizer_propagates_instance_initialization_failure() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let attributes = indexmap::IndexMap::from([(
+        "__mock_initialize_error__".to_string(),
+        Value::Concrete(ConcreteValue::String("normalizer init failed".to_string())),
+    )]);
+    let config = ready_config(&factory, &attributes);
+
+    let result = factory
+        .create_normalizer(Some("bad-normalizer"), &config)
+        .await;
+
+    let error = match result {
+        Ok(_) => panic!("normalizer instance failures must not become NoopNormalizer"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .message()
+            .contains("intentional mock initialization failure"),
+        "unexpected normalizer initialization error: {error}"
     );
 }
 
@@ -646,7 +680,7 @@ async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() 
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &indexmap::IndexMap::new())
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -734,11 +768,11 @@ async fn test_wasm_normalize_state_trap_is_an_error_and_does_not_mutate_state() 
     let (factory, _cache) = load_factory(&path).await;
     let attributes = indexmap::IndexMap::new();
     let provider = factory
-        .create_provider(None, &attributes)
+        .create_provider(None, &ready_config(&factory, &attributes))
         .await
         .expect("provider should initialize");
     let normalizer = factory
-        .create_normalizer(None, &attributes)
+        .create_normalizer(None, &ready_config(&factory, &attributes))
         .await
         .expect("normalizer should initialize");
     let id = ResourceId::with_provider_identity(
@@ -791,7 +825,7 @@ async fn test_wasm_crud_trap_poisons_instance_with_original_operation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &indexmap::IndexMap::new())
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
     let trap_id =
@@ -834,7 +868,7 @@ async fn test_wasm_provider_returned_error_does_not_poison_instance() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &indexmap::IndexMap::new())
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
     let error_id =
@@ -863,11 +897,11 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
     let (factory, _cache) = load_factory(&path).await;
     let attributes = indexmap::IndexMap::new();
     let provider = factory
-        .create_provider(None, &attributes)
+        .create_provider(None, &ready_config(&factory, &attributes))
         .await
         .expect("provider should initialize");
     let normalizer = factory
-        .create_normalizer(None, &attributes)
+        .create_normalizer(None, &ready_config(&factory, &attributes))
         .await
         .expect("normalizer should initialize");
 
@@ -1035,7 +1069,7 @@ async fn test_wasm_normalizer_rejects_nested_non_finite_float_without_mutating_r
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &indexmap::IndexMap::new())
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -1064,7 +1098,7 @@ async fn test_wasm_normalizer_rejects_non_finite_default_tag_without_mutating_re
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &indexmap::IndexMap::new())
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
     let mut resources = vec![Resource::with_provider(
@@ -1100,7 +1134,7 @@ async fn test_wasm_normalizer_skips_unresolved_default_tag_and_continues() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &indexmap::IndexMap::new())
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
     let mut resources = vec![Resource::with_provider(
@@ -1137,7 +1171,7 @@ async fn test_wasm_normalize_state_rejects_nested_non_finite_float_without_mutat
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &indexmap::IndexMap::new())
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "bad-state", None);
@@ -1169,7 +1203,7 @@ async fn test_wasm_hydrate_rejects_non_finite_saved_attribute_without_mutation()
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &indexmap::IndexMap::new())
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "bad-saved", None);
@@ -1199,7 +1233,7 @@ async fn test_wasm_normalize_desired_preserves_secret() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &indexmap::IndexMap::new())
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -1222,7 +1256,7 @@ async fn test_wasm_merge_default_tags_restores_secret_into_two_resources() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &indexmap::IndexMap::new())
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -1281,7 +1315,7 @@ async fn test_wasm_mock_provider_hydrate_read_state_preserves_host_ids() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &indexmap::IndexMap::new())
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -1343,7 +1377,7 @@ async fn test_wasm_mock_provider_merge_default_tags_dispatches_through_wit() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &indexmap::IndexMap::new())
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -1386,7 +1420,7 @@ async fn test_wasm_mock_provider_merge_default_tags_empty_short_circuits() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &indexmap::IndexMap::new())
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -1419,7 +1453,7 @@ async fn test_wasm_mock_provider_merge_default_tags_preserves_order() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &indexmap::IndexMap::new())
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -1471,7 +1505,7 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &indexmap::IndexMap::new())
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
 
@@ -1532,7 +1566,7 @@ async fn test_wasm_mock_provider_required_permissions_dispatches_through_wit() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &indexmap::IndexMap::new())
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "example", None);
@@ -1550,7 +1584,7 @@ async fn test_wasm_required_permissions_trap_is_not_an_empty_permission_set() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &indexmap::IndexMap::new())
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -1575,7 +1609,7 @@ async fn test_wasm_invalid_satisfier_hint_is_not_silently_dropped() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_provider(None, &indexmap::IndexMap::new())
+        .create_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(

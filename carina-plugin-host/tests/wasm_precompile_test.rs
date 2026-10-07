@@ -458,8 +458,12 @@ async fn test_precompiled_factory_creates_provider() {
         .expect("from_precompiled should succeed");
 
     // Verify the factory can actually create a working provider
+    let attributes = indexmap::IndexMap::new();
+    let config =
+        carina_core::executor::prepare_provider_ready_config(&factory, factory.name(), &attributes)
+            .expect("test provider config should pass preparation");
     let provider = factory
-        .create_provider(None, &indexmap::IndexMap::new())
+        .create_provider(None, &config)
         .await
         .expect("provider should init");
     assert_eq!(provider.name(), "mock");

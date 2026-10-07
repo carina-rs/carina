@@ -38,7 +38,7 @@ impl ProviderFactory for DuplicateTestFactory {
     fn create_provider(
         &self,
         _binding: Option<&str>,
-        _attributes: &IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async { panic!("validation tests never instantiate providers") })
     }

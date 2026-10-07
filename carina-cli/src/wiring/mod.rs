@@ -22,7 +22,10 @@ use carina_core::executor::normalized::{
     is_value_fully_concrete_for_expansion, restore_stripped_attributes,
     run_desired_normalization_stages, states_contain_unknown, strip_provider_boundary_attributes,
 };
-use carina_core::executor::{UnresolvedDataSourceInput, unresolved_data_source_inputs};
+use carina_core::executor::{
+    ProviderReadyConfig, UnresolvedDataSourceInput, prepare_provider_ready_config,
+    unresolved_data_source_inputs,
+};
 use carina_core::identifier::{
     self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
 };
@@ -1207,15 +1210,25 @@ pub fn normalize_state_with_ctx(
     ctx: &WiringContext,
     current_states: &mut HashMap<ResourceId, State>,
 ) -> Result<(), ProviderError> {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    // WASM factories bridge their synchronous validation hook to async host
+    // calls with `block_in_place` plus `Handle::current`. Preparation must
+    // therefore be polled inside a multi-thread runtime, not merely happen
+    // before a later async factory call.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .build()
         .expect("failed to build tokio runtime for normalize_state");
     let mut router = ProviderRouter::new();
     for factory in ctx.factories() {
         let attrs = indexmap::IndexMap::new();
+        let config = rt
+            .block_on(async {
+                prepare_provider_ready_config(factory.as_ref(), factory.name(), &attrs)
+            })
+            .map_err(|error| ProviderError::internal(error.to_string()).with_cause(error))?;
         router.add_normalizer(
             factory.name(),
-            rt.block_on(factory.create_normalizer(None, &attrs))?,
+            rt.block_on(factory.create_normalizer(None, &config))?,
         );
     }
     // Outermost runtime: not nested.
@@ -1671,7 +1684,12 @@ async fn instantiate_provider_into_router(
     }
 
     if let Some(factory) = provider_mod::find_factory(ctx.factories(), &provider_config.name) {
-        let region = factory.extract_region(&provider_config.attributes);
+        let config = prepare_provider_ready_config(
+            factory,
+            &provider_config.name,
+            &provider_config.attributes,
+        )?;
+        let region = factory.extract_region(config.attributes());
         // Reaching this branch implies `provider_config.source` is None:
         // the early-return above handles `binding.is_none() && source.is_some()`,
         // and the parser rejects `source` on named instances. So the only
@@ -1688,13 +1706,13 @@ async fn instantiate_provider_into_router(
             .cyan()
         );
         let provider = factory
-            .create_provider(binding.as_deref(), &provider_config.attributes)
+            .create_provider(binding.as_deref(), &config)
             .await
             .map_err(|e| e.for_provider(provider_config.name.clone()))?;
         router.add_normalizer(
             provider_config.name.clone(),
             factory
-                .create_normalizer(binding.as_deref(), &provider_config.attributes)
+                .create_normalizer(binding.as_deref(), &config)
                 .await
                 .map_err(|e| e.for_provider(provider_config.name.clone()))?,
         );
@@ -1733,8 +1751,8 @@ async fn try_add_source_provider(
     base_dir: &Path,
 ) -> Result<(), AppError> {
     match load_source_provider(source, config, base_dir).await {
-        Ok((factory, provider, name)) => {
-            let region = factory.extract_region(&config.attributes);
+        Ok((factory, provider, name, ready_config)) => {
+            let region = factory.extract_region(ready_config.attributes());
             println!(
                 "{}",
                 format_provider_using_line(&name, &region, None, Some(source)).cyan()
@@ -1743,7 +1761,7 @@ async fn try_add_source_provider(
             router.add_normalizer(
                 config.name.clone(),
                 factory
-                    .create_normalizer(None, &config.attributes)
+                    .create_normalizer(None, &ready_config)
                     .await
                     .map_err(|e| AppError::Provider(e.for_provider(config.name.clone())))?,
             );
@@ -1758,6 +1776,7 @@ async fn try_add_source_provider(
             // structured block with the right provider.
             Err(AppError::Provider(e.for_provider(config.name.clone())))
         }
+        Err(LoadSourceError::Config(error)) => Err(AppError::from(error)),
         Err(LoadSourceError::Wasm(error)) => {
             // Terminal display boundary for the structured host error plus
             // resolver provenance. The underlying error remains typed until
@@ -1781,6 +1800,8 @@ async fn try_add_source_provider(
 /// "Failed to load provider '...': ..." wrapper that obscures the
 /// real message (#2407).
 enum LoadSourceError {
+    /// Resolved provider configuration failed the construction gate.
+    Config(carina_core::executor::ProviderConfigPreparationError),
     /// The provider's `init` step rejected the configuration (e.g.,
     /// `allowed_account_ids` mismatch). Message is user-facing.
     Provider(ProviderError),
@@ -1801,7 +1822,15 @@ async fn load_source_provider(
     source: &str,
     config: &ProviderConfig,
     base_dir: &Path,
-) -> Result<(Box<dyn ProviderFactory>, Box<dyn Provider>, String), LoadSourceError> {
+) -> Result<
+    (
+        Box<dyn ProviderFactory>,
+        Box<dyn Provider>,
+        String,
+        ProviderReadyConfig,
+    ),
+    LoadSourceError,
+> {
     let installed = if source.starts_with("file://") || source.starts_with("github.com/") {
         carina_provider_resolver::find_installed_provider(base_dir, config)
             .map_err(|e| LoadSourceError::Other(format!("Provider '{}' {}", config.name, e)))?
@@ -1825,15 +1854,15 @@ async fn load_source_provider(
     );
     let name = factory.name().to_string();
 
-    factory
-        .validate_config(&config.attributes)
-        .map_err(|e| LoadSourceError::Other(format!("Config validation failed: {e}")))?;
+    let ready_config =
+        prepare_provider_ready_config(factory.as_ref(), &config.name, &config.attributes)
+            .map_err(LoadSourceError::Config)?;
 
     let provider = factory
-        .create_provider(None, &config.attributes)
+        .create_provider(None, &ready_config)
         .await
         .map_err(LoadSourceError::Provider)?;
-    Ok((factory, provider, name))
+    Ok((factory, provider, name, ready_config))
 }
 
 /// Returns the wired router **and** the `WiringContext` it was built

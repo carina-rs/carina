@@ -700,7 +700,7 @@ impl ProviderFactory for AliasFactory {
     fn create_provider(
         &self,
         _binding: Option<&str>,
-        _attributes: &indexmap::IndexMap<String, Value>,
+        _config: &crate::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn crate::provider::Provider>>> {
         unreachable!("test factory does not create providers")
     }

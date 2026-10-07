@@ -85,7 +85,7 @@ impl ProviderFactory for AwsStub {
     fn create_provider(
         &self,
         _b: Option<&str>,
-        _a: &IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async {
             Ok(Box::new(NoopProvider {
@@ -96,7 +96,7 @@ impl ProviderFactory for AwsStub {
     fn create_normalizer(
         &self,
         _b: Option<&str>,
-        _a: &IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }

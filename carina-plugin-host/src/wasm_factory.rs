@@ -26,8 +26,8 @@ use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
     BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, Provider, ProviderError,
-    ProviderFactory, ProviderNormalizer, ProviderResult, ReadRequest, SavedAttrs, UpdateOutcome,
-    UpdateRequest,
+    ProviderFactory, ProviderNormalizer, ProviderReadyConfig, ProviderResult, ReadRequest,
+    SavedAttrs, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resource::{Resource, ResourceId, ResourceIdentityState, State, Value};
 use carina_core::schema::{CompletionValue, ResourceSchema, TypeIdentity};
@@ -2916,9 +2916,9 @@ impl ProviderFactory for WasmProviderFactory {
     fn create_provider(
         &self,
         binding: Option<&str>,
-        attributes: &IndexMap<String, Value>,
+        config: &ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
-        let attrs = attributes.clone();
+        let attrs = config.attributes().clone();
         let binding = binding.map(|s| s.to_string());
         Box::pin(async move {
             // Provider init rejections still surface their user-actionable
@@ -2940,9 +2940,9 @@ impl ProviderFactory for WasmProviderFactory {
     fn create_normalizer(
         &self,
         binding: Option<&str>,
-        attributes: &IndexMap<String, Value>,
+        config: &ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
-        let attrs = attributes.clone();
+        let attrs = config.attributes().clone();
         let binding = binding.map(|s| s.to_string());
         Box::pin(async move {
             let instance = self

@@ -187,7 +187,7 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
         fn create_provider(
             &self,
             _binding: Option<&str>,
-            _attributes: &IndexMap<String, Value>,
+            _config: &carina_core::provider::ProviderReadyConfig,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
             Box::pin(async { Ok(Box::new(MockProvider::new()) as Box<dyn Provider>) })
         }
@@ -195,7 +195,7 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
         fn create_normalizer(
             &self,
             _binding: Option<&str>,
-            _attributes: &IndexMap<String, Value>,
+            _config: &carina_core::provider::ProviderReadyConfig,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
             Box::pin(async { Err(ProviderError::internal("normalizer initialization failed")) })
         }
@@ -229,6 +229,152 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
     assert_eq!(error.detail().provider_name.as_deref(), Some("failing"));
 }
 
+struct ProviderConfigConstraintFactory {
+    creates: Arc<AtomicUsize>,
+}
+
+impl ProviderFactory for ProviderConfigConstraintFactory {
+    fn name(&self) -> &str {
+        "test"
+    }
+
+    fn display_name(&self) -> &str {
+        "provider config constraint test provider"
+    }
+
+    fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+        HashMap::from([(
+            "role_arn".to_string(),
+            AttributeType::refined_string(
+                None,
+                Some(r"^arn:aws:iam::[0-9]{12}:role/.+$".to_string()),
+                None,
+                None,
+            ),
+        )])
+    }
+
+    fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+        "local".to_string()
+    }
+
+    fn create_provider(
+        &self,
+        _binding: Option<&str>,
+        _config: &carina_core::provider::ProviderReadyConfig,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+        self.creates.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(Box::new(MockProvider::new()) as Box<dyn Provider>) })
+    }
+
+    fn schemas(&self) -> Vec<ResourceSchema> {
+        Vec::new()
+    }
+}
+
+fn resolved_invalid_provider_config() -> carina_core::parser::InferredFile {
+    let mut attributes = IndexMap::new();
+    attributes.insert(
+        "role_arn".to_string(),
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: carina_core::resource::AccessPath::new("net", "role_arn"),
+        }),
+    );
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.providers.push(ProviderConfig {
+        name: "test".to_string(),
+        attributes,
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    });
+    let remote = HashMap::from([(
+        "net".to_string(),
+        HashMap::from([(
+            "role_arn".to_string(),
+            Value::Concrete(ConcreteValue::String("not-an-arn".to_string())),
+        )]),
+    )]);
+    carina_core::parser::resolve_provider_attributes_with_remote(
+        &mut parsed,
+        &remote,
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("upstream provider attribute must resolve");
+    parsed
+}
+
+fn assert_provider_config_constraint_error(error: &AppError) {
+    let message = error.to_string();
+    assert!(message.contains("provider test"), "{message}");
+    assert!(message.contains("role_arn"), "{message}");
+    assert!(
+        message.contains(r"^arn:aws:iam::[0-9]{12}:role/.+$"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creation() {
+    let parsed = resolved_invalid_provider_config();
+    let creates = Arc::new(AtomicUsize::new(0));
+    let ctx = WiringContext::new(
+        vec![Box::new(ProviderConfigConstraintFactory {
+            creates: Arc::clone(&creates),
+        })],
+        &parsed.providers,
+    );
+    let temp = tempfile::tempdir().unwrap();
+
+    let result = create_plan_from_parsed_with_upstream_with_ctx(
+        &ctx,
+        &parsed,
+        &[],
+        &None,
+        false,
+        &HashMap::new(),
+        &StateBlockClaims::default(),
+        &ResolvedStateBlockTargets::default(),
+        temp.path(),
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("resolved provider config must be rejected during plan"),
+        Err(error) => error,
+    };
+
+    assert_provider_config_constraint_error(&error);
+    assert_eq!(creates.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn apply_provider_construction_revalidates_resolved_upstream_config() {
+    let parsed = resolved_invalid_provider_config();
+    let creates = Arc::new(AtomicUsize::new(0));
+    let ctx = WiringContext::new(
+        vec![Box::new(ProviderConfigConstraintFactory {
+            creates: Arc::clone(&creates),
+        })],
+        &parsed.providers,
+    );
+    let temp = tempfile::tempdir().unwrap();
+
+    let error = match get_provider_with_ctx(&ctx, &parsed, temp.path()).await {
+        Ok(_) => panic!("resolved provider config must be rejected before apply construction"),
+        Err(error) => error,
+    };
+
+    assert_provider_config_constraint_error(&error);
+    assert_eq!(creates.load(Ordering::SeqCst), 0);
+}
+
 struct CascadeAwsccFactory;
 
 impl ProviderFactory for CascadeAwsccFactory {
@@ -255,7 +401,7 @@ impl ProviderFactory for CascadeAwsccFactory {
     fn create_provider(
         &self,
         _binding: Option<&str>,
-        _attributes: &IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
         Box::pin(async { Ok(Box::new(CascadeCreateProvider::default()) as Box<dyn Provider>) })
     }
@@ -757,6 +903,62 @@ fn test_normalize_state_prevents_false_enum_diff() {
     );
 }
 
+#[test]
+fn normalize_state_with_ctx_prepares_config_inside_multithread_runtime() {
+    struct BlockInPlaceValidationFactory {
+        validated: Arc<AtomicBool>,
+    }
+
+    impl ProviderFactory for BlockInPlaceValidationFactory {
+        fn name(&self) -> &str {
+            "block-in-place"
+        }
+
+        fn display_name(&self) -> &str {
+            "block-in-place validation test provider"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+            let _handle = tokio::task::block_in_place(|| tokio::runtime::Handle::current());
+            self.validated.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "test-region".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _config: &carina_core::provider::ProviderReadyConfig,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            Box::pin(async { unreachable!("state normalization does not create providers") })
+        }
+
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            Vec::new()
+        }
+    }
+
+    let validated = Arc::new(AtomicBool::new(false));
+    let ctx = WiringContext::new(
+        vec![Box::new(BlockInPlaceValidationFactory {
+            validated: Arc::clone(&validated),
+        })],
+        &[],
+    );
+
+    normalize_state_with_ctx(&ctx, &mut HashMap::new())
+        .expect("block-in-place provider validation should run inside a compatible runtime");
+
+    assert!(validated.load(Ordering::SeqCst));
+}
+
 /// Verify that merge_default_tags prevents false diffs when default_tags are
 /// configured in the provider block.
 ///
@@ -860,9 +1062,15 @@ fn test_merge_default_tags_prevents_false_diff() {
     let mut router = ProviderRouter::new();
     for factory in ctx.factories() {
         let attrs = IndexMap::new();
+        let config = carina_core::executor::prepare_provider_ready_config(
+            factory.as_ref(),
+            factory.name(),
+            &attrs,
+        )
+        .expect("test provider config should pass preparation");
         router.add_normalizer(
             factory.name(),
-            rt.block_on(factory.create_normalizer(None, &attrs))
+            rt.block_on(factory.create_normalizer(None, &config))
                 .expect("test normalizer should be created"),
         );
     }
@@ -1821,7 +2029,7 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
     fn create_provider(
         &self,
         _binding: Option<&str>,
-        _attributes: &IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> carina_core::provider::BoxFuture<
         '_,
         carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
@@ -1834,7 +2042,7 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
     fn create_normalizer(
         &self,
         _binding: Option<&str>,
-        _attributes: &IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> carina_core::provider::BoxFuture<
         '_,
         carina_core::provider::ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>,
@@ -3187,7 +3395,7 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
     fn create_provider(
         &self,
         _binding: Option<&str>,
-        _attributes: &IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> carina_core::provider::BoxFuture<
         '_,
         carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
@@ -3200,7 +3408,7 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
     fn create_normalizer(
         &self,
         _binding: Option<&str>,
-        _attributes: &IndexMap<String, Value>,
+        _config: &carina_core::provider::ProviderReadyConfig,
     ) -> carina_core::provider::BoxFuture<
         '_,
         carina_core::provider::ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>,
@@ -5128,14 +5336,14 @@ mod wait_until_enum_alias {
         fn create_provider(
             &self,
             _b: Option<&str>,
-            _a: &IndexMap<String, Value>,
+            _config: &carina_core::provider::ProviderReadyConfig,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
             Box::pin(async { Ok(Box::new(StubProvider) as Box<dyn Provider>) })
         }
         fn create_normalizer(
             &self,
             _b: Option<&str>,
-            _a: &IndexMap<String, Value>,
+            _config: &carina_core::provider::ProviderReadyConfig,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
             Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
         }
@@ -5732,8 +5940,8 @@ mod resolved_value_constraint_gate {
         ProviderNormalizer, ProviderResult, ReadRequest, UpdateOutcome, UpdateRequest, ready_noop,
     };
     use carina_core::resource::{
-        AccessPath, Composition, CompositionArgument, DataSource, ModuleConstraintId,
-        PendingModuleConstraint, Signature, UnknownReason,
+        AccessPath, Composition, CompositionArgument, DataSource, InterpolationPart,
+        ModuleConstraintId, PendingModuleConstraint, Signature, UnknownReason,
     };
     use carina_core::schema::{TypeError, TypeIdentity};
 
@@ -5786,7 +5994,7 @@ mod resolved_value_constraint_gate {
         fn create_provider(
             &self,
             _binding: Option<&str>,
-            _attributes: &IndexMap<String, Value>,
+            _config: &carina_core::provider::ProviderReadyConfig,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
             Box::pin(async { Ok(Box::new(MockProvider::new()) as Box<dyn Provider>) })
         }
@@ -5794,7 +6002,7 @@ mod resolved_value_constraint_gate {
         fn create_normalizer(
             &self,
             _binding: Option<&str>,
-            _attributes: &IndexMap<String, Value>,
+            _config: &carina_core::provider::ProviderReadyConfig,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
             Box::pin(async {
                 Ok(Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>)
@@ -5859,7 +6067,7 @@ mod resolved_value_constraint_gate {
         fn create_provider(
             &self,
             _binding: Option<&str>,
-            _attributes: &IndexMap<String, Value>,
+            _config: &carina_core::provider::ProviderReadyConfig,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
             let reads = self.reads.clone();
             Box::pin(async move {
@@ -6321,6 +6529,110 @@ mod resolved_value_constraint_gate {
             composition.signature.arguments["value"].value(),
             &source,
             "plan evaluation must not replace the stored source expression"
+        );
+    }
+
+    /// Regression test for carina#3448: plan-time upstream substitutions honor sink refinements.
+    #[tokio::test]
+    async fn upstream_export_substituted_at_plan_is_revalidated_against_sink_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let network_dir = temp.path().join("network");
+        let consumer_dir = temp.path().join("consumer");
+        std::fs::create_dir_all(&network_dir).unwrap();
+        std::fs::create_dir_all(&consumer_dir).unwrap();
+        std::fs::write(
+            network_dir.join("main.crn"),
+            r#"backend local { path = "carina.state.json" }
+exports { team_prefix: String = "x" }"#,
+        )
+        .unwrap();
+
+        let mut upstream_state = StateFile::new();
+        upstream_state.exports.insert(
+            "team_prefix".to_string(),
+            serde_json::json!("Tokyo_Platform"),
+        );
+        std::fs::write(
+            network_dir.join("carina.state.json"),
+            serde_json::to_string(&upstream_state).unwrap(),
+        )
+        .unwrap();
+
+        let provider_config = ProviderConfig {
+            name: "test".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        };
+        let target = Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new("net", "team_prefix"),
+            })),
+            InterpolationPart::Literal("-logs".to_string()),
+        ]));
+        let consumer = Resource::with_provider("test", "consumer.Pattern", "sink", None)
+            .with_binding("sink")
+            .with_attribute("target", target);
+        let unresolved_resources = vec![consumer.clone()];
+        let mut parsed = carina_core::parser::InferredFile::default();
+        parsed.providers.push(provider_config);
+        parsed.resources.push(consumer); // allow: direct — fixture test inspection
+        parsed
+            .upstream_states
+            .push(carina_core::parser::UpstreamState {
+                binding: "net".to_string(),
+                source: std::path::PathBuf::from("../network"),
+            });
+
+        let mut cycle_guard = crate::commands::plan::seed_cycle_guard(&consumer_dir);
+        let remote_bindings = crate::commands::plan::load_upstream_states(
+            &parsed.upstream_states,
+            &consumer_dir,
+            &carina_core::parser::ProviderContext::default(),
+            &mut cycle_guard,
+            crate::commands::plan::UpstreamMissingStatePolicy::Lenient,
+        )
+        .await
+        .expect("upstream state fixture must load");
+        let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)], &[]);
+
+        let plan = create_plan_from_parsed_with_upstream_with_ctx(
+            &ctx,
+            &parsed,
+            &unresolved_resources,
+            &None,
+            true,
+            &remote_bindings,
+            &StateBlockClaims::default(),
+            &ResolvedStateBlockTargets::default(),
+            &consumer_dir,
+        )
+        .await
+        .expect("resolved-value violations must be represented by the plan");
+
+        assert_eq!(plan.plan.errors().len(), 1, "{:#?}", plan.plan.errors());
+        match &plan.plan.errors()[0].kind {
+            PlanErrorKind::ResolvedValueConstraint {
+                attributes,
+                message,
+                origins,
+                ..
+            } => {
+                assert_eq!(attributes, &["target"]);
+                assert_eq!(origins, &["net.team_prefix"]);
+                assert!(message.contains("Tokyo_Platform-logs"), "{message}");
+                assert!(message.contains("required pattern"), "{message}");
+            }
+            other => panic!("unexpected plan error: {other:?}"),
+        }
+        assert!(
+            plan.plan.effects().is_empty(),
+            "constraint failures must not produce effects: {:#?}",
+            plan.plan.effects()
         );
     }
 

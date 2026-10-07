@@ -1126,7 +1126,7 @@ exports {
         fn create_provider(
             &self,
             _binding: Option<&str>,
-            _attributes: &IndexMap<String, Value>,
+            _config: &carina_core::provider::ProviderReadyConfig,
         ) -> carina_core::provider::BoxFuture<
             '_,
             carina_core::provider::ProviderResult<Box<dyn carina_core::provider::Provider>>,
@@ -1140,7 +1140,7 @@ exports {
         fn create_normalizer(
             &self,
             _binding: Option<&str>,
-            _attributes: &IndexMap<String, Value>,
+            _config: &carina_core::provider::ProviderReadyConfig,
         ) -> carina_core::provider::BoxFuture<
             '_,
             carina_core::provider::ProviderResult<

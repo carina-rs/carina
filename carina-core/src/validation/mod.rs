@@ -1700,21 +1700,12 @@ pub fn validate_provider_config<E>(
         let Some(factory) = factories.iter().find(|f| f.name() == provider.name) else {
             continue;
         };
-        // Host-side type-level validation. Routed through
-        // `Schema::validate_attr` with an empty `defs` because provider
-        // configs are flat (no cyclic CFN-style Refs today); if a
-        // future provider config grows a `Ref`, the empty-defs path
-        // returns a clean `ValidationFailed` instead of tripping the
-        // standalone validator sentinel (carina#3345).
-        let attr_types = factory.provider_config_attribute_types();
-        let schema_view = crate::schema::Schema::with_defs(std::collections::BTreeMap::new());
-        for (attr_name, value) in &provider.attributes {
-            if let Some(attr_type) = attr_types.get(attr_name) {
-                schema_view
-                    .validate_attr(attr_type, value)
-                    .map_err(|e| format!("provider {}: {}: {}", provider.name, attr_name, e))?;
-            }
-        }
+        crate::executor::provider_ready::validate_provider_config_attributes(
+            factory.as_ref(),
+            &provider.name,
+            &provider.attributes,
+        )
+        .map_err(|error| error.to_string())?;
         // Plugin-side validation. Drop attributes containing unresolved
         // refs before crossing the WASM boundary; they will be checked
         // again at plan/apply time post-resolution.
