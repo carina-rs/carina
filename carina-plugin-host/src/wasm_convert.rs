@@ -27,8 +27,7 @@ use carina_core::wait::predicate::{AttrPath as CoreAttrPath, AttrPathError};
 
 use carina_provider_protocol::types as proto;
 
-use crate::wasm_bindings::carina::provider::types as wit;
-use crate::wasm_bindings::exports::carina::provider::provider as wit_provider;
+use crate::wasm_factory::version_checked_bindings::{WitPlanOp, wit_types as wit};
 
 /// Error raised when provider-emitted schema wire data cannot be decoded.
 ///
@@ -248,7 +247,7 @@ impl std::error::Error for WasmValueDecodeError {
 /// previous `format!("{v:?}")` debug-format fallback would send
 /// `"Secret(String(\"…\"))"` literally to the provider — a contract leak
 /// equivalent to the pre-#2387 `ResourceRef` debug-string.
-pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError> {
+pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError> {
     match v {
         CoreValue::Concrete(ConcreteValue::String(s)) => {
             // Enum identifiers lower to the WIT boundary as plain
@@ -342,7 +341,7 @@ pub fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError
 }
 
 /// Convert a WIT Value to a core Value.
-pub fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDecodeError> {
+pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDecodeError> {
     match v {
         wit::Value::StrVal(s) => Ok(CoreValue::Concrete(ConcreteValue::String(s.clone()))),
         wit::Value::IntVal(i) => Ok(CoreValue::Concrete(ConcreteValue::Int(*i))),
@@ -421,16 +420,17 @@ pub fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDecodeErr
     }
 }
 
-pub fn core_to_wit_plan_op(op: CorePlanOp) -> wit_provider::PlanOp {
+pub(crate) fn core_to_wit_plan_op(op: CorePlanOp) -> WitPlanOp {
     match op {
-        CorePlanOp::Create => wit_provider::PlanOp::Create,
-        CorePlanOp::Read => wit_provider::PlanOp::Read,
-        CorePlanOp::Update => wit_provider::PlanOp::Update,
-        CorePlanOp::Delete => wit_provider::PlanOp::Delete,
+        CorePlanOp::Create => WitPlanOp::Create,
+        CorePlanOp::Read => WitPlanOp::Read,
+        CorePlanOp::Update => WitPlanOp::Update,
+        CorePlanOp::Delete => WitPlanOp::Delete,
     }
 }
 
-pub fn core_to_wit_binding_pattern(p: &CoreBindingPattern) -> wit::BindingPattern {
+#[cfg(test)]
+pub(crate) fn core_to_wit_binding_pattern(p: &CoreBindingPattern) -> wit::BindingPattern {
     match p {
         CoreBindingPattern::Exact(name) => wit::BindingPattern::Exact(name.clone()),
         CoreBindingPattern::ForLoopChildren { base } => {
@@ -448,7 +448,7 @@ pub fn core_to_wit_binding_pattern(p: &CoreBindingPattern) -> wit::BindingPatter
     }
 }
 
-pub fn wit_to_core_binding_pattern(
+pub(crate) fn wit_to_core_binding_pattern(
     p: wit::BindingPattern,
 ) -> Result<CoreBindingPattern, AttrPathError> {
     let pattern = match p {
@@ -593,7 +593,9 @@ fn json_to_core_value(
 
 // -- Value map helpers --
 
-pub fn core_to_wit_value_map<'a, M>(map: M) -> Result<Vec<(String, wit::Value)>, SerializationError>
+pub(crate) fn core_to_wit_value_map<'a, M>(
+    map: M,
+) -> Result<Vec<(String, wit::Value)>, SerializationError>
 where
     M: IntoIterator<Item = (&'a String, &'a CoreValue)>,
 {
@@ -602,7 +604,7 @@ where
         .collect()
 }
 
-pub fn wit_to_core_value_map(
+pub(crate) fn wit_to_core_value_map(
     entries: &[(String, wit::Value)],
 ) -> Result<HashMap<String, CoreValue>, WasmValueDecodeError> {
     entries
@@ -637,7 +639,7 @@ pub(crate) fn resource_id_wire_key(id: &CoreResourceId) -> String {
     }
 }
 
-pub fn core_to_wit_resource_id(id: &CoreResourceId) -> wit::ResourceId {
+pub(crate) fn core_to_wit_resource_id(id: &CoreResourceId) -> wit::ResourceId {
     let identity = match id.identity_state() {
         ResourceIdentityState::Pending(_) => String::new(),
         ResourceIdentityState::Resolved(identity) => identity.as_str().to_string(),
@@ -649,7 +651,7 @@ pub fn core_to_wit_resource_id(id: &CoreResourceId) -> wit::ResourceId {
     }
 }
 
-pub fn wit_to_core_resource_id(id: &wit::ResourceId) -> CoreResourceId {
+pub(crate) fn wit_to_core_resource_id(id: &wit::ResourceId) -> CoreResourceId {
     // The WIT `resource-id` record has no `provider-instance` field
     // yet, so this boundary cannot round-trip a named instance.
     // Tracked as a follow-up to extend the WIT contract; until then,
@@ -672,7 +674,7 @@ pub fn wit_to_core_resource_id(id: &wit::ResourceId) -> CoreResourceId {
 
 // -- State --
 
-pub fn core_to_wit_state(state: &CoreState) -> Result<wit::State, SerializationError> {
+pub(crate) fn core_to_wit_state(state: &CoreState) -> Result<wit::State, SerializationError> {
     Ok(wit::State {
         identifier: state.identifier.clone(),
         attributes: core_to_wit_value_map(&state.attributes)?,
@@ -680,7 +682,7 @@ pub fn core_to_wit_state(state: &CoreState) -> Result<wit::State, SerializationE
     })
 }
 
-pub fn wit_to_core_state(
+pub(crate) fn wit_to_core_state(
     state: &wit::State,
     id: &CoreResourceId,
 ) -> Result<CoreState, WasmValueDecodeError> {
@@ -695,7 +697,7 @@ pub fn wit_to_core_state(
     Ok(core_state)
 }
 
-pub fn wit_to_core_create_outcome(
+pub(crate) fn wit_to_core_create_outcome(
     outcome: wit::CreateOutcome,
     id: &CoreResourceId,
 ) -> Result<CoreCreateOutcome, WasmValueDecodeError> {
@@ -711,7 +713,7 @@ pub fn wit_to_core_create_outcome(
     }
 }
 
-pub fn wit_to_core_update_outcome(
+pub(crate) fn wit_to_core_update_outcome(
     outcome: wit::UpdateOutcome,
     id: &CoreResourceId,
 ) -> Result<CoreUpdateOutcome, WasmValueDecodeError> {
@@ -729,7 +731,7 @@ pub fn wit_to_core_update_outcome(
 
 // -- Resource --
 
-pub fn core_to_wit_resource(
+pub(crate) fn core_to_wit_resource(
     resource: &CoreResource,
 ) -> Result<wit::ResourceDef, SerializationError> {
     Ok(wit::ResourceDef {
@@ -742,7 +744,7 @@ pub fn core_to_wit_resource(
 /// plugin boundary. The WIT contract has a single `ResourceDef` record,
 /// so a data source maps to the same `{ id, attributes }` shape as a
 /// managed resource (carina#3181).
-pub fn core_data_source_to_wit_resource(
+pub(crate) fn core_data_source_to_wit_resource(
     data_source: &CoreDataSource,
 ) -> Result<wit::ResourceDef, SerializationError> {
     Ok(wit::ResourceDef {
@@ -753,7 +755,8 @@ pub fn core_data_source_to_wit_resource(
     })
 }
 
-pub fn wit_to_core_resource(
+#[cfg(test)]
+pub(crate) fn wit_to_core_resource(
     resource: &wit::ResourceDef,
 ) -> Result<CoreResource, WasmValueDecodeError> {
     let id = wit_to_core_resource_id(&resource.id);
@@ -769,7 +772,8 @@ pub fn wit_to_core_resource(
 /// Convert a host-side core [`CoreProviderError`] into the WIT
 /// `provider-error` variant. The boxed `cause` chain is flattened to a
 /// string because WIT cannot represent `dyn std::error::Error`.
-pub fn core_to_wit_provider_error(err: &CoreProviderError) -> wit::ProviderError {
+#[cfg(test)]
+pub(crate) fn core_to_wit_provider_error(err: &CoreProviderError) -> wit::ProviderError {
     let detail = err.detail();
     let wit_detail = wit::ErrorDetail {
         message: detail.message.clone(),
@@ -797,7 +801,7 @@ pub fn core_to_wit_provider_error(err: &CoreProviderError) -> wit::ProviderError
 /// [`CoreProviderError`]. The variant is preserved exactly; the
 /// `cause` string is rehydrated as an `Option<String>` inside
 /// [`CoreErrorDetail`].
-pub fn wit_to_core_provider_error(err: wit::ProviderError) -> CoreProviderError {
+pub(crate) fn wit_to_core_provider_error(err: wit::ProviderError) -> CoreProviderError {
     let (detail, ctor): (
         wit::ErrorDetail,
         fn(Box<CoreErrorDetail>) -> CoreProviderError,
@@ -845,7 +849,7 @@ impl std::error::Error for FlattenedCause {}
 
 /// Build a [`wit::UpdateRequest`] from the host-side core
 /// [`CoreUpdateRequest`]. Patch op order is preserved.
-pub fn core_to_wit_update_request(
+pub(crate) fn core_to_wit_update_request(
     request: &CoreUpdateRequest,
 ) -> Result<wit::UpdateRequest, SerializationError> {
     Ok(wit::UpdateRequest {
@@ -856,7 +860,7 @@ pub fn core_to_wit_update_request(
 
 /// Build a [`wit::CreateRequest`] from the host-side core
 /// [`CoreCreateRequest`].
-pub fn core_to_wit_create_request(
+pub(crate) fn core_to_wit_create_request(
     request: &CoreCreateRequest,
 ) -> Result<wit::CreateRequest, SerializationError> {
     Ok(wit::CreateRequest {
@@ -869,20 +873,20 @@ pub fn core_to_wit_create_request(
 /// `ReadRequest` carries no operationally meaningful fields; the
 /// `reserved` placeholder exists because the wasm component model
 /// rejects records with zero fields.
-pub fn core_to_wit_read_request(_request: &CoreReadRequest) -> wit::ReadRequest {
+pub(crate) fn core_to_wit_read_request(_request: &CoreReadRequest) -> wit::ReadRequest {
     wit::ReadRequest { reserved: false }
 }
 
 /// Build a [`wit::DeleteRequest`] from the host-side core
 /// [`CoreDeleteRequest`].
-pub fn core_to_wit_delete_request(request: &CoreDeleteRequest) -> wit::DeleteRequest {
+pub(crate) fn core_to_wit_delete_request(request: &CoreDeleteRequest) -> wit::DeleteRequest {
     wit::DeleteRequest {
         directives: core_to_wit_directives(&request.directives),
     }
 }
 
 /// Convert a [`Directives`] to a [`wit::Directives`].
-pub fn core_to_wit_directives(directives: &Directives) -> wit::Directives {
+pub(crate) fn core_to_wit_directives(directives: &Directives) -> wit::Directives {
     // `depends_on` and `provider_instance` are host-only orchestration metadata;
     // the WIT Directives record intentionally carries only these three flags.
     wit::Directives {
@@ -894,7 +898,7 @@ pub fn core_to_wit_directives(directives: &Directives) -> wit::Directives {
 
 /// Convert a host-side [`CoreUpdatePatch`] to a [`wit::UpdatePatch`].
 /// Op order is preserved.
-pub fn core_to_wit_update_patch(
+pub(crate) fn core_to_wit_update_patch(
     patch: &CoreUpdatePatch,
 ) -> Result<wit::UpdatePatch, SerializationError> {
     let ops = patch
@@ -906,7 +910,7 @@ pub fn core_to_wit_update_patch(
 }
 
 /// Convert a host-side [`CorePatchOp`] to a [`wit::PatchOp`].
-pub fn core_to_wit_patch_op(op: &CorePatchOp) -> Result<wit::PatchOp, SerializationError> {
+pub(crate) fn core_to_wit_patch_op(op: &CorePatchOp) -> Result<wit::PatchOp, SerializationError> {
     let value = match &op.value {
         Some(v) => Some(core_to_wit_value(v)?),
         None => None,
@@ -923,7 +927,8 @@ pub fn core_to_wit_patch_op(op: &CorePatchOp) -> Result<wit::PatchOp, Serializat
 }
 
 /// Convert a [`wit::PatchOp`] to a host-side [`CorePatchOp`].
-pub fn wit_to_core_patch_op(op: &wit::PatchOp) -> Result<CorePatchOp, WasmValueDecodeError> {
+#[cfg(test)]
+pub(crate) fn wit_to_core_patch_op(op: &wit::PatchOp) -> Result<CorePatchOp, WasmValueDecodeError> {
     Ok(CorePatchOp {
         kind: match op.kind {
             wit::PatchOpKind::Add => CorePatchOpKind::Add,
@@ -941,7 +946,7 @@ pub fn wit_to_core_patch_op(op: &wit::PatchOp) -> Result<CorePatchOp, WasmValueD
 /// The WIT record has no `option` provider field; an absent provider
 /// axis is encoded as an empty string (see the `type-identity` record
 /// doc in `provider.wit`).
-pub fn core_type_identity_to_wit(
+pub(crate) fn core_type_identity_to_wit(
     identity: &carina_core::schema::TypeIdentity,
 ) -> wit::TypeIdentity {
     wit::TypeIdentity {
@@ -2625,26 +2630,20 @@ mod tests {
     }
 
     #[test]
-    fn test_check_protocol_version_accepts_previous_supported_version() {
-        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 2);
-        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 1);
-        let json = format!(
-            r#"{{"name":"aws","display_name":"AWS Provider","version":"1.0.0","protocol_version":{}}}"#,
-            carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION
-        );
-
-        assert!(check_protocol_version(&json).is_ok());
+    fn test_protocol_version_range_is_v3_only() {
+        assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 3);
+        assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 3);
     }
 
     #[test]
     fn test_check_protocol_version_rejects_lower_version() {
         let err = check_protocol_version(
-            r#"{"name":"aws","display_name":"AWS Provider","version":"1.0.0","protocol_version":0}"#,
+            r#"{"name":"aws","display_name":"AWS Provider","version":"1.0.0","protocol_version":2}"#,
         )
         .unwrap_err();
 
         assert!(err.contains("provider 'aws'"));
-        assert!(err.contains("protocol version 0"));
+        assert!(err.contains("protocol version 2"));
         assert!(err.contains(&format!(
             "requires at least version {}",
             carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION

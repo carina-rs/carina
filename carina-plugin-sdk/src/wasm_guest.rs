@@ -577,15 +577,21 @@ macro_rules! export_provider {
             }
 
             fn boundary_decode_to_provider_error(
+                operation: &'static str,
+                part: Option<&'static str>,
                 error: helpers::WasmValueDecodeError,
             ) -> wit_types::ProviderError {
                 let error = helpers::format_wasm_value_decode_error(&error);
+                let location = part.map_or_else(
+                    || operation.to_string(),
+                    |part| format!("{operation} {part}"),
+                );
                 wit_types::ProviderError::Internal(wit_types::ErrorDetail {
-                    message: format!("WASM boundary decode error: {error}"),
+                    message: format!("WASM boundary decode error in {location}: {error}"),
                     resource_id: None,
                     cause: None,
                     provider_name: None,
-                    operation: None,
+                    operation: Some(operation.to_string()),
                     status: None,
                     code: None,
                     request_id: None,
@@ -593,36 +599,23 @@ macro_rules! export_provider {
             }
 
             fn boundary_encode_to_provider_error(
+                operation: &'static str,
+                part: Option<&'static str>,
                 error: helpers::WasmValueEncodeError,
             ) -> wit_types::ProviderError {
+                let location = part.map_or_else(
+                    || operation.to_string(),
+                    |part| format!("{operation} {part}"),
+                );
                 wit_types::ProviderError::Internal(wit_types::ErrorDetail {
-                    message: format!("WASM boundary encode error: {error}"),
+                    message: format!("WASM boundary encode error in {location}: {error}"),
                     resource_id: None,
                     cause: None,
                     provider_name: None,
-                    operation: None,
+                    operation: Some(operation.to_string()),
                     status: None,
                     code: None,
                     request_id: None,
-                })
-            }
-
-            fn boundary_decode_or_trap<T>(
-                operation: &'static str,
-                result: Result<T, helpers::WasmValueDecodeError>,
-            ) -> T {
-                result.unwrap_or_else(|error| {
-                    let error = helpers::format_wasm_value_decode_error(&error);
-                    panic!("WASM boundary decode error in {operation}: {error}")
-                })
-            }
-
-            fn boundary_encode_or_trap<T>(
-                operation: &'static str,
-                result: Result<T, helpers::WasmValueEncodeError>,
-            ) -> T {
-                result.unwrap_or_else(|error| {
-                    panic!("WASM boundary encode error in {operation}: {error}")
                 })
             }
 
@@ -754,8 +747,9 @@ macro_rules! export_provider {
                 fn validate_config(
                     attrs: Vec<(String, wit_types::Value)>,
                 ) -> Result<(), wit_types::ProviderError> {
-                    let map = wit_to_proto_value_map(&attrs)
-                        .map_err(boundary_decode_to_provider_error)?;
+                    let map = wit_to_proto_value_map(&attrs).map_err(|error| {
+                        boundary_decode_to_provider_error("validate_config", None, error)
+                    })?;
                     let provider = get_provider().lock().unwrap();
                     $crate::CarinaProvider::validate_config(&*provider, &map)
                         .map_err(validate_string_to_provider_error)
@@ -764,8 +758,9 @@ macro_rules! export_provider {
                 fn initialize(
                     attrs: Vec<(String, wit_types::Value)>,
                 ) -> Result<(), wit_types::ProviderError> {
-                    let map = wit_to_proto_value_map(&attrs)
-                        .map_err(boundary_decode_to_provider_error)?;
+                    let map = wit_to_proto_value_map(&attrs).map_err(|error| {
+                        boundary_decode_to_provider_error("initialize", None, error)
+                    })?;
                     let mut provider = get_provider().lock().unwrap();
                     $crate::CarinaProvider::initialize(&mut *provider, &map)
                         .map_err(validate_string_to_provider_error)
@@ -785,7 +780,9 @@ macro_rules! export_provider {
                         proto::ReadRequest,
                     ) {
                         Ok(state) => proto_to_wit_state(&state)
-                            .map_err(boundary_encode_to_provider_error),
+                            .map_err(|error| {
+                                boundary_encode_to_provider_error("read", None, error)
+                            }),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
@@ -793,12 +790,14 @@ macro_rules! export_provider {
                 fn read_data_source(
                     res: wit_types::ResourceDef,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let proto_res =
-                        wit_to_proto_resource(&res).map_err(boundary_decode_to_provider_error)?;
+                    let proto_res = wit_to_proto_resource(&res).map_err(|error| {
+                        boundary_decode_to_provider_error("read_data_source", None, error)
+                    })?;
                     let provider = get_provider().lock().unwrap();
                     match $crate::CarinaProvider::read_data_source(&*provider, &proto_res) {
-                        Ok(state) => proto_to_wit_state(&state)
-                            .map_err(boundary_encode_to_provider_error),
+                        Ok(state) => proto_to_wit_state(&state).map_err(|error| {
+                            boundary_encode_to_provider_error("read_data_source", None, error)
+                        }),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
@@ -809,11 +808,15 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::CreateOutcome, wit_types::ProviderError> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_request = wit_to_proto_create_request(request)
-                        .map_err(boundary_decode_to_provider_error)?;
+                        .map_err(|error| {
+                            boundary_decode_to_provider_error("create", None, error)
+                        })?;
                     let provider = get_provider().lock().unwrap();
                     match $crate::CarinaProvider::create(&*provider, &proto_id, proto_request) {
                         Ok(outcome) => proto_to_wit_create_outcome(&outcome)
-                            .map_err(boundary_encode_to_provider_error),
+                            .map_err(|error| {
+                                boundary_encode_to_provider_error("create", None, error)
+                            }),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
@@ -825,7 +828,9 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::UpdateOutcome, wit_types::ProviderError> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_request = wit_to_proto_update_request(request, &proto_id)
-                        .map_err(boundary_decode_to_provider_error)?;
+                        .map_err(|error| {
+                            boundary_decode_to_provider_error("update", None, error)
+                        })?;
                     let provider = get_provider().lock().unwrap();
                     match $crate::CarinaProvider::update(
                         &*provider,
@@ -834,7 +839,9 @@ macro_rules! export_provider {
                         proto_request,
                     ) {
                         Ok(outcome) => proto_to_wit_update_outcome(&outcome)
-                            .map_err(boundary_encode_to_provider_error),
+                            .map_err(|error| {
+                                boundary_encode_to_provider_error("update", None, error)
+                            }),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
@@ -923,89 +930,94 @@ macro_rules! export_provider {
 
                 fn normalize_desired(
                     resources: Vec<wit_types::ResourceDef>,
-                ) -> Vec<wit_types::ResourceDef> {
-                    // This legacy WIT export has no error result. Decode before
-                    // taking the provider lock and trap on failure so no
-                    // substitute value reaches the provider.
-                    let proto_resources = boundary_decode_or_trap(
-                        "normalize_desired",
-                        resources.iter().map(wit_to_proto_resource).collect(),
-                    );
+                ) -> Result<Vec<wit_types::ResourceDef>, wit_types::ProviderError> {
+                    let proto_resources = resources
+                        .iter()
+                        .map(wit_to_proto_resource)
+                        .collect::<Result<_, _>>()
+                        .map_err(|error| {
+                            boundary_decode_to_provider_error("normalize_desired", None, error)
+                        })?;
                     // Keep the mutex guard's lexical scope limited to the
                     // provider call; bridge result and encoding work does not
                     // require access to the shared provider.
                     let result = {
                         let provider = get_provider().lock().unwrap();
                         $crate::CarinaProvider::normalize_desired(&*provider, proto_resources)
-                    };
-                    let result = provider_export_or_trap(
-                        "normalize_desired",
-                        result,
-                    );
-                    boundary_encode_or_trap(
-                        "normalize_desired",
-                        result.iter().map(proto_to_wit_resource).collect(),
-                    )
+                    }
+                    .map_err(proto_to_wit_provider_error)?;
+                    result
+                        .iter()
+                        .map(proto_to_wit_resource)
+                        .collect::<Result<_, _>>()
+                        .map_err(|error| {
+                            boundary_encode_to_provider_error("normalize_desired", None, error)
+                        })
                 }
 
                 fn normalize_state(
                     states: Vec<(String, wit_types::State)>,
-                ) -> Vec<(String, wit_types::State)> {
-                    let proto_states = boundary_decode_or_trap(
-                        "normalize_state",
-                        states
-                            .iter()
-                            .map(|(key, state)| {
-                                let parsed_id = helpers::parse_resource_id_string(key);
-                                wit_to_proto_state(&parsed_id, state)
-                                    .map(|state| (key.clone(), state))
-                            })
-                            .collect::<Result<HashMap<_, _>, _>>(),
-                    );
+                ) -> Result<Vec<(String, wit_types::State)>, wit_types::ProviderError> {
+                    let proto_states = states
+                        .iter()
+                        .map(|(key, state)| {
+                            let parsed_id = helpers::parse_resource_id_string(key);
+                            wit_to_proto_state(&parsed_id, state)
+                                .map(|state| (key.clone(), state))
+                        })
+                        .collect::<Result<HashMap<_, _>, _>>()
+                        .map_err(|error| {
+                            boundary_decode_to_provider_error("normalize_state", None, error)
+                        })?;
                     let result = {
                         let provider = get_provider().lock().unwrap();
                         $crate::CarinaProvider::normalize_state(&*provider, proto_states)
-                    };
-                    let result = provider_export_or_trap(
-                        "normalize_state",
-                        result,
-                    );
-                    boundary_encode_or_trap(
-                        "normalize_state",
-                        result
-                            .into_iter()
-                            .map(|(key, state)| {
-                                proto_to_wit_state(&state).map(|state| (key, state))
-                            })
-                            .collect(),
-                    )
+                    }
+                    .map_err(proto_to_wit_provider_error)?;
+                    result
+                        .into_iter()
+                        .map(|(key, state)| {
+                            proto_to_wit_state(&state).map(|state| (key, state))
+                        })
+                        .collect::<Result<_, _>>()
+                        .map_err(|error| {
+                            boundary_encode_to_provider_error("normalize_state", None, error)
+                        })
                 }
 
                 fn hydrate_read_state(
                     states: Vec<(String, wit_types::State)>,
                     saved_attrs: Vec<(String, Vec<(String, wit_types::Value)>)>,
-                ) -> Vec<(String, wit_types::State)> {
-                    let mut proto_states = boundary_decode_or_trap(
-                        "hydrate_read_state states",
-                        states
-                            .iter()
-                            .map(|(key, state)| {
-                                let parsed_id = helpers::parse_resource_id_string(key);
-                                wit_to_proto_state(&parsed_id, state)
-                                    .map(|state| (key.clone(), state))
-                            })
-                            .collect::<Result<HashMap<_, _>, _>>(),
-                    );
-                    let proto_saved = boundary_decode_or_trap(
-                        "hydrate_read_state saved attributes",
-                        saved_attrs
-                            .iter()
-                            .map(|(key, attributes)| {
-                                wit_to_proto_value_map(attributes)
-                                    .map(|attributes| (key.clone(), attributes))
-                            })
-                            .collect::<Result<HashMap<_, _>, _>>(),
-                    );
+                ) -> Result<Vec<(String, wit_types::State)>, wit_types::ProviderError> {
+                    let mut proto_states = states
+                        .iter()
+                        .map(|(key, state)| {
+                            let parsed_id = helpers::parse_resource_id_string(key);
+                            wit_to_proto_state(&parsed_id, state)
+                                .map(|state| (key.clone(), state))
+                        })
+                        .collect::<Result<HashMap<_, _>, _>>()
+                        .map_err(|error| {
+                            boundary_decode_to_provider_error(
+                                "hydrate_read_state",
+                                Some("states"),
+                                error,
+                            )
+                        })?;
+                    let proto_saved = saved_attrs
+                        .iter()
+                        .map(|(key, attributes)| {
+                            wit_to_proto_value_map(attributes)
+                                .map(|attributes| (key.clone(), attributes))
+                        })
+                        .collect::<Result<HashMap<_, _>, _>>()
+                        .map_err(|error| {
+                            boundary_decode_to_provider_error(
+                                "hydrate_read_state",
+                                Some("saved attributes"),
+                                error,
+                            )
+                        })?;
                     let result = {
                         let provider = get_provider().lock().unwrap();
                         $crate::CarinaProvider::hydrate_read_state(
@@ -1013,34 +1025,45 @@ macro_rules! export_provider {
                             &mut proto_states,
                             &proto_saved,
                         )
-                    };
-                    provider_export_or_trap(
-                        "hydrate_read_state",
-                        result,
-                    );
-                    boundary_encode_or_trap(
-                        "hydrate_read_state",
-                        proto_states
-                            .into_iter()
-                            .map(|(key, state)| {
-                                proto_to_wit_state(&state).map(|state| (key, state))
-                            })
-                            .collect(),
-                    )
+                    }
+                    .map_err(proto_to_wit_provider_error)?;
+                    proto_states
+                        .into_iter()
+                        .map(|(key, state)| {
+                            proto_to_wit_state(&state).map(|state| (key, state))
+                        })
+                        .collect::<Result<_, _>>()
+                        .map_err(|error| {
+                            boundary_encode_to_provider_error(
+                                "hydrate_read_state",
+                                None,
+                                error,
+                            )
+                        })
                 }
 
                 fn merge_default_tags(
                     resources: Vec<wit_types::ResourceDef>,
                     default_tags: Vec<(String, wit_types::Value)>,
-                ) -> Vec<wit_types::ResourceDef> {
-                    let mut proto_resources = boundary_decode_or_trap(
-                        "merge_default_tags resources",
-                        resources.iter().map(wit_to_proto_resource).collect(),
-                    );
-                    let proto_tags = boundary_decode_or_trap(
-                        "merge_default_tags default tags",
-                        wit_to_proto_value_map(&default_tags),
-                    );
+                ) -> Result<Vec<wit_types::ResourceDef>, wit_types::ProviderError> {
+                    let mut proto_resources = resources
+                        .iter()
+                        .map(wit_to_proto_resource)
+                        .collect::<Result<_, _>>()
+                        .map_err(|error| {
+                            boundary_decode_to_provider_error(
+                                "merge_default_tags",
+                                Some("resources"),
+                                error,
+                            )
+                        })?;
+                    let proto_tags = wit_to_proto_value_map(&default_tags).map_err(|error| {
+                        boundary_decode_to_provider_error(
+                            "merge_default_tags",
+                            Some("default tags"),
+                            error,
+                        )
+                    })?;
                     let result = {
                         let provider = get_provider().lock().unwrap();
                         let schemas = $crate::CarinaProvider::schemas(&*provider);
@@ -1050,15 +1073,15 @@ macro_rules! export_provider {
                             &proto_tags,
                             &schemas,
                         )
-                    };
-                    provider_export_or_trap(
-                        "merge_default_tags",
-                        result,
-                    );
-                    boundary_encode_or_trap(
-                        "merge_default_tags",
-                        proto_resources.iter().map(proto_to_wit_resource).collect(),
-                    )
+                    }
+                    .map_err(proto_to_wit_provider_error)?;
+                    proto_resources
+                        .iter()
+                        .map(proto_to_wit_resource)
+                        .collect::<Result<_, _>>()
+                        .map_err(|error| {
+                            boundary_encode_to_provider_error("merge_default_tags", None, error)
+                        })
                 }
             }
 
@@ -1319,15 +1342,21 @@ macro_rules! export_provider {
             }
 
             fn boundary_decode_to_provider_error(
+                operation: &'static str,
+                part: Option<&'static str>,
                 error: helpers::WasmValueDecodeError,
             ) -> wit_types::ProviderError {
                 let error = helpers::format_wasm_value_decode_error(&error);
+                let location = part.map_or_else(
+                    || operation.to_string(),
+                    |part| format!("{operation} {part}"),
+                );
                 wit_types::ProviderError::Internal(wit_types::ErrorDetail {
-                    message: format!("WASM boundary decode error: {error}"),
+                    message: format!("WASM boundary decode error in {location}: {error}"),
                     resource_id: None,
                     cause: None,
                     provider_name: None,
-                    operation: None,
+                    operation: Some(operation.to_string()),
                     status: None,
                     code: None,
                     request_id: None,
@@ -1335,36 +1364,23 @@ macro_rules! export_provider {
             }
 
             fn boundary_encode_to_provider_error(
+                operation: &'static str,
+                part: Option<&'static str>,
                 error: helpers::WasmValueEncodeError,
             ) -> wit_types::ProviderError {
+                let location = part.map_or_else(
+                    || operation.to_string(),
+                    |part| format!("{operation} {part}"),
+                );
                 wit_types::ProviderError::Internal(wit_types::ErrorDetail {
-                    message: format!("WASM boundary encode error: {error}"),
+                    message: format!("WASM boundary encode error in {location}: {error}"),
                     resource_id: None,
                     cause: None,
                     provider_name: None,
-                    operation: None,
+                    operation: Some(operation.to_string()),
                     status: None,
                     code: None,
                     request_id: None,
-                })
-            }
-
-            fn boundary_decode_or_trap<T>(
-                operation: &'static str,
-                result: Result<T, helpers::WasmValueDecodeError>,
-            ) -> T {
-                result.unwrap_or_else(|error| {
-                    let error = helpers::format_wasm_value_decode_error(&error);
-                    panic!("WASM boundary decode error in {operation}: {error}")
-                })
-            }
-
-            fn boundary_encode_or_trap<T>(
-                operation: &'static str,
-                result: Result<T, helpers::WasmValueEncodeError>,
-            ) -> T {
-                result.unwrap_or_else(|error| {
-                    panic!("WASM boundary encode error in {operation}: {error}")
                 })
             }
 
@@ -1496,8 +1512,9 @@ macro_rules! export_provider {
                 fn validate_config(
                     attrs: Vec<(String, wit_types::Value)>,
                 ) -> Result<(), wit_types::ProviderError> {
-                    let map = wit_to_proto_value_map(&attrs)
-                        .map_err(boundary_decode_to_provider_error)?;
+                    let map = wit_to_proto_value_map(&attrs).map_err(|error| {
+                        boundary_decode_to_provider_error("validate_config", None, error)
+                    })?;
                     let provider = get_provider().lock().unwrap();
                     $crate::CarinaProvider::validate_config(&*provider, &map)
                         .map_err(validate_string_to_provider_error)
@@ -1506,8 +1523,9 @@ macro_rules! export_provider {
                 fn initialize(
                     attrs: Vec<(String, wit_types::Value)>,
                 ) -> Result<(), wit_types::ProviderError> {
-                    let map = wit_to_proto_value_map(&attrs)
-                        .map_err(boundary_decode_to_provider_error)?;
+                    let map = wit_to_proto_value_map(&attrs).map_err(|error| {
+                        boundary_decode_to_provider_error("initialize", None, error)
+                    })?;
                     let mut provider = get_provider().lock().unwrap();
                     $crate::CarinaProvider::initialize(&mut *provider, &map)
                         .map_err(validate_string_to_provider_error)
@@ -1527,7 +1545,9 @@ macro_rules! export_provider {
                         proto::ReadRequest,
                     ) {
                         Ok(state) => proto_to_wit_state(&state)
-                            .map_err(boundary_encode_to_provider_error),
+                            .map_err(|error| {
+                                boundary_encode_to_provider_error("read", None, error)
+                            }),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
@@ -1535,12 +1555,14 @@ macro_rules! export_provider {
                 fn read_data_source(
                     res: wit_types::ResourceDef,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
-                    let proto_res =
-                        wit_to_proto_resource(&res).map_err(boundary_decode_to_provider_error)?;
+                    let proto_res = wit_to_proto_resource(&res).map_err(|error| {
+                        boundary_decode_to_provider_error("read_data_source", None, error)
+                    })?;
                     let provider = get_provider().lock().unwrap();
                     match $crate::CarinaProvider::read_data_source(&*provider, &proto_res) {
-                        Ok(state) => proto_to_wit_state(&state)
-                            .map_err(boundary_encode_to_provider_error),
+                        Ok(state) => proto_to_wit_state(&state).map_err(|error| {
+                            boundary_encode_to_provider_error("read_data_source", None, error)
+                        }),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
@@ -1551,11 +1573,15 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::CreateOutcome, wit_types::ProviderError> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_request = wit_to_proto_create_request(request)
-                        .map_err(boundary_decode_to_provider_error)?;
+                        .map_err(|error| {
+                            boundary_decode_to_provider_error("create", None, error)
+                        })?;
                     let provider = get_provider().lock().unwrap();
                     match $crate::CarinaProvider::create(&*provider, &proto_id, proto_request) {
                         Ok(outcome) => proto_to_wit_create_outcome(&outcome)
-                            .map_err(boundary_encode_to_provider_error),
+                            .map_err(|error| {
+                                boundary_encode_to_provider_error("create", None, error)
+                            }),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
@@ -1567,7 +1593,9 @@ macro_rules! export_provider {
                 ) -> Result<wit_types::UpdateOutcome, wit_types::ProviderError> {
                     let proto_id = wit_to_proto_resource_id(&id);
                     let proto_request = wit_to_proto_update_request(request, &proto_id)
-                        .map_err(boundary_decode_to_provider_error)?;
+                        .map_err(|error| {
+                            boundary_decode_to_provider_error("update", None, error)
+                        })?;
                     let provider = get_provider().lock().unwrap();
                     match $crate::CarinaProvider::update(
                         &*provider,
@@ -1576,7 +1604,9 @@ macro_rules! export_provider {
                         proto_request,
                     ) {
                         Ok(outcome) => proto_to_wit_update_outcome(&outcome)
-                            .map_err(boundary_encode_to_provider_error),
+                            .map_err(|error| {
+                                boundary_encode_to_provider_error("update", None, error)
+                            }),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
@@ -1665,89 +1695,94 @@ macro_rules! export_provider {
 
                 fn normalize_desired(
                     resources: Vec<wit_types::ResourceDef>,
-                ) -> Vec<wit_types::ResourceDef> {
-                    // This legacy WIT export has no error result. Decode before
-                    // taking the provider lock and trap on failure so no
-                    // substitute value reaches the provider.
-                    let proto_resources = boundary_decode_or_trap(
-                        "normalize_desired",
-                        resources.iter().map(wit_to_proto_resource).collect(),
-                    );
+                ) -> Result<Vec<wit_types::ResourceDef>, wit_types::ProviderError> {
+                    let proto_resources = resources
+                        .iter()
+                        .map(wit_to_proto_resource)
+                        .collect::<Result<_, _>>()
+                        .map_err(|error| {
+                            boundary_decode_to_provider_error("normalize_desired", None, error)
+                        })?;
                     // Keep the mutex guard's lexical scope limited to the
                     // provider call; bridge result and encoding work does not
                     // require access to the shared provider.
                     let result = {
                         let provider = get_provider().lock().unwrap();
                         $crate::CarinaProvider::normalize_desired(&*provider, proto_resources)
-                    };
-                    let result = provider_export_or_trap(
-                        "normalize_desired",
-                        result,
-                    );
-                    boundary_encode_or_trap(
-                        "normalize_desired",
-                        result.iter().map(proto_to_wit_resource).collect(),
-                    )
+                    }
+                    .map_err(proto_to_wit_provider_error)?;
+                    result
+                        .iter()
+                        .map(proto_to_wit_resource)
+                        .collect::<Result<_, _>>()
+                        .map_err(|error| {
+                            boundary_encode_to_provider_error("normalize_desired", None, error)
+                        })
                 }
 
                 fn normalize_state(
                     states: Vec<(String, wit_types::State)>,
-                ) -> Vec<(String, wit_types::State)> {
-                    let proto_states = boundary_decode_or_trap(
-                        "normalize_state",
-                        states
-                            .iter()
-                            .map(|(key, state)| {
-                                let parsed_id = helpers::parse_resource_id_string(key);
-                                wit_to_proto_state(&parsed_id, state)
-                                    .map(|state| (key.clone(), state))
-                            })
-                            .collect::<Result<HashMap<_, _>, _>>(),
-                    );
+                ) -> Result<Vec<(String, wit_types::State)>, wit_types::ProviderError> {
+                    let proto_states = states
+                        .iter()
+                        .map(|(key, state)| {
+                            let parsed_id = helpers::parse_resource_id_string(key);
+                            wit_to_proto_state(&parsed_id, state)
+                                .map(|state| (key.clone(), state))
+                        })
+                        .collect::<Result<HashMap<_, _>, _>>()
+                        .map_err(|error| {
+                            boundary_decode_to_provider_error("normalize_state", None, error)
+                        })?;
                     let result = {
                         let provider = get_provider().lock().unwrap();
                         $crate::CarinaProvider::normalize_state(&*provider, proto_states)
-                    };
-                    let result = provider_export_or_trap(
-                        "normalize_state",
-                        result,
-                    );
-                    boundary_encode_or_trap(
-                        "normalize_state",
-                        result
-                            .into_iter()
-                            .map(|(key, state)| {
-                                proto_to_wit_state(&state).map(|state| (key, state))
-                            })
-                            .collect(),
-                    )
+                    }
+                    .map_err(proto_to_wit_provider_error)?;
+                    result
+                        .into_iter()
+                        .map(|(key, state)| {
+                            proto_to_wit_state(&state).map(|state| (key, state))
+                        })
+                        .collect::<Result<_, _>>()
+                        .map_err(|error| {
+                            boundary_encode_to_provider_error("normalize_state", None, error)
+                        })
                 }
 
                 fn hydrate_read_state(
                     states: Vec<(String, wit_types::State)>,
                     saved_attrs: Vec<(String, Vec<(String, wit_types::Value)>)>,
-                ) -> Vec<(String, wit_types::State)> {
-                    let mut proto_states = boundary_decode_or_trap(
-                        "hydrate_read_state states",
-                        states
-                            .iter()
-                            .map(|(key, state)| {
-                                let parsed_id = helpers::parse_resource_id_string(key);
-                                wit_to_proto_state(&parsed_id, state)
-                                    .map(|state| (key.clone(), state))
-                            })
-                            .collect::<Result<HashMap<_, _>, _>>(),
-                    );
-                    let proto_saved = boundary_decode_or_trap(
-                        "hydrate_read_state saved attributes",
-                        saved_attrs
-                            .iter()
-                            .map(|(key, attributes)| {
-                                wit_to_proto_value_map(attributes)
-                                    .map(|attributes| (key.clone(), attributes))
-                            })
-                            .collect::<Result<HashMap<_, _>, _>>(),
-                    );
+                ) -> Result<Vec<(String, wit_types::State)>, wit_types::ProviderError> {
+                    let mut proto_states = states
+                        .iter()
+                        .map(|(key, state)| {
+                            let parsed_id = helpers::parse_resource_id_string(key);
+                            wit_to_proto_state(&parsed_id, state)
+                                .map(|state| (key.clone(), state))
+                        })
+                        .collect::<Result<HashMap<_, _>, _>>()
+                        .map_err(|error| {
+                            boundary_decode_to_provider_error(
+                                "hydrate_read_state",
+                                Some("states"),
+                                error,
+                            )
+                        })?;
+                    let proto_saved = saved_attrs
+                        .iter()
+                        .map(|(key, attributes)| {
+                            wit_to_proto_value_map(attributes)
+                                .map(|attributes| (key.clone(), attributes))
+                        })
+                        .collect::<Result<HashMap<_, _>, _>>()
+                        .map_err(|error| {
+                            boundary_decode_to_provider_error(
+                                "hydrate_read_state",
+                                Some("saved attributes"),
+                                error,
+                            )
+                        })?;
                     let result = {
                         let provider = get_provider().lock().unwrap();
                         $crate::CarinaProvider::hydrate_read_state(
@@ -1755,34 +1790,45 @@ macro_rules! export_provider {
                             &mut proto_states,
                             &proto_saved,
                         )
-                    };
-                    provider_export_or_trap(
-                        "hydrate_read_state",
-                        result,
-                    );
-                    boundary_encode_or_trap(
-                        "hydrate_read_state",
-                        proto_states
-                            .into_iter()
-                            .map(|(key, state)| {
-                                proto_to_wit_state(&state).map(|state| (key, state))
-                            })
-                            .collect(),
-                    )
+                    }
+                    .map_err(proto_to_wit_provider_error)?;
+                    proto_states
+                        .into_iter()
+                        .map(|(key, state)| {
+                            proto_to_wit_state(&state).map(|state| (key, state))
+                        })
+                        .collect::<Result<_, _>>()
+                        .map_err(|error| {
+                            boundary_encode_to_provider_error(
+                                "hydrate_read_state",
+                                None,
+                                error,
+                            )
+                        })
                 }
 
                 fn merge_default_tags(
                     resources: Vec<wit_types::ResourceDef>,
                     default_tags: Vec<(String, wit_types::Value)>,
-                ) -> Vec<wit_types::ResourceDef> {
-                    let mut proto_resources = boundary_decode_or_trap(
-                        "merge_default_tags resources",
-                        resources.iter().map(wit_to_proto_resource).collect(),
-                    );
-                    let proto_tags = boundary_decode_or_trap(
-                        "merge_default_tags default tags",
-                        wit_to_proto_value_map(&default_tags),
-                    );
+                ) -> Result<Vec<wit_types::ResourceDef>, wit_types::ProviderError> {
+                    let mut proto_resources = resources
+                        .iter()
+                        .map(wit_to_proto_resource)
+                        .collect::<Result<_, _>>()
+                        .map_err(|error| {
+                            boundary_decode_to_provider_error(
+                                "merge_default_tags",
+                                Some("resources"),
+                                error,
+                            )
+                        })?;
+                    let proto_tags = wit_to_proto_value_map(&default_tags).map_err(|error| {
+                        boundary_decode_to_provider_error(
+                            "merge_default_tags",
+                            Some("default tags"),
+                            error,
+                        )
+                    })?;
                     let result = {
                         let provider = get_provider().lock().unwrap();
                         let schemas = $crate::CarinaProvider::schemas(&*provider);
@@ -1792,15 +1838,15 @@ macro_rules! export_provider {
                             &proto_tags,
                             &schemas,
                         )
-                    };
-                    provider_export_or_trap(
-                        "merge_default_tags",
-                        result,
-                    );
-                    boundary_encode_or_trap(
-                        "merge_default_tags",
-                        proto_resources.iter().map(proto_to_wit_resource).collect(),
-                    )
+                    }
+                    .map_err(proto_to_wit_provider_error)?;
+                    proto_resources
+                        .iter()
+                        .map(proto_to_wit_resource)
+                        .collect::<Result<_, _>>()
+                        .map_err(|error| {
+                            boundary_encode_to_provider_error("merge_default_tags", None, error)
+                        })
                 }
             }
 

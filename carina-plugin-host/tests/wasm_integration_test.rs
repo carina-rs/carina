@@ -762,7 +762,7 @@ async fn test_wasm_normalize_state_trap_is_an_error_and_does_not_mutate_state() 
     let error = normalizer
         .normalize_state(&mut states)
         .await
-        .expect_err("a bare-list guest trap must become a normalizer error");
+        .expect_err("a guest normalizer trap must become a normalizer error");
 
     assert!(error.to_string().contains("normalize_state"));
     assert_eq!(states, before, "guest traps must be atomic");
@@ -858,13 +858,60 @@ async fn test_wasm_provider_returned_error_does_not_poison_instance() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_wasm_provider_normalizer_error_traps_and_does_not_mutate_state() {
+async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_instance() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
+    let attributes = indexmap::IndexMap::new();
+    let provider = factory
+        .create_provider(None, &attributes)
+        .await
+        .expect("provider should initialize");
     let normalizer = factory
-        .create_normalizer(None, &indexmap::IndexMap::new())
+        .create_normalizer(None, &attributes)
         .await
         .expect("normalizer should initialize");
+
+    let desired_id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "__mock_normalize_desired_error__",
+        None,
+    );
+    let mut desired_resources = vec![Resource::with_provider(
+        "mock",
+        "test.resource",
+        "__mock_normalize_desired_error__",
+        None,
+    )];
+    let desired_before = desired_resources.clone();
+    let error = normalizer
+        .normalize_desired(&mut desired_resources)
+        .await
+        .expect_err("a guest normalize_desired error must cross the structured error channel");
+    assert_eq!(error.variant_name(), "internal");
+    assert_eq!(error.message(), "intentional mock normalize_desired error");
+    assert_eq!(
+        error.detail().resource_id.as_deref(),
+        Some(&desired_id),
+        "the guest resource id must survive the WIT conversion"
+    );
+    assert_eq!(error.detail().provider_name.as_deref(), Some("mock"));
+    assert_eq!(
+        desired_resources, desired_before,
+        "provider normalizer errors must be atomic"
+    );
+
+    let mut recovery_resources = vec![Resource::with_provider(
+        "mock",
+        "test.resource",
+        "after-normalize-desired-error",
+        None,
+    )];
+    normalizer
+        .normalize_desired(&mut recovery_resources)
+        .await
+        .expect("a provider-returned normalize_desired error must not poison the shared instance");
+
     let id = ResourceId::with_provider_identity(
         "mock",
         "test.resource",
@@ -874,7 +921,7 @@ async fn test_wasm_provider_normalizer_error_traps_and_does_not_mutate_state() {
     let mut states = HashMap::from([(
         id.clone(),
         State::existing(
-            id,
+            id.clone(),
             HashMap::from([(
                 "original".to_string(),
                 Value::Concrete(ConcreteValue::String("value".to_string())),
@@ -886,10 +933,101 @@ async fn test_wasm_provider_normalizer_error_traps_and_does_not_mutate_state() {
     let error = normalizer
         .normalize_state(&mut states)
         .await
-        .expect_err("an SDK normalizer error must trap across the bare-list WIT export");
+        .expect_err("a guest normalize_state error must cross the structured error channel");
 
-    assert!(error.to_string().contains("normalize_state"), "{error}");
+    assert_eq!(error.variant_name(), "internal");
+    assert_eq!(error.message(), "intentional mock normalize_state error");
+    assert_eq!(error.detail().resource_id.as_deref(), Some(&id));
     assert_eq!(states, before, "provider normalizer errors must be atomic");
+
+    normalizer
+        .normalize_desired(&mut recovery_resources)
+        .await
+        .expect("a provider-returned normalize_state error must not poison the shared instance");
+
+    let hydrate_id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "__mock_hydrate_state_error__",
+        None,
+    );
+    let mut hydrate_states = HashMap::from([(
+        hydrate_id.clone(),
+        State::existing(
+            hydrate_id.clone(),
+            HashMap::from([(
+                "original".to_string(),
+                Value::Concrete(ConcreteValue::String("value".to_string())),
+            )]),
+        ),
+    )]);
+    let hydrate_before = hydrate_states.clone();
+    let error = normalizer
+        .hydrate_read_state(&mut hydrate_states, &SavedAttrs::new())
+        .await
+        .expect_err("a guest hydrate_read_state error must cross the structured error channel");
+    assert_eq!(error.variant_name(), "internal");
+    assert_eq!(error.message(), "intentional mock hydrate_read_state error");
+    assert_eq!(error.detail().resource_id.as_deref(), Some(&hydrate_id));
+    assert_eq!(
+        hydrate_states, hydrate_before,
+        "provider hydration errors must be atomic"
+    );
+
+    normalizer
+        .normalize_desired(&mut recovery_resources)
+        .await
+        .expect("a provider-returned hydrate_read_state error must not poison the shared instance");
+
+    let merge_id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "__mock_merge_default_tags_error__",
+        None,
+    );
+    let mut merge_resources = vec![Resource::with_provider(
+        "mock",
+        "test.resource",
+        "__mock_merge_default_tags_error__",
+        None,
+    )];
+    let merge_before = merge_resources.clone();
+    let default_tags = indexmap::IndexMap::from([(
+        "Environment".to_string(),
+        Value::Concrete(ConcreteValue::String("test".to_string())),
+    )]);
+    let error = normalizer
+        .merge_default_tags(
+            &mut merge_resources,
+            &default_tags,
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .await
+        .expect_err("a guest merge_default_tags error must cross the structured error channel");
+    assert_eq!(error.variant_name(), "internal");
+    assert_eq!(error.message(), "intentional mock merge_default_tags error");
+    assert_eq!(error.detail().resource_id.as_deref(), Some(&merge_id));
+    assert_eq!(
+        merge_resources, merge_before,
+        "provider default-tag errors must be atomic"
+    );
+
+    normalizer
+        .normalize_desired(&mut recovery_resources)
+        .await
+        .expect("a provider-returned merge_default_tags error must not poison the shared instance");
+
+    let read_id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "after-normalizer-errors",
+        None,
+    );
+    let state = provider
+        .read(&read_id, None, ReadRequest)
+        .await
+        .expect("provider-returned normalizer errors must not poison a later CRUD call");
+    assert!(!state.exists);
 }
 
 #[tokio::test(flavor = "multi_thread")]

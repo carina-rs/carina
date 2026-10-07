@@ -107,7 +107,10 @@ is why "just add a timeout" cannot work and was correctly rejected.
   `normalize-state`, `hydrate-read-state`, `merge-default-tags` funcs
   are already host-driven-async (guest runs synchronously; the host
   decides how to drive). Only the **host-side Rust trait** changes.
-  No WIT change, no provider plugin rebuild required for the contract.
+  No sync/async WIT change or provider plugin rebuild was required for
+  this redesign. Issue #3842 later added `result<_, provider-error>` to
+  these four exports; that independent error-channel change does require
+  rebuilding providers against protocol v3.
 - **Folding the normalizer into the `Provider` trait.** They are
   distinct responsibilities (one mutates desired/state in place; the
   other performs CRUD). Keep them separate traits; only align the

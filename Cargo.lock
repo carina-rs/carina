@@ -1109,10 +1109,14 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.25.0",
  "uuid",
+ "wasmprinter",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
+ "wat",
  "webpki-roots 0.26.11",
+ "wit-component 0.245.1",
+ "wit-parser 0.245.1",
 ]
 
 [[package]]
@@ -7710,6 +7714,7 @@ dependencies = [
  "wasm-encoder 0.245.1",
  "wasm-metadata 0.245.1",
  "wasmparser 0.245.1",
+ "wat",
  "wit-parser 0.245.1",
 ]
 

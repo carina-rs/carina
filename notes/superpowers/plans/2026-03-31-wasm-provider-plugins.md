@@ -330,11 +330,11 @@ interface provider {
         lifecycle: lifecycle-config,
     ) -> result<_, provider-error>;
 
-    normalize-desired: func(resources: list<resource>) -> list<resource>;
+    normalize-desired: func(resources: list<resource>) -> result<list<resource>, provider-error>;
 
     normalize-state: func(
         states: list<tuple<string, state>>,
-    ) -> list<tuple<string, state>>;
+    ) -> result<list<tuple<string, state>>, provider-error>;
 }
 ```
 

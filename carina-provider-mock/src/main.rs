@@ -38,6 +38,20 @@ impl MockProcessProvider {
             }
         }
     }
+
+    fn normalizer_error(operation: &str, id: &ResourceId) -> ProviderError {
+        ProviderError {
+            kind: ProviderErrorKind::Internal,
+            message: format!("intentional mock {operation} error"),
+            resource_id: Some(id.clone()),
+            cause: None,
+            provider_name: Some("mock".to_string()),
+            operation: None,
+            status: None,
+            code: None,
+            request_id: None,
+        }
+    }
 }
 
 impl CarinaProvider for MockProcessProvider {
@@ -240,6 +254,16 @@ impl CarinaProvider for MockProcessProvider {
         Ok(Vec::new())
     }
 
+    fn normalize_desired(&self, resources: Vec<Resource>) -> Result<Vec<Resource>, ProviderError> {
+        if let Some(resource) = resources
+            .iter()
+            .find(|resource| resource.id.identity == "__mock_normalize_desired_error__")
+        {
+            return Err(Self::normalizer_error("normalize_desired", &resource.id));
+        }
+        Ok(resources)
+    }
+
     fn normalize_state(
         &self,
         states: HashMap<String, State>,
@@ -260,21 +284,11 @@ impl CarinaProvider for MockProcessProvider {
         {
             panic!("intentional mock normalize_state trap");
         }
-        if special_id
+        if let Some(id) = special_id
             .as_ref()
-            .is_some_and(|id| id.identity == "__mock_normalize_state_error__")
+            .filter(|id| id.identity == "__mock_normalize_state_error__")
         {
-            return Err(ProviderError {
-                kind: ProviderErrorKind::Internal,
-                message: "intentional mock normalize_state error".to_string(),
-                resource_id: special_id,
-                cause: None,
-                provider_name: None,
-                operation: None,
-                status: None,
-                code: None,
-                request_id: None,
-            });
+            return Err(Self::normalizer_error("normalize_state", id));
         }
 
         let mut normalized: HashMap<_, _> = states
@@ -331,6 +345,12 @@ impl CarinaProvider for MockProcessProvider {
             .values()
             .map(|state| state.id.clone())
             .find(|id| id.identity.starts_with("__mock_hydrate_state_"));
+        if let Some(id) = special_id
+            .as_ref()
+            .filter(|id| id.identity == "__mock_hydrate_state_error__")
+        {
+            return Err(Self::normalizer_error("hydrate_read_state", id));
+        }
         *states = std::mem::take(states)
             .into_iter()
             .map(|(input_key, mut state)| {
@@ -383,6 +403,12 @@ impl CarinaProvider for MockProcessProvider {
         default_tags: &HashMap<String, Value>,
         _schemas: &Vec<ResourceSchema>,
     ) -> Result<(), ProviderError> {
+        if let Some(resource) = resources
+            .iter()
+            .find(|resource| resource.id.identity == "__mock_merge_default_tags_error__")
+        {
+            return Err(Self::normalizer_error("merge_default_tags", &resource.id));
+        }
         let snapshot: Vec<Value> = default_tags
             .iter()
             .map(|(k, v)| {
