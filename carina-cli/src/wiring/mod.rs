@@ -33,7 +33,10 @@ use carina_core::module_resolver;
 use carina_core::override_aware::OverrideAwareResources;
 #[cfg(test)]
 use carina_core::parser::MovedAddresses;
-use carina_core::parser::{ProviderConfig, StateBlock, StateBlockAddress, WarningKind};
+use carina_core::parser::{
+    ProviderConfig, ResolvedProviderConfig, ResolvedProviderConfigs, StateBlock, StateBlockAddress,
+    WarningKind,
+};
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::provider::{
     self as provider_mod, LiftedSavedAttrs, Provider, ProviderError, ProviderFactory,
@@ -1208,6 +1211,7 @@ impl<'a> PlanPreprocessor<'a> {
 /// `normalize_desired` produces, preventing false diffs.
 pub fn normalize_state_with_ctx(
     ctx: &WiringContext,
+    provider_configs: &ResolvedProviderConfigs,
     current_states: &mut HashMap<ResourceId, State>,
 ) -> Result<(), ProviderError> {
     // WASM factories bridge their synchronous validation hook to async host
@@ -1220,10 +1224,10 @@ pub fn normalize_state_with_ctx(
         .expect("failed to build tokio runtime for normalize_state");
     let mut router = ProviderRouter::new();
     for factory in ctx.factories() {
-        let attrs = indexmap::IndexMap::new();
+        let resolved_config = provider_configs.provider_or_implicit(factory.name());
         let config = rt
             .block_on(async {
-                prepare_provider_ready_config(factory.as_ref(), factory.name(), &attrs)
+                prepare_provider_ready_config(factory.as_ref(), resolved_config.as_ref())
             })
             .map_err(|error| ProviderError::internal(error.to_string()).with_cause(error))?;
         router.add_normalizer(
@@ -1563,9 +1567,9 @@ pub(crate) fn validate_no_exports_in_modules(module_walk: &ModuleWalk) -> Vec<Ap
     errors
 }
 
-pub async fn get_provider_with_ctx<E>(
+pub async fn get_provider_with_ctx(
     ctx: &WiringContext,
-    parsed: &carina_core::parser::File<E>,
+    configs: &ResolvedProviderConfigs,
     base_dir: &Path,
 ) -> Result<ProviderRouter, AppError> {
     let mut router = ProviderRouter::new();
@@ -1576,23 +1580,22 @@ pub async fn get_provider_with_ctx<E>(
     // may need a WASM plugin to be loaded. Pass 2 handles each named
     // instance (`let <name> = provider <kind> { ... }`), reusing the
     // factory the default instance already brought in.
-    for provider_config in parsed.providers.iter().filter(|p| p.is_default()) {
+    for provider_config in configs.iter().filter(|config| config.is_default()) {
         instantiate_provider_into_router(ctx, &mut router, provider_config, base_dir, None, None)
             .await?;
     }
 
-    for (provider_config, binding) in parsed
-        .providers
+    for (provider_config, binding) in configs
         .iter()
-        .filter_map(|config| config.binding.as_ref().map(|binding| (config, binding)))
+        .filter_map(|config| config.binding().map(|binding| (config, binding)))
     {
-        let inherited_source = kind_default_source(&parsed.providers, &provider_config.name);
+        let inherited_source = kind_default_source(configs, provider_config.name());
         instantiate_provider_into_router(
             ctx,
             &mut router,
             provider_config,
             base_dir,
-            Some(binding.clone()),
+            Some(binding.to_string()),
             inherited_source,
         )
         .await?;
@@ -1614,11 +1617,25 @@ pub async fn get_provider_with_ctx<E>(
 /// default — the parser rejects `source` on `let <name> = provider
 /// <kind>` — so this is the only way to get the source URL while
 /// processing a named instance's wiring.
-fn kind_default_source<'a>(configs: &'a [ProviderConfig], kind: &str) -> Option<&'a str> {
+fn kind_default_source<'a>(configs: &'a ResolvedProviderConfigs, kind: &str) -> Option<&'a str> {
     configs
         .iter()
-        .find(|p| p.is_default() && p.name == kind)
-        .and_then(|p| p.source.as_deref())
+        .find(|config| config.is_default() && config.name() == kind)
+        .and_then(ResolvedProviderConfig::source)
+}
+
+/// Prepare the default instance used by implicit backend operations.
+///
+/// Both state-bucket bootstrap and deletion route through this typed seam, so
+/// neither can recover an attribute map from `parsed.providers`. Providers
+/// without a declared block retain the historical empty-config fallback.
+pub(crate) fn prepare_default_provider_ready_config(
+    factory: &dyn ProviderFactory,
+    provider_name: &str,
+    configs: &ResolvedProviderConfigs,
+) -> Result<ProviderReadyConfig, carina_core::executor::ProviderConfigPreparationError> {
+    let config = configs.provider_or_implicit(provider_name);
+    prepare_provider_ready_config(factory, config.as_ref())
 }
 
 /// Format the "Using <provider>" announcement emitted by both the
@@ -1667,7 +1684,7 @@ fn format_provider_using_line(
 async fn instantiate_provider_into_router(
     ctx: &WiringContext,
     router: &mut ProviderRouter,
-    provider_config: &ProviderConfig,
+    provider_config: &ResolvedProviderConfig,
     base_dir: &Path,
     binding: Option<String>,
     inherited_source: Option<&str>,
@@ -1677,18 +1694,14 @@ async fn instantiate_provider_into_router(
     // on `let <name> = provider <kind> { ... }`. Only the default
     // instance can trigger the source-loading path.
     if binding.is_none()
-        && let Some(ref source) = provider_config.source
+        && let Some(source) = provider_config.source()
     {
         try_add_source_provider(router, source, provider_config, base_dir).await?;
         return Ok(());
     }
 
-    if let Some(factory) = provider_mod::find_factory(ctx.factories(), &provider_config.name) {
-        let config = prepare_provider_ready_config(
-            factory,
-            &provider_config.name,
-            &provider_config.attributes,
-        )?;
+    if let Some(factory) = provider_mod::find_factory(ctx.factories(), provider_config.name()) {
+        let config = prepare_provider_ready_config(factory, provider_config)?;
         let region = factory.extract_region(config.attributes());
         // Reaching this branch implies `provider_config.source` is None:
         // the early-return above handles `binding.is_none() && source.is_some()`,
@@ -1708,23 +1721,23 @@ async fn instantiate_provider_into_router(
         let provider = factory
             .create_provider(binding.as_deref(), &config)
             .await
-            .map_err(|e| e.for_provider(provider_config.name.clone()))?;
+            .map_err(|e| e.for_provider(provider_config.name().to_string()))?;
         router.add_normalizer(
-            provider_config.name.clone(),
+            provider_config.name().to_string(),
             factory
                 .create_normalizer(binding.as_deref(), &config)
                 .await
-                .map_err(|e| e.for_provider(provider_config.name.clone()))?,
+                .map_err(|e| e.for_provider(provider_config.name().to_string()))?,
         );
-        router.add_provider_instance(provider_config.name.clone(), binding, provider);
-    } else if ctx.uses_builtin_mock() && provider_config.name == BUILTIN_PROVIDER_NAME {
+        router.add_provider_instance(provider_config.name().to_string(), binding, provider);
+    } else if ctx.uses_builtin_mock() && provider_config.name() == BUILTIN_PROVIDER_NAME {
         println!("{}", "Using mock provider".cyan());
         router.add_provider_instance(
-            provider_config.name.clone(),
+            provider_config.name().to_string(),
             binding,
             Box::new(MockProvider::new()),
         );
-    } else if !provider_config.name.is_empty() {
+    } else if !provider_config.name().is_empty() {
         let message = match &binding {
             // Named instance whose kind's default did not register a
             // factory — usually the default instance failed to load
@@ -1732,11 +1745,12 @@ async fn instantiate_provider_into_router(
             Some(name) => format!(
                 "Named provider instance '{}' (kind '{}') cannot be loaded \
                  because the kind's default instance is unavailable.",
-                name, provider_config.name
+                name,
+                provider_config.name()
             ),
             None => format!(
                 "Provider '{}' requires 'source' and 'version' attributes.",
-                provider_config.name
+                provider_config.name()
             ),
         };
         eprintln!("{}", message.red());
@@ -1747,7 +1761,7 @@ async fn instantiate_provider_into_router(
 async fn try_add_source_provider(
     router: &mut ProviderRouter,
     source: &str,
-    config: &ProviderConfig,
+    config: &ResolvedProviderConfig,
     base_dir: &Path,
 ) -> Result<(), AppError> {
     match load_source_provider(source, config, base_dir).await {
@@ -1759,11 +1773,11 @@ async fn try_add_source_provider(
             );
             router.add_provider(name, provider);
             router.add_normalizer(
-                config.name.clone(),
+                config.name().to_string(),
                 factory
                     .create_normalizer(None, &ready_config)
                     .await
-                    .map_err(|e| AppError::Provider(e.for_provider(config.name.clone())))?,
+                    .map_err(|e| AppError::Provider(e.for_provider(config.name().to_string())))?,
             );
             Ok(())
         }
@@ -1774,7 +1788,9 @@ async fn try_add_source_provider(
             // wrappers like "Failed to load provider '...': ...".
             // Attach provider name so the renderer can label the
             // structured block with the right provider.
-            Err(AppError::Provider(e.for_provider(config.name.clone())))
+            Err(AppError::Provider(
+                e.for_provider(config.name().to_string()),
+            ))
         }
         Err(LoadSourceError::Config(error)) => Err(AppError::from(error)),
         Err(LoadSourceError::Wasm(error)) => {
@@ -1787,7 +1803,7 @@ async fn try_add_source_provider(
         Err(LoadSourceError::Other(msg)) => {
             eprintln!(
                 "{}",
-                format!("Failed to load provider '{}': {}", config.name, msg).red()
+                format!("Failed to load provider '{}': {}", config.name(), msg).red()
             );
             Ok(())
         }
@@ -1820,7 +1836,7 @@ enum LoadSourceError {
 
 async fn load_source_provider(
     source: &str,
-    config: &ProviderConfig,
+    config: &ResolvedProviderConfig,
     base_dir: &Path,
 ) -> Result<
     (
@@ -1832,8 +1848,8 @@ async fn load_source_provider(
     LoadSourceError,
 > {
     let installed = if source.starts_with("file://") || source.starts_with("github.com/") {
-        carina_provider_resolver::find_installed_provider(base_dir, config)
-            .map_err(|e| LoadSourceError::Other(format!("Provider '{}' {}", config.name, e)))?
+        carina_provider_resolver::find_installed_provider(base_dir, config.as_provider_config())
+            .map_err(|e| LoadSourceError::Other(format!("Provider '{}' {}", config.name(), e)))?
     } else {
         return Err(LoadSourceError::Other(format!(
             "Unsupported source format: {source}. Use file:// for local binaries or github.com/owner/repo for remote."
@@ -1843,7 +1859,7 @@ async fn load_source_provider(
     if !carina_provider_resolver::is_wasm_provider(installed.path()) {
         return Err(LoadSourceError::Other(format!(
             "Provider '{}': native binaries are no longer supported. Use a .wasm component instead.",
-            config.name
+            config.name()
         )));
     }
 
@@ -1855,8 +1871,7 @@ async fn load_source_provider(
     let name = factory.name().to_string();
 
     let ready_config =
-        prepare_provider_ready_config(factory.as_ref(), &config.name, &config.attributes)
-            .map_err(LoadSourceError::Config)?;
+        prepare_provider_ready_config(factory.as_ref(), config).map_err(LoadSourceError::Config)?;
 
     let provider = factory
         .create_provider(None, &ready_config)
@@ -1871,30 +1886,30 @@ async fn load_source_provider(
 /// apply-time reference re-resolution (carina#3063) — without it the
 /// from-plan path would silently undo enum-alias / canonicalize stages.
 pub async fn create_providers_from_configs(
-    configs: &[ProviderConfig],
+    configs: &ResolvedProviderConfigs,
     base_dir: &Path,
 ) -> Result<(ProviderRouter, WiringContext), AppError> {
-    let (factories, _) = build_factories_from_providers(configs, base_dir)?;
-    let ctx = WiringContext::new(factories, configs);
+    let (factories, _) = build_factories_from_providers(configs.as_provider_configs(), base_dir)?;
+    let ctx = WiringContext::new(factories, configs.as_provider_configs());
     let mut router = ProviderRouter::new();
 
     // Same two-pass shape as `get_provider_with_ctx`: default instances
     // first (they may load the WASM plugin), then named instances reuse
     // the factory that was just loaded.
-    for config in configs.iter().filter(|p| p.is_default()) {
+    for config in configs.iter().filter(|config| config.is_default()) {
         instantiate_provider_into_router(&ctx, &mut router, config, base_dir, None, None).await?;
     }
     for (config, binding) in configs
         .iter()
-        .filter_map(|config| config.binding.as_ref().map(|binding| (config, binding)))
+        .filter_map(|config| config.binding().map(|binding| (config, binding)))
     {
-        let inherited_source = kind_default_source(configs, &config.name);
+        let inherited_source = kind_default_source(configs, config.name());
         instantiate_provider_into_router(
             &ctx,
             &mut router,
             config,
             base_dir,
-            Some(binding.clone()),
+            Some(binding.to_string()),
             inherited_source,
         )
         .await?;
@@ -2047,7 +2062,7 @@ pub struct DeferredForExpansion {
 /// upstream-only carve-out.
 ///
 /// Pure (no provider I/O) so it is unit-testable with a hand-built
-/// post-refresh `current_states`; `create_plan_from_parsed_with_upstream`
+/// post-refresh `current_states`; `create_plan_from_parsed_with_upstream_with_ctx`
 /// calls exactly this function, then targeted-refreshes
 /// `refreshable_child_ids`.
 ///
@@ -2343,63 +2358,11 @@ pub async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNorm
     })
 }
 
-/// Create a plan from parsed configuration (without upstream state bindings).
-///
-/// This is a convenience wrapper around `create_plan_from_parsed_with_upstream`
-/// for callers that don't use upstream_state blocks.
-#[allow(dead_code)]
-pub async fn create_plan_from_parsed<E: Clone>(
-    parsed: &carina_core::parser::File<E>,
-    state_file: &Option<StateFile>,
-    refresh: bool,
-    state_block_claims: &StateBlockClaims,
-    resolved_state_block_targets: &ResolvedStateBlockTargets,
-    base_dir: &Path,
-) -> Result<PlanContext, AppError> {
-    create_plan_from_parsed_with_upstream(
-        parsed,
-        &parsed.resources,
-        state_file,
-        refresh,
-        &HashMap::new(),
-        state_block_claims,
-        resolved_state_block_targets,
-        base_dir,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn create_plan_from_parsed_with_upstream<E: Clone>(
-    parsed: &carina_core::parser::File<E>,
-    unresolved_resources: &[Resource],
-    state_file: &Option<StateFile>,
-    refresh: bool,
-    remote_bindings: &HashMap<String, HashMap<String, Value>>,
-    state_block_claims: &StateBlockClaims,
-    resolved_state_block_targets: &ResolvedStateBlockTargets,
-    base_dir: &Path,
-) -> Result<PlanContext, AppError> {
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
-    let ctx = WiringContext::new(factories, &parsed.providers);
-    create_plan_from_parsed_with_upstream_with_ctx(
-        &ctx,
-        parsed,
-        unresolved_resources,
-        state_file,
-        refresh,
-        remote_bindings,
-        state_block_claims,
-        resolved_state_block_targets,
-        base_dir,
-    )
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E>,
+    provider_configs: &ResolvedProviderConfigs,
     unresolved_resources: &[Resource],
     state_file: &Option<StateFile>,
     refresh: bool,
@@ -2408,6 +2371,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     resolved_state_block_targets: &ResolvedStateBlockTargets,
     base_dir: &Path,
 ) -> Result<PlanContext, AppError> {
+    let raw_provider_configs = provider_configs.as_provider_configs();
     // Mutable: a same-config deferred-for loop is expanded into concrete
     // resources *after* refresh (carina#3132) and the augmented set is
     // re-sorted in place below. Every use up to that point sees the
@@ -2424,7 +2388,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     let data_sources: Vec<DataSource> = parsed.data_sources.clone();
 
     // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(ctx, parsed, base_dir).await?;
+    let provider = get_provider_with_ctx(ctx, provider_configs, base_dir).await?;
 
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
 
@@ -2593,7 +2557,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         moved_pairs.extend(apply_anonymous_to_named_renames(
             ctx,
             &sorted_resources,
-            &parsed.providers,
+            raw_provider_configs,
             &mut current_states,
             &mut prev_explicit,
             &mut saved_attrs,
@@ -2711,7 +2675,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             moved_pairs.extend(apply_anonymous_to_named_renames(
                 ctx,
                 &sorted_resources,
-                &parsed.providers,
+                raw_provider_configs,
                 &mut current_states,
                 &mut prev_explicit,
                 &mut saved_attrs,
@@ -2896,7 +2860,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                 &constraint_origin_resources,
                 &module_gate,
                 &mut current_states,
-                &parsed.providers,
+                raw_provider_configs,
                 &mut data_sources_for_plan,
                 &data_sources,
                 &mut wait_bindings,
@@ -2945,7 +2909,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
             resources: &mut override_aware_resources,
             state_file: state_file.as_ref(),
             state_block_claims,
-            providers: &parsed.providers,
+            providers: raw_provider_configs,
         },
     )?;
     validate_plan_time_state_block_collisions(

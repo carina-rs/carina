@@ -156,7 +156,6 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         &duplicate_declarations,
     )
     .unwrap();
-
     let mut state_file: Option<StateFile> = if state_path.exists() {
         let json = std::fs::read_to_string(&state_path).unwrap();
         // Go through check_and_migrate so v5 fixtures (with the legacy
@@ -294,6 +293,13 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             .unwrap_or_default();
         remote_bindings.insert(us.binding.clone(), bindings);
     }
+    let resolved_provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
+        &parsed,
+        &remote_bindings,
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("fixture provider configs must resolve");
+    let raw_provider_configs = resolved_provider_configs.as_provider_configs();
 
     let wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
         .wait_bindings
@@ -372,13 +378,12 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             .build()
             .expect("failed to build tokio runtime for plan preprocessing");
         for factory in wiring.factories() {
-            let attrs = indexmap::IndexMap::new();
+            let resolved_config = resolved_provider_configs.provider_or_implicit(factory.name());
             let config = rt
                 .block_on(async {
                     carina_core::executor::prepare_provider_ready_config(
                         factory.as_ref(),
-                        factory.name(),
-                        &attrs,
+                        resolved_config.as_ref(),
                     )
                 })
                 .expect("fixture provider config unexpectedly failed validation");
@@ -397,7 +402,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             &constraint_origin_resources,
             &module_gate,
             &mut current_states,
-            &parsed.providers,
+            raw_provider_configs,
             &mut data_sources_for_plan,
             &data_sources,
             &mut wait_bindings,
@@ -433,7 +438,7 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             resources: &mut override_aware_resources,
             state_file: state_file.as_ref(),
             state_block_claims: &state_block_claims,
-            providers: &parsed.providers,
+            providers: raw_provider_configs,
         },
     )
     .expect("fixture late anonymous identities must resolve uniquely");

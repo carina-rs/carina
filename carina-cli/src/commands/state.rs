@@ -9,7 +9,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::effect::Effect;
-use carina_core::executor::{UnresolvedDataSourceInput, prepare_provider_ready_config};
+use carina_core::executor::UnresolvedDataSourceInput;
 use carina_core::parser::ProviderContext;
 use carina_core::plan::Plan;
 use carina_core::provider::{
@@ -30,14 +30,18 @@ use carina_state::{
 };
 
 use super::{BackendDriftStatus, DriftCommand, inspect_backend_drift, verify_for_mutation};
+use crate::commands::plan::{
+    ProviderUpstreamScope, ResolvedProviderInputs, UpstreamMissingStatePolicy,
+    load_and_resolve_provider_configs,
+};
 use crate::commands::shared::finalize::release_lock_after_execute;
 use crate::commands::shared::state_writeback::{SkippedExports, apply_name_overrides};
 use crate::error::AppError;
 use crate::wiring::{
     DataSourceRefreshResolution, WiringContext, build_factories_from_providers,
-    data_source_refresh_bindings, get_provider_with_ctx, read_data_source_with_retry,
-    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
-    resolve_data_source_refs_for_refresh,
+    data_source_refresh_bindings, get_provider_with_ctx, prepare_default_provider_ready_config,
+    read_data_source_with_retry, reconcile_anonymous_identifiers_with_ctx,
+    reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -923,21 +927,14 @@ async fn run_state_bucket_delete(
         .resource_type()
         .ok_or("Backend does not specify a resource type")?;
     let base_dir = get_base_dir(path);
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
-    let ctx = WiringContext::new(factories, &parsed.providers);
-    let factory = provider_mod::find_factory(ctx.factories(), backend_provider_name)
-        .ok_or_else(|| format!("No provider factory found for '{}'", backend_provider_name))?;
-
-    // Create provider to delete the bucket
-    let provider_config_attrs = parsed
-        .providers
-        .iter()
-        .find(|p| p.name == backend_provider_name)
-        .map(|p| p.attributes.clone())
-        .unwrap_or_default();
-    let provider_config =
-        prepare_provider_ready_config(factory, backend_provider_name, &provider_config_attrs)?;
-    let bucket_provider = factory.create_provider(None, &provider_config).await?;
+    let provider_inputs =
+        load_state_bucket_delete_provider_inputs(&parsed, base_dir, provider_context).await?;
+    let (factories, _) =
+        build_factories_from_providers(provider_inputs.configs().as_provider_configs(), base_dir)?;
+    let ctx = WiringContext::new(factories, provider_inputs.configs().as_provider_configs());
+    let bucket_provider =
+        create_state_bucket_delete_provider(&ctx, provider_inputs.configs(), backend_provider_name)
+            .await?;
 
     // First, try to empty the bucket (delete all objects and versions)
     println!();
@@ -978,6 +975,35 @@ async fn run_state_bucket_delete(
         }
         Err(e) => Err(AppError::Provider(e)),
     }
+}
+
+async fn load_state_bucket_delete_provider_inputs<E>(
+    parsed: &carina_core::parser::File<E>,
+    base_dir: &Path,
+    provider_context: &ProviderContext,
+) -> Result<ResolvedProviderInputs, AppError> {
+    load_and_resolve_provider_configs(
+        parsed,
+        base_dir,
+        provider_context,
+        UpstreamMissingStatePolicy::Strict,
+        ProviderUpstreamScope::ProviderReferences,
+    )
+    .await
+}
+
+async fn create_state_bucket_delete_provider(
+    ctx: &WiringContext,
+    provider_configs: &carina_core::parser::ResolvedProviderConfigs,
+    provider_name: &str,
+) -> Result<Box<dyn carina_core::provider::Provider>, AppError> {
+    let factory = provider_mod::find_factory(ctx.factories(), provider_name)
+        .ok_or_else(|| format!("No provider factory found for '{provider_name}'"))?;
+    let config = prepare_default_provider_ready_config(factory, provider_name, provider_configs)?;
+    factory
+        .create_provider(None, &config)
+        .await
+        .map_err(AppError::Provider)
 }
 
 /// Run state refresh command
@@ -1038,6 +1064,7 @@ pub async fn run_state_refresh(
         backend.as_ref(),
         lock_info.as_ref(),
         base_dir,
+        provider_context,
         cancel.clone(),
     )
     .await;
@@ -1062,12 +1089,24 @@ pub(crate) async fn run_state_refresh_locked(
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
     base_dir: &std::path::Path,
+    provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    // Provider declaration metadata is sufficient for schema/factory wiring;
+    // construction attributes are resolved after state reconciliation below.
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
     let ctx = WiringContext::new(factories, &parsed.providers);
 
-    run_state_refresh_locked_with_ctx(parsed, backend, lock, base_dir, cancel, &ctx).await
+    run_state_refresh_locked_with_ctx(
+        parsed,
+        backend,
+        lock,
+        base_dir,
+        provider_context,
+        cancel,
+        &ctx,
+    )
+    .await
 }
 
 async fn run_state_refresh_locked_with_ctx(
@@ -1075,6 +1114,7 @@ async fn run_state_refresh_locked_with_ctx(
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
     base_dir: &std::path::Path,
+    provider_context: &ProviderContext,
     cancel: ShutdownToken,
     ctx: &WiringContext,
 ) -> Result<(), AppError> {
@@ -1119,10 +1159,19 @@ async fn run_state_refresh_locked_with_ctx(
     // notes/specs/2026-06-28-issue-3625-cbd-decompose-clean-design.md Phase 5 T5.8.
     apply_name_overrides(&mut parsed.resources, &state_file);
 
+    let provider_inputs = load_and_resolve_provider_configs(
+        parsed,
+        base_dir,
+        provider_context,
+        UpstreamMissingStatePolicy::Strict,
+        ProviderUpstreamScope::ProviderReferences,
+    )
+    .await?;
+
     let mut sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select provider
-    let provider = get_provider_with_ctx(ctx, parsed, base_dir).await?;
+    let provider = get_provider_with_ctx(ctx, provider_inputs.configs(), base_dir).await?;
 
     println!();
     println!("{}", "Refreshing state...".cyan().bold());
@@ -2027,6 +2076,10 @@ mod tests {
     use crate::commands::shared::cancellation_test_support::{
         CancellationFixtureBase, MOCK_PROVIDER_ENV_LOCK, ScopedEnv, install_refresh_drain_barrier,
     };
+    use crate::provider_upstream_test_support::{
+        ProviderConfigCaptureFactory, provider_default_tags_local_resource_fixture,
+        provider_default_tags_missing_upstream_fixture, provider_upstream_fixture,
+    };
     use carina_core::parser::parse;
     use carina_core::parser::{CompareOp, TypeExpr, ValidateExpr};
     use carina_core::provider::{
@@ -2051,6 +2104,16 @@ mod tests {
 
     struct ModuleConstraintRefreshBackend {
         state: StateFile,
+    }
+
+    fn non_empty_refresh_backend(provider: &str) -> ModuleConstraintRefreshBackend {
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(
+                ResourceState::new("thing", "orphan", provider).with_identifier("orphan"),
+            )
+            .unwrap();
+        ModuleConstraintRefreshBackend { state }
     }
 
     #[async_trait::async_trait]
@@ -2114,6 +2177,313 @@ mod tests {
         fn resource_definition(&self, _bucket_name: &str) -> Option<String> {
             None
         }
+    }
+
+    #[tokio::test]
+    async fn state_refresh_resolves_provider_config_from_upstream_state_before_construction() {
+        let (_temp, downstream, mut parsed) = provider_upstream_fixture();
+        let received_role_arn = Arc::new(Mutex::new(None));
+        let ctx = WiringContext::new(
+            vec![Box::new(ProviderConfigCaptureFactory {
+                received_role_arn: Arc::clone(&received_role_arn),
+            })],
+            &parsed.providers,
+        );
+        let backend = non_empty_refresh_backend("test");
+
+        run_state_refresh_locked_with_ctx(
+            &mut parsed,
+            &backend,
+            None,
+            &downstream,
+            &ProviderContext::default(),
+            ShutdownToken::running(),
+            &ctx,
+        )
+        .await
+        .expect("state refresh must construct the provider from resolved upstream attributes");
+
+        assert_eq!(
+            *received_role_arn.lock().unwrap(),
+            Some(Value::Concrete(ConcreteValue::String(
+                "arn:aws:iam::123456789012:role/upstream".to_string()
+            )))
+        );
+    }
+
+    #[tokio::test]
+    async fn state_refresh_provider_resolution_ignores_unrelated_missing_upstream_state() {
+        let (_temp, downstream, mut parsed) = provider_upstream_fixture();
+        let unrelated = downstream.parent().unwrap().join("unrelated");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        std::fs::write(
+            unrelated.join("main.crn"),
+            "backend local { path = \"carina.state.json\" }\n",
+        )
+        .unwrap();
+        parsed
+            .upstream_states
+            .push(carina_core::parser::UpstreamState {
+                binding: "unrelated".to_string(),
+                source: PathBuf::from("../unrelated"),
+            });
+        let received_role_arn = Arc::new(Mutex::new(None));
+        let ctx = WiringContext::new(
+            vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
+            &parsed.providers,
+        );
+        let backend = non_empty_refresh_backend("test");
+        run_state_refresh_locked_with_ctx(
+            &mut parsed,
+            &backend,
+            None,
+            &downstream,
+            &ProviderContext::default(),
+            ShutdownToken::running(),
+            &ctx,
+        )
+        .await
+        .expect("state refresh must not load an upstream unused by provider configuration");
+    }
+
+    #[tokio::test]
+    async fn state_refresh_provider_resolution_reports_referenced_missing_upstream_state() {
+        let (_temp, downstream, mut parsed) = provider_upstream_fixture();
+        std::fs::remove_file(
+            downstream
+                .parent()
+                .unwrap()
+                .join("upstream")
+                .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
+        )
+        .unwrap();
+        let received_role_arn = Arc::new(Mutex::new(None));
+        let ctx = WiringContext::new(
+            vec![Box::new(ProviderConfigCaptureFactory { received_role_arn })],
+            &parsed.providers,
+        );
+        let backend = non_empty_refresh_backend("test");
+
+        let error = match run_state_refresh_locked_with_ctx(
+            &mut parsed,
+            &backend,
+            None,
+            &downstream,
+            &ProviderContext::default(),
+            ShutdownToken::running(),
+            &ctx,
+        )
+        .await
+        {
+            Ok(_) => panic!("state refresh must fail when provider-referenced state is missing"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("upstream_state 'mgmt'"), "{message}");
+        assert!(message.contains("no state found"), "{message}");
+        assert!(
+            message.contains("required by provider 'test' attribute 'role_arn'"),
+            "{message}"
+        );
+        let AppError::ProviderReferencedUpstream { source, .. } = &error else {
+            panic!("provider-reference context must remain a typed AppError: {error:?}");
+        };
+        assert!(
+            matches!(source.as_ref(), AppError::Config(_)),
+            "the wrapped source must remain the original typed upstream error: {source:?}"
+        );
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "provider-reference context must expose the upstream error via Error::source"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_refresh_without_downstream_state_ignores_missing_provider_upstream() {
+        let (_temp, downstream, mut parsed) = provider_upstream_fixture();
+        std::fs::remove_file(
+            downstream
+                .parent()
+                .unwrap()
+                .join("upstream")
+                .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
+        )
+        .unwrap();
+        let backend =
+            carina_state::LocalBackend::with_path(downstream.join("missing-local-state.json"));
+
+        run_state_refresh_locked(
+            &mut parsed,
+            &backend,
+            None,
+            &downstream,
+            &ProviderContext::default(),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect("state refresh must return before resolving providers when no local state exists");
+    }
+
+    #[tokio::test]
+    async fn state_refresh_allows_default_tags_referencing_local_computed_attributes() {
+        let (_temp, base_dir, mut parsed) = provider_default_tags_local_resource_fixture();
+        let backend = non_empty_refresh_backend("mock");
+
+        run_state_refresh_locked(
+            &mut parsed,
+            &backend,
+            None,
+            &base_dir,
+            &ProviderContext::default(),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect("state refresh must defer provider default tags until resource normalization");
+    }
+
+    #[tokio::test]
+    async fn state_refresh_ignores_missing_upstream_referenced_only_by_default_tags() {
+        let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
+        let backend = non_empty_refresh_backend("mock");
+
+        run_state_refresh_locked(
+            &mut parsed,
+            &backend,
+            None,
+            &base_dir,
+            &ProviderContext::default(),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect("state refresh must not load upstream state used only by default tags");
+    }
+
+    #[tokio::test]
+    async fn state_bucket_delete_prepares_resolved_upstream_provider_config() {
+        let (_temp, downstream, parsed) = provider_upstream_fixture();
+        let inputs = load_state_bucket_delete_provider_inputs(
+            &parsed,
+            &downstream,
+            &ProviderContext::default(),
+        )
+        .await
+        .expect("state bucket delete provider inputs must resolve");
+        let received_role_arn = Arc::new(Mutex::new(None));
+        let ctx = WiringContext::new(
+            vec![Box::new(ProviderConfigCaptureFactory {
+                received_role_arn: Arc::clone(&received_role_arn),
+            })],
+            inputs.configs().as_provider_configs(),
+        );
+        create_state_bucket_delete_provider(&ctx, inputs.configs(), "test")
+            .await
+            .expect("state bucket delete must create from the resolved value");
+
+        assert_eq!(
+            received_role_arn.lock().unwrap().as_ref(),
+            Some(&Value::Concrete(ConcreteValue::String(
+                "arn:aws:iam::123456789012:role/upstream".to_string()
+            )))
+        );
+    }
+
+    #[tokio::test]
+    async fn state_bucket_delete_reports_provider_attribute_for_missing_upstream_state() {
+        let (_temp, downstream, parsed) = provider_upstream_fixture();
+        std::fs::remove_file(
+            downstream
+                .parent()
+                .unwrap()
+                .join("upstream")
+                .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
+        )
+        .unwrap();
+
+        let error = match load_state_bucket_delete_provider_inputs(
+            &parsed,
+            &downstream,
+            &ProviderContext::default(),
+        )
+        .await
+        {
+            Ok(_) => panic!("bucket delete must fail when provider-referenced state is missing"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("upstream_state 'mgmt'"), "{message}");
+        assert!(message.contains("no state found"), "{message}");
+        assert!(
+            message.contains("required by provider 'test' attribute 'role_arn'"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_bucket_delete_ignores_upstream_referenced_only_by_default_tags() {
+        let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
+        parsed.providers[0].name = "test".to_string();
+        let inputs = load_state_bucket_delete_provider_inputs(
+            &parsed,
+            &base_dir,
+            &ProviderContext::default(),
+        )
+        .await
+        .expect("bucket delete must not load tag-only upstream state");
+        let received_role_arn = Arc::new(Mutex::new(None));
+        let ctx = WiringContext::new(
+            vec![Box::new(ProviderConfigCaptureFactory {
+                received_role_arn: Arc::clone(&received_role_arn),
+            })],
+            inputs.configs().as_provider_configs(),
+        );
+
+        create_state_bucket_delete_provider(&ctx, inputs.configs(), "test")
+            .await
+            .expect("bucket delete must construct without resolving default tags");
+        assert_eq!(*received_role_arn.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn state_bucket_delete_accepts_parser_deferred_non_literal_default_tags() {
+        let temp = tempfile::tempdir().unwrap();
+        let parsed = parse(
+            r#"
+                let tags_mod = use { source = "./modules/standard-tags" }
+                let tags = tags_mod { environment = "dev" }
+
+                provider test {
+                    default_tags = tags.tags
+                }
+            "#,
+            &ProviderContext::default(),
+        )
+        .expect("fixture must parse");
+        assert!(
+            parsed.providers[0]
+                .unresolved_attributes
+                .contains_key("default_tags"),
+            "the fixture must exercise the parser shape used by bucket delete"
+        );
+
+        let inputs = load_state_bucket_delete_provider_inputs(
+            &parsed,
+            temp.path(),
+            &ProviderContext::default(),
+        )
+        .await
+        .expect("deferred default tags must not block bucket provider construction");
+        let received_role_arn = Arc::new(Mutex::new(None));
+        let ctx = WiringContext::new(
+            vec![Box::new(ProviderConfigCaptureFactory {
+                received_role_arn: Arc::clone(&received_role_arn),
+            })],
+            inputs.configs().as_provider_configs(),
+        );
+
+        create_state_bucket_delete_provider(&ctx, inputs.configs(), "test")
+            .await
+            .expect("bucket delete must use the real prepared-provider path");
+        assert_eq!(*received_role_arn.lock().unwrap(), None);
     }
 
     struct ModuleConstraintRefreshFactory {
@@ -2291,6 +2661,7 @@ mod tests {
             &backend,
             None,
             temp.path(),
+            &ProviderContext::default(),
             ShutdownToken::running(),
             &ctx,
         )

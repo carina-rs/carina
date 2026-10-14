@@ -3131,9 +3131,11 @@ mod tests {
         }
 
         let factory = FailingFactory;
-        let attributes = IndexMap::new();
+        let resolved_configs =
+            crate::parser::ResolvedProviderConfigs::from_test_configs(Vec::new()).unwrap();
+        let resolved_config = resolved_configs.provider_or_implicit(factory.name());
         let config =
-            crate::executor::prepare_provider_ready_config(&factory, factory.name(), &attributes)
+            crate::executor::prepare_provider_ready_config(&factory, resolved_config.as_ref())
                 .unwrap();
         let result = factory.create_provider(None, &config).await;
         let err = match result {
@@ -3213,9 +3215,11 @@ mod tests {
         }
 
         let factory = BindingCapturingFactory::default();
-        let attributes = IndexMap::new();
+        let resolved_configs =
+            crate::parser::ResolvedProviderConfigs::from_test_configs(Vec::new()).unwrap();
+        let resolved_config = resolved_configs.provider_or_implicit(factory.name());
         let config =
-            crate::executor::prepare_provider_ready_config(&factory, factory.name(), &attributes)
+            crate::executor::prepare_provider_ready_config(&factory, resolved_config.as_ref())
                 .unwrap();
         let _ = factory.create_provider(None, &config).await.unwrap();
         let _ = factory.create_provider(Some("us"), &config).await.unwrap();

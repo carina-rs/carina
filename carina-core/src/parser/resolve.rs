@@ -3,7 +3,7 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use super::ProviderContext;
-use super::ast::ParsedFile;
+use super::ast::{ParsedFile, ProviderConfig};
 use super::entry::BindingSeed;
 use super::error::{ParseError, undefined_identifier_error};
 use super::static_eval::is_static_value;
@@ -12,7 +12,213 @@ use crate::resource::{
     ConcreteValue, DataSource, DeferredValue, InterpolationPart, Resource, Value,
 };
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use thiserror::Error;
+
+/// One provider configuration whose construction-time attributes have crossed
+/// an allowed resolution seam.
+///
+/// The inner parser value is private so provider construction cannot accept a
+/// raw [`ProviderConfig`]. Instances come only from
+/// [`resolve_provider_attributes_with_remote`], a checked
+/// [`TryFrom`](std::convert::TryFrom) conversion of a deserialized
+/// [`SavedProviderConfigs`], or the collection-owned implicit fallback returned
+/// only when no block of the requested provider kind is declared.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedProviderConfig {
+    config: ProviderConfig,
+}
+
+impl ResolvedProviderConfig {
+    fn from_resolved(config: ProviderConfig) -> Self {
+        Self { config }
+    }
+
+    fn implicit(name: impl Into<String>) -> Self {
+        Self {
+            config: ProviderConfig {
+                name: name.into(),
+                attributes: IndexMap::new(),
+                default_tags: IndexMap::new(),
+                source: None,
+                version: None,
+                revision: None,
+                unresolved_attributes: IndexMap::new(),
+                binding: None,
+            },
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.config.name
+    }
+
+    pub fn attributes(&self) -> &IndexMap<String, Value> {
+        &self.config.attributes
+    }
+
+    pub fn source(&self) -> Option<&str> {
+        self.config.source.as_deref()
+    }
+
+    pub fn binding(&self) -> Option<&str> {
+        self.config.binding.as_deref()
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.config.is_default()
+    }
+
+    /// Borrow the serializable parser representation for metadata consumers.
+    ///
+    /// Provider-construction APIs intentionally do not accept this raw type.
+    pub fn as_provider_config(&self) -> &ProviderConfig {
+        &self.config
+    }
+}
+
+/// Provider configurations whose construction-time attributes have crossed an
+/// allowed resolution seam.
+///
+/// There is intentionally no `Default`, `From<Vec<ProviderConfig>>`, or
+/// deserialization implementation. Raw parser configs cannot be used for
+/// provider construction without first resolving upstream bindings or
+/// validating a saved-plan payload.
+///
+/// ```compile_fail
+/// use carina_core::parser::{ProviderConfig, ResolvedProviderConfigs};
+///
+/// let raw = Vec::<ProviderConfig>::new();
+/// let _: ResolvedProviderConfigs = raw.into();
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedProviderConfigs {
+    configs: Vec<ResolvedProviderConfig>,
+    provider_configs: Vec<ProviderConfig>,
+}
+
+impl ResolvedProviderConfigs {
+    fn from_resolved(configs: Vec<ProviderConfig>) -> Result<Self, ProviderConfigInvariantError> {
+        validate_resolved_provider_configs(&configs)?;
+        let resolved = configs
+            .iter()
+            .cloned()
+            .map(ResolvedProviderConfig::from_resolved)
+            .collect();
+        Ok(Self {
+            configs: resolved,
+            provider_configs: configs,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_configs(
+        configs: Vec<ProviderConfig>,
+    ) -> Result<Self, ProviderConfigInvariantError> {
+        Self::from_resolved(configs)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ResolvedProviderConfig> {
+        self.configs.iter()
+    }
+
+    fn find_default(&self, name: &str) -> Option<&ResolvedProviderConfig> {
+        self.configs
+            .iter()
+            .find(|config| config.is_default() && config.name() == name)
+    }
+
+    /// Select the configuration for an implicit operation of `name`.
+    ///
+    /// A default block wins. If the project declares only named instances,
+    /// retain the historical first-declaration behavior. The empty fallback
+    /// can be produced only here, and only when no block of this provider kind
+    /// exists in this already-validated collection.
+    pub fn provider_or_implicit(&self, name: &str) -> Cow<'_, ResolvedProviderConfig> {
+        self.find_default(name)
+            .or_else(|| self.configs.iter().find(|config| config.name() == name))
+            .map_or_else(
+                || Cow::Owned(ResolvedProviderConfig::implicit(name)),
+                Cow::Borrowed,
+            )
+    }
+
+    /// Borrow the resolved serializable shape used by saved plans and
+    /// metadata-only consumers.
+    pub fn as_provider_configs(&self) -> &[ProviderConfig] {
+        &self.provider_configs
+    }
+}
+
+/// Provider configurations crossing the saved-plan serialization seam.
+///
+/// The transparent representation preserves the historical JSON array shape.
+/// Values can be created only from already-resolved configs or by
+/// deserialization; converting them back to [`ResolvedProviderConfigs`]
+/// revalidates every construction-time attribute.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SavedProviderConfigs(Vec<ProviderConfig>);
+
+impl SavedProviderConfigs {
+    /// Borrow the serialized provider configuration projection.
+    pub fn as_provider_configs(&self) -> &[ProviderConfig] {
+        &self.0
+    }
+}
+
+impl From<&ResolvedProviderConfigs> for SavedProviderConfigs {
+    fn from(configs: &ResolvedProviderConfigs) -> Self {
+        Self(configs.provider_configs.clone())
+    }
+}
+
+impl TryFrom<SavedProviderConfigs> for ResolvedProviderConfigs {
+    type Error = ProviderConfigInvariantError;
+
+    fn try_from(configs: SavedProviderConfigs) -> Result<Self, Self::Error> {
+        Self::from_resolved(configs.0)
+    }
+}
+
+fn validate_resolved_provider_configs(
+    configs: &[ProviderConfig],
+) -> Result<(), ProviderConfigInvariantError> {
+    for config in configs {
+        for (attribute, value) in &config.attributes {
+            crate::resource::assert_value_fully_resolved(value).map_err(|source| {
+                ProviderConfigInvariantError::UnresolvedAttribute {
+                    provider: config.name.clone(),
+                    attribute: attribute.clone(),
+                    source: Box::new(source),
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+pub enum ProviderConfigInvariantError {
+    #[error("provider {provider}: {attribute}: {source}")]
+    UnresolvedAttribute {
+        provider: String,
+        attribute: String,
+        #[source]
+        source: Box<crate::value::SerializationError>,
+    },
+}
+
+/// Failure while resolving a parsed provider configuration.
+#[derive(Debug, Error)]
+pub enum ProviderConfigResolutionError {
+    #[error(transparent)]
+    Parse(#[from] ParseError),
+    #[error(transparent)]
+    Invariant(#[from] ProviderConfigInvariantError),
+}
 
 /// Mutable pre-apply traversal — the resolver mutates `attributes` and
 /// `dependency_bindings` of every resource whose references are resolved
@@ -844,26 +1050,28 @@ pub fn resolve_provider_unresolved_attributes<E>(
 
 /// Resolve `ResourceRef` values inside provider blocks' `attributes`
 /// against a binding map built from `parsed`'s resources and `remote_bindings`
-/// (the values fetched by `load_upstream_states` at plan/apply time).
+/// (the values fetched by the CLI's shared upstream-loading step).
 ///
-/// This is the plan/apply-time counterpart to
-/// [`resolve_provider_unresolved_attributes`], which only touches the
-/// parse-time `unresolved_attributes` bucket (default_tags etc.). The
-/// regular `provider.attributes` map can contain refs nested inside
+/// This is the strict plan/apply-time counterpart to the edit-tolerant
+/// [`resolve_provider_unresolved_attributes`] pass. It resolves only regular
+/// provider attributes. `default_tags` deliberately remain deferred because
+/// they are resolved per resource during desired normalization. The regular
+/// `provider.attributes` map can contain refs nested inside
 /// struct literals — `assume_role = { role_arn = upstream.arn }` is the
 /// motivating case (carina#3182) — and those refs need to be substituted
 /// before the attributes cross the WASM provider boundary in
 /// `create_provider`.
 ///
-/// Refs whose binding is unknown (neither a top-level resource nor an
-/// upstream binding) are left in place so the caller can decide whether
-/// that is a fatal error or expected (validate path tolerates it; the
-/// post-resolution WASM boundary rejects it on plan/apply).
+/// Every construction-time provider attribute is resolved and then checked
+/// before the typed result is minted. Unknown references therefore fail here;
+/// validation/LSP paths that intentionally tolerate incomplete edits use the
+/// lower-level parser resolution passes and never receive
+/// [`ResolvedProviderConfigs`].
 pub fn resolve_provider_attributes_with_remote<E>(
-    parsed: &mut super::File<E>,
+    parsed: &super::File<E>,
     remote_bindings: &HashMap<String, HashMap<String, Value>>,
     config: &ProviderContext,
-) -> Result<(), ParseError> {
+) -> Result<ResolvedProviderConfigs, ProviderConfigResolutionError> {
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for rref in parsed.iter_top_level_resources() {
         if let Some(binding_name) = rref.binding() {
@@ -877,15 +1085,19 @@ pub fn resolve_provider_attributes_with_remote<E>(
     let mut fn_ctx = super::ParseContext::new(config);
     fn_ctx.user_functions = parsed.user_functions.clone();
 
-    for provider in &mut parsed.providers {
-        let mut resolved: IndexMap<String, Value> = IndexMap::new();
+    let mut providers = Vec::with_capacity(parsed.providers.len());
+    for provider in &parsed.providers {
+        let mut provider = provider.clone();
+        let mut resolved = IndexMap::new();
         for (key, expr) in &provider.attributes {
             let r = resolve_value_with_config(expr, &binding_map, &fn_ctx)?;
             resolved.insert(key.clone(), r);
         }
         provider.attributes = resolved;
+
+        providers.push(provider);
     }
-    Ok(())
+    ResolvedProviderConfigs::from_resolved(providers).map_err(Into::into)
 }
 
 /// Drain `ProviderConfig.unresolved_attributes` and promote resolved

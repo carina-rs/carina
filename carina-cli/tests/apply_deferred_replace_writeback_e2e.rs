@@ -7,7 +7,10 @@ use carina_cli::commands::plan::{CurrentStateEntry, PlanFile};
 use carina_core::effect::{
     DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration, NonEmptyDeletes,
 };
-use carina_core::parser::{BackendConfig, DeferredForExpression, ForBinding, ProviderConfig};
+use carina_core::parser::{
+    BackendConfig, DeferredForExpression, ForBinding, ProviderConfig, ProviderContext,
+    SavedProviderConfigs,
+};
 use carina_core::plan::Plan;
 use carina_core::resource::{
     ConcreteValue, Directives, ResolvedResource, Resource, ResourceId, State, Value,
@@ -18,6 +21,29 @@ use tempfile::TempDir;
 
 fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
+}
+
+fn mock_saved_provider_configs() -> SavedProviderConfigs {
+    let parsed = carina_core::parser::InferredFile {
+        providers: vec![ProviderConfig {
+            name: "mock".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        }],
+        ..Default::default()
+    };
+    let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
+        &parsed,
+        &HashMap::new(),
+        &ProviderContext::default(),
+    )
+    .expect("test provider config must resolve");
+    SavedProviderConfigs::from(&resolved)
 }
 
 struct Scenario {
@@ -220,16 +246,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         source_path: project.display().to_string(),
         state_lineage: Some(state.lineage.clone()),
         state_serial: Some(state.serial),
-        provider_configs: vec![ProviderConfig {
-            name: "mock".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
-            source: None,
-            version: None,
-            revision: None,
-            unresolved_attributes: IndexMap::new(),
-            binding: None,
-        }],
+        provider_configs: mock_saved_provider_configs(),
         backend_config: Some(BackendConfig {
             backend_type: "local".to_string(),
             attributes: HashMap::from([(
@@ -340,16 +357,7 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         source_path: scenario.project.display().to_string(),
         state_lineage: Some(state.lineage.clone()),
         state_serial: Some(state.serial),
-        provider_configs: vec![ProviderConfig {
-            name: "mock".to_string(),
-            attributes: IndexMap::new(),
-            default_tags: IndexMap::new(),
-            source: None,
-            version: None,
-            revision: None,
-            unresolved_attributes: IndexMap::new(),
-            binding: None,
-        }],
+        provider_configs: mock_saved_provider_configs(),
         backend_config: Some(BackendConfig {
             backend_type: "local".to_string(),
             attributes: HashMap::from([(

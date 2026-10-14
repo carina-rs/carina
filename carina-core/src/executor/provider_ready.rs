@@ -17,7 +17,7 @@ use crate::binding_index::ResolvedBindings;
 use crate::executor::normalized::apply_desired_normalization;
 pub use crate::module_resolver::ModuleConstraintFailure;
 use crate::module_resolver::evaluate_pending_constraints;
-use crate::parser::ProviderConfig;
+use crate::parser::{ProviderConfig, ResolvedProviderConfig};
 use crate::provider::{CreateRequest, ProviderFactory, ProviderNormalizer, UpdateRequest};
 use crate::resource::{
     Composition, ConcreteValue, DataSource, DeferredValue, ResolvedDataSource, ResolvedResource,
@@ -359,14 +359,6 @@ pub struct ProviderConfigValidationError {
 /// Failure while preparing configuration for provider construction.
 #[derive(Debug, Error)]
 pub enum ProviderConfigPreparationError {
-    /// A deferred placeholder survived provider attribute resolution.
-    #[error("provider {provider}: {attribute}: {source}")]
-    UnresolvedAttribute {
-        provider: String,
-        attribute: String,
-        #[source]
-        source: Box<SerializationError>,
-    },
     /// A concrete attribute violates its host-side type schema.
     #[error("provider {provider}: {attribute}: {source}")]
     InvalidAttribute {
@@ -386,25 +378,29 @@ pub enum ProviderConfigPreparationError {
 
 /// Prepare provider configuration for construction and normalization.
 ///
-/// Checks run in boundary order: every value must be fully resolved, each
-/// known attribute must satisfy the provider's host-side schema, and finally
-/// the provider-specific configuration validator must accept the complete
-/// map. This is the sole constructor for [`ProviderReadyConfig`].
+/// [`ResolvedProviderConfig`] carries the guarantee that every construction-
+/// time attribute is fully resolved. This boundary therefore checks each
+/// attribute against the provider's host-side schema and then runs the
+/// provider-specific configuration validator. This is the sole constructor
+/// for [`ProviderReadyConfig`].
+///
+/// A raw parser config cannot skip the provider-resolution capability.
+///
+/// ```compile_fail
+/// use carina_core::executor::prepare_provider_ready_config;
+/// use carina_core::parser::ProviderConfig;
+/// use carina_core::provider::ProviderFactory;
+///
+/// fn bypass(factory: &dyn ProviderFactory, raw: &ProviderConfig) {
+///     let _ = prepare_provider_ready_config(factory, raw);
+/// }
+/// ```
 pub fn prepare_provider_ready_config(
     factory: &dyn ProviderFactory,
-    provider_name: &str,
-    attributes: &IndexMap<String, Value>,
+    config: &ResolvedProviderConfig,
 ) -> Result<ProviderReadyConfig, ProviderConfigPreparationError> {
-    for (attribute, value) in attributes {
-        crate::resource::assert_value_fully_resolved(value).map_err(|source| {
-            ProviderConfigPreparationError::UnresolvedAttribute {
-                provider: provider_name.to_string(),
-                attribute: attribute.clone(),
-                source: Box::new(source),
-            }
-        })?;
-    }
-
+    let provider_name = config.name();
+    let attributes = config.attributes();
     validate_provider_config_attributes(factory, provider_name, attributes)?;
 
     factory.validate_config(attributes).map_err(|message| {
@@ -747,8 +743,9 @@ mod provider_config_tests {
     use indexmap::IndexMap;
 
     use super::*;
+    use crate::parser::ResolvedProviderConfigs;
     use crate::provider::{Provider, ProviderResult};
-    use crate::resource::{AccessPath, ConcreteValue};
+    use crate::resource::ConcreteValue;
     use crate::schema::AttributeType;
 
     struct ConfigFactory {
@@ -817,14 +814,29 @@ mod provider_config_tests {
         IndexMap::from([("region".to_string(), value)])
     }
 
+    fn resolved_configs(attributes: IndexMap<String, Value>) -> ResolvedProviderConfigs {
+        ResolvedProviderConfigs::from_test_configs(vec![crate::parser::ProviderConfig {
+            name: "test".to_string(),
+            attributes,
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        }])
+        .expect("test provider attributes must satisfy the resolved-config invariant")
+    }
+
     #[test]
     fn prepare_provider_ready_config_accepts_valid_attributes() {
         let factory = ConfigFactory::successful();
         let attributes = config(Value::Concrete(ConcreteValue::String(
             "good-tokyo".to_string(),
         )));
+        let resolved = resolved_configs(attributes.clone());
 
-        let ready = prepare_provider_ready_config(&factory, "test", &attributes)
+        let ready = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
             .expect("valid provider config must be prepared");
 
         assert_eq!(ready.attributes(), &attributes);
@@ -835,8 +847,9 @@ mod provider_config_tests {
     fn prepare_provider_ready_config_rejects_pattern_violation() {
         let factory = ConfigFactory::successful();
         let attributes = config(Value::Concrete(ConcreteValue::String("bad".to_string())));
+        let resolved = resolved_configs(attributes);
 
-        let error = prepare_provider_ready_config(&factory, "test", &attributes)
+        let error = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
             .expect_err("pattern mismatch must fail preparation");
         let message = error.to_string();
 
@@ -848,31 +861,14 @@ mod provider_config_tests {
     }
 
     #[test]
-    fn prepare_provider_ready_config_rejects_unresolved_reference() {
-        let factory = ConfigFactory::successful();
-        let attributes = config(Value::Deferred(DeferredValue::ResourceRef {
-            path: AccessPath::new("upstream", "region"),
-        }));
-
-        let error = prepare_provider_ready_config(&factory, "test", &attributes)
-            .expect_err("unresolved provider config must fail preparation");
-        let message = error.to_string();
-
-        assert!(message.contains("provider test"), "{message}");
-        assert!(message.contains("region"), "{message}");
-        assert!(message.contains("upstream.region"), "{message}");
-        assert!(std::error::Error::source(&error).is_some());
-        assert_eq!(factory.validate_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
     fn prepare_provider_ready_config_rejects_plugin_validation_failure() {
         let factory = ConfigFactory::failing("configured account is forbidden");
         let attributes = config(Value::Concrete(ConcreteValue::String(
             "good-tokyo".to_string(),
         )));
+        let resolved = resolved_configs(attributes);
 
-        let error = prepare_provider_ready_config(&factory, "test", &attributes)
+        let error = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
             .expect_err("plugin config validation must fail preparation");
         let message = error.to_string();
 
@@ -892,8 +888,9 @@ mod provider_config_tests {
         let attributes = config(Value::Deferred(DeferredValue::Secret(Box::new(
             Value::Concrete(ConcreteValue::String("good-secret".to_string())),
         ))));
+        let resolved = resolved_configs(attributes);
 
-        let error = prepare_provider_ready_config(&factory, "test", &attributes)
+        let error = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
             .expect_err("plugin config validation must fail preparation");
         let message = error.to_string();
 

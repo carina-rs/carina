@@ -2738,7 +2738,7 @@ fn resolve_provider_attributes_with_remote_substitutes_upstream_refs() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
 
     // Pre-check: the ref survives parsing nested inside the assume_role map.
     let pre = parsed.providers[0].attributes.get("assume_role").unwrap();
@@ -2765,10 +2765,17 @@ fn resolve_provider_attributes_with_remote_substitutes_upstream_refs() {
     let mut remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
     remote.insert("mgmt".to_string(), mgmt_attrs);
 
-    resolve_provider_attributes_with_remote(&mut parsed, &remote, &ProviderContext::default())
-        .expect("resolve must succeed");
+    let resolved =
+        resolve_provider_attributes_with_remote(&parsed, &remote, &ProviderContext::default())
+            .expect("resolve must succeed");
 
-    let assume_role = parsed.providers[0].attributes.get("assume_role").unwrap();
+    let assume_role = resolved
+        .iter()
+        .next()
+        .unwrap()
+        .attributes()
+        .get("assume_role")
+        .unwrap();
     let Value::Concrete(ConcreteValue::Map(m)) = assume_role else {
         panic!("expected Map for assume_role post-resolve, got: {assume_role:?}");
     };
@@ -2786,14 +2793,27 @@ fn resolve_provider_attributes_with_remote_substitutes_upstream_refs() {
         ))),
         "literal sibling must be preserved",
     );
+
+    let Value::Concrete(ConcreteValue::Map(raw)) =
+        parsed.providers[0].attributes.get("assume_role").unwrap()
+    else {
+        panic!("expected raw provider map to remain intact");
+    };
+    assert!(
+        matches!(
+            raw.get("role_arn"),
+            Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+        ),
+        "resolution must not create a second mutable source of truth in parsed.providers"
+    );
 }
 
 #[test]
-fn resolve_provider_attributes_with_remote_leaves_unknown_refs_alone() {
-    // When `remote_bindings` does not name the binding referenced from
-    // provider attributes, the ref must be left in place (the caller —
-    // validate vs plan/apply — decides whether to error). The resolver
-    // itself must not panic or invent a value.
+fn resolve_provider_attributes_with_remote_rejects_unknown_refs() {
+    // A value carrying the `ResolvedProviderConfigs` capability must not
+    // contain a deferred provider reference. Missing remote state is
+    // therefore an error at the resolution seam, not later at provider
+    // construction (carina#3845).
     use crate::parser::resolve_provider_attributes_with_remote;
 
     let input = r#"
@@ -2809,22 +2829,116 @@ fn resolve_provider_attributes_with_remote_leaves_unknown_refs_alone() {
         }
     "#;
 
-    let mut parsed = parse(input, &ProviderContext::default()).unwrap();
+    let parsed = parse(input, &ProviderContext::default()).unwrap();
     let empty: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-    resolve_provider_attributes_with_remote(&mut parsed, &empty, &ProviderContext::default())
-        .expect("resolve must not error on missing binding");
+    let error =
+        resolve_provider_attributes_with_remote(&parsed, &empty, &ProviderContext::default())
+            .expect_err("resolved provider configs must reject a missing binding");
 
-    let assume_role = parsed.providers[0].attributes.get("assume_role").unwrap();
-    let Value::Concrete(ConcreteValue::Map(m)) = assume_role else {
-        panic!("expected Map for assume_role, got: {assume_role:?}");
-    };
-    match m.get("role_arn").unwrap() {
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            assert_eq!(path.binding(), "mgmt");
-        }
-        other => panic!("expected ResourceRef preserved, got: {other:?}"),
-    }
+    let message = error.to_string();
+    assert!(message.contains("assume_role"), "{message}");
+    assert!(message.contains("mgmt.role_arn"), "{message}");
+}
+
+#[test]
+fn provider_default_tags_remain_deferred_and_saved_plan_validation_accepts_them() {
+    use crate::parser::resolve_provider_attributes_with_remote;
+    use crate::resource::AccessPath;
+
+    let mut parsed = InferredFile::default();
+    parsed.providers.push(ProviderConfig {
+        name: "aws".to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::from([(
+            "Owner".to_string(),
+            Value::Deferred(DeferredValue::ResourceRef {
+                path: AccessPath::new("mgmt", "owner"),
+            }),
+        )]),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    });
+    parsed.upstream_states.push(UpstreamState {
+        binding: "mgmt".to_string(),
+        source: "../mgmt".into(),
+    });
+    let remote = HashMap::new();
+
+    let resolved =
+        resolve_provider_attributes_with_remote(&parsed, &remote, &ProviderContext::default())
+            .expect("default_tags do not participate in the provider-ready invariant");
+    let saved = SavedProviderConfigs::from(&resolved);
+    assert!(matches!(
+        saved.as_provider_configs()[0].default_tags.get("Owner"),
+        Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+    ));
+    assert_eq!(
+        serde_json::to_value(&saved).unwrap(),
+        serde_json::to_value(resolved.as_provider_configs()).unwrap(),
+        "the saved-provider newtype must preserve the historical JSON array shape"
+    );
+
+    let decoded: SavedProviderConfigs =
+        serde_json::from_value(serde_json::to_value(saved).unwrap()).unwrap();
+    ResolvedProviderConfigs::try_from(decoded)
+        .expect("saved plans may carry deferred default_tags for per-resource resolution");
+}
+
+#[test]
+fn saved_plan_provider_configs_require_fully_resolved_attributes() {
+    let parsed = parse(
+        r#"
+            let mgmt = upstream_state { source = "../mgmt" }
+            provider aws {
+                assume_role = { role_arn = mgmt.role_arn }
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .unwrap();
+
+    let json = serde_json::to_string(&parsed.providers).unwrap();
+    let saved: SavedProviderConfigs = serde_json::from_str(&json).unwrap();
+    let error = ResolvedProviderConfigs::try_from(saved)
+        .expect_err("a saved plan must not mint resolved configs from deferred values");
+
+    assert!(
+        matches!(
+            error,
+            ProviderConfigInvariantError::UnresolvedAttribute { .. }
+        ),
+        "unexpected validation error: {error}"
+    );
+    assert!(error.to_string().contains("assume_role"));
+}
+
+#[test]
+fn saved_plan_provider_configs_accept_fully_resolved_attributes() {
+    let parsed = parse(
+        r#"
+            provider aws {
+                region = "ap-northeast-1"
+            }
+        "#,
+        &ProviderContext::default(),
+    )
+    .unwrap();
+
+    let json = serde_json::to_string(&parsed.providers).unwrap();
+    let saved: SavedProviderConfigs = serde_json::from_str(&json).unwrap();
+    let resolved = ResolvedProviderConfigs::try_from(saved)
+        .expect("literal saved-plan config must be accepted");
+
+    assert_eq!(
+        resolved.iter().next().unwrap().attributes().get("region"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "ap-northeast-1".into()
+        )))
+    );
 }
 
 #[test]

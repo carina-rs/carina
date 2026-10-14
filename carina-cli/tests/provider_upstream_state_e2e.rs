@@ -5,10 +5,11 @@
 //! `provider aws { assume_role = { role_arn = upstream.arn } }` with
 //! `cannot serialize at WASM provider boundary: unresolved reference
 //! <binding>.<attr>` because `provider.attributes` was never substituted
-//! with the upstream's loaded values. The fix runs
-//! [`carina_core::parser::resolve_provider_attributes_with_remote`] right
-//! after `load_upstream_states` (plan/apply) and skips serializing
-//! still-deferred provider attributes at validate time.
+//! with the upstream's loaded values. Provider-constructing commands now use
+//! one shared `load_upstream_states` +
+//! [`carina_core::parser::resolve_provider_attributes_with_remote`] step and
+//! carry its typed result to the construction boundary. Validation still skips
+//! serializing deferred provider attributes.
 //!
 //! These tests follow the directory-scoped rule: each fixture is a
 //! `tempfile::tempdir()` mirroring the real `infra/aws/management/...`
@@ -91,7 +92,7 @@ fn provider_attributes_resolve_upstream_state_refs_post_load() {
     write_upstream(&upstream);
     write_downstream(&downstream, "../mgmt");
 
-    let mut config = load_configuration(&downstream).expect("load_configuration");
+    let config = load_configuration(&downstream).expect("load_configuration");
 
     // Sanity: pre-resolve, the ref survives nested inside `assume_role`.
     let pc_pre = config
@@ -122,20 +123,18 @@ fn provider_attributes_resolve_upstream_state_refs_post_load() {
     let mut remote = std::collections::HashMap::new();
     remote.insert("mgmt".to_string(), mgmt_attrs);
 
-    resolve_provider_attributes_with_remote(
-        &mut config.parsed,
+    let resolved = resolve_provider_attributes_with_remote(
+        &config.parsed,
         &remote,
         &ProviderContext::default(),
     )
     .expect("resolve must succeed");
 
-    let pc = config
-        .parsed
-        .providers
+    let pc = resolved
         .iter()
-        .find(|p| p.name == "aws")
+        .find(|p| p.name() == "aws")
         .expect("aws provider present");
-    let assume = pc.attributes.get("assume_role").unwrap();
+    let assume = pc.attributes().get("assume_role").unwrap();
     let Value::Concrete(ConcreteValue::Map(m)) = assume else {
         panic!("expected Map for assume_role post-resolve, got: {assume:?}");
     };

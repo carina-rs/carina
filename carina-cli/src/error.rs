@@ -275,6 +275,27 @@ pub enum AppError {
     #[error(transparent)]
     ProviderConfigPreparation(#[from] carina_core::executor::ProviderConfigPreparationError),
 
+    /// A parsed provider expression could not be evaluated.
+    #[error("Provider attribute resolution error: {0}")]
+    ProviderAttributeResolution(#[source] Box<carina_core::parser::ParseError>),
+
+    /// Provider resolution completed but left a value outside the resolved invariant.
+    #[error("Provider configuration did not fully resolve: {0}")]
+    ProviderConfigInvariant(#[source] Box<carina_core::parser::ProviderConfigInvariantError>),
+
+    /// An upstream needed by a provider construction attribute could not be loaded.
+    #[error("{source}; required by provider '{provider}' attribute '{attribute}'")]
+    ProviderReferencedUpstream {
+        provider: String,
+        attribute: String,
+        #[source]
+        source: Box<AppError>,
+    },
+
+    /// A saved plan attempted to cross the provider boundary with unresolved config.
+    #[error("Invalid provider config in saved plan: {0}")]
+    SavedProviderConfig(#[source] Box<carina_core::parser::ProviderConfigInvariantError>),
+
     /// State-backend bootstrap preparation failed before provider dispatch.
     #[error(transparent)]
     StateBucketPreparation(StateBucketPreparationError),
