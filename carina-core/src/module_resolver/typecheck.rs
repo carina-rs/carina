@@ -1,5 +1,6 @@
 //! Type-checking of module call arguments against declared `TypeExpr`s.
 
+use crate::ValueDescription;
 use crate::parser::{ArgumentParameter, ProviderContext, TypeExpr, validate_custom_type};
 use crate::resource::{ConcreteValue, DeferredValue, Value};
 
@@ -22,54 +23,37 @@ pub(super) fn check_module_arg_type(
 ) -> Result<(), ModuleError> {
     match check_type_match(type_expr, value, config, enclosing_args) {
         TypeCheckResult::Ok => Ok(()),
-        TypeCheckResult::Mismatch => Err(ModuleError::InvalidArgumentType {
+        TypeCheckResult::Mismatch(actual) => Err(ModuleError::InvalidArgumentType {
             module: module_name.to_string(),
             argument: arg_name.to_string(),
             expected: type_expr.to_string(),
-            actual: describe_value_shape(value).to_string(),
+            actual,
         }),
         TypeCheckResult::ValidationError(e) => Err(ModuleError::InvalidArgumentType {
             module: module_name.to_string(),
             argument: arg_name.to_string(),
             expected: format!("{} ({})", type_expr, e),
-            actual: describe_value_shape(value).to_string(),
+            actual: ValueDescription::of(value),
         }),
-    }
-}
-
-/// One-word description of a value's shape for error messages.
-///
-/// The previous `expected list(T)`-only message was misleading because
-/// it didn't say what the user actually passed — a string, a map, a
-/// reference to another resource's attribute, etc. Naming the actual
-/// shape lets the reader see at a glance whether the mismatch is
-/// element-type or value-shape (carina#3238).
-fn describe_value_shape(value: &Value) -> &'static str {
-    match value {
-        Value::Concrete(ConcreteValue::String(_)) => "string",
-        Value::Concrete(ConcreteValue::Int(_)) => "int",
-        Value::Concrete(ConcreteValue::Float(_)) => "float",
-        Value::Concrete(ConcreteValue::Bool(_)) => "bool",
-        Value::Concrete(ConcreteValue::Duration(_)) => "duration",
-        Value::Concrete(ConcreteValue::List(_)) | Value::Concrete(ConcreteValue::StringList(_)) => {
-            "list"
-        }
-        Value::Concrete(ConcreteValue::Map(_)) => "map",
-        Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "enum identifier",
-        Value::Concrete(ConcreteValue::CanonicalEnum(_)) => "canonical enum",
-        Value::Deferred(DeferredValue::ResourceRef { .. }) => "resource reference",
-        Value::Deferred(DeferredValue::BindingRef { .. }) => "binding reference",
-        Value::Deferred(DeferredValue::Interpolation(_)) => "interpolation",
-        Value::Deferred(DeferredValue::FunctionCall { .. }) => "function call",
-        Value::Deferred(DeferredValue::Secret(_)) => "secret",
-        Value::Deferred(DeferredValue::Unknown(_)) => "unknown",
     }
 }
 
 pub(super) enum TypeCheckResult {
     Ok,
-    Mismatch,
+    Mismatch(ValueDescription),
     ValidationError(String),
+}
+
+impl TypeCheckResult {
+    /// Wrap a mismatch with the container in which it occurred.
+    fn within(self, outer: &Value) -> Self {
+        match self {
+            Self::Mismatch(description) => {
+                Self::Mismatch(ValueDescription::containing(outer, description))
+            }
+            other => other,
+        }
+    }
 }
 
 /// If `value` is a bare reference to a binding in `enclosing_args`,
@@ -104,7 +88,11 @@ pub(super) fn check_type_match(
     // available here — it lands later when the parent expands — so we
     // compare type tags instead.
     if let Some(declared) = enclosing_arg_type(value, enclosing_args) {
-        return type_expr_compatible(type_expr, declared);
+        return if type_expr_compatible(type_expr, declared) {
+            TypeCheckResult::Ok
+        } else {
+            TypeCheckResult::Mismatch(ValueDescription::of(value))
+        };
     }
 
     match type_expr {
@@ -131,41 +119,41 @@ pub(super) fn check_type_match(
             ) {
                 TypeCheckResult::Ok
             } else {
-                TypeCheckResult::Mismatch
+                TypeCheckResult::Mismatch(ValueDescription::of(value))
             }
         }
         TypeExpr::Int => {
             if matches!(value, Value::Concrete(ConcreteValue::Int(_))) {
                 TypeCheckResult::Ok
             } else {
-                TypeCheckResult::Mismatch
+                TypeCheckResult::Mismatch(ValueDescription::of(value))
             }
         }
         TypeExpr::Float => {
             if matches!(value, Value::Concrete(ConcreteValue::Float(_))) {
                 TypeCheckResult::Ok
             } else {
-                TypeCheckResult::Mismatch
+                TypeCheckResult::Mismatch(ValueDescription::of(value))
             }
         }
         TypeExpr::Bool => {
             if matches!(value, Value::Concrete(ConcreteValue::Bool(_))) {
                 TypeCheckResult::Ok
             } else {
-                TypeCheckResult::Mismatch
+                TypeCheckResult::Mismatch(ValueDescription::of(value))
             }
         }
         TypeExpr::Duration => {
             if matches!(value, Value::Concrete(ConcreteValue::Duration(_))) {
                 TypeCheckResult::Ok
             } else {
-                TypeCheckResult::Mismatch
+                TypeCheckResult::Mismatch(ValueDescription::of(value))
             }
         }
         TypeExpr::List(inner) => match value {
             Value::Concrete(ConcreteValue::List(items)) => {
                 for item in items {
-                    match check_type_match(inner, item, config, enclosing_args) {
+                    match check_type_match(inner, item, config, enclosing_args).within(value) {
                         TypeCheckResult::Ok => {}
                         other => return other,
                     }
@@ -181,7 +169,7 @@ pub(super) fn check_type_match(
             Value::Concrete(ConcreteValue::StringList(items)) => {
                 for s in items {
                     let item = Value::Concrete(ConcreteValue::String(s.clone()));
-                    match check_type_match(inner, &item, config, enclosing_args) {
+                    match check_type_match(inner, &item, config, enclosing_args).within(value) {
                         TypeCheckResult::Ok => {}
                         other => return other,
                     }
@@ -196,12 +184,12 @@ pub(super) fn check_type_match(
             // collection arms must do the same so a `list(T)` argument
             // can receive a list-typed attribute (carina#3238).
             Value::Deferred(DeferredValue::ResourceRef { .. }) => TypeCheckResult::Ok,
-            _ => TypeCheckResult::Mismatch,
+            _ => TypeCheckResult::Mismatch(ValueDescription::of(value)),
         },
         TypeExpr::Map(inner) => match value {
             Value::Concrete(ConcreteValue::Map(entries)) => {
                 for v in entries.values() {
-                    match check_type_match(inner, v, config, enclosing_args) {
+                    match check_type_match(inner, v, config, enclosing_args).within(value) {
                         TypeCheckResult::Ok => {}
                         other => return other,
                     }
@@ -210,7 +198,7 @@ pub(super) fn check_type_match(
             }
             // Sibling case to the `List` arm above (carina#3238).
             Value::Deferred(DeferredValue::ResourceRef { .. }) => TypeCheckResult::Ok,
-            _ => TypeCheckResult::Mismatch,
+            _ => TypeCheckResult::Mismatch(ValueDescription::of(value)),
         },
         // Simple types (cidr, arn, iam_policy_arn, etc.) are string subtypes
         TypeExpr::Simple(name) => {
@@ -220,7 +208,7 @@ pub(super) fn check_type_match(
                     | Value::Deferred(DeferredValue::Interpolation(_))
                     | Value::Deferred(DeferredValue::ResourceRef { .. })
             ) {
-                TypeCheckResult::Mismatch
+                TypeCheckResult::Mismatch(ValueDescription::of(value))
             } else {
                 let identity =
                     crate::schema::TypeIdentity::bare(crate::parser::snake_to_pascal(name));
@@ -241,7 +229,7 @@ pub(super) fn check_type_match(
             ) {
                 TypeCheckResult::Ok
             } else {
-                TypeCheckResult::Mismatch
+                TypeCheckResult::Mismatch(ValueDescription::of(value))
             }
         }
         TypeExpr::Struct { fields } => {
@@ -253,14 +241,14 @@ pub(super) fn check_type_match(
                 return TypeCheckResult::Ok;
             }
             let Value::Concrete(ConcreteValue::Map(entries)) = value else {
-                return TypeCheckResult::Mismatch;
+                return TypeCheckResult::Mismatch(ValueDescription::of(value));
             };
             if crate::validation::struct_field_shape_errors(fields, entries).is_some() {
-                return TypeCheckResult::Mismatch;
+                return TypeCheckResult::Mismatch(ValueDescription::of(value));
             }
             for (name, ty) in fields {
                 if let Some(v) = entries.get(name) {
-                    match check_type_match(ty, v, config, enclosing_args) {
+                    match check_type_match(ty, v, config, enclosing_args).within(value) {
                         TypeCheckResult::Ok => {}
                         other => return other,
                     }
@@ -274,7 +262,7 @@ pub(super) fn check_type_match(
             if matches!(value, Value::Concrete(ConcreteValue::String(s)) if s == expected) {
                 TypeCheckResult::Ok
             } else {
-                TypeCheckResult::Mismatch
+                TypeCheckResult::Mismatch(ValueDescription::of(value))
             }
         }
         // Union: `T1 | T2 | ...` accepts the value if any member does.
@@ -287,12 +275,13 @@ pub(super) fn check_type_match(
                     return TypeCheckResult::Ok;
                 }
             }
-            TypeCheckResult::Mismatch
+            // Member-level mismatch details are ambiguous when no union member matches.
+            TypeCheckResult::Mismatch(ValueDescription::of(value))
         }
         // Sentinel for failed inference (#2360 stage 2). Module signatures
         // are user-declared and should never carry Unknown — reaching this
         // arm is a defensive fallthrough, treated as a mismatch.
-        TypeExpr::Unknown => TypeCheckResult::Mismatch,
+        TypeExpr::Unknown => TypeCheckResult::Mismatch(ValueDescription::of(value)),
     }
 }
 
@@ -301,7 +290,7 @@ pub(super) fn check_type_match(
 /// `Value`. `String`-shaped types (`String`, `Simple`, `Ref`,
 /// unresolved dotted refs, `SchemaType`) are mutually compatible because the parser does not
 /// distinguish their value shape — they all accept string-shaped values.
-fn type_expr_compatible(expected: &TypeExpr, actual: &TypeExpr) -> TypeCheckResult {
+fn type_expr_compatible(expected: &TypeExpr, actual: &TypeExpr) -> bool {
     fn is_string_shaped(t: &TypeExpr) -> bool {
         matches!(
             t,
@@ -315,7 +304,7 @@ fn type_expr_compatible(expected: &TypeExpr, actual: &TypeExpr) -> TypeCheckResu
     }
 
     if is_string_shaped(expected) && is_string_shaped(actual) {
-        return TypeCheckResult::Ok;
+        return true;
     }
     if matches!(
         (expected, actual),
@@ -324,7 +313,7 @@ fn type_expr_compatible(expected: &TypeExpr, actual: &TypeExpr) -> TypeCheckResu
             | (TypeExpr::Bool, TypeExpr::Bool)
             | (TypeExpr::Duration, TypeExpr::Duration)
     ) {
-        return TypeCheckResult::Ok;
+        return true;
     }
     if let (TypeExpr::List(e), TypeExpr::List(a)) = (expected, actual) {
         return type_expr_compatible(e, a);
@@ -334,41 +323,36 @@ fn type_expr_compatible(expected: &TypeExpr, actual: &TypeExpr) -> TypeCheckResu
     }
     if let (TypeExpr::Struct { fields: ef }, TypeExpr::Struct { fields: af }) = (expected, actual) {
         if ef.len() != af.len() {
-            return TypeCheckResult::Mismatch;
+            return false;
         }
         for ((en, et), (an, at)) in ef.iter().zip(af.iter()) {
             if en != an {
-                return TypeCheckResult::Mismatch;
+                return false;
             }
-            match type_expr_compatible(et, at) {
-                TypeCheckResult::Ok => {}
-                other => return other,
+            if !type_expr_compatible(et, at) {
+                return false;
             }
         }
-        return TypeCheckResult::Ok;
+        return true;
     }
     // Union compatibility: actual must satisfy *some* member of expected when
     // expected is a union; an actual union must satisfy expected on at least
     // one member. See carina-rs/carina#2611.
     if let TypeExpr::Union(members) = expected
-        && members
-            .iter()
-            .any(|m| matches!(type_expr_compatible(m, actual), TypeCheckResult::Ok))
+        && members.iter().any(|m| type_expr_compatible(m, actual))
     {
-        return TypeCheckResult::Ok;
+        return true;
     }
     if matches!(expected, TypeExpr::Union(_)) {
-        return TypeCheckResult::Mismatch;
+        return false;
     }
     if let TypeExpr::Union(members) = actual
-        && members
-            .iter()
-            .any(|m| matches!(type_expr_compatible(expected, m), TypeCheckResult::Ok))
+        && members.iter().any(|m| type_expr_compatible(expected, m))
     {
-        return TypeCheckResult::Ok;
+        return true;
     }
 
     // Unknown is the failed-inference sentinel; all remaining concrete
     // shape mismatches are rejected.
-    TypeCheckResult::Mismatch
+    false
 }

@@ -2080,6 +2080,49 @@ fn validate_type_expr_value_int_got_float_is_rejected() {
 }
 
 #[test]
+fn validate_type_expr_value_escapes_string_literal_value() {
+    let result = validate_type_expr_value(
+        &TypeExpr::Bool,
+        &Value::Concrete(ConcreteValue::String("yes\"\nno".to_string())),
+        &ProviderContext::default(),
+    );
+
+    assert_eq!(
+        result.as_deref(),
+        Some("expected Bool, got string \"yes\\\"\\nno\". Use true or false.")
+    );
+}
+
+#[test]
+fn validate_type_expr_value_preserves_float_fraction() {
+    let result = validate_type_expr_value(
+        &TypeExpr::Int,
+        &Value::Concrete(ConcreteValue::Float(1.0)),
+        &ProviderContext::default(),
+    );
+
+    assert_eq!(result.as_deref(), Some("expected Int, got float (1.0)."));
+}
+
+#[test]
+fn validate_type_expr_value_struct_got_string_includes_literal() {
+    let type_expr = TypeExpr::Struct {
+        fields: vec![("environment".to_string(), TypeExpr::String)],
+    };
+    let result = validate_type_expr_value(
+        &type_expr,
+        &Value::Concrete(ConcreteValue::String("production".to_string())),
+        &ProviderContext::default(),
+    );
+
+    let message = result.expect("a string must not satisfy a struct type");
+    assert!(
+        message.contains("got string \"production\""),
+        "struct mismatch should include the scalar literal; got: {message}"
+    );
+}
+
+#[test]
 fn validate_type_expr_value_float_got_int_is_accepted() {
     // Intentional one-way widening: Int flows into Float (see #2864).
     let result = validate_type_expr_value(

@@ -1,5 +1,6 @@
 //! Module resolution error type.
 
+use crate::ValueDescription;
 use crate::parser::ParseError;
 
 use super::validation::ModuleConstraintDiagnostic;
@@ -23,13 +24,15 @@ pub enum ModuleError {
         module: String,
         argument: String,
         expected: String,
-        /// Short, human-readable description of the value shape that was
-        /// passed (e.g. `string`, `int`, `list`, `map`, `resource reference`).
-        /// Surfacing the actual shape avoids the misleading
-        /// `expected list(...)` reading that sent issue #3238's reporter
-        /// hunting for an element-type mismatch when the real cause was
-        /// a value-shape mismatch.
-        actual: String,
+        /// Value-derived description of the argument. Concrete scalar values
+        /// except `Duration` include their literal, while duration, structural,
+        /// and deferred values expose only their shape (e.g. `list`, `map`,
+        /// `resource reference`, or `secret`). Nested mismatches use
+        /// `<outer shape> containing <inner>`, such as
+        /// `list containing string "production"`. For a `ValidationError`, the
+        /// outer value is described because the validator message carries the
+        /// mismatch detail.
+        actual: ValueDescription,
     },
 
     #[error("IO error: {0}")]

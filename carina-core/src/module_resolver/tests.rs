@@ -14,7 +14,8 @@ use indexmap::IndexMap;
 use super::*;
 use crate::parser::{ArgumentParameter, ModuleCall, ParsedFile, ProviderContext, TypeExpr};
 use crate::resource::{
-    ConcreteValue, DeferredValue, Directives, Resource, ResourceId, ResourceIdentity, Value,
+    CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, RawEnumIdentifier, Resource,
+    ResourceId, ResourceIdentity, Value,
 };
 use crate::schema::TypeIdentity;
 
@@ -5919,53 +5920,329 @@ let rd = infra_deploy {
 }
 
 /// carina#3238: the error message for a true list-vs-scalar mismatch
-/// must show the actual value shape, not just the expected type. The
+/// must show the actual value, not just the expected type. The
 /// previous wording (`expected list(aws.iam.Role.Arn)`) sent the
 /// reporter hunting for an element-type mismatch when the actual cause
-/// was a value-shape mismatch. The fix surfaces both sides.
+/// was a string value passed where a list was required. The fix surfaces
+/// both the expected type and the offending value.
 #[test]
-fn argument_type_mismatch_error_shows_actual_value_shape() {
+fn argument_type_mismatch_error_shows_actual_value() {
+    let msg = module_argument_type_error(
+        "role_arns",
+        TypeExpr::List(Box::new(TypeExpr::Simple("arn".to_string()))),
+        Value::Concrete(ConcreteValue::String("arn:aws:iam::123:role/A".to_string())),
+    );
+
+    assert!(
+        msg.contains("got string \"arn:aws:iam::123:role/A\""),
+        "error should show the actual string value for a string-into-list mismatch (carina#3238); got: {msg}"
+    );
+}
+
+fn module_argument_type_error(arg_name: &str, type_expr: TypeExpr, value: Value) -> String {
+    module_argument_type_error_with_enclosing_args(arg_name, type_expr, value, None)
+}
+
+fn module_argument_type_error_with_enclosing_args(
+    arg_name: &str,
+    type_expr: TypeExpr,
+    value: Value,
+    enclosing_args: Option<&[ArgumentParameter]>,
+) -> String {
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
-        name: "role_arns".to_string(),
-        type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("arn".to_string()))),
+        name: arg_name.to_string(),
+        type_expr,
         default: None,
         description: None,
         validations: Vec::new(),
     }];
 
     let resolver = {
-        let mut r = ModuleResolver::new(".");
-        r.imported_modules.insert("test_module".to_string(), module);
-        r
+        let mut resolver = ModuleResolver::new(".");
+        resolver
+            .imported_modules
+            .insert("web_tier".to_string(), module);
+        resolver
     };
 
     let call = ModuleCall {
-        module_name: "test_module".to_string(),
-        binding_name: Some("a".to_string()),
+        module_name: "web_tier".to_string(),
+        binding_name: Some("web".to_string()),
         source: Default::default(),
-        arguments: {
-            let mut args = HashMap::new();
-            // Pass a plain string where list is expected.
-            args.insert(
-                "role_arns".to_string(),
-                Value::Concrete(ConcreteValue::String("arn:aws:iam::123:role/A".to_string())),
-            );
-            args
-        },
+        arguments: HashMap::from([(arg_name.to_string(), value)]),
     };
 
-    let result = resolver.expand_module_call(&call, "a", None);
+    let result = resolver.expand_module_call(&call, "web", enclosing_args);
     let Err(err) = result else {
         panic!("expected InvalidArgumentType error, got Ok");
     };
-    let msg = err.to_string();
+    err.to_string()
+}
+
+fn environment_type() -> TypeExpr {
+    TypeExpr::Union(vec![
+        TypeExpr::StringLiteral("dev".to_string()),
+        TypeExpr::StringLiteral("stg".to_string()),
+        TypeExpr::StringLiteral("prod".to_string()),
+    ])
+}
+
+#[test]
+fn argument_type_mismatch_error_shows_string_literal_value() {
+    let value = Value::Concrete(ConcreteValue::String("production".to_string()));
+
+    let msg = module_argument_type_error("environment", environment_type(), value);
+
     assert!(
-        msg.contains("got"),
-        "error should include the actual value shape (carina#3238); got: {msg}"
+        msg.contains("got string \"production\""),
+        "error should include the mismatched string value; got: {msg}"
+    );
+}
+
+#[test]
+fn argument_type_mismatch_error_shows_int_literal_value() {
+    let value = Value::Concrete(ConcreteValue::Int(5));
+
+    let msg = module_argument_type_error("environment", TypeExpr::String, value);
+
+    assert!(
+        msg.contains("got int (5)"),
+        "error should include the mismatched int value; got: {msg}"
+    );
+}
+
+#[test]
+fn argument_type_mismatch_error_redacts_secret_value() {
+    let secret = "issue-3804-secret-plaintext";
+    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String(secret.to_string()),
+    ))));
+
+    let msg = module_argument_type_error("environment", TypeExpr::Int, value);
+
+    assert!(
+        msg.contains("got secret"),
+        "error should describe a deferred secret by shape; got: {msg}"
     );
     assert!(
-        msg.contains("string"),
-        "error should name the actual value shape (string) for a string-into-list mismatch (carina#3238); got: {msg}"
+        !msg.contains(secret),
+        "error must not reveal secret plaintext; got: {msg}"
+    );
+}
+
+#[test]
+fn argument_type_mismatch_error_shows_nested_list_element_value() {
+    let value = Value::Concrete(ConcreteValue::List(vec![
+        Value::Concrete(ConcreteValue::String("dev".to_string())),
+        Value::Concrete(ConcreteValue::String("production".to_string())),
+    ]));
+
+    let msg = module_argument_type_error(
+        "environments",
+        TypeExpr::List(Box::new(environment_type())),
+        value,
+    );
+
+    assert!(
+        msg.contains("got list containing string \"production\""),
+        "error should include the mismatched list element; got: {msg}"
+    );
+}
+
+#[test]
+fn argument_type_mismatch_error_shows_string_list_element_value() {
+    let type_expr = TypeExpr::List(Box::new(TypeExpr::Union(vec![
+        TypeExpr::StringLiteral("dev".to_string()),
+        TypeExpr::StringLiteral("stg".to_string()),
+    ])));
+    let value = Value::Concrete(ConcreteValue::StringList(vec![
+        "dev".to_string(),
+        "production".to_string(),
+    ]));
+
+    let msg = module_argument_type_error("environments", type_expr, value);
+
+    assert!(
+        msg.contains("got list containing string \"production\""),
+        "error should include the mismatched StringList element; got: {msg}"
+    );
+}
+
+#[test]
+fn argument_type_mismatch_error_shows_complete_nested_list_path() {
+    let type_expr = TypeExpr::List(Box::new(TypeExpr::List(Box::new(TypeExpr::StringLiteral(
+        "dev".to_string(),
+    )))));
+    let value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::List(vec![Value::Concrete(ConcreteValue::String(
+            "production".to_string(),
+        ))]),
+    )]));
+
+    let msg = module_argument_type_error("environments", type_expr, value);
+
+    assert!(
+        msg.contains("got list containing list containing string \"production\""),
+        "error should report the complete path to the innermost mismatched list element; got: {msg}"
+    );
+}
+
+#[test]
+fn argument_type_mismatch_error_describes_nested_enclosing_arg_binding_ref() {
+    let enclosing_args = vec![ArgumentParameter {
+        name: "outer_environments".to_string(),
+        type_expr: TypeExpr::List(Box::new(TypeExpr::List(Box::new(TypeExpr::Int)))),
+        default: None,
+        description: None,
+        validations: Vec::new(),
+    }];
+    let expected = TypeExpr::List(Box::new(TypeExpr::List(Box::new(TypeExpr::String))));
+    let value = Value::Deferred(DeferredValue::BindingRef {
+        binding: "outer_environments".to_string(),
+    });
+
+    let msg = module_argument_type_error_with_enclosing_args(
+        "environments",
+        expected,
+        value,
+        Some(&enclosing_args),
+    );
+
+    assert!(
+        msg.contains("got binding reference"),
+        "error should describe the enclosing-argument reference; got: {msg}"
+    );
+}
+
+#[test]
+fn argument_type_mismatch_error_redacts_secret_list_element() {
+    let secret = "issue-3804-nested-secret-plaintext";
+    let value = Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
+        DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::String(
+            secret.to_string(),
+        )))),
+    )]));
+
+    let msg = module_argument_type_error("counts", TypeExpr::List(Box::new(TypeExpr::Int)), value);
+
+    assert!(
+        msg.contains("got list containing secret"),
+        "error should describe a secret list element by shape; got: {msg}"
+    );
+    assert!(
+        !msg.contains(secret),
+        "error must not reveal nested secret plaintext; got: {msg}"
+    );
+}
+
+#[test]
+fn argument_type_mismatch_error_shows_nested_map_value() {
+    let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "primary".to_string(),
+            Value::Concrete(ConcreteValue::String("dev".to_string())),
+        ),
+        (
+            "secondary".to_string(),
+            Value::Concrete(ConcreteValue::String("production".to_string())),
+        ),
+    ])));
+
+    let msg = module_argument_type_error(
+        "environments",
+        TypeExpr::Map(Box::new(environment_type())),
+        value,
+    );
+
+    assert!(
+        msg.contains("got map containing string \"production\""),
+        "error should include the mismatched map value; got: {msg}"
+    );
+}
+
+#[test]
+fn argument_type_mismatch_error_shows_nested_struct_field_value() {
+    let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "environment".to_string(),
+        Value::Concrete(ConcreteValue::String("production".to_string())),
+    )])));
+    let type_expr = TypeExpr::Struct {
+        fields: vec![("environment".to_string(), environment_type())],
+    };
+
+    let msg = module_argument_type_error("settings", type_expr, value);
+
+    assert!(
+        msg.contains("got map containing string \"production\""),
+        "error should include the mismatched struct field value; got: {msg}"
+    );
+}
+
+#[test]
+fn argument_type_mismatch_error_escapes_string_literal_value() {
+    let value = Value::Concrete(ConcreteValue::String("production\"\nnext".to_string()));
+
+    let msg = module_argument_type_error("environment", environment_type(), value);
+
+    assert!(
+        msg.contains("got string \"production\\\"\\nnext\""),
+        "error should escape quotes and newlines in string values; got: {msg}"
+    );
+}
+
+#[test]
+fn argument_type_mismatch_error_preserves_float_fraction() {
+    let value = Value::Concrete(ConcreteValue::Float(1.0));
+
+    let msg = module_argument_type_error("count", TypeExpr::Int, value);
+
+    assert!(
+        msg.contains("got float (1.0)"),
+        "error should preserve the float's decimal point; got: {msg}"
+    );
+}
+
+#[test]
+fn argument_type_validation_error_shows_actual_string_literal() {
+    let value = Value::Concrete(ConcreteValue::String("not-an-ipv4-cidr".to_string()));
+
+    let msg =
+        module_argument_type_error("network", TypeExpr::Simple("ipv4_cidr".to_string()), value);
+
+    assert!(
+        msg.contains("got string \"not-an-ipv4-cidr\""),
+        "validation errors should include the actual scalar literal; got: {msg}"
+    );
+}
+
+#[test]
+fn argument_type_mismatch_error_shows_enum_identifier_value() {
+    let value = Value::Concrete(ConcreteValue::EnumIdentifier(RawEnumIdentifier::parse(
+        "aws.foo.Bar.baz",
+    )));
+
+    let msg = module_argument_type_error("count", TypeExpr::Int, value);
+
+    assert!(
+        msg.contains("got enum identifier aws.foo.Bar.baz"),
+        "error should include the enum identifier; got: {msg}"
+    );
+}
+
+#[test]
+fn argument_type_mismatch_error_shows_canonical_enum_value() {
+    let value = Value::Concrete(ConcreteValue::CanonicalEnum(
+        CanonicalEnumValue::new_for_test(
+            TypeIdentity::from_schema_type("aws", "foo", "Bar"),
+            "baz",
+        ),
+    ));
+
+    let msg = module_argument_type_error("count", TypeExpr::Int, value);
+
+    assert!(
+        msg.contains("got canonical enum aws.foo.Bar.baz"),
+        "error should include the canonical enum value; got: {msg}"
     );
 }

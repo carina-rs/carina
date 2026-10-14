@@ -8,6 +8,7 @@ use std::collections::HashSet;
 
 use indexmap::IndexMap;
 
+use crate::ValueDescription;
 use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
 use crate::deps::collect_dependencies;
 use crate::parser::{
@@ -1927,43 +1928,28 @@ pub fn validate_type_expr_value(
             validate_struct_fields(fields, entries, config)
         }
         (TypeExpr::Struct { .. }, _) => Some(format!(
-            "expected {}, got {}.",
-            type_expr,
-            crate::parser::value_type_name(value)
+            "expected {type_expr}, got {}.",
+            ValueDescription::of(value)
         )),
-        (TypeExpr::Bool, Value::Concrete(ConcreteValue::String(s))) => Some(format!(
-            "expected {type_expr}, got string \"{s}\". Use true or false."
+        (TypeExpr::Bool, Value::Concrete(ConcreteValue::String(_))) => Some(format!(
+            "expected {type_expr}, got {}. Use true or false.",
+            ValueDescription::of(value)
         )),
-        (TypeExpr::Int, Value::Concrete(ConcreteValue::String(s))) => {
-            Some(format!("expected {type_expr}, got string \"{s}\"."))
-        }
-        (TypeExpr::Float, Value::Concrete(ConcreteValue::String(s))) => {
-            Some(format!("expected {type_expr}, got string \"{s}\"."))
-        }
-        (TypeExpr::String, Value::Concrete(ConcreteValue::Bool(b))) => {
-            Some(format!("expected {type_expr}, got bool ({b})."))
-        }
-        (TypeExpr::String, Value::Concrete(ConcreteValue::Int(n))) => {
-            Some(format!("expected {type_expr}, got int ({n})."))
-        }
-        (TypeExpr::String, Value::Concrete(ConcreteValue::Float(f))) => {
-            Some(format!("expected {type_expr}, got float ({f})."))
-        }
-        (TypeExpr::Bool, Value::Concrete(ConcreteValue::Int(n))) => {
-            Some(format!("expected {type_expr}, got int ({n})."))
-        }
-        (TypeExpr::Bool, Value::Concrete(ConcreteValue::Float(f))) => {
-            Some(format!("expected {type_expr}, got float ({f})."))
-        }
-        (TypeExpr::Int, Value::Concrete(ConcreteValue::Bool(b))) => {
-            Some(format!("expected {type_expr}, got bool ({b})."))
-        }
-        (TypeExpr::Int, Value::Concrete(ConcreteValue::Float(f))) => {
-            Some(format!("expected {type_expr}, got float ({f})."))
-        }
-        (TypeExpr::Float, Value::Concrete(ConcreteValue::Bool(b))) => {
-            Some(format!("expected {type_expr}, got bool ({b})."))
-        }
+        (TypeExpr::Int | TypeExpr::Float, Value::Concrete(ConcreteValue::String(_))) => Some(
+            format!("expected {type_expr}, got {}.", ValueDescription::of(value)),
+        ),
+        (
+            TypeExpr::String,
+            Value::Concrete(
+                ConcreteValue::Bool(_) | ConcreteValue::Int(_) | ConcreteValue::Float(_),
+            ),
+        )
+        | (TypeExpr::Bool, Value::Concrete(ConcreteValue::Int(_) | ConcreteValue::Float(_)))
+        | (TypeExpr::Int, Value::Concrete(ConcreteValue::Bool(_) | ConcreteValue::Float(_)))
+        | (TypeExpr::Float, Value::Concrete(ConcreteValue::Bool(_))) => Some(format!(
+            "expected {type_expr}, got {}.",
+            ValueDescription::of(value)
+        )),
         // Intentional one-way widening: an Int may flow into a Float sink.
         // The reverse (Float -> Int) is rejected above. Mirrors the schema
         // validator's `(Float, Int) => Ok` rule in `schema/mod.rs`.
@@ -1971,16 +1957,13 @@ pub fn validate_type_expr_value(
         // Schema and unresolved dotted types are string subtypes — reject non-string values.
         (
             TypeExpr::SchemaType { .. } | TypeExpr::DottedUnresolved(_),
-            Value::Concrete(ConcreteValue::Bool(b)),
-        ) => Some(format!("expected {}, got bool ({}).", type_expr, b)),
-        (
-            TypeExpr::SchemaType { .. } | TypeExpr::DottedUnresolved(_),
-            Value::Concrete(ConcreteValue::Int(n)),
-        ) => Some(format!("expected {}, got int ({}).", type_expr, n)),
-        (
-            TypeExpr::SchemaType { .. } | TypeExpr::DottedUnresolved(_),
-            Value::Concrete(ConcreteValue::Float(f)),
-        ) => Some(format!("expected {}, got float ({}).", type_expr, f)),
+            Value::Concrete(
+                ConcreteValue::Bool(_) | ConcreteValue::Int(_) | ConcreteValue::Float(_),
+            ),
+        ) => Some(format!(
+            "expected {type_expr}, got {}.",
+            ValueDescription::of(value)
+        )),
         _ => None,
     }
 }
