@@ -2,6 +2,10 @@
 //!
 //! Core library for an infrastructure management tool that treats side effects as values
 
+mod value_description;
+
+pub use value_description::ValueDescription;
+
 pub mod binding_index;
 #[cfg(test)]
 mod binding_index_split_tests;
