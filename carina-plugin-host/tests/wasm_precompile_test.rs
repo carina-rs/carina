@@ -458,10 +458,15 @@ async fn test_precompiled_factory_creates_provider() {
         .expect("from_precompiled should succeed");
 
     // Verify the factory can actually create a working provider
-    let attributes = indexmap::IndexMap::new();
-    let config =
-        carina_core::executor::prepare_provider_ready_config(&factory, factory.name(), &attributes)
-            .expect("test provider config should pass preparation");
+    let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
+        &carina_core::parser::InferredFile::default(),
+        &std::collections::HashMap::new(),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("empty provider config set is resolved");
+    let resolved = resolved.provider_or_implicit(factory.name());
+    let config = carina_core::executor::prepare_provider_ready_config(&factory, resolved.as_ref())
+        .expect("test provider config should pass preparation");
     let provider = factory
         .create_provider(None, &config)
         .await

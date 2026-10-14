@@ -34,6 +34,9 @@ use carina_core::parser::ProviderContext;
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::collect_delete_attributes;
+use crate::commands::plan::{
+    ProviderUpstreamScope, UpstreamMissingStatePolicy, load_and_resolve_provider_configs,
+};
 use crate::commands::shared::finalize::{
     StatePersistence, finalize_after_execute, release_lock_after_execute,
 };
@@ -127,6 +130,7 @@ pub async fn run_destroy(
         refresh,
         force,
         base_dir,
+        provider_context,
         parallelism,
         cancel.clone(),
     )
@@ -161,12 +165,47 @@ async fn run_destroy_locked(
     refresh: bool,
     force: bool,
     base_dir: &std::path::Path,
+    provider_context: &ProviderContext,
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    // Provider declaration metadata is sufficient for schema/factory wiring;
+    // construction attributes are resolved after state reconciliation below.
     let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
     let ctx = WiringContext::new(factories, &parsed.providers);
 
+    run_destroy_locked_with_ctx(
+        parsed,
+        auto_approve,
+        backend,
+        protected_bucket,
+        lock,
+        refresh,
+        force,
+        base_dir,
+        provider_context,
+        parallelism,
+        cancel,
+        &ctx,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_destroy_locked_with_ctx(
+    parsed: &mut carina_core::parser::InferredFile,
+    auto_approve: bool,
+    backend: &dyn StateBackend,
+    protected_bucket: Option<String>,
+    lock: Option<&LockInfo>,
+    refresh: bool,
+    force: bool,
+    base_dir: &std::path::Path,
+    provider_context: &ProviderContext,
+    parallelism: NonZeroUsize,
+    cancel: ShutdownToken,
+    ctx: &WiringContext,
+) -> Result<(), AppError> {
     // Read current state from backend. carina#3315: persist any older-schema
     // migration under the destroy lock before any short-circuit
     // (e.g. "No resources to destroy.") returns — see
@@ -196,7 +235,7 @@ async fn run_destroy_locked(
     }
     if let Some(sf) = state_file.as_mut() {
         reconcile_anonymous_identifiers_with_ctx(
-            &ctx,
+            ctx,
             &mut parsed.resources,
             sf,
             &state_block_claims,
@@ -210,6 +249,15 @@ async fn run_destroy_locked(
     // notes/specs/2026-06-28-issue-3625-cbd-decompose-clean-design.md Phase 5 T5.8.
     apply_name_overrides(&mut parsed.resources, &state_file);
 
+    let provider_inputs = load_and_resolve_provider_configs(
+        parsed,
+        base_dir,
+        provider_context,
+        UpstreamMissingStatePolicy::Strict,
+        ProviderUpstreamScope::ProviderReferences,
+    )
+    .await?;
+
     // Collect all resources (managed + orphans) before sorting.
     // We use the unsorted list for state reads, then sort once at the end.
     let mut all_resources: Vec<Resource> = parsed.resources.clone(); // allow: direct — plan-time reconciliation
@@ -222,7 +270,7 @@ async fn run_destroy_locked(
     }
 
     // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(&ctx, parsed, base_dir).await?;
+    let provider = get_provider_with_ctx(ctx, provider_inputs.configs(), base_dir).await?;
 
     // Build current states -- either from provider (refresh=true) or from state file
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
@@ -1763,13 +1811,189 @@ pub(crate) async fn finalize_destroy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_upstream_test_support::{
+        ProviderConfigCaptureFactory, provider_default_tags_local_resource_fixture,
+        provider_default_tags_missing_upstream_fixture, provider_upstream_fixture,
+    };
     use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     #[path = "cancellation_fixture.rs"]
     mod cancellation_fixture;
 
     use cancellation_fixture::DestroyCancellationFixture;
+
+    #[tokio::test]
+    async fn destroy_resolves_provider_config_from_upstream_state_before_construction() {
+        let (_temp, downstream, mut parsed) = provider_upstream_fixture();
+        let received_role_arn = Arc::new(Mutex::new(None));
+        let ctx = WiringContext::new(
+            vec![Box::new(ProviderConfigCaptureFactory {
+                received_role_arn: Arc::clone(&received_role_arn),
+            })],
+            &parsed.providers,
+        );
+        let mut state = StateFile::new();
+        state
+            .upsert_resource(
+                carina_state::ResourceState::new("thing", "orphan", "test")
+                    .with_identifier("orphan"),
+            )
+            .unwrap();
+        let state_path = downstream.join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
+        std::fs::write(
+            &state_path,
+            carina_core::utils::pretty_with_newline(&state).unwrap(),
+        )
+        .unwrap();
+        let backend = carina_state::LocalBackend::with_path(state_path);
+
+        run_destroy_locked_with_ctx(
+            &mut parsed,
+            true,
+            &backend,
+            None,
+            None,
+            false,
+            true,
+            &downstream,
+            &ProviderContext::default(),
+            NonZeroUsize::new(1).unwrap(),
+            ShutdownToken::running(),
+            &ctx,
+        )
+        .await
+        .expect("destroy must construct the provider from resolved upstream attributes");
+
+        assert_eq!(
+            *received_role_arn.lock().unwrap(),
+            Some(Value::Concrete(ConcreteValue::String(
+                "arn:aws:iam::123456789012:role/upstream".to_string()
+            )))
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_provider_resolution_ignores_unrelated_missing_upstream_state() {
+        let (_temp, downstream, mut parsed) = provider_upstream_fixture();
+        let unrelated = downstream.parent().unwrap().join("unrelated");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        std::fs::write(
+            unrelated.join("main.crn"),
+            "backend local { path = \"carina.state.json\" }\n",
+        )
+        .unwrap();
+        parsed
+            .upstream_states
+            .push(carina_core::parser::UpstreamState {
+                binding: "unrelated".to_string(),
+                source: std::path::PathBuf::from("../unrelated"),
+            });
+
+        let backend =
+            carina_state::LocalBackend::with_path(downstream.join("missing-local-state.json"));
+        run_destroy_locked(
+            &mut parsed,
+            true,
+            &backend,
+            None,
+            None,
+            false,
+            true,
+            &downstream,
+            &ProviderContext::default(),
+            NonZeroUsize::new(1).unwrap(),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect("destroy must not load an upstream unused by provider configuration");
+    }
+
+    #[tokio::test]
+    async fn destroy_provider_resolution_reports_referenced_missing_upstream_state() {
+        let (_temp, downstream, mut parsed) = provider_upstream_fixture();
+        std::fs::remove_file(
+            downstream
+                .parent()
+                .unwrap()
+                .join("upstream")
+                .join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
+        )
+        .unwrap();
+        let backend =
+            carina_state::LocalBackend::with_path(downstream.join("missing-local-state.json"));
+
+        let error = match run_destroy_locked(
+            &mut parsed,
+            true,
+            &backend,
+            None,
+            None,
+            false,
+            true,
+            &downstream,
+            &ProviderContext::default(),
+            NonZeroUsize::new(1).unwrap(),
+            ShutdownToken::running(),
+        )
+        .await
+        {
+            Ok(_) => panic!("destroy must fail when provider-referenced state is missing"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("upstream_state 'mgmt'"), "{message}");
+        assert!(message.contains("no state found"), "{message}");
+        assert!(
+            message.contains("required by provider 'test' attribute 'role_arn'"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_allows_default_tags_referencing_local_computed_attributes() {
+        let (_temp, base_dir, mut parsed) = provider_default_tags_local_resource_fixture();
+        let backend = carina_state::LocalBackend::with_path(base_dir.join("state.json"));
+
+        run_destroy_locked(
+            &mut parsed,
+            true,
+            &backend,
+            None,
+            None,
+            false,
+            true,
+            &base_dir,
+            &ProviderContext::default(),
+            NonZeroUsize::new(1).unwrap(),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect("destroy must defer provider default tags until resource normalization");
+    }
+
+    #[tokio::test]
+    async fn destroy_ignores_missing_upstream_referenced_only_by_default_tags() {
+        let (_temp, base_dir, mut parsed) = provider_default_tags_missing_upstream_fixture();
+        let backend = carina_state::LocalBackend::with_path(base_dir.join("state.json"));
+
+        run_destroy_locked(
+            &mut parsed,
+            true,
+            &backend,
+            None,
+            None,
+            false,
+            true,
+            &base_dir,
+            &ProviderContext::default(),
+            NonZeroUsize::new(1).unwrap(),
+            ShutdownToken::running(),
+        )
+        .await
+        .expect("destroy must not load upstream state used only by default tags");
+    }
 
     #[test]
     fn destroy_parallelism_default_is_eight() {

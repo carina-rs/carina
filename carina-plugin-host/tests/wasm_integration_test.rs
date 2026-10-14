@@ -97,8 +97,38 @@ fn ready_config(
     factory: &dyn ProviderFactory,
     attributes: &indexmap::IndexMap<String, Value>,
 ) -> ProviderReadyConfig {
-    carina_core::executor::prepare_provider_ready_config(factory, factory.name(), attributes)
+    let config = resolved_provider_config(factory.name(), attributes.clone());
+    carina_core::executor::prepare_provider_ready_config(factory, &config)
         .expect("test provider config should pass preparation")
+}
+
+fn resolved_provider_config(
+    name: &str,
+    attributes: indexmap::IndexMap<String, Value>,
+) -> carina_core::parser::ResolvedProviderConfig {
+    let parsed = carina_core::parser::InferredFile {
+        providers: vec![carina_core::parser::ProviderConfig {
+            name: name.to_string(),
+            attributes,
+            default_tags: indexmap::IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: indexmap::IndexMap::new(),
+            binding: None,
+        }],
+        ..Default::default()
+    };
+    carina_core::parser::resolve_provider_attributes_with_remote(
+        &parsed,
+        &HashMap::new(),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("test provider config must be fully resolved")
+    .iter()
+    .next()
+    .expect("test provider config must exist")
+    .clone()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -640,8 +670,8 @@ async fn test_wasm_provider_config_preparation_propagates_boundary_encoding_fail
         )])),
     )]);
 
-    let result =
-        carina_core::executor::prepare_provider_ready_config(&factory, factory.name(), &attributes);
+    let resolved = resolved_provider_config(factory.name(), attributes);
+    let result = carina_core::executor::prepare_provider_ready_config(&factory, &resolved);
 
     assert!(
         result.is_err(),

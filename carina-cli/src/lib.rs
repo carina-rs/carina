@@ -9,6 +9,8 @@ pub mod wiring;
 
 pub(crate) mod legacy_name_overrides;
 pub(crate) mod module_walk;
+#[cfg(test)]
+pub(crate) mod provider_upstream_test_support;
 
 #[cfg(test)]
 mod lock_file_api_tests;

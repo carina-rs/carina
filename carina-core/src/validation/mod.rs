@@ -1688,8 +1688,8 @@ pub(crate) fn value_contains_unresolved_ref(value: &Value) -> bool {
 /// type validation — `AttributeType::validate` is deferred-aware and
 /// no-ops on `Value::Deferred` — but **excluded from the plugin-side
 /// `validate_config` call**, because the WASM serializer rejects
-/// deferred values. The same `validate_config` runs again at plan/apply
-/// time once the refs have been substituted by
+/// deferred values. The same `validate_config` runs again at the typed
+/// provider-construction boundary once the refs have been substituted by
 /// [`resolve_provider_attributes_with_remote`], so no plugin-side check
 /// is permanently lost. carina#3182.
 pub fn validate_provider_config<E>(

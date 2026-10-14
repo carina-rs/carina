@@ -14,7 +14,7 @@ use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{block_deletes_on_prior_consumer_updates, create_plan_with_cascades};
 use carina_core::executor::{
     DeferredDataSourceReads, ExecutionInput, ExecutionObserver, ExecutionOutcome, ExecutionResult,
-    ProviderCheckInputs, UnresolvedResource, prepare_provider_ready_config,
+    ProviderCheckInputs, UnresolvedResource,
 };
 use carina_core::override_aware::OverrideAwareResources;
 use carina_core::plan::Plan;
@@ -26,11 +26,14 @@ use carina_core::shutdown::ShutdownToken;
 use carina_core::value::format_value;
 use carina_state::{BackendLock, LockInfo, StateBackend, StateFile};
 
-use carina_core::parser::{ProviderConfig, ProviderContext};
+use carina_core::parser::{ProviderConfig, ProviderContext, ResolvedProviderConfigs};
 
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
-use crate::commands::plan::{PlanFile, collect_delete_attributes};
+use crate::commands::plan::{
+    PlanFile, ProviderUpstreamScope, ResolvedProviderInputs, UpstreamMissingStatePolicy,
+    collect_delete_attributes, load_and_resolve_provider_configs,
+};
 use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
 };
@@ -53,9 +56,10 @@ use crate::error::AppError;
 use crate::wiring::{
     DataSourceRefreshResolution, LateAnonymousIdentityInputs, WiringContext,
     build_factories_from_providers, create_providers_from_configs, data_source_refresh_bindings,
-    get_provider_with_ctx, prepare_data_sources_for_plan, read_data_source_with_retry,
-    read_with_retry, reconcile_anonymous_identifiers_with_ctx, reconcile_late_anonymous_identities,
-    reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
+    get_provider_with_ctx, prepare_data_sources_for_plan, prepare_default_provider_ready_config,
+    read_data_source_with_retry, read_with_retry, reconcile_anonymous_identifiers_with_ctx,
+    reconcile_late_anonymous_identities, reconcile_prefixed_names,
+    resolve_data_source_refs_for_refresh,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -85,6 +89,7 @@ async fn create_checked_bootstrap_resource(
     provider: &dyn Provider,
     resource: Resource,
     parsed: &carina_core::parser::InferredFile,
+    provider_configs: &ResolvedProviderConfigs,
     normalizer: &dyn ProviderNormalizer,
     factories: &[Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &carina_core::schema::SchemaRegistry,
@@ -95,7 +100,7 @@ async fn create_checked_bootstrap_resource(
     let preparation = carina_core::executor::ProviderPreparationContext::new(
         &bindings,
         &module_gate,
-        &parsed.providers,
+        provider_configs.as_provider_configs(),
         normalizer,
         factories,
         schemas,
@@ -969,8 +974,6 @@ async fn run_apply_with_observer_factory(
     let backend_file = loaded.backend_file;
 
     let base_dir = get_base_dir(path);
-    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
-    let ctx = WiringContext::new(factories, &parsed.providers);
     crate::commands::validate_and_resolve_with_config(
         &mut parsed,
         base_dir,
@@ -978,6 +981,13 @@ async fn run_apply_with_observer_factory(
         &inference_errors,
         &duplicate_declarations,
     )?;
+
+    // Wiring needs declaration metadata and schemas before a bootstrap
+    // provider may be created. Provider inputs are loaded lazily in that
+    // branch; ordinary apply reaches backend verification without touching
+    // upstream state and resolves once in the lock-held path.
+    let (factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
+    let ctx = WiringContext::new(factories, &parsed.providers);
 
     let verified_backend = verify_for_mutation(path, parsed.backend.as_ref(), DriftCommand::Apply)?;
 
@@ -1026,23 +1036,17 @@ async fn run_apply_with_observer_factory(
                 let backend_provider_name = backend
                     .provider_name()
                     .ok_or("Backend does not specify a provider name")?;
-                let factory = provider_mod::find_factory(ctx.factories(), backend_provider_name)
-                    .ok_or_else(|| {
-                        format!("No provider factory found for '{}'", backend_provider_name)
-                    })?;
-                let provider_config_attrs = parsed
-                    .providers
-                    .iter()
-                    .find(|p| p.name == backend_provider_name)
-                    .map(|p| p.attributes.clone())
-                    .unwrap_or_default();
-                let provider_config = prepare_provider_ready_config(
-                    factory,
+                // This is the only pre-lock path that constructs a provider.
+                // Resolve its attributes here; every other apply path waits
+                // for the post-reconciliation lock-held resolution below.
+                let bootstrap_provider_inputs =
+                    load_apply_provider_inputs(&parsed, base_dir, provider_context).await?;
+                let (bucket_provider, bucket_normalizer) = create_state_bucket_bootstrap_provider(
+                    &ctx,
+                    bootstrap_provider_inputs.configs(),
                     backend_provider_name,
-                    &provider_config_attrs,
-                )?;
-                let bucket_provider = factory.create_provider(None, &provider_config).await?;
-                let bucket_normalizer = factory.create_normalizer(None, &provider_config).await?;
+                )
+                .await?;
                 // Module expansion can place a module-owned state-bucket
                 // resource in `parsed.resources`; `find_resource_by_attr`
                 // does not imply top-level ownership. Gate bootstrap with
@@ -1052,6 +1056,7 @@ async fn run_apply_with_observer_factory(
                     bucket_provider.as_ref(),
                     bucket_resource.clone(),
                     &parsed,
+                    bootstrap_provider_inputs.configs(),
                     bucket_normalizer.as_ref(),
                     ctx.factories(),
                     ctx.schemas(),
@@ -1107,20 +1112,13 @@ async fn run_apply_with_observer_factory(
                     // reuses the heavier preflight pipeline only for its
                     // resolve+anon-id steps; the schema validation already
                     // ran on the pre-injection configuration.
-                    let reloaded = load_configuration_with_config(
+                    // Keep the authored pre-injection `unresolved_parsed` for
+                    // resource pairing; replace only the resolved snapshot so
+                    // the lock-held path sees the injected bucket row.
+                    parsed = reload_apply_configuration_after_bootstrap(
                         path,
-                        provider_context,
-                        &carina_core::schema::SchemaRegistry::new(),
-                    )?;
-                    let reloaded_inference_errors = reloaded.inference_errors;
-                    let reloaded_duplicate_declarations = reloaded.duplicate_declarations;
-                    parsed = reloaded.parsed;
-                    crate::commands::validate_and_resolve_with_config(
-                        &mut parsed,
                         base_dir,
-                        true,
-                        &reloaded_inference_errors,
-                        &reloaded_duplicate_declarations,
+                        provider_context,
                     )?;
 
                     let backend_resource_type = backend
@@ -1230,6 +1228,63 @@ async fn run_apply_with_observer_factory(
     Ok(())
 }
 
+fn reload_apply_configuration_after_bootstrap(
+    path: &Path,
+    base_dir: &Path,
+    provider_context: &ProviderContext,
+) -> Result<carina_core::parser::InferredFile, AppError> {
+    let reloaded = load_configuration_with_config(
+        path,
+        provider_context,
+        &carina_core::schema::SchemaRegistry::new(),
+    )?;
+    let inference_errors = reloaded.inference_errors;
+    let duplicate_declarations = reloaded.duplicate_declarations;
+    let mut parsed = reloaded.parsed;
+    crate::commands::validate_and_resolve_with_config(
+        &mut parsed,
+        base_dir,
+        true,
+        &inference_errors,
+        &duplicate_declarations,
+    )?;
+    Ok(parsed)
+}
+
+async fn load_apply_provider_inputs<E>(
+    parsed: &carina_core::parser::File<E>,
+    base_dir: &Path,
+    provider_context: &ProviderContext,
+) -> Result<ResolvedProviderInputs, AppError> {
+    load_and_resolve_provider_configs(
+        parsed,
+        base_dir,
+        provider_context,
+        UpstreamMissingStatePolicy::Strict,
+        ProviderUpstreamScope::All,
+    )
+    .await
+}
+
+async fn create_state_bucket_bootstrap_provider(
+    ctx: &WiringContext,
+    provider_configs: &ResolvedProviderConfigs,
+    provider_name: &str,
+) -> Result<
+    (
+        Box<dyn Provider>,
+        Box<dyn carina_core::provider::ProviderNormalizer>,
+    ),
+    AppError,
+> {
+    let factory = provider_mod::find_factory(ctx.factories(), provider_name)
+        .ok_or_else(|| format!("No provider factory found for '{provider_name}'"))?;
+    let config = prepare_default_provider_ready_config(factory, provider_name, provider_configs)?;
+    let provider = factory.create_provider(None, &config).await?;
+    let normalizer = factory.create_normalizer(None, &config).await?;
+    Ok((provider, normalizer))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_locked(
     ctx: &WiringContext,
@@ -1291,33 +1346,12 @@ async fn run_apply_locked(
             &state_block_claims,
         )?;
     }
-    // Upstream state bindings are loaded up front so refs that target
-    // `upstream_state` blocks can be resolved during refresh (#1683) and
-    // so that provider configuration refs (`assume_role.role_arn =
-    // upstream.arn`) can be substituted before `create_provider` crosses
-    // the WASM boundary (carina#3182). Order matters: load upstream
-    // first, then resolve, then build the provider.
-    let mut cycle_guard = super::plan::seed_cycle_guard(project_dir);
-    let remote_bindings = super::plan::load_upstream_states(
-        &parsed.upstream_states,
-        project_dir,
-        provider_context,
-        &mut cycle_guard,
-        super::plan::UpstreamMissingStatePolicy::Strict,
-    )
-    .await?;
-
-    // carina#3182: substitute upstream/binding refs inside
-    // `provider.attributes` before they reach `create_provider`.
-    carina_core::parser::resolve_provider_attributes_with_remote(
-        parsed,
-        &remote_bindings,
-        provider_context,
-    )
-    .map_err(|e| AppError::Config(format!("Provider attribute resolution error: {}", e)))?;
-
+    let provider_inputs = load_apply_provider_inputs(parsed, project_dir, provider_context).await?;
+    let provider_configs = provider_inputs.configs();
+    let raw_provider_configs = provider_configs.as_provider_configs();
+    let remote_bindings = provider_inputs.remote_bindings();
     // Select appropriate Provider based on configuration
-    let provider = get_provider_with_ctx(ctx, parsed, project_dir).await?;
+    let provider = get_provider_with_ctx(ctx, provider_configs, project_dir).await?;
 
     // carina#3132: `sorted_resources` is `mut` because deferred-for
     // expansion now runs post-refresh (after phase-2, below) via the
@@ -1478,7 +1512,7 @@ async fn run_apply_locked(
         pairs.extend(crate::wiring::apply_anonymous_to_named_renames(
             ctx,
             &sorted_resources,
-            &parsed.providers,
+            raw_provider_configs,
             &mut current_states,
             &mut prev_explicit,
             &mut saved_attrs,
@@ -1504,7 +1538,7 @@ async fn run_apply_locked(
         &parsed.compositions,
         &data_sources,
         &current_states,
-        &remote_bindings,
+        remote_bindings,
         ctx.schemas(),
         &wait_aliases,
     );
@@ -1514,7 +1548,7 @@ async fn run_apply_locked(
         &parsed.compositions,
         &data_sources,
         &current_states,
-        &remote_bindings,
+        remote_bindings,
         ctx.schemas(),
         &wait_aliases,
     )?;
@@ -1599,7 +1633,7 @@ async fn run_apply_locked(
         provider: &provider,
         sorted_resources: &sorted_resources,
         current_states: &mut current_states,
-        remote_bindings: &remote_bindings,
+        remote_bindings,
         wait_aliases: &wait_aliases,
         moved_targets: &moved_targets,
         already_refreshed: &orphan_refreshed_ids,
@@ -1656,7 +1690,7 @@ async fn run_apply_locked(
             compositions: &pre_resolve_compositions,
             data_sources: &data_sources,
             current_states: &pre_apply_input_states,
-            remote_bindings: &remote_bindings,
+            remote_bindings,
             wait_aliases: &wait_aliases,
         },
     )?;
@@ -1672,7 +1706,7 @@ async fn run_apply_locked(
             compositions: &pre_resolve_compositions,
             data_sources: &data_sources,
             current_states: &pre_apply_input_states,
-            remote_bindings: &remote_bindings,
+            remote_bindings,
             wait_aliases: &wait_aliases,
         },
     )?;
@@ -1704,7 +1738,7 @@ async fn run_apply_locked(
             &constraint_origin_resources,
             &module_gate,
             &mut current_states,
-            &parsed.providers,
+            raw_provider_configs,
             &mut data_sources_for_plan,
             &data_sources,
             &mut wait_bindings,
@@ -1730,7 +1764,7 @@ async fn run_apply_locked(
             resources: &mut override_aware_resources,
             state_file: state_file.as_ref(),
             state_block_claims: &state_block_claims,
-            providers: &parsed.providers,
+            providers: raw_provider_configs,
         },
     )?;
     crate::wiring::validate_plan_time_state_block_collisions(
@@ -1940,7 +1974,7 @@ async fn run_apply_locked(
         &plan,
         &provider,
         &provider,
-        &parsed.providers,
+        raw_provider_configs,
         ctx.factories(),
         ctx.schemas(),
         &mut bindings,
@@ -2268,6 +2302,10 @@ async fn run_apply_from_plan_locked(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
+    let resolved_provider_configs =
+        ResolvedProviderConfigs::try_from(plan_file.provider_configs)
+            .map_err(|source| AppError::SavedProviderConfig(Box::new(source)))?;
+    let raw_provider_configs = resolved_provider_configs.as_provider_configs();
     let project_dir = apply_target.source_dir();
     // Read current state and validate lineage. carina#3315: a
     // pending in-memory schema migration must be persisted under
@@ -2350,7 +2388,7 @@ async fn run_apply_from_plan_locked(
 
     // Create provider early for drift detection
     let (provider, ctx) =
-        create_providers_from_configs(&plan_file.provider_configs, project_dir).await?;
+        create_providers_from_configs(&resolved_provider_configs, project_dir).await?;
 
     // Drift detection: re-read actual infrastructure state and compare against planned states
     println!("{}", "Checking for infrastructure drift...".cyan());
@@ -2507,7 +2545,7 @@ async fn run_apply_from_plan_locked(
         plan,
         &provider,
         &provider,
-        &plan_file.provider_configs,
+        raw_provider_configs,
         ctx.factories(),
         ctx.schemas(),
         &mut bindings,
@@ -2531,8 +2569,8 @@ async fn run_apply_from_plan_locked(
     let resources_finished = Instant::now();
 
     // Build schemas for write-only attribute persistence
-    let (factories, _) = build_factories_from_providers(&plan_file.provider_configs, project_dir)?;
-    let ctx = WiringContext::new(factories, &plan_file.provider_configs);
+    let (factories, _) = build_factories_from_providers(raw_provider_configs, project_dir)?;
+    let ctx = WiringContext::new(factories, raw_provider_configs);
 
     let skipped_exports = finalize_after_execute(
         |persistence| {

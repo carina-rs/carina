@@ -26,6 +26,64 @@ fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
 }
 
+fn resolved_provider_configs<E>(
+    parsed: &carina_core::parser::File<E>,
+) -> carina_core::parser::ResolvedProviderConfigs {
+    resolved_provider_configs_with_remote(parsed, &HashMap::new())
+}
+
+fn resolved_provider_configs_with_remote<E>(
+    parsed: &carina_core::parser::File<E>,
+    remote: &HashMap<String, HashMap<String, Value>>,
+) -> carina_core::parser::ResolvedProviderConfigs {
+    carina_core::parser::resolve_provider_attributes_with_remote(
+        parsed,
+        remote,
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("test provider configs must resolve")
+}
+
+fn validated_provider_configs(
+    configs: Vec<ProviderConfig>,
+) -> carina_core::parser::ResolvedProviderConfigs {
+    let parsed = carina_core::parser::InferredFile {
+        providers: configs,
+        ..Default::default()
+    };
+    resolved_provider_configs(&parsed)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_plan_from_parsed_with_upstream_for_test<E: Clone>(
+    parsed: &carina_core::parser::File<E>,
+    provider_configs: &carina_core::parser::ResolvedProviderConfigs,
+    unresolved_resources: &[Resource],
+    state_file: &Option<StateFile>,
+    refresh: bool,
+    remote_bindings: &HashMap<String, HashMap<String, Value>>,
+    state_block_claims: &StateBlockClaims,
+    resolved_state_block_targets: &ResolvedStateBlockTargets,
+    base_dir: &Path,
+) -> Result<PlanContext, AppError> {
+    let (factories, _) =
+        build_factories_from_providers(provider_configs.as_provider_configs(), base_dir)?;
+    let ctx = WiringContext::new(factories, provider_configs.as_provider_configs());
+    create_plan_from_parsed_with_upstream_with_ctx(
+        &ctx,
+        parsed,
+        provider_configs,
+        unresolved_resources,
+        state_file,
+        refresh,
+        remote_bindings,
+        state_block_claims,
+        resolved_state_block_targets,
+        base_dir,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_plan(
     managed: &[Resource],
@@ -216,9 +274,11 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
         unresolved_attributes: IndexMap::new(),
         binding: None,
     };
+    let configs = validated_provider_configs(vec![config]);
+    let config = configs.iter().next().unwrap();
     let mut router = ProviderRouter::new();
     let error =
-        instantiate_provider_into_router(&ctx, &mut router, &config, Path::new("."), None, None)
+        instantiate_provider_into_router(&ctx, &mut router, config, Path::new("."), None, None)
             .await
             .expect_err("normalizer creation failure must abort provider router setup");
 
@@ -276,7 +336,10 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
     }
 }
 
-fn resolved_invalid_provider_config() -> carina_core::parser::InferredFile {
+fn resolved_invalid_provider_config() -> (
+    carina_core::parser::InferredFile,
+    carina_core::parser::ResolvedProviderConfigs,
+) {
     let mut attributes = IndexMap::new();
     attributes.insert(
         "role_arn".to_string(),
@@ -302,13 +365,8 @@ fn resolved_invalid_provider_config() -> carina_core::parser::InferredFile {
             Value::Concrete(ConcreteValue::String("not-an-arn".to_string())),
         )]),
     )]);
-    carina_core::parser::resolve_provider_attributes_with_remote(
-        &mut parsed,
-        &remote,
-        &carina_core::parser::ProviderContext::default(),
-    )
-    .expect("upstream provider attribute must resolve");
-    parsed
+    let configs = resolved_provider_configs_with_remote(&parsed, &remote);
+    (parsed, configs)
 }
 
 fn assert_provider_config_constraint_error(error: &AppError) {
@@ -323,19 +381,19 @@ fn assert_provider_config_constraint_error(error: &AppError) {
 
 #[tokio::test]
 async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creation() {
-    let parsed = resolved_invalid_provider_config();
+    let (parsed, provider_configs) = resolved_invalid_provider_config();
     let creates = Arc::new(AtomicUsize::new(0));
     let ctx = WiringContext::new(
         vec![Box::new(ProviderConfigConstraintFactory {
             creates: Arc::clone(&creates),
         })],
-        &parsed.providers,
+        provider_configs.as_provider_configs(),
     );
     let temp = tempfile::tempdir().unwrap();
-
     let result = create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
         &parsed,
+        &provider_configs,
         &[],
         &None,
         false,
@@ -356,17 +414,17 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
 
 #[tokio::test]
 async fn apply_provider_construction_revalidates_resolved_upstream_config() {
-    let parsed = resolved_invalid_provider_config();
+    let (_parsed, provider_configs) = resolved_invalid_provider_config();
     let creates = Arc::new(AtomicUsize::new(0));
     let ctx = WiringContext::new(
         vec![Box::new(ProviderConfigConstraintFactory {
             creates: Arc::clone(&creates),
         })],
-        &parsed.providers,
+        provider_configs.as_provider_configs(),
     );
     let temp = tempfile::tempdir().unwrap();
 
-    let error = match get_provider_with_ctx(&ctx, &parsed, temp.path()).await {
+    let error = match get_provider_with_ctx(&ctx, &provider_configs, temp.path()).await {
         Ok(_) => panic!("resolved provider config must be rejected before apply construction"),
         Err(error) => error,
     };
@@ -879,7 +937,8 @@ fn test_normalize_state_prevents_false_enum_diff() {
     );
 
     // After normalize_state, state values match desired values → no diff
-    normalize_state_with_ctx(&ctx, &mut current_states).unwrap();
+    let provider_configs = validated_provider_configs(Vec::new());
+    normalize_state_with_ctx(&ctx, &provider_configs, &mut current_states).unwrap();
     let resources_with = vec![resource];
     let plan_with = create_plan(
         &resources_with,
@@ -907,6 +966,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
 fn normalize_state_with_ctx_prepares_config_inside_multithread_runtime() {
     struct BlockInPlaceValidationFactory {
         validated: Arc<AtomicBool>,
+        received_region: Arc<Mutex<Option<Value>>>,
     }
 
     impl ProviderFactory for BlockInPlaceValidationFactory {
@@ -922,9 +982,10 @@ fn normalize_state_with_ctx_prepares_config_inside_multithread_runtime() {
             HashMap::new()
         }
 
-        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+        fn validate_config(&self, attributes: &IndexMap<String, Value>) -> Result<(), String> {
             let _handle = tokio::task::block_in_place(|| tokio::runtime::Handle::current());
             self.validated.store(true, Ordering::SeqCst);
+            *self.received_region.lock().unwrap() = attributes.get("region").cloned();
             Ok(())
         }
 
@@ -946,17 +1007,125 @@ fn normalize_state_with_ctx_prepares_config_inside_multithread_runtime() {
     }
 
     let validated = Arc::new(AtomicBool::new(false));
+    let received_region = Arc::new(Mutex::new(None));
+    let raw_configs = vec![ProviderConfig {
+        name: "block-in-place".to_string(),
+        attributes: IndexMap::from([(
+            "region".to_string(),
+            Value::Concrete(ConcreteValue::String("resolved-region".to_string())),
+        )]),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    }];
+    let provider_configs = validated_provider_configs(raw_configs);
     let ctx = WiringContext::new(
         vec![Box::new(BlockInPlaceValidationFactory {
             validated: Arc::clone(&validated),
+            received_region: Arc::clone(&received_region),
         })],
-        &[],
+        provider_configs.as_provider_configs(),
     );
 
-    normalize_state_with_ctx(&ctx, &mut HashMap::new())
+    normalize_state_with_ctx(&ctx, &provider_configs, &mut HashMap::new())
         .expect("block-in-place provider validation should run inside a compatible runtime");
 
     assert!(validated.load(Ordering::SeqCst));
+    assert_eq!(
+        *received_region.lock().unwrap(),
+        Some(Value::Concrete(ConcreteValue::String(
+            "resolved-region".to_string()
+        ))),
+        "state normalization must prepare the declared provider config"
+    );
+}
+
+#[test]
+fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
+    struct CaptureFactory;
+
+    impl ProviderFactory for CaptureFactory {
+        fn name(&self) -> &str {
+            "capture"
+        }
+
+        fn display_name(&self) -> &str {
+            "capture"
+        }
+
+        fn provider_config_attribute_types(&self) -> HashMap<String, AttributeType> {
+            HashMap::new()
+        }
+
+        fn validate_config(&self, _attributes: &IndexMap<String, Value>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &IndexMap<String, Value>) -> String {
+            "test".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _binding: Option<&str>,
+            _config: &carina_core::provider::ProviderReadyConfig,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn Provider>>> {
+            unreachable!("config selection test does not construct a provider")
+        }
+
+        fn schemas(&self) -> Vec<ResourceSchema> {
+            Vec::new()
+        }
+    }
+
+    let config = |region: &str, binding: Option<&str>| ProviderConfig {
+        name: "capture".to_string(),
+        attributes: IndexMap::from([(
+            "region".to_string(),
+            Value::Concrete(ConcreteValue::String(region.to_string())),
+        )]),
+        default_tags: IndexMap::new(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: binding.map(str::to_string),
+    };
+
+    let configs = validated_provider_configs(vec![
+        config("first-named-region", Some("main")),
+        config("second-named-region", Some("secondary")),
+        config("default-region", None),
+    ]);
+    let ready = prepare_default_provider_ready_config(&CaptureFactory, "capture", &configs)
+        .expect("the default provider instance must win");
+    assert_eq!(
+        ready.attributes().get("region"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "default-region".to_string()
+        )))
+    );
+
+    let configs = validated_provider_configs(vec![
+        config("first-named-region", Some("main")),
+        config("second-named-region", Some("secondary")),
+    ]);
+    let ready = prepare_default_provider_ready_config(&CaptureFactory, "capture", &configs)
+        .expect("the first named provider instance must supply backend config");
+    assert_eq!(
+        ready.attributes().get("region"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "first-named-region".to_string()
+        )))
+    );
+
+    let configs = validated_provider_configs(Vec::new());
+    let ready = prepare_default_provider_ready_config(&CaptureFactory, "capture", &configs)
+        .expect("an undeclared provider kind must retain the empty fallback");
+    assert!(ready.attributes().is_empty());
 }
 
 /// Verify that merge_default_tags prevents false diffs when default_tags are
@@ -1061,11 +1230,11 @@ fn test_merge_default_tags_prevents_false_diff() {
         .expect("failed to build tokio runtime");
     let mut router = ProviderRouter::new();
     for factory in ctx.factories() {
-        let attrs = IndexMap::new();
+        let resolved_configs = validated_provider_configs(Vec::new());
+        let resolved_config = resolved_configs.provider_or_implicit(factory.name());
         let config = carina_core::executor::prepare_provider_ready_config(
             factory.as_ref(),
-            factory.name(),
-            &attrs,
+            resolved_config.as_ref(),
         )
         .expect("test provider config should pass preparation");
         router.add_normalizer(
@@ -1682,9 +1851,11 @@ moved {
         &carina_core::schema::SchemaRegistry::new(),
     );
     let tmp = tempfile::tempdir().expect("tempdir");
+    let provider_configs = resolved_provider_configs(&parsed);
 
-    let err = match create_plan_from_parsed_with_upstream(
+    let err = match create_plan_from_parsed_with_upstream_for_test(
         &parsed,
+        &provider_configs,
         &parsed.resources,
         &state_file,
         false,
@@ -1770,9 +1941,11 @@ removed {
         &carina_core::schema::SchemaRegistry::new(),
     );
     let tmp = tempfile::tempdir().expect("tempdir");
+    let provider_configs = resolved_provider_configs(&parsed);
 
-    let err = match create_plan_from_parsed_with_upstream(
+    let err = match create_plan_from_parsed_with_upstream_for_test(
         &parsed,
+        &provider_configs,
         &parsed.resources,
         &state_file,
         false,
@@ -2518,9 +2691,11 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         .expect("test state setup must be valid");
 
     let tmp = tempfile::tempdir().expect("tempdir");
+    let provider_configs = resolved_provider_configs(&parsed);
     let plan_ctx = create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
         &parsed,
+        &provider_configs,
         &unresolved_parsed.resources,
         &Some(state_file),
         false,
@@ -2632,7 +2807,7 @@ async fn moved_blocks_plan_level_fixture_emits_five_moves_only() {
     use carina_state::state::{ResourceState, StateFile};
 
     // This plan-level fixture pins moved materialization and Move-effect
-    // emission at the `create_plan_from_parsed_with_upstream` seam. The
+    // emission at the `create_plan_from_parsed_with_upstream_with_ctx` seam. The
     // claims-precedence ordering itself is covered by
     // `moved_blocks_are_honored_before_heuristic_reconciliation_for_five_renames`.
     let mut source = String::new();
@@ -2682,8 +2857,10 @@ moved {{
         &carina_core::schema::SchemaRegistry::new(),
     );
     let tmp = tempfile::tempdir().expect("tempdir");
-    let ctx = create_plan_from_parsed_with_upstream(
+    let provider_configs = resolved_provider_configs(&parsed);
+    let ctx = create_plan_from_parsed_with_upstream_for_test(
         &parsed,
+        &provider_configs,
         &parsed.resources,
         &Some(state_file),
         false,
@@ -3996,7 +4173,7 @@ mod read_with_retry_identifier_tests {
 // carina#3132 PR-1: `expand_same_config_deferred_for` — the pure
 // post-refresh expansion the plan path calls. Tested with a hand-built
 // post-refresh `current_states` (the documented refresh-phase output);
-// `create_plan_from_parsed_with_upstream` invokes this exact function,
+// `create_plan_from_parsed_with_upstream_with_ctx` invokes this exact function,
 // so this is the real plan-path expansion, not a transform in
 // isolation (cf. MEMORY "unit-test path ≠ apply path").
 //
@@ -4004,7 +4181,7 @@ mod read_with_retry_identifier_tests {
 // refresh-agnostic (it expands against whatever `current_states` it is
 // given — cached-state and live-refresh are the same input shape, both
 // covered below). The only refresh-specific code is the child-state
-// restore in `create_plan_from_parsed_with_upstream`, which routes the
+// restore in `create_plan_from_parsed_with_upstream_with_ctx`, which routes the
 // new children through the *same* `sf.build_state_for_resource` /
 // `State::not_found` path the original resources already use under
 // `--refresh=false` (via the shared `children()` filter).
@@ -4778,7 +4955,7 @@ mod expand_same_config_deferred_for_tests {
     ///     migrated state from `materialize_moved_states` must survive,
     ///     so the differ emits `Move`, never a same-address `Create`).
     ///
-    /// Both the plan path (`create_plan_from_parsed_with_upstream`) and
+    /// Both the plan path (`create_plan_from_parsed_with_upstream_with_ctx`) and
     /// the apply path (`run_apply_locked`) refresh exactly
     /// `refreshable_child_ids` — this single typed field is what makes
     /// the moved-exclusion impossible to diverge between them
@@ -5190,7 +5367,7 @@ mod using_line_format_tests {
 #[cfg(test)]
 mod kind_default_source_tests {
     use super::super::kind_default_source;
-    use carina_core::parser::ProviderConfig;
+    use carina_core::parser::{ProviderConfig, ResolvedProviderConfigs};
     use indexmap::IndexMap;
 
     fn config(name: &str, binding: Option<&str>, source: Option<&str>) -> ProviderConfig {
@@ -5206,16 +5383,29 @@ mod kind_default_source_tests {
         }
     }
 
+    fn resolved(configs: Vec<ProviderConfig>) -> ResolvedProviderConfigs {
+        let parsed = carina_core::parser::InferredFile {
+            providers: configs,
+            ..Default::default()
+        };
+        carina_core::parser::resolve_provider_attributes_with_remote(
+            &parsed,
+            &std::collections::HashMap::new(),
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn returns_source_of_matching_kind_default() {
-        let configs = vec![
+        let configs = resolved(vec![
             config(
                 "aws",
                 None,
                 Some("github.com/carina-rs/carina-provider-aws"),
             ),
             config("aws", Some("named"), None),
-        ];
+        ]);
         assert_eq!(
             kind_default_source(&configs, "aws"),
             Some("github.com/carina-rs/carina-provider-aws"),
@@ -5227,14 +5417,14 @@ mod kind_default_source_tests {
         // Named instance comes first in the slice. The function must
         // still pick the default, not the named — otherwise it would
         // return the named instance's (always-None) source.
-        let configs = vec![
+        let configs = resolved(vec![
             config("aws", Some("named"), None),
             config(
                 "aws",
                 None,
                 Some("github.com/carina-rs/carina-provider-aws"),
             ),
-        ];
+        ]);
         assert_eq!(
             kind_default_source(&configs, "aws"),
             Some("github.com/carina-rs/carina-provider-aws"),
@@ -5245,7 +5435,7 @@ mod kind_default_source_tests {
     fn different_kinds_do_not_cross_leak() {
         // Two kinds, each with their own default + source. Asking for
         // one kind must never return the other's source.
-        let configs = vec![
+        let configs = resolved(vec![
             config(
                 "aws",
                 None,
@@ -5256,7 +5446,7 @@ mod kind_default_source_tests {
                 None,
                 Some("github.com/carina-rs/carina-provider-awscc"),
             ),
-        ];
+        ]);
         assert_eq!(
             kind_default_source(&configs, "aws"),
             Some("github.com/carina-rs/carina-provider-aws"),
@@ -5269,17 +5459,17 @@ mod kind_default_source_tests {
 
     #[test]
     fn returns_none_when_kind_default_has_no_source() {
-        let configs = vec![config("mock", None, None)];
+        let configs = resolved(vec![config("mock", None, None)]);
         assert_eq!(kind_default_source(&configs, "mock"), None);
     }
 
     #[test]
     fn returns_none_when_kind_is_absent() {
-        let configs = vec![config(
+        let configs = resolved(vec![config(
             "aws",
             None,
             Some("github.com/carina-rs/carina-provider-aws"),
-        )];
+        )]);
         assert_eq!(kind_default_source(&configs, "awscc"), None);
     }
 }
@@ -6599,10 +6789,16 @@ exports { team_prefix: String = "x" }"#,
         .await
         .expect("upstream state fixture must load");
         let ctx = WiringContext::new(vec![Box::new(ConstraintFactory)], &[]);
-
+        let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
+            &parsed,
+            &remote_bindings,
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .expect("test provider configs must resolve");
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
             &ctx,
             &parsed,
+            &provider_configs,
             &unresolved_resources,
             &None,
             true,
@@ -6668,10 +6864,16 @@ exports { team_prefix: String = "x" }"#,
             &[],
         );
         let temp = tempfile::tempdir().unwrap();
-
+        let provider_configs = carina_core::parser::resolve_provider_attributes_with_remote(
+            &parsed,
+            &HashMap::new(),
+            &carina_core::parser::ProviderContext::default(),
+        )
+        .expect("test provider configs must resolve");
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
             &ctx,
             &parsed,
+            &provider_configs,
             &[],
             &None,
             true,

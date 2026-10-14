@@ -7,7 +7,7 @@ use indexmap::IndexMap;
 use serde_json::json;
 
 use carina_core::effect::Effect;
-use carina_core::parser::{ParsedFile, ProviderConfig};
+use carina_core::parser::{ParsedFile, ProviderConfig, ProviderContext};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, ProviderError, ProviderResult};
 use carina_core::resource::{
@@ -45,6 +45,22 @@ fn resolved(resource: Resource) -> ResolvedResource {
 
 fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
     ResolvedDataSource::new(resource)
+}
+
+fn saved_provider_configs(
+    configs: Vec<ProviderConfig>,
+) -> carina_core::parser::SavedProviderConfigs {
+    let parsed = carina_core::parser::InferredFile {
+        providers: configs,
+        ..Default::default()
+    };
+    let resolved = carina_core::parser::resolve_provider_attributes_with_remote(
+        &parsed,
+        &HashMap::new(),
+        &ProviderContext::default(),
+    )
+    .expect("test provider configs must resolve");
+    carina_core::parser::SavedProviderConfigs::from(&resolved)
 }
 
 struct TestProvider {
@@ -346,7 +362,7 @@ fn plan_file_serde_round_trip() {
         source_path: "example.crn".to_string(),
         state_lineage: Some("test-lineage".to_string()),
         state_serial: Some(1),
-        provider_configs: vec![ProviderConfig {
+        provider_configs: saved_provider_configs(vec![ProviderConfig {
             name: "aws".to_string(),
             attributes: IndexMap::from([(
                 "region".to_string(),
@@ -360,7 +376,7 @@ fn plan_file_serde_round_trip() {
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-        }],
+        }]),
         backend_config: Some(BackendConfig {
             backend_type: "s3".to_string(),
             attributes: HashMap::from([
@@ -394,8 +410,11 @@ fn plan_file_serde_round_trip() {
     assert_eq!(deserialized.source_path, "example.crn");
     assert_eq!(deserialized.state_lineage, Some("test-lineage".to_string()));
     assert_eq!(deserialized.state_serial, Some(1));
-    assert_eq!(deserialized.provider_configs.len(), 1);
-    assert_eq!(deserialized.provider_configs[0].name, "aws");
+    assert_eq!(deserialized.provider_configs.as_provider_configs().len(), 1);
+    assert_eq!(
+        deserialized.provider_configs.as_provider_configs()[0].name,
+        "aws"
+    );
     assert!(deserialized.backend_config.is_some());
     assert_eq!(deserialized.plan.effects().len(), 2);
     assert_eq!(deserialized.sorted_resources.len(), 1);
@@ -1726,6 +1745,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
         &backend,
         Some(&lock),
         std::path::Path::new("."),
+        &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
     )
     .await;
@@ -1770,6 +1790,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
         &backend,
         Some(&lock),
         std::path::Path::new("."),
+        &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
     )
     .await;
@@ -1832,6 +1853,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
         &backend,
         Some(&lock),
         std::path::Path::new("."),
+        &ProviderContext::default(),
         carina_core::shutdown::ShutdownToken::running(),
     )
     .await;
@@ -1980,7 +2002,7 @@ fn wiring_context_activates_builtin_mock_for_implicit_fallback() {
 }
 
 /// Issue #931: orphaned resources that no longer exist in infrastructure should not
-/// produce a Delete effect. `create_plan_from_parsed()` now calls `provider.read()`
+/// produce a Delete effect. The plan path now calls `provider.read()`
 /// for each orphan returned by `build_orphan_states()` and skips those that no longer
 /// exist.
 ///
@@ -2009,7 +2031,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
 
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
 
-    // Simulate the fixed code path in create_plan_from_parsed():
+    // Simulate the fixed plan path:
     // For each orphan, call provider.read(). If the provider returns not-found
     // (resource was deleted externally), skip inserting it into current_states.
     let orphan_states = state_file.build_orphan_states(&desired_ids);
@@ -2631,7 +2653,7 @@ fn plan_file_serialization_redacts_secrets() {
         source_path: "example.crn".to_string(),
         state_lineage: None,
         state_serial: None,
-        provider_configs: vec![],
+        provider_configs: saved_provider_configs(Vec::new()),
         backend_config: None,
         plan: redact_secrets_in_plan(&plan).unwrap(),
         sorted_resources: vec![redact_secrets_in_resource(&resource_with_secret).unwrap()],
@@ -2677,7 +2699,7 @@ fn plan_file_serialization_rejects_pending_resource_identity() {
         source_path: "main.crn".to_string(),
         state_lineage: None,
         state_serial: None,
-        provider_configs: Vec::new(),
+        provider_configs: saved_provider_configs(Vec::new()),
         backend_config: None,
         plan: Plan::new(),
         sorted_resources: vec![Resource::pending_with_provider(
@@ -2713,7 +2735,7 @@ fn plan_file_validation_rejects_missing_resource_identity() {
         source_path: "main.crn".to_string(),
         state_lineage: None,
         state_serial: None,
-        provider_configs: Vec::new(),
+        provider_configs: saved_provider_configs(Vec::new()),
         backend_config: None,
         plan: Plan::new(),
         sorted_resources: vec![Resource::with_provider(

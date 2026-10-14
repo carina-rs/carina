@@ -29,6 +29,37 @@ fn resolved(resource: Resource) -> ResolvedResource {
     ResolvedResource::new(resource)
 }
 
+fn resolved_provider_configs<E>(
+    parsed: &carina_core::parser::File<E>,
+) -> carina_core::parser::ResolvedProviderConfigs {
+    carina_core::parser::resolve_provider_attributes_with_remote(
+        parsed,
+        &HashMap::new(),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("test provider configs must resolve")
+}
+
+fn empty_resolved_provider_configs() -> carina_core::parser::ResolvedProviderConfigs {
+    resolved_provider_configs(&carina_core::parser::InferredFile::default())
+}
+
+fn saved_provider_configs(
+    configs: Vec<ProviderConfig>,
+) -> carina_core::parser::SavedProviderConfigs {
+    let parsed = carina_core::parser::InferredFile {
+        providers: configs,
+        ..Default::default()
+    };
+    carina_core::parser::SavedProviderConfigs::from(&resolved_provider_configs(&parsed))
+}
+
+fn deserialize_saved_provider_configs(
+    configs: Vec<ProviderConfig>,
+) -> carina_core::parser::SavedProviderConfigs {
+    serde_json::from_value(serde_json::to_value(configs).unwrap()).unwrap()
+}
+
 fn saved_module_composition(argument: Value, rejected: &str) -> Composition {
     let argument_name = "value";
     Composition {
@@ -117,6 +148,193 @@ impl ProviderFactory for FailBCreateFactory {
                 .attribute(AttributeSchema::new("name", AttributeType::string())),
         ]
     }
+}
+
+#[tokio::test]
+async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
+    let (_temp, downstream, parsed) =
+        crate::provider_upstream_test_support::provider_upstream_fixture();
+    let inputs = load_apply_provider_inputs(&parsed, &downstream, &ProviderContext::default())
+        .await
+        .expect("bootstrap provider inputs must resolve");
+    let received_role_arn = Arc::new(Mutex::new(None));
+    let ctx = WiringContext::new(
+        vec![Box::new(
+            crate::provider_upstream_test_support::ProviderConfigCaptureFactory {
+                received_role_arn: Arc::clone(&received_role_arn),
+            },
+        )],
+        inputs.configs().as_provider_configs(),
+    );
+    create_state_bucket_bootstrap_provider(&ctx, inputs.configs(), "test")
+        .await
+        .expect("bootstrap must construct the provider from resolved inputs");
+
+    assert_eq!(
+        received_role_arn.lock().unwrap().as_ref(),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "arn:aws:iam::123456789012:role/upstream".to_string()
+        )))
+    );
+}
+
+#[tokio::test]
+async fn apply_provider_loading_remains_all_strict_for_tag_only_upstreams() {
+    let (_temp, base_dir, parsed) =
+        crate::provider_upstream_test_support::provider_default_tags_missing_upstream_fixture();
+
+    let error =
+        match load_apply_provider_inputs(&parsed, &base_dir, &ProviderContext::default()).await {
+            Ok(_) => panic!("apply must load every declared upstream strictly"),
+            Err(error) => error,
+        };
+
+    let message = error.to_string();
+    assert!(message.contains("upstream_state 'mgmt'"), "{message}");
+    assert!(message.contains("no state found"), "{message}");
+}
+
+#[tokio::test]
+async fn apply_verifies_backend_before_loading_bootstrap_provider_upstreams() {
+    let temp = tempfile::tempdir().unwrap();
+    let upstream = temp.path().join("upstream");
+    let downstream = temp.path().join("downstream");
+    std::fs::create_dir_all(&upstream).unwrap();
+    std::fs::create_dir_all(&downstream).unwrap();
+    std::fs::write(
+        upstream.join("main.crn"),
+        "backend local { path = \"carina.state.json\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        downstream.join("main.crn"),
+        r#"
+            provider mock { target = mgmt.target }
+            let mgmt = upstream_state { source = "../upstream" }
+        "#,
+    )
+    .unwrap();
+
+    let error = run_apply_with_observer_factory(
+        &downstream,
+        true,
+        false,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+        &ProviderContext::default(),
+        ShutdownToken::running(),
+        &cli_observer_factory,
+    )
+    .await
+    .expect_err("apply without a backend lock must require init first");
+
+    let message = error.to_string();
+    assert!(message.contains("Backend lock file not found"), "{message}");
+    assert!(!message.contains("upstream_state 'mgmt'"), "{message}");
+}
+
+#[tokio::test]
+async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
+    let temp = tempfile::tempdir().unwrap();
+    let upstream = temp.path().join("upstream");
+    let downstream = temp.path().join("downstream");
+    std::fs::create_dir_all(&upstream).unwrap();
+    std::fs::create_dir_all(&downstream).unwrap();
+    std::fs::write(
+        upstream.join("main.crn"),
+        "backend local { path = \"carina.state.json\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        downstream.join("backend.crn"),
+        "backend local { path = \"carina.state.json\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        downstream.join("providers.crn"),
+        "provider test { role_arn = mgmt.role_arn }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        downstream.join("main.crn"),
+        "let mgmt = upstream_state { source = \"../upstream\" }\n",
+    )
+    .unwrap();
+
+    let write_upstream = |role_arn: &str| {
+        let mut state = StateFile::new();
+        state
+            .exports
+            .insert("role_arn".to_string(), serde_json::json!(role_arn));
+        std::fs::write(
+            upstream.join(carina_state::LocalBackend::DEFAULT_STATE_FILE),
+            carina_core::utils::pretty_with_newline(&state).unwrap(),
+        )
+        .unwrap();
+    };
+    write_upstream("arn:aws:iam::111111111111:role/old");
+    let loaded = load_configuration_with_config(
+        &downstream,
+        &ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .unwrap();
+    let unresolved_parsed = loaded.unresolved_parsed;
+    let stale_inputs =
+        load_apply_provider_inputs(&loaded.parsed, &downstream, &ProviderContext::default())
+            .await
+            .unwrap();
+    assert_eq!(
+        stale_inputs.configs().as_provider_configs()[0]
+            .attributes
+            .get("role_arn"),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "arn:aws:iam::111111111111:role/old".to_string()
+        )))
+    );
+
+    write_upstream("arn:aws:iam::222222222222:role/new");
+    let mut reloaded = reload_apply_configuration_after_bootstrap(
+        &downstream,
+        &downstream,
+        &ProviderContext::default(),
+    )
+    .expect("bootstrap reload must succeed");
+    let received_role_arn = Arc::new(Mutex::new(None));
+    let ctx = WiringContext::new(
+        vec![Box::new(
+            crate::provider_upstream_test_support::ProviderConfigCaptureFactory {
+                received_role_arn: Arc::clone(&received_role_arn),
+            },
+        )],
+        &reloaded.providers,
+    );
+    let backend = carina_state::LocalBackend::with_path(downstream.join("apply.state.json"));
+
+    run_apply_locked(
+        &ctx,
+        &mut reloaded,
+        &unresolved_parsed,
+        true,
+        &backend,
+        None,
+        &downstream,
+        &ProviderContext::default(),
+        ShutdownToken::running(),
+        &cli_observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect("the production locked path must resolve providers from the reloaded snapshot");
+
+    assert_eq!(
+        received_role_arn.lock().unwrap().as_ref(),
+        Some(&Value::Concrete(ConcreteValue::String(
+            "arn:aws:iam::222222222222:role/new".to_string()
+        ))),
+        "the lock-held provider must ignore stale pre-reload bootstrap inputs"
+    );
 }
 
 struct FailBCreateProvider;
@@ -998,9 +1216,11 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         })],
         &[],
     );
+    let provider_configs = resolved_provider_configs(&parsed);
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
         &parsed,
+        &provider_configs,
         &unresolved_parsed.resources,
         &None,
         true,
@@ -1258,7 +1478,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         consumer.clone(),
     )));
 
-    let provider_configs = vec![ProviderConfig {
+    let provider_configs = saved_provider_configs(vec![ProviderConfig {
         name: "mock".to_string(),
         attributes: IndexMap::new(),
         default_tags: IndexMap::new(),
@@ -1267,7 +1487,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         revision: None,
         unresolved_attributes: IndexMap::new(),
         binding: None,
-    }];
+    }]);
     let plan_file = PlanFile {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
@@ -1389,7 +1609,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         source_path: fixture.config_path().display().to_string(),
         state_lineage: None,
         state_serial: None,
-        provider_configs: vec![ProviderConfig {
+        provider_configs: saved_provider_configs(vec![ProviderConfig {
             name: "mock".to_string(),
             attributes: IndexMap::new(),
             default_tags: IndexMap::new(),
@@ -1398,7 +1618,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
             revision: None,
             unresolved_attributes: IndexMap::new(),
             binding: None,
-        }],
+        }]),
         backend_config: None,
         plan,
         sorted_resources: vec![producer.clone(), consumer.clone()],
@@ -1463,7 +1683,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         source_path: fixture.config_path().display().to_string(),
         state_lineage: None,
         state_serial: None,
-        provider_configs: Vec::new(),
+        provider_configs: saved_provider_configs(Vec::new()),
         backend_config: None,
         plan: Plan::new(),
         sorted_resources: Vec::new(),
@@ -1507,6 +1727,171 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
     ] {
         assert!(message.contains(expected), "message: {message}");
     }
+}
+
+#[tokio::test]
+async fn saved_plan_provider_validation_preserves_typed_error_source() {
+    use std::error::Error as _;
+
+    let fixture = ApplyCancellationFixture::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plan_file = PlanFile {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-10-14T00:00:00Z".to_string(),
+        source_path: fixture.config_path().display().to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: deserialize_saved_provider_configs(vec![ProviderConfig {
+            name: "mock".to_string(),
+            attributes: IndexMap::from([(
+                "region".to_string(),
+                Value::resource_ref("mgmt", "region", vec![]),
+            )]),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        }]),
+        backend_config: None,
+        plan: Plan::new(),
+        sorted_resources: Vec::new(),
+        unresolved_resources: Vec::new(),
+        compositions: Vec::new(),
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        current_states: Vec::new(),
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    };
+    let plan_path = tmp.path().join("unresolved-provider-config.plan.json");
+    std::fs::write(
+        &plan_path,
+        carina_core::utils::pretty_with_newline(&plan_file).unwrap(),
+    )
+    .expect("write saved plan");
+    let plan_file: PlanFile = serde_json::from_slice(
+        &std::fs::read(&plan_path).expect("read saved plan after serialization"),
+    )
+    .expect("saved plan must round-trip through its on-disk representation");
+    let observer_factory = fixture.observer_factory();
+
+    let error = run_apply_from_plan_locked(
+        plan_file,
+        true,
+        fixture.backend(),
+        None,
+        ApplyTarget::SavedPlan {
+            plan_file: &plan_path,
+            source_dir: tmp.path(),
+        },
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect_err("saved plan with unresolved provider config must be rejected");
+
+    let source = error.source().expect("AppError must retain a source");
+    assert!(
+        source
+            .downcast_ref::<Box<carina_core::parser::ProviderConfigInvariantError>>()
+            .is_some(),
+        "ProviderConfigInvariantError must remain in the AppError source chain: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn deferred_default_tags_are_accepted_by_saved_plan_apply() {
+    let fixture = ApplyCancellationFixture::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_provider_temp, downstream, _) =
+        crate::provider_upstream_test_support::provider_upstream_fixture();
+    let upstream_state_path = downstream
+        .parent()
+        .unwrap()
+        .join("upstream")
+        .join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
+    std::fs::remove_file(&upstream_state_path).expect("remove upstream state");
+    std::fs::write(
+        downstream.join("providers.crn"),
+        "provider mock { default_tags = { Owner = mgmt.owner } }\n",
+    )
+    .expect("write provider config");
+    let parsed = carina_core::config_loader::load_configuration_with_config(
+        &downstream,
+        &ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
+    .expect("load plan fixture")
+    .parsed;
+    let plan_inputs = load_and_resolve_provider_configs(
+        &parsed,
+        &downstream,
+        &ProviderContext::default(),
+        UpstreamMissingStatePolicy::Lenient,
+        ProviderUpstreamScope::All,
+    )
+    .await
+    .expect("plan must preserve deferred default_tags when upstream state is absent");
+    assert!(matches!(
+        plan_inputs.configs().as_provider_configs()[0]
+            .default_tags
+            .get("Owner"),
+        Some(Value::Deferred(DeferredValue::ResourceRef { .. }))
+    ));
+    let plan_file = PlanFile {
+        version: PlanFile::CURRENT_VERSION,
+        carina_version: "test".to_string(),
+        timestamp: "2026-10-14T00:00:00Z".to_string(),
+        source_path: fixture.config_path().display().to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: carina_core::parser::SavedProviderConfigs::from(plan_inputs.configs()),
+        backend_config: None,
+        plan: Plan::new(),
+        sorted_resources: Vec::new(),
+        unresolved_resources: Vec::new(),
+        compositions: Vec::new(),
+        data_sources: Vec::new(),
+        data_source_origins: Vec::new(),
+        current_states: Vec::new(),
+        upstream_snapshot: HashMap::new(),
+        upstream_sources: Vec::new(),
+        wait_bindings: Vec::new(),
+    };
+    let plan_path = tmp.path().join("deferred-default-tags.plan.json");
+    std::fs::write(
+        &plan_path,
+        carina_core::utils::pretty_with_newline(&plan_file).unwrap(),
+    )
+    .expect("write saved plan");
+    let plan_file: PlanFile = serde_json::from_slice(
+        &std::fs::read(&plan_path).expect("read saved plan after serialization"),
+    )
+    .expect("saved plan must round-trip through its on-disk representation");
+    let observer_factory = fixture.observer_factory();
+
+    run_apply_from_plan_locked(
+        plan_file,
+        true,
+        fixture.backend(),
+        None,
+        ApplyTarget::SavedPlan {
+            plan_file: &plan_path,
+            source_dir: tmp.path(),
+        },
+        fixture.cancel_token(),
+        &observer_factory,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+    )
+    .await
+    .expect("apply --plan must accept deferred default_tags");
 }
 
 #[tokio::test]
@@ -2499,9 +2884,11 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         "fixture must mirror AWS read-back defaults that are absent from config"
     );
 
+    let provider_configs = resolved_provider_configs(&parsed);
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         &ctx,
         &parsed,
+        &provider_configs,
         &unresolved_parsed.resources,
         &state_file,
         true,
@@ -2739,10 +3126,12 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
     );
 
     let parsed = carina_core::parser::InferredFile::default();
+    let provider_configs = empty_resolved_provider_configs();
     let error = create_checked_bootstrap_resource(
         &provider,
         resource,
         &parsed,
+        &provider_configs,
         &NoopNormalizer,
         &[],
         &schemas,
@@ -2801,10 +3190,12 @@ async fn state_bucket_provider_error_keeps_typed_source() {
             .attribute(AttributeSchema::new("bucket", AttributeType::string())),
     );
 
+    let provider_configs = empty_resolved_provider_configs();
     let error = create_checked_bootstrap_resource(
         &provider,
         resource,
         &carina_core::parser::InferredFile::default(),
+        &provider_configs,
         &NoopNormalizer,
         &[],
         &schemas,
@@ -2848,10 +3239,12 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
             .attribute(AttributeSchema::new("bucket", AttributeType::string())),
     );
 
+    let provider_configs = empty_resolved_provider_configs();
     let result = create_checked_bootstrap_resource(
         &provider,
         resource,
         &parsed,
+        &provider_configs,
         &NoopNormalizer,
         &[],
         &schemas,
@@ -4742,7 +5135,9 @@ mod saved_plan_version_tests {
 
     use tempfile::TempDir;
 
-    use super::{ApplyTarget, PlanFileHeader, saved_plan_replan_project_dir};
+    use super::{
+        ApplyTarget, PlanFileHeader, saved_plan_replan_project_dir, saved_provider_configs,
+    };
 
     #[tokio::test]
     async fn future_saved_plan_without_source_path_is_rejected_by_version() {
@@ -5192,7 +5587,7 @@ mod saved_plan_version_tests {
             source_path: "missing.crn".to_string(),
             state_lineage: None,
             state_serial: None,
-            provider_configs: Vec::new(),
+            provider_configs: saved_provider_configs(Vec::new()),
             backend_config: None,
             plan,
             sorted_resources: vec![resource.clone()],
