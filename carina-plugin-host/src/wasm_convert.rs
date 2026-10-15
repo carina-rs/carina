@@ -253,7 +253,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
             // Enum identifiers lower to the WIT boundary as plain
             // strings — the WASM plugin sees the same wire shape as
             // any other string value. See carina#2986.
-            Ok(wit::Value::StrVal(s.clone()))
+            Ok(wit::Value::StrVal(s.expose_plaintext().to_owned()))
         }
         CoreValue::Concrete(ConcreteValue::EnumIdentifier(s)) => {
             Ok(wit::Value::StrVal(s.to_string()))
@@ -343,7 +343,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
 /// Convert a WIT Value to a core Value.
 pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDecodeError> {
     match v {
-        wit::Value::StrVal(s) => Ok(CoreValue::Concrete(ConcreteValue::String(s.clone()))),
+        wit::Value::StrVal(s) => Ok(CoreValue::Concrete(ConcreteValue::String(s.clone().into()))),
         wit::Value::IntVal(i) => Ok(CoreValue::Concrete(ConcreteValue::Int(*i))),
         wit::Value::FloatVal(f) => Ok(CoreValue::Concrete(ConcreteValue::Float(*f))),
         wit::Value::BoolVal(b) => Ok(CoreValue::Concrete(ConcreteValue::Bool(*b))),
@@ -364,7 +364,7 @@ pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDe
                 .into_iter()
                 .enumerate()
                 .map(|(index, item)| match item {
-                    serde_json::Value::String(item) => Ok(item),
+                    serde_json::Value::String(item) => Ok(item.into()),
                     _ => Err(WasmValueDecodeError::new(
                         WitValueVariant::StringListVal,
                         WasmValueDecodeErrorKind::ExpectedString { index },
@@ -470,7 +470,9 @@ pub(crate) fn wit_to_core_binding_pattern(
 /// pass that keeps these arms unreachable in legitimate flows.
 fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationError> {
     match v {
-        CoreValue::Concrete(ConcreteValue::String(s)) => Ok(serde_json::Value::String(s.clone())),
+        CoreValue::Concrete(ConcreteValue::String(s)) => {
+            Ok(serde_json::Value::String(s.expose_plaintext().to_owned()))
+        }
         CoreValue::Concrete(ConcreteValue::EnumIdentifier(s)) => {
             Ok(serde_json::Value::String(s.to_string()))
         }
@@ -495,7 +497,7 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         CoreValue::Concrete(ConcreteValue::StringList(items)) => Ok(serde_json::Value::Array(
             items
                 .iter()
-                .map(|s| serde_json::Value::String(s.clone()))
+                .map(|s| serde_json::Value::String(s.expose_plaintext().to_owned()))
                 .collect(),
         )),
         CoreValue::Concrete(ConcreteValue::Map(map)) => {
@@ -552,7 +554,9 @@ fn json_to_core_value(
     wit_variant: WitValueVariant,
 ) -> Result<CoreValue, WasmValueDecodeError> {
     match v {
-        serde_json::Value::String(s) => Ok(CoreValue::Concrete(ConcreteValue::String(s.clone()))),
+        serde_json::Value::String(s) => {
+            Ok(CoreValue::Concrete(ConcreteValue::String(s.clone().into())))
+        }
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(CoreValue::Concrete(ConcreteValue::Int(i)))
@@ -1733,7 +1737,7 @@ mod tests {
 
         let core_attr = CoreAttributeSchema::new("status", CoreAttributeType::string())
             .with_default(CoreValue::Concrete(ConcreteValue::String(
-                "provider-default".to_string(),
+                "provider-default".into(),
             )))
             .with_description("Eventually populated status")
             .with_provider_name("Status")
@@ -1790,7 +1794,7 @@ mod tests {
         let required_attr = CoreAttributeSchema::new("region", CoreAttributeType::string())
             .required()
             .with_default(CoreValue::Concrete(ConcreteValue::String(
-                "us-east-1".to_string(),
+                "us-east-1".into(),
             )));
         let proto_required = core_attr_schema_to_proto_for_schema_round_trip(&required_attr);
         assert!(proto_required.required);
@@ -3168,7 +3172,7 @@ mod tests {
         };
         let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
         let state = carina_core::resource::Value::Concrete(
-            carina_core::resource::ConcreteValue::String("ap-northeast-1a".to_string()),
+            carina_core::resource::ConcreteValue::String("ap-northeast-1a".into()),
         );
 
         let lifted = carina_core::utils::lift_enum_leaves(&state, &core_attr)
@@ -3205,7 +3209,7 @@ mod tests {
         let core_attr = proto_attr_type_to_core(&proto_attr).unwrap();
 
         let garbage = carina_core::resource::Value::Concrete(
-            carina_core::resource::ConcreteValue::String("garbage-not-an-az".to_string()),
+            carina_core::resource::ConcreteValue::String("garbage-not-an-az".into()),
         );
         assert_eq!(
             carina_core::utils::lift_enum_leaves(&garbage, &core_attr),
@@ -3214,7 +3218,7 @@ mod tests {
         );
 
         let az_shaped_garbage = carina_core::resource::Value::Concrete(
-            carina_core::resource::ConcreteValue::String("foo_bar_42".to_string()),
+            carina_core::resource::ConcreteValue::String("foo_bar_42".into()),
         );
         assert_eq!(
             carina_core::utils::lift_enum_leaves(&az_shaped_garbage, &core_attr),
@@ -3239,7 +3243,7 @@ mod tests {
 
         for raw in ["   ", "", "AP-NORTHEAST-1A"] {
             let value = carina_core::resource::Value::Concrete(
-                carina_core::resource::ConcreteValue::String(raw.to_string()),
+                carina_core::resource::ConcreteValue::String(raw.to_string().into()),
             );
             assert_eq!(
                 carina_core::utils::lift_enum_leaves(&value, &core_attr),
@@ -3249,7 +3253,7 @@ mod tests {
         }
 
         let valid = carina_core::resource::Value::Concrete(
-            carina_core::resource::ConcreteValue::String("ap-northeast-1a".to_string()),
+            carina_core::resource::ConcreteValue::String("ap-northeast-1a".into()),
         );
         match carina_core::utils::lift_enum_leaves(&valid, &core_attr) {
             Some(carina_core::resource::Value::Concrete(

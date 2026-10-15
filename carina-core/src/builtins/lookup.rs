@@ -44,7 +44,10 @@ pub(crate) fn builtin_lookup(args: &[Value]) -> Result<Value, String> {
         }
     };
 
-    Ok(map.get(key).cloned().unwrap_or_else(|| args[2].clone()))
+    Ok(map
+        .get(key.expose_plaintext())
+        .cloned()
+        .unwrap_or_else(|| args[2].clone()))
 }
 
 #[cfg(test)]
@@ -59,23 +62,20 @@ mod tests {
         let map = Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "a".to_string(),
-                Value::Concrete(ConcreteValue::String("one".to_string())),
+                Value::Concrete(ConcreteValue::String("one".into())),
             ),
             (
                 "b".to_string(),
-                Value::Concrete(ConcreteValue::String("two".to_string())),
+                Value::Concrete(ConcreteValue::String("two".into())),
             ),
         ])));
         let args = vec![
             map,
-            Value::Concrete(ConcreteValue::String("a".to_string())),
-            Value::Concrete(ConcreteValue::String("default".to_string())),
+            Value::Concrete(ConcreteValue::String("a".into())),
+            Value::Concrete(ConcreteValue::String("default".into())),
         ];
         let result = evaluate_builtin("lookup", &args).unwrap();
-        assert_eq!(
-            result,
-            Value::Concrete(ConcreteValue::String("one".to_string()))
-        );
+        assert_eq!(result, Value::Concrete(ConcreteValue::String("one".into())));
     }
 
     #[test]
@@ -83,22 +83,22 @@ mod tests {
         let map = Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "a".to_string(),
-                Value::Concrete(ConcreteValue::String("one".to_string())),
+                Value::Concrete(ConcreteValue::String("one".into())),
             ),
             (
                 "b".to_string(),
-                Value::Concrete(ConcreteValue::String("two".to_string())),
+                Value::Concrete(ConcreteValue::String("two".into())),
             ),
         ])));
         let args = vec![
             map,
-            Value::Concrete(ConcreteValue::String("c".to_string())),
-            Value::Concrete(ConcreteValue::String("default".to_string())),
+            Value::Concrete(ConcreteValue::String("c".into())),
+            Value::Concrete(ConcreteValue::String("default".into())),
         ];
         let result = evaluate_builtin("lookup", &args).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("default".to_string()))
+            Value::Concrete(ConcreteValue::String("default".into()))
         );
     }
 
@@ -107,13 +107,13 @@ mod tests {
         let map = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
         let args = vec![
             map,
-            Value::Concrete(ConcreteValue::String("key".to_string())),
-            Value::Concrete(ConcreteValue::String("fallback".to_string())),
+            Value::Concrete(ConcreteValue::String("key".into())),
+            Value::Concrete(ConcreteValue::String("fallback".into())),
         ];
         let result = evaluate_builtin("lookup", &args).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("fallback".to_string()))
+            Value::Concrete(ConcreteValue::String("fallback".into()))
         );
     }
 
@@ -125,7 +125,7 @@ mod tests {
         )])));
         let args = vec![
             map,
-            Value::Concrete(ConcreteValue::String("missing".to_string())),
+            Value::Concrete(ConcreteValue::String("missing".into())),
             Value::Concrete(ConcreteValue::Int(0)),
         ];
         let result = evaluate_builtin("lookup", &args).unwrap();
@@ -140,7 +140,7 @@ mod tests {
         )])));
         let args = vec![
             map,
-            Value::Concrete(ConcreteValue::String("count".to_string())),
+            Value::Concrete(ConcreteValue::String("count".into())),
             Value::Concrete(ConcreteValue::Int(0)),
         ];
         let result = evaluate_builtin("lookup", &args).unwrap();
@@ -152,7 +152,7 @@ mod tests {
         use crate::builtins::evaluate_builtin_for_tests;
         let args = vec![
             Value::Concrete(ConcreteValue::Map(IndexMap::new())),
-            Value::Concrete(ConcreteValue::String("key".to_string())),
+            Value::Concrete(ConcreteValue::String("key".into())),
         ];
         let result = evaluate_builtin_for_tests("lookup", &args).unwrap();
         assert!(result.is_closure());
@@ -161,9 +161,9 @@ mod tests {
     #[test]
     fn lookup_non_map_first_arg() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("not a map".to_string())),
-            Value::Concrete(ConcreteValue::String("key".to_string())),
-            Value::Concrete(ConcreteValue::String("default".to_string())),
+            Value::Concrete(ConcreteValue::String("not a map".into())),
+            Value::Concrete(ConcreteValue::String("key".into())),
+            Value::Concrete(ConcreteValue::String("default".into())),
         ];
         let result = evaluate_builtin("lookup", &args);
         assert!(result.is_err());
@@ -175,7 +175,7 @@ mod tests {
         let args = vec![
             Value::Concrete(ConcreteValue::Map(IndexMap::new())),
             Value::Concrete(ConcreteValue::Int(1)),
-            Value::Concrete(ConcreteValue::String("default".to_string())),
+            Value::Concrete(ConcreteValue::String("default".into())),
         ];
         let result = evaluate_builtin("lookup", &args);
         assert!(result.is_err());

@@ -25,7 +25,7 @@ pub(crate) fn builtin_keys(args: &[Value]) -> Result<Value, String> {
             keys.sort();
             Ok(Value::Concrete(ConcreteValue::List(
                 keys.into_iter()
-                    .map(|s| Value::Concrete(ConcreteValue::String(s)))
+                    .map(|s| Value::Concrete(ConcreteValue::String(s.into())))
                     .collect(),
             )))
         }
@@ -84,9 +84,9 @@ mod tests {
         assert_eq!(
             result,
             Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("a".to_string())),
-                Value::Concrete(ConcreteValue::String("b".to_string())),
-                Value::Concrete(ConcreteValue::String("c".to_string())),
+                Value::Concrete(ConcreteValue::String("a".into())),
+                Value::Concrete(ConcreteValue::String("b".into())),
+                Value::Concrete(ConcreteValue::String("c".into())),
             ]))
         );
     }
@@ -102,13 +102,13 @@ mod tests {
     fn keys_single_entry() {
         let args = vec![Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "only".to_string(),
-            Value::Concrete(ConcreteValue::String("value".to_string())),
+            Value::Concrete(ConcreteValue::String("value".into())),
         )])))];
         let result = evaluate_builtin("keys", &args).unwrap();
         assert_eq!(
             result,
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("only".to_string())
+                ConcreteValue::String("only".into())
             )]))
         );
     }
@@ -172,7 +172,7 @@ mod tests {
         let args = vec![Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "name".to_string(),
-                Value::Concrete(ConcreteValue::String("test".to_string())),
+                Value::Concrete(ConcreteValue::String("test".into())),
             ),
             ("count".to_string(), Value::Concrete(ConcreteValue::Int(42))),
         ])))];
@@ -182,7 +182,7 @@ mod tests {
             result,
             Value::Concrete(ConcreteValue::List(vec![
                 Value::Concrete(ConcreteValue::Int(42)),
-                Value::Concrete(ConcreteValue::String("test".to_string())),
+                Value::Concrete(ConcreteValue::String("test".into())),
             ]))
         );
     }
@@ -207,9 +207,7 @@ mod tests {
 
     #[test]
     fn values_invalid_type() {
-        let args = vec![Value::Concrete(ConcreteValue::String(
-            "not a map".to_string(),
-        ))];
+        let args = vec![Value::Concrete(ConcreteValue::String("not a map".into()))];
         let result = evaluate_builtin("values", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("must be a Map"));

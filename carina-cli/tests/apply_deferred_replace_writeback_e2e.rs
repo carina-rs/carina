@@ -175,23 +175,21 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
     let mut cert = mock_resource("cert", "cert")
         .with_attribute(
             "name",
-            Value::Concrete(ConcreteValue::String("new-cert".to_string())),
+            Value::Concrete(ConcreteValue::String("new-cert".into())),
         )
         .with_attribute(
             "domain_validation_options",
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("new-validation-token".to_string()),
+                ConcreteValue::String("new-validation-token".into()),
             )])),
         );
     cert.dependency_bindings.clear();
 
-    let lb = mock_resource("load_balancer", "lb").with_attribute(
-        "name",
-        Value::Concrete(ConcreteValue::String("lb".to_string())),
-    );
+    let lb = mock_resource("load_balancer", "lb")
+        .with_attribute("name", Value::Concrete(ConcreteValue::String("lb".into())));
     let alias = mock_resource("alias_record", "alias").with_attribute(
         "name",
-        Value::Concrete(ConcreteValue::String("alias".to_string())),
+        Value::Concrete(ConcreteValue::String("alias".into())),
     );
 
     let template_resource = mock_resource("validation_records", "validation_records");
@@ -251,7 +249,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
             backend_type: "local".to_string(),
             attributes: HashMap::from([(
                 "path".to_string(),
-                Value::Concrete(ConcreteValue::String("carina.state.json".to_string())),
+                Value::Concrete(ConcreteValue::String("carina.state.json".into())),
             )]),
         }),
         plan,
@@ -362,7 +360,7 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
             backend_type: "local".to_string(),
             attributes: HashMap::from([(
                 "path".to_string(),
-                Value::Concrete(ConcreteValue::String("carina.state.json".to_string())),
+                Value::Concrete(ConcreteValue::String("carina.state.json".into())),
             )]),
         }),
         plan,

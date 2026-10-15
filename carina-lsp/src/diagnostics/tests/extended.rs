@@ -890,6 +890,54 @@ fn resource_scalar_string_mismatches_use_core_value_descriptions_once() {
 }
 
 #[test]
+fn resource_scalar_mismatches_never_display_environment_plaintext() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("enabled", AttributeType::bool()))
+        .attribute(AttributeSchema::new("count", AttributeType::int()))
+        .attribute(AttributeSchema::new("ratio", AttributeType::float()));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", schema);
+    let engine = custom_engine(schemas);
+    let variable = "CARINA_LSP_ATTRIBUTE_SECRET";
+    let plaintext = "hunter2SECRET";
+    unsafe {
+        std::env::set_var(variable, plaintext);
+    }
+    let doc = create_document(&format!(
+        r#"mock.test.resource {{
+  enabled = env('{variable}')
+  count   = env('{variable}')
+  ratio   = env('{variable}')
+}}"#
+    ));
+
+    let diagnostics = engine.analyze(&doc, None);
+    unsafe {
+        std::env::remove_var(variable);
+    }
+    let mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.starts_with("Type mismatch: expected"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(mismatches.len(), 3, "diagnostics: {diagnostics:#?}");
+    assert!(
+        mismatches
+            .iter()
+            .all(|diagnostic| diagnostic.message.contains("got string")),
+        "diagnostics: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains(plaintext)),
+        "environment plaintext leaked: {diagnostics:#?}"
+    );
+}
+
+#[test]
 fn union_of_structs_reports_alternatives_at_the_attribute() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
@@ -1895,7 +1943,7 @@ let name = join("-", parts)
 fn shared_typecheck_ipv4_address_invalid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv4_address".to_string());
-    let value = Value::Concrete(ConcreteValue::String("not-an-ip".to_string()));
+    let value = Value::Concrete(ConcreteValue::String("not-an-ip".into()));
     let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
         result.is_some(),
@@ -1907,7 +1955,7 @@ fn shared_typecheck_ipv4_address_invalid() {
 fn shared_typecheck_ipv4_address_valid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv4_address".to_string());
-    let value = Value::Concrete(ConcreteValue::String("192.168.1.1".to_string()));
+    let value = Value::Concrete(ConcreteValue::String("192.168.1.1".into()));
     let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
         result.is_none(),
@@ -1920,7 +1968,7 @@ fn shared_typecheck_ipv4_address_valid() {
 fn shared_typecheck_ipv6_cidr_invalid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_cidr".to_string());
-    let value = Value::Concrete(ConcreteValue::String("not-a-cidr".to_string()));
+    let value = Value::Concrete(ConcreteValue::String("not-a-cidr".into()));
     let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
         result.is_some(),
@@ -1932,7 +1980,7 @@ fn shared_typecheck_ipv6_cidr_invalid() {
 fn shared_typecheck_ipv6_cidr_valid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_cidr".to_string());
-    let value = Value::Concrete(ConcreteValue::String("2001:db8::/32".to_string()));
+    let value = Value::Concrete(ConcreteValue::String("2001:db8::/32".into()));
     let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
         result.is_none(),
@@ -1945,7 +1993,7 @@ fn shared_typecheck_ipv6_cidr_valid() {
 fn shared_typecheck_ipv6_address_invalid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_address".to_string());
-    let value = Value::Concrete(ConcreteValue::String("not-an-ipv6".to_string()));
+    let value = Value::Concrete(ConcreteValue::String("not-an-ipv6".into()));
     let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
         result.is_some(),
@@ -1957,7 +2005,7 @@ fn shared_typecheck_ipv6_address_invalid() {
 fn shared_typecheck_ipv6_address_valid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_address".to_string());
-    let value = Value::Concrete(ConcreteValue::String("2001:db8::1".to_string()));
+    let value = Value::Concrete(ConcreteValue::String("2001:db8::1".into()));
     let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
         result.is_none(),
@@ -1973,8 +2021,8 @@ fn shared_typecheck_list_ipv4_address_invalid() {
         carina_core::parser::TypeExpr::Simple("ipv4_address".to_string()),
     ));
     let value = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("192.168.1.1".to_string())),
-        Value::Concrete(ConcreteValue::String("bad-ip".to_string())),
+        Value::Concrete(ConcreteValue::String("192.168.1.1".into())),
+        Value::Concrete(ConcreteValue::String("bad-ip".into())),
     ]));
     let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
@@ -1995,8 +2043,8 @@ fn shared_typecheck_list_ipv6_cidr_valid() {
         carina_core::parser::TypeExpr::Simple("ipv6_cidr".to_string()),
     ));
     let value = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("2001:db8::/32".to_string())),
-        Value::Concrete(ConcreteValue::String("::/0".to_string())),
+        Value::Concrete(ConcreteValue::String("2001:db8::/32".into())),
+        Value::Concrete(ConcreteValue::String("::/0".into())),
     ]));
     let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
@@ -2140,7 +2188,7 @@ fn resource_ref_type_check_helper_regression() {
         match v {
             carina_core::resource::Value::Concrete(
                 carina_core::resource::ConcreteValue::String(s),
-            ) if s.starts_with("test.") => Ok(()),
+            ) if s.expose_plaintext().starts_with("test.") => Ok(()),
             _ => Err("invalid custom value".to_string()),
         }
     }
@@ -2721,7 +2769,7 @@ fn distinct_semantic_customs_are_rejected() {
         match v {
             carina_core::resource::Value::Concrete(
                 carina_core::resource::ConcreteValue::String(s),
-            ) if s.len() == 12 => Ok(()),
+            ) if s.expose_plaintext().len() == 12 => Ok(()),
             _ => Err("expected 12-digit account ID".to_string()),
         }
     }
@@ -3017,13 +3065,14 @@ fn exports_cross_file_ref_no_false_positive() {
         None,
         carina_core::schema::legacy_validator(|v| match v {
             Value::Concrete(ConcreteValue::String(s))
-                if s.len() == 12 && s.chars().all(|c| c.is_ascii_digit()) =>
+                if s.expose_plaintext().len() == 12
+                    && s.expose_plaintext().chars().all(|c| c.is_ascii_digit()) =>
             {
                 Ok(())
             }
             Value::Concrete(ConcreteValue::String(s)) => Err(format!(
                 "must be exactly 12 digits, got {} characters",
-                s.len()
+                s.expose_plaintext().len()
             )),
             _ => Err("expected string".to_string()),
         }),
@@ -3826,7 +3875,7 @@ let first = unrelated { }
     source.signature.attributes.insert(
         "sg".to_string(),
         CompositionAttribute::from_value(
-            Value::Concrete(ConcreteValue::String("sg-123".to_string())),
+            Value::Concrete(ConcreteValue::String("sg-123".into())),
             Some(schema_type("ec2.SecurityGroup")),
         ),
     );
@@ -7844,6 +7893,274 @@ fn write_tag_key_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
         std::fs::write(path, source).unwrap();
     }
     temp
+}
+
+#[test]
+fn environment_plaintext_is_redacted_across_lsp_directory_typecheck_paths() {
+    type DirectoryCase<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
+    let cases: &[DirectoryCase<'_>] = &[
+        (
+            "module literal union argument",
+            "main.crn",
+            &[
+                (
+                    "main.crn",
+                    "let m = use { source = './m' }\nm {\n  n = f()\n}\n",
+                ),
+                ("functions.crn", "fn f() { env('LEAKX') }\n"),
+                ("m/main.crn", "arguments { n: 'dev' | 'prod' }\n"),
+            ],
+        ),
+        (
+            "module list argument",
+            "main.crn",
+            &[
+                (
+                    "main.crn",
+                    "let m = use { source = './m' }\nm {\n  l = list_values()\n}\n",
+                ),
+                (
+                    "functions.crn",
+                    "fn list_values() { [env('LEAKX'), 'b'] }\n",
+                ),
+                ("m/main.crn", "arguments { l: list(Int) }\n"),
+            ],
+        ),
+        (
+            "literal union export",
+            "exports.crn",
+            &[
+                ("functions.crn", "fn f() { env('LEAKX') }\n"),
+                ("exports.crn", "exports {\n  e: 'dev' | 'prod' = f()\n}\n"),
+            ],
+        ),
+        (
+            "nested function export",
+            "exports.crn",
+            &[
+                ("functions.crn", "fn k(x) { x }\n"),
+                ("exports.crn", "exports {\n  q: Int = k(env('LEAKX'))\n}\n"),
+            ],
+        ),
+    ];
+
+    unsafe {
+        std::env::set_var("LEAKX", "hunter2SECRET");
+    }
+    for (label, filename, files) in cases {
+        let temp = write_tag_key_fixture(files);
+        let buffer = std::fs::read_to_string(temp.path().join(filename)).unwrap();
+        let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), filename, &buffer);
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("got string")),
+            "{label}: diagnostics={diagnostics:#?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("hunter2SECRET")),
+            "{label} leaked env plaintext: diagnostics={diagnostics:#?}"
+        );
+    }
+    unsafe {
+        std::env::remove_var("LEAKX");
+    }
+}
+
+#[test]
+fn secret_valued_exports_are_rejected_for_direct_derived_and_nested_shapes() {
+    let source = r#"
+let s = secret("topsecretXYZ")
+
+exports {
+  direct: String = s
+  builtin: String = upper(s)
+  interpolated: String = "x-${s}"
+  inline_interpolated = "x-${secret("topsecretXYZ")}"
+  decrypted: String = decrypt("ciphertext-marker")
+  nested_list: list(String) = [s]
+  nested_map: map(String) = { key = s }
+}
+"#;
+    let temp = write_tag_key_fixture(&[("main.crn", source)]);
+
+    let mut engine = test_engine();
+    engine.provider_context.decryptor = Some(Box::new(|_, _| Ok("decrypted-marker".to_string())));
+    let diagnostics = analyze_with_buffer(&engine, temp.path(), "main.crn", source);
+
+    for name in [
+        "direct",
+        "builtin",
+        "interpolated",
+        "inline_interpolated",
+        "decrypted",
+        "nested_list",
+        "nested_map",
+    ] {
+        let expected = format!("export '{name}' cannot hold a secret value");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == expected),
+            "missing {expected:?}: {diagnostics:#?}",
+        );
+    }
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("topsecretXYZ")),
+        "secret leaked: {diagnostics:#?}",
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("decrypted-marker")),
+        "decrypted secret leaked: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn secret_exports_through_resource_and_module_attributes_are_rejected_across_files() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("comment", AttributeType::string()))
+            .attribute(AttributeSchema::new("identifier", AttributeType::string()).read_only()),
+    );
+    let engine = custom_engine(schemas);
+
+    type Case<'a> = (&'a str, &'a str, &'a str, &'a [(&'a str, &'a str)]);
+    let cases: &[Case<'_>] = &[
+        (
+            "resource attribute",
+            "exports.crn",
+            "c",
+            &[
+                (
+                    "main.crn",
+                    r#"let r = mock.test.resource {
+  name = "alpha"
+  comment = secret("hunter2SECRET")
+}
+"#,
+                ),
+                ("exports.crn", "exports {\n  c: String = r.comment\n}\n"),
+            ],
+        ),
+        (
+            "module attribute",
+            "exports.crn",
+            "e",
+            &[
+                (
+                    "main.crn",
+                    r#"let m = use { source = "./modules/pass" }
+let inst = m { pw = secret("hunter2SECRET") }
+"#,
+                ),
+                ("exports.crn", "exports {\n  e: String = inst.out\n}\n"),
+                (
+                    "modules/pass/main.crn",
+                    "arguments { pw: String }\nattributes { out: String = pw }\n",
+                ),
+            ],
+        ),
+        (
+            "derived module attribute",
+            "exports.crn",
+            "x",
+            &[
+                (
+                    "providers.crn",
+                    "let r = mock.test.resource { name = 'alpha' }\n",
+                ),
+                (
+                    "main.crn",
+                    r#"let m = use { source = "./modules/upper" }
+let inst = m { pw = "${r.identifier}${secret("hunter2SECRET")}" }
+"#,
+                ),
+                ("exports.crn", "exports {\n  x: String = inst.out\n}\n"),
+                (
+                    "modules/upper/main.crn",
+                    "arguments { pw: String }\nattributes { out: String = upper(pw) }\n",
+                ),
+            ],
+        ),
+    ];
+
+    for (label, filename, export_name, files) in cases {
+        let temp = write_tag_key_fixture(files);
+        let source = std::fs::read_to_string(temp.path().join(filename)).unwrap();
+        let diagnostics = analyze_with_buffer(&engine, temp.path(), filename, &source);
+        let expected = format!("export '{export_name}' cannot hold a secret value");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == expected),
+            "{label} missing {expected:?}: {diagnostics:#?}",
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("hunter2SECRET")),
+            "{label} leaked plaintext: {diagnostics:#?}",
+        );
+    }
+}
+
+#[test]
+fn secret_export_does_not_hide_sibling_export_type_error() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string()))
+            .attribute(AttributeSchema::new("comment", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let source = r#"let r = mock.test.resource {
+  name = "alpha"
+  comment = secret("hunter2SECRET")
+}
+
+exports {
+  c: String = r.comment
+  n: Int = "notint"
+}
+"#;
+    let temp = write_tag_key_fixture(&[("main.crn", source)]);
+    let diagnostics = analyze_with_buffer(&engine, temp.path(), "main.crn", source);
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == "export 'c' cannot hold a secret value"),
+        "missing secret export diagnostic: {diagnostics:#?}",
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("expected Int")
+                && diagnostic.message.contains("got string 'notint'")
+        }),
+        "missing sibling type diagnostic: {diagnostics:#?}",
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("hunter2SECRET")),
+        "secret leaked: {diagnostics:#?}",
+    );
 }
 
 #[test]

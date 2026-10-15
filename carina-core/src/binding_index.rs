@@ -593,7 +593,7 @@ impl<'a> BindingIndex<'a> {
         reference: ReferencePathRef<'_>,
         visiting: &mut HashSet<String>,
     ) -> RefType {
-        let key = reference.to_dot_string();
+        let key = reference.to_plaintext_dot_string();
         if !visiting.insert(key.clone()) {
             return RefType::Unchecked;
         }
@@ -1193,6 +1193,30 @@ pub struct PreApplyInputs<'a> {
 }
 
 impl ResolvedBindings {
+    /// Build the value-level binding view used by validation and editor
+    /// diagnostics.
+    ///
+    /// Unlike plan/apply there is no provider state to layer in: the DSL's
+    /// managed resources, data sources, expanded compositions, and wait
+    /// aliases are the complete value authority available at this phase.
+    /// Keeping this constructor next to [`Self::pre_apply`] prevents CLI and
+    /// LSP validation from assembling subtly different binding maps.
+    pub fn for_validation<E>(parsed: &crate::parser::File<E>) -> Self {
+        let wait_aliases = parsed
+            .wait_bindings
+            .iter()
+            .map(WaitAliasSpec::from)
+            .collect::<Vec<_>>();
+        Self::pre_apply(PreApplyInputs {
+            managed: &parsed.resources,
+            compositions: &parsed.compositions,
+            data_sources: &parsed.data_sources,
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &wait_aliases,
+        })
+    }
+
     /// Single typed pre-apply constructor (carina#3248).
     ///
     /// Builds the bindings view from every kind of binding that
@@ -1600,7 +1624,7 @@ mod tests {
                 attributes: indexmap::indexmap! {
                     "target_group_arn".to_string() => CompositionAttribute::from_value(
                         Value::Concrete(crate::resource::ConcreteValue::String(
-                            "arn:example".to_string(),
+                            "arn:example".into(),
                         )),
                         None,
                     ),
@@ -1741,7 +1765,7 @@ let existing = read aws.ec2.Vpc {
             until_raw: "instance.target_group_arn == 'ready'".to_string(),
             until_predicate: UntilPredicateAst {
                 lhs_segments: vec!["instance".to_string(), "target_group_arn".to_string()],
-                rhs: Value::Concrete(crate::resource::ConcreteValue::String("ready".to_string())),
+                rhs: Value::Concrete(crate::resource::ConcreteValue::String("ready".into())),
             },
             timeout_secs: None,
             depends_on: Vec::new(),
@@ -2338,7 +2362,7 @@ mod resolved_bindings_tests {
             Some("vpc"),
             vec![(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             )],
         )];
         let states: HashMap<ResourceId, State> = HashMap::new();
@@ -2361,7 +2385,7 @@ mod resolved_bindings_tests {
         assert_eq!(
             attrs.get("cidr_block"),
             Some(&Value::Concrete(ConcreteValue::String(
-                "10.0.0.0/16".to_string()
+                "10.0.0.0/16".into()
             )))
         );
         assert_eq!(resolved.source("vpc"), Some(&BindingValueSource::Local));
@@ -2375,7 +2399,7 @@ mod resolved_bindings_tests {
             Some("vpc"),
             vec![(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             )],
         )];
         let mut states: HashMap<ResourceId, State> = HashMap::new();
@@ -2388,12 +2412,12 @@ mod resolved_bindings_tests {
                 attributes: vec![
                     (
                         "id".to_string(),
-                        Value::Concrete(ConcreteValue::String("vpc-abc".to_string())),
+                        Value::Concrete(ConcreteValue::String("vpc-abc".into())),
                     ),
                     // conflicting key — DSL value should win
                     (
                         "cidr_block".to_string(),
-                        Value::Concrete(ConcreteValue::String("WRONG".to_string())),
+                        Value::Concrete(ConcreteValue::String("WRONG".into())),
                     ),
                 ]
                 .into_iter()
@@ -2421,15 +2445,13 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("vpc").expect("vpc binding present");
         assert_eq!(
             attrs.get("id"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "vpc-abc".to_string()
-            ))),
+            Some(&Value::Concrete(ConcreteValue::String("vpc-abc".into()))),
             "state-only attribute must be merged in",
         );
         assert_eq!(
             attrs.get("cidr_block"),
             Some(&Value::Concrete(ConcreteValue::String(
-                "10.0.0.0/16".to_string()
+                "10.0.0.0/16".into()
             ))),
             "DSL value must win when both sides define a key",
         );
@@ -2514,7 +2536,7 @@ mod resolved_bindings_tests {
         let mut network_attrs = HashMap::new();
         network_attrs.insert(
             "vpc_id".to_string(),
-            Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+            Value::Concrete(ConcreteValue::String("vpc-123".into())),
         );
         remote.insert("network".to_string(), network_attrs);
 
@@ -2534,9 +2556,7 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("network").expect("upstream binding present");
         assert_eq!(
             attrs.get("vpc_id"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "vpc-123".to_string()
-            )))
+            Some(&Value::Concrete(ConcreteValue::String("vpc-123".into())))
         );
         assert_eq!(
             resolved.source("network"),
@@ -2551,7 +2571,7 @@ mod resolved_bindings_tests {
             None,
             vec![(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             )],
         )];
         let states: HashMap<ResourceId, State> = HashMap::new();
@@ -2583,7 +2603,7 @@ mod resolved_bindings_tests {
             Some("shared"),
             vec![(
                 "kind",
-                Value::Concrete(ConcreteValue::String("local".to_string())),
+                Value::Concrete(ConcreteValue::String("local".into())),
             )],
         )];
         let states: HashMap<ResourceId, State> = HashMap::new();
@@ -2592,7 +2612,7 @@ mod resolved_bindings_tests {
             "shared".to_string(),
             vec![(
                 "kind".to_string(),
-                Value::Concrete(ConcreteValue::String("upstream".to_string())),
+                Value::Concrete(ConcreteValue::String("upstream".into())),
             )]
             .into_iter()
             .collect(),
@@ -2613,9 +2633,7 @@ mod resolved_bindings_tests {
         let attrs = resolved.get("shared").expect("shared binding present");
         assert_eq!(
             attrs.get("kind"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "upstream".to_string()
-            ))),
+            Some(&Value::Concrete(ConcreteValue::String("upstream".into()))),
             "upstream binding must override local one with the same name",
         );
         assert_eq!(
@@ -2635,7 +2653,7 @@ mod resolved_bindings_tests {
             Some("vpc"),
             vec![(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             )],
         )];
         let mut states: HashMap<ResourceId, State> = HashMap::new();
@@ -2647,7 +2665,7 @@ mod resolved_bindings_tests {
                 exists: false,
                 attributes: vec![(
                     "id".to_string(),
-                    Value::Concrete(ConcreteValue::String("vpc-stale".to_string())),
+                    Value::Concrete(ConcreteValue::String("vpc-stale".into())),
                 )]
                 .into_iter()
                 .collect(),
@@ -2689,11 +2707,11 @@ mod resolved_bindings_tests {
         let resource_attrs: HashMap<String, Value> = vec![
             (
                 "name".to_string(),
-                Value::Concrete(ConcreteValue::String("vpc-dsl".to_string())),
+                Value::Concrete(ConcreteValue::String("vpc-dsl".into())),
             ),
             (
                 "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             ),
         ]
         .into_iter()
@@ -2706,12 +2724,12 @@ mod resolved_bindings_tests {
                 // overrides DSL value
                 (
                     "name".to_string(),
-                    Value::Concrete(ConcreteValue::String("vpc-applied".to_string())),
+                    Value::Concrete(ConcreteValue::String("vpc-applied".into())),
                 ),
                 // adds a state-only key
                 (
                     "id".to_string(),
-                    Value::Concrete(ConcreteValue::String("vpc-abc".to_string())),
+                    Value::Concrete(ConcreteValue::String("vpc-abc".into())),
                 ),
             ]
             .into_iter()
@@ -2727,20 +2745,18 @@ mod resolved_bindings_tests {
         assert_eq!(
             attrs.get("name"),
             Some(&Value::Concrete(ConcreteValue::String(
-                "vpc-applied".to_string()
+                "vpc-applied".into()
             ))),
             "state must win over resource_attrs on conflict",
         );
         assert_eq!(
             attrs.get("id"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "vpc-abc".to_string()
-            )))
+            Some(&Value::Concrete(ConcreteValue::String("vpc-abc".into())))
         );
         assert_eq!(
             attrs.get("cidr_block"),
             Some(&Value::Concrete(ConcreteValue::String(
-                "10.0.0.0/16".to_string()
+                "10.0.0.0/16".into()
             ))),
         );
         assert_eq!(resolved.source("vpc"), Some(&BindingValueSource::Local));
@@ -2776,7 +2792,7 @@ mod resolved_bindings_tests {
             Some("vpc"),
             vec![(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             )],
         )];
         let states: HashMap<ResourceId, State> = HashMap::new();
@@ -2801,7 +2817,7 @@ mod resolved_bindings_tests {
             exists: true,
             attributes: vec![(
                 "id".to_string(),
-                Value::Concrete(ConcreteValue::String("subnet-1".to_string())),
+                Value::Concrete(ConcreteValue::String("subnet-1".into())),
             )]
             .into_iter()
             .collect(),
@@ -2827,7 +2843,7 @@ mod resolved_bindings_tests {
         let mut resolved = ResolvedBindings::default();
         let initial: HashMap<String, Value> = vec![(
             "kind".to_string(),
-            Value::Concrete(ConcreteValue::String("first".to_string())),
+            Value::Concrete(ConcreteValue::String("first".into())),
         )]
         .into_iter()
         .collect();
@@ -2838,12 +2854,12 @@ mod resolved_bindings_tests {
         );
         assert_eq!(
             resolved.get("registry").and_then(|a| a.get("kind")),
-            Some(&Value::Concrete(ConcreteValue::String("first".to_string())))
+            Some(&Value::Concrete(ConcreteValue::String("first".into())))
         );
 
         let replacement: HashMap<String, Value> = vec![(
             "kind".to_string(),
-            Value::Concrete(ConcreteValue::String("second".to_string())),
+            Value::Concrete(ConcreteValue::String("second".into())),
         )]
         .into_iter()
         .collect();
@@ -2855,9 +2871,7 @@ mod resolved_bindings_tests {
         );
         assert_eq!(
             resolved.get("registry").and_then(|a| a.get("kind")),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "second".to_string()
-            )))
+            Some(&Value::Concrete(ConcreteValue::String("second".into())))
         );
     }
 
@@ -2880,7 +2894,7 @@ mod resolved_bindings_tests {
             vec![(
                 "certificate_arn",
                 Value::Concrete(ConcreteValue::String(
-                    "arn:aws:acm:us-east-1:1:certificate/abc".to_string(),
+                    "arn:aws:acm:us-east-1:1:certificate/abc".into(),
                 )),
             )],
         );
@@ -2897,7 +2911,7 @@ mod resolved_bindings_tests {
                 .get("cert_issued")
                 .and_then(|a| a.get("certificate_arn")),
             Some(&Value::Concrete(ConcreteValue::String(
-                "arn:aws:acm:us-east-1:1:certificate/abc".to_string()
+                "arn:aws:acm:us-east-1:1:certificate/abc".into()
             ))),
             "cert_issued.certificate_arn must passthrough to cert's value"
         );
@@ -2938,7 +2952,7 @@ mod resolved_bindings_tests {
         let mut attrs = HashMap::new();
         attrs.insert(
             "id".to_string(),
-            Value::Concrete(ConcreteValue::String("up-1".to_string())),
+            Value::Concrete(ConcreteValue::String("up-1".into())),
         );
         remote.insert("up".to_string(), attrs);
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
@@ -2951,7 +2965,7 @@ mod resolved_bindings_tests {
         });
         assert_eq!(
             resolved.get("waited").and_then(|a| a.get("id")),
-            Some(&Value::Concrete(ConcreteValue::String("up-1".to_string())))
+            Some(&Value::Concrete(ConcreteValue::String("up-1".into())))
         );
     }
 
@@ -2965,7 +2979,7 @@ mod resolved_bindings_tests {
             Some("cert"),
             vec![(
                 "certificate_arn",
-                Value::Concrete(ConcreteValue::String("arn:old".to_string())),
+                Value::Concrete(ConcreteValue::String("arn:old".into())),
             )],
         );
         let mut resolved = ResolvedBindings::pre_apply(PreApplyInputs {
@@ -2979,16 +2993,14 @@ mod resolved_bindings_tests {
         let mut new_attrs = HashMap::new();
         new_attrs.insert(
             "certificate_arn".to_string(),
-            Value::Concrete(ConcreteValue::String("arn:new".to_string())),
+            Value::Concrete(ConcreteValue::String("arn:new".into())),
         );
         resolved.set("cert", new_attrs, BindingValueSource::Local);
         assert_eq!(
             resolved
                 .get("cert_issued")
                 .and_then(|a| a.get("certificate_arn")),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "arn:old".to_string()
-            ))),
+            Some(&Value::Concrete(ConcreteValue::String("arn:old".into()))),
             "wait alias is a snapshot: a later set('cert', …) must not mutate it"
         );
     }
@@ -3007,7 +3019,7 @@ mod resolved_bindings_tests {
             Some("cert"),
             vec![(
                 "certificate_arn",
-                Value::Concrete(ConcreteValue::String("arn:shared".to_string())),
+                Value::Concrete(ConcreteValue::String("arn:shared".into())),
             )],
         );
         let resolved = ResolvedBindings::pre_apply(PreApplyInputs {
@@ -3030,9 +3042,7 @@ mod resolved_bindings_tests {
         assert_eq!(a, b);
         assert_eq!(
             a,
-            Some(Value::Concrete(ConcreteValue::String(
-                "arn:shared".to_string()
-            )))
+            Some(Value::Concrete(ConcreteValue::String("arn:shared".into())))
         );
     }
 
@@ -3062,13 +3072,15 @@ mod resolved_bindings_tests {
         ds.attributes.insert(
             "path_prefix".to_string(),
             Value::Concrete(ConcreteValue::String(
-                "/aws-reserved/sso.amazonaws.com/".to_string(),
+                "/aws-reserved/sso.amazonaws.com/".into(),
             )),
         );
         ds.attributes.insert(
             "name_regex".to_string(),
             Value::Concrete(ConcreteValue::String(
-                "^AWSReservedSSO_AdministratorAccess_[0-9a-f]{16}$".to_string(),
+                "^AWSReservedSSO_AdministratorAccess_[0-9a-f]{16}$"
+                    .to_string()
+                    .into(),
             )),
         );
 
@@ -3083,7 +3095,7 @@ mod resolved_bindings_tests {
                     "arns".to_string(),
                     Value::Concrete(ConcreteValue::List(vec![
                         Value::Concrete(ConcreteValue::String(
-                            "arn:aws:iam::111111111111:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_AdministratorAccess_abcdef0123456789".to_string(),
+                            "arn:aws:iam::111111111111:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_AdministratorAccess_abcdef0123456789".into(),
                         )),
                     ])),
                 )]
@@ -3151,7 +3163,7 @@ mod resolved_bindings_tests {
         ds.binding = Some("echo".to_string());
         ds.attributes.insert(
             "filter".to_string(),
-            Value::Concrete(ConcreteValue::String("dsl-input".to_string())),
+            Value::Concrete(ConcreteValue::String("dsl-input".into())),
         );
 
         let mut states: HashMap<ResourceId, State> = HashMap::new();
@@ -3163,7 +3175,7 @@ mod resolved_bindings_tests {
                 exists: true,
                 attributes: vec![(
                     "filter".to_string(),
-                    Value::Concrete(ConcreteValue::String("provider-result".to_string())),
+                    Value::Concrete(ConcreteValue::String("provider-result".into())),
                 )]
                 .into_iter()
                 .collect(),
@@ -3189,7 +3201,7 @@ mod resolved_bindings_tests {
         assert_eq!(
             attrs.get("filter"),
             Some(&Value::Concrete(ConcreteValue::String(
-                "provider-result".to_string()
+                "provider-result".into()
             ))),
             "read-state attribute must override DSL input on collision",
         );
@@ -3221,7 +3233,7 @@ mod resolved_bindings_tests {
                 ds_id,
                 vec![(
                     "account_id".to_string(),
-                    Value::Concrete(ConcreteValue::String("111111111111".to_string())),
+                    Value::Concrete(ConcreteValue::String("111111111111".into())),
                 )]
                 .into_iter()
                 .collect(),
@@ -3244,7 +3256,7 @@ mod resolved_bindings_tests {
         assert_eq!(
             attrs.get("account_id"),
             Some(&Value::Concrete(ConcreteValue::String(
-                "111111111111".to_string()
+                "111111111111".into()
             ))),
             "with no DSL inputs, the binding's content is entirely the \
              read state's attributes",

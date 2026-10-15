@@ -96,7 +96,7 @@ fn provider_config(default_tags: IndexMap<String, Value>) -> ProviderConfig {
 }
 
 fn string_value(value: &str) -> Value {
-    Value::Concrete(ConcreteValue::String(value.to_string()))
+    Value::Concrete(ConcreteValue::String(value.to_string().into()))
 }
 
 #[tokio::test]
@@ -328,7 +328,7 @@ async fn desired_normalization_runs_stages_in_order() {
             format!(
                 "normalize_desired:{:?}",
                 Some(Value::Concrete(ConcreteValue::StringList(vec![
-                    "one".to_string()
+                    "one".into()
                 ])))
             ),
             format!(
@@ -520,7 +520,7 @@ async fn desired_normalization_slice_canonicalizes_strips_stages_and_restores_re
     }
 
     let ref_interpolation = Value::Deferred(DeferredValue::Interpolation(vec![
-        InterpolationPart::Literal("role:".to_string()),
+        InterpolationPart::Literal("role:".into()),
         InterpolationPart::Expr(Value::resource_ref("role", "arn", vec![])),
     ]));
     let mut resource = Resource::with_provider("test", "thing", "example", None);
@@ -557,7 +557,7 @@ async fn desired_normalization_slice_canonicalizes_strips_stages_and_restores_re
     assert_eq!(
         resources[0].get_attr("subjects"),
         Some(&Value::Concrete(ConcreteValue::StringList(vec![
-            "one".to_string()
+            "one".into()
         ]))),
         "slice wrapper must canonicalize before running provider stages"
     );

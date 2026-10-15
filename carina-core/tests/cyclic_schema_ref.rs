@@ -81,7 +81,7 @@ fn rule_value(name: &str, child_count: usize) -> Value {
     let mut rule = indexmap::IndexMap::new();
     rule.insert(
         "name".to_string(),
-        Value::Concrete(ConcreteValue::String(name.to_string())),
+        Value::Concrete(ConcreteValue::String(name.to_string().into())),
     );
     rule.insert("statement".to_string(), statement_value(child_count));
     Value::Concrete(ConcreteValue::Map(rule))
@@ -110,12 +110,12 @@ fn cyclic_schema_rejects_a_string_where_a_list_is_required_under_ref() {
     let mut bad_statement = indexmap::IndexMap::new();
     bad_statement.insert(
         "and_statement".to_string(),
-        Value::Concrete(ConcreteValue::String("not a list".to_string())),
+        Value::Concrete(ConcreteValue::String("not a list".into())),
     );
     let mut bad_rule = indexmap::IndexMap::new();
     bad_rule.insert(
         "name".to_string(),
-        Value::Concrete(ConcreteValue::String("X".to_string())),
+        Value::Concrete(ConcreteValue::String("X".into())),
     );
     bad_rule.insert(
         "statement".to_string(),
@@ -292,7 +292,7 @@ fn canonicalize_through_defs_resolves_ref_arm_and_walks_resolved_type() {
     let mut payload = indexmap::IndexMap::new();
     payload.insert(
         "tags".to_string(),
-        Value::Concrete(ConcreteValue::String("env=prod".to_string())),
+        Value::Concrete(ConcreteValue::String("env=prod".into())),
     );
     let value = Value::Concrete(ConcreteValue::Map(payload));
 
@@ -330,7 +330,7 @@ fn dangling_ref_surfaces_clean_validation_error() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "broken".to_string(),
-        Value::Concrete(ConcreteValue::String("anything".to_string())),
+        Value::Concrete(ConcreteValue::String("anything".into())),
     );
 
     let errors = schema
@@ -398,7 +398,7 @@ fn schema_validate_attr_map_arm_lifts_enum_key() {
     let mut payload = indexmap::IndexMap::new();
     payload.insert(
         "eq".to_string(),
-        Value::Concrete(ConcreteValue::String("x".to_string())),
+        Value::Concrete(ConcreteValue::String("x".into())),
     );
     let value = Value::Concrete(ConcreteValue::Map(payload));
 
@@ -413,7 +413,7 @@ fn schema_validate_attr_map_arm_lifts_enum_key() {
     let mut bad_payload = indexmap::IndexMap::new();
     bad_payload.insert(
         "unknown".to_string(),
-        Value::Concrete(ConcreteValue::String("x".to_string())),
+        Value::Concrete(ConcreteValue::String("x".into())),
     );
     let bad_value = Value::Concrete(ConcreteValue::Map(bad_payload));
     schema

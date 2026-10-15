@@ -6,7 +6,9 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::document::Document;
 use crate::position;
-use carina_core::binding_index::{BindingIndex, RefTargetKind, RefType, RefTypeError};
+use carina_core::binding_index::{
+    BindingIndex, RefTargetKind, RefType, RefTypeError, ResolvedBindings,
+};
 use carina_core::builtins;
 use carina_core::config_loader::{DeclarationKind, DirectoryParseResult, DuplicateDeclaration};
 use carina_core::parser::{
@@ -2315,18 +2317,35 @@ impl DiagnosticEngine {
         doc: &Document,
         parsed: &ParsedFile,
         semantic_view: &SemanticView<'_>,
+        value_bindings: &ResolvedBindings,
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
         for param in &parsed.export_params {
-            if let Some(type_expr) = &param.type_expr
-                && let Some(value) =
-                    semantic_view.value_for_typecheck(param, TypecheckValueSlot::Parameter)
-                && let Err(type_error) = carina_core::validation::typecheck::check_type_expr_value(
-                    type_expr,
-                    value,
-                    &self.provider_context,
-                )
+            let fallback;
+            let semantic_param = match semantic_view.lookup(param) {
+                Some(semantic_param) => semantic_param,
+                None => {
+                    let Some(value) =
+                        semantic_view.value_for_typecheck(param, TypecheckValueSlot::Parameter)
+                    else {
+                        continue;
+                    };
+                    fallback = ParsedExportParam::new(
+                        param.name.clone(),
+                        param.type_expr.clone(),
+                        Some(value.clone()),
+                    );
+                    &fallback
+                }
+            };
+            let message = carina_core::validation::check_export_values_pre_apply(
+                std::slice::from_ref(semantic_param),
+                value_bindings,
+                &self.provider_context,
+            )
+            .err();
+            if let Some(message) = message
                 && let Some((line, col)) = self.find_exports_param_position(doc, &param.name)
             {
                 diagnostics.push(carina_diagnostic(
@@ -2334,7 +2353,7 @@ impl DiagnosticEngine {
                     col,
                     col + param.name.len() as u32,
                     DiagnosticSeverity::WARNING,
-                    type_error.to_string(),
+                    message,
                 ));
             }
         }

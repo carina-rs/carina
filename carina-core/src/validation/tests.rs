@@ -371,7 +371,7 @@ fn used_binding_no_warning() {
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         );
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
@@ -393,7 +393,7 @@ fn unused_binding_warns() {
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         );
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
@@ -411,7 +411,7 @@ fn dotted_string_literal_does_not_count_as_binding_use() {
 
     let target = Resource::with_provider("test", "r.Target", "target", None).with_attribute(
         "x",
-        Value::Concrete(ConcreteValue::String("publish.example.com".to_string())),
+        Value::Concrete(ConcreteValue::String("publish.example.com".into())),
     );
     parsed.resources.push(target); // allow: direct — fixture test inspection
 
@@ -426,7 +426,7 @@ fn anonymous_resource_no_warning() {
     // Anonymous resource (no _binding attribute)
     let bucket = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None).with_attribute(
         "bucket_name",
-        Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+        Value::Concrete(ConcreteValue::String("my-bucket".into())),
     );
     parsed.resources.push(bucket); // allow: direct — fixture test inspection
 
@@ -899,7 +899,7 @@ fn make_composition(binding: &str, attributes: &[&str]) -> Composition {
                     (
                         (*name).to_string(),
                         CompositionAttribute::from_value(
-                            Value::Concrete(ConcreteValue::String(format!("{name}-value"))),
+                            Value::Concrete(ConcreteValue::String(format!("{name}-value").into())),
                             None,
                         ),
                     )
@@ -1015,7 +1015,7 @@ fn unknown_attribute_reference_reports_error() {
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         );
 
     // Subnet references vpc.nonexistent_attr which doesn't exist on the VPC schema
@@ -1105,7 +1105,7 @@ fn unknown_attribute_reference_through_wait_binding_reports_error() {
         .with_binding("cert")
         .with_attribute(
             "status",
-            Value::Concrete(ConcreteValue::String("pending".to_string())),
+            Value::Concrete(ConcreteValue::String("pending".into())),
         );
     let listener =
         Resource::with_provider("awscc", "elasticloadbalancingv2.Listener", "listener", None)
@@ -1126,7 +1126,7 @@ fn unknown_attribute_reference_through_wait_binding_reports_error() {
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("issued".to_string())),
+            rhs: Value::Concrete(ConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -1174,7 +1174,7 @@ fn known_attribute_reference_through_wait_binding_is_accepted() {
         .with_binding("cert")
         .with_attribute(
             "status",
-            Value::Concrete(ConcreteValue::String("pending".to_string())),
+            Value::Concrete(ConcreteValue::String("pending".into())),
         );
     let listener =
         Resource::with_provider("awscc", "elasticloadbalancingv2.Listener", "listener", None)
@@ -1195,7 +1195,7 @@ fn known_attribute_reference_through_wait_binding_is_accepted() {
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("issued".to_string())),
+            rhs: Value::Concrete(ConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -1360,7 +1360,7 @@ fn unknown_attribute_reference_through_wait_binding_inside_nested_struct_reports
         .with_binding("cert")
         .with_attribute(
             "status",
-            Value::Concrete(ConcreteValue::String("pending".to_string())),
+            Value::Concrete(ConcreteValue::String("pending".into())),
         );
     let mut certificate = IndexMap::new();
     certificate.insert(
@@ -1384,7 +1384,7 @@ fn unknown_attribute_reference_through_wait_binding_inside_nested_struct_reports
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("issued".to_string())),
+            rhs: Value::Concrete(ConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -1432,7 +1432,7 @@ fn unknown_attribute_reference_through_managed_binding_inside_nested_struct_repo
         .with_binding("cert")
         .with_attribute(
             "status",
-            Value::Concrete(ConcreteValue::String("pending".to_string())),
+            Value::Concrete(ConcreteValue::String("pending".into())),
         );
     let mut certificate = IndexMap::new();
     certificate.insert(
@@ -1615,7 +1615,7 @@ fn provider_in_module_with_attributes_errors() {
         .push(crate::parser::AttributeParameter::new(
             "vpc_id".to_string(),
             Some(TypeExpr::String),
-            Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
+            Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
         ));
 
     let result = validate_no_provider_in_module(&parsed);
@@ -1723,7 +1723,7 @@ fn state_block_in_module_with_attributes_errors() {
         .push(crate::parser::AttributeParameter::new(
             "resource_id".to_string(),
             Some(TypeExpr::String),
-            Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
+            Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
         ));
 
     let result = validate_no_state_blocks_in_module(&parsed);
@@ -1790,7 +1790,7 @@ fn backend_in_module_with_attributes_errors() {
         .push(crate::parser::AttributeParameter::new(
             "resource_id".to_string(),
             Some(TypeExpr::String),
-            Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
+            Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
         ));
     parsed.backend = Some(crate::parser::BackendConfig {
         backend_type: "local".to_string(),
@@ -1853,7 +1853,7 @@ fn upstream_state_in_module_with_attributes_errors() {
         .push(crate::parser::AttributeParameter::new(
             "resource_id".to_string(),
             Some(TypeExpr::String),
-            Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
+            Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
         ));
 
     let result = validate_no_upstream_states_in_module(&parsed);
@@ -1901,7 +1901,7 @@ fn exports_in_module_with_attributes_errors() {
         .push(crate::parser::AttributeParameter::new(
             "resource_id".to_string(),
             Some(TypeExpr::String),
-            Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
+            Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
         ));
 
     let result = validate_no_exports_in_module(&parsed);
@@ -2035,7 +2035,7 @@ fn validate_type_expr_struct_error_uses_pascal_case_in_field_type() {
 fn rendered_typecheck_result_ipv4_cidr_valid() {
     let result = rendered_typecheck_result(
         &TypeExpr::Simple("ipv4_cidr".to_string()),
-        &Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        &Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         &ProviderContext::default(),
     );
     assert!(result.is_none());
@@ -2045,7 +2045,7 @@ fn rendered_typecheck_result_ipv4_cidr_valid() {
 fn rendered_typecheck_result_ipv4_cidr_invalid() {
     let result = rendered_typecheck_result(
         &TypeExpr::Simple("ipv4_cidr".to_string()),
-        &Value::Concrete(ConcreteValue::String("not-a-cidr".to_string())),
+        &Value::Concrete(ConcreteValue::String("not-a-cidr".into())),
         &ProviderContext::default(),
     );
     assert!(result.is_some());
@@ -2055,7 +2055,7 @@ fn rendered_typecheck_result_ipv4_cidr_invalid() {
 fn rendered_typecheck_result_ipv4_address_valid() {
     let result = rendered_typecheck_result(
         &TypeExpr::Simple("ipv4_address".to_string()),
-        &Value::Concrete(ConcreteValue::String("192.168.1.1".to_string())),
+        &Value::Concrete(ConcreteValue::String("192.168.1.1".into())),
         &ProviderContext::default(),
     );
     assert!(result.is_none());
@@ -2065,7 +2065,7 @@ fn rendered_typecheck_result_ipv4_address_valid() {
 fn rendered_typecheck_result_ipv4_address_invalid() {
     let result = rendered_typecheck_result(
         &TypeExpr::Simple("ipv4_address".to_string()),
-        &Value::Concrete(ConcreteValue::String("999.999.999.999".to_string())),
+        &Value::Concrete(ConcreteValue::String("999.999.999.999".into())),
         &ProviderContext::default(),
     );
     assert!(result.is_some());
@@ -2075,7 +2075,7 @@ fn rendered_typecheck_result_ipv4_address_invalid() {
 fn rendered_typecheck_result_ipv6_cidr_valid() {
     let result = rendered_typecheck_result(
         &TypeExpr::Simple("ipv6_cidr".to_string()),
-        &Value::Concrete(ConcreteValue::String("2001:db8::/32".to_string())),
+        &Value::Concrete(ConcreteValue::String("2001:db8::/32".into())),
         &ProviderContext::default(),
     );
     assert!(result.is_none());
@@ -2085,7 +2085,7 @@ fn rendered_typecheck_result_ipv6_cidr_valid() {
 fn rendered_typecheck_result_ipv6_cidr_invalid() {
     let result = rendered_typecheck_result(
         &TypeExpr::Simple("ipv6_cidr".to_string()),
-        &Value::Concrete(ConcreteValue::String("not-ipv6-cidr".to_string())),
+        &Value::Concrete(ConcreteValue::String("not-ipv6-cidr".into())),
         &ProviderContext::default(),
     );
     assert!(result.is_some());
@@ -2095,7 +2095,7 @@ fn rendered_typecheck_result_ipv6_cidr_invalid() {
 fn rendered_typecheck_result_ipv6_address_valid() {
     let result = rendered_typecheck_result(
         &TypeExpr::Simple("ipv6_address".to_string()),
-        &Value::Concrete(ConcreteValue::String("2001:db8::1".to_string())),
+        &Value::Concrete(ConcreteValue::String("2001:db8::1".into())),
         &ProviderContext::default(),
     );
     assert!(result.is_none());
@@ -2105,7 +2105,7 @@ fn rendered_typecheck_result_ipv6_address_valid() {
 fn rendered_typecheck_result_ipv6_address_invalid() {
     let result = rendered_typecheck_result(
         &TypeExpr::Simple("ipv6_address".to_string()),
-        &Value::Concrete(ConcreteValue::String("zzz::zzz".to_string())),
+        &Value::Concrete(ConcreteValue::String("zzz::zzz".into())),
         &ProviderContext::default(),
     );
     assert!(result.is_some());
@@ -2115,7 +2115,7 @@ fn rendered_typecheck_result_ipv6_address_invalid() {
 fn rendered_typecheck_result_bool_mismatch() {
     let result = rendered_typecheck_result(
         &TypeExpr::Bool,
-        &Value::Concrete(ConcreteValue::String("yes".to_string())),
+        &Value::Concrete(ConcreteValue::String("yes".into())),
         &ProviderContext::default(),
     );
     assert!(result.is_some());
@@ -2126,7 +2126,7 @@ fn rendered_typecheck_result_bool_mismatch() {
 fn rendered_typecheck_result_int_mismatch() {
     let result = rendered_typecheck_result(
         &TypeExpr::Int,
-        &Value::Concrete(ConcreteValue::String("42".to_string())),
+        &Value::Concrete(ConcreteValue::String("42".into())),
         &ProviderContext::default(),
     );
     assert!(result.is_some());
@@ -2137,7 +2137,7 @@ fn rendered_typecheck_result_int_mismatch() {
 fn rendered_typecheck_result_float_mismatch() {
     let result = rendered_typecheck_result(
         &TypeExpr::Float,
-        &Value::Concrete(ConcreteValue::String("3.14".to_string())),
+        &Value::Concrete(ConcreteValue::String("3.14".into())),
         &ProviderContext::default(),
     );
     assert!(result.is_some());
@@ -2147,8 +2147,8 @@ fn rendered_typecheck_result_float_mismatch() {
 #[test]
 fn rendered_typecheck_result_list_of_ipv4_address() {
     let items = vec![
-        Value::Concrete(ConcreteValue::String("192.168.1.1".to_string())),
-        Value::Concrete(ConcreteValue::String("999.0.0.1".to_string())),
+        Value::Concrete(ConcreteValue::String("192.168.1.1".into())),
+        Value::Concrete(ConcreteValue::String("999.0.0.1".into())),
     ];
     let result = rendered_typecheck_result(
         &TypeExpr::List(Box::new(TypeExpr::Simple("ipv4_address".to_string()))),
@@ -2163,7 +2163,7 @@ fn rendered_typecheck_result_list_of_ipv4_address() {
 fn rendered_typecheck_result_string_type_accepts_string() {
     let result = rendered_typecheck_result(
         &TypeExpr::String,
-        &Value::Concrete(ConcreteValue::String("hello".to_string())),
+        &Value::Concrete(ConcreteValue::String("hello".into())),
         &ProviderContext::default(),
     );
     assert!(result.is_none());
@@ -2263,7 +2263,7 @@ fn rendered_typecheck_result_int_got_float_is_rejected() {
 fn rendered_typecheck_result_escapes_string_literal_value() {
     let result = rendered_typecheck_result(
         &TypeExpr::Bool,
-        &Value::Concrete(ConcreteValue::String("yes\"\nno".to_string())),
+        &Value::Concrete(ConcreteValue::String("yes\"\nno".into())),
         &ProviderContext::default(),
     );
 
@@ -2291,7 +2291,7 @@ fn rendered_typecheck_result_struct_got_string_includes_literal() {
     };
     let result = rendered_typecheck_result(
         &type_expr,
-        &Value::Concrete(ConcreteValue::String("production".to_string())),
+        &Value::Concrete(ConcreteValue::String("production".into())),
         &ProviderContext::default(),
     );
 
@@ -2322,7 +2322,7 @@ fn rendered_typecheck_result_schema_type_accepts_string() {
     };
     let result = rendered_typecheck_result(
         &schema_type,
-        &Value::Concrete(ConcreteValue::String("vpc-12345678".to_string())),
+        &Value::Concrete(ConcreteValue::String("vpc-12345678".into())),
         &ProviderContext::default(),
     );
     assert!(result.is_none());
@@ -2377,7 +2377,7 @@ fn validate_type_expr_custom_type_rejects_invalid() {
 
     let result = rendered_typecheck_result(
         &TypeExpr::Simple("iam_policy_arn".to_string()),
-        &Value::Concrete(ConcreteValue::String("aaaa".to_string())),
+        &Value::Concrete(ConcreteValue::String("aaaa".into())),
         &config,
     );
     assert!(result.is_some(), "Expected validation error for 'aaaa'");
@@ -2386,7 +2386,9 @@ fn validate_type_expr_custom_type_rejects_invalid() {
     let result = rendered_typecheck_result(
         &TypeExpr::Simple("iam_policy_arn".to_string()),
         &Value::Concrete(ConcreteValue::String(
-            "arn:aws:iam::123456789012:policy/MyPolicy".to_string(),
+            "arn:aws:iam::123456789012:policy/MyPolicy"
+                .to_string()
+                .into(),
         )),
         &config,
     );
@@ -2400,7 +2402,7 @@ fn validate_type_expr_list_custom_type_rejects_invalid() {
     let result = rendered_typecheck_result(
         &TypeExpr::List(Box::new(TypeExpr::Simple("iam_policy_arn".to_string()))),
         &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::String("aaaa".to_string()),
+            ConcreteValue::String("aaaa".into()),
         )])),
         &config,
     );
@@ -2425,7 +2427,7 @@ fn validate_type_expr_struct_accepts_well_formed_map() {
     let mut map = IndexMap::new();
     map.insert(
         "name".to_string(),
-        Value::Concrete(ConcreteValue::String("x".to_string())),
+        Value::Concrete(ConcreteValue::String("x".into())),
     );
     map.insert("value".to_string(), Value::Concrete(ConcreteValue::Int(1)));
     let result = rendered_typecheck_result(
@@ -2441,7 +2443,7 @@ fn validate_type_expr_struct_rejects_missing_field() {
     let mut map = IndexMap::new();
     map.insert(
         "name".to_string(),
-        Value::Concrete(ConcreteValue::String("x".to_string())),
+        Value::Concrete(ConcreteValue::String("x".into())),
     );
     let result = rendered_typecheck_result(
         &struct_type_name_value(),
@@ -2459,12 +2461,12 @@ fn validate_type_expr_struct_rejects_unknown_field() {
     let mut map = IndexMap::new();
     map.insert(
         "name".to_string(),
-        Value::Concrete(ConcreteValue::String("x".to_string())),
+        Value::Concrete(ConcreteValue::String("x".into())),
     );
     map.insert("value".to_string(), Value::Concrete(ConcreteValue::Int(1)));
     map.insert(
         "extra".to_string(),
-        Value::Concrete(ConcreteValue::String("y".to_string())),
+        Value::Concrete(ConcreteValue::String("y".into())),
     );
     let result = rendered_typecheck_result(
         &struct_type_name_value(),
@@ -2482,11 +2484,11 @@ fn validate_type_expr_struct_rejects_wrong_field_type() {
     let mut map = IndexMap::new();
     map.insert(
         "name".to_string(),
-        Value::Concrete(ConcreteValue::String("x".to_string())),
+        Value::Concrete(ConcreteValue::String("x".into())),
     );
     map.insert(
         "value".to_string(),
-        Value::Concrete(ConcreteValue::String("not-an-int".to_string())),
+        Value::Concrete(ConcreteValue::String("not-an-int".into())),
     );
     let result = rendered_typecheck_result(
         &struct_type_name_value(),
@@ -2502,7 +2504,7 @@ fn validate_type_expr_struct_rejects_wrong_field_type() {
 fn validate_type_expr_struct_rejects_non_map_value() {
     let result = rendered_typecheck_result(
         &struct_type_name_value(),
-        &Value::Concrete(ConcreteValue::String("oops".to_string())),
+        &Value::Concrete(ConcreteValue::String("oops".into())),
         &ProviderContext::default(),
     );
     assert!(result.is_some());
@@ -2837,7 +2839,7 @@ fn validate_module_calls_rejects_custom_type() {
     args.insert(
         "managed_policy_arns".to_string(),
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::String("aaaa".to_string()),
+            ConcreteValue::String("aaaa".into()),
         )])),
     );
 
@@ -2879,7 +2881,7 @@ fn validate_module_calls_rejects_literal_union_mismatch() {
         source: Default::default(),
         arguments: HashMap::from([(
             "environment".to_string(),
-            Value::Concrete(ConcreteValue::String("production".to_string())),
+            Value::Concrete(ConcreteValue::String("production".into())),
         )]),
     }];
     let imported_modules = HashMap::from([(
@@ -2962,12 +2964,12 @@ fn attribute_param_ref_type_mismatch_detected() {
         .with_binding("role")
         .with_attribute(
             "role_name",
-            Value::Concrete(ConcreteValue::String("my-role".to_string())),
+            Value::Concrete(ConcreteValue::String("my-role".into())),
         )
         .with_attribute(
             "arn",
             Value::Concrete(ConcreteValue::String(
-                "arn:aws:iam::123456789012:role/my-role".to_string(),
+                "arn:aws:iam::123456789012:role/my-role".into(),
             )),
         );
 
@@ -3038,7 +3040,7 @@ fn attribute_param_ref_type_resolves_terminal_schema_ref() {
         .with_binding("source")
         .with_attribute(
             "value",
-            Value::Concrete(ConcreteValue::String("text".to_string())),
+            Value::Concrete(ConcreteValue::String("text".into())),
         );
     let source_schema = ResourceSchema::new("source.Item")
         .attribute(AttributeSchema::new(
@@ -3167,7 +3169,7 @@ fn post_expansion_composition_argument_schema_types_use_directional_relation() {
     source.signature.attributes.insert(
         "security_group_id".to_string(),
         CompositionAttribute::from_value(
-            Value::Concrete(ConcreteValue::String("sg-123".to_string())),
+            Value::Concrete(ConcreteValue::String("sg-123".into())),
             Some(schema_type("ec2.SecurityGroup")),
         ),
     );
@@ -3246,7 +3248,7 @@ fn post_expansion_module_attribute_error_is_per_declaration_and_names_module() {
         source.signature.attributes.insert(
             "group_id".to_string(),
             CompositionAttribute::from_value(
-                Value::Concrete(ConcreteValue::String("sg-123".to_string())),
+                Value::Concrete(ConcreteValue::String("sg-123".into())),
                 Some(schema_type("ec2.SecurityGroup")),
             ),
         );
@@ -3294,7 +3296,7 @@ fn post_expansion_module_attribute_dedup_keeps_distinct_errors() {
         source.signature.attributes.insert(
             "group_id".to_string(),
             CompositionAttribute::from_value(
-                Value::Concrete(ConcreteValue::String("sg-123".to_string())),
+                Value::Concrete(ConcreteValue::String("sg-123".into())),
                 Some(security_group_id.clone()),
             ),
         );
@@ -3358,7 +3360,7 @@ fn post_expansion_anonymous_call_error_uses_module_label() {
     source.signature.attributes.insert(
         "group_id".to_string(),
         CompositionAttribute::from_value(
-            Value::Concrete(ConcreteValue::String("sg-123".to_string())),
+            Value::Concrete(ConcreteValue::String("sg-123".into())),
             Some(schema_type("ec2.SecurityGroup")),
         ),
     );
@@ -3548,7 +3550,7 @@ fn attribute_param_ref_types_flags_unknown_attribute_inside_nested_struct() {
         .with_binding("vpc")
         .with_attribute(
             "vpc_id",
-            Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+            Value::Concrete(ConcreteValue::String("vpc-123".into())),
         );
 
     let mut vpc_schema = ResourceSchema::new("ec2.Vpc");
@@ -3587,7 +3589,7 @@ fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
         .with_binding("cert")
         .with_attribute(
             "status",
-            Value::Concrete(ConcreteValue::String("pending".to_string())),
+            Value::Concrete(ConcreteValue::String("pending".into())),
         );
 
     let mut cert_schema = ResourceSchema::new("acm.Certificate");
@@ -3618,7 +3620,7 @@ fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("issued".to_string())),
+            rhs: Value::Concrete(ConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -3643,7 +3645,7 @@ fn attribute_param_ref_types_does_not_misreport_type_mismatch_for_nested_ref_to_
         .with_binding("vpc")
         .with_attribute(
             "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         );
 
     let mut vpc_schema = ResourceSchema::new("ec2.Vpc");
@@ -3680,10 +3682,7 @@ fn validate_attribute_params_against_target_group(
 
     let target_group = Resource::with_provider("awscc", "elbv2.TargetGroup", "app", None)
         .with_binding("target_group")
-        .with_attribute(
-            "name",
-            Value::Concrete(ConcreteValue::String("app".to_string())),
-        );
+        .with_attribute("name", Value::Concrete(ConcreteValue::String("app".into())));
     let target_group_schema = ResourceSchema::new("elbv2.TargetGroup")
         .attribute(AttributeSchema::new("name", AttributeType::string()))
         .attribute(AttributeSchema::new(
@@ -3900,6 +3899,18 @@ fn simple_annotated_plain_ref_reports_unknown_attribute_once() {
     );
 }
 
+fn resolve_and_validate_export_params(
+    exports: &[crate::parser::InferredExportParam],
+    config: &ProviderContext,
+) -> Result<(), String> {
+    check_export_values_pre_apply(
+        exports,
+        &crate::binding_index::ResolvedBindings::default(),
+        config,
+    )
+    .map(|_| ())
+}
+
 #[test]
 fn validate_export_params_rejects_invalid_custom_type() {
     use crate::parser::InferredExportParam;
@@ -3908,11 +3919,9 @@ fn validate_export_params_rejects_invalid_custom_type() {
     let exports = vec![InferredExportParam {
         name: "policy".to_string(),
         type_expr: TypeExpr::Simple("iam_policy_arn".to_string()),
-        value: Some(Value::Concrete(ConcreteValue::String(
-            "not-an-arn".to_string(),
-        ))),
+        value: Some(Value::Concrete(ConcreteValue::String("not-an-arn".into()))),
     }];
-    let result = validate_export_params(&exports, &config);
+    let result = resolve_and_validate_export_params(&exports, &config);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.contains("export 'policy'"), "err={err}");
@@ -3929,12 +3938,12 @@ fn validate_export_params_rejects_invalid_list_element() {
         type_expr: TypeExpr::List(Box::new(TypeExpr::Simple("iam_policy_arn".to_string()))),
         value: Some(Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::String(
-                "arn:aws:iam::123456789012:policy/valid".to_string(),
+                "arn:aws:iam::123456789012:policy/valid".into(),
             )),
-            Value::Concrete(ConcreteValue::String("garbage".to_string())),
+            Value::Concrete(ConcreteValue::String("garbage".into())),
         ]))),
     }];
-    let result = validate_export_params(&exports, &config);
+    let result = resolve_and_validate_export_params(&exports, &config);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.contains("export 'policies'"), "err={err}");
@@ -3950,10 +3959,10 @@ fn validate_export_params_accepts_valid_values() {
         name: "policy".to_string(),
         type_expr: TypeExpr::Simple("iam_policy_arn".to_string()),
         value: Some(Value::Concrete(ConcreteValue::String(
-            "arn:aws:iam::123456789012:policy/admin".to_string(),
+            "arn:aws:iam::123456789012:policy/admin".into(),
         ))),
     }];
-    let result = validate_export_params(&exports, &config);
+    let result = resolve_and_validate_export_params(&exports, &config);
     assert!(result.is_ok());
 }
 
@@ -3968,11 +3977,9 @@ fn validate_export_params_skips_unknown_sentinel() {
     let exports = vec![InferredExportParam {
         name: "raw".to_string(),
         type_expr: TypeExpr::Unknown,
-        value: Some(Value::Concrete(ConcreteValue::String(
-            "anything".to_string(),
-        ))),
+        value: Some(Value::Concrete(ConcreteValue::String("anything".into()))),
     }];
-    let result = validate_export_params(&exports, &config);
+    let result = resolve_and_validate_export_params(&exports, &config);
     assert!(result.is_ok());
 }
 
@@ -3984,15 +3991,173 @@ fn validate_export_params_rejects_type_mismatch() {
     let exports = vec![InferredExportParam {
         name: "flag".to_string(),
         type_expr: TypeExpr::Bool,
-        value: Some(Value::Concrete(ConcreteValue::String(
-            "not-a-bool".to_string(),
-        ))),
+        value: Some(Value::Concrete(ConcreteValue::String("not-a-bool".into()))),
     }];
-    let result = validate_export_params(&exports, &config);
+    let result = resolve_and_validate_export_params(&exports, &config);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.contains("export 'flag'"), "err={err}");
     assert!(err.contains("expected Bool"), "err={err}");
+}
+
+#[test]
+fn validate_export_params_rejects_decrypt_result_as_secret_export() {
+    use crate::parser::InferredExportParam;
+
+    let plaintext = "hunter2SECRET";
+    let config = ProviderContext {
+        decryptor: Some(Box::new(move |_, _| Ok(plaintext.to_string()))),
+        ..ProviderContext::default()
+    };
+    let value = crate::builtins::evaluate_builtin_with_config_to_value(
+        "decrypt",
+        &[Value::Concrete(ConcreteValue::String("ciphertext".into()))],
+        &config,
+    )
+    .expect("test decryptor");
+    let exports = vec![InferredExportParam {
+        name: "count".to_string(),
+        type_expr: TypeExpr::Int,
+        value: Some(value),
+    }];
+
+    let error = resolve_and_validate_export_params(&exports, &config)
+        .expect_err("secret cannot be exported");
+
+    assert_eq!(error, "export 'count' cannot hold a secret value");
+    assert!(!error.contains(plaintext), "error={error}");
+}
+
+#[test]
+fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
+    use crate::parser::InferredExportParam;
+    use crate::resource::InterpolationPart;
+
+    fn secret(value: Value) -> Value {
+        Value::Deferred(DeferredValue::Secret(Box::new(value)))
+    }
+
+    let secret_string = || {
+        secret(Value::Concrete(ConcreteValue::String(
+            "topsecretXYZ".into(),
+        )))
+    };
+    let builtin = crate::builtins::evaluate_builtin_to_value("upper", &[secret_string()])
+        .expect("upper(secret(...)) must evaluate");
+    let config = ProviderContext {
+        decryptor: Some(Box::new(|_, _| Ok("decrypted-secret".to_string()))),
+        ..ProviderContext::default()
+    };
+    let decrypt = crate::builtins::evaluate_builtin_with_config_to_value(
+        "decrypt",
+        &[Value::Concrete(ConcreteValue::String("ciphertext".into()))],
+        &config,
+    )
+    .expect("test decryptor");
+    let exports = vec![
+        InferredExportParam {
+            name: "direct".into(),
+            type_expr: TypeExpr::String,
+            value: Some(secret_string()),
+        },
+        InferredExportParam {
+            name: "builtin".into(),
+            type_expr: TypeExpr::String,
+            value: Some(builtin),
+        },
+        InferredExportParam {
+            name: "interpolated".into(),
+            type_expr: TypeExpr::String,
+            value: Some(Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Literal("prefix-".into()),
+                InterpolationPart::Expr(secret_string()),
+            ]))),
+        },
+        InferredExportParam {
+            name: "nested_list".into(),
+            type_expr: TypeExpr::List(Box::new(TypeExpr::String)),
+            value: Some(Value::Concrete(ConcreteValue::List(vec![secret_string()]))),
+        },
+        InferredExportParam {
+            name: "nested_map".into(),
+            type_expr: TypeExpr::Map(Box::new(TypeExpr::String)),
+            value: Some(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "key".into(),
+                secret_string(),
+            )])))),
+        },
+        InferredExportParam {
+            name: "decrypted".into(),
+            type_expr: TypeExpr::String,
+            value: Some(decrypt),
+        },
+    ];
+
+    let error = resolve_and_validate_export_params(&exports, &config)
+        .expect_err("secrets cannot be exported");
+
+    for name in [
+        "direct",
+        "builtin",
+        "interpolated",
+        "nested_list",
+        "nested_map",
+        "decrypted",
+    ] {
+        assert!(
+            error.contains(&format!("export '{name}' cannot hold a secret value")),
+            "missing uniform error for {name}: {error}",
+        );
+    }
+    assert!(!error.contains("topsecretXYZ"), "error={error}");
+    assert!(!error.contains("decrypted-secret"), "error={error}");
+}
+
+#[test]
+fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
+    use crate::binding_index::{PreApplyInputs, ResolvedBindings};
+    use crate::parser::InferredExportParam;
+
+    fn bindings(identifier: &str) -> ResolvedBindings {
+        let resource = Resource::with_provider("mock", "test.resource", "resource", None)
+            .with_binding("r")
+            .with_attribute(
+                "identifier",
+                Value::Concrete(ConcreteValue::String(identifier.into())),
+            );
+        ResolvedBindings::pre_apply(PreApplyInputs {
+            managed: &[resource],
+            compositions: &[],
+            data_sources: &[],
+            current_states: &HashMap::new(),
+            remote_bindings: &HashMap::new(),
+            wait_aliases: &[],
+        })
+    }
+
+    let exports = [InferredExportParam {
+        name: "id".into(),
+        type_expr: TypeExpr::String,
+        value: Some(Value::resource_ref("r", "identifier", vec![])),
+    }];
+    let pre_apply =
+        check_export_values_pre_apply(&exports, &bindings("alpha-id"), &ProviderContext::default())
+            .expect("pre-apply export check");
+    assert_eq!(
+        pre_apply.display_values()[0].value,
+        Some(Value::Concrete(ConcreteValue::String("alpha-id".into()))),
+    );
+
+    let post_apply = resolve_export_values_post_apply(
+        &pre_apply,
+        &bindings("beta-id"),
+        &ProviderContext::default(),
+    )
+    .expect("post-apply export resolution");
+    assert_eq!(
+        post_apply.as_slice()[0].value,
+        Some(Value::Concrete(ConcreteValue::String("beta-id".into()))),
+    );
 }
 
 #[test]
@@ -4275,7 +4440,7 @@ fn validate_export_param_ref_types_map_accepts_compatible_types() {
         .with_binding("registry_prod")
         .with_attribute(
             "account_id",
-            Value::Concrete(ConcreteValue::String("111".to_string())),
+            Value::Concrete(ConcreteValue::String("111".into())),
         );
 
     let mut map_value = IndexMap::new();
@@ -4324,7 +4489,7 @@ fn validate_export_param_ref_types_map_rejects_type_mismatch() {
         .with_binding("registry_prod")
         .with_attribute(
             "account_id",
-            Value::Concrete(ConcreteValue::String("111".to_string())),
+            Value::Concrete(ConcreteValue::String("111".into())),
         );
 
     let mut map_value = IndexMap::new();
@@ -4415,7 +4580,7 @@ fn export_param_ref_types_flags_unknown_attribute() {
         .with_binding("vpc")
         .with_attribute(
             "vpc_id",
-            Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+            Value::Concrete(ConcreteValue::String("vpc-123".into())),
         );
 
     let exports = vec![InferredExportParam {
@@ -4575,7 +4740,7 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
         .with_binding("cert")
         .with_attribute(
             "status",
-            Value::Concrete(ConcreteValue::String("pending".to_string())),
+            Value::Concrete(ConcreteValue::String("pending".into())),
         );
 
     let exports = vec![InferredExportParam {
@@ -4596,7 +4761,7 @@ fn export_param_ref_types_flags_unknown_attribute_through_wait_binding() {
         until_raw: "cert.status == 'issued'".to_string(),
         until_predicate: UntilPredicateAst {
             lhs_segments: vec!["cert".to_string(), "status".to_string()],
-            rhs: Value::Concrete(ConcreteValue::String("issued".to_string())),
+            rhs: Value::Concrete(ConcreteValue::String("issued".into())),
         },
         timeout_secs: None,
         depends_on: Vec::new(),
@@ -4708,7 +4873,7 @@ fn validate_export_param_ref_types_against_inferred_inputs() {
         .with_binding("registry_prod")
         .with_attribute(
             "account_id",
-            Value::Concrete(ConcreteValue::String("111".to_string())),
+            Value::Concrete(ConcreteValue::String("111".into())),
         );
 
     let mut schemas = SchemaRegistry::new();
@@ -5500,13 +5665,13 @@ fn validate_provider_config_skips_attributes_with_deferred_refs() {
     assume_inner.insert("role_arn".to_string(), role_arn);
     assume_inner.insert(
         "session_name".to_string(),
-        Value::Concrete(ConcreteValue::String("sess".to_string())),
+        Value::Concrete(ConcreteValue::String("sess".into())),
     );
 
     let mut attrs: IndexMap<String, Value> = IndexMap::new();
     attrs.insert(
         "region".to_string(),
-        Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
+        Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
     );
     attrs.insert(
         "assume_role".to_string(),
@@ -5562,7 +5727,7 @@ fn value_contains_unresolved_ref_detects_nested_resource_ref() {
     inner.insert("role_arn".to_string(), role_arn);
     inner.insert(
         "session_name".to_string(),
-        Value::Concrete(ConcreteValue::String("sess".to_string())),
+        Value::Concrete(ConcreteValue::String("sess".into())),
     );
     let assume_role = Value::Concrete(ConcreteValue::Map(inner));
 
@@ -5577,7 +5742,7 @@ fn value_contains_unresolved_ref_false_for_pure_literal() {
     let mut m: IndexMap<String, Value> = IndexMap::new();
     m.insert(
         "region".to_string(),
-        Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
+        Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
     );
     let v = Value::Concrete(ConcreteValue::Map(m));
 
@@ -5592,7 +5757,7 @@ fn value_contains_unresolved_ref_detects_list_element() {
     use crate::resource::{AccessPath, DeferredValue};
 
     let v = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("ok".to_string())),
+        Value::Concrete(ConcreteValue::String("ok".into())),
         Value::Deferred(DeferredValue::ResourceRef {
             path: AccessPath::new("x", "y"),
         }),
@@ -5618,7 +5783,7 @@ fn value_contains_unresolved_ref_unwraps_secret() {
     );
 
     let secret_literal = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("plaintext".to_string()),
+        ConcreteValue::String("plaintext".into()),
     ))));
     assert!(
         !value_contains_unresolved_ref(&secret_literal),

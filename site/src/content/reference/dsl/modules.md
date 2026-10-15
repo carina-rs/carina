@@ -24,6 +24,8 @@ Because `description` and `validation` are input-side concerns (documenting what
 
 `attributes` and `exports` share their body grammar but are intentionally kept separate because their consumers are different: `attributes` is the interface a module presents to its direct caller, while `exports` is the interface a directory presents to other projects through `upstream_state`.
 
+Exports cannot hold secret values, including values derived from `secret()` or `decrypt()`; `carina validate` and `carina plan` report `export '<name>' cannot hold a secret value`.
+
 ## Module Structure
 
 A module is a directory containing one or more `.crn` files that together declare `arguments` and `attributes` blocks. Carina merges every `.crn` file in the directory as peers; there is no privileged filename like `main.crn`.

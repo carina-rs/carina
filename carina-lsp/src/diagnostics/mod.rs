@@ -12,7 +12,9 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
 use crate::position;
-use carina_core::parser::{ParseError, ParsedFile, ResourceRef, WarningKind};
+use carina_core::parser::{
+    ParseError, ParsedFile, ResourceRef, WarningKind, contains_function_call,
+};
 use carina_core::provider::ProviderFactory;
 use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 use carina_core::schema::{SchemaRegistry, TypeInSchema};
@@ -457,6 +459,8 @@ impl DiagnosticEngine {
                 upstream_exports,
                 &module_signatures,
             );
+            let export_value_bindings =
+                carina_core::binding_index::ResolvedBindings::for_validation(binding_input);
             diagnostics.extend(self.check_user_function_ref_types(doc, parsed, &binding_index));
             if base_path.is_some() {
                 diagnostics.extend(self.check_module_calls(
@@ -517,15 +521,38 @@ impl DiagnosticEngine {
                     &binding_index,
                 ));
             }
+            // The document AST intentionally preserves function calls for
+            // source-oriented checks. Build a parallel, same-order view with
+            // locally resolvable calls evaluated so schema diagnostics see
+            // the actual value type (not a deferred FunctionCall). The value
+            // itself carries any diagnostic-sensitivity provenance.
+            let resolved_buffer = {
+                let mut resolved = parsed.clone();
+                carina_core::parser::resolve_resource_refs_with_config(
+                    &mut resolved,
+                    &self.provider_context,
+                )
+                .ok()
+                .map(|()| resolved)
+            };
+            let resolved_buffer_resources = resolved_buffer.as_ref().map(|resolved| {
+                resolved
+                    .iter_all_resources()
+                    .collect::<Vec<carina_core::parser::ResourceRef<'_>>>()
+            });
             // Check resource types — include for-body template resources so
             // attribute/type/enum validation fires inside `for` loops too.
-            for rref in parsed.iter_all_resources() {
+            for (resource_index, rref) in parsed.iter_all_resources().enumerate() {
                 let ctx = rref.context();
                 // carina#3181: schema lookup routes by the typestate arm.
                 // The `id` / `attributes` / `quoted_string_attrs` reads
                 // below go through the shared `ResourceRef` accessors.
                 let resource_id = rref.id();
                 let resource_attributes = rref.attributes();
+                let resolved_resource_attributes = resolved_buffer_resources
+                    .as_ref()
+                    .and_then(|resources| resources.get(resource_index))
+                    .map(carina_core::parser::ResourceRef::attributes);
                 let resource_quoted_string_attrs = rref.quoted_string_attrs();
                 let resource_schema = || match rref {
                     carina_core::parser::ResourceRef::Resource(m)
@@ -667,7 +694,15 @@ impl DiagnosticEngine {
                     // Build block_name -> canonical_name map for this schema
                     let bn_map = schema.block_name_map();
 
-                    for (attr_name, attr_value) in resource_attributes.iter() {
+                    for (attr_name, authored_attr_value) in resource_attributes.iter() {
+                        let attr_value = if contains_function_call(authored_attr_value) {
+                            resolved_resource_attributes
+                                .as_ref()
+                                .and_then(|attributes| attributes.get(attr_name))
+                                .unwrap_or(authored_attr_value)
+                        } else {
+                            authored_attr_value
+                        };
                         if attr_name.starts_with('_') {
                             continue; // Skip internal attributes
                         }
@@ -915,8 +950,10 @@ impl DiagnosticEngine {
                                     carina_core::schema::Shape::String { .. },
                                     Value::Concrete(ConcreteValue::String(s)),
                                 ) => {
-                                    if let Some(binding) =
-                                        s.strip_prefix("${").and_then(|s| s.strip_suffix("}"))
+                                    if let Some(binding) = s
+                                        .diagnostic_literal()
+                                        .and_then(|s| s.strip_prefix("${"))
+                                        .and_then(|s| s.strip_suffix("}"))
                                     {
                                         let suggested_attr = if attr_name.ends_with("_id") {
                                             "id"
@@ -1165,7 +1202,12 @@ impl DiagnosticEngine {
                 &known_bindings,
             ));
 
-            diagnostics.extend(self.check_exports_blocks(doc, parsed, &semantic_view));
+            diagnostics.extend(self.check_exports_blocks(
+                doc,
+                parsed,
+                &semantic_view,
+                &export_value_bindings,
+            ));
 
             // Unused `let` detection. When a merged parse is available,
             // run the core check against it (so references from sibling

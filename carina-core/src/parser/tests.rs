@@ -78,9 +78,7 @@ fn iter_all_resources_yields_direct_then_deferred() {
     assert!(matches!(items[0].context(), ResourceContext::Direct));
     assert_eq!(
         items[0].attributes().get("name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "direct".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("direct".into())))
     );
 
     // The for-expression template body comes last as a Deferred arm.
@@ -181,9 +179,7 @@ fn parse_resource_with_namespaced_type() {
     ); // binding name becomes the resource ID
     assert_eq!(
         resource.get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "my-bucket".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("my-bucket".into())))
     );
     assert_eq!(
         resource.get_attr("region"),
@@ -296,9 +292,7 @@ fn function_call_is_parsed() {
         result.resources[0].get_attr("name"),
         Some(&Value::Deferred(DeferredValue::FunctionCall {
             name: "env".to_string(),
-            args: vec![Value::Concrete(ConcreteValue::String(
-                "SOME_VAR".to_string()
-            ))],
+            args: vec![Value::Concrete(ConcreteValue::String("SOME_VAR".into()))],
         }))
     );
 }
@@ -428,9 +422,7 @@ fn parse_and_resolve_resource_reference() {
     let policy = &result.resources[1];
     assert_eq!(
         policy.get_attr("bucket"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "my-bucket".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("my-bucket".into())))
     );
     assert_eq!(
         policy.get_attr("bucket_region"),
@@ -643,7 +635,7 @@ fn parse_nested_blocks_terraform_style() {
         if let Value::Concrete(ConcreteValue::Map(rule)) = &items[0] {
             assert_eq!(
                 rule.get("protocol"),
-                Some(&Value::Concrete(ConcreteValue::String("tcp".to_string())))
+                Some(&Value::Concrete(ConcreteValue::String("tcp".into())))
             );
             assert_eq!(
                 rule.get("from_port"),
@@ -690,15 +682,11 @@ fn parse_list_syntax() {
         if let Value::Concrete(ConcreteValue::Map(route)) = &items[0] {
             assert_eq!(
                 route.get("destination"),
-                Some(&Value::Concrete(ConcreteValue::String(
-                    "0.0.0.0/0".to_string()
-                )))
+                Some(&Value::Concrete(ConcreteValue::String("0.0.0.0/0".into())))
             );
             assert_eq!(
                 route.get("gateway"),
-                Some(&Value::Concrete(ConcreteValue::String(
-                    "my-igw".to_string()
-                )))
+                Some(&Value::Concrete(ConcreteValue::String("my-igw".into())))
             );
         } else {
             panic!("Expected map for route");
@@ -1255,13 +1243,13 @@ fn parse_backend_block() {
     assert_eq!(
         backend.attributes.get("bucket"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "my-carina-state".to_string()
+            "my-carina-state".into()
         )))
     );
     assert_eq!(
         backend.attributes.get("key"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "infra/prod/carina.crnstate".to_string()
+            "infra/prod/carina.crnstate".into()
         )))
     );
     assert_eq!(
@@ -1315,9 +1303,7 @@ fn parse_backend_block_with_resources() {
     assert_eq!(backend.backend_type, "s3");
     assert_eq!(
         backend.attributes.get("bucket"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "my-state".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("my-state".into())))
     );
 
     assert_eq!(result.providers.len(), 1);
@@ -1587,9 +1573,7 @@ fn parse_block_syntax_inside_map() {
     if let Value::Concrete(ConcreteValue::Map(map)) = doc {
         assert_eq!(
             map.get("version"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "2012-10-17".to_string()
-            )))
+            Some(&Value::Concrete(ConcreteValue::String("2012-10-17".into())))
         );
         // statement block becomes a list with one element
         let statement = map.get("statement").unwrap();
@@ -1598,12 +1582,12 @@ fn parse_block_syntax_inside_map() {
             if let Value::Concrete(ConcreteValue::Map(stmt)) = &stmts[0] {
                 assert_eq!(
                     stmt.get("effect"),
-                    Some(&Value::Concrete(ConcreteValue::String("Allow".to_string())))
+                    Some(&Value::Concrete(ConcreteValue::String("Allow".into())))
                 );
                 assert_eq!(
                     stmt.get("action"),
                     Some(&Value::Concrete(ConcreteValue::String(
-                        "sts:AssumeRole".to_string()
+                        "sts:AssumeRole".into()
                     )))
                 );
             } else {
@@ -1709,7 +1693,7 @@ fn parse_deeply_nested_blocks() {
                 if let Value::Concrete(ConcreteValue::Map(inner_map)) = &inner_items[0] {
                     assert_eq!(
                         inner_map.get("leaf"),
-                        Some(&Value::Concrete(ConcreteValue::String("value".to_string())))
+                        Some(&Value::Concrete(ConcreteValue::String("value".into())))
                     );
                 } else {
                     panic!("Expected map for inner block");
@@ -1750,7 +1734,7 @@ fn parse_nested_block_in_map() {
             if let Value::Concrete(ConcreteValue::Map(s)) = &items[0] {
                 assert_eq!(
                     s.get("effect"),
-                    Some(&Value::Concrete(ConcreteValue::String("Allow".to_string())))
+                    Some(&Value::Concrete(ConcreteValue::String("Allow".into())))
                 );
             } else {
                 panic!("Expected map for statement");
@@ -1830,7 +1814,7 @@ fn pipe_operator_desugars_to_function_call() {
         result.variables.get("x"),
         Some(&Value::Deferred(DeferredValue::FunctionCall {
             name: "upper".to_string(),
-            args: vec![Value::Concrete(ConcreteValue::String("hello".to_string()))],
+            args: vec![Value::Concrete(ConcreteValue::String("hello".into()))],
         }))
     );
 }
@@ -1848,7 +1832,7 @@ fn pipe_operator_in_attribute_desugars() {
         result.resources[0].get_attr("name"),
         Some(&Value::Deferred(DeferredValue::FunctionCall {
             name: "lower".to_string(),
-            args: vec![Value::Concrete(ConcreteValue::String("test".to_string()))],
+            args: vec![Value::Concrete(ConcreteValue::String("test".into()))],
         }))
     );
 }
@@ -1868,11 +1852,11 @@ fn join_function_call_parsed() {
         Some(&Value::Deferred(DeferredValue::FunctionCall {
             name: "join".to_string(),
             args: vec![
-                Value::Concrete(ConcreteValue::String("-".to_string())),
+                Value::Concrete(ConcreteValue::String("-".into())),
                 Value::Concrete(ConcreteValue::List(vec![
-                    Value::Concrete(ConcreteValue::String("a".to_string())),
-                    Value::Concrete(ConcreteValue::String("b".to_string())),
-                    Value::Concrete(ConcreteValue::String("c".to_string())),
+                    Value::Concrete(ConcreteValue::String("a".into())),
+                    Value::Concrete(ConcreteValue::String("b".into())),
+                    Value::Concrete(ConcreteValue::String("c".into())),
                 ])),
             ],
         }))
@@ -1894,11 +1878,11 @@ fn pipe_with_join_parsed() {
         Some(&Value::Deferred(DeferredValue::FunctionCall {
             name: "join".to_string(),
             args: vec![
-                Value::Concrete(ConcreteValue::String("-".to_string())),
+                Value::Concrete(ConcreteValue::String("-".into())),
                 Value::Concrete(ConcreteValue::List(vec![
-                    Value::Concrete(ConcreteValue::String("a".to_string())),
-                    Value::Concrete(ConcreteValue::String("b".to_string())),
-                    Value::Concrete(ConcreteValue::String("c".to_string())),
+                    Value::Concrete(ConcreteValue::String("a".into())),
+                    Value::Concrete(ConcreteValue::String("b".into())),
+                    Value::Concrete(ConcreteValue::String("c".into())),
                 ])),
             ],
         }))
@@ -1921,10 +1905,10 @@ fn join_with_multiple_pipes() {
             args: vec![Value::Deferred(DeferredValue::FunctionCall {
                 name: "join".to_string(),
                 args: vec![
-                    Value::Concrete(ConcreteValue::String("-".to_string())),
+                    Value::Concrete(ConcreteValue::String("-".into())),
                     Value::Concrete(ConcreteValue::List(vec![
-                        Value::Concrete(ConcreteValue::String("a".to_string())),
-                        Value::Concrete(ConcreteValue::String("b".to_string())),
+                        Value::Concrete(ConcreteValue::String("a".into())),
+                        Value::Concrete(ConcreteValue::String("b".into())),
                     ])),
                 ],
             })],
@@ -1959,7 +1943,7 @@ fn join_resolved_during_resource_ref_resolution() {
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "my-bucket-name".to_string()
+            "my-bucket-name".into()
         )))
     );
 }
@@ -1975,9 +1959,7 @@ fn pipe_join_resolved_during_resource_ref_resolution() {
     resolve_resource_refs(&mut result).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "my-bucket".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("my-bucket".into())))
     );
 }
 
@@ -2010,7 +1992,7 @@ fn partial_application_join_with_pipe() {
     resolve_resource_refs(&mut result).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String("a,b".to_string())))
+        Some(&Value::Concrete(ConcreteValue::String("a,b".into())))
     );
 }
 
@@ -2024,7 +2006,7 @@ fn partial_application_closure_direct_call() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.variables.get("x"),
-        Some(&Value::Concrete(ConcreteValue::String("a,b".to_string())))
+        Some(&Value::Concrete(ConcreteValue::String("a,b".into())))
     );
 }
 
@@ -2040,7 +2022,7 @@ fn partial_application_chained_pipes() {
     resolve_resource_refs(&mut result).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String("A,B".to_string())))
+        Some(&Value::Concrete(ConcreteValue::String("A,B".into())))
     );
 }
 
@@ -2054,7 +2036,7 @@ fn partial_application_closure_pipe() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.variables.get("x"),
-        Some(&Value::Concrete(ConcreteValue::String("a,b".to_string())))
+        Some(&Value::Concrete(ConcreteValue::String("a,b".into())))
     );
 }
 
@@ -2080,7 +2062,7 @@ fn partial_application_replace() {
     assert_eq!(
         result.variables.get("x"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "hello_world".to_string()
+            "hello_world".into()
         )))
     );
 }
@@ -2097,9 +2079,7 @@ fn partial_application_in_resource_attribute() {
     resolve_resource_refs(&mut parsed).unwrap();
     assert_eq!(
         parsed.resources[0].get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "my-bucket".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("my-bucket".into())))
     );
 }
 
@@ -2116,9 +2096,7 @@ fn partial_application_closure_in_resource_attribute() {
     resolve_resource_refs(&mut parsed).unwrap();
     assert_eq!(
         parsed.resources[0].get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "my-bucket".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("my-bucket".into())))
     );
 }
 
@@ -2135,9 +2113,7 @@ fn partial_application_closure_direct_call_in_resource_attribute() {
     resolve_resource_refs(&mut parsed).unwrap();
     assert_eq!(
         parsed.resources[0].get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "my-bucket".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("my-bucket".into())))
     );
 }
 
@@ -2446,7 +2422,7 @@ fn parse_slash_slash_comment_inline() {
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.0.0/16".to_string()
+            "10.0.0.0/16".into()
         )))
     );
 }
@@ -2467,7 +2443,7 @@ fn parse_mixed_comment_styles() {
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.0.0/16".to_string()
+            "10.0.0.0/16".into()
         )))
     );
 }
@@ -2533,7 +2509,7 @@ fn parse_block_comment_inline() {
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.0.0/16".to_string()
+            "10.0.0.0/16".into()
         )))
     );
 }
@@ -2642,14 +2618,14 @@ fn finalize_provider_configs_promotes_resolved_default_tags() {
     assert_eq!(
         pc.default_tags.get("region"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "ap-northeast-1".to_string()
+            "ap-northeast-1".into()
         ))),
         "resolved default_tags must contain the literal map's entries; got: {:?}",
         pc.default_tags
     );
     assert_eq!(
         pc.default_tags.get("env"),
-        Some(&Value::Concrete(ConcreteValue::String("dev".to_string()))),
+        Some(&Value::Concrete(ConcreteValue::String("dev".into()))),
     );
 }
 
@@ -2682,15 +2658,13 @@ fn finalize_provider_configs_resolves_resource_ref_default_tags() {
     );
     assert_eq!(
         pc.default_tags.get("Project"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "carina-rs".to_string()
-        ))),
+        Some(&Value::Concrete(ConcreteValue::String("carina-rs".into()))),
         "ResourceRef default_tags must resolve to the referenced map; got: {:?}",
         pc.default_tags
     );
     assert_eq!(
         pc.default_tags.get("Env"),
-        Some(&Value::Concrete(ConcreteValue::String("dev".to_string()))),
+        Some(&Value::Concrete(ConcreteValue::String("dev".into()))),
     );
 }
 
@@ -2759,7 +2733,7 @@ fn resolve_provider_attributes_with_remote_substitutes_upstream_refs() {
     mgmt_attrs.insert(
         "role_arn".to_string(),
         Value::Concrete(ConcreteValue::String(
-            "arn:aws:iam::123456789012:role/writer".to_string(),
+            "arn:aws:iam::123456789012:role/writer".into(),
         )),
     );
     let mut remote: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -2782,15 +2756,13 @@ fn resolve_provider_attributes_with_remote_substitutes_upstream_refs() {
     assert_eq!(
         m.get("role_arn"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "arn:aws:iam::123456789012:role/writer".to_string()
+            "arn:aws:iam::123456789012:role/writer".into()
         ))),
         "role_arn must be substituted from remote_bindings; got: {m:?}",
     );
     assert_eq!(
         m.get("session_name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "downstream".to_string()
-        ))),
+        Some(&Value::Concrete(ConcreteValue::String("downstream".into()))),
         "literal sibling must be preserved",
     );
 
@@ -2980,21 +2952,15 @@ fn parse_provider_block_with_default_tags() {
     assert_eq!(result.providers[0].default_tags.len(), 3);
     assert_eq!(
         result.providers[0].default_tags.get("Environment"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "production".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("production".into())))
     );
     assert_eq!(
         result.providers[0].default_tags.get("Team"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "platform".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("platform".into())))
     );
     assert_eq!(
         result.providers[0].default_tags.get("ManagedBy"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "carina".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("carina".into())))
     );
 }
 
@@ -3179,9 +3145,7 @@ fn parse_let_binding_module_call() {
     assert_eq!(call.binding_name, Some("web".to_string()));
     assert_eq!(
         call.arguments.get("vpc"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "vpc-123".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("vpc-123".into())))
     );
 }
 
@@ -3227,9 +3191,7 @@ fn parse_string_interpolation_simple() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "vpc-prod".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("vpc-prod".into())))
     );
 }
 
@@ -3248,7 +3210,7 @@ fn parse_string_interpolation_multiple_exprs() {
     assert_eq!(
         vpc.get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "vpc-prod-us-east-1".to_string()
+            "vpc-prod-us-east-1".into()
         )))
     );
 }
@@ -3269,7 +3231,7 @@ fn parse_string_interpolation_with_resource_ref() {
     assert_eq!(
         subnet.get_attr("name"),
         Some(&Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Literal("subnet-".to_string()),
+            InterpolationPart::Literal("subnet-".into()),
             InterpolationPart::Expr(Value::resource_ref(
                 "vpc".to_string(),
                 "vpc_id".to_string(),
@@ -3292,9 +3254,7 @@ fn parse_string_no_interpolation() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "my-vpc".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("my-vpc".into())))
     );
 }
 
@@ -3311,9 +3271,7 @@ fn parse_string_dollar_without_brace() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "price$100".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("price$100".into())))
     );
 }
 
@@ -3331,7 +3289,7 @@ fn parse_string_escaped_interpolation() {
     assert_eq!(
         vpc.get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "literal${expr}".to_string()
+            "literal${expr}".into()
         )))
     );
 }
@@ -3453,7 +3411,7 @@ fn parse_string_interpolation_with_bool() {
     assert_eq!(
         vpc.get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "enabled-true".to_string()
+            "enabled-true".into()
         )))
     );
 }
@@ -3470,9 +3428,7 @@ fn parse_string_interpolation_with_number() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "port-8080".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("port-8080".into())))
     );
 }
 
@@ -3490,7 +3446,7 @@ fn parse_string_interpolation_only_expr() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("tag"),
-        Some(&Value::Concrete(ConcreteValue::String("prod".to_string())))
+        Some(&Value::Concrete(ConcreteValue::String("prod".into())))
     );
 }
 
@@ -3513,14 +3469,12 @@ fn parse_local_let_binding_in_resource_block() {
     // The local binding value should be resolved in subsequent attributes
     assert_eq!(
         subnet.get_attr("tag_name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "my-subnet".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("my-subnet".into())))
     );
     assert_eq!(
         subnet.get_attr("cidr_block"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.1.0/24".to_string()
+            "10.0.1.0/24".into()
         )))
     );
 }
@@ -3542,9 +3496,7 @@ fn parse_local_let_binding_with_interpolation() {
     // Local binding should resolve outer scope variable in interpolation.
     assert_eq!(
         subnet.get_attr("tag_name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "app-prod".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("app-prod".into())))
     );
 }
 
@@ -3565,9 +3517,7 @@ fn parse_local_let_binding_chain() {
     // Chained local bindings should resolve correctly.
     assert_eq!(
         subnet.get_attr("tag_name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "app-subnet".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("app-subnet".into())))
     );
 
     // Local bindings should NOT appear in attributes
@@ -3593,9 +3543,7 @@ fn parse_local_let_binding_with_function_call() {
         subnet.get_attr("tag_name"),
         Some(&Value::Deferred(DeferredValue::FunctionCall {
             name: "upper".to_string(),
-            args: vec![Value::Concrete(ConcreteValue::String(
-                "my-subnet".to_string()
-            ))],
+            args: vec![Value::Concrete(ConcreteValue::String("my-subnet".into()))],
         }))
     );
 }
@@ -3617,9 +3565,7 @@ fn parse_local_let_binding_in_anonymous_resource() {
     assert!(!subnet.attributes.contains_key("name"));
     assert_eq!(
         subnet.get_attr("tag_name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "my-subnet".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("my-subnet".into())))
     );
 }
 
@@ -3643,7 +3589,7 @@ fn parse_local_let_binding_in_nested_block() {
         if let Some(Value::Concrete(ConcreteValue::Map(tags))) = tags_list.first() {
             assert_eq!(
                 tags.get("Name"),
-                Some(&Value::Concrete(ConcreteValue::String("prod".to_string())))
+                Some(&Value::Concrete(ConcreteValue::String("prod".into())))
             );
         } else {
             panic!("Expected Map in tags list");
@@ -3687,13 +3633,13 @@ fn parse_for_expression_over_list() {
     assert_eq!(
         result.resources[0].get_attr("availability_zone"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "ap-northeast-1a".to_string()
+            "ap-northeast-1a".into()
         )))
     );
     assert_eq!(
         result.resources[1].get_attr("availability_zone"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "ap-northeast-1c".to_string()
+            "ap-northeast-1c".into()
         )))
     );
 }
@@ -3887,7 +3833,7 @@ fn parse_for_expression_with_module_call() {
     assert_eq!(
         prod_call.arguments.get("vpc_cidr"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.0.0/16".to_string()
+            "10.0.0.0/16".into()
         )))
     );
 
@@ -3899,7 +3845,7 @@ fn parse_for_expression_with_module_call() {
     assert_eq!(
         staging_call.arguments.get("vpc_cidr"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.1.0.0/16".to_string()
+            "10.1.0.0/16".into()
         )))
     );
 }
@@ -3932,13 +3878,13 @@ fn parse_for_expression_with_module_call_over_list() {
     assert_eq!(
         result.module_calls[0].arguments.get("vpc_cidr"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.0.0/16".to_string()
+            "10.0.0.0/16".into()
         )))
     );
     assert_eq!(
         result.module_calls[1].arguments.get("vpc_cidr"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.1.0.0/16".to_string()
+            "10.1.0.0/16".into()
         )))
     );
 }
@@ -4165,7 +4111,7 @@ fn parse_subscript_after_field_access_with_string_key() {
             assert_eq!(
                 path.trailing_subscripts(),
                 [crate::resource::Subscript::Str {
-                    key: "alpha".to_string()
+                    key: "alpha".into()
                 }]
             );
             assert_eq!(path.to_dot_string(), "orgs.accounts[\"alpha\"]");
@@ -4314,7 +4260,7 @@ fn parse_import_block() {
             assert_eq!(to.name_str(), "main-vpc");
             assert_eq!(
                 id,
-                &Value::Concrete(ConcreteValue::String("vpc-0abc123def456".to_string()))
+                &Value::Concrete(ConcreteValue::String("vpc-0abc123def456".into()))
             );
         }
         other => panic!("Expected Import, got {:?}", other),
@@ -4361,7 +4307,7 @@ fn parse_import_block_preserves_interpolation_segments() {
                 let literal_concat: String = parts
                     .iter()
                     .filter_map(|p| match p {
-                        InterpolationPart::Literal(s) => Some(s.as_str()),
+                        InterpolationPart::Literal(s) => Some(s.expose_plaintext()),
                         InterpolationPart::Expr(_) => None,
                     })
                     .collect();
@@ -4644,11 +4590,11 @@ fn parse_for_expression_with_keys_function_call() {
     );
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String("Env".to_string())))
+        Some(&Value::Concrete(ConcreteValue::String("Env".into())))
     );
     assert_eq!(
         result.resources[1].get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String("Name".to_string())))
+        Some(&Value::Concrete(ConcreteValue::String("Name".into())))
     );
 }
 
@@ -4673,13 +4619,13 @@ fn parse_for_expression_with_values_function_call() {
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.0.0/16".to_string()
+            "10.0.0.0/16".into()
         )))
     );
     assert_eq!(
         result.resources[1].get_attr("cidr_block"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.1.0.0/16".to_string()
+            "10.1.0.0/16".into()
         )))
     );
 }
@@ -4701,13 +4647,13 @@ fn parse_for_expression_with_concat_function_call() {
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.1.0.0/16".to_string()
+            "10.1.0.0/16".into()
         )))
     );
     assert_eq!(
         result.resources[1].get_attr("cidr_block"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.0.0/16".to_string()
+            "10.0.0.0/16".into()
         )))
     );
 }
@@ -4775,9 +4721,7 @@ fn parse_if_true_condition_includes_resource() {
     );
     assert_eq!(
         result.resources[0].get_attr("alarm_name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "cpu-high".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("cpu-high".into())))
     );
 }
 
@@ -4814,7 +4758,7 @@ fn parse_if_else_true_uses_if_branch() {
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.0.0/16".to_string()
+            "10.0.0.0/16".into()
         )))
     );
 }
@@ -4838,7 +4782,7 @@ fn parse_if_else_false_uses_else_branch() {
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "172.16.0.0/16".to_string()
+            "172.16.0.0/16".into()
         )))
     );
 }
@@ -4872,9 +4816,7 @@ fn parse_if_else_value_expression() {
     let result2 = parse(input2, &ProviderContext::default()).unwrap();
     assert_eq!(
         result2.resources[0].get_attr("instance_type"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "m5.xlarge".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("m5.xlarge".into())))
     );
 }
 
@@ -4895,9 +4837,7 @@ fn parse_if_else_value_expression_false_branch() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("instance_type"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "t3.micro".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("t3.micro".into())))
     );
 }
 
@@ -4935,6 +4875,34 @@ fn parse_if_non_bool_condition_errors() {
         "Expected error about Bool condition, got: {}",
         err
     );
+}
+
+#[test]
+fn parse_if_env_condition_reports_only_the_string_type() {
+    let variable = "CARINA_3849_IF_CONDITION";
+    let plaintext = "hunter2SECRET";
+    unsafe {
+        std::env::set_var(variable, plaintext);
+    }
+    let input = format!(
+        r#"
+        let alarm = if env('{variable}') {{
+            'enabled'
+        }} else {{
+            'disabled'
+        }}
+    "#
+    );
+
+    let error = parse(&input, &ProviderContext::default()).expect_err("non-bool condition");
+    unsafe {
+        std::env::remove_var(variable);
+    }
+    let message = error.to_string();
+
+    assert!(!message.contains(plaintext), "message leaked: {message}");
+    assert!(message.contains("got: string"), "message={message}");
+    assert!(!message.contains("value from env"), "message={message}");
 }
 
 #[test]
@@ -5005,9 +4973,7 @@ fn parse_if_with_local_binding() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("alarm_name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "cpu-high".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("cpu-high".into())))
     );
 }
 
@@ -5026,7 +4992,7 @@ fn parse_if_else_value_expr_in_attribute_true() {
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.0.0/16".to_string()
+            "10.0.0.0/16".into()
         )))
     );
 }
@@ -5046,7 +5012,7 @@ fn parse_if_else_value_expr_in_attribute_false() {
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "172.16.0.0/16".to_string()
+            "172.16.0.0/16".into()
         )))
     );
 }
@@ -5065,7 +5031,7 @@ fn parse_if_value_expr_no_else_true() {
     assert_eq!(
         result.resources[0].get_attr("cidr_block"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.0.0/16".to_string()
+            "10.0.0.0/16".into()
         )))
     );
 }
@@ -5106,13 +5072,13 @@ fn parse_top_level_for_expression() {
     assert_eq!(
         result.resources[0].get_attr("availability_zone"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "ap-northeast-1a".to_string()
+            "ap-northeast-1a".into()
         )))
     );
     assert_eq!(
         result.resources[1].get_attr("availability_zone"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "ap-northeast-1c".to_string()
+            "ap-northeast-1c".into()
         )))
     );
 }
@@ -5132,9 +5098,7 @@ fn parse_top_level_if_expression() {
     assert_eq!(result.resources.len(), 1);
     assert_eq!(
         result.resources[0].get_attr("alarm_name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "cpu-high".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("cpu-high".into())))
     );
 }
 
@@ -5573,9 +5537,7 @@ fn parse_arguments_block_form_string_default_not_confused_with_description() {
     );
     assert_eq!(
         result.arguments[0].default,
-        Some(Value::Concrete(ConcreteValue::String(
-            "my-resource".to_string()
-        )))
+        Some(Value::Concrete(ConcreteValue::String("my-resource".into())))
     );
 }
 
@@ -5782,7 +5744,7 @@ fn join_with_resolved_args_still_works() {
     let resource = &result.resources[0];
     assert_eq!(
         resource.get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String("a-b-c".to_string()))),
+        Some(&Value::Concrete(ConcreteValue::String("a-b-c".into()))),
     );
 }
 
@@ -5805,7 +5767,7 @@ fn user_fn_simple_call() {
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "hello world".to_string()
+            "hello world".into()
         ))),
     );
 }
@@ -5830,14 +5792,12 @@ fn user_fn_with_default_param() {
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "prod-default".to_string()
+            "prod-default".into()
         ))),
     );
     assert_eq!(
         result.resources[1].get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "prod-web".to_string()
-        ))),
+        Some(&Value::Concrete(ConcreteValue::String("prod-web".into()))),
     );
 }
 
@@ -5858,7 +5818,7 @@ fn user_fn_with_local_let() {
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "prod-subnet-a".to_string()
+            "prod-subnet-a".into()
         ))),
     );
 }
@@ -5878,7 +5838,7 @@ fn user_fn_calling_builtin() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String("HELLO".to_string()))),
+        Some(&Value::Concrete(ConcreteValue::String("HELLO".into()))),
     );
 }
 
@@ -5902,7 +5862,7 @@ fn user_fn_calling_another_fn() {
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "prod-app-web".to_string()
+            "prod-app-web".into()
         ))),
     );
 }
@@ -6039,7 +5999,7 @@ fn user_fn_no_params() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String("hello".to_string()))),
+        Some(&Value::Concrete(ConcreteValue::String("hello".into()))),
     );
 }
 
@@ -6101,7 +6061,7 @@ fn user_fn_with_pipe_operator() {
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "hello-world".to_string()
+            "hello-world".into()
         ))),
     );
 }
@@ -6124,7 +6084,7 @@ fn user_fn_with_string_interpolation() {
     let name = result.resources[0].get_attr("name").unwrap();
     assert_eq!(
         name,
-        &Value::Concrete(ConcreteValue::String("hello world-suffix".to_string()))
+        &Value::Concrete(ConcreteValue::String("hello world-suffix".into()))
     );
 }
 
@@ -6144,7 +6104,7 @@ fn user_fn_interpolation_substitutes_param_inside_string() {
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "myapp-prod-bucket".to_string()
+            "myapp-prod-bucket".into()
         ))),
     );
 }
@@ -6166,7 +6126,7 @@ fn user_fn_interpolation_substitutes_local_inside_string() {
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "myapp-prod-bucket".to_string()
+            "myapp-prod-bucket".into()
         ))),
     );
 }
@@ -6188,7 +6148,7 @@ fn user_fn_typed_param_string() {
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "hello world".to_string()
+            "hello world".into()
         ))),
     );
 }
@@ -6293,7 +6253,7 @@ let result = mock.test.resource {
         .expect_err("a decrypted String must not satisfy an Int parameter")
         .to_string();
     assert!(
-        error.contains("function 'f': parameter 'x': expected Int, got string"),
+        error.contains("function 'f': parameter 'x': expected Int, got secret"),
         "{error}"
     );
     assert!(!error.contains("hunter2plaintext"), "{error}");
@@ -6315,7 +6275,7 @@ let result = mock.test.resource { name = f() }
         .expect_err("a decrypted String must not satisfy an Int return")
         .to_string();
     assert!(
-        error.contains("function 'f': return value: expected Int, got string"),
+        error.contains("function 'f': return value: expected Int, got secret"),
         "{error}"
     );
     assert!(!error.contains("hunter2plaintext"), "{error}");
@@ -6391,7 +6351,7 @@ fn user_fn_typed_param_with_default() {
     assert_eq!(
         result.resources[0].get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "prod-default".to_string()
+            "prod-default".into()
         ))),
     );
 }
@@ -6411,9 +6371,7 @@ fn user_fn_mixed_typed_and_untyped() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.resources[0].get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "prod-web".to_string()
-        ))),
+        Some(&Value::Concrete(ConcreteValue::String("prod-web".into()))),
     );
 }
 
@@ -7348,6 +7306,122 @@ fn user_fn_custom_type_return_ipv6_address_invalid() {
 // --- ProviderContext tests ---
 
 #[test]
+fn parse_env_resource_keeps_runtime_plan_and_state_plaintext() {
+    let variable = "CARINA_3849_RESOURCE_ENV";
+    let plaintext = "hunter2SECRET";
+    unsafe {
+        std::env::set_var(variable, plaintext);
+    }
+    let input = format!(
+        r#"
+        let my_bucket = aws.s3_bucket {{
+            name = env('{variable}')
+        }}
+    "#
+    );
+
+    let mut parsed = parse(&input, &ProviderContext::default()).unwrap();
+    resolve_resource_refs_with_config(&mut parsed, &ProviderContext::default()).unwrap();
+    unsafe {
+        std::env::remove_var(variable);
+    }
+
+    let value = parsed.resources[0].get_attr("name").unwrap();
+    assert_eq!(crate::ValueDescription::of(value).to_string(), "string");
+    assert_eq!(crate::value::format_value(value), r#""hunter2SECRET""#);
+    assert_eq!(
+        crate::value::value_to_json(value).unwrap(),
+        serde_json::json!(plaintext)
+    );
+}
+
+#[test]
+fn env_derived_provider_version_error_does_not_echo_plaintext() {
+    let variable = "CARINA_3849_PROVIDER_VERSION";
+    let plaintext = "hunter2SECRET";
+    unsafe {
+        std::env::set_var(variable, plaintext);
+    }
+    let input = format!(
+        r#"
+        fn version() {{ env('{variable}') }}
+        provider mock {{
+            version = version()
+        }}
+    "#
+    );
+
+    let error = parse(&input, &ProviderContext::default()).expect_err("invalid version");
+    unsafe {
+        std::env::remove_var(variable);
+    }
+    let message = error.to_string();
+
+    assert!(!message.contains(plaintext), "message leaked: {message}");
+    assert!(message.contains("value from env()"), "message={message}");
+}
+
+#[test]
+fn env_derived_subscript_is_redacted_in_unresolved_reference_diagnostic() {
+    let variable = "CARINA_3849_SUBSCRIPT_KEY";
+    let plaintext = "hunter2SECRET";
+    unsafe {
+        std::env::set_var(variable, plaintext);
+    }
+    let input = format!(
+        r#"
+        fn key() {{ env('{variable}') }}
+        let unresolved = missing.value[key()]
+    "#
+    );
+
+    let parsed = parse(&input, &ProviderContext::default()).expect("parse");
+    unsafe {
+        std::env::remove_var(variable);
+    }
+    let value = parsed
+        .variables
+        .get("unresolved")
+        .expect("unresolved binding");
+    let message = crate::value::value_to_json(value)
+        .expect_err("reference remains unresolved")
+        .to_string();
+
+    assert!(!message.contains(plaintext), "message leaked: {message}");
+    assert!(message.contains("value from env()"), "message={message}");
+}
+
+#[test]
+fn env_derived_pre_field_subscript_is_redacted_in_unresolved_reference_diagnostic() {
+    let variable = "CARINA_3849_PRE_FIELD_SUBSCRIPT_KEY";
+    let plaintext = "hunter2SECRET";
+    unsafe {
+        std::env::set_var(variable, plaintext);
+    }
+    let input = format!(
+        r#"
+        fn key() {{ env('{variable}') }}
+        let unresolved = missing[key()].value
+    "#
+    );
+
+    let parsed = parse(&input, &ProviderContext::default()).expect("parse");
+    unsafe {
+        std::env::remove_var(variable);
+    }
+    let value = parsed
+        .variables
+        .get("unresolved")
+        .expect("unresolved binding");
+    let message = crate::value::value_to_json(value)
+        .expect_err("reference remains unresolved")
+        .to_string();
+
+    assert!(!message.contains(plaintext), "message leaked: {message}");
+    assert!(message.contains("value from env()"), "message={message}");
+}
+
+#[test]
 fn parse_decrypt_uses_config_decryptor() {
     use std::collections::HashMap;
     let config = ProviderContext {
@@ -7366,6 +7440,7 @@ fn parse_decrypt_uses_config_decryptor() {
         let my_bucket = aws.s3_bucket {
             name   = "test-bucket"
             secret = decrypt("AQICAHh")
+            wrapped = secret(decrypt("AQICAHh"))
         }
     "#;
     let mut parsed = parse(input, &config).unwrap();
@@ -7374,8 +7449,56 @@ fn parse_decrypt_uses_config_decryptor() {
     let secret_val = parsed.resources[0].get_attr("secret").unwrap();
     assert_eq!(
         *secret_val,
-        Value::Concrete(ConcreteValue::String("decrypted:AQICAHh".to_string()))
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("decrypted:AQICAHh".into())
+        ))))
     );
+    let wrapped_val = parsed.resources[0].get_attr("wrapped").unwrap();
+    assert_eq!(
+        wrapped_val, secret_val,
+        "secret(decrypt(...)) must be idempotent"
+    );
+    assert_eq!(crate::value::format_value(secret_val), "(secret)");
+    let state_value = crate::value::value_to_json(secret_val).unwrap();
+    let state_value = state_value.as_str().expect("Argon2id secret hash");
+    assert!(state_value.starts_with(crate::value::SECRET_PREFIX));
+    assert!(!state_value.contains("decrypted:AQICAHh"));
+}
+
+#[test]
+fn decrypt_inside_interpolation_resolves_to_a_secret_string() {
+    use std::collections::HashMap;
+
+    let config = ProviderContext {
+        decryptor: Some(Box::new(|ciphertext, _key| {
+            Ok(format!("decrypted:{ciphertext}"))
+        })),
+        validators: HashMap::new(),
+        custom_type_validator: None,
+        resource_types: Default::default(),
+        customs_loaded: false,
+    };
+    let input = r#"
+        let my_bucket = aws.s3_bucket {
+            name = "prefix-${decrypt('ciphertext')}-suffix"
+        }
+    "#;
+
+    let mut parsed = parse(input, &config).unwrap();
+    resolve_resource_refs_with_config(&mut parsed, &config).unwrap();
+    let value = parsed.resources[0].get_attr("name").unwrap();
+
+    assert_eq!(
+        value,
+        &Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("prefix-decrypted:ciphertext-suffix".into()),
+        ))))
+    );
+    assert_eq!(crate::value::format_value(value), "(secret)");
+    let state_value = crate::value::value_to_json(value).unwrap();
+    let state_value = state_value.as_str().expect("Argon2id secret hash");
+    assert!(state_value.starts_with(crate::value::SECRET_PREFIX));
+    assert!(!state_value.contains("decrypted:ciphertext"));
 }
 
 #[test]
@@ -7425,7 +7548,7 @@ fn parse_custom_validator_accepts_valid() {
 
     let result = validate_custom_type(
         &TypeIdentity::bare("CustomType"),
-        &Value::Concrete(ConcreteValue::String("valid-data".to_string())),
+        &Value::Concrete(ConcreteValue::String("valid-data".into())),
         &config,
     );
     assert!(result.is_ok());
@@ -7433,7 +7556,7 @@ fn parse_custom_validator_accepts_valid() {
     // Unknown type with no custom validator should also pass (permissive)
     let result = validate_custom_type(
         &TypeIdentity::bare("UnknownType"),
-        &Value::Concrete(ConcreteValue::String("anything".to_string())),
+        &Value::Concrete(ConcreteValue::String("anything".into())),
         &config,
     );
     assert!(result.is_ok());
@@ -7469,14 +7592,14 @@ fn parse_custom_validator_rejects_invalid() {
     // arbitrary type names. This verifies the custom validator is called.
     let valid_result = validate_custom_type(
         &TypeIdentity::bare("CustomType"),
-        &Value::Concrete(ConcreteValue::String("valid-data".to_string())),
+        &Value::Concrete(ConcreteValue::String("valid-data".into())),
         &config,
     );
     assert!(valid_result.is_ok());
 
     let invalid_result = validate_custom_type(
         &TypeIdentity::bare("CustomType"),
-        &Value::Concrete(ConcreteValue::String("invalid".to_string())),
+        &Value::Concrete(ConcreteValue::String("invalid".into())),
         &config,
     );
     assert!(invalid_result.is_err());
@@ -7814,7 +7937,7 @@ fn test_compose_operator_followed_by_pipe_consumes_closure() {
 
     assert_eq!(
         result.variables.get("result").unwrap(),
-        &Value::Concrete(ConcreteValue::String("a,b".to_string()))
+        &Value::Concrete(ConcreteValue::String("a,b".into()))
     );
     // `f` is a closure-only binding and does not appear in the
     // user-facing variable map.
@@ -7831,7 +7954,7 @@ fn test_compose_operator_with_pipe() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.variables.get("names").unwrap(),
-        &Value::Concrete(ConcreteValue::String("alice, bob".to_string()))
+        &Value::Concrete(ConcreteValue::String("alice, bob".into()))
     );
 }
 
@@ -7845,7 +7968,7 @@ fn test_compose_operator_two_step_chain() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.variables.get("result").unwrap(),
-        &Value::Concrete(ConcreteValue::String("a-b-c".to_string()))
+        &Value::Concrete(ConcreteValue::String("a-b-c".into()))
     );
 }
 
@@ -7892,7 +8015,7 @@ fn test_compose_operator_precedence_with_pipe() {
     let result = parse(input, &ProviderContext::default()).unwrap();
     assert_eq!(
         result.variables.get("result").unwrap(),
-        &Value::Concrete(ConcreteValue::String("1-2".to_string()))
+        &Value::Concrete(ConcreteValue::String("1-2".into()))
     );
 }
 
@@ -7924,9 +8047,7 @@ fn parse_single_quoted_string_literal() {
     let vpc = &result.resources[0];
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "my-vpc".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("my-vpc".into())))
     );
 }
 
@@ -7945,9 +8066,7 @@ fn parse_single_quoted_string_no_interpolation() {
     // Should be a plain string, not interpolated
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "vpc-${env}".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("vpc-${env}".into())))
     );
 }
 
@@ -8006,7 +8125,7 @@ fn parse_single_quoted_string_escape_sequences() {
     assert_eq!(
         vpc.get_attr("name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "it's a test".to_string()
+            "it's a test".into()
         )))
     );
 }
@@ -8023,9 +8142,9 @@ fn test_compose_three_functions_execution() {
     assert_eq!(
         result.variables.get("result").unwrap(),
         &Value::Concrete(ConcreteValue::List(vec![
-            Value::Concrete(ConcreteValue::String("a".to_string())),
-            Value::Concrete(ConcreteValue::String("b".to_string())),
-            Value::Concrete(ConcreteValue::String("c".to_string())),
+            Value::Concrete(ConcreteValue::String("a".into())),
+            Value::Concrete(ConcreteValue::String("b".into())),
+            Value::Concrete(ConcreteValue::String("c".into())),
         ]))
     );
 }
@@ -8047,7 +8166,7 @@ EOT
     assert_eq!(
         resource.get_attr("policy"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "{\n  \"Version\": \"2012-10-17\"\n}".to_string()
+            "{\n  \"Version\": \"2012-10-17\"\n}".into()
         )))
     );
 }
@@ -8061,7 +8180,7 @@ fn parse_heredoc_indented() {
     assert_eq!(
         resource.get_attr("policy"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "line1\nline2\nline3".to_string()
+            "line1\nline2\nline3".into()
         )))
     );
 }
@@ -8073,7 +8192,7 @@ fn parse_heredoc_empty() {
     let resource = &result.resources[0];
     assert_eq!(
         resource.get_attr("policy"),
-        Some(&Value::Concrete(ConcreteValue::String("".to_string())))
+        Some(&Value::Concrete(ConcreteValue::String("".into())))
     );
 }
 
@@ -8088,7 +8207,7 @@ EOF
     assert_eq!(
         result.variables.get("doc"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "hello world".to_string()
+            "hello world".into()
         )))
     );
 }
@@ -8106,14 +8225,12 @@ fn quoted_string_as_map_key() {
         assert_eq!(
             map.get("token.actions.githubusercontent.com:aud"),
             Some(&Value::Concrete(ConcreteValue::String(
-                "sts.amazonaws.com".to_string()
+                "sts.amazonaws.com".into()
             )))
         );
         assert_eq!(
             map.get("aws:SourceIp"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "10.0.0.0/8".to_string()
-            )))
+            Some(&Value::Concrete(ConcreteValue::String("10.0.0.0/8".into())))
         );
     } else {
         panic!("Expected map, got {:?}", result.variables.get("m"));
@@ -8153,7 +8270,7 @@ fn quoted_string_as_attribute_key_in_block() {
         assert_eq!(
             string_equals.get("token.actions.githubusercontent.com:aud"),
             Some(&Value::Concrete(ConcreteValue::String(
-                "sts.amazonaws.com".to_string()
+                "sts.amazonaws.com".into()
             )))
         );
     } else {
@@ -8281,7 +8398,7 @@ awscc.ec2.Subnet {
     assert_eq!(
         cidr,
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.1.0/24".to_string()
+            "10.0.1.0/24".into()
         ))),
         "?? should return default when left is an unresolved ResourceRef"
     );
@@ -8344,7 +8461,7 @@ awscc.ec2.Vpc {
     assert_eq!(
         cidr,
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.1.0.0/16".to_string()
+            "10.1.0.0/16".into()
         ))),
         "?? should return left when it's resolved"
     );
@@ -8427,8 +8544,8 @@ fn expand_deferred_for_with_remote_bindings() {
     orgs_attrs.insert(
         "accounts".to_string(),
         Value::Concrete(ConcreteValue::List(vec![
-            Value::Concrete(ConcreteValue::String("111111111111".to_string())),
-            Value::Concrete(ConcreteValue::String("222222222222".to_string())),
+            Value::Concrete(ConcreteValue::String("111111111111".into())),
+            Value::Concrete(ConcreteValue::String("222222222222".into())),
         ])),
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
@@ -8462,7 +8579,7 @@ fn expand_deferred_for_with_remote_bindings() {
     assert_eq!(
         target_id_0,
         Some(&Value::Concrete(ConcreteValue::String(
-            "111111111111".to_string()
+            "111111111111".into()
         ))),
         "target_id should be substituted with actual account ID"
     );
@@ -8472,7 +8589,7 @@ fn expand_deferred_for_with_remote_bindings() {
     assert_eq!(
         target_id_1,
         Some(&Value::Concrete(ConcreteValue::String(
-            "222222222222".to_string()
+            "222222222222".into()
         ))),
     );
 }
@@ -8531,11 +8648,11 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
     let mut accounts: IndexMap<String, Value> = IndexMap::new();
     accounts.insert(
         "prod".to_string(),
-        Value::Concrete(ConcreteValue::String("111111111111".to_string())),
+        Value::Concrete(ConcreteValue::String("111111111111".into())),
     );
     accounts.insert(
         "dev".to_string(),
-        Value::Concrete(ConcreteValue::String("222222222222".to_string())),
+        Value::Concrete(ConcreteValue::String("222222222222".into())),
     );
     let mut orgs_attrs = HashMap::new();
     orgs_attrs.insert(
@@ -8553,21 +8670,21 @@ fn expand_deferred_for_map_binding_substitutes_key_and_value() {
     let mut by_name: HashMap<String, &Resource> = HashMap::new();
     for r in &parsed.resources {
         if let Some(Value::Concrete(ConcreteValue::String(s))) = r.get_attr("target_name") {
-            by_name.insert(s.clone(), r);
+            by_name.insert(s.expose_plaintext().to_owned(), r);
         }
     }
     let prod = by_name.get("prod").expect("prod entry");
     assert_eq!(
         prod.get_attr("target_id"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "111111111111".to_string()
+            "111111111111".into()
         )))
     );
     let dev = by_name.get("dev").expect("dev entry");
     assert_eq!(
         dev.get_attr("target_id"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "222222222222".to_string()
+            "222222222222".into()
         )))
     );
 }
@@ -8598,8 +8715,8 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
     orgs_attrs.insert(
         "accounts".to_string(),
         Value::Concrete(ConcreteValue::List(vec![
-            Value::Concrete(ConcreteValue::String("111111111111".to_string())),
-            Value::Concrete(ConcreteValue::String("222222222222".to_string())),
+            Value::Concrete(ConcreteValue::String("111111111111".into())),
+            Value::Concrete(ConcreteValue::String("222222222222".into())),
         ])),
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
@@ -8610,7 +8727,7 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
     assert_eq!(
         parsed.resources[0].get_attr("target_id"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "111111111111".to_string()
+            "111111111111".into()
         )))
     );
     assert_eq!(
@@ -8621,7 +8738,7 @@ fn expand_deferred_for_indexed_binding_substitutes_index_and_value() {
     assert_eq!(
         parsed.resources[1].get_attr("target_id"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "222222222222".to_string()
+            "222222222222".into()
         )))
     );
     assert_eq!(
@@ -8666,13 +8783,13 @@ fn expand_deferred_for_children_depend_on_iterable_binding_for_all_binding_shape
     orgs_attrs.insert(
         "accounts".to_string(),
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::String("111111111111".to_string()),
+            ConcreteValue::String("111111111111".into()),
         )])),
     );
     let mut named_accounts: IndexMap<String, Value> = IndexMap::new();
     named_accounts.insert(
         "prod".to_string(),
-        Value::Concrete(ConcreteValue::String("222222222222".to_string())),
+        Value::Concrete(ConcreteValue::String("222222222222".into())),
     );
     orgs_attrs.insert(
         "named_accounts".to_string(),
@@ -8720,14 +8837,14 @@ fn expand_deferred_for_dependency_binding_survives_resolve() {
     orgs_attrs.insert(
         "accounts".to_string(),
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::String("111111111111".to_string()),
+            ConcreteValue::String("111111111111".into()),
         )])),
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
     let mut anchor_attrs = HashMap::new();
     anchor_attrs.insert(
         "target_id".to_string(),
-        Value::Concrete(ConcreteValue::String("anchor".to_string())),
+        Value::Concrete(ConcreteValue::String("anchor".into())),
     );
     remote_bindings.insert("anchor".to_string(), anchor_attrs);
 
@@ -8782,7 +8899,7 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
     orgs_attrs.insert(
         "accounts".to_string(),
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::String("111111111111".to_string()),
+            ConcreteValue::String("111111111111".into()),
         )])),
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
@@ -8797,16 +8914,18 @@ fn expand_deferred_for_substitutes_placeholder_inside_interpolation() {
             let mut s = String::new();
             for p in parts {
                 match p {
-                    crate::resource::InterpolationPart::Literal(lit) => s.push_str(lit),
+                    crate::resource::InterpolationPart::Literal(lit) => {
+                        s.push_str(lit.expose_plaintext())
+                    }
                     crate::resource::InterpolationPart::Expr(Value::Concrete(
                         ConcreteValue::String(v),
-                    )) => s.push_str(v),
+                    )) => s.push_str(v.expose_plaintext()),
                     _ => s.push_str("<expr>"),
                 }
             }
             s
         }
-        Some(Value::Concrete(ConcreteValue::String(s))) => s.clone(),
+        Some(Value::Concrete(ConcreteValue::String(s))) => s.expose_plaintext().to_owned(),
         other => panic!("unexpected label shape: {:?}", other),
     };
     assert!(
@@ -8868,7 +8987,7 @@ fn expand_deferred_for_simple_binding_with_map_iterable_warns() {
     let mut accounts: IndexMap<String, Value> = IndexMap::new();
     accounts.insert(
         "prod".to_string(),
-        Value::Concrete(ConcreteValue::String("111111111111".to_string())),
+        Value::Concrete(ConcreteValue::String("111111111111".into())),
     );
     let mut orgs_attrs = HashMap::new();
     orgs_attrs.insert(
@@ -8918,8 +9037,8 @@ fn expand_deferred_for_map_binding_with_list_iterable_warns() {
     orgs_attrs.insert(
         "accounts".to_string(),
         Value::Concrete(ConcreteValue::List(vec![
-            Value::Concrete(ConcreteValue::String("111111111111".to_string())),
-            Value::Concrete(ConcreteValue::String("222222222222".to_string())),
+            Value::Concrete(ConcreteValue::String("111111111111".into())),
+            Value::Concrete(ConcreteValue::String("222222222222".into())),
         ])),
     );
     remote_bindings.insert("orgs".to_string(), orgs_attrs);
@@ -9875,7 +9994,7 @@ fn assert_directory_let_chain_resolves(hops: usize) {
 
     assert_eq!(
         final_file.1.parsed().variables.get(&final_name),
-        Some(&Value::Concrete(ConcreteValue::String("x".to_string())))
+        Some(&Value::Concrete(ConcreteValue::String("x".into())))
     );
 }
 
@@ -10084,7 +10203,7 @@ fn parse_directory_files_does_not_treat_dotted_string_literal_as_let_reference()
     assert_eq!(
         a_file.1.parsed().variables.get("A"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "A.something".to_string()
+            "A.something".into()
         )))
     );
 }
@@ -10174,7 +10293,7 @@ fn parse_directory_preserves_module_arg_dotted_string_literal() {
     assert_eq!(
         record.attributes.get("domain_name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "publish.example.com".to_string()
+            "publish.example.com".into()
         )))
     );
 }
@@ -10214,7 +10333,7 @@ fn parse_directory_preserves_direct_attr_dotted_string_literal() {
     assert_eq!(
         target.attributes.get("x"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "publish.example.com".to_string()
+            "publish.example.com".into()
         )))
     );
 }
@@ -10259,7 +10378,7 @@ fn parse_directory_preserves_export_param_dotted_string_literal() {
     assert_eq!(
         export.value.as_ref(),
         Some(&Value::Concrete(ConcreteValue::String(
-            "publish.example.com".to_string()
+            "publish.example.com".into()
         )))
     );
 }
@@ -10291,7 +10410,7 @@ fn parse_preserves_data_source_attr_dotted_string_literal() {
     assert_eq!(
         data_source.attributes.get("x"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "publish.example.com".to_string()
+            "publish.example.com".into()
         )))
     );
 }
@@ -10323,7 +10442,7 @@ fn parse_preserves_attribute_param_default_dotted_string_literal() {
     assert_eq!(
         attr.value.as_ref(),
         Some(&Value::Concrete(ConcreteValue::String(
-            "publish.example.com".to_string()
+            "publish.example.com".into()
         )))
     );
 }
@@ -10383,7 +10502,7 @@ fn parse_subscript_on_upstream_state_in_sibling_file() {
             assert_eq!(
                 path.trailing_subscripts(),
                 [crate::resource::Subscript::Str {
-                    key: "registry_dev".to_string()
+                    key: "registry_dev".into()
                 }]
             );
         }
@@ -10446,7 +10565,7 @@ fn parse_subscript_on_upstream_state_inside_string_interpolation_sibling_file() 
                     assert_eq!(
                         path.trailing_subscripts(),
                         [crate::resource::Subscript::Str {
-                            key: "registry_dev".to_string()
+                            key: "registry_dev".into()
                         }]
                     );
                     found_ref = true;
@@ -10898,7 +11017,7 @@ arguments {
     let arg = &parsed.arguments[0];
     assert_eq!(
         arg.default.as_ref().unwrap(),
-        &Value::Concrete(ConcreteValue::String("prod".to_string()))
+        &Value::Concrete(ConcreteValue::String("prod".into()))
     );
 }
 
@@ -11549,7 +11668,7 @@ fn provider_config_named_instance_serde_round_trip() {
             let mut m = IndexMap::new();
             m.insert(
                 "region".to_string(),
-                Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+                Value::Concrete(ConcreteValue::String("us-east-1".into())),
             );
             m
         },
@@ -12021,7 +12140,7 @@ fn parse_directory_named_instance_region_is_enum_identifier_namespaced() {
     // when the user wrote `aws.Region.us_east_1`. See carina#3021.
     let region_text = match us.attributes.get("region") {
         Some(Value::Concrete(ConcreteValue::EnumIdentifier(s))) => Some(s.as_str()),
-        Some(Value::Concrete(ConcreteValue::String(s))) => Some(s.as_str()),
+        Some(Value::Concrete(ConcreteValue::String(s))) => Some(s.expose_plaintext()),
         _ => None,
     };
     assert_eq!(
@@ -12055,7 +12174,7 @@ fn parse_directory_named_instance_region_is_enum_identifier_namespaced() {
         .expect("default instance must exist");
     let default_region_text = match default.attributes.get("region") {
         Some(Value::Concrete(ConcreteValue::EnumIdentifier(s))) => Some(s.as_str()),
-        Some(Value::Concrete(ConcreteValue::String(s))) => Some(s.as_str()),
+        Some(Value::Concrete(ConcreteValue::String(s))) => Some(s.expose_plaintext()),
         _ => None,
     };
     assert_eq!(
@@ -12288,7 +12407,7 @@ fn access_path_serde_round_trips_mixed_segments() {
             },
             PathSegment::Subscript {
                 index: Subscript::Str {
-                    key: "primary".to_string(),
+                    key: "primary".into(),
                 },
             },
         ],

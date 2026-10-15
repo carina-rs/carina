@@ -1,6 +1,6 @@
 //! `replace(search, replacement, string)` built-in function
 
-use crate::resource::{ConcreteValue, Value};
+use crate::resource::{ConcreteValue, Value, ValueString};
 
 use super::value_type_name;
 
@@ -28,7 +28,7 @@ pub(crate) fn builtin_replace(args: &[Value]) -> Result<Value, String> {
     }
 
     let search = match &args[0] {
-        Value::Concrete(ConcreteValue::String(s)) => s.clone(),
+        Value::Concrete(ConcreteValue::String(s)) => s,
         other => {
             return Err(format!(
                 "replace() first argument must be a string, got {}",
@@ -38,7 +38,7 @@ pub(crate) fn builtin_replace(args: &[Value]) -> Result<Value, String> {
     };
 
     let replacement = match &args[1] {
-        Value::Concrete(ConcreteValue::String(s)) => s.clone(),
+        Value::Concrete(ConcreteValue::String(s)) => s,
         other => {
             return Err(format!(
                 "replace() second argument must be a string, got {}",
@@ -48,7 +48,7 @@ pub(crate) fn builtin_replace(args: &[Value]) -> Result<Value, String> {
     };
 
     let input = match &args[2] {
-        Value::Concrete(ConcreteValue::String(s)) => s.clone(),
+        Value::Concrete(ConcreteValue::String(s)) => s,
         other => {
             return Err(format!(
                 "replace() third argument must be a string, got {}",
@@ -57,8 +57,11 @@ pub(crate) fn builtin_replace(args: &[Value]) -> Result<Value, String> {
         }
     };
 
+    let replaced = input
+        .expose_plaintext()
+        .replace(search.expose_plaintext(), replacement.expose_plaintext());
     Ok(Value::Concrete(ConcreteValue::String(
-        input.replace(&search, &replacement),
+        ValueString::derived_from(replaced, [search, replacement, input]),
     )))
 }
 
@@ -71,108 +74,105 @@ mod tests {
     fn replace_basic() {
         // replace(search, replacement, string)
         let args = vec![
-            Value::Concrete(ConcreteValue::String("-".to_string())),
-            Value::Concrete(ConcreteValue::String("_".to_string())),
-            Value::Concrete(ConcreteValue::String("hello-world".to_string())),
+            Value::Concrete(ConcreteValue::String("-".into())),
+            Value::Concrete(ConcreteValue::String("_".into())),
+            Value::Concrete(ConcreteValue::String("hello-world".into())),
         ];
         let result = evaluate_builtin("replace", &args).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("hello_world".to_string()))
+            Value::Concrete(ConcreteValue::String("hello_world".into()))
         );
     }
 
     #[test]
     fn replace_multiple_occurrences() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("-".to_string())),
-            Value::Concrete(ConcreteValue::String("_".to_string())),
-            Value::Concrete(ConcreteValue::String("a-b-c-d".to_string())),
+            Value::Concrete(ConcreteValue::String("-".into())),
+            Value::Concrete(ConcreteValue::String("_".into())),
+            Value::Concrete(ConcreteValue::String("a-b-c-d".into())),
         ];
         let result = evaluate_builtin("replace", &args).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("a_b_c_d".to_string()))
+            Value::Concrete(ConcreteValue::String("a_b_c_d".into()))
         );
     }
 
     #[test]
     fn replace_no_match() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("-".to_string())),
-            Value::Concrete(ConcreteValue::String("_".to_string())),
-            Value::Concrete(ConcreteValue::String("hello".to_string())),
+            Value::Concrete(ConcreteValue::String("-".into())),
+            Value::Concrete(ConcreteValue::String("_".into())),
+            Value::Concrete(ConcreteValue::String("hello".into())),
         ];
         let result = evaluate_builtin("replace", &args).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("hello".to_string()))
+            Value::Concrete(ConcreteValue::String("hello".into()))
         );
     }
 
     #[test]
     fn replace_empty_search() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("".to_string())),
-            Value::Concrete(ConcreteValue::String("-".to_string())),
-            Value::Concrete(ConcreteValue::String("abc".to_string())),
+            Value::Concrete(ConcreteValue::String("".into())),
+            Value::Concrete(ConcreteValue::String("-".into())),
+            Value::Concrete(ConcreteValue::String("abc".into())),
         ];
         let result = evaluate_builtin("replace", &args).unwrap();
         // Rust's replace("", x) inserts x between every char and at boundaries
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("-a-b-c-".to_string()))
+            Value::Concrete(ConcreteValue::String("-a-b-c-".into()))
         );
     }
 
     #[test]
     fn replace_with_empty() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("-".to_string())),
-            Value::Concrete(ConcreteValue::String("".to_string())),
-            Value::Concrete(ConcreteValue::String("hello-world".to_string())),
+            Value::Concrete(ConcreteValue::String("-".into())),
+            Value::Concrete(ConcreteValue::String("".into())),
+            Value::Concrete(ConcreteValue::String("hello-world".into())),
         ];
         let result = evaluate_builtin("replace", &args).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("helloworld".to_string()))
+            Value::Concrete(ConcreteValue::String("helloworld".into()))
         );
     }
 
     #[test]
     fn replace_multi_char() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("::".to_string())),
-            Value::Concrete(ConcreteValue::String(".".to_string())),
-            Value::Concrete(ConcreteValue::String("foo::bar::baz".to_string())),
+            Value::Concrete(ConcreteValue::String("::".into())),
+            Value::Concrete(ConcreteValue::String(".".into())),
+            Value::Concrete(ConcreteValue::String("foo::bar::baz".into())),
         ];
         let result = evaluate_builtin("replace", &args).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("foo.bar.baz".to_string()))
+            Value::Concrete(ConcreteValue::String("foo.bar.baz".into()))
         );
     }
 
     #[test]
     fn replace_empty_input() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("-".to_string())),
-            Value::Concrete(ConcreteValue::String("_".to_string())),
-            Value::Concrete(ConcreteValue::String("".to_string())),
+            Value::Concrete(ConcreteValue::String("-".into())),
+            Value::Concrete(ConcreteValue::String("_".into())),
+            Value::Concrete(ConcreteValue::String("".into())),
         ];
         let result = evaluate_builtin("replace", &args).unwrap();
-        assert_eq!(
-            result,
-            Value::Concrete(ConcreteValue::String("".to_string()))
-        );
+        assert_eq!(result, Value::Concrete(ConcreteValue::String("".into())));
     }
 
     #[test]
     fn replace_partial_application() {
         use crate::builtins::evaluate_builtin_for_tests;
         let args = vec![
-            Value::Concrete(ConcreteValue::String("hello".to_string())),
-            Value::Concrete(ConcreteValue::String("-".to_string())),
+            Value::Concrete(ConcreteValue::String("hello".into())),
+            Value::Concrete(ConcreteValue::String("-".into())),
         ];
         let result = evaluate_builtin_for_tests("replace", &args).unwrap();
         assert!(result.is_closure());
@@ -182,8 +182,8 @@ mod tests {
     fn replace_non_string_first_arg() {
         let args = vec![
             Value::Concrete(ConcreteValue::Int(1)),
-            Value::Concrete(ConcreteValue::String("_".to_string())),
-            Value::Concrete(ConcreteValue::String("hello".to_string())),
+            Value::Concrete(ConcreteValue::String("_".into())),
+            Value::Concrete(ConcreteValue::String("hello".into())),
         ];
         let result = evaluate_builtin("replace", &args);
         assert!(result.is_err());
@@ -197,9 +197,9 @@ mod tests {
     #[test]
     fn replace_non_string_second_arg() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("-".to_string())),
+            Value::Concrete(ConcreteValue::String("-".into())),
             Value::Concrete(ConcreteValue::Int(1)),
-            Value::Concrete(ConcreteValue::String("hello".to_string())),
+            Value::Concrete(ConcreteValue::String("hello".into())),
         ];
         let result = evaluate_builtin("replace", &args);
         assert!(result.is_err());
@@ -213,8 +213,8 @@ mod tests {
     #[test]
     fn replace_non_string_third_arg() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("-".to_string())),
-            Value::Concrete(ConcreteValue::String("_".to_string())),
+            Value::Concrete(ConcreteValue::String("-".into())),
+            Value::Concrete(ConcreteValue::String("_".into())),
             Value::Concrete(ConcreteValue::Int(1)),
         ];
         let result = evaluate_builtin("replace", &args);

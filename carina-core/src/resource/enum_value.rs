@@ -312,7 +312,7 @@ impl<'a> EnumValueResolver<'a> {
         // RawDsl input above.
         let validation_result = validate.map(|validate| {
             validate(&crate::resource::Value::Concrete(
-                crate::resource::ConcreteValue::String(api_value.clone()),
+                crate::resource::ConcreteValue::String(api_value.clone().into()),
             ))
         });
         let validation_ok = !enumerated && validation_result.as_ref().is_none_or(Result::is_ok);

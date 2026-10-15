@@ -14,7 +14,7 @@ fn list_rule(port: i64, description: Option<&str>) -> Value {
     if let Some(description) = description {
         fields.insert(
             "description".to_string(),
-            Value::Concrete(ConcreteValue::String(description.to_string())),
+            Value::Concrete(ConcreteValue::String(description.to_string().into())),
         );
     }
     Value::Concrete(ConcreteValue::Map(fields))
@@ -718,7 +718,7 @@ fn test_build_saved_attrs() {
     assert_eq!(
         attrs.get("region"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "ap-northeast-1".to_string()
+            "ap-northeast-1".into()
         )))
     );
 }
@@ -811,7 +811,7 @@ fn test_from_provider_state() {
         identifier: Some("my-bucket-abcd1234".to_string()),
         attributes: [(
             "region".to_string(),
-            Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
+            Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
         )]
         .into_iter()
         .collect(),
@@ -851,7 +851,7 @@ fn test_from_provider_state_without_existing() {
         identifier: Some("test-id".to_string()),
         attributes: [(
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("test".to_string())),
+            Value::Concrete(ConcreteValue::String("test".into())),
         )]
         .into_iter()
         .collect(),
@@ -983,11 +983,11 @@ fn test_from_provider_state_repairs_unrecorded_from_state_attrs() {
         attributes: [
             (
                 "principal_type".to_string(),
-                Value::Concrete(ConcreteValue::String("GROUP".to_string())),
+                Value::Concrete(ConcreteValue::String("GROUP".into())),
             ),
             (
                 "target_id".to_string(),
-                Value::Concrete(ConcreteValue::String("123".to_string())),
+                Value::Concrete(ConcreteValue::String("123".into())),
             ),
         ]
         .into_iter()
@@ -1040,7 +1040,7 @@ fn test_from_provider_state_emits_unrecorded_for_fresh_empty_body_resource() {
         identifier: Some("identifier".to_string()),
         attributes: [(
             "account_id".to_string(),
-            Value::Concrete(ConcreteValue::String("123456789012".to_string())),
+            Value::Concrete(ConcreteValue::String("123456789012".into())),
         )]
         .into_iter()
         .collect(),
@@ -1084,7 +1084,7 @@ fn test_from_provider_state_preserves_populated_struct_when_resource_attrs_empty
         identifier: Some("id".to_string()),
         attributes: [(
             "account_id".to_string(),
-            Value::Concrete(ConcreteValue::String("123".to_string())),
+            Value::Concrete(ConcreteValue::String("123".into())),
         )]
         .into_iter()
         .collect(),
@@ -1124,7 +1124,7 @@ fn test_from_provider_state_demotes_top_level_list_elements_when_resource_attrs_
         resource.id.clone(),
         HashMap::from([(
             "provider_value".to_string(),
-            Value::Concrete(ConcreteValue::String("value".to_string())),
+            Value::Concrete(ConcreteValue::String("value".into())),
         )]),
     )
     .with_identifier("resource-id");
@@ -1536,14 +1536,12 @@ fn test_build_saved_attrs_provider_scoped() {
 
     assert_eq!(
         saved.get(&aws_id).unwrap().get("region"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "us-east-1".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("us-east-1".into())))
     );
     assert_eq!(
         saved.get(&awscc_id).unwrap().get("region"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "ap-northeast-1".to_string()
+            "ap-northeast-1".into()
         )))
     );
 }
@@ -1569,7 +1567,7 @@ fn test_build_state_for_resource_existing() {
     assert_eq!(
         result.attributes.get("region"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "ap-northeast-1".to_string()
+            "ap-northeast-1".into()
         )))
     );
 }
@@ -1621,7 +1619,7 @@ fn test_from_provider_state_stores_binding_and_dependencies() {
         identifier: Some("subnet-123".to_string()),
         attributes: [(
             "vpc_id".to_string(),
-            Value::Concrete(ConcreteValue::String("vpc-abc".to_string())),
+            Value::Concrete(ConcreteValue::String("vpc-abc".into())),
         )]
         .into_iter()
         .collect(),
@@ -1666,9 +1664,7 @@ fn test_build_orphan_states_injects_binding() {
     assert!(orphan_state.exists);
     assert_eq!(
         orphan_state.attributes.get("_binding"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "my_subnet".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("my_subnet".into())))
     );
 }
 
@@ -2285,7 +2281,7 @@ fn test_merge_write_only_attributes() {
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
         "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
     resource.set_attr(
         "ipv4_netmask_length".to_string(),
@@ -2298,7 +2294,7 @@ fn test_merge_write_only_attributes() {
         identifier: Some("vpc-123".to_string()),
         attributes: [(
             "cidr_block".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         )]
         .into_iter()
         .collect(),
@@ -2342,7 +2338,7 @@ fn test_merge_write_only_attributes_not_in_desired() {
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
         "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
 
     let provider_state = ProviderState {
@@ -2350,7 +2346,7 @@ fn test_merge_write_only_attributes_not_in_desired() {
         identifier: Some("vpc-123".to_string()),
         attributes: [(
             "cidr_block".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         )]
         .into_iter()
         .collect(),
@@ -2385,7 +2381,7 @@ fn test_merge_write_only_skips_if_already_in_provider_state() {
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
         "some_attr".to_string(),
-        Value::Concrete(ConcreteValue::String("desired".to_string())),
+        Value::Concrete(ConcreteValue::String("desired".into())),
     );
 
     // Provider happens to return this attribute (unusual for write-only but possible)
@@ -2394,7 +2390,7 @@ fn test_merge_write_only_skips_if_already_in_provider_state() {
         identifier: Some("vpc-123".to_string()),
         attributes: [(
             "some_attr".to_string(),
-            Value::Concrete(ConcreteValue::String("from-api".to_string())),
+            Value::Concrete(ConcreteValue::String("from-api".into())),
         )]
         .into_iter()
         .collect(),
@@ -2468,7 +2464,7 @@ fn test_from_provider_state_secret_stored_as_hash() {
     resource.set_attr(
         "master_password".to_string(),
         Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("my-password".to_string()),
+            ConcreteValue::String("my-password".into()),
         )))),
     );
 
@@ -2478,7 +2474,7 @@ fn test_from_provider_state_secret_stored_as_hash() {
         // Provider returns the actual password (since secret was unwrapped before sending)
         attributes: [(
             "master_password".to_string(),
-            Value::Concrete(ConcreteValue::String("my-password".to_string())),
+            Value::Concrete(ConcreteValue::String("my-password".into())),
         )]
         .into_iter()
         .collect(),
@@ -2531,7 +2527,7 @@ fn from_provider_state_rehashes_previous_secret_hash_without_desired_secret() {
         identifier: Some("db-old".to_string()),
         attributes: [(
             "password".to_string(),
-            Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+            Value::Concrete(ConcreteValue::String("plain-secret".into())),
         )]
         .into_iter()
         .collect(),
@@ -2566,7 +2562,7 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None);
     let attrs = HashMap::from([(
         "password".to_string(),
-        Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+        Value::Concrete(ConcreteValue::String("plain-secret".into())),
     )]);
     let existing = HashMap::from([(
         "password".to_string(),
@@ -2598,7 +2594,7 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
     let attrs = HashMap::from([(
         "password".to_string(),
         Value::Concrete(ConcreteValue::String(
-            previous.as_str().unwrap().to_string(),
+            previous.as_str().unwrap().to_string().into(),
         )),
     )]);
     let existing = HashMap::from([("password".to_string(), previous.clone())]);
@@ -2620,7 +2616,7 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
         "password",
-        Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+        Value::Concrete(ConcreteValue::String("plain-secret".into())),
     );
     let existing = ResourceState::new("db.Instance", "main", "awscc")
         .with_identifier("db-old")
@@ -2633,7 +2629,7 @@ fn from_provider_state_stores_plain_value_when_secret_is_demoted() {
         identifier: Some("db-old".to_string()),
         attributes: [(
             "password".to_string(),
-            Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+            Value::Concrete(ConcreteValue::String("plain-secret".into())),
         )]
         .into_iter()
         .collect(),
@@ -2664,7 +2660,7 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
         "password",
-        Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+        Value::Concrete(ConcreteValue::String("plain-secret".into())),
     );
     let existing = ResourceState::new("db.Instance", "main", "awscc")
         .with_identifier("db-old")
@@ -2712,11 +2708,11 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
     let mut provider_tags = IndexMap::new();
     provider_tags.insert(
         "Name".to_string(),
-        Value::Concrete(ConcreteValue::String("new-name".to_string())),
+        Value::Concrete(ConcreteValue::String("new-name".into())),
     );
     provider_tags.insert(
         "SecretTag".to_string(),
-        Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+        Value::Concrete(ConcreteValue::String("plain-secret".into())),
     );
     let attrs = HashMap::from([(
         "tags".to_string(),
@@ -2812,20 +2808,20 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
     let mut first_provider_item = IndexMap::new();
     first_provider_item.insert(
         "Name".to_string(),
-        Value::Concrete(ConcreteValue::String("two".to_string())),
+        Value::Concrete(ConcreteValue::String("two".into())),
     );
     first_provider_item.insert(
         "Public".to_string(),
-        Value::Concrete(ConcreteValue::String("kept".to_string())),
+        Value::Concrete(ConcreteValue::String("kept".into())),
     );
     let mut second_provider_item = IndexMap::new();
     second_provider_item.insert(
         "Name".to_string(),
-        Value::Concrete(ConcreteValue::String("one".to_string())),
+        Value::Concrete(ConcreteValue::String("one".into())),
     );
     second_provider_item.insert(
         "Token".to_string(),
-        Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+        Value::Concrete(ConcreteValue::String("plain-secret".into())),
     );
     let attrs = HashMap::from([(
         "items".to_string(),
@@ -2865,12 +2861,12 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
     let mut tags_map = IndexMap::new();
     tags_map.insert(
         "Name".to_string(),
-        Value::Concrete(ConcreteValue::String("test".to_string())),
+        Value::Concrete(ConcreteValue::String("test".into())),
     );
     tags_map.insert(
         "SecretTag".to_string(),
         Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("super-secret-value".to_string()),
+            ConcreteValue::String("super-secret-value".into()),
         )))),
     );
     resource.set_attr(
@@ -2881,11 +2877,11 @@ fn test_from_provider_state_secret_in_map_stored_as_hash() {
     let mut state_tags = IndexMap::new();
     state_tags.insert(
         "Name".to_string(),
-        Value::Concrete(ConcreteValue::String("test".to_string())),
+        Value::Concrete(ConcreteValue::String("test".into())),
     );
     state_tags.insert(
         "SecretTag".to_string(),
-        Value::Concrete(ConcreteValue::String("super-secret-value".to_string())),
+        Value::Concrete(ConcreteValue::String("super-secret-value".into())),
     );
 
     let provider_state = ProviderState {
@@ -2944,7 +2940,7 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
     tags_map.insert(
         "SecretTag".to_string(),
         Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("super-secret-value".to_string()),
+            ConcreteValue::String("super-secret-value".into()),
         )))),
     );
     resource.set_attr(
@@ -2956,15 +2952,15 @@ fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
     let mut state_tags = IndexMap::new();
     state_tags.insert(
         "Name".to_string(),
-        Value::Concrete(ConcreteValue::String("test".to_string())),
+        Value::Concrete(ConcreteValue::String("test".into())),
     );
     state_tags.insert(
         "ExtraTag".to_string(),
-        Value::Concrete(ConcreteValue::String("extra-value".to_string())),
+        Value::Concrete(ConcreteValue::String("extra-value".into())),
     );
     state_tags.insert(
         "SecretTag".to_string(),
-        Value::Concrete(ConcreteValue::String("super-secret-value".to_string())),
+        Value::Concrete(ConcreteValue::String("super-secret-value".into())),
     );
 
     let provider_state = ProviderState {
@@ -3024,9 +3020,9 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
     resource.set_attr(
         "values".to_string(),
         Value::Concrete(ConcreteValue::List(vec![
-            Value::Concrete(ConcreteValue::String("public".to_string())),
+            Value::Concrete(ConcreteValue::String("public".into())),
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("secret-item".to_string()),
+                ConcreteValue::String("secret-item".into()),
             )))),
         ])),
     );
@@ -3037,8 +3033,8 @@ fn test_from_provider_state_secret_in_list_stored_as_hash() {
         attributes: [(
             "values".to_string(),
             Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("public".to_string())),
-                Value::Concrete(ConcreteValue::String("secret-item".to_string())),
+                Value::Concrete(ConcreteValue::String("public".into())),
+                Value::Concrete(ConcreteValue::String("secret-item".into())),
             ])),
         )]
         .into_iter()
@@ -3083,7 +3079,7 @@ fn build_remote_bindings_returns_exports() {
     assert_eq!(
         bindings.get("account_id"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "123456789012".to_string()
+            "123456789012".into()
         )))
     );
 }
@@ -3519,7 +3515,7 @@ fn repeated_writeback_realigns_reordered_elements_and_plan_uses_first_row_alignm
     assert_eq!(
         port_443.get("description"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "provider-default".to_string()
+            "provider-default".into()
         )))
     );
     assert!(matches!(

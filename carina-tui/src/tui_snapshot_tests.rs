@@ -62,7 +62,7 @@ fn build_all_create_plan() -> Plan {
             .with_binding("vpc")
             .with_attribute(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             ),
     ));
     plan.add(create(
@@ -78,7 +78,7 @@ fn build_all_create_plan() -> Plan {
             .with_binding("subnet")
             .with_attribute(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.1.0/24".into())),
             )
             .with_attribute(
                 "vpc_id",
@@ -97,11 +97,11 @@ fn build_mixed_operations_plan() -> Plan {
             [
                 (
                     "cidr_block".to_string(),
-                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                 ),
                 (
                     "_binding".to_string(),
-                    Value::Concrete(ConcreteValue::String("vpc".to_string())),
+                    Value::Concrete(ConcreteValue::String("vpc".into())),
                 ),
             ]
             .into_iter()
@@ -112,7 +112,7 @@ fn build_mixed_operations_plan() -> Plan {
                 .with_binding("vpc")
                 .with_attribute(
                     "cidr_block",
-                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                 )
                 .with_attribute(
                     "enable_dns_support",
@@ -126,7 +126,7 @@ fn build_mixed_operations_plan() -> Plan {
             .with_binding("sg")
             .with_attribute(
                 "group_description",
-                Value::Concrete(ConcreteValue::String("Web security group".to_string())),
+                Value::Concrete(ConcreteValue::String("Web security group".into())),
             )
             .with_attribute(
                 "vpc_id",
@@ -175,15 +175,15 @@ fn build_map_key_diff_plan() -> Plan {
     let old_tags: indexmap::IndexMap<String, Value> = [
         (
             "Name".to_string(),
-            Value::Concrete(ConcreteValue::String("my-vpc".to_string())),
+            Value::Concrete(ConcreteValue::String("my-vpc".into())),
         ),
         (
             "Environment".to_string(),
-            Value::Concrete(ConcreteValue::String("staging".to_string())),
+            Value::Concrete(ConcreteValue::String("staging".into())),
         ),
         (
             "OldTag".to_string(),
-            Value::Concrete(ConcreteValue::String("to-remove".to_string())),
+            Value::Concrete(ConcreteValue::String("to-remove".into())),
         ),
     ]
     .into_iter()
@@ -192,15 +192,15 @@ fn build_map_key_diff_plan() -> Plan {
     let new_tags: indexmap::IndexMap<String, Value> = [
         (
             "Name".to_string(),
-            Value::Concrete(ConcreteValue::String("my-vpc".to_string())),
+            Value::Concrete(ConcreteValue::String("my-vpc".into())),
         ),
         (
             "Environment".to_string(),
-            Value::Concrete(ConcreteValue::String("production".to_string())),
+            Value::Concrete(ConcreteValue::String("production".into())),
         ),
         (
             "NewTag".to_string(),
-            Value::Concrete(ConcreteValue::String("added".to_string())),
+            Value::Concrete(ConcreteValue::String("added".into())),
         ),
     ]
     .into_iter()
@@ -212,11 +212,11 @@ fn build_map_key_diff_plan() -> Plan {
             [
                 (
                     "_binding".to_string(),
-                    Value::Concrete(ConcreteValue::String("vpc".to_string())),
+                    Value::Concrete(ConcreteValue::String("vpc".into())),
                 ),
                 (
                     "cidr_block".to_string(),
-                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                 ),
                 (
                     "tags".to_string(),
@@ -231,7 +231,7 @@ fn build_map_key_diff_plan() -> Plan {
                 .with_binding("vpc")
                 .with_attribute(
                     "cidr_block",
-                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                 )
                 .with_attribute("tags", Value::Concrete(ConcreteValue::Map(new_tags))),
         ),
@@ -344,11 +344,11 @@ fn certificate_resource() -> Resource {
         .with_binding("cert")
         .with_attribute(
             "domain_name",
-            Value::Concrete(ConcreteValue::String("registry.example.com".to_string())),
+            Value::Concrete(ConcreteValue::String("registry.example.com".into())),
         )
         .with_attribute(
             "validation_method",
-            Value::Concrete(ConcreteValue::String("DNS".to_string())),
+            Value::Concrete(ConcreteValue::String("DNS".into())),
         )
 }
 
@@ -356,12 +356,12 @@ fn deferred_record_attributes() -> Vec<(String, Value)> {
     vec![
         (
             "hosted_zone_id".to_string(),
-            Value::Concrete(ConcreteValue::String("Z123".to_string())),
+            Value::Concrete(ConcreteValue::String("Z123".into())),
         ),
         ("ttl".to_string(), Value::Concrete(ConcreteValue::Int(60))),
         (
             "type".to_string(),
-            Value::Concrete(ConcreteValue::String("CNAME".to_string())),
+            Value::Concrete(ConcreteValue::String("CNAME".into())),
         ),
         (
             "name".to_string(),
@@ -449,7 +449,7 @@ fn snapshot_create_with_schema() {
             .with_binding("vpc")
             .with_attribute(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             ),
     ));
 
@@ -564,11 +564,11 @@ fn build_moved_with_changes_plan() -> Plan {
             [
                 (
                     "cidr_block".to_string(),
-                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                 ),
                 (
                     "_binding".to_string(),
-                    Value::Concrete(ConcreteValue::String("new_vpc".to_string())),
+                    Value::Concrete(ConcreteValue::String("new_vpc".into())),
                 ),
             ]
             .into_iter()
@@ -579,14 +579,14 @@ fn build_moved_with_changes_plan() -> Plan {
                 .with_binding("new_vpc")
                 .with_attribute(
                     "cidr_block",
-                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                 )
                 .with_attribute(
                     "tags",
                     Value::Concrete(ConcreteValue::Map(
                         [(
                             "Name".to_string(),
-                            Value::Concrete(ConcreteValue::String("updated".to_string())),
+                            Value::Concrete(ConcreteValue::String("updated".into())),
                         )]
                         .into_iter()
                         .collect(),
@@ -599,7 +599,7 @@ fn build_moved_with_changes_plan() -> Plan {
         Resource::new("ec2.Subnet", "my-subnet")
             .with_attribute(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.1.0/24".into())),
             )
             .with_attribute(
                 "vpc_id",

@@ -47,6 +47,17 @@ fn resolved_data_source(resource: DataSource) -> ResolvedDataSource {
     ResolvedDataSource::new(resource)
 }
 
+fn checked_exports(
+    params: &[carina_core::parser::InferredExportParam],
+) -> carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam> {
+    carina_core::validation::check_export_values_pre_apply(
+        params,
+        &carina_core::binding_index::ResolvedBindings::default(),
+        &ProviderContext::default(),
+    )
+    .expect("test exports must pass the secret boundary")
+}
+
 fn saved_provider_configs(
     configs: Vec<ProviderConfig>,
 ) -> carina_core::parser::SavedProviderConfigs {
@@ -157,7 +168,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
             id.clone(),
             HashMap::from([(
                 "status".to_string(),
-                Value::Concrete(ConcreteValue::String("before".to_string())),
+                Value::Concrete(ConcreteValue::String("before".into())),
             )]),
         )
         .with_identifier(identifier),
@@ -169,7 +180,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
             id.clone(),
             HashMap::from([(
                 "status".to_string(),
-                Value::Concrete(ConcreteValue::String("after".to_string())),
+                Value::Concrete(ConcreteValue::String("after".into())),
             )]),
         )
         .with_identifier(identifier),
@@ -221,7 +232,7 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
             id.clone(),
             HashMap::from([(
                 "status".to_string(),
-                Value::Concrete(ConcreteValue::String("before".to_string())),
+                Value::Concrete(ConcreteValue::String("before".into())),
             )]),
         )
         .with_identifier(identifier),
@@ -270,7 +281,7 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
             id.clone(),
             HashMap::from([(
                 "status".to_string(),
-                Value::Concrete(ConcreteValue::String("stale-current".to_string())),
+                Value::Concrete(ConcreteValue::String("stale-current".into())),
             )]),
         )
         .with_identifier(identifier),
@@ -319,7 +330,7 @@ fn plan_file_serde_round_trip() {
     plan.add(Effect::Create(resolved(
         Resource::with_provider("aws", "s3.Bucket", "my-bucket", None).with_attribute(
             "bucket",
-            Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+            Value::Concrete(ConcreteValue::String("my-bucket".into())),
         ),
     )));
     plan.add(Effect::Delete {
@@ -341,7 +352,7 @@ fn plan_file_serde_round_trip() {
     let sorted_resources = vec![
         Resource::with_provider("aws", "s3.Bucket", "my-bucket", None).with_attribute(
             "bucket",
-            Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+            Value::Concrete(ConcreteValue::String("my-bucket".into())),
         ),
     ];
 
@@ -366,9 +377,7 @@ fn plan_file_serde_round_trip() {
             name: "aws".to_string(),
             attributes: IndexMap::from([(
                 "region".to_string(),
-                Value::Concrete(ConcreteValue::String(
-                    "aws.Region.ap_northeast_1".to_string(),
-                )),
+                Value::Concrete(ConcreteValue::String("aws.Region.ap_northeast_1".into())),
             )]),
             default_tags: IndexMap::new(),
             source: None,
@@ -382,11 +391,11 @@ fn plan_file_serde_round_trip() {
             attributes: HashMap::from([
                 (
                     "bucket".to_string(),
-                    Value::Concrete(ConcreteValue::String("my-state".to_string())),
+                    Value::Concrete(ConcreteValue::String("my-state".into())),
                 ),
                 (
                     "key".to_string(),
-                    Value::Concrete(ConcreteValue::String("prod/carina.state".to_string())),
+                    Value::Concrete(ConcreteValue::String("prod/carina.state".into())),
                 ),
             ]),
         }),
@@ -428,7 +437,7 @@ fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
     resource.set_attr(
         "bucket_name_prefix".to_string(),
-        Value::Concrete(ConcreteValue::String("my-app-".to_string())),
+        Value::Concrete(ConcreteValue::String("my-app-".into())),
     );
 
     let mut resources = vec![resource];
@@ -442,8 +451,8 @@ fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
         Value::Concrete(ConcreteValue::String(s)) => s.clone(),
         _ => panic!("expected String"),
     };
-    assert!(bucket_name.starts_with("my-app-"));
-    assert_eq!(bucket_name.len(), "my-app-".len() + 8); // prefix + 8 hex chars
+    assert!(bucket_name.expose_plaintext().starts_with("my-app-"));
+    assert_eq!(bucket_name.expose_plaintext().len(), "my-app-".len() + 8); // prefix + 8 hex chars
 
     // prefixes map should have the entry
     assert_eq!(
@@ -458,7 +467,7 @@ fn test_resolve_attr_prefixes_leaves_non_matching_prefix_alone() {
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
     resource.set_attr(
         "nonexistent_attr_prefix".to_string(),
-        Value::Concrete(ConcreteValue::String("some-value".to_string())),
+        Value::Concrete(ConcreteValue::String("some-value".into())),
     );
 
     let mut resources = vec![resource];
@@ -479,11 +488,11 @@ fn test_resolve_attr_prefixes_errors_when_both_prefix_and_attr_specified() {
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
     resource.set_attr(
         "bucket_name_prefix".to_string(),
-        Value::Concrete(ConcreteValue::String("my-app-".to_string())),
+        Value::Concrete(ConcreteValue::String("my-app-".into())),
     );
     resource.set_attr(
         "bucket_name".to_string(),
-        Value::Concrete(ConcreteValue::String("my-actual-bucket".to_string())),
+        Value::Concrete(ConcreteValue::String("my-actual-bucket".into())),
     );
 
     let mut resources = vec![resource];
@@ -503,7 +512,7 @@ fn test_resolve_attr_prefixes_errors_on_empty_prefix() {
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "test-bucket", None);
     resource.set_attr(
         "bucket_name_prefix".to_string(),
-        Value::Concrete(ConcreteValue::String("".to_string())),
+        Value::Concrete(ConcreteValue::String("".into())),
     );
 
     let mut resources = vec![resource];
@@ -523,7 +532,7 @@ fn test_resolve_names_handles_block_name_before_prefix() {
             ConcreteValue::Map(
                 vec![(
                     "region_name".to_string(),
-                    Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+                    Value::Concrete(ConcreteValue::String("us-east-1".into())),
                 )]
                 .into_iter()
                 .collect(),
@@ -547,7 +556,7 @@ fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
         .insert("bucket_name".to_string(), "my-app-".to_string());
     resource.set_attr(
         "bucket_name".to_string(),
-        Value::Concrete(ConcreteValue::String("my-app-temporary".to_string())),
+        Value::Concrete(ConcreteValue::String("my-app-temporary".into())),
     );
 
     let mut state_file = StateFile::new();
@@ -569,7 +578,7 @@ fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
     assert_eq!(
         resources[0].get_attr("bucket_name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "my-app-existing1".to_string()
+            "my-app-existing1".into()
         )))
     );
 }
@@ -582,7 +591,7 @@ fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
         .insert("bucket_name".to_string(), "new-prefix-".to_string());
     resource.set_attr(
         "bucket_name".to_string(),
-        Value::Concrete(ConcreteValue::String("new-prefix-abcd1234".to_string())),
+        Value::Concrete(ConcreteValue::String("new-prefix-abcd1234".into())),
     );
 
     let mut state_file = StateFile::new();
@@ -604,7 +613,7 @@ fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
     assert_eq!(
         resources[0].get_attr("bucket_name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "new-prefix-abcd1234".to_string()
+            "new-prefix-abcd1234".into()
         )))
     );
 }
@@ -617,7 +626,7 @@ fn test_reconcile_prefixed_names_keeps_generated_name_when_no_state() {
         .insert("bucket_name".to_string(), "my-app-".to_string());
     resource.set_attr(
         "bucket_name".to_string(),
-        Value::Concrete(ConcreteValue::String("my-app-abcd1234".to_string())),
+        Value::Concrete(ConcreteValue::String("my-app-abcd1234".into())),
     );
 
     let mut resources = vec![resource];
@@ -627,7 +636,7 @@ fn test_reconcile_prefixed_names_keeps_generated_name_when_no_state() {
     assert_eq!(
         resources[0].get_attr("bucket_name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "my-app-abcd1234".to_string()
+            "my-app-abcd1234".into()
         )))
     );
 }
@@ -664,7 +673,7 @@ fn make_awscc_provider(region_dsl: &str) -> ProviderConfig {
     let mut attrs = IndexMap::new();
     attrs.insert(
         "region".to_string(),
-        Value::Concrete(ConcreteValue::String(region_dsl.to_string())),
+        Value::Concrete(ConcreteValue::String(region_dsl.to_string().into())),
     );
     ProviderConfig {
         name: "awscc".to_string(),
@@ -685,13 +694,13 @@ fn test_anonymous_id_different_regions_produce_different_identifiers() {
     let mut r1 = Resource::pending_with_provider("awscc", "ec2.Vpc", None);
     r1.set_attr(
         "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
 
     let mut r2 = Resource::pending_with_provider("awscc", "ec2.Vpc", None);
     r2.set_attr(
         "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
 
     // Use two different provider configs with different regions
@@ -740,13 +749,13 @@ fn test_anonymous_id_same_region_same_create_only_collides() {
     let mut r1 = Resource::pending_with_provider("awscc", "ec2.Vpc", None);
     r1.set_attr(
         "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
 
     let mut r2 = Resource::pending_with_provider("awscc", "ec2.Vpc", None);
     r2.set_attr(
         "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
 
     let providers = vec![make_awscc_provider("awscc.Region.us_east_1")];
@@ -763,13 +772,13 @@ fn test_anonymous_id_different_create_only_same_region_no_collision() {
     let mut r1 = Resource::pending_with_provider("awscc", "ec2.Vpc", None);
     r1.set_attr(
         "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
 
     let mut r2 = Resource::pending_with_provider("awscc", "ec2.Vpc", None);
     r2.set_attr(
         "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+        Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
     );
 
     let providers = vec![make_awscc_provider("awscc.Region.us_east_1")];
@@ -802,7 +811,7 @@ fn test_anonymous_id_named_resources_are_skipped() {
     let mut r1 = Resource::with_provider("awscc", "ec2.Vpc", "my_vpc", None);
     r1.set_attr(
         "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
 
     let providers = vec![make_awscc_provider("awscc.Region.us_east_1")];
@@ -824,7 +833,7 @@ fn test_find_state_bucket_resource_matching_type() {
         resources: vec![
             Resource::with_provider("aws", "s3.Bucket", "my-bucket", None).with_attribute(
                 "bucket",
-                Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+                Value::Concrete(ConcreteValue::String("my-bucket".into())),
             ),
         ],
         data_sources: vec![],
@@ -899,11 +908,11 @@ fn validate_regular_resource_without_read_keyword_passes() {
     let resource = Resource::with_provider("aws", "s3.Bucket", "my-bucket", None)
         .with_attribute(
             "bucket",
-            Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+            Value::Concrete(ConcreteValue::String("my-bucket".into())),
         )
         .with_attribute(
             "region",
-            Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
+            Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
         );
     let result = validate_resources(&[resource]);
     assert!(
@@ -933,7 +942,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
     let mut resource_run1 = Resource::pending_with_provider("awscc", "s3.Bucket", None);
     resource_run1.set_attr(
         "bucket_name_prefix".to_string(),
-        Value::Concrete(ConcreteValue::String("my-app-".to_string())),
+        Value::Concrete(ConcreteValue::String("my-app-".into())),
     );
 
     let providers = vec![make_awscc_provider("awscc.Region.ap_northeast_1")];
@@ -952,7 +961,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
         _ => panic!("bucket_name should be a string"),
     };
     assert!(
-        run1_bucket_name.starts_with("my-app-"),
+        run1_bucket_name.expose_plaintext().starts_with("my-app-"),
         "bucket_name should start with prefix"
     );
 
@@ -998,7 +1007,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
     let mut resource_run2 = Resource::pending_with_provider("awscc", "s3.Bucket", None);
     resource_run2.set_attr(
         "bucket_name_prefix".to_string(),
-        Value::Concrete(ConcreteValue::String("my-app-".to_string())),
+        Value::Concrete(ConcreteValue::String("my-app-".into())),
     );
 
     // 2. resolve_names (resolve_attr_prefixes) - generates NEW random suffix
@@ -1052,20 +1061,18 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     let mut resource_run1 = Resource::pending_with_provider("awscc", "iam.role", None);
     resource_run1.set_attr(
         "role_name_prefix".to_string(),
-        Value::Concrete(ConcreteValue::String("carina-acc-test-".to_string())),
+        Value::Concrete(ConcreteValue::String("carina-acc-test-".into())),
     );
     resource_run1.set_attr(
         "path".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            "/carina/acceptance-test/".to_string(),
-        )),
+        Value::Concrete(ConcreteValue::String("/carina/acceptance-test/".into())),
     );
     resource_run1.set_attr(
         "assume_role_policy_document".to_string(),
         Value::Concrete(ConcreteValue::Map(
             vec![(
                 "version".to_string(),
-                Value::Concrete(ConcreteValue::String("2012-10-17".to_string())),
+                Value::Concrete(ConcreteValue::String("2012-10-17".into())),
             )]
             .into_iter()
             .collect(),
@@ -1095,15 +1102,13 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
             ),
             (
                 "path".to_string(),
-                Value::Concrete(ConcreteValue::String(
-                    "/carina/acceptance-test/".to_string(),
-                )),
+                Value::Concrete(ConcreteValue::String("/carina/acceptance-test/".into())),
             ),
         ]
         .into_iter()
         .collect(),
     )
-    .with_identifier(run1_role_name.as_str());
+    .with_identifier(run1_role_name.expose_plaintext());
 
     let resource_state = ResourceState::from_provider_state_for_resource_and_schema(
         &ResolvedResource::new(resources_run1[0].clone()),
@@ -1121,20 +1126,18 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     let mut resource_run2 = Resource::pending_with_provider("awscc", "iam.role", None);
     resource_run2.set_attr(
         "role_name_prefix".to_string(),
-        Value::Concrete(ConcreteValue::String("carina-acc-test-".to_string())),
+        Value::Concrete(ConcreteValue::String("carina-acc-test-".into())),
     );
     resource_run2.set_attr(
         "path".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            "/carina/acceptance-test/".to_string(),
-        )),
+        Value::Concrete(ConcreteValue::String("/carina/acceptance-test/".into())),
     );
     resource_run2.set_attr(
         "assume_role_policy_document".to_string(),
         Value::Concrete(ConcreteValue::Map(
             vec![(
                 "version".to_string(),
-                Value::Concrete(ConcreteValue::String("2012-10-17".to_string())),
+                Value::Concrete(ConcreteValue::String("2012-10-17".into())),
             )]
             .into_iter()
             .collect(),
@@ -1205,7 +1208,7 @@ async fn detect_drift_returns_none_when_no_drift() {
         id.clone(),
         HashMap::from([(
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+            Value::Concrete(ConcreteValue::String("my-bucket".into())),
         )]),
     )
     .with_identifier(identifier);
@@ -1235,7 +1238,7 @@ async fn detect_drift_returns_messages_when_drift_detected() {
         id.clone(),
         HashMap::from([(
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+            Value::Concrete(ConcreteValue::String("my-bucket".into())),
         )]),
     )
     .with_identifier(identifier);
@@ -1245,7 +1248,7 @@ async fn detect_drift_returns_messages_when_drift_detected() {
         id.clone(),
         HashMap::from([(
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("changed-bucket".to_string())),
+            Value::Concrete(ConcreteValue::String("changed-bucket".into())),
         )]),
     )
     .with_identifier(identifier);
@@ -1296,7 +1299,7 @@ fn orphaned_state_resource_produces_delete_effect() {
     let desired = vec![
         Resource::with_provider("aws", "s3.Bucket", "keep-bucket", None).with_attribute(
             "bucket",
-            Value::Concrete(ConcreteValue::String("keep-bucket".to_string())),
+            Value::Concrete(ConcreteValue::String("keep-bucket".into())),
         ),
     ];
 
@@ -1311,7 +1314,7 @@ fn orphaned_state_resource_produces_delete_effect() {
                 resource.id.clone(),
                 HashMap::from([(
                     "bucket".to_string(),
-                    Value::Concrete(ConcreteValue::String("keep-bucket".to_string())),
+                    Value::Concrete(ConcreteValue::String("keep-bucket".into())),
                 )]),
             )
             .with_identifier("keep-bucket"),
@@ -1477,7 +1480,8 @@ async fn lock_released_on_write_state_failure() {
             backend: &backend,
             lock: Some(&lock),
             schemas: &SchemaRegistry::new(),
-            export_params: Some(&[]),
+            export_params: Some(&checked_exports(&[])),
+            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -1620,7 +1624,8 @@ async fn finalize_apply_uses_write_state_locked() {
             backend: &backend,
             lock: Some(&lock),
             schemas: &SchemaRegistry::new(),
-            export_params: Some(&[]),
+            export_params: Some(&checked_exports(&[])),
+            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -1733,7 +1738,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
     let mut parsed = carina_core::parser::InferredFile {
         resources: vec![Resource::new("s3.Bucket", "keep-bucket").with_attribute(
             "bucket",
-            Value::Concrete(ConcreteValue::String("keep-bucket".to_string())),
+            Value::Concrete(ConcreteValue::String("keep-bucket".into())),
         )],
         ..carina_core::parser::InferredFile::default()
     };
@@ -1936,7 +1941,8 @@ async fn finalize_apply_without_lock_uses_write_state() {
             backend: &backend,
             lock: None, // No lock
             schemas: &SchemaRegistry::new(),
-            export_params: Some(&[]),
+            export_params: Some(&checked_exports(&[])),
+            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -2109,11 +2115,11 @@ fn refresh_false_uses_cached_state_from_state_file() {
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None);
     resource.set_attr(
         "bucket_name".to_string(),
-        Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+        Value::Concrete(ConcreteValue::String("my-bucket".into())),
     );
     resource.set_attr(
         "region".to_string(),
-        Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
+        Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
     );
 
     let desired = vec![resource];
@@ -2136,9 +2142,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
     );
     assert_eq!(
         cached_state.attributes.get("bucket_name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "my-bucket".to_string()
-        ))),
+        Some(&Value::Concrete(ConcreteValue::String("my-bucket".into()))),
         "Attributes should come from state file"
     );
 
@@ -2243,7 +2247,7 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "new-bucket", None);
     resource.set_attr(
         "bucket_name".to_string(),
-        Value::Concrete(ConcreteValue::String("new-bucket".to_string())),
+        Value::Concrete(ConcreteValue::String("new-bucket".into())),
     );
 
     let desired = vec![resource];
@@ -2294,7 +2298,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None)
         .with_attribute(
             "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         )
         .with_binding("my_vpc_binding");
     resource.directives.force_delete = true;
@@ -2310,7 +2314,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
         id.clone(),
         HashMap::from([(
             "cidr_block".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         )]),
     )
     .with_identifier(identifier);
@@ -2322,7 +2326,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
     let mut plan = Plan::new();
     plan.add(Effect::Import {
         id: carina_core::resource::ResolvedResourceId::new(id.clone()),
-        identifier: Value::Concrete(ConcreteValue::String(identifier.to_string())),
+        identifier: Value::Concrete(ConcreteValue::String(identifier.to_string().into())),
     });
 
     let saved = build_state_after_apply(ApplyStateSave {
@@ -2383,7 +2387,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
         "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
     resource.set_attr(
         "ipv4_netmask_length".to_string(),
@@ -2400,7 +2404,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
             identifier: Some("vpc-123".to_string()),
             attributes: HashMap::from([(
                 "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             )]),
             exists: true,
             dependency_bindings: BTreeSet::new(),
@@ -2482,7 +2486,7 @@ fn write_only_canonical_enum_state_roundtrip_converges_without_diff() {
             id,
             HashMap::from([(
                 "allocation_id".to_string(),
-                Value::Concrete(ConcreteValue::String("eipalloc-123".to_string())),
+                Value::Concrete(ConcreteValue::String("eipalloc-123".into())),
             )]),
         ),
     )]);
@@ -2544,7 +2548,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
         "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/24".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/24".into())),
     );
     resource.set_attr(
         "ipv4_netmask_length".to_string(),
@@ -2561,7 +2565,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
             identifier: Some("vpc-123".to_string()),
             attributes: HashMap::from([(
                 "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/24".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/24".into())),
             )]),
             exists: true,
             dependency_bindings: BTreeSet::new(),
@@ -2621,13 +2625,13 @@ fn plan_file_serialization_redacts_secrets() {
 
     // Build a plan with secrets in resources, states, and effects
     let secret_password = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("super-secret-pw".to_string()),
+        ConcreteValue::String("super-secret-pw".into()),
     ))));
 
     let resource_with_secret = Resource::with_provider("awscc", "rds.db_instance", "my-db", None)
         .with_attribute(
             "name",
-            Value::Concrete(ConcreteValue::String("my-db".to_string())),
+            Value::Concrete(ConcreteValue::String("my-db".into())),
         )
         .with_attribute("master_password", secret_password.clone());
 
@@ -2637,7 +2641,7 @@ fn plan_file_serialization_redacts_secrets() {
     let mut state_attrs = HashMap::new();
     state_attrs.insert(
         "name".to_string(),
-        Value::Concrete(ConcreteValue::String("my-db".to_string())),
+        Value::Concrete(ConcreteValue::String("my-db".into())),
     );
     state_attrs.insert("master_password".to_string(), secret_password.clone());
     let state_with_secret = State::existing(
@@ -2840,10 +2844,11 @@ async fn persist_exports_only_clears_state_exports_when_params_empty() {
         &[],
         &[],
         &[],
-        &[],
+        &checked_exports(&[]),
         &carina_core::schema::SchemaRegistry::new(),
         &[],
         &std::collections::HashMap::new(),
+        &ProviderContext::default(),
     )
     .await;
 
@@ -2873,7 +2878,7 @@ async fn persist_exports_only_writes_state_with_new_exports() {
         name: "account_id".to_string(),
         type_expr: TypeExpr::Unknown,
         value: Some(Value::Concrete(ConcreteValue::String(
-            "123456789012".to_string(),
+            "123456789012".into(),
         ))),
     }];
 
@@ -2884,10 +2889,11 @@ async fn persist_exports_only_writes_state_with_new_exports() {
         &[],
         &[],
         &[],
-        &export_params,
+        &checked_exports(&export_params),
         &carina_core::schema::SchemaRegistry::new(),
         &[],
         &std::collections::HashMap::new(),
+        &ProviderContext::default(),
     )
     .await;
 
@@ -2931,10 +2937,11 @@ async fn persist_exports_only_saves_state_then_errors_for_unresolved_export() {
         &[],
         &[],
         &[],
-        &export_params,
+        &checked_exports(&export_params),
         &carina_core::schema::SchemaRegistry::new(),
         &[],
         &HashMap::new(),
+        &ProviderContext::default(),
     )
     .await;
 
@@ -3005,7 +3012,8 @@ async fn finalize_apply_clears_state_exports_when_params_empty() {
             backend: &backend,
             lock: Some(&lock),
             schemas: &SchemaRegistry::new(),
-            export_params: Some(&[]),
+            export_params: Some(&checked_exports(&[])),
+            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -3071,6 +3079,7 @@ async fn finalize_apply_preserves_state_exports_when_params_none() {
             lock: Some(&lock),
             schemas: &SchemaRegistry::new(),
             export_params: None,
+            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -3111,7 +3120,7 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     let mut a_attrs = HashMap::new();
     a_attrs.insert(
         "id".to_string(),
-        Value::Concrete(ConcreteValue::String("a-id".to_string())),
+        Value::Concrete(ConcreteValue::String("a-id".into())),
     );
     let a_state = State::existing(a_id.clone(), a_attrs).with_identifier("a-id");
 
@@ -3158,7 +3167,8 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
             backend: &backend,
             lock: Some(&lock),
             schemas: &SchemaRegistry::new(),
-            export_params: Some(&export_params),
+            export_params: Some(&checked_exports(&export_params)),
+            provider_context: &ProviderContext::default(),
             wait_aliases: &[],
             pre_resolve_compositions: &[],
         },
@@ -3196,5 +3206,81 @@ async fn finalize_apply_persists_successful_state_when_one_export_is_unresolved(
     assert_eq!(
         state.serial, 1,
         "writeback should advance serial after persisting partial apply state"
+    );
+}
+
+#[tokio::test]
+async fn finalize_apply_persists_resource_state_before_reporting_export_error() {
+    use carina_core::parser::{InferredExportParam, TypeExpr};
+
+    let captured = Arc::new(Mutex::new(None));
+    let backend = CapturingBackend {
+        captured: captured.clone(),
+    };
+    let lock = LockInfo::new("apply");
+
+    let mut resource = Resource::with_provider("mock", "test.resource", "created", None);
+    resource.binding = Some("created".to_string());
+    let sorted_resources = vec![resolved(resource.clone())];
+    let resource_id = resource.id.clone();
+    let state = State::existing(
+        resource_id.clone(),
+        HashMap::from([(
+            "name".to_string(),
+            Value::Concrete(ConcreteValue::String("created".into())),
+        )]),
+    )
+    .with_identifier("created-id");
+    let result = ApplyResult {
+        success_count: 1,
+        failure_count: 0,
+        partial_count: 0,
+        partial_diagnostics: Vec::new(),
+        skip_count: 0,
+        applied_states: HashMap::from([(resource_id.clone(), state.clone())]),
+        runtime_synthesized_resources: Vec::new(),
+        permanent_name_overrides: HashMap::new(),
+        successfully_deleted: HashSet::new(),
+        current_states: HashMap::from([(resource_id, state)]),
+        bindings: carina_core::binding_index::ResolvedBindings::default(),
+        failed_refreshes: HashSet::new(),
+    };
+    let export_params = vec![InferredExportParam {
+        name: "broken".to_string(),
+        type_expr: TypeExpr::Float,
+        value: Some(Value::Concrete(ConcreteValue::Float(f64::NAN))),
+    }];
+
+    let error = finalize_apply(
+        FinalizeApplyInput {
+            result: &result,
+            state_file: Some(StateFile::new()),
+            sorted_resources: &sorted_resources,
+            data_sources: &[],
+            current_states: &result.current_states,
+            plan: &Plan::new(),
+            backend: &backend,
+            lock: Some(&lock),
+            schemas: &SchemaRegistry::new(),
+            export_params: Some(&checked_exports(&export_params)),
+            provider_context: &ProviderContext::default(),
+            wait_aliases: &[],
+            pre_resolve_compositions: &[],
+        },
+        StatePersistence::Normal,
+    )
+    .await
+    .expect_err("non-finite export must still be reported");
+    assert!(error.to_string().contains("non-finite"), "{error}");
+
+    let written = captured.lock().unwrap();
+    let state = written
+        .as_ref()
+        .expect("successful resource state must be persisted despite the export error");
+    assert!(
+        state
+            .find_resource("mock", "test.resource", "created")
+            .is_some(),
+        "created resource missing from persisted state: {state:#?}",
     );
 }

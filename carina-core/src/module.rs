@@ -121,7 +121,8 @@ impl DependencyGraph {
 fn format_value(value: &Value) -> String {
     match value {
         Value::Concrete(ConcreteValue::String(s)) => {
-            let (value, marker) = crate::utils::truncate_chars_for_display(s, 47);
+            let (value, marker) =
+                crate::utils::truncate_chars_for_display(s.expose_plaintext(), 47);
             format!("{}{marker}", display_string_literal(&value))
         }
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
@@ -156,7 +157,10 @@ fn format_value(value: &Value) -> String {
             if items.is_empty() {
                 "[]".to_string()
             } else if items.len() <= 3 {
-                let strs: Vec<_> = items.iter().map(|s| display_string_literal(s)).collect();
+                let strs: Vec<_> = items
+                    .iter()
+                    .map(|s| display_string_literal(s.expose_plaintext()))
+                    .collect();
                 format!("[{}]", strs.join(", "))
             } else {
                 format!("[{} items]", items.len())
@@ -178,7 +182,9 @@ fn format_value(value: &Value) -> String {
             let inner: String = parts
                 .iter()
                 .map(|p| match p {
-                    InterpolationPart::Literal(s) => display_double_quoted_literal_part(s),
+                    InterpolationPart::Literal(s) => {
+                        display_double_quoted_literal_part(s.expose_plaintext())
+                    }
                     InterpolationPart::Expr(v) => format!("${{{}}}", format_value(v)),
                 })
                 .collect();
@@ -379,7 +385,9 @@ impl RootConfigSignature {
                 .attributes
                 .get("_type")
                 .and_then(|v| match v {
-                    Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
+                    Value::Concrete(ConcreteValue::String(s)) => {
+                        Some(s.expose_plaintext().to_owned())
+                    }
                     _ => None,
                 })
                 .unwrap_or_else(|| resource.id.resource_type.clone());
@@ -850,7 +858,9 @@ impl ModuleSignature {
                 .attributes
                 .get("_type")
                 .and_then(|v| match v {
-                    Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
+                    Value::Concrete(ConcreteValue::String(s)) => {
+                        Some(s.expose_plaintext().to_owned())
+                    }
                     _ => None,
                 })
                 .unwrap_or_else(|| resource.id.resource_type.clone());
@@ -1342,19 +1352,19 @@ mod tests {
     #[test]
     fn format_value_uses_canonical_string_literals() {
         assert_eq!(
-            format_value(&Value::Concrete(ConcreteValue::String("hello".to_string()))),
+            format_value(&Value::Concrete(ConcreteValue::String("hello".into()))),
             "'hello'"
         );
         assert_eq!(
             format_value(&Value::Concrete(ConcreteValue::StringList(vec![
-                "hello".to_string(),
-                "it's".to_string(),
+                "hello".into(),
+                "it's".into(),
             ]))),
             r#"['hello', "it's"]"#
         );
         assert_eq!(
             format_value(&Value::Deferred(DeferredValue::Interpolation(vec![
-                crate::resource::InterpolationPart::Literal("prefix-".to_string()),
+                crate::resource::InterpolationPart::Literal("prefix-".into()),
                 crate::resource::InterpolationPart::Expr(Value::Deferred(
                     DeferredValue::BindingRef {
                         binding: "name".to_string(),
@@ -1365,7 +1375,7 @@ mod tests {
         );
         assert_eq!(
             format_value(&Value::Deferred(DeferredValue::Interpolation(vec![
-                crate::resource::InterpolationPart::Literal(r#"prefix-${literal}""#.to_string(),),
+                crate::resource::InterpolationPart::Literal(r#"prefix-${literal}""#.into(),),
                 crate::resource::InterpolationPart::Expr(Value::Deferred(
                     DeferredValue::BindingRef {
                         binding: "name".to_string(),
@@ -1382,7 +1392,9 @@ mod tests {
         assert_eq!(value.chars().count(), 51);
 
         assert_eq!(
-            format_value(&Value::Concrete(ConcreteValue::String(value.clone()))),
+            format_value(&Value::Concrete(ConcreteValue::String(
+                value.clone().into()
+            ))),
             format!("'{}あ'…", "a".repeat(46))
         );
         assert_eq!(

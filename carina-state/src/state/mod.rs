@@ -555,7 +555,7 @@ impl StateFile {
                 if let Some(ref binding) = rs.binding {
                     attrs.insert(
                         "_binding".to_string(),
-                        Value::Concrete(ConcreteValue::String(binding.clone())),
+                        Value::Concrete(ConcreteValue::String(binding.clone().into())),
                     );
                 }
                 let state = State {

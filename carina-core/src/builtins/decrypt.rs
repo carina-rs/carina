@@ -5,7 +5,7 @@
 //! before parsing begins.
 
 use crate::parser::ProviderContext;
-use crate::resource::{ConcreteValue, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Value, ValueString};
 
 use super::value_type_name;
 
@@ -36,14 +36,28 @@ pub(crate) fn builtin_decrypt_with_config(
          Ensure a provider (e.g., awscc) is configured and credentials are available."
             .to_string()
     })?;
-    let plaintext = decryptor(ciphertext, key)?;
-    Ok(Value::Concrete(ConcreteValue::String(plaintext)))
+    let plaintext = decryptor(
+        ciphertext.expose_plaintext(),
+        key.map(ValueString::expose_plaintext),
+    )
+    .map_err(|error| {
+        if ciphertext.is_diagnostic_sensitive()
+            || key.is_some_and(ValueString::is_diagnostic_sensitive)
+        {
+            "decrypt() failed for a sensitive value".to_string()
+        } else {
+            error
+        }
+    })?;
+    Ok(Value::Deferred(DeferredValue::Secret(Box::new(
+        Value::Concrete(ConcreteValue::String(plaintext.into())),
+    ))))
 }
 
 /// Parse and validate arguments for `decrypt()`.
 ///
 /// Returns `(ciphertext, optional_key)` or an error.
-fn parse_decrypt_args(args: &[Value]) -> Result<(&str, Option<&str>), String> {
+fn parse_decrypt_args(args: &[Value]) -> Result<(&ValueString, Option<&ValueString>), String> {
     if args.is_empty() || args.len() > 2 {
         return Err(format!(
             "decrypt() expects 1 or 2 arguments (ciphertext[, key]), got {}",
@@ -52,7 +66,7 @@ fn parse_decrypt_args(args: &[Value]) -> Result<(&str, Option<&str>), String> {
     }
 
     let ciphertext = match &args[0] {
-        Value::Concrete(ConcreteValue::String(s)) => s.as_str(),
+        Value::Concrete(ConcreteValue::String(s)) => s,
         other => {
             return Err(format!(
                 "decrypt() first argument must be a string (ciphertext), got {}",
@@ -63,7 +77,7 @@ fn parse_decrypt_args(args: &[Value]) -> Result<(&str, Option<&str>), String> {
 
     let key = if args.len() == 2 {
         match &args[1] {
-            Value::Concrete(ConcreteValue::String(s)) => Some(s.as_str()),
+            Value::Concrete(ConcreteValue::String(s)) => Some(s),
             other => {
                 return Err(format!(
                     "decrypt() second argument must be a string (key), got {}",
@@ -104,13 +118,13 @@ mod tests {
             Ok(format!("decrypted:{ciphertext}"))
         }));
 
-        let args = vec![Value::Concrete(ConcreteValue::String(
-            "AQICAHh".to_string(),
-        ))];
+        let args = vec![Value::Concrete(ConcreteValue::String("AQICAHh".into()))];
         let result = evaluate_builtin_with_config("decrypt", &args, &config).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("decrypted:AQICAHh".to_string()))
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("decrypted:AQICAHh".into())
+            ))))
         );
     }
 
@@ -122,15 +136,15 @@ mod tests {
         }));
 
         let args = vec![
-            Value::Concrete(ConcreteValue::String("AQICAHh".to_string())),
-            Value::Concrete(ConcreteValue::String("alias/my-key".to_string())),
+            Value::Concrete(ConcreteValue::String("AQICAHh".into())),
+            Value::Concrete(ConcreteValue::String("alias/my-key".into())),
         ];
         let result = evaluate_builtin_with_config("decrypt", &args, &config).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String(
-                "decrypted:AQICAHh:key=alias/my-key".to_string()
-            ))
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("decrypted:AQICAHh:key=alias/my-key".into())
+            ))))
         );
     }
 
@@ -138,9 +152,7 @@ mod tests {
     fn decrypt_without_decryptor_returns_error() {
         let config = ProviderContext::default();
 
-        let args = vec![Value::Concrete(ConcreteValue::String(
-            "AQICAHh".to_string(),
-        ))];
+        let args = vec![Value::Concrete(ConcreteValue::String("AQICAHh".into()))];
         let result = evaluate_builtin_with_config("decrypt", &args, &config);
         assert!(result.is_err());
         assert!(
@@ -152,9 +164,7 @@ mod tests {
 
     #[test]
     fn decrypt_fallback_without_config_returns_error() {
-        let args = vec![Value::Concrete(ConcreteValue::String(
-            "AQICAHh".to_string(),
-        ))];
+        let args = vec![Value::Concrete(ConcreteValue::String("AQICAHh".into()))];
         let result = builtin_decrypt(&args);
         assert!(result.is_err());
         assert!(
@@ -177,9 +187,9 @@ mod tests {
     fn decrypt_error_on_too_many_args() {
         let config = ProviderContext::default();
         let args = vec![
-            Value::Concrete(ConcreteValue::String("a".to_string())),
-            Value::Concrete(ConcreteValue::String("b".to_string())),
-            Value::Concrete(ConcreteValue::String("c".to_string())),
+            Value::Concrete(ConcreteValue::String("a".into())),
+            Value::Concrete(ConcreteValue::String("b".into())),
+            Value::Concrete(ConcreteValue::String("c".into())),
         ];
         let result = evaluate_builtin_with_config("decrypt", &args, &config);
         assert!(result.is_err());
@@ -203,7 +213,7 @@ mod tests {
     fn decrypt_error_on_non_string_key() {
         let config = ProviderContext::default();
         let args = vec![
-            Value::Concrete(ConcreteValue::String("cipher".to_string())),
+            Value::Concrete(ConcreteValue::String("cipher".into())),
             Value::Concrete(ConcreteValue::Int(42)),
         ];
         let result = evaluate_builtin_with_config("decrypt", &args, &config);
@@ -221,18 +231,21 @@ mod tests {
             Ok("my-secret-password".to_string())
         }));
 
-        // decrypt() then wrap with secret()
+        // decrypt() is already secret; wrapping it again is idempotent.
         let decrypted = evaluate_builtin_with_config(
             "decrypt",
-            &[Value::Concrete(ConcreteValue::String("cipher".to_string()))],
+            &[Value::Concrete(ConcreteValue::String("cipher".into()))],
             &config,
         )
         .unwrap();
-        let secret = evaluate_builtin_with_config("secret", &[decrypted], &config).unwrap();
+        let secret =
+            evaluate_builtin_with_config("secret", std::slice::from_ref(&decrypted), &config)
+                .unwrap();
+        assert_eq!(secret, decrypted);
         assert_eq!(
             secret,
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("my-secret-password".to_string())
+                ConcreteValue::String("my-secret-password".into())
             ))))
         );
     }

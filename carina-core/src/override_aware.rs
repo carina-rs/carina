@@ -366,7 +366,7 @@ fn resolve_resources(
 
 fn concrete_string(value: &Value) -> Option<&str> {
     match value {
-        Value::Concrete(ConcreteValue::String(value)) => Some(value.as_str()),
+        Value::Concrete(ConcreteValue::String(value)) => Some(value.expose_plaintext()),
         _ => None,
     }
 }
@@ -377,7 +377,7 @@ fn apply_override(
     attribute: &str,
     override_: &NameOverride,
 ) {
-    let value = Value::Concrete(ConcreteValue::String(override_.temp_value.clone()));
+    let value = Value::Concrete(ConcreteValue::String(override_.temp_value.clone().into()));
     resource
         .attributes
         .insert(attribute.to_string(), value.clone());
@@ -399,7 +399,7 @@ mod tests {
     use crate::resource::{AccessPath, DeferredValue, PlanInputState};
 
     fn string(value: impl Into<String>) -> Value {
-        Value::Concrete(ConcreteValue::String(value.into()))
+        Value::Concrete(ConcreteValue::String(value.into().into()))
     }
 
     fn resource(binding: &'static str, name: Value) -> Resource {

@@ -170,7 +170,7 @@ impl BackendLock {
             .map(|(k, v)| {
                 let value = match v {
                     serde_json::Value::String(s) => {
-                        Value::Concrete(ConcreteValue::String(s.clone()))
+                        Value::Concrete(ConcreteValue::String(s.clone().into()))
                     }
                     serde_json::Value::Bool(b) => Value::Concrete(ConcreteValue::Bool(*b)),
                     serde_json::Value::Number(n) => Value::Concrete(ConcreteValue::Int(
@@ -182,7 +182,7 @@ impl BackendLock {
                     // backend reads); keep the key so the address shape
                     // is preserved rather than silently shrinking it.
                     serde_json::Value::Null => Value::Concrete(ConcreteValue::Bool(false)),
-                    other => Value::Concrete(ConcreteValue::String(other.to_string())),
+                    other => Value::Concrete(ConcreteValue::String(other.to_string().into())),
                 };
                 (k.clone(), value)
             })
@@ -234,7 +234,9 @@ fn value_to_json(
     use carina_core::resource::{ConcreteValue, DeferredValue, Value};
     use carina_core::value::{SerializationContext, SerializationError};
     match value {
-        Value::Concrete(ConcreteValue::String(s)) => Ok(serde_json::Value::String(s.clone())),
+        Value::Concrete(ConcreteValue::String(s)) => {
+            Ok(serde_json::Value::String(s.expose_plaintext().to_owned()))
+        }
         Value::Concrete(ConcreteValue::Bool(b)) => Ok(serde_json::Value::Bool(*b)),
         Value::Concrete(ConcreteValue::Int(i)) => Ok(serde_json::Value::Number((*i).into())),
         Value::Concrete(ConcreteValue::Duration(d)) => {
@@ -260,11 +262,11 @@ mod tests {
         let mut attributes = HashMap::new();
         attributes.insert(
             "bucket".to_string(),
-            Value::Concrete(ConcreteValue::String(bucket.to_string())),
+            Value::Concrete(ConcreteValue::String(bucket.to_string().into())),
         );
         attributes.insert(
             "region".to_string(),
-            Value::Concrete(ConcreteValue::String(region.to_string())),
+            Value::Concrete(ConcreteValue::String(region.to_string().into())),
         );
         BackendConfig {
             backend_type: "s3".to_string(),
@@ -392,7 +394,7 @@ mod tests {
         let mut attributes = HashMap::new();
         attributes.insert(
             "bucket".to_string(),
-            Value::Concrete(ConcreteValue::String("b".to_string())),
+            Value::Concrete(ConcreteValue::String("b".into())),
         );
         attributes.insert(
             "use_lockfile".to_string(),
@@ -433,7 +435,7 @@ mod tests {
         let mut attributes = HashMap::new();
         attributes.insert(
             "bucket".to_string(),
-            Value::Concrete(ConcreteValue::String("real-bucket".to_string())),
+            Value::Concrete(ConcreteValue::String("real-bucket".into())),
         );
         attributes.insert(
             "ttl".to_string(),

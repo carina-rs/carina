@@ -111,7 +111,8 @@ pub struct FixturePlan {
     pub moved_origins: HashMap<ResourceId, ResourceId>,
     pub deferred_for_expressions: Vec<carina_core::parser::DeferredForExpression>,
     pub export_params: Vec<carina_core::parser::InferredExportParam>,
-    pub resolved_export_params: Vec<carina_core::parser::InferredExportParam>,
+    pub resolved_export_params:
+        carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam>,
     /// Per-resource user-authoring trees lifted from the fixture's
     /// `carina.state.json`. Forwarded to `format_plan` so server-side
     /// default fields the user never wrote do not surface in plan
@@ -427,7 +428,12 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
             moved_origins: HashMap::new(),
             deferred_for_expressions: parsed.deferred_for_expressions,
             export_params: parsed.export_params,
-            resolved_export_params: Vec::new(),
+            resolved_export_params: carina_core::validation::check_export_values_pre_apply(
+                &[],
+                &carina_core::binding_index::ResolvedBindings::default(),
+                &carina_core::parser::ProviderContext::default(),
+            )
+            .expect("empty exports are checked"),
             prev_explicit,
             expansion_trace: parsed.expansion_trace,
         };
@@ -546,15 +552,20 @@ pub fn build_plan_from_fixture_path(fixture_path: &Path) -> FixturePlan {
         .iter()
         .map(carina_core::binding_index::WaitAliasSpec::from)
         .collect();
-    let resolved_export_params = crate::commands::plan::resolve_export_values_for_display(
-        &parsed.export_params,
-        override_aware_resources.resources(),
-        &parsed.compositions,
-        &data_sources_for_plan,
-        &current_states,
-        wiring.schemas(),
-        &export_wait_aliases,
-    );
+    let provider_context = carina_core::parser::ProviderContext::default();
+    let resolved_export_params = crate::commands::plan::check_exports_pre_apply(
+        crate::commands::plan::CheckExportsPreApplyInput {
+            export_params: &parsed.export_params,
+            resources: override_aware_resources.resources(),
+            compositions: &parsed.compositions,
+            data_sources: &data_sources_for_plan,
+            current_states: &current_states,
+            schemas: wiring.schemas(),
+            wait_aliases: &export_wait_aliases,
+            provider_context: &provider_context,
+        },
+    )
+    .expect("fixture exports must resolve without secrets");
 
     FixturePlan {
         plan,

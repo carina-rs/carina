@@ -785,7 +785,7 @@ mod tests {
         let mut attributes = HashMap::new();
         attributes.insert(
             "path".to_string(),
-            Value::Concrete(ConcreteValue::String("custom.state.json".to_string())),
+            Value::Concrete(ConcreteValue::String("custom.state.json".into())),
         );
 
         let config = BackendConfig {
@@ -812,7 +812,7 @@ mod tests {
         attributes.insert(
             "path".to_string(),
             Value::Concrete(ConcreteValue::String(
-                state_path.to_string_lossy().into_owned(),
+                state_path.to_string_lossy().into_owned().into(),
             )),
         );
 

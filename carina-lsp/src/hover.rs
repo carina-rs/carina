@@ -50,7 +50,10 @@ fn find_use_import_path(
 /// Format a Value for hover display
 fn format_value_for_hover(value: &Value) -> String {
     match value {
-        Value::Concrete(ConcreteValue::String(s)) => display_string_literal(s),
+        Value::Concrete(ConcreteValue::String(s)) => s
+            .diagnostic_literal()
+            .map(display_string_literal)
+            .unwrap_or_else(|| "string".to_string()),
         Value::Concrete(ConcreteValue::Int(n)) => n.to_string(),
         Value::Concrete(ConcreteValue::Float(f)) => f.to_string(),
         Value::Concrete(ConcreteValue::Bool(b)) => b.to_string(),
@@ -814,10 +817,10 @@ mod tests {
 
     #[test]
     fn format_value_for_hover_uses_canonical_string_literals() {
-        let value = Value::Concrete(ConcreteValue::String(r#"say "hi""#.to_string()));
+        let value = Value::Concrete(ConcreteValue::String(r#"say "hi""#.into()));
         assert_eq!(format_value_for_hover(&value), r#"'say "hi"'"#);
 
-        let value = Value::Concrete(ConcreteValue::String("${value}".to_string()));
+        let value = Value::Concrete(ConcreteValue::String("${value}".into()));
         assert_eq!(format_value_for_hover(&value), r#""\${value}""#);
     }
 

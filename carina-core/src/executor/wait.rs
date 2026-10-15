@@ -633,7 +633,7 @@ mod tests {
         let mut attrs = HashMap::new();
         attrs.insert(
             "status".to_string(),
-            Value::Concrete(ConcreteValue::String(status.to_string())),
+            Value::Concrete(ConcreteValue::String(status.to_string().into())),
         );
         State::existing(ResourceId::with_identity("acm.Certificate", "cert"), attrs)
     }
@@ -641,7 +641,7 @@ mod tests {
     fn equals_status(value: &str) -> WaitPredicate {
         WaitPredicate::Equals {
             attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String(value.to_string())),
+            value: Value::Concrete(ConcreteValue::String(value.to_string().into())),
         }
     }
 
@@ -936,9 +936,7 @@ mod tests {
         };
         assert_eq!(
             state.attributes.get("status"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "ISSUED".to_string()
-            )))
+            Some(&Value::Concrete(ConcreteValue::String("ISSUED".into())))
         );
         assert_eq!(provider.read_count(), 1);
     }
@@ -1010,7 +1008,7 @@ mod tests {
         assert_eq!(
             last_attrs.get("status"),
             Some(&Value::Concrete(ConcreteValue::String(
-                "PENDING_VALIDATION".to_string()
+                "PENDING_VALIDATION".into()
             )))
         );
     }
@@ -1022,12 +1020,12 @@ mod tests {
             last_attrs: HashMap::from([
                 (
                     "status".to_string(),
-                    Value::Concrete(ConcreteValue::String("pending".to_string())),
+                    Value::Concrete(ConcreteValue::String("pending".into())),
                 ),
                 (
                     "arn".to_string(),
                     Value::Concrete(ConcreteValue::String(
-                        "arn:aws:acm:1:certificate/abc".to_string(),
+                        "arn:aws:acm:1:certificate/abc".into(),
                     )),
                 ),
             ]),

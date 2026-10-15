@@ -729,7 +729,7 @@ pub enum Subscript {
     /// Integer subscript: `[0]`. Valid against `list(_)` exports.
     Int { index: i64 },
     /// String subscript: `["k"]`. Valid against `map(_)` exports.
-    Str { key: String },
+    Str { key: ValueString },
 }
 
 impl Subscript {
@@ -743,8 +743,26 @@ impl Subscript {
             Subscript::Int { index } => {
                 let _ = write!(out, "[{}]", index);
             }
+            Subscript::Str { key } => match key.diagnostic_literal() {
+                Some(key) => {
+                    let _ = write!(out, "[{key:?}]");
+                }
+                None => out.push_str("[value from env()]"),
+            },
+        }
+    }
+
+    /// Append the runtime path spelling. This is reserved for evaluation,
+    /// identity, serialization, and provider transport; diagnostics must use
+    /// [`Self::append_to_dot_string`] so an `env()`-derived key stays marked.
+    pub fn append_to_plaintext_dot_string(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        match self {
+            Subscript::Int { index } => {
+                let _ = write!(out, "[{index}]");
+            }
             Subscript::Str { key } => {
-                let _ = write!(out, "[{:?}]", key);
+                let _ = write!(out, "[{:?}]", key.expose_plaintext());
             }
         }
     }
@@ -781,7 +799,7 @@ pub enum PathSegment {
 /// both.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AccessPath {
-    binding: String,
+    binding: ValueString,
     attribute: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     segments: Vec<PathSegment>,
@@ -793,7 +811,7 @@ impl AccessPath {
     /// `attribute` must be non-empty. A bare-binding reference (no
     /// `.attr`) is represented by [`Value::BindingRef`], not by an
     /// `AccessPath` with an empty attribute.
-    pub fn new(binding: impl Into<String>, attribute: impl Into<String>) -> Self {
+    pub fn new(binding: impl Into<ValueString>, attribute: impl Into<String>) -> Self {
         Self::with_segments(binding, attribute, Vec::new())
     }
 
@@ -803,7 +821,7 @@ impl AccessPath {
     ///
     /// `attribute` must be non-empty. See [`AccessPath::new`].
     pub fn with_fields(
-        binding: impl Into<String>,
+        binding: impl Into<ValueString>,
         attribute: impl Into<String>,
         field_path: Vec<String>,
     ) -> Self {
@@ -820,7 +838,7 @@ impl AccessPath {
     ///
     /// `attribute` must be non-empty. See [`AccessPath::new`].
     pub fn with_fields_and_subscripts(
-        binding: impl Into<String>,
+        binding: impl Into<ValueString>,
         attribute: impl Into<String>,
         field_path: Vec<String>,
         subscripts: Vec<Subscript>,
@@ -847,7 +865,7 @@ impl AccessPath {
     ///
     /// `attribute` must be non-empty. See [`AccessPath::new`].
     pub fn with_segments(
-        binding: impl Into<String>,
+        binding: impl Into<ValueString>,
         attribute: impl Into<String>,
         segments: Vec<PathSegment>,
     ) -> Self {
@@ -868,7 +886,7 @@ impl AccessPath {
 
     /// Returns the binding name.
     pub fn binding(&self) -> &str {
-        &self.binding
+        self.binding.expose_plaintext()
     }
 
     /// Returns the attribute name.
@@ -946,6 +964,17 @@ impl AccessPath {
     /// Returns the path in source-form: `binding.attribute` followed by
     /// `.field…[idx]…` segments as written.
     pub fn to_dot_string(&self) -> String {
+        self.render_dot_string(false)
+    }
+
+    /// Return the runtime path spelling, including plaintext string
+    /// subscripts. Callers must use this only as a data channel, never to
+    /// construct an error, warning, or log message.
+    pub fn to_plaintext_dot_string(&self) -> String {
+        self.render_dot_string(true)
+    }
+
+    fn render_dot_string(&self, expose_plaintext: bool) -> String {
         let segment_len: usize = self
             .segments
             .iter()
@@ -954,9 +983,15 @@ impl AccessPath {
                 PathSegment::Subscript { .. } => 4, // rough: `[xx]`
             })
             .sum();
-        let mut out =
-            String::with_capacity(self.binding.len() + self.attribute.len() + 1 + segment_len);
-        out.push_str(&self.binding);
+        let binding = if expose_plaintext {
+            self.binding.expose_plaintext()
+        } else {
+            self.binding
+                .diagnostic_literal()
+                .unwrap_or("value from env()")
+        };
+        let mut out = String::with_capacity(binding.len() + self.attribute.len() + 1 + segment_len);
+        out.push_str(binding);
         out.push('.');
         out.push_str(&self.attribute);
         for segment in &self.segments {
@@ -966,7 +1001,11 @@ impl AccessPath {
                     out.push_str(name);
                 }
                 PathSegment::Subscript { index } => {
-                    index.append_to_dot_string(&mut out);
+                    if expose_plaintext {
+                        index.append_to_plaintext_dot_string(&mut out);
+                    } else {
+                        index.append_to_dot_string(&mut out);
+                    }
                 }
             }
         }
@@ -1005,6 +1044,13 @@ impl ReferencePath {
             Self::Binding(binding) => binding.clone(),
         }
     }
+
+    pub fn to_plaintext_dot_string(&self) -> String {
+        match self {
+            Self::Access(path) => path.to_plaintext_dot_string(),
+            Self::Binding(binding) => binding.clone(),
+        }
+    }
 }
 
 impl std::fmt::Display for ReferencePath {
@@ -1034,6 +1080,13 @@ impl<'a> ReferencePathRef<'a> {
     pub fn to_dot_string(self) -> String {
         match self {
             Self::Access(path) => path.to_dot_string(),
+            Self::Binding(binding) => binding.to_string(),
+        }
+    }
+
+    pub fn to_plaintext_dot_string(self) -> String {
+        match self {
+            Self::Access(path) => path.to_plaintext_dot_string(),
             Self::Binding(binding) => binding.to_string(),
         }
     }
@@ -1135,7 +1188,7 @@ pub fn navigate_value_path(root: &Value, path: &AccessPath) -> Option<Value> {
                 PathSegment::Subscript {
                     index: Subscript::Str { key },
                 },
-            ) => map.get(key)?.clone(),
+            ) => map.get(key.expose_plaintext())?.clone(),
             _ => return None,
         };
         current = rewrap_secrets(next, secret_depth);
@@ -1187,11 +1240,165 @@ pub enum Value {
     Deferred(DeferredValue),
 }
 
+/// A runtime string together with provenance used exclusively to make
+/// diagnostic rendering safe.
+///
+/// The provenance bit is deliberately absent from equality, hashing, and the
+/// serde representation. An `env()` result therefore behaves exactly like an
+/// authored string in evaluation, plans, state, diffs, and provider payloads,
+/// while diagnostic code cannot accidentally format its plaintext. There is
+/// deliberately no `Display` implementation; `Debug` is redacted, and code
+/// that genuinely needs the bytes at an execution or serialization boundary
+/// must opt in through [`Self::expose_plaintext`].
+#[derive(Clone)]
+pub struct ValueString {
+    plaintext: String,
+    diagnostic_sensitive: bool,
+}
+
+impl ValueString {
+    /// Construct an ordinary authored/runtime string.
+    pub fn plain(plaintext: impl Into<String>) -> Self {
+        Self {
+            plaintext: plaintext.into(),
+            diagnostic_sensitive: false,
+        }
+    }
+
+    /// Construct a string whose contents must never be included in a
+    /// diagnostic. Kept crate-private so only trusted value producers (`env()`
+    /// and the builtin dispatcher while computing through `Secret`) can attach
+    /// the provenance mark.
+    pub(crate) fn diagnostic_sensitive(plaintext: impl Into<String>) -> Self {
+        Self {
+            plaintext: plaintext.into(),
+            diagnostic_sensitive: true,
+        }
+    }
+
+    /// Expose the runtime bytes for evaluation, plan/state serialization, or
+    /// provider transport. Do not use this method to build diagnostics.
+    pub fn expose_plaintext(&self) -> &str {
+        &self.plaintext
+    }
+
+    /// Consume this value at an evaluation/serialization boundary.
+    pub fn into_plaintext(self) -> String {
+        self.plaintext
+    }
+
+    pub fn is_diagnostic_sensitive(&self) -> bool {
+        self.diagnostic_sensitive
+    }
+
+    /// Return a diagnostic-safe authored literal, or `None` when only the
+    /// runtime type may be rendered.
+    pub fn diagnostic_literal(&self) -> Option<&str> {
+        (!self.diagnostic_sensitive).then_some(self.plaintext.as_str())
+    }
+
+    /// Build a derived string and inherit diagnostic sensitivity from every
+    /// string input that contributed to it.
+    pub(crate) fn derived_from<'a>(
+        plaintext: impl Into<String>,
+        sources: impl IntoIterator<Item = &'a Self>,
+    ) -> Self {
+        Self {
+            plaintext: plaintext.into(),
+            diagnostic_sensitive: sources
+                .into_iter()
+                .any(|source| source.diagnostic_sensitive),
+        }
+    }
+
+    pub(crate) fn push_derived(&mut self, other: &Self) {
+        self.plaintext.push_str(other.expose_plaintext());
+        self.diagnostic_sensitive |= other.diagnostic_sensitive;
+    }
+}
+
+impl From<String> for ValueString {
+    fn from(value: String) -> Self {
+        Self::plain(value)
+    }
+}
+
+impl From<&str> for ValueString {
+    fn from(value: &str) -> Self {
+        Self::plain(value)
+    }
+}
+
+impl fmt::Debug for ValueString {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.diagnostic_literal() {
+            Some(value) => fmt::Debug::fmt(value, f),
+            None => f.write_str("<sensitive string>"),
+        }
+    }
+}
+
+impl PartialEq for ValueString {
+    fn eq(&self, other: &Self) -> bool {
+        self.plaintext == other.plaintext
+    }
+}
+
+impl Eq for ValueString {}
+
+impl Hash for ValueString {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.plaintext.hash(state);
+    }
+}
+
+impl PartialEq<str> for ValueString {
+    fn eq(&self, other: &str) -> bool {
+        self.plaintext == other
+    }
+}
+
+impl PartialEq<&str> for ValueString {
+    fn eq(&self, other: &&str) -> bool {
+        self.plaintext == *other
+    }
+}
+
+impl PartialEq<String> for ValueString {
+    fn eq(&self, other: &String) -> bool {
+        self.plaintext == *other
+    }
+}
+
+impl PartialEq<ValueString> for str {
+    fn eq(&self, other: &ValueString) -> bool {
+        self == other.plaintext
+    }
+}
+
+impl PartialEq<ValueString> for String {
+    fn eq(&self, other: &ValueString) -> bool {
+        *self == other.plaintext
+    }
+}
+
+impl Serialize for ValueString {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.expose_plaintext())
+    }
+}
+
+impl<'de> Deserialize<'de> for ValueString {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::plain)
+    }
+}
+
 /// Concrete-axis variants: values that carry their own runtime type
 /// and are safe to type-check at validate time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ConcreteValue {
-    String(String),
+    String(ValueString),
     /// An enum identifier — a value written in the DSL as a bare
     /// identifier (`tcp`) or namespaced identifier
     /// (`awscc.ec2.SecurityGroup.IpProtocol.tcp`), not as a quoted
@@ -1217,13 +1424,13 @@ pub enum ConcreteValue {
     /// Canonical form for fields whose schema type is
     /// `Union(vec![String, list(String)])` — the IAM-style
     /// `string_or_list_of_strings` shape. See #2481, #2510.
-    StringList(Vec<String>),
+    StringList(Vec<ValueString>),
     Map(IndexMap<String, Value>),
 }
 
 /// Deferred-axis variants: placeholders that resolve later
 /// (apply time, upstream load, function evaluation).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum DeferredValue {
     /// Reference to another resource's attribute via an access path.
     ResourceRef { path: AccessPath },
@@ -1235,11 +1442,33 @@ pub enum DeferredValue {
     /// `["a", "b"] |> join("-")`. Evaluated during reference resolution.
     FunctionCall { name: String, args: Vec<Value> },
     /// A secret value. The inner value is sent to the provider but
-    /// stored as a SHA256 hash in state.
+    /// stored as an Argon2id hash in state.
     Secret(Box<Value>),
     /// A value not known at plan time. RFC #2371.
     #[serde(skip)]
     Unknown(UnknownReason),
+}
+
+impl fmt::Debug for DeferredValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResourceRef { path } => {
+                f.debug_struct("ResourceRef").field("path", path).finish()
+            }
+            Self::BindingRef { binding } => f
+                .debug_struct("BindingRef")
+                .field("binding", binding)
+                .finish(),
+            Self::Interpolation(parts) => f.debug_tuple("Interpolation").field(parts).finish(),
+            Self::FunctionCall { name, args } => f
+                .debug_struct("FunctionCall")
+                .field("name", name)
+                .field("args", args)
+                .finish(),
+            Self::Secret(_) => f.write_str("Secret((secret))"),
+            Self::Unknown(reason) => f.debug_tuple("Unknown").field(reason).finish(),
+        }
+    }
 }
 
 /// Borrowing projection of [`Value`] restricted to the **concrete** axis
@@ -1262,7 +1491,7 @@ pub enum DeferredValue {
 /// elements (e.g. `["literal", vpc.id]`).
 #[derive(Debug, Clone, Copy)]
 pub enum ConcreteValueRef<'a> {
-    String(&'a str),
+    String(&'a ValueString),
     /// See `ConcreteValue::EnumIdentifier`.
     EnumIdentifier(&'a RawEnumIdentifier),
     CanonicalEnum(&'a CanonicalEnumValue),
@@ -1271,7 +1500,7 @@ pub enum ConcreteValueRef<'a> {
     Bool(bool),
     Duration(std::time::Duration),
     List(&'a [Value]),
-    StringList(&'a [String]),
+    StringList(&'a [ValueString]),
     Map(&'a IndexMap<String, Value>),
 }
 
@@ -1282,7 +1511,7 @@ impl<'a> ConcreteValueRef<'a> {
     /// only the validator cares about the distinction.
     pub fn as_string_like(&self) -> Option<&'a str> {
         match self {
-            ConcreteValueRef::String(s) => Some(s),
+            ConcreteValueRef::String(s) => Some(s.expose_plaintext()),
             ConcreteValueRef::EnumIdentifier(s) => Some(s.as_str()),
             ConcreteValueRef::CanonicalEnum(_) => None,
             _ => None,
@@ -1321,6 +1550,48 @@ pub enum DeferredValueRef<'a> {
 }
 
 impl Value {
+    /// Whether this value tree carries any `env()`-derived string whose
+    /// plaintext must be excluded from diagnostics.
+    pub(crate) fn contains_diagnostic_sensitive_string(&self) -> bool {
+        match self {
+            Value::Concrete(ConcreteValue::String(value)) => value.is_diagnostic_sensitive(),
+            Value::Concrete(ConcreteValue::StringList(values)) => {
+                values.iter().any(ValueString::is_diagnostic_sensitive)
+            }
+            Value::Concrete(ConcreteValue::List(values)) => values
+                .iter()
+                .any(Value::contains_diagnostic_sensitive_string),
+            Value::Concrete(ConcreteValue::Map(values)) => values
+                .values()
+                .any(Value::contains_diagnostic_sensitive_string),
+            Value::Deferred(DeferredValue::Interpolation(parts)) => {
+                parts.iter().any(|part| match part {
+                    InterpolationPart::Literal(value) => value.is_diagnostic_sensitive(),
+                    InterpolationPart::Expr(value) => value.contains_diagnostic_sensitive_string(),
+                })
+            }
+            Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
+                args.iter().any(Value::contains_diagnostic_sensitive_string)
+            }
+            Value::Deferred(DeferredValue::Secret(inner)) => {
+                inner.contains_diagnostic_sensitive_string()
+            }
+            Value::Concrete(
+                ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::Duration(_),
+            )
+            | Value::Deferred(
+                DeferredValue::ResourceRef { .. }
+                | DeferredValue::BindingRef { .. }
+                | DeferredValue::Unknown(_),
+            ) => false,
+        }
+    }
+
     /// If this value is on the concrete axis, return a borrowing
     /// projection. Returns `None` for deferred-resolution variants
     /// ([`Value::ResourceRef`], [`Value::BindingRef`],
@@ -1436,7 +1707,7 @@ pub enum UnknownReason {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InterpolationPart {
     /// Literal text segment
-    Literal(String),
+    Literal(ValueString),
     /// An expression to be evaluated and converted to string
     Expr(Value),
 }
@@ -1540,53 +1811,68 @@ impl PartialEq for Value {
 /// `Value::String` when no `Expr` parts remain.
 fn canonicalize_interpolation(parts: Vec<InterpolationPart>) -> Value {
     let mut merged: Vec<InterpolationPart> = Vec::with_capacity(parts.len());
+    let mut contains_folded_secret = false;
     for part in parts {
         let next = match part {
             InterpolationPart::Literal(s) => InterpolationPart::Literal(s),
             InterpolationPart::Expr(mut v) => {
                 v.canonicalize_in_place();
                 match value_into_literal(v) {
-                    Ok(s) => InterpolationPart::Literal(s),
+                    Ok((s, is_secret)) => {
+                        contains_folded_secret |= is_secret;
+                        InterpolationPart::Literal(s)
+                    }
                     Err(other) => InterpolationPart::Expr(other),
                 }
             }
         };
         match (merged.last_mut(), next) {
             (Some(InterpolationPart::Literal(prev)), InterpolationPart::Literal(s)) => {
-                prev.push_str(&s);
+                prev.push_derived(&s);
             }
             (_, p) => merged.push(p),
         }
     }
-    if merged.is_empty() {
-        return Value::Concrete(ConcreteValue::String(String::new()));
-    }
-    if merged.len() == 1 {
+    let value = if merged.is_empty() {
+        Value::Concrete(ConcreteValue::String("".into()))
+    } else if merged.len() == 1 {
         // Pop the sole element. If it is a Literal, we collapse to
         // `Value::String`; otherwise it is a non-foldable Expr and we
         // rebuild the single-element Interpolation.
         match merged.pop().expect("len == 1") {
-            InterpolationPart::Literal(s) => return Value::Concrete(ConcreteValue::String(s)),
-            expr @ InterpolationPart::Expr(_) => merged.push(expr),
+            InterpolationPart::Literal(s) => Value::Concrete(ConcreteValue::String(s)),
+            expr @ InterpolationPart::Expr(_) => {
+                merged.push(expr);
+                Value::Deferred(DeferredValue::Interpolation(merged))
+            }
         }
+    } else {
+        Value::Deferred(DeferredValue::Interpolation(merged))
+    };
+    if contains_folded_secret {
+        Value::Deferred(DeferredValue::Secret(Box::new(value)))
+    } else {
+        value
     }
-    Value::Deferred(DeferredValue::Interpolation(merged))
 }
 
 /// If `v` is a string-shaped scalar, return its string form (consuming
 /// `v`); otherwise return `v` unchanged so the caller can keep wrapping
 /// it as an `Expr`.
 ///
-/// `Secret(_)` is intentionally **not** folded: stripping the wrapper
-/// would let the secret travel as a plain `Literal` and bypass
-/// redaction in plan display, state serialization, and logging. Secrets
-/// stay as `Expr(Secret(...))`.
-fn value_into_literal(v: Value) -> Result<String, Value> {
+/// A scalar inside `Secret(_)` is folded through the same conversion and
+/// reports that provenance to the caller, which wraps the completed
+/// interpolation in `Secret` rather than dropping the sensitivity tag.
+fn value_into_literal(v: Value) -> Result<(ValueString, bool), Value> {
     match v {
-        Value::Concrete(ConcreteValue::String(s)) => Ok(s),
-        Value::Concrete(ConcreteValue::Int(n)) => Ok(n.to_string()),
-        Value::Concrete(ConcreteValue::Float(f)) => Ok(f.to_string()),
-        Value::Concrete(ConcreteValue::Bool(b)) => Ok(b.to_string()),
+        Value::Concrete(ConcreteValue::String(s)) => Ok((s, false)),
+        Value::Concrete(ConcreteValue::Int(n)) => Ok((n.to_string().into(), false)),
+        Value::Concrete(ConcreteValue::Float(f)) => Ok((f.to_string().into(), false)),
+        Value::Concrete(ConcreteValue::Bool(b)) => Ok((b.to_string().into(), false)),
+        Value::Deferred(DeferredValue::Secret(inner)) => match value_into_literal(*inner) {
+            Ok((literal, _)) => Ok((literal, true)),
+            Err(inner) => Err(Value::Deferred(DeferredValue::Secret(Box::new(inner)))),
+        },
         other => Err(other),
     }
 }
@@ -1600,9 +1886,9 @@ impl Value {
     /// - Adjacent `InterpolationPart::Literal`s are merged.
     /// - `InterpolationPart::Expr(v)` whose `v` is a bare `String`/`Int`/
     ///   `Float`/`Bool` is folded into a `Literal`, then merged with
-    ///   neighbors per the previous rule. `Secret(_)` is intentionally
-    ///   not folded — keeping it wrapped preserves redaction in plan
-    ///   display, state serialization, and logging.
+    ///   neighbors per the previous rule. A scalar `Secret(_)` is folded
+    ///   through its inner value and the completed interpolation is wrapped
+    ///   in `Secret`, preserving redaction while allowing static evaluation.
     /// - An `Interpolation` whose parts collapse to a single `Literal` is
     ///   replaced with `Value::String(s)`.
     ///
@@ -1658,7 +1944,7 @@ impl Value {
     /// empty attribute — see #2847 for the regression that motivated
     /// the type-level split.
     pub fn resource_ref(
-        binding_name: impl Into<String>,
+        binding_name: impl Into<ValueString>,
         attribute_name: impl Into<String>,
         field_path: Vec<String>,
     ) -> Self {
@@ -2566,7 +2852,9 @@ fn pairing_hashes(
             hashes.push(secret_state_pairing_hash());
         }
         Value::Concrete(ConcreteValue::String(value))
-            if value.starts_with(crate::value::SECRET_PREFIX) =>
+            if value
+                .expose_plaintext()
+                .starts_with(crate::value::SECRET_PREFIX) =>
         {
             hashes.push(secret_state_pairing_hash());
         }
@@ -2601,7 +2889,10 @@ fn append_schema_pairing_hashes(
             ..
         } => {
             if let Value::Concrete(ConcreteValue::String(text)) = value {
-                hashes.push(pairing_component_hash(0x01, &transform.apply(text)));
+                hashes.push(pairing_component_hash(
+                    0x01,
+                    &transform.apply(text.expose_plaintext()),
+                ));
             }
         }
         Shape::String { to_dsl: None, .. } | Shape::Bool | Shape::Duration => {}
@@ -2617,7 +2908,7 @@ fn append_schema_pairing_hashes(
             ..
         } => {
             let text = match value {
-                Value::Concrete(ConcreteValue::String(text)) => Some(text.as_str()),
+                Value::Concrete(ConcreteValue::String(text)) => Some(text.expose_plaintext()),
                 Value::Concrete(ConcreteValue::EnumIdentifier(text)) => Some(text.as_str()),
                 Value::Concrete(ConcreteValue::CanonicalEnum(value)) => Some(value.api_value()),
                 _ => None,
@@ -3174,8 +3465,8 @@ impl Resource {
                 enum_attr_from_resolved_text(identity, values, raw.as_str(), &canonical)
             }
             Value::Concrete(ConcreteValue::String(s)) => {
-                let canonical = resolver.resolve_state_text(s).ok()?;
-                enum_attr_from_resolved_text(identity, values, s, &canonical)
+                let canonical = resolver.resolve_state_text(s.expose_plaintext()).ok()?;
+                enum_attr_from_resolved_text(identity, values, s.expose_plaintext(), &canonical)
             }
             _ => None,
         }
@@ -3319,7 +3610,7 @@ mod enum_attr_tests {
     fn returns_none_when_schema_attribute_is_not_enum() {
         let schema = ResourceSchema::new("aws.s3.BucketVersioning")
             .attribute(AttributeSchema::new("name", AttributeType::string()));
-        let resource = resource_with_attr("name", ConcreteValue::String("x".to_string()));
+        let resource = resource_with_attr("name", ConcreteValue::String("x".into()));
 
         assert!(resource.get_enum_attr(&schema, "name").is_none());
     }
@@ -3352,7 +3643,7 @@ mod enum_attr_tests {
     #[test]
     fn resolves_string_through_resolver() {
         let schema = schema_with_status();
-        let resource = resource_with_attr("status", ConcreteValue::String("Enabled".to_string()));
+        let resource = resource_with_attr("status", ConcreteValue::String("Enabled".into()));
 
         let attr = resource.get_enum_attr(&schema, "status").unwrap();
 
@@ -3393,7 +3684,7 @@ mod enum_attr_tests {
         let cases = [
             canonical_status("Enabled"),
             ConcreteValue::enum_identifier("aws.s3.BucketVersioning.Status.enabled"),
-            ConcreteValue::String("Enabled".to_string()),
+            ConcreteValue::String("Enabled".into()),
         ];
 
         for value in cases {
@@ -3421,7 +3712,7 @@ mod enum_attr_tests {
     #[test]
     fn struct_field_returns_none_when_struct_attribute_is_not_map() {
         let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
-        let resource = resource_with_attr("options", ConcreteValue::String("Enabled".to_string()));
+        let resource = resource_with_attr("options", ConcreteValue::String("Enabled".into()));
 
         assert!(
             resource
@@ -3451,7 +3742,7 @@ mod enum_attr_tests {
         )]);
         let resource = resource_with_options(vec![(
             "dns_support",
-            ConcreteValue::String("Enabled".to_string()),
+            ConcreteValue::String("Enabled".into()),
         )]);
 
         assert!(
@@ -3497,7 +3788,7 @@ mod enum_attr_tests {
         let schema = schema_with_options(vec![StructField::new("dns_support", status_enum_type())]);
         let resource = resource_with_options(vec![(
             "dns_support",
-            ConcreteValue::String("Enabled".to_string()),
+            ConcreteValue::String("Enabled".into()),
         )]);
 
         assert_struct_field_enabled(&resource, &schema);
@@ -3535,7 +3826,7 @@ mod enum_attr_tests {
         let cases = [
             canonical_status("Enabled"),
             ConcreteValue::enum_identifier("aws.s3.BucketVersioning.Status.enabled"),
-            ConcreteValue::String("Enabled".to_string()),
+            ConcreteValue::String("Enabled".into()),
         ];
 
         for value in cases {
@@ -3559,7 +3850,7 @@ mod enum_attr_tests {
         let cases = [
             canonical_status("Enabled"),
             ConcreteValue::enum_identifier("aws.s3.BucketVersioning.Status.enabled"),
-            ConcreteValue::String("Enabled".to_string()),
+            ConcreteValue::String("Enabled".into()),
         ];
 
         for value in cases {

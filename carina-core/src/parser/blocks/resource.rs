@@ -42,7 +42,7 @@ pub(in crate::parser) fn parse_anonymous_resource(
     let mut attributes = attributes;
     attributes.insert(
         "_type".to_string(),
-        Value::Concrete(ConcreteValue::String(namespaced_type.clone())),
+        Value::Concrete(ConcreteValue::String(namespaced_type.clone().into())),
     );
 
     // Extract directives block from attributes (it's a meta-argument, not a real attribute)
@@ -215,7 +215,7 @@ pub(crate) fn parse_resource_expr(
 
     attributes.insert(
         "_type".to_string(),
-        Value::Concrete(ConcreteValue::String(namespaced_type.clone())),
+        Value::Concrete(ConcreteValue::String(namespaced_type.clone().into())),
     );
 
     let id = ResourceId::with_provider_identity(
@@ -271,7 +271,7 @@ pub(crate) fn parse_read_resource_expr(
 
     attributes.insert(
         "_type".to_string(),
-        Value::Concrete(ConcreteValue::String(namespaced_type.clone())),
+        Value::Concrete(ConcreteValue::String(namespaced_type.clone().into())),
     );
 
     let id = ResourceId::with_provider_identity(

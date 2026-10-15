@@ -108,7 +108,7 @@ impl VerifiedBackend {
     pub fn string_attribute(&self, key: &str) -> Option<&str> {
         self.parser_config.as_ref().and_then(|config| {
             config.attributes.get(key).and_then(|value| match value {
-                Value::Concrete(ConcreteValue::String(value)) => Some(value.as_str()),
+                Value::Concrete(ConcreteValue::String(value)) => Some(value.expose_plaintext()),
                 _ => None,
             })
         })
@@ -612,6 +612,13 @@ pub(crate) fn validate_and_resolve_errors_with_context(
                 .map(|error| AppError::Validation(error.to_string())),
         );
 
+        let export_value_bindings =
+            carina_core::binding_index::ResolvedBindings::for_validation(parsed);
+        let checked_export_values = carina_core::validation::check_export_values_pre_apply(
+            &parsed.export_params,
+            &export_value_bindings,
+            &enriched_context,
+        );
         let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports(
             parsed,
             ctx.schemas(),
@@ -652,10 +659,7 @@ pub(crate) fn validate_and_resolve_errors_with_context(
         ) {
             errors.extend(split_validation_message(&message));
         }
-        if let Err(msg) = carina_core::validation::validate_export_params(
-            &parsed.export_params,
-            &enriched_context,
-        ) {
+        if let Err(msg) = checked_export_values {
             errors.extend(split_validation_message(&msg));
         }
         if let Err(msg) = carina_core::validation::validate_export_param_ref_types_with_bindings(
@@ -772,11 +776,11 @@ mod tests {
         let mut attributes = HashMap::new();
         attributes.insert(
             "bucket".to_string(),
-            Value::Concrete(ConcreteValue::String(bucket.to_string())),
+            Value::Concrete(ConcreteValue::String(bucket.to_string().into())),
         );
         attributes.insert(
             "region".to_string(),
-            Value::Concrete(ConcreteValue::String(region.to_string())),
+            Value::Concrete(ConcreteValue::String(region.to_string().into())),
         );
         BackendConfig {
             backend_type: "s3".to_string(),
@@ -788,7 +792,7 @@ mod tests {
         let mut attributes = HashMap::new();
         attributes.insert(
             "path".to_string(),
-            Value::Concrete(ConcreteValue::String(path.to_string())),
+            Value::Concrete(ConcreteValue::String(path.to_string().into())),
         );
         BackendConfig {
             backend_type: "local".to_string(),

@@ -44,6 +44,24 @@ fn empty_resolved_provider_configs() -> carina_core::parser::ResolvedProviderCon
     resolved_provider_configs(&carina_core::parser::InferredFile::default())
 }
 
+fn checked_exports(
+    params: &[carina_core::parser::InferredExportParam],
+) -> carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam> {
+    carina_core::validation::check_export_values_pre_apply(
+        params,
+        &carina_core::binding_index::ResolvedBindings::default(),
+        &carina_core::parser::ProviderContext::default(),
+    )
+    .expect("test exports must pass the secret boundary")
+}
+
+fn resolve_and_materialize_exports_for_test(
+    input: ResolveExportValuesPostApplyInput<'_>,
+) -> Result<crate::commands::shared::state_writeback::ExportResolution, AppError> {
+    let values = resolve_export_values_post_apply(input)?;
+    materialize_exports(&values)
+}
+
 fn saved_provider_configs(
     configs: Vec<ProviderConfig>,
 ) -> carina_core::parser::SavedProviderConfigs {
@@ -173,7 +191,7 @@ async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
     assert_eq!(
         received_role_arn.lock().unwrap().as_ref(),
         Some(&Value::Concrete(ConcreteValue::String(
-            "arn:aws:iam::123456789012:role/upstream".to_string()
+            "arn:aws:iam::123456789012:role/upstream".into()
         )))
     );
 }
@@ -289,7 +307,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
             .attributes
             .get("role_arn"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "arn:aws:iam::111111111111:role/old".to_string()
+            "arn:aws:iam::111111111111:role/old".into()
         )))
     );
 
@@ -331,7 +349,7 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     assert_eq!(
         received_role_arn.lock().unwrap().as_ref(),
         Some(&Value::Concrete(ConcreteValue::String(
-            "arn:aws:iam::222222222222:role/new".to_string()
+            "arn:aws:iam::222222222222:role/new".into()
         ))),
         "the lock-held provider must ignore stale pre-reload bootstrap inputs"
     );
@@ -834,7 +852,7 @@ impl Provider for ApplyCascadeProvider {
 }
 
 fn string_value(value: &str) -> Value {
-    Value::Concrete(ConcreteValue::String(value.to_string()))
+    Value::Concrete(ConcreteValue::String(value.to_string().into()))
 }
 
 fn apply_cascade_crn(state_path: &std::path::Path, include_subnet: bool) -> String {
@@ -1101,7 +1119,7 @@ impl Provider for ApplyTimeReadProvider {
                 .values()
                 .filter_map(|attrs| attrs.get("role_name").and_then(value_string))
                 .filter(|role_name| role_name == &expected)
-                .map(|role_name| Value::Concrete(ConcreteValue::String(role_name)))
+                .map(|role_name| Value::Concrete(ConcreteValue::String(role_name.into())))
                 .collect();
 
             Ok(State::existing(
@@ -1127,7 +1145,7 @@ impl Provider for ApplyTimeReadProvider {
             if id.resource_type == "iam.Role" {
                 attrs
                     .entry("path".to_string())
-                    .or_insert_with(|| Value::Concrete(ConcreteValue::String("/".to_string())));
+                    .or_insert_with(|| Value::Concrete(ConcreteValue::String("/".into())));
                 attrs
                     .entry("max_session_duration".to_string())
                     .or_insert_with(|| Value::Concrete(ConcreteValue::Int(3600)));
@@ -1181,7 +1199,7 @@ impl Provider for ApplyTimeReadProvider {
 
 fn value_string(value: &Value) -> Option<String> {
     match value {
-        Value::Concrete(ConcreteValue::String(value)) => Some(value.clone()),
+        Value::Concrete(ConcreteValue::String(value)) => Some(value.expose_plaintext().to_owned()),
         _ => None,
     }
 }
@@ -1548,7 +1566,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
     target.binding = Some("target".to_string());
     target.set_attr(
         "name",
-        Value::Concrete(ConcreteValue::String("target".to_string())),
+        Value::Concrete(ConcreteValue::String("target".into())),
     );
 
     let lookup_id = ResourceId::with_provider_identity("mock", "test.resource", "lookup", None);
@@ -1568,7 +1586,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
     consumer.binding = Some("consumer".to_string());
     consumer.set_attr(
         "name",
-        Value::Concrete(ConcreteValue::String("consumer".to_string())),
+        Value::Concrete(ConcreteValue::String("consumer".into())),
     );
     consumer.set_attr(
         "comment",
@@ -2142,7 +2160,7 @@ fn apply_emits_legacy_override_warning_to_stderr() {
     let state = legacy_override_state();
     let resource = Resource::with_provider("mock", "test.resource", "legacy", None).with_attribute(
         "name",
-        Value::Concrete(ConcreteValue::String("legacy".to_string())),
+        Value::Concrete(ConcreteValue::String("legacy".into())),
     );
     let current_states = HashMap::new();
     let remote_bindings = HashMap::new();
@@ -2181,7 +2199,7 @@ fn apply_does_not_require_flag_after_v7_to_v8_migration() {
     let mut resource = Resource::with_provider("mock", "test.resource", "legacy", None);
     resource.set_attr(
         "name".to_string(),
-        Value::Concrete(ConcreteValue::String("legacy".to_string())),
+        Value::Concrete(ConcreteValue::String("legacy".into())),
     );
     let id = resource.id.clone();
     let sorted_resources = vec![resolved(resource)];
@@ -2189,7 +2207,7 @@ fn apply_does_not_require_flag_after_v7_to_v8_migration() {
         id.clone(),
         HashMap::from([(
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("legacy-temp".to_string())),
+            Value::Concrete(ConcreteValue::String("legacy-temp".into())),
         )]),
     )
     .with_identifier("legacy-id");
@@ -2501,7 +2519,7 @@ async fn run_apply_locked_defers_value_resolvable_data_source_read_until_referen
     assert_eq!(
         *shared.consumer_description.lock().unwrap(),
         Some(Value::Concrete(ConcreteValue::String(
-            "carina-acc-test-3666-target".to_string()
+            "carina-acc-test-3666-target".into()
         ))),
         "consumer create must receive the data-source output resolved from the apply-time read"
     );
@@ -3117,7 +3135,7 @@ let consumer = mock.iam.Role {{
     assert_eq!(
         *shared.consumer_description.lock().unwrap(),
         Some(Value::Concrete(ConcreteValue::String(
-            "carina-acc-test-3666-target".to_string()
+            "carina-acc-test-3666-target".into()
         ))),
         "consumer create must receive the second read's output"
     );
@@ -3127,15 +3145,15 @@ fn s3_backend_config_with_encrypt(encrypt: bool) -> carina_core::parser::Backend
     let mut attributes = HashMap::new();
     attributes.insert(
         "bucket".to_string(),
-        Value::Concrete(ConcreteValue::String("state-bucket".to_string())),
+        Value::Concrete(ConcreteValue::String("state-bucket".into())),
     );
     attributes.insert(
         "key".to_string(),
-        Value::Concrete(ConcreteValue::String("project/state.json".to_string())),
+        Value::Concrete(ConcreteValue::String("project/state.json".into())),
     );
     attributes.insert(
         "region".to_string(),
-        Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+        Value::Concrete(ConcreteValue::String("us-east-1".into())),
     );
     attributes.insert(
         "encrypt".to_string(),
@@ -3224,7 +3242,7 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
     resource.set_attr(
         "bucket",
-        Value::Concrete(ConcreteValue::String("invalid-bucket".to_string())),
+        Value::Concrete(ConcreteValue::String("invalid-bucket".into())),
     );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -3291,7 +3309,7 @@ async fn state_bucket_provider_error_keeps_typed_source() {
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
     resource.set_attr(
         "bucket",
-        Value::Concrete(ConcreteValue::String("state-bucket".to_string())),
+        Value::Concrete(ConcreteValue::String("state-bucket".into())),
     );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -3333,11 +3351,11 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
     resource.set_attr(
         "bucket",
-        Value::Concrete(ConcreteValue::String("state-bucket".to_string())),
+        Value::Concrete(ConcreteValue::String("state-bucket".into())),
     );
     let parsed = carina_core::parser::InferredFile {
         compositions: vec![saved_module_composition(
-            Value::Concrete(ConcreteValue::String("forbidden".to_string())),
+            Value::Concrete(ConcreteValue::String("forbidden".into())),
             "forbidden",
         )],
         ..Default::default()
@@ -3408,11 +3426,11 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     let mut resource = Resource::with_provider("awscc", "ec2.Vpc", "my-vpc", None);
     resource.set_attr(
         "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
     resource.set_attr(
         "ipv4_netmask_length".to_string(),
-        Value::Concrete(ConcreteValue::String("16".to_string())),
+        Value::Concrete(ConcreteValue::String("16".into())),
     );
 
     let sorted_resources = vec![resolved(resource)];
@@ -3421,7 +3439,7 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
     let mut applied_attrs = HashMap::new();
     applied_attrs.insert(
         "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
     let applied_state = State::existing(sorted_resources[0].id.clone(), applied_attrs);
     let mut applied_states = HashMap::new();
@@ -3486,7 +3504,7 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
     let mut resource = Resource::with_provider("awscc", "iam.role", "test-role", None);
     resource.set_attr(
         "role_name".to_string(),
-        Value::Concrete(ConcreteValue::String("test-role".to_string())),
+        Value::Concrete(ConcreteValue::String("test-role".into())),
     );
     resource.set_attr(
         "policies".to_string(),
@@ -3495,11 +3513,11 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
                 vec![
                     (
                         "policy_name".to_string(),
-                        Value::Concrete(ConcreteValue::String("test-policy".to_string())),
+                        Value::Concrete(ConcreteValue::String("test-policy".into())),
                     ),
                     (
                         "policy_document".to_string(),
-                        Value::Concrete(ConcreteValue::String("{}".to_string())),
+                        Value::Concrete(ConcreteValue::String("{}".into())),
                     ),
                 ]
                 .into_iter()
@@ -3515,7 +3533,7 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
     let mut applied_attrs = HashMap::new();
     applied_attrs.insert(
         "role_name".to_string(),
-        Value::Concrete(ConcreteValue::String("test-role".to_string())),
+        Value::Concrete(ConcreteValue::String("test-role".into())),
     );
     applied_attrs.insert(
         "policies".to_string(),
@@ -3524,11 +3542,11 @@ fn build_state_after_apply_preserves_block_unique_name_attribute() {
                 vec![
                     (
                         "policy_name".to_string(),
-                        Value::Concrete(ConcreteValue::String("test-policy".to_string())),
+                        Value::Concrete(ConcreteValue::String("test-policy".into())),
                     ),
                     (
                         "policy_document".to_string(),
-                        Value::Concrete(ConcreteValue::String("{}".to_string())),
+                        Value::Concrete(ConcreteValue::String("{}".into())),
                     ),
                 ]
                 .into_iter()
@@ -3628,7 +3646,7 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
     let mut resource = Resource::with_provider("awscc", "iam.role", "test-role", None);
     resource.set_attr(
         "role_name".to_string(),
-        Value::Concrete(ConcreteValue::String("test-role".to_string())),
+        Value::Concrete(ConcreteValue::String("test-role".into())),
     );
     resource.set_attr(
         "policies".to_string(),
@@ -3637,11 +3655,11 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
                 vec![
                     (
                         "policy_name".to_string(),
-                        Value::Concrete(ConcreteValue::String("test-policy".to_string())),
+                        Value::Concrete(ConcreteValue::String("test-policy".into())),
                     ),
                     (
                         "policy_document".to_string(),
-                        Value::Concrete(ConcreteValue::String("{}".to_string())),
+                        Value::Concrete(ConcreteValue::String("{}".into())),
                     ),
                 ]
                 .into_iter()
@@ -3654,7 +3672,7 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
     let mut state_attrs = HashMap::new();
     state_attrs.insert(
         "role_name".to_string(),
-        Value::Concrete(ConcreteValue::String("test-role".to_string())),
+        Value::Concrete(ConcreteValue::String("test-role".into())),
     );
     state_attrs.insert(
         "policies".to_string(),
@@ -3663,11 +3681,11 @@ fn block_unique_name_attribute_no_diff_when_hydrated() {
                 vec![
                     (
                         "policy_name".to_string(),
-                        Value::Concrete(ConcreteValue::String("test-policy".to_string())),
+                        Value::Concrete(ConcreteValue::String("test-policy".into())),
                     ),
                     (
                         "policy_document".to_string(),
-                        Value::Concrete(ConcreteValue::String("{}".to_string())),
+                        Value::Concrete(ConcreteValue::String("{}".into())),
                     ),
                 ]
                 .into_iter()
@@ -3742,7 +3760,7 @@ fn block_unique_name_attribute_state_roundtrip() {
             ConcreteValue::Map(
                 vec![(
                     "region_name".to_string(),
-                    Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
+                    Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
                 )]
                 .into_iter()
                 .collect(),
@@ -3751,7 +3769,7 @@ fn block_unique_name_attribute_state_roundtrip() {
     );
     resource.set_attr(
         "description".to_string(),
-        Value::Concrete(ConcreteValue::String("test IPAM".to_string())),
+        Value::Concrete(ConcreteValue::String("test IPAM".into())),
     );
 
     let sorted_resources = vec![resolved(resource)];
@@ -3760,7 +3778,7 @@ fn block_unique_name_attribute_state_roundtrip() {
     let mut applied_attrs = HashMap::new();
     applied_attrs.insert(
         "description".to_string(),
-        Value::Concrete(ConcreteValue::String("test IPAM".to_string())),
+        Value::Concrete(ConcreteValue::String("test IPAM".into())),
     );
     applied_attrs.insert(
         "operating_regions".to_string(),
@@ -3768,7 +3786,7 @@ fn block_unique_name_attribute_state_roundtrip() {
             ConcreteValue::Map(
                 vec![(
                     "region_name".to_string(),
-                    Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
+                    Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
                 )]
                 .into_iter()
                 .collect(),
@@ -3835,7 +3853,7 @@ fn block_unique_name_attribute_state_roundtrip() {
             assert_eq!(
                 map.get("region_name"),
                 Some(&Value::Concrete(ConcreteValue::String(
-                    "ap-northeast-1".to_string()
+                    "ap-northeast-1".into()
                 )))
             );
         } else {
@@ -3864,22 +3882,22 @@ fn move_plus_update_keeps_post_update_attributes() {
     let mut resource = Resource::with_provider("awscc", "ec2.Tag", "tag_new", None);
     resource.set_attr(
         "key".to_string(),
-        Value::Concrete(ConcreteValue::String("env".to_string())),
+        Value::Concrete(ConcreteValue::String("env".into())),
     );
     resource.set_attr(
         "value".to_string(),
-        Value::Concrete(ConcreteValue::String("prod".to_string())),
+        Value::Concrete(ConcreteValue::String("prod".into())),
     );
     let sorted_resources = vec![resolved(resource)];
 
     let mut applied_attrs = HashMap::new();
     applied_attrs.insert(
         "key".to_string(),
-        Value::Concrete(ConcreteValue::String("env".to_string())),
+        Value::Concrete(ConcreteValue::String("env".into())),
     );
     applied_attrs.insert(
         "value".to_string(),
-        Value::Concrete(ConcreteValue::String("prod".to_string())),
+        Value::Concrete(ConcreteValue::String("prod".into())),
     );
     let applied = State::existing(new_id.clone(), applied_attrs).with_identifier("tag-abc");
     let mut applied_states = HashMap::new();
@@ -3955,7 +3973,7 @@ fn move_alone_carries_attributes_via_current_states() {
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "bucket_new", None);
     resource.set_attr(
         "bucket_name".to_string(),
-        Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+        Value::Concrete(ConcreteValue::String("my-bucket".into())),
     );
     let sorted_resources = vec![resolved(resource)];
 
@@ -3963,7 +3981,7 @@ fn move_alone_carries_attributes_via_current_states() {
     let mut current_attrs = HashMap::new();
     current_attrs.insert(
         "bucket_name".to_string(),
-        Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+        Value::Concrete(ConcreteValue::String("my-bucket".into())),
     );
     let current = State::existing(new_id.clone(), current_attrs).with_identifier("my-bucket");
     let mut current_states = HashMap::new();
@@ -4129,7 +4147,7 @@ fn move_from_overlapping_desired_resource_errors() {
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "collision", None);
     resource.set_attr(
         "bucket_name".to_string(),
-        Value::Concrete(ConcreteValue::String("x".to_string())),
+        Value::Concrete(ConcreteValue::String("x".into())),
     );
     let sorted_resources = vec![resolved(resource.clone())];
 
@@ -4186,7 +4204,7 @@ fn remove_overlapping_desired_resource_errors() {
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "collision", None);
     resource.set_attr(
         "bucket_name".to_string(),
-        Value::Concrete(ConcreteValue::String("x".to_string())),
+        Value::Concrete(ConcreteValue::String("x".into())),
     );
     let sorted_resources = vec![resolved(resource)];
 
@@ -4239,7 +4257,7 @@ fn self_move_overlapping_desired_resource_errors() {
     let mut resource = Resource::with_provider("awscc", "s3.Bucket", "self", None);
     resource.set_attr(
         "bucket_name".to_string(),
-        Value::Concrete(ConcreteValue::String("x".to_string())),
+        Value::Concrete(ConcreteValue::String("x".into())),
     );
     let sorted_resources = vec![resolved(resource)];
 
@@ -4352,15 +4370,16 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
             &std::collections::HashMap::new(),
             &state,
         );
-    let exports = resolve_exports(
-        &export_params,
-        &sorted_resources,
-        &[],
-        &[],
-        &post_apply_states,
-        &carina_core::schema::SchemaRegistry::new(),
-        &[],
-    )
+    let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
+        export_params: &checked_exports(&export_params),
+        sorted_resources: &sorted_resources,
+        data_sources: &[],
+        pre_resolve_compositions: &[],
+        post_apply_states: &post_apply_states,
+        schemas: &carina_core::schema::SchemaRegistry::new(),
+        wait_aliases: &[],
+        provider_context: &carina_core::parser::ProviderContext::default(),
+    })
     .unwrap()
     .into_parts()
     .0;
@@ -4368,7 +4387,7 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
     assert_eq!(
         exports.get("account_id"),
         Some(&serde_json::Value::String("459524413166".to_string())),
-        "resolve_exports should resolve ResourceRef values to actual values. Got: {:?}",
+        "resolve_export_values_post_apply should resolve ResourceRef values to actual values. Got: {:?}",
         exports
     );
 }
@@ -4456,15 +4475,16 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
             &std::collections::HashMap::new(),
             &state,
         );
-    let exports = resolve_exports(
-        &export_params,
-        &sorted_resources,
-        &[],
-        &pre_resolve_compositions,
-        &post_apply_states,
-        &carina_core::schema::SchemaRegistry::new(),
-        &[],
-    )
+    let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
+        export_params: &checked_exports(&export_params),
+        sorted_resources: &sorted_resources,
+        data_sources: &[],
+        pre_resolve_compositions: &pre_resolve_compositions,
+        post_apply_states: &post_apply_states,
+        schemas: &carina_core::schema::SchemaRegistry::new(),
+        wait_aliases: &[],
+        provider_context: &carina_core::parser::ProviderContext::default(),
+    })
     .unwrap()
     .into_parts()
     .0;
@@ -4581,15 +4601,16 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
             &std::collections::HashMap::new(),
             &state,
         );
-    let exports = resolve_exports(
-        &export_params,
-        &sorted_resources,
-        &[],
-        &pre_resolve_compositions,
-        &post_apply_states,
-        &carina_core::schema::SchemaRegistry::new(),
-        &[],
-    )
+    let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
+        export_params: &checked_exports(&export_params),
+        sorted_resources: &sorted_resources,
+        data_sources: &[],
+        pre_resolve_compositions: &pre_resolve_compositions,
+        post_apply_states: &post_apply_states,
+        schemas: &carina_core::schema::SchemaRegistry::new(),
+        wait_aliases: &[],
+        provider_context: &carina_core::parser::ProviderContext::default(),
+    })
     .unwrap()
     .into_parts()
     .0;
@@ -4616,7 +4637,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // concrete value (here: OLD_ARN). The composition's `role_arn`
     // attribute thus becomes a frozen string snapshot of the
     // pre-apply state. Later in `finalize_apply`, the resource
-    // graph is sent into `resolve_exports`, which feeds the
+    // graph is sent into `resolve_export_values_post_apply`, which feeds the
     // composition's stale `role_arn` into `state.exports` — even
     // though the writeback wrote the new ARN into
     // `state.resources[role].arn`. So `state.exports.role_arn` and
@@ -4627,7 +4648,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // *before* the head-of-pipeline `ResourceRef` collapse — that
     // snapshot still carries the authored `ref role.arn`. It
     // threads that pre-resolve snapshot into `finalize_apply` →
-    // `resolve_exports`, which uses it (instead of the mutated
+    // `resolve_export_values_post_apply`, which uses it (instead of the mutated
     // `sorted_resources`) to build a fresh post-apply
     // `ResolvedBindings` view via the typestate-split API
     // (`from_managed_with_state` + `resolve_virtual_refs_post_apply`
@@ -4639,11 +4660,11 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // pre-resolve snapshot of the composition, (3) runs the head-of-
     // pipeline resolver against a *pre-apply* `current_states`
     // (OLD_ARN), then (4) feeds the pre-resolve snapshot and the
-    // resolved working slice into `resolve_exports` along with a
+    // resolved working slice into `resolve_export_values_post_apply` along with a
     // *post-apply* `StateFile` (NEW_ARN). The assertion checks the
     // export ends up at NEW_ARN.
     //
-    // Without the #3177 fix, `resolve_exports` would consult the
+    // Without the #3177 fix, `resolve_export_values_post_apply` would consult the
     // mutated composition's stale concrete attribute and return
     // OLD_ARN. With the fix in place, the pre-resolve snapshot
     // kicks in and re-resolves against the post-apply state.
@@ -4660,7 +4681,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
 
     // Step (a): post-apply `StateFile` — what `state.resources`
     // looks like after the writeback wrote the new ARN. This is
-    // what `resolve_exports` sees as its `state` argument.
+    // what `resolve_export_values_post_apply` sees as its `state` argument.
     let post_apply_state_file = {
         let json = serde_json::json!({
             "version": 5,
@@ -4689,7 +4710,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
         let mut attrs: HashMap<String, Value> = HashMap::new();
         attrs.insert(
             "arn".to_string(),
-            Value::Concrete(ConcreteValue::String(pre_apply_arn.to_string())),
+            Value::Concrete(ConcreteValue::String(pre_apply_arn.to_string().into())),
         );
         let mut m = HashMap::new();
         m.insert(id.clone(), ResourceState::existing(id, attrs));
@@ -4773,15 +4794,16 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
             &std::collections::HashMap::new(),
             &post_apply_state_file,
         );
-    let exports = resolve_exports(
-        &export_params,
-        &sorted_resources,
-        &[],
-        &pre_resolve_compositions,
-        &post_apply_states,
-        &carina_core::schema::SchemaRegistry::new(),
-        &[],
-    )
+    let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
+        export_params: &checked_exports(&export_params),
+        sorted_resources: &sorted_resources,
+        data_sources: &[],
+        pre_resolve_compositions: &pre_resolve_compositions,
+        post_apply_states: &post_apply_states,
+        schemas: &carina_core::schema::SchemaRegistry::new(),
+        wait_aliases: &[],
+        provider_context: &carina_core::parser::ProviderContext::default(),
+    })
     .unwrap()
     .into_parts()
     .0;
@@ -4799,7 +4821,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
 fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     // carina#3266 root-cause regression test.
     //
-    // The bug: `resolve_exports` builds `post_apply_states` from
+    // The bug: `resolve_export_values_post_apply` builds `post_apply_states` from
     // `state.resources` only. Managed resources are persisted there,
     // but data sources are not — they are queried each run and the
     // result lives in `current_states` during execution and is
@@ -4812,11 +4834,11 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     // silently keeps the prior literal in `state.exports`.
     //
     // The fix: thread `current_states` from `finalize_apply` into
-    // `resolve_exports` so the read results stay visible across the
+    // `resolve_export_values_post_apply` so the read results stay visible across the
     // exports-resolution boundary. `layer_data_source_bindings` then
     // merges the read attrs and `ds.arns` resolves to the read value.
     //
-    // Without the fix, `resolve_exports` returns an empty map (no
+    // Without the fix, `resolve_export_values_post_apply` returns an empty map (no
     // entry for the export) instead of the NEW arn — exports stays
     // at the pre-apply literal in production.
     use carina_core::parser::{InferredExportParam as ExportParameter, TypeExpr};
@@ -4849,7 +4871,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     ds.attributes.insert(
         "path_prefix".to_string(),
         Value::Concrete(ConcreteValue::String(
-            "/aws-reserved/sso.amazonaws.com/".to_string(),
+            "/aws-reserved/sso.amazonaws.com/".into(),
         )),
     );
     let data_sources = vec![ds];
@@ -4861,7 +4883,7 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
         attrs.insert(
             "arns".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String(new_arn.to_string()),
+                ConcreteValue::String(new_arn.to_string().into()),
             )])),
         );
         let mut m = HashMap::new();
@@ -4883,15 +4905,16 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
             &current_states,
             &post_apply_state_file,
         );
-    let exports = resolve_exports(
-        &export_params,
-        &[],
-        &data_sources,
-        &[],
-        &post_apply_states,
-        &carina_core::schema::SchemaRegistry::new(),
-        &[],
-    )
+    let exports = resolve_and_materialize_exports_for_test(ResolveExportValuesPostApplyInput {
+        export_params: &checked_exports(&export_params),
+        sorted_resources: &[],
+        data_sources: &data_sources,
+        pre_resolve_compositions: &[],
+        post_apply_states: &post_apply_states,
+        schemas: &carina_core::schema::SchemaRegistry::new(),
+        wait_aliases: &[],
+        provider_context: &carina_core::parser::ProviderContext::default(),
+    })
     .unwrap()
     .into_parts()
     .0;
@@ -5648,7 +5671,7 @@ mod saved_plan_version_tests {
         let resource = carina_core::resource::Resource::new("ec2.Vpc", "main").with_attribute(
             "cidr_block",
             carina_core::resource::Value::Concrete(carina_core::resource::ConcreteValue::String(
-                "10.1.0.0/16".to_string(),
+                "10.1.0.0/16".into(),
             )),
         );
         let id = resource.id.clone();
@@ -5657,7 +5680,7 @@ mod saved_plan_version_tests {
             std::collections::HashMap::from([(
                 "cidr_block".to_string(),
                 carina_core::resource::Value::Concrete(
-                    carina_core::resource::ConcreteValue::String("10.0.0.0/16".to_string()),
+                    carina_core::resource::ConcreteValue::String("10.0.0.0/16".into()),
                 ),
             )]),
         )

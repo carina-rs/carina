@@ -29,7 +29,7 @@ fn local_backend_lock(path: &str) -> BackendLock {
     let mut attributes = std::collections::HashMap::new();
     attributes.insert(
         "path".to_string(),
-        Value::Concrete(ConcreteValue::String(path.to_string())),
+        Value::Concrete(ConcreteValue::String(path.to_string().into())),
     );
     let config = carina_core::parser::BackendConfig {
         backend_type: "local".to_string(),

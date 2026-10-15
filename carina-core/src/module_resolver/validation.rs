@@ -597,7 +597,10 @@ fn constraint_actuals(
 
 fn format_constraint_actual(value: &Value) -> String {
     match value {
-        Value::Concrete(ConcreteValue::String(value)) => format_constraint_string(value),
+        Value::Concrete(ConcreteValue::String(value)) => value
+            .diagnostic_literal()
+            .map(format_constraint_string)
+            .unwrap_or_else(|| "string".to_string()),
         Value::Concrete(ConcreteValue::List(values)) => format!(
             "[{}]",
             values
@@ -610,7 +613,12 @@ fn format_constraint_actual(value: &Value) -> String {
             "[{}]",
             values
                 .iter()
-                .map(|value| format_constraint_string(value))
+                .map(|value| {
+                    value
+                        .diagnostic_literal()
+                        .map(format_constraint_string)
+                        .unwrap_or_else(|| "string".to_string())
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -693,7 +701,7 @@ fn eval_expr(expr: &ValidateExpr, arguments: &HashMap<String, Value>) -> Result<
         ValidateExpr::Int(value) => Ok(value_from(ConcreteValue::Int(*value))),
         ValidateExpr::Float(value) => Ok(value_from(ConcreteValue::Float(*value))),
         ValidateExpr::Duration(value) => Ok(value_from(ConcreteValue::Duration(*value))),
-        ValidateExpr::String(value) => Ok(value_from(ConcreteValue::String(value.clone()))),
+        ValidateExpr::String(value) => Ok(value_from(ConcreteValue::String(value.clone().into()))),
         ValidateExpr::Null => Ok(EvalValue::Null),
         ValidateExpr::Var(name) => arguments
             .get(name)
@@ -835,7 +843,9 @@ fn eval_function(
             }
             let value = eval_expr(&args[0], arguments)?;
             let length = match value {
-                EvalValue::Value(Value::Concrete(ConcreteValue::String(value))) => value.len(),
+                EvalValue::Value(Value::Concrete(ConcreteValue::String(value))) => {
+                    value.expose_plaintext().len()
+                }
                 EvalValue::Value(Value::Concrete(ConcreteValue::List(value))) => value.len(),
                 EvalValue::Value(Value::Concrete(ConcreteValue::StringList(value))) => value.len(),
                 EvalValue::Value(Value::Concrete(ConcreteValue::Map(value))) => value.len(),
@@ -895,7 +905,7 @@ mod tests {
         let cases = [
             (
                 "string",
-                Value::Concrete(ConcreteValue::String("ab".to_string())),
+                Value::Concrete(ConcreteValue::String("ab".into())),
             ),
             (
                 "list",
@@ -906,10 +916,7 @@ mod tests {
             ),
             (
                 "string_list",
-                Value::Concrete(ConcreteValue::StringList(vec![
-                    "a".to_string(),
-                    "b".to_string(),
-                ])),
+                Value::Concrete(ConcreteValue::StringList(vec!["a".into(), "b".into()])),
             ),
             (
                 "map",
@@ -937,8 +944,8 @@ mod tests {
         let arguments = HashMap::from([(
             "items".to_string(),
             Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("a".to_string())),
-                Value::Concrete(ConcreteValue::String("b".to_string())),
+                Value::Concrete(ConcreteValue::String("a".into())),
+                Value::Concrete(ConcreteValue::String("b".into())),
             ])),
         )]);
 
@@ -954,17 +961,13 @@ mod tests {
         let nested = Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "list".to_string(),
-                Value::Concrete(ConcreteValue::StringList(vec![
-                    "a".to_string(),
-                    "b".to_string(),
-                ])),
+                Value::Concrete(ConcreteValue::StringList(vec!["a".into(), "b".into()])),
             ),
             (
                 "secret".to_string(),
-                Value::Concrete(ConcreteValue::String(format!(
-                    "{}deadbeef",
-                    crate::value::SECRET_PREFIX
-                ))),
+                Value::Concrete(ConcreteValue::String(
+                    format!("{}deadbeef", crate::value::SECRET_PREFIX).into(),
+                )),
             ),
         ])));
         assert_eq!(
@@ -983,7 +986,7 @@ mod tests {
         let arguments = HashMap::from([(
             "password".to_string(),
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("plaintext".to_string()),
+                ConcreteValue::String("plaintext".into()),
             )))),
         )]);
 
@@ -1013,18 +1016,17 @@ mod tests {
         let values = HashMap::from([
             (
                 "plain".to_string(),
-                Value::Concrete(ConcreteValue::String("abc".to_string())),
+                Value::Concrete(ConcreteValue::String("abc".into())),
             ),
             (
                 "enum_text".to_string(),
-                Value::Concrete(ConcreteValue::String("aws.Region.us_east_1".to_string())),
+                Value::Concrete(ConcreteValue::String("aws.Region.us_east_1".into())),
             ),
             (
                 "secret_hash".to_string(),
-                Value::Concrete(ConcreteValue::String(format!(
-                    "{}deadbeef",
-                    crate::value::SECRET_PREFIX
-                ))),
+                Value::Concrete(ConcreteValue::String(
+                    format!("{}deadbeef", crate::value::SECRET_PREFIX).into(),
+                )),
             ),
         ]);
 
@@ -1105,7 +1107,7 @@ mod tests {
         }];
         let values = HashMap::from([(
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("abc".to_string())),
+            Value::Concrete(ConcreteValue::String("abc".into())),
         )]);
         let evaluated = evaluate_module_constraints(
             ModuleConstraints::declarations(&declarations, &[]),

@@ -27,9 +27,9 @@ pub(crate) fn builtin_length(args: &[Value]) -> Result<Value, String> {
         Value::Concrete(ConcreteValue::Map(map)) => {
             Ok(Value::Concrete(ConcreteValue::Int(map.len() as i64)))
         }
-        Value::Concrete(ConcreteValue::String(s)) => {
-            Ok(Value::Concrete(ConcreteValue::Int(s.len() as i64)))
-        }
+        Value::Concrete(ConcreteValue::String(s)) => Ok(Value::Concrete(ConcreteValue::Int(
+            s.expose_plaintext().len() as i64,
+        ))),
         other => Err(format!(
             "length() argument must be a List, Map, or String, got {}",
             value_type_name(other)
@@ -81,14 +81,14 @@ mod tests {
 
     #[test]
     fn length_string() {
-        let args = vec![Value::Concrete(ConcreteValue::String("hello".to_string()))];
+        let args = vec![Value::Concrete(ConcreteValue::String("hello".into()))];
         let result = evaluate_builtin("length", &args).unwrap();
         assert_eq!(result, Value::Concrete(ConcreteValue::Int(5)));
     }
 
     #[test]
     fn length_empty_string() {
-        let args = vec![Value::Concrete(ConcreteValue::String("".to_string()))];
+        let args = vec![Value::Concrete(ConcreteValue::String("".into()))];
         let result = evaluate_builtin("length", &args).unwrap();
         assert_eq!(result, Value::Concrete(ConcreteValue::Int(0)));
     }

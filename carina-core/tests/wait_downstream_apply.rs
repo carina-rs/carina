@@ -79,12 +79,14 @@ impl Provider for MockProvider {
                 let mut attrs = HashMap::new();
                 attrs.insert(
                     "status".to_string(),
-                    Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+                    Value::Concrete(ConcreteValue::String("ISSUED".into())),
                 );
                 attrs.insert(
                     "certificate_arn".to_string(),
                     Value::Concrete(ConcreteValue::String(
-                        "arn:aws:acm:us-east-1:111:certificate/abc".to_string(),
+                        "arn:aws:acm:us-east-1:111:certificate/abc"
+                            .to_string()
+                            .into(),
                     )),
                 );
                 Ok(State::existing(id, attrs).with_identifier("acm-cert-id"))
@@ -113,12 +115,12 @@ impl Provider for MockProvider {
             if id.resource_type == "acm.Certificate" {
                 attrs.insert(
                     "status".to_string(),
-                    Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".to_string())),
+                    Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".into())),
                 );
             }
             attrs.insert(
                 "id".to_string(),
-                Value::Concrete(ConcreteValue::String("id-123".to_string())),
+                Value::Concrete(ConcreteValue::String("id-123".into())),
             );
             Ok(CreateOutcome::Success {
                 state: State::existing(id, attrs).with_identifier("id-123"),
@@ -554,7 +556,7 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     let mut cert_attrs = HashMap::new();
     cert_attrs.insert(
         "certificate_arn".to_string(),
-        Value::Concrete(ConcreteValue::String(arn.to_string())),
+        Value::Concrete(ConcreteValue::String(arn.to_string().into())),
     );
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
     current_states.insert(
@@ -612,7 +614,7 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
     };
     assert_eq!(
         arn_value,
-        &Value::Concrete(ConcreteValue::String(arn.to_string())),
+        &Value::Concrete(ConcreteValue::String(arn.to_string().into())),
         "carina#3085: acm_certificate_arn must resolve through the wait \
          binding to cert's ARN, not stay an unresolved ResourceRef \
          (got {arn_value:?})"

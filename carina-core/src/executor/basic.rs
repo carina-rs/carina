@@ -1006,7 +1006,7 @@ mod assert_fully_resolved_tests {
     #[test]
     fn interpolation_with_unresolved_part_is_rejected() {
         let v = Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Literal("prefix-".to_string()),
+            InterpolationPart::Literal("prefix-".into()),
             InterpolationPart::Expr(dvo_chained_ref()),
         ]));
         let err = assert_fully_resolved(&v, "name", &empty_bindings())
@@ -1069,7 +1069,7 @@ mod assert_fully_resolved_tests {
     fn interpolation_into_upstream_state_binding_does_not_suggest_wait() {
         let path = AccessPath::with_segments("infra", "cloudfront_distribution_id", vec![]);
         let v = Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Literal("arn:aws:cloudfront::123:distribution/".to_string()),
+            InterpolationPart::Literal("arn:aws:cloudfront::123:distribution/".into()),
             InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef { path })),
         ]));
         let bindings = bindings_with("infra", BindingValueSource::Upstream);
@@ -1126,7 +1126,7 @@ mod assert_fully_resolved_tests {
             InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
                 path: local_path,
             })),
-            InterpolationPart::Literal("-".to_string()),
+            InterpolationPart::Literal("-".into()),
             InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
                 path: upstream_path,
             })),

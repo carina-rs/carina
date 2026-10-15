@@ -87,7 +87,7 @@ mod tests {
     use crate::wait::predicate::{AttrPath, WaitPredicate};
 
     fn string_value(value: &str) -> Value {
-        Value::Concrete(ConcreteValue::String(value.to_string()))
+        Value::Concrete(ConcreteValue::String(value.to_string().into()))
     }
 
     fn equals_predicate(attr: AttrPath, value: &str) -> WaitPredicate {

@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::parser::ProviderConfig;
 use crate::parser::StateBlockAddress;
 use crate::resource::{
-    ConcreteValue, DeferredValue, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
+    ConcreteValue, DeferredValue, ResolvedResourceId, Resource, ResourceId, ResourceIdentity,
+    Value, ValueString,
 };
 use crate::schema::{ResourceSchema, SchemaRegistry};
 use crate::validation::is_string_compatible_type;
@@ -149,7 +150,7 @@ fn stable_anonymous_hash_inputs(
                 .get(&unresolved_prefix)
                 .map(|value| match value {
                     Value::Concrete(ConcreteValue::String(prefix)) => {
-                        format!("Prefix({prefix:?})")
+                        format!("Prefix({:?})", prefix.expose_plaintext())
                     }
                     value => format!("Prefix({})", deterministic_value_string(value)),
                 })
@@ -381,7 +382,7 @@ pub fn resolve_attr_prefixes(
         };
 
         // Collect prefix attributes to process
-        let prefix_attrs: Vec<(String, String)> = resource
+        let prefix_attrs: Vec<(String, ValueString)> = resource
             .attributes
             .iter()
             .filter_map(|(key, value)| {
@@ -400,7 +401,7 @@ pub fn resolve_attr_prefixes(
             let prefix_key = format!("{}_prefix", base_attr);
 
             // Error if prefix is empty
-            if prefix_value.is_empty() {
+            if prefix_value.expose_plaintext().is_empty() {
                 all_errors.push(format!("{}: '{}' cannot be empty", resource.id, prefix_key));
                 continue;
             }
@@ -420,12 +421,20 @@ pub fn resolve_attr_prefixes(
             resource.attributes.shift_remove(&prefix_key);
 
             // Store prefix
-            resource
-                .prefixes
-                .insert(base_attr.clone(), prefix_value.clone());
+            resource.prefixes.insert(
+                base_attr.clone(),
+                prefix_value.expose_plaintext().to_owned(),
+            );
 
             // Generate temporary name
-            let generated_name = format!("{}{}", prefix_value, generate_random_suffix());
+            let generated_name = ValueString::derived_from(
+                format!(
+                    "{}{}",
+                    prefix_value.expose_plaintext(),
+                    generate_random_suffix()
+                ),
+                [&prefix_value],
+            );
             resource.set_attr(
                 base_attr,
                 Value::Concrete(ConcreteValue::String(generated_name)),
@@ -482,7 +491,7 @@ pub fn reconcile_prefixed_names(
                     state_info.attribute_values.get(attr_name).map(|name_str| {
                         (
                             attr_name.clone(),
-                            Value::Concrete(ConcreteValue::String(name_str.clone())),
+                            Value::Concrete(ConcreteValue::String(name_str.clone().into())),
                         )
                     })
                 } else {
@@ -502,7 +511,9 @@ pub fn reconcile_prefixed_names(
 /// so the output is consistent across runs (HashMap iteration order is random).
 fn deterministic_value_string(value: &Value) -> String {
     match value {
-        Value::Concrete(ConcreteValue::String(s)) => format!("String({:?})", s),
+        Value::Concrete(ConcreteValue::String(s)) => {
+            format!("String({:?})", s.expose_plaintext())
+        }
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
             format!("EnumIdentifier({:?})", s.as_str())
         }
@@ -518,7 +529,10 @@ fn deterministic_value_string(value: &Value) -> String {
             format!("List([{}])", parts.join(", "))
         }
         Value::Concrete(ConcreteValue::StringList(items)) => {
-            let parts: Vec<String> = items.iter().map(|s| format!("{:?}", s)).collect();
+            let parts: Vec<String> = items
+                .iter()
+                .map(|s| format!("{:?}", s.expose_plaintext()))
+                .collect();
             format!("StringList([{}])", parts.join(", "))
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
@@ -531,7 +545,7 @@ fn deterministic_value_string(value: &Value) -> String {
             format!("Map({{{}}})", parts.join(", "))
         }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            format!("ResourceRef({})", path.to_dot_string())
+            format!("ResourceRef({})", path.to_plaintext_dot_string())
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             format!("BindingRef({})", binding)
@@ -541,7 +555,9 @@ fn deterministic_value_string(value: &Value) -> String {
             let strs: Vec<String> = parts
                 .iter()
                 .map(|p| match p {
-                    InterpolationPart::Literal(s) => format!("Literal({:?})", s),
+                    InterpolationPart::Literal(s) => {
+                        format!("Literal({:?})", s.expose_plaintext())
+                    }
                     InterpolationPart::Expr(v) => {
                         format!("Expr({})", deterministic_value_string(v))
                     }
@@ -560,7 +576,7 @@ fn deterministic_value_string(value: &Value) -> String {
             use crate::resource::UnknownReason;
             match reason {
                 UnknownReason::UpstreamRef { path } => {
-                    format!("Unknown(UpstreamRef({}))", path.to_dot_string())
+                    format!("Unknown(UpstreamRef({}))", path.to_plaintext_dot_string())
                 }
                 UnknownReason::UpstreamBareRef { binding } => {
                     format!("Unknown(UpstreamBareRef({}))", binding)
@@ -575,7 +591,7 @@ fn deterministic_value_string(value: &Value) -> String {
                     format!("Unknown(FnLocal({name}))")
                 }
                 UnknownReason::ForValuePath { path } => {
-                    format!("Unknown(ForValuePath({}))", path.to_dot_string())
+                    format!("Unknown(ForValuePath({}))", path.to_plaintext_dot_string())
                 }
                 UnknownReason::EmptyInterpolation => "Unknown(EmptyInterpolation)".to_string(),
                 UnknownReason::PostCreateReadIncomplete { detail } => {
@@ -588,7 +604,7 @@ fn deterministic_value_string(value: &Value) -> String {
 
 fn canonical_create_only_value_string(value: &Value) -> Option<String> {
     match value {
-        Value::Concrete(ConcreteValue::String(s)) => Some(s.to_string()),
+        Value::Concrete(ConcreteValue::String(s)) => Some(s.expose_plaintext().to_owned()),
         Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => Some(raw.as_str().to_string()),
         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
             Some(format!("EnumApiValue({:?})", c.api_value()))
@@ -608,9 +624,14 @@ fn canonical_create_only_value_string(value: &Value) -> Option<String> {
         }
         // State JSON cannot distinguish StringList from List, so the
         // canonical comparison channel uses the List form.
-        Value::Concrete(ConcreteValue::StringList(items)) => {
-            Some(format!("List([{}])", items.join(", ")))
-        }
+        Value::Concrete(ConcreteValue::StringList(items)) => Some(format!(
+            "List([{}])",
+            items
+                .iter()
+                .map(|item| item.expose_plaintext())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
         Value::Concrete(ConcreteValue::Map(map)) => {
             let mut entries: Vec<(&String, &Value)> = map.iter().collect();
             entries.sort_by_key(|(key, _)| *key);
@@ -1372,7 +1393,7 @@ pub fn detect_anonymous_to_named_renames(
         let mut resource_co_values: HashMap<&str, String> = HashMap::new();
         for attr_name in &create_only_attrs {
             if let Some(Value::Concrete(ConcreteValue::String(v))) = resource.get_attr(attr_name) {
-                resource_co_values.insert(attr_name, v.clone());
+                resource_co_values.insert(attr_name, v.expose_plaintext().to_owned());
             }
         }
 

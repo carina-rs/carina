@@ -1235,7 +1235,7 @@ mock.test.Thing {
                 .and_then(|v| match v {
                     carina_core::resource::Value::Concrete(
                         carina_core::resource::ConcreteValue::String(s),
-                    ) => Some(s.as_str()),
+                    ) => Some(s.expose_plaintext()),
                     _ => None,
                 })
                 .map(|p| std::path::Path::new(p).exists())
@@ -1261,7 +1261,9 @@ mock.test.Thing {
         let mut attributes = IndexMap::new();
         attributes.insert(
             "_installed_at".to_string(),
-            Value::Concrete(ConcreteValue::String(installed.display().to_string())),
+            Value::Concrete(ConcreteValue::String(
+                installed.display().to_string().into(),
+            )),
         );
         let config = ProviderConfig {
             name: "foo".into(),

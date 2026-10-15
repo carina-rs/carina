@@ -876,7 +876,7 @@ mod tests {
         });
         plan.add(Effect::Import {
             id: carina_core::resource::ResolvedResourceId::new(import_id),
-            identifier: Value::Concrete(ConcreteValue::String("group".to_string())),
+            identifier: Value::Concrete(ConcreteValue::String("group".into())),
         });
         plan.add(Effect::Remove {
             id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_provider_identity(

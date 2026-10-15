@@ -278,6 +278,8 @@ let vpcs = for (i, env) in ['dev', 'stg'] {
 
 Reads an environment variable. Returns an error if the variable is not set.
 
+Environment values behave like ordinary strings in expressions, plans, providers, and state. To prevent accidental disclosure, diagnostics identify an environment-derived value only by type (for example, `got string`) and never include its contents. Use `secret(env(...))` when the value must also be masked in plans and hashed in state.
+
 ```
 env(name: String) -> String
 ```
@@ -291,7 +293,9 @@ let db_host = env('DB_HOST')
 
 ### `secret`
 
-Marks a value as secret. The value is sent to the provider but stored only as a SHA256 hash in state. Plan output displays `(secret)` instead of the actual value.
+Marks a value as secret. The value is sent to the provider, and plan output displays `(secret)` instead of the actual value. The serialized representation of `Secret` in resource state is an Argon2id hash rather than plaintext. Applying `secret()` to an already-secret value is idempotent.
+
+Values derived from `secret()` or `decrypt()` cannot be published through `exports`; `carina validate` and `carina plan` report `export '<name>' cannot hold a secret value`.
 
 ```
 secret(value: Any) -> Secret
@@ -308,7 +312,7 @@ awscc.rds.DbInstance {
 Decrypts ciphertext using the configured provider's encryption service (e.g., AWS KMS). The key argument is optional when the key identifier is embedded in the ciphertext.
 
 ```
-decrypt(ciphertext: String, key?: String) -> String
+decrypt(ciphertext: String, key?: String) -> Secret
 ```
 
 ```crn
@@ -318,10 +322,12 @@ let password = decrypt('AQICAHh...')
 # Explicit key
 let password = decrypt('AQICAHh...', 'alias/my-key')
 
-# Combined with secret() to prevent storing the decrypted value in state
+# The decrypted result is already secret
 awscc.rds.DbInstance {
-  master_user_password = secret(decrypt('AQICAHh...'))
+  master_user_password = decrypt('AQICAHh...')
 }
 ```
+
+The result is automatically masked as `(secret)` in plans, and providers receive the plaintext. Wrapping it in `secret()` is harmless but unnecessary.
 
 Requires a configured provider with encryption support. An error is raised if no provider is configured or credentials are unavailable.

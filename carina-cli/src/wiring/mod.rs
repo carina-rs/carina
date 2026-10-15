@@ -988,7 +988,7 @@ fn resolved_constraint_context(
             origins_by_attribute
                 .entry(attribute.clone())
                 .or_default()
-                .insert(path.to_dot_string());
+                .insert(path.to_plaintext_dot_string());
         });
     }
 

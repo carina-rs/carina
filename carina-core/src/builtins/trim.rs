@@ -1,6 +1,6 @@
 //! `trim(string)` built-in function
 
-use crate::resource::{ConcreteValue, Value};
+use crate::resource::{ConcreteValue, Value, ValueString};
 
 use super::value_type_name;
 
@@ -32,7 +32,9 @@ pub(crate) fn builtin_trim(args: &[Value]) -> Result<Value, String> {
         }
     };
 
-    Ok(Value::Concrete(ConcreteValue::String(s.trim().to_string())))
+    Ok(Value::Concrete(ConcreteValue::String(
+        ValueString::derived_from(s.expose_plaintext().trim(), [s]),
+    )))
 }
 
 #[cfg(test)]
@@ -42,99 +44,87 @@ mod tests {
 
     #[test]
     fn trim_both_sides() {
-        let args = vec![Value::Concrete(ConcreteValue::String(
-            "  hello  ".to_string(),
-        ))];
+        let args = vec![Value::Concrete(ConcreteValue::String("  hello  ".into()))];
         let result = evaluate_builtin("trim", &args).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("hello".to_string()))
+            Value::Concrete(ConcreteValue::String("hello".into()))
         );
     }
 
     #[test]
     fn trim_leading_only() {
-        let args = vec![Value::Concrete(ConcreteValue::String(
-            "  hello".to_string(),
-        ))];
+        let args = vec![Value::Concrete(ConcreteValue::String("  hello".into()))];
         let result = evaluate_builtin("trim", &args).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("hello".to_string()))
+            Value::Concrete(ConcreteValue::String("hello".into()))
         );
     }
 
     #[test]
     fn trim_trailing_only() {
-        let args = vec![Value::Concrete(ConcreteValue::String(
-            "hello  ".to_string(),
-        ))];
+        let args = vec![Value::Concrete(ConcreteValue::String("hello  ".into()))];
         let result = evaluate_builtin("trim", &args).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("hello".to_string()))
+            Value::Concrete(ConcreteValue::String("hello".into()))
         );
     }
 
     #[test]
     fn trim_no_whitespace() {
-        let args = vec![Value::Concrete(ConcreteValue::String("hello".to_string()))];
+        let args = vec![Value::Concrete(ConcreteValue::String("hello".into()))];
         let result = evaluate_builtin("trim", &args).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("hello".to_string()))
+            Value::Concrete(ConcreteValue::String("hello".into()))
         );
     }
 
     #[test]
     fn trim_empty_string() {
-        let args = vec![Value::Concrete(ConcreteValue::String("".to_string()))];
+        let args = vec![Value::Concrete(ConcreteValue::String("".into()))];
         let result = evaluate_builtin("trim", &args).unwrap();
-        assert_eq!(
-            result,
-            Value::Concrete(ConcreteValue::String("".to_string()))
-        );
+        assert_eq!(result, Value::Concrete(ConcreteValue::String("".into())));
     }
 
     #[test]
     fn trim_whitespace_only() {
-        let args = vec![Value::Concrete(ConcreteValue::String("   ".to_string()))];
+        let args = vec![Value::Concrete(ConcreteValue::String("   ".into()))];
         let result = evaluate_builtin("trim", &args).unwrap();
-        assert_eq!(
-            result,
-            Value::Concrete(ConcreteValue::String("".to_string()))
-        );
+        assert_eq!(result, Value::Concrete(ConcreteValue::String("".into())));
     }
 
     #[test]
     fn trim_tabs_and_newlines() {
         let args = vec![Value::Concrete(ConcreteValue::String(
-            "\n\t hello \t\n".to_string(),
+            "\n\t hello \t\n".into(),
         ))];
         let result = evaluate_builtin("trim", &args).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("hello".to_string()))
+            Value::Concrete(ConcreteValue::String("hello".into()))
         );
     }
 
     #[test]
     fn trim_preserves_inner_whitespace() {
         let args = vec![Value::Concrete(ConcreteValue::String(
-            "  hello world  ".to_string(),
+            "  hello world  ".into(),
         ))];
         let result = evaluate_builtin("trim", &args).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("hello world".to_string()))
+            Value::Concrete(ConcreteValue::String("hello world".into()))
         );
     }
 
     #[test]
     fn trim_wrong_arg_count() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("a".to_string())),
-            Value::Concrete(ConcreteValue::String("b".to_string())),
+            Value::Concrete(ConcreteValue::String("a".into())),
+            Value::Concrete(ConcreteValue::String("b".into())),
         ];
         let result = evaluate_builtin("trim", &args);
         assert!(result.is_err());

@@ -435,7 +435,7 @@ mod tests {
     fn equals_predicate(attr: AttrPath, value: &str) -> WaitPredicate {
         WaitPredicate::Equals {
             attr,
-            value: Value::Concrete(ConcreteValue::String(value.to_string())),
+            value: Value::Concrete(ConcreteValue::String(value.to_string().into())),
         }
     }
 
@@ -445,11 +445,11 @@ mod tests {
         let attrs = HashMap::from([
             (
                 "status".to_string(),
-                Value::Concrete(ConcreteValue::String("pending".to_string())),
+                Value::Concrete(ConcreteValue::String("pending".into())),
             ),
             (
                 "arn".to_string(),
-                Value::Concrete(ConcreteValue::String("arn:demo".to_string())),
+                Value::Concrete(ConcreteValue::String("arn:demo".into())),
             ),
         ]);
         let predicate = equals_predicate(AttrPath::single("missing"), "present");
@@ -466,11 +466,11 @@ mod tests {
         let attrs = HashMap::from([
             (
                 "arn".to_string(),
-                Value::Concrete(ConcreteValue::String("arn:demo".to_string())),
+                Value::Concrete(ConcreteValue::String("arn:demo".into())),
             ),
             (
                 "status".to_string(),
-                Value::Concrete(ConcreteValue::String("pending".to_string())),
+                Value::Concrete(ConcreteValue::String("pending".into())),
             ),
         ]);
         let observation = wait_observation(&target_id, &predicate, &attrs);
@@ -488,7 +488,7 @@ mod tests {
             "renewal_summary".to_string(),
             Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                 "renewal_status".to_string(),
-                Value::Concrete(ConcreteValue::String("PENDING".to_string())),
+                Value::Concrete(ConcreteValue::String("PENDING".into())),
             )]))),
         )]);
         let observation = wait_observation(&target_id, &predicate, &attrs);
@@ -507,11 +507,11 @@ mod tests {
         let attrs = HashMap::from([
             (
                 "status".to_string(),
-                Value::Concrete(ConcreteValue::String("pending".to_string())),
+                Value::Concrete(ConcreteValue::String("pending".into())),
             ),
             (
                 "arn".to_string(),
-                Value::Concrete(ConcreteValue::String("arn:demo".to_string())),
+                Value::Concrete(ConcreteValue::String("arn:demo".into())),
             ),
         ]);
         let observation = wait_observation(&target_id, &predicate, &attrs);
@@ -525,7 +525,7 @@ mod tests {
         let attrs = HashMap::from([(
             "arn".to_string(),
             Value::Concrete(ConcreteValue::String(
-                "arn:aws:acm:1:certificate/abc".to_string(),
+                "arn:aws:acm:1:certificate/abc".into(),
             )),
         )]);
         let predicate = equals_predicate(AttrPath::single("missing"), "present");

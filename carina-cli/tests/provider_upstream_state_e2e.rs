@@ -117,7 +117,9 @@ fn provider_attributes_resolve_upstream_state_refs_post_load() {
     mgmt_attrs.insert(
         "delegation_writer_role_arn".to_string(),
         Value::Concrete(ConcreteValue::String(
-            "arn:aws:iam::412038850359:role/carina-route53-delegation-writer".to_string(),
+            "arn:aws:iam::412038850359:role/carina-route53-delegation-writer"
+                .to_string()
+                .into(),
         )),
     );
     let mut remote = std::collections::HashMap::new();
@@ -141,14 +143,16 @@ fn provider_attributes_resolve_upstream_state_refs_post_load() {
     assert_eq!(
         m.get("role_arn"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "arn:aws:iam::412038850359:role/carina-route53-delegation-writer".to_string()
+            "arn:aws:iam::412038850359:role/carina-route53-delegation-writer"
+                .to_string()
+                .into()
         ))),
         "role_arn must be substituted from the upstream binding; got: {m:?}",
     );
     assert_eq!(
         m.get("session_name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "carina-test".to_string()
+            "carina-test".into()
         ))),
         "literal sibling must be preserved post-resolve",
     );

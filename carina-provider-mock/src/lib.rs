@@ -358,14 +358,14 @@ impl MockProvider {
         let name = attrs
             .get("name")
             .and_then(|value| match value {
-                Value::Concrete(ConcreteValue::String(name)) => Some(name.as_str()),
+                Value::Concrete(ConcreteValue::String(name)) => Some(name.expose_plaintext()),
                 _ => None,
             })
             .map(str::to_string);
         if let Some(identifier) = Self::test_resource_identifier(id, name.as_deref()) {
             attrs
                 .entry("identifier".to_string())
-                .or_insert_with(|| Value::Concrete(ConcreteValue::String(identifier)));
+                .or_insert_with(|| Value::Concrete(ConcreteValue::String(identifier.into())));
         }
     }
 
@@ -790,6 +790,7 @@ mod tests {
     }
 
     fn string_value(value: impl Into<String>) -> Value {
+        let value: String = value.into();
         Value::Concrete(ConcreteValue::String(value.into()))
     }
 

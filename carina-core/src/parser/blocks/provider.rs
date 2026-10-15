@@ -56,7 +56,7 @@ pub(in crate::parser) fn parse_provider_block(
     let source = if let Some(Value::Concrete(ConcreteValue::String(s))) =
         attributes.shift_remove("source")
     {
-        Some(s)
+        Some(s.into_plaintext())
     } else {
         None
     };
@@ -65,12 +65,18 @@ pub(in crate::parser) fn parse_provider_block(
     let version = if let Some(Value::Concrete(ConcreteValue::String(v))) =
         attributes.shift_remove("version")
     {
-        Some(VersionConstraint::parse(&v).map_err(|e| {
-            pest::error::Error::new_from_pos(
-                pest::error::ErrorVariant::CustomError { message: e },
-                pest::Position::from_start(""),
-            )
-        })?)
+        Some(
+            VersionConstraint::parse(v.expose_plaintext()).map_err(|error| {
+                let message = match v.diagnostic_literal() {
+                    Some(_) => error,
+                    None => "Invalid version constraint: value from env()".to_string(),
+                };
+                pest::error::Error::new_from_pos(
+                    pest::error::ErrorVariant::CustomError { message },
+                    pest::Position::from_start(""),
+                )
+            })?,
+        )
     } else {
         None
     };
@@ -79,7 +85,7 @@ pub(in crate::parser) fn parse_provider_block(
     let revision = if let Some(Value::Concrete(ConcreteValue::String(r))) =
         attributes.shift_remove("revision")
     {
-        Some(r)
+        Some(r.into_plaintext())
     } else {
         None
     };

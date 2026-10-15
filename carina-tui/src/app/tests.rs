@@ -152,14 +152,14 @@ fn update_effect_has_detail_rows() {
             ResourceId::with_identity("s3.Bucket", "my-bucket"),
             [(
                 "versioning".to_string(),
-                Value::Concrete(ConcreteValue::String("Disabled".to_string())),
+                Value::Concrete(ConcreteValue::String("Disabled".into())),
             )]
             .into_iter()
             .collect(),
         )),
         to: resolved(Resource::new("s3.Bucket", "my-bucket").with_attribute(
             "versioning",
-            Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+            Value::Concrete(ConcreteValue::String("Enabled".into())),
         )),
         changed_attributes: vec!["versioning".to_string()],
     });
@@ -182,7 +182,7 @@ fn internal_attributes_filtered() {
         Resource::new("s3.Bucket", "my-bucket")
             .with_attribute(
                 "name",
-                Value::Concrete(ConcreteValue::String("test".to_string())),
+                Value::Concrete(ConcreteValue::String("test".into())),
             )
             .with_binding("my_bucket")
             .with_module_source(carina_core::resource::ModuleSource::module("web", "web")),
@@ -202,7 +202,7 @@ fn internal_attributes_filtered() {
 #[test]
 fn format_value_display() {
     assert_eq!(
-        format_value(&Value::Concrete(ConcreteValue::String("hello".to_string()))),
+        format_value(&Value::Concrete(ConcreteValue::String("hello".into()))),
         "\"hello\""
     );
     assert_eq!(format_value(&Value::Concrete(ConcreteValue::Int(42))), "42");
@@ -228,7 +228,7 @@ fn tree_structure_with_dependencies() {
             .with_binding("vpc")
             .with_attribute(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             ),
     ));
     plan.add(create(
@@ -259,7 +259,7 @@ fn selected_node_returns_correct_node() {
     plan.add(create(
         Resource::new("s3.Bucket", "my-bucket").with_attribute(
             "name",
-            Value::Concrete(ConcreteValue::String("test".to_string())),
+            Value::Concrete(ConcreteValue::String("test".into())),
         ),
     ));
 
@@ -401,7 +401,7 @@ fn make_tree_plan() -> Plan {
             .with_binding("vpc")
             .with_attribute(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             ),
     ));
     plan.add(create(
@@ -624,7 +624,9 @@ fn format_value_resolves_dsl_enum_identifiers() {
     // 5-part DSL enum: should resolve to quoted value
     assert_eq!(
         format_value(&Value::Concrete(ConcreteValue::String(
-            "awscc.ec2.vpc_endpoint.VpcEndpointType.Interface".to_string()
+            "awscc.ec2.vpc_endpoint.VpcEndpointType.Interface"
+                .to_string()
+                .into()
         ))),
         "\"Interface\""
     );
@@ -632,7 +634,7 @@ fn format_value_resolves_dsl_enum_identifiers() {
     // 4-part DSL enum
     assert_eq!(
         format_value(&Value::Concrete(ConcreteValue::String(
-            "aws.s3.VersioningStatus.Enabled".to_string()
+            "aws.s3.VersioningStatus.Enabled".into()
         ))),
         "\"Enabled\""
     );
@@ -640,16 +642,14 @@ fn format_value_resolves_dsl_enum_identifiers() {
     // 3-part DSL enum: namespace stripped, value returned as-is
     assert_eq!(
         format_value(&Value::Concrete(ConcreteValue::String(
-            "aws.Region.ap_northeast_1".to_string()
+            "aws.Region.ap_northeast_1".into()
         ))),
         "\"ap_northeast_1\""
     );
 
     // Regular string should be quoted as-is
     assert_eq!(
-        format_value(&Value::Concrete(ConcreteValue::String(
-            "my-bucket".to_string()
-        ))),
+        format_value(&Value::Concrete(ConcreteValue::String("my-bucket".into()))),
         "\"my-bucket\""
     );
 
@@ -672,7 +672,9 @@ fn create_effect_attributes_resolve_enum_values() {
             .with_attribute(
                 "vpc_endpoint_type",
                 Value::Concrete(ConcreteValue::String(
-                    "awscc.ec2.vpc_endpoint.VpcEndpointType.Interface".to_string(),
+                    "awscc.ec2.vpc_endpoint.VpcEndpointType.Interface"
+                        .to_string()
+                        .into(),
                 )),
             )
             .with_attribute(
@@ -721,14 +723,14 @@ fn move_suppressed_when_update_exists_for_same_target() {
             ResourceId::with_identity("s3.Bucket", "new-name"),
             [(
                 "versioning".to_string(),
-                Value::Concrete(ConcreteValue::String("Disabled".to_string())),
+                Value::Concrete(ConcreteValue::String("Disabled".into())),
             )]
             .into_iter()
             .collect(),
         )),
         to: resolved(Resource::new("s3.Bucket", "new-name").with_attribute(
             "versioning",
-            Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+            Value::Concrete(ConcreteValue::String("Enabled".into())),
         )),
         changed_attributes: vec!["versioning".to_string()],
     });

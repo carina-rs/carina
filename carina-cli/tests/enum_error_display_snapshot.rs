@@ -127,7 +127,7 @@ fn string_literal_expected_enum_enum_display() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "target_type".to_string(),
-        Value::Concrete(ConcreteValue::String("aaa".to_string())),
+        Value::Concrete(ConcreteValue::String("aaa".into())),
     );
     insta::assert_snapshot!(render_first_error(&schema, attrs, true));
 }
@@ -137,9 +137,10 @@ fn string_literal_expected_enum_custom_namespaced_display() {
     fn validate_mode(v: &Value) -> Result<(), String> {
         match v {
             Value::Concrete(ConcreteValue::String(s)) if s == "test.r.Mode.fast" => Ok(()),
-            Value::Concrete(ConcreteValue::String(s)) => {
-                Err(format!("invalid Mode '{}': expected fast", s))
-            }
+            Value::Concrete(ConcreteValue::String(s)) => Err(format!(
+                "invalid Mode '{}': expected fast",
+                s.expose_plaintext()
+            )),
             _ => Err("expected String".to_string()),
         }
     }
@@ -163,7 +164,7 @@ fn string_literal_expected_enum_custom_namespaced_display() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "mode".to_string(),
-        Value::Concrete(ConcreteValue::String("aaa".to_string())),
+        Value::Concrete(ConcreteValue::String("aaa".into())),
     );
     insta::assert_snapshot!(render_first_error(&schema, attrs, true));
 }

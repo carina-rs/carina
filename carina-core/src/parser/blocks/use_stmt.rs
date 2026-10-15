@@ -49,7 +49,7 @@ pub(in crate::parser) fn parse_use_expr(
                 message: "`use` block has more than one `source` attribute".to_string(),
             });
         }
-        source = Some(path);
+        source = Some(path.into_plaintext());
     }
 
     let path = source.ok_or_else(|| ParseError::InvalidExpression {

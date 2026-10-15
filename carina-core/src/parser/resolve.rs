@@ -457,6 +457,67 @@ fn resolve_resource_refs_with_policy(
         parsed.variables[&key] = resolved;
     }
 
+    // Resolve calls in every other value-bearing declaration as well. These
+    // expressions may name a user function declared in a sibling `.crn`
+    // file, so the per-file parser necessarily leaves a FunctionCall behind.
+    // Type checking module arguments, attributes, or exports before this pass
+    // would treat that deferred call as unknown and silently accept it.
+    for call in &mut parsed.module_calls {
+        for argument in call.arguments.values_mut() {
+            *argument = resolve_function_calls_only(
+                argument,
+                &binding_map,
+                &fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
+        }
+    }
+    for argument in &mut parsed.arguments {
+        if let Some(default) = &mut argument.default {
+            *default = resolve_function_calls_only(
+                default,
+                &binding_map,
+                &fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
+        }
+    }
+    for attribute in &mut parsed.attribute_params {
+        // Keep unannotated outputs in expression form until inference has
+        // classified the function's return type. In particular, eagerly
+        // reducing an `Any` builtin such as `lookup()` would incorrectly make
+        // an otherwise-uninferrable output look like a concrete String.
+        if attribute.type_expr.is_some()
+            && let Some(value) = &mut attribute.value
+        {
+            *value = resolve_function_calls_only(
+                value,
+                &binding_map,
+                &fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
+        }
+    }
+    for export in &mut parsed.export_params {
+        // See the matching attribute-output guard above. Annotated exports
+        // need their concrete values for boundary checking; unannotated
+        // exports must retain the expression for return-type inference.
+        if export.type_expr.is_some()
+            && let Some(value) = &mut export.value
+        {
+            *value = resolve_function_calls_only(
+                value,
+                &binding_map,
+                &fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
+        }
+    }
+
     // Provider attribute resolution lives in
     // `resolve_provider_unresolved_attributes` (generic over export-
     // parameter shape so it works on both `ParsedFile` and `InferredFile`),
@@ -956,10 +1017,6 @@ fn resolve_value_with_config(
             Ok(Value::Deferred(DeferredValue::Interpolation(resolved?)).canonicalize())
         }
         Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
-            let argument_origins = args
-                .iter()
-                .map(super::functions::contains_function_call)
-                .collect::<Vec<_>>();
             let resolved_args: Result<Vec<Value>, ParseError> = args
                 .iter()
                 .map(|a| {
@@ -1000,10 +1057,9 @@ fn resolve_value_with_config(
                     // Truly-undefined names with all-static args still
                     // error.
                     if let Some(user_fn) = fn_ctx.user_functions.get(name) {
-                        let evaluated = super::functions::evaluate_user_function_with_origins(
+                        let evaluated = super::functions::evaluate_user_function(
                             user_fn,
                             &resolved_args,
-                            &argument_origins,
                             fn_ctx,
                         );
                         if preserve_failed_user_calls && evaluated.is_err() {
@@ -1103,6 +1159,15 @@ fn resolve_function_calls_only(
                 .collect();
             Ok(Value::Deferred(DeferredValue::Interpolation(resolved?)).canonicalize())
         }
+        Value::Deferred(DeferredValue::Secret(inner)) => Ok(Value::Deferred(
+            DeferredValue::Secret(Box::new(resolve_function_calls_only(
+                inner,
+                binding_map,
+                fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?)),
+        )),
         _ => Ok(value.clone()),
     }
 }
@@ -1272,7 +1337,7 @@ mod seed_precedence_tests {
 
         parsed.variables.insert(
             "cluster".to_string(),
-            Value::Concrete(ConcreteValue::String("${cluster}".to_string())),
+            Value::Concrete(ConcreteValue::String("${cluster}".into())),
         );
 
         let seeds = collect_seed_bindings_merged(&parsed);
@@ -1302,7 +1367,7 @@ mod seed_precedence_tests {
         let mut parsed = ParsedFile::default();
         parsed.variables.insert(
             "bad_name".to_string(),
-            Value::Concrete(ConcreteValue::String("literal".to_string())),
+            Value::Concrete(ConcreteValue::String("literal".into())),
         );
 
         let seeds = collect_seed_bindings_merged(&parsed);
@@ -1315,7 +1380,7 @@ mod seed_precedence_tests {
             SeedKind::Value(value) => {
                 assert_eq!(
                     value,
-                    &Value::Concrete(ConcreteValue::String("literal".to_string())),
+                    &Value::Concrete(ConcreteValue::String("literal".into())),
                     "Value seed must carry the actual literal"
                 );
             }

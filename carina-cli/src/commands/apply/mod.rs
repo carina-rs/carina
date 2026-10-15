@@ -31,8 +31,8 @@ use carina_core::parser::{ProviderConfig, ProviderContext, ResolvedProviderConfi
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::{
-    PlanFile, ProviderUpstreamScope, ResolvedProviderInputs, UpstreamMissingStatePolicy,
-    collect_delete_attributes, load_and_resolve_provider_configs,
+    CheckExportsPreApplyInput, PlanFile, ProviderUpstreamScope, ResolvedProviderInputs,
+    UpstreamMissingStatePolicy, collect_delete_attributes, load_and_resolve_provider_configs,
 };
 use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
@@ -46,8 +46,8 @@ use crate::commands::shared::progress::{
     RefreshProgress, emit_newline_on_interrupt, format_duration, refresh_multi_progress,
 };
 use crate::commands::shared::state_writeback::{
-    ApplyStateSave, FinalizeApplyInput, PostApplyStates, SkippedExports, build_state_after_apply,
-    resolve_exports,
+    ApplyStateSave, FinalizeApplyInput, PostApplyStates, ResolveExportValuesPostApplyInput,
+    SkippedExports, build_state_after_apply, materialize_exports, resolve_export_values_post_apply,
 };
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
@@ -487,7 +487,7 @@ mod upstream_snapshot_tests {
             .map(|(k, v)| {
                 (
                     k.to_string(),
-                    Value::Concrete(ConcreteValue::String(v.to_string())),
+                    Value::Concrete(ConcreteValue::String(v.to_string().into())),
                 )
             })
             .collect();
@@ -630,7 +630,7 @@ pub(crate) async fn finalize_apply(
     // (#2932). `None` preserves `state.exports` because the caller has
     // no source-side view of which exports the user intends — see the
     // `FinalizeApplyInput::export_params` doc-comment.
-    let skipped_exports = if let Some(params) = input.export_params {
+    let export_resolution = if let Some(params) = input.export_params {
         let post_apply_states =
             PostApplyStates::from_current_and_state(input.current_states, &state);
         let export_resources: Vec<Resource> = input
@@ -638,20 +638,26 @@ pub(crate) async fn finalize_apply(
             .iter()
             .map(|resource| resource.as_resource().clone())
             .collect();
-        let resolution = resolve_exports(
-            params,
-            &export_resources,
-            input.data_sources,
-            input.pre_resolve_compositions,
-            &post_apply_states,
-            input.schemas,
-            input.wait_aliases,
-        )?;
-        resolution.write_into(&mut state)
+        resolve_export_values_post_apply(ResolveExportValuesPostApplyInput {
+            export_params: params,
+            sorted_resources: &export_resources,
+            data_sources: input.data_sources,
+            pre_resolve_compositions: input.pre_resolve_compositions,
+            post_apply_states: &post_apply_states,
+            schemas: input.schemas,
+            wait_aliases: input.wait_aliases,
+            provider_context: input.provider_context,
+        })
+        .and_then(|values| materialize_exports(&values))
+        .map(|resolution| resolution.write_into(&mut state))
     } else {
-        SkippedExports::default()
+        Ok(SkippedExports::default())
     };
 
+    // A provider mutation has already happened. Export materialization is a
+    // secondary concern, so an export error must not prevent durable resource
+    // writeback. Save the resource state first, then return the original
+    // export error to the caller.
     if let Some(lock) = input.lock {
         save_state_locked_after_execute(input.backend, lock, &mut state, persistence).await?;
     } else {
@@ -659,7 +665,7 @@ pub(crate) async fn finalize_apply(
     }
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
-    Ok(skipped_exports)
+    export_resolution
 }
 
 /// Renew the lock and write state with lock validation.
@@ -783,22 +789,27 @@ pub(crate) async fn persist_exports_only(
     sorted_resources: &[Resource],
     data_sources: &[carina_core::resource::DataSource],
     pre_resolve_compositions: &[carina_core::resource::Composition],
-    export_params: &[carina_core::parser::InferredExportParam],
+    export_params: &carina_core::validation::ExportsCheckedPreApply<
+        carina_core::parser::InferredExportParam,
+    >,
     schemas: &carina_core::schema::SchemaRegistry,
     wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
     current_states: &HashMap<ResourceId, carina_core::resource::State>,
+    provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     let mut state = state_file.unwrap_or_default();
     let post_apply_states = PostApplyStates::from_current_and_state(current_states, &state);
-    let resolution = resolve_exports(
+    let values = resolve_export_values_post_apply(ResolveExportValuesPostApplyInput {
         export_params,
         sorted_resources,
         data_sources,
         pre_resolve_compositions,
-        &post_apply_states,
+        post_apply_states: &post_apply_states,
         schemas,
         wait_aliases,
-    )?;
+        provider_context,
+    })?;
+    let resolution = materialize_exports(&values)?;
     let skipped_exports = resolution.write_into(&mut state);
     if let Some(lk) = lock {
         save_state_locked(backend, lk, &mut state).await?;
@@ -1845,22 +1856,27 @@ async fn run_apply_locked(
             &pre_resolve_compositions,
             override_aware_resources.bindings(),
         )?;
-        let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
-            &parsed.export_params,
-            &paired_unresolved_resources,
-            &parsed.compositions,
-            &parsed.data_sources,
-            &current_states,
-            ctx.schemas(),
-            &wait_aliases,
-        );
+        let checked_exports_pre_apply =
+            crate::commands::plan::check_exports_pre_apply(CheckExportsPreApplyInput {
+                export_params: &parsed.export_params,
+                resources: &paired_unresolved_resources,
+                compositions: &parsed.compositions,
+                data_sources: &parsed.data_sources,
+                current_states: &current_states,
+                schemas: ctx.schemas(),
+                wait_aliases: &wait_aliases,
+                provider_context,
+            })
+            .map_err(AppError::Validation)?;
         let empty_exports = HashMap::new();
         let current_exports = state_file
             .as_ref()
             .map(|s| &s.exports)
             .unwrap_or(&empty_exports);
-        let export_changes =
-            crate::commands::plan::compute_export_diffs(&resolved_exports, current_exports);
+        let export_changes = crate::commands::plan::compute_export_diffs(
+            &checked_exports_pre_apply,
+            current_exports,
+        );
 
         if export_changes.is_empty() {
             println!("{}", "No changes needed.".green());
@@ -1896,7 +1912,7 @@ async fn run_apply_locked(
         // No-op apply path: compositions were never resolved (no head-of-
         // pipeline pass ran). carina#3181: compositions live in
         // `parsed.compositions` and still carry the authored
-        // `ResourceRef` snapshots — the shape `resolve_exports` expects
+        // `ResourceRef` snapshots — the shape post-apply export resolution expects
         // from the post-apply path.
         let pre_resolve_compositions_noop: Vec<carina_core::resource::Composition> =
             parsed.compositions.clone();
@@ -1907,10 +1923,11 @@ async fn run_apply_locked(
             &paired_unresolved_resources,
             &data_sources,
             &pre_resolve_compositions_noop,
-            &parsed.export_params,
+            &checked_exports_pre_apply,
             ctx.schemas(),
             &wait_aliases,
             &current_states,
+            provider_context,
         )
         .await?;
         return Ok(None);
@@ -1924,21 +1941,24 @@ async fn run_apply_locked(
         .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
         .collect();
 
-    let resolved_exports = crate::commands::plan::resolve_export_values_for_display(
-        &parsed.export_params,
-        &paired_unresolved_resources,
-        &parsed.compositions,
-        &parsed.data_sources,
-        &current_states,
-        ctx.schemas(),
-        &wait_aliases,
-    );
+    let checked_exports_pre_apply =
+        crate::commands::plan::check_exports_pre_apply(CheckExportsPreApplyInput {
+            export_params: &parsed.export_params,
+            resources: &paired_unresolved_resources,
+            compositions: &parsed.compositions,
+            data_sources: &parsed.data_sources,
+            current_states: &current_states,
+            schemas: ctx.schemas(),
+            wait_aliases: &wait_aliases,
+            provider_context,
+        })
+        .map_err(AppError::Validation)?;
     let current_exports = state_file
         .as_ref()
         .map(|s| s.exports.clone())
         .unwrap_or_default();
     let export_changes =
-        crate::commands::plan::compute_export_diffs(&resolved_exports, &current_exports);
+        crate::commands::plan::compute_export_diffs(&checked_exports_pre_apply, &current_exports);
     print_plan(
         &plan,
         DetailLevel::Full,
@@ -2015,7 +2035,8 @@ async fn run_apply_locked(
                     backend,
                     lock,
                     schemas,
-                    export_params: Some(&parsed.export_params),
+                    export_params: Some(&checked_exports_pre_apply),
+                    provider_context,
                     wait_aliases: &wait_aliases,
                     pre_resolve_compositions: &pre_resolve_compositions,
                 },
@@ -2571,6 +2592,7 @@ async fn run_apply_from_plan_locked(
     // Build schemas for write-only attribute persistence
     let (factories, _) = build_factories_from_providers(raw_provider_configs, project_dir)?;
     let ctx = WiringContext::new(factories, raw_provider_configs);
+    let provider_context = ProviderContext::default();
 
     let skipped_exports = finalize_after_execute(
         |persistence| {
@@ -2590,6 +2612,7 @@ async fn run_apply_from_plan_locked(
                     // Source-driven `carina apply` reconciles exports from the
                     // `.crn` directly (#2932).
                     export_params: None,
+                    provider_context: &provider_context,
                     // No export resolution runs here (export_params is None), but
                     // the field is required; pass the reconstructed aliases so the
                     // value is correct if a future plan file persists export_params.

@@ -42,7 +42,7 @@ pub(crate) fn apply_name_overrides(resources: &mut [Resource], state_file: &Opti
             for (attr, value) in name_overrides {
                 resource.attributes.insert(
                     attr.clone(),
-                    Value::Concrete(ConcreteValue::String(value.clone())),
+                    Value::Concrete(ConcreteValue::String(value.clone().into())),
                 );
             }
         }
@@ -151,7 +151,7 @@ pub(crate) struct FinalizeApplyInput<'a> {
     /// resolves (carina#3181).
     pub data_sources: &'a [carina_core::resource::DataSource],
     /// Live execution view of every resource read this run, including
-    /// data-source results. Forwarded to `resolve_exports` so a
+    /// data-source results. Forwarded to `resolve_export_values_post_apply` so a
     /// `<data_source>.<attr>` export reference can resolve against
     /// the provider-read attributes — `state.resources` never persists
     /// data sources, so consulting it alone leaves those references
@@ -170,7 +170,14 @@ pub(crate) struct FinalizeApplyInput<'a> {
     /// neither resolves nor wipes them, leaving the prior values
     /// intact for the next source-driven `carina apply` to
     /// reconcile.
-    pub export_params: Option<&'a [carina_core::parser::InferredExportParam]>,
+    pub export_params: Option<
+        &'a carina_core::validation::ExportsCheckedPreApply<
+            carina_core::parser::InferredExportParam,
+        >,
+    >,
+    /// Provider-aware builtin context used when post-apply bindings make a
+    /// previously deferred export expression concrete.
+    pub provider_context: &'a carina_core::parser::ProviderContext,
     /// Wait-binding aliases (carina#3085). When export expressions
     /// reference a `wait` binding (`exports { x = cert_issued.arn }`),
     /// these make `<wait-binding>.<attr>` resolve to `<target>.<attr>`
@@ -391,18 +398,27 @@ pub(crate) struct SkippedExport {
 /// and omitted from `state.exports` so the writeback still persists
 /// completed resources. Genuine serialization corruption, such as a
 /// non-finite float, remains an error and aborts writeback.
-pub(crate) fn resolve_exports(
-    export_params: &[carina_core::parser::InferredExportParam],
-    sorted_resources: &[Resource],
-    data_sources: &[carina_core::resource::DataSource],
-    pre_resolve_compositions: &[carina_core::resource::Composition],
-    post_apply_states: &PostApplyStates,
-    schemas: &SchemaRegistry,
-    wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
-) -> Result<ExportResolution, AppError> {
+pub(crate) struct ResolveExportValuesPostApplyInput<'a> {
+    pub export_params: &'a carina_core::validation::ExportsCheckedPreApply<
+        carina_core::parser::InferredExportParam,
+    >,
+    pub sorted_resources: &'a [Resource],
+    pub data_sources: &'a [carina_core::resource::DataSource],
+    pub pre_resolve_compositions: &'a [carina_core::resource::Composition],
+    pub post_apply_states: &'a PostApplyStates,
+    pub schemas: &'a SchemaRegistry,
+    pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
+    pub provider_context: &'a carina_core::parser::ProviderContext,
+}
+
+pub(crate) fn resolve_export_values_post_apply(
+    input: ResolveExportValuesPostApplyInput<'_>,
+) -> Result<
+    carina_core::validation::CheckedExportValues<carina_core::parser::InferredExportParam>,
+    AppError,
+> {
     use carina_core::binding_index::ResolvedBindings;
     use carina_core::resolver::resolve_virtual_refs_post_apply;
-    use carina_core::value::SerializationError;
 
     // Step 1: the post-apply state view was assembled by
     // [`PostApplyStates::from_current_and_state`] before this call.
@@ -416,7 +432,7 @@ pub(crate) fn resolve_exports(
     // any managed sibling that was Replaced during apply
     // (#3169 / #3177).
     let mut compositions: Vec<carina_core::resource::Composition> =
-        pre_resolve_compositions.to_vec();
+        input.pre_resolve_compositions.to_vec();
 
     // Step 3: build the bindings view from the managed slice plus
     // post-apply states, **with data sources but no compositions yet**.
@@ -428,17 +444,17 @@ pub(crate) fn resolve_exports(
     // `layer_compositions_post_apply` once the re-resolution is done.
     // (carina#3181, carina#3248)
     let plan_input_states = carina_core::resource::into_plan_input_map(
-        post_apply_states.as_map().clone(),
-        schemas,
-        sorted_resources,
+        input.post_apply_states.as_map().clone(),
+        input.schemas,
+        input.sorted_resources,
     );
     let mut bindings = ResolvedBindings::pre_apply(carina_core::binding_index::PreApplyInputs {
-        managed: sorted_resources,
+        managed: input.sorted_resources,
         compositions: &[],
-        data_sources,
+        data_sources: input.data_sources,
         current_states: &plan_input_states,
         remote_bindings: &HashMap::new(),
-        wait_aliases,
+        wait_aliases: input.wait_aliases,
     });
 
     // Step 4: re-resolve each composition's attributes against the
@@ -453,17 +469,37 @@ pub(crate) fn resolve_exports(
     bindings.layer_compositions_post_apply(&compositions)?;
 
     // Step 6: resolve the export expressions against the combined
-    // view.
+    // view. The input is already checked at the pre-apply boundary, but a
+    // reference can become concrete only after a successful mutation. Run the
+    // same constructor again so the post-apply value is checked before the
+    // serializer can observe it.
+    carina_core::validation::resolve_export_values_post_apply(
+        input.export_params,
+        &bindings,
+        input.provider_context,
+    )
+    .map_err(AppError::Validation)
+}
+
+/// Convert post-apply checked export values into the state writeback shape.
+///
+/// Requiring [`carina_core::validation::CheckedExportValues`] here makes it
+/// impossible to serialize the pre-apply display snapshot.
+pub(crate) fn materialize_exports(
+    export_params: &carina_core::validation::CheckedExportValues<
+        carina_core::parser::InferredExportParam,
+    >,
+) -> Result<ExportResolution, AppError> {
+    use carina_core::value::SerializationError;
+
     let mut resolved_exports = HashMap::new();
     let mut skipped = Vec::new();
-    for param in export_params {
+    for param in export_params.iter() {
         if let Some(ref value) = param.value {
-            let resolved = crate::commands::plan::resolve_export_value(value, &bindings);
-            match dsl_value_to_json(&resolved) {
-                Ok(Some(json)) => {
+            match dsl_value_to_json(value) {
+                Ok(json) => {
                     resolved_exports.insert(param.name.clone(), json);
                 }
-                Ok(None) => {}
                 Err(SerializationError::UnresolvedResourceRef { path, .. }) => {
                     skipped.push(SkippedExport {
                         name: param.name.clone(),
@@ -489,6 +525,7 @@ pub(crate) fn resolve_exports(
                     });
                 }
                 Err(e @ SerializationError::NonFiniteFloat { .. }) => return Err(e.into()),
+                Err(e) => return Err(e.into()),
             }
         }
     }
@@ -498,77 +535,66 @@ pub(crate) fn resolve_exports(
     })
 }
 
-/// Convert a DSL Value to a serde_json::Value for state persistence.
+/// Convert a DSL Value to a serde_json::Value for export state persistence.
 ///
-/// Returns:
-/// - `Ok(Some(json))` for a representable concrete value
-/// - `Ok(None)` for `Value::Deferred(DeferredValue::Secret)` only —
-///   `state.exports` must not embed plaintext secrets, so exports of
-///   secret-typed values are skipped silently. No other variant uses
-///   this skip path.
-/// - `Err(SerializationError)` for variants that should not have
-///   reached this boundary — the resolver / canonicalize / for-expand
-///   pass should have eliminated them — and for non-finite floats
-///   (`NonFiniteFloat`) which JSON cannot represent. Surfacing as Err
-///   names the specific bug instead of silently losing the export.
+/// Returns concrete JSON for a representable value. Deferred values and
+/// non-finite floats are errors because earlier passes should have eliminated
+/// them. Secrets are also errors: export validation rejects them before
+/// planning, and this boundary must never silently drop an export if that
+/// invariant is bypassed.
 pub(crate) fn dsl_value_to_json(
     value: &carina_core::resource::Value,
-) -> Result<Option<serde_json::Value>, carina_core::value::SerializationError> {
+) -> Result<serde_json::Value, carina_core::value::SerializationError> {
     use carina_core::resource::{ConcreteValue, DeferredValue, Value};
     use carina_core::value::{SerializationContext, SerializationError};
     let ctx = SerializationContext::StateWriteback;
     match value {
-        Value::Concrete(ConcreteValue::String(s)) => Ok(Some(serde_json::Value::String(s.clone()))),
+        Value::Concrete(ConcreteValue::String(s)) => {
+            Ok(serde_json::Value::String(s.expose_plaintext().to_owned()))
+        }
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
-            Ok(Some(serde_json::Value::String(s.to_string())))
+            Ok(serde_json::Value::String(s.to_string()))
         }
         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
-            Ok(Some(carina_core::value::canonical_enum_to_json(c)))
+            Ok(carina_core::value::canonical_enum_to_json(c))
         }
-        Value::Concrete(ConcreteValue::Bool(b)) => Ok(Some(serde_json::Value::Bool(*b))),
-        Value::Concrete(ConcreteValue::Int(i)) => Ok(Some(serde_json::Value::Number((*i).into()))),
+        Value::Concrete(ConcreteValue::Bool(b)) => Ok(serde_json::Value::Bool(*b)),
+        Value::Concrete(ConcreteValue::Int(i)) => Ok(serde_json::Value::Number((*i).into())),
         Value::Concrete(ConcreteValue::Float(f)) => {
             // Non-finite floats (NaN / +inf / -inf) cannot be represented
-            // in JSON. Surface as `NonFiniteFloat` rather than mapping to
-            // `Ok(None)` — the `Ok(None)` contract is reserved for
-            // `Value::Deferred(DeferredValue::Secret)` skipping, and
-            // silently dropping a non-finite export would hide a real
-            // upstream bug. Mirrors `value_to_json_with_context` in
+            // in JSON. Surface as `NonFiniteFloat`; silently dropping a
+            // non-finite export would hide a real upstream bug. Mirrors
+            // `value_to_json_with_context` in
             // `carina-core/src/value.rs`. (#2859)
             let num =
                 serde_json::Number::from_f64(*f).ok_or(SerializationError::NonFiniteFloat {
                     value: *f,
                     context: ctx,
                 })?;
-            Ok(Some(serde_json::Value::Number(num)))
+            Ok(serde_json::Value::Number(num))
         }
         Value::Concrete(ConcreteValue::Duration(d)) => {
-            Ok(Some(serde_json::Value::Number((d.as_secs() as i64).into())))
+            Ok(serde_json::Value::Number((d.as_secs() as i64).into()))
         }
         Value::Concrete(ConcreteValue::List(items)) => {
-            // `Result::transpose` flips `Result<Option<T>, E>` to
-            // `Option<Result<T, E>>`, so `filter_map` drops the
-            // `Ok(None)` skips and propagates `Err`.
             let json_items: Vec<_> = items
                 .iter()
                 .map(dsl_value_to_json)
-                .filter_map(Result::transpose)
                 .collect::<Result<_, _>>()?;
-            Ok(Some(serde_json::Value::Array(json_items)))
+            Ok(serde_json::Value::Array(json_items))
         }
-        Value::Concrete(ConcreteValue::StringList(items)) => Ok(Some(serde_json::Value::Array(
+        Value::Concrete(ConcreteValue::StringList(items)) => Ok(serde_json::Value::Array(
             items
                 .iter()
-                .map(|s| serde_json::Value::String(s.clone()))
+                .map(|s| serde_json::Value::String(s.expose_plaintext().to_owned()))
                 .collect(),
-        ))),
+        )),
         Value::Concrete(ConcreteValue::Map(map)) => {
             let json_map: serde_json::Map<String, serde_json::Value> = map
                 .iter()
-                .map(|(k, v)| dsl_value_to_json(v).map(|jv| jv.map(|j| (k.clone(), j))))
-                .filter_map(Result::transpose)
+                .map(|(key, value)| dsl_value_to_json(value).map(|value| (key.clone(), value)))
                 .collect::<Result<_, _>>()?;
-            Ok(Some(serde_json::Value::Object(json_map)))
+            Ok(serde_json::Value::Object(json_map))
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
@@ -597,7 +623,9 @@ pub(crate) fn dsl_value_to_json(
                 context: ctx,
             })
         }
-        Value::Deferred(DeferredValue::Secret(_)) => Ok(None),
+        Value::Deferred(DeferredValue::Secret(_)) => {
+            Err(SerializationError::SecretNotAllowed { context: ctx })
+        }
     }
 }
 
@@ -1363,7 +1391,7 @@ mod post_apply_states_tests {
         ds_attrs.insert(
             "arns".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("arn:aws:iam::1:role/x".to_string()),
+                ConcreteValue::String("arn:aws:iam::1:role/x".into()),
             )])),
         );
         let mut current_states = HashMap::new();
@@ -1392,7 +1420,7 @@ mod post_apply_states_tests {
         let mut pre_attrs = HashMap::new();
         pre_attrs.insert(
             "versioning".to_string(),
-            Value::Concrete(ConcreteValue::String("Suspended".to_string())),
+            Value::Concrete(ConcreteValue::String("Suspended".into())),
         );
         let mut current_states = HashMap::new();
         current_states.insert(id.clone(), State::existing(id.clone(), pre_attrs));
@@ -1468,7 +1496,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "name".to_string(),
-                Value::Concrete(ConcreteValue::String(name.to_string())),
+                Value::Concrete(ConcreteValue::String(name.to_string().into())),
             )]),
         )
         .with_identifier(format!("{name}-id"))
@@ -1484,7 +1512,7 @@ mod apply_state_save_tests {
             if let Some(description) = description {
                 fields.insert(
                     "description".to_string(),
-                    Value::Concrete(ConcreteValue::String(description.to_string())),
+                    Value::Concrete(ConcreteValue::String(description.to_string().into())),
                 );
             }
             Value::Concrete(ConcreteValue::Map(fields))
@@ -1563,7 +1591,7 @@ mod apply_state_save_tests {
         let mut resource = Resource::with_provider("mock", "test.resource", "thing", None);
         resource.set_attr(
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("dsl-new".to_string())),
+            Value::Concrete(ConcreteValue::String("dsl-new".into())),
         );
         let id = resource.id.clone();
         let sorted_resources = vec![resource];
@@ -1613,7 +1641,7 @@ mod apply_state_save_tests {
         let mut resource = Resource::with_provider("mock", "test.resource", "thing", None);
         resource.set_attr(
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("dsl-value".to_string())),
+            Value::Concrete(ConcreteValue::String("dsl-value".into())),
         );
         let id = resource.id.clone();
         let sorted_resources = vec![resource];
@@ -1663,14 +1691,14 @@ mod apply_state_save_tests {
         let runtime_child = Resource::new("route53.Record", "validation_records[0]")
             .with_attribute(
                 "name",
-                Value::Concrete(ConcreteValue::String("_dns_record_name_".to_string())),
+                Value::Concrete(ConcreteValue::String("_dns_record_name_".into())),
             );
         let child_id = runtime_child.id.clone();
         let child_state = State::existing(
             child_id.clone(),
             HashMap::from([(
                 "name".to_string(),
-                Value::Concrete(ConcreteValue::String("_dns_record_name_".to_string())),
+                Value::Concrete(ConcreteValue::String("_dns_record_name_".into())),
             )]),
         )
         .with_identifier("record-id");
@@ -1949,7 +1977,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "name".to_string(),
-                Value::Concrete(ConcreteValue::String("new.example.com".to_string())),
+                Value::Concrete(ConcreteValue::String("new.example.com".into())),
             )]),
         )
         .with_identifier("new-record-id");
@@ -1957,7 +1985,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "name".to_string(),
-                Value::Concrete(ConcreteValue::String("old.example.com".to_string())),
+                Value::Concrete(ConcreteValue::String("old.example.com".into())),
             )]),
         )
         .with_identifier("old-record-id");
@@ -2054,7 +2082,7 @@ mod apply_state_save_tests {
             .with_binding("main")
             .with_attribute(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             );
         let id = desired.id.clone();
         let existing = ResourceState::new("ec2.Vpc", "main", "awscc")
@@ -2068,7 +2096,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             )]),
         )
         .with_identifier("vpc-canonical-old");
@@ -2076,7 +2104,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             )]),
         )
         .with_identifier("vpc-canonical-new");
@@ -2116,7 +2144,7 @@ mod apply_state_save_tests {
             .with_binding("main")
             .with_attribute(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             );
         let id = desired.id.clone();
         let mut existing = ResourceState::new("ec2.Vpc", "main", "awscc")
@@ -2131,7 +2159,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             )]),
         )
         .with_identifier("vpc-new");
@@ -2175,7 +2203,7 @@ mod apply_state_save_tests {
             .with_binding("main")
             .with_attribute(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             );
         let id = desired.id.clone();
         let existing = ResourceState::new("ec2.Vpc", "main", "awscc")
@@ -2190,7 +2218,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             )]),
         )
         .with_identifier("vpc-new");
@@ -2229,7 +2257,7 @@ mod apply_state_save_tests {
                 .with_binding("main")
                 .with_attribute(
                     "cidr_block",
-                    Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                    Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
                 );
         let id = desired.id.clone();
         let mut existing = ResourceState::new("ec2.Vpc", "main", "awscc")
@@ -2244,7 +2272,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             )]),
         )
         .with_identifier("vpc-new");
@@ -2287,7 +2315,7 @@ mod apply_state_save_tests {
                 .with_binding("main")
                 .with_attribute(
                     "cidr_block",
-                    Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                    Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
                 );
         let create_id = desired.id.clone();
         let delete_id = ResourceId::with_provider_identity(
@@ -2308,7 +2336,7 @@ mod apply_state_save_tests {
             create_id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             )]),
         )
         .with_identifier("vpc-new");
@@ -2328,7 +2356,7 @@ mod apply_state_save_tests {
         ));
         let previous_attributes = HashMap::from([(
             "cidr_block".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         )]);
         let mut plan_json = serde_json::to_value(&plan).expect("plan should serialize");
         plan_json["replace_display"] = serde_json::json!([
@@ -2377,7 +2405,7 @@ mod apply_state_save_tests {
                 .with_binding("main")
                 .with_attribute(
                     "cidr_block",
-                    Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                    Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
                 );
         let create_id = desired.id.clone();
         let mut existing = ResourceState::new("ec2.Vpc", "main", "awscc")
@@ -2392,7 +2420,7 @@ mod apply_state_save_tests {
             create_id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             )]),
         )
         .with_identifier("vpc-new");
@@ -2442,7 +2470,7 @@ mod apply_state_save_tests {
         .with_binding("validation_records[0]")
         .with_attribute(
             "name",
-            Value::Concrete(ConcreteValue::String("new-2.example.com".to_string())),
+            Value::Concrete(ConcreteValue::String("new-2.example.com".into())),
         );
         let id = desired.id.clone();
         let mut existing = ResourceState::new("route53.Record", "validation_records[0]", "aws")
@@ -2465,7 +2493,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "name".to_string(),
-                Value::Concrete(ConcreteValue::String("new-2.example.com".to_string())),
+                Value::Concrete(ConcreteValue::String("new-2.example.com".into())),
             )]),
         )
         .with_identifier("new-2-record-id");
@@ -2485,7 +2513,7 @@ mod apply_state_save_tests {
         ));
         let previous_attributes = HashMap::from([(
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("old.example.com".to_string())),
+            Value::Concrete(ConcreteValue::String("old.example.com".into())),
         )]);
         let mut plan_json = serde_json::to_value(&plan).expect("plan should serialize");
         plan_json["replace_display"] = serde_json::json!([
@@ -2552,7 +2580,7 @@ mod apply_state_save_tests {
         .with_binding("validation_records[0]")
         .with_attribute(
             "name",
-            Value::Concrete(ConcreteValue::String("new-2.example.com".to_string())),
+            Value::Concrete(ConcreteValue::String("new-2.example.com".into())),
         );
         let id = desired.id.clone();
         let mut existing = ResourceState::new("route53.Record", "validation_records[0]", "aws")
@@ -2575,7 +2603,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "name".to_string(),
-                Value::Concrete(ConcreteValue::String("new-2.example.com".to_string())),
+                Value::Concrete(ConcreteValue::String("new-2.example.com".into())),
             )]),
         )
         .with_identifier("new-2-record-id");
@@ -2595,7 +2623,7 @@ mod apply_state_save_tests {
         ));
         let previous_attributes = HashMap::from([(
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("old.example.com".to_string())),
+            Value::Concrete(ConcreteValue::String("old.example.com".into())),
         )]);
         let mut plan_json = serde_json::to_value(&plan).expect("plan should serialize");
         plan_json["replace_display"] = serde_json::json!([
@@ -2658,7 +2686,7 @@ mod apply_state_save_tests {
             .with_binding("main")
             .with_attribute(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             );
         let id = desired.id.clone();
         let existing = ResourceState::new("ec2.Vpc", "main", "awscc")
@@ -2672,7 +2700,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             )]),
         )
         .with_identifier("vpc-new");
@@ -2704,7 +2732,7 @@ mod apply_state_save_tests {
     fn apply_writeback_secret_to_plain_demotion_converges() {
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
             "password",
-            Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+            Value::Concrete(ConcreteValue::String("plain-secret".into())),
         );
         let id = desired.id.clone();
         let existing = ResourceState::new("db.Instance", "main", "awscc")
@@ -2721,7 +2749,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "password".to_string(),
-                Value::Concrete(ConcreteValue::String("old-secret".to_string())),
+                Value::Concrete(ConcreteValue::String("old-secret".into())),
             )]),
         )
         .with_identifier("db-1");
@@ -2729,7 +2757,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "password".to_string(),
-                Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+                Value::Concrete(ConcreteValue::String("plain-secret".into())),
             )]),
         )
         .with_identifier("db-1");
@@ -2789,7 +2817,7 @@ mod apply_state_save_tests {
     fn apply_writeback_write_only_secret_to_plain_demotion_converges() {
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
             "password",
-            Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+            Value::Concrete(ConcreteValue::String("plain-secret".into())),
         );
         let id = desired.id.clone();
         let existing = ResourceState::new("db.Instance", "main", "awscc")
@@ -2877,7 +2905,7 @@ mod apply_state_save_tests {
                 .with_attribute(
                     "password",
                     Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                        ConcreteValue::String("plain-secret".to_string()),
+                        ConcreteValue::String("plain-secret".into()),
                     )))),
                 );
         let applied_state =
@@ -2887,7 +2915,7 @@ mod apply_state_save_tests {
             HashMap::from([
                 (
                     "password".to_string(),
-                    Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+                    Value::Concrete(ConcreteValue::String("plain-secret".into())),
                 ),
                 (
                     "unknown".to_string(),
@@ -2950,13 +2978,13 @@ mod apply_state_save_tests {
                 .with_binding("validation_records[0]")
                 .with_attribute(
                     "password",
-                    Value::Concrete(ConcreteValue::String("plain-new".to_string())),
+                    Value::Concrete(ConcreteValue::String("plain-new".into())),
                 );
         let applied_state = State::existing(
             id.clone(),
             HashMap::from([(
                 "password".to_string(),
-                Value::Concrete(ConcreteValue::String("plain-new".to_string())),
+                Value::Concrete(ConcreteValue::String("plain-new".into())),
             )]),
         )
         .with_identifier("new-record-id");
@@ -2964,7 +2992,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "password".to_string(),
-                Value::Concrete(ConcreteValue::String("plain-old".to_string())),
+                Value::Concrete(ConcreteValue::String("plain-old".into())),
             )]),
         )
         .with_identifier("old-record-id");
@@ -3026,7 +3054,7 @@ mod apply_state_save_tests {
                 .with_binding("validation_records[0]")
                 .with_attribute(
                     "name",
-                    Value::Concrete(ConcreteValue::String("new.example.com".to_string())),
+                    Value::Concrete(ConcreteValue::String("new.example.com".into())),
                 );
         let applied_state =
             State::existing(id.clone(), HashMap::new()).with_identifier("new-record-id");
@@ -3035,11 +3063,11 @@ mod apply_state_save_tests {
             HashMap::from([
                 (
                     "name".to_string(),
-                    Value::Concrete(ConcreteValue::String("old.example.com".to_string())),
+                    Value::Concrete(ConcreteValue::String("old.example.com".into())),
                 ),
                 (
                     "password".to_string(),
-                    Value::Concrete(ConcreteValue::String("plain-secret".to_string())),
+                    Value::Concrete(ConcreteValue::String("plain-secret".into())),
                 ),
             ]),
         )
@@ -3229,7 +3257,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "name".to_string(),
-                Value::Concrete(ConcreteValue::String("old.example.com".to_string())),
+                Value::Concrete(ConcreteValue::String("old.example.com".into())),
             )]),
         )
         .with_identifier("old-record-id");
@@ -3315,7 +3343,7 @@ mod apply_state_save_tests {
     fn plain_replacement_delete_success_create_failure_writes_cleanup() {
         let resource = Resource::new("ec2.Vpc", "main").with_attribute(
             "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
         );
         let id = resource.id.clone();
         let sorted_resources = vec![resolved(resource)];
@@ -3323,7 +3351,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             )]),
         )
         .with_identifier("vpc-old");
@@ -3385,7 +3413,7 @@ mod apply_state_save_tests {
         let mut resource = Resource::with_provider("awscc", "s3.Bucket", "new_bucket", None)
             .with_attribute(
                 "bucket_name",
-                Value::Concrete(ConcreteValue::String("new-name".to_string())),
+                Value::Concrete(ConcreteValue::String("new-name".into())),
             );
         resource.directives.create_before_destroy = true;
         let id = resource.id.clone();
@@ -3394,7 +3422,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "bucket_name".to_string(),
-                Value::Concrete(ConcreteValue::String("old-name".to_string())),
+                Value::Concrete(ConcreteValue::String("old-name".into())),
             )]),
         )
         .with_identifier("bucket-old-id");
@@ -3474,7 +3502,7 @@ mod apply_state_save_tests {
             id.clone(),
             HashMap::from([(
                 "bucket_name".to_string(),
-                Value::Concrete(ConcreteValue::String("new-name".to_string())),
+                Value::Concrete(ConcreteValue::String("new-name".into())),
             )]),
         )
         .with_identifier("bucket-new-id");
@@ -3556,7 +3584,7 @@ mod apply_state_save_tests {
 }
 
 #[cfg(test)]
-mod resolve_exports_tests {
+mod export_writeback_tests {
     use super::*;
     use carina_core::parser::{InferredExportParam, TypeExpr};
     use carina_core::resource::{
@@ -3577,17 +3605,26 @@ mod resolve_exports_tests {
     ) -> (HashMap<String, serde_json::Value>, Vec<SkippedExport>) {
         let state = StateFile::new();
         let post_apply_states = PostApplyStates::from_current_and_state(&HashMap::new(), &state);
-        resolve_exports(
+        let checked = carina_core::validation::check_export_values_pre_apply(
             export_params,
-            &[],
-            &[],
-            &[],
-            &post_apply_states,
-            &carina_core::schema::SchemaRegistry::new(),
-            &[],
+            &carina_core::binding_index::ResolvedBindings::default(),
+            &carina_core::parser::ProviderContext::default(),
         )
-        .expect("unresolved exports should be skipped, not abort writeback")
-        .into_parts()
+        .expect("test exports must pass the secret boundary");
+        let values = resolve_export_values_post_apply(ResolveExportValuesPostApplyInput {
+            export_params: &checked,
+            sorted_resources: &[],
+            data_sources: &[],
+            pre_resolve_compositions: &[],
+            post_apply_states: &post_apply_states,
+            schemas: &carina_core::schema::SchemaRegistry::new(),
+            wait_aliases: &[],
+            provider_context: &carina_core::parser::ProviderContext::default(),
+        })
+        .expect("post-apply export resolution should succeed");
+        materialize_exports(&values)
+            .expect("unresolved exports should be skipped, not abort writeback")
+            .into_parts()
     }
 
     #[test]
@@ -3667,6 +3704,9 @@ mod resolve_exports_tests {
             "template",
             Value::Deferred(DeferredValue::Interpolation(vec![
                 InterpolationPart::Literal("x".into()),
+                InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
+                    path: AccessPath::new("missing", "value"),
+                })),
             ])),
         )];
 
@@ -3684,7 +3724,14 @@ mod resolve_exports_tests {
             "joined",
             Value::Deferred(DeferredValue::FunctionCall {
                 name: "join".into(),
-                args: vec![],
+                args: vec![
+                    Value::Concrete(ConcreteValue::String("-".into())),
+                    Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
+                        DeferredValue::ResourceRef {
+                            path: AccessPath::new("missing", "value"),
+                        },
+                    )])),
+                ],
             }),
         )];
 
@@ -3826,14 +3873,24 @@ mod stage4_unknown_err_tests {
         );
     }
 
-    /// `Value::Deferred(DeferredValue::Secret)` continues to be skipped silently — exports must
-    /// not embed plaintext secrets in state.
+    /// `Value::Deferred(DeferredValue::Secret)` must never be silently dropped. Export
+    /// validation rejects it earlier, and this serialization boundary is the invariant
+    /// backstop.
     #[test]
-    fn secret_returns_ok_none() {
+    fn secret_returns_an_error() {
         let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
             ConcreteValue::String("password".into()),
         ))));
-        assert!(matches!(dsl_value_to_json(&v), Ok(None)));
+        let error = dsl_value_to_json(&v).expect_err("secret export must be rejected");
+        assert!(
+            matches!(
+                error,
+                SerializationError::SecretNotAllowed {
+                    context: SerializationContext::StateWriteback,
+                }
+            ),
+            "{error}",
+        );
     }
 
     #[test]
@@ -3852,7 +3909,7 @@ mod stage4_unknown_err_tests {
 
         assert_eq!(
             dsl_value_to_json(&v).unwrap(),
-            Some(serde_json::json!({
+            serde_json::json!({
                 "Enum": {
                     "identity": {
                         "provider": "aws",
@@ -3861,15 +3918,13 @@ mod stage4_unknown_err_tests {
                     },
                     "api_value": "vpc"
                 }
-            }))
+            })
         );
     }
 
     /// Non-finite floats (NaN / +inf / -inf) cannot be represented in
     /// JSON. `dsl_value_to_json` must surface them as
-    /// `SerializationError::NonFiniteFloat` rather than mapping to
-    /// `Ok(None)`, which would silently drop the export. The
-    /// `Ok(None)` skip path is reserved for `DeferredValue::Secret`.
+    /// `SerializationError::NonFiniteFloat` rather than silently dropping the export.
     /// (#2859)
     #[test]
     fn non_finite_float_returns_err() {

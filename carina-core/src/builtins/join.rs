@@ -1,6 +1,6 @@
 //! `join(separator, list)` built-in function
 
-use crate::resource::{ConcreteValue, Value};
+use crate::resource::{ConcreteValue, DeferredValue, Value, ValueString};
 
 use super::value_type_name;
 
@@ -24,7 +24,7 @@ pub(crate) fn builtin_join(args: &[Value]) -> Result<Value, String> {
     }
 
     let separator = match &args[0] {
-        Value::Concrete(ConcreteValue::String(s)) => s.clone(),
+        Value::Concrete(ConcreteValue::String(s)) => s,
         other => {
             return Err(format!(
                 "join() first argument must be a string, got {}",
@@ -43,94 +43,125 @@ pub(crate) fn builtin_join(args: &[Value]) -> Result<Value, String> {
         }
     };
 
-    let joined: String = items
+    let mut contains_secret = false;
+    let rendered = items
         .iter()
-        .map(|v| match v {
-            Value::Concrete(ConcreteValue::String(s)) => s.clone(),
-            Value::Concrete(ConcreteValue::Int(n)) => n.to_string(),
-            Value::Concrete(ConcreteValue::Float(f)) => f.to_string(),
-            Value::Concrete(ConcreteValue::Bool(b)) => b.to_string(),
-            Value::Concrete(ConcreteValue::Duration(d)) => crate::value::render_duration(*d),
-            other => format!("{:?}", other),
+        .map(|value| {
+            let (text, item_secret) = join_scalar(value)?;
+            contains_secret |= item_secret;
+            Ok(text)
         })
+        .collect::<Result<Vec<_>, String>>()?;
+    let joined = rendered
+        .iter()
+        .map(ValueString::expose_plaintext)
         .collect::<Vec<_>>()
-        .join(&separator);
+        .join(separator.expose_plaintext());
+    let joined =
+        ValueString::derived_from(joined, std::iter::once(separator).chain(rendered.iter()));
+    let value = Value::Concrete(ConcreteValue::String(joined));
+    if contains_secret {
+        Ok(Value::Deferred(DeferredValue::Secret(Box::new(value))))
+    } else {
+        Ok(value)
+    }
+}
 
-    Ok(Value::Concrete(ConcreteValue::String(joined)))
+fn join_scalar(value: &Value) -> Result<(ValueString, bool), String> {
+    match value {
+        Value::Concrete(ConcreteValue::String(value)) => Ok((value.clone(), false)),
+        Value::Concrete(ConcreteValue::EnumIdentifier(value)) => Ok((value.as_str().into(), false)),
+        Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
+            Ok((value.api_value().into(), false))
+        }
+        Value::Concrete(ConcreteValue::Int(value)) => Ok((value.to_string().into(), false)),
+        Value::Concrete(ConcreteValue::Float(value)) => Ok((value.to_string().into(), false)),
+        Value::Concrete(ConcreteValue::Bool(value)) => Ok((value.to_string().into(), false)),
+        Value::Concrete(ConcreteValue::Duration(value)) => {
+            Ok((crate::value::render_duration(*value).into(), false))
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            let (text, _) = join_scalar(inner)?;
+            Ok((
+                ValueString::diagnostic_sensitive(text.into_plaintext()),
+                true,
+            ))
+        }
+        other => Err(format!(
+            "join() list elements must be scalar, got {}",
+            value_type_name(other)
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::ValueDescription;
     use crate::builtins::evaluate_builtin_to_value as evaluate_builtin;
-    use crate::resource::{ConcreteValue, Value};
+    use crate::resource::{ConcreteValue, DeferredValue, Value};
+    use crate::value::{SECRET_PREFIX, format_value, value_to_json};
 
     #[test]
     fn join_basic() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("-".to_string())),
+            Value::Concrete(ConcreteValue::String("-".into())),
             Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("a".to_string())),
-                Value::Concrete(ConcreteValue::String("b".to_string())),
-                Value::Concrete(ConcreteValue::String("c".to_string())),
+                Value::Concrete(ConcreteValue::String("a".into())),
+                Value::Concrete(ConcreteValue::String("b".into())),
+                Value::Concrete(ConcreteValue::String("c".into())),
             ])),
         ];
         let result = evaluate_builtin("join", &args).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("a-b-c".to_string()))
+            Value::Concrete(ConcreteValue::String("a-b-c".into()))
         );
     }
 
     #[test]
     fn join_empty_separator() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("".to_string())),
+            Value::Concrete(ConcreteValue::String("".into())),
             Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("a".to_string())),
-                Value::Concrete(ConcreteValue::String("b".to_string())),
+                Value::Concrete(ConcreteValue::String("a".into())),
+                Value::Concrete(ConcreteValue::String("b".into())),
             ])),
         ];
         let result = evaluate_builtin("join", &args).unwrap();
-        assert_eq!(
-            result,
-            Value::Concrete(ConcreteValue::String("ab".to_string()))
-        );
+        assert_eq!(result, Value::Concrete(ConcreteValue::String("ab".into())));
     }
 
     #[test]
     fn join_empty_list() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("-".to_string())),
+            Value::Concrete(ConcreteValue::String("-".into())),
             Value::Concrete(ConcreteValue::List(vec![])),
         ];
         let result = evaluate_builtin("join", &args).unwrap();
-        assert_eq!(
-            result,
-            Value::Concrete(ConcreteValue::String("".to_string()))
-        );
+        assert_eq!(result, Value::Concrete(ConcreteValue::String("".into())));
     }
 
     #[test]
     fn join_single_element() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("-".to_string())),
+            Value::Concrete(ConcreteValue::String("-".into())),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("only".to_string()),
+                ConcreteValue::String("only".into()),
             )])),
         ];
         let result = evaluate_builtin("join", &args).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("only".to_string()))
+            Value::Concrete(ConcreteValue::String("only".into()))
         );
     }
 
     #[test]
     fn join_mixed_types() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String(", ".to_string())),
+            Value::Concrete(ConcreteValue::String(", ".into())),
             Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("hello".to_string())),
+                Value::Concrete(ConcreteValue::String("hello".into())),
                 Value::Concrete(ConcreteValue::Int(42)),
                 Value::Concrete(ConcreteValue::Bool(true)),
             ])),
@@ -138,14 +169,42 @@ mod tests {
         let result = evaluate_builtin("join", &args).unwrap();
         assert_eq!(
             result,
-            Value::Concrete(ConcreteValue::String("hello, 42, true".to_string()))
+            Value::Concrete(ConcreteValue::String("hello, 42, true".into()))
         );
+    }
+
+    #[test]
+    fn join_over_secret_element_returns_secret_without_debug_text() {
+        let args = vec![
+            Value::Concrete(ConcreteValue::String("-".into())),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("prefix".into())),
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::String("hunter2SECRET".into()),
+                )))),
+            ])),
+        ];
+
+        let result = evaluate_builtin("join", &args).unwrap();
+
+        assert_eq!(
+            result,
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("prefix-hunter2SECRET".into()),
+            ))))
+        );
+        assert_eq!(format_value(&result), "(secret)");
+        assert_eq!(ValueDescription::of(&result).to_string(), "secret");
+        let state_value = value_to_json(&result).unwrap();
+        let state_value = state_value.as_str().expect("secret hash string");
+        assert!(state_value.starts_with(SECRET_PREFIX));
+        assert!(!state_value.contains("hunter2SECRET"));
     }
 
     #[test]
     fn join_partial_application() {
         use crate::builtins::evaluate_builtin_for_tests;
-        let args = vec![Value::Concrete(ConcreteValue::String("-".to_string()))];
+        let args = vec![Value::Concrete(ConcreteValue::String("-".into()))];
         let result = evaluate_builtin_for_tests("join", &args).unwrap();
         assert!(result.is_closure());
     }
@@ -155,7 +214,7 @@ mod tests {
         let args = vec![
             Value::Concrete(ConcreteValue::Int(1)),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("a".to_string()),
+                ConcreteValue::String("a".into()),
             )])),
         ];
         let result = evaluate_builtin("join", &args);
@@ -170,8 +229,8 @@ mod tests {
     #[test]
     fn join_non_list_second_arg() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("-".to_string())),
-            Value::Concrete(ConcreteValue::String("not a list".to_string())),
+            Value::Concrete(ConcreteValue::String("-".into())),
+            Value::Concrete(ConcreteValue::String("not a list".into())),
         ];
         let result = evaluate_builtin("join", &args);
         assert!(result.is_err());

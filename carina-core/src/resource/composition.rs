@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn from_value_concrete_string_classifies_as_derived() {
-        let v = Value::Concrete(ConcreteValue::String("literal".to_string()));
+        let v = Value::Concrete(ConcreteValue::String("literal".into()));
         let attr = CompositionAttribute::from_value(v.clone(), None);
         assert_eq!(attr.forwarded_path(), None);
         assert_eq!(attr.to_value(), v);
@@ -566,7 +566,7 @@ mod tests {
     fn from_value_interpolation_classifies_as_derived() {
         use crate::resource::InterpolationPart;
         let v = Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Literal("prefix-".to_string()),
+            InterpolationPart::Literal("prefix-".into()),
             InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::new("svc", "id"),
             })),
@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn derived_to_value_returns_inner() {
-        let inner = Value::Concrete(ConcreteValue::String("kept".to_string()));
+        let inner = Value::Concrete(ConcreteValue::String("kept".into()));
         let attr = CompositionAttribute::from_value(inner.clone(), None);
         assert_eq!(attr.to_value(), inner);
     }
@@ -607,7 +607,7 @@ mod tests {
             Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::new("a", "b"),
             }),
-            Value::Concrete(ConcreteValue::String("literal".to_string())),
+            Value::Concrete(ConcreteValue::String("literal".into())),
             Value::Concrete(ConcreteValue::Int(42)),
         ];
         for original in cases {
@@ -626,7 +626,7 @@ mod tests {
             Some(declared.clone()),
         );
 
-        let rewritten = attr.with_value(Value::Concrete(ConcreteValue::String("x".to_string())));
+        let rewritten = attr.with_value(Value::Concrete(ConcreteValue::String("x".into())));
 
         assert_eq!(rewritten.declared_type(), Some(&declared));
     }
@@ -709,7 +709,7 @@ mod tests {
                     "password".to_string(),
                     CompositionArgument::from_value(
                         Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                            ConcreteValue::String("plaintext-secret".to_string()),
+                            ConcreteValue::String("plaintext-secret".into()),
                         )))),
                         TypeExpr::String,
                     ),

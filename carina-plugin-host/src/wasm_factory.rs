@@ -3985,7 +3985,7 @@ mod tests {
         let first_id = Resource::with_provider("mock", "test.resource", "first", None).id;
         let second_id = Resource::with_provider("mock", "test.resource", "second", None).id;
         let original_value = Value::Concrete(carina_core::resource::ConcreteValue::String(
-            "original".to_string(),
+            "original".into(),
         ));
         let mut states = HashMap::from([
             (

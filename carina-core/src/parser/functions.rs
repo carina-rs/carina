@@ -142,7 +142,6 @@ enum PreparedUserFunctionCall<'cfg> {
     Ready {
         child_ctx: Box<ParseContext<'cfg>>,
         substitutions: HashMap<String, Value>,
-        function_derived: HashMap<String, bool>,
     },
     Deferred(Vec<Value>),
 }
@@ -152,7 +151,6 @@ enum PreparedUserFunctionCall<'cfg> {
 fn prepare_user_function_call<'cfg>(
     func: &UserFunction,
     args: &[Value],
-    argument_origins: &[bool],
     ctx: &ParseContext<'cfg>,
 ) -> Result<PreparedUserFunctionCall<'cfg>, ParseError> {
     let fn_name = &func.name;
@@ -180,18 +178,12 @@ fn prepare_user_function_call<'cfg>(
 
     // Build substitution map: param_name -> value, and type-check annotated params
     let mut substitutions: HashMap<String, Value> = HashMap::new();
-    let mut function_derived: HashMap<String, bool> = HashMap::new();
     let mut effective_args = Vec::with_capacity(func.params.len());
     for (i, param) in func.params.iter().enumerate() {
-        let (value, authored_origin) = if i < args.len() {
-            (
-                args[i].clone(),
-                argument_origins.get(i).copied().unwrap_or(false),
-            )
+        let value = if i < args.len() {
+            args[i].clone()
         } else {
-            let value = param.default.clone().unwrap();
-            let origin = contains_function_call(&value);
-            (value, origin)
+            param.default.clone().unwrap()
         };
         // A direct parser call can reach this seam with a nested builtin still
         // represented as `DeferredValue::FunctionCall`. The shared value
@@ -199,15 +191,12 @@ fn prepare_user_function_call<'cfg>(
         // is knowable first and validate the actual argument value. This also
         // ensures a bad secret argument is blamed on the parameter rather than
         // flowing into the body and being blamed on the return annotation.
-        let evaluated = try_evaluate_fn_value(value, ctx)?;
-        let value = evaluated.value;
-        let derived = authored_origin || evaluated.function_derived;
+        let value = try_evaluate_fn_value(value, ctx)?;
         // Type-check if the parameter has a type annotation
         if let Some(ref type_expr) = param.param_type {
-            check_fn_arg_type(fn_name, &param.name, type_expr, &value, derived, ctx)?;
+            check_fn_arg_type(fn_name, &param.name, type_expr, &value, ctx)?;
         }
         substitutions.insert(param.name.clone(), value.clone());
-        function_derived.insert(param.name.clone(), derived);
         effective_args.push(value);
     }
 
@@ -226,19 +215,15 @@ fn prepare_user_function_call<'cfg>(
 
     // Evaluate local lets, substituting and resolving each one
     for (let_name, let_expr) in &func.local_lets {
-        let derived = is_function_derived(let_expr, &function_derived);
         let substituted = substitute_fn_params(let_expr, &substitutions);
         let evaluated = try_evaluate_fn_value(substituted, &child_ctx)?;
-        let derived = derived || evaluated.function_derived;
-        child_ctx.set_variable(let_name.clone(), evaluated.value.clone());
-        substitutions.insert(let_name.clone(), evaluated.value);
-        function_derived.insert(let_name.clone(), derived);
+        child_ctx.set_variable(let_name.clone(), evaluated.clone());
+        substitutions.insert(let_name.clone(), evaluated);
     }
 
     Ok(PreparedUserFunctionCall::Ready {
         child_ctx: Box::new(child_ctx),
         substitutions,
-        function_derived,
     })
 }
 
@@ -350,17 +335,11 @@ fn check_fn_arg_type(
     param_name: &str,
     type_expr: &TypeExpr,
     value: &Value,
-    function_derived: bool,
     ctx: &ParseContext,
 ) -> Result<(), ParseError> {
     if let Err(mismatch) =
         crate::validation::typecheck::check_type_expr_value(type_expr, value, ctx.config)
     {
-        let mismatch = if function_derived {
-            mismatch.redact_evaluated_value(type_expr, value)
-        } else {
-            mismatch
-        };
         return Err(function_argument_type_error(fn_name, param_name, mismatch));
     }
 
@@ -370,6 +349,7 @@ fn check_fn_arg_type(
     if let TypeExpr::Ref(expected_path) = type_expr
         && let Value::Concrete(ConcreteValue::String(value)) = value
         && let Some(ref_name) = value
+            .expose_plaintext()
             .strip_prefix("${")
             .and_then(|value| value.strip_suffix('}'))
         && let Some(resource) = ctx.resource_bindings.get(ref_name)
@@ -410,17 +390,11 @@ fn check_fn_return_type(
     fn_name: &str,
     type_expr: &TypeExpr,
     value: &Value,
-    function_derived: bool,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
     if let Err(mismatch) =
         crate::validation::typecheck::check_type_expr_value(type_expr, value, config)
     {
-        let mismatch = if function_derived {
-            mismatch.redact_evaluated_value(type_expr, value)
-        } else {
-            mismatch
-        };
         return Err(function_return_type_error(fn_name, mismatch));
     }
     Ok(())
@@ -439,51 +413,30 @@ pub(crate) fn evaluate_user_function(
     args: &[Value],
     ctx: &ParseContext,
 ) -> Result<Value, ParseError> {
-    let argument_origins = args.iter().map(contains_function_call).collect::<Vec<_>>();
-    evaluate_user_function_with_origins(func, args, &argument_origins, ctx)
-}
-
-pub(crate) fn evaluate_user_function_with_origins(
-    func: &UserFunction,
-    args: &[Value],
-    argument_origins: &[bool],
-    ctx: &ParseContext,
-) -> Result<Value, ParseError> {
-    let (child_ctx, substitutions, function_derived) =
-        match prepare_user_function_call(func, args, argument_origins, ctx)? {
-            PreparedUserFunctionCall::Ready {
-                child_ctx,
-                substitutions,
-                function_derived,
-            } => (child_ctx, substitutions, function_derived),
-            PreparedUserFunctionCall::Deferred(args) => {
-                return Ok(Value::Deferred(DeferredValue::FunctionCall {
-                    name: func.name.clone(),
-                    args,
-                }));
-            }
-        };
+    let (child_ctx, substitutions) = match prepare_user_function_call(func, args, ctx)? {
+        PreparedUserFunctionCall::Ready {
+            child_ctx,
+            substitutions,
+        } => (child_ctx, substitutions),
+        PreparedUserFunctionCall::Deferred(args) => {
+            return Ok(Value::Deferred(DeferredValue::FunctionCall {
+                name: func.name.clone(),
+                args,
+            }));
+        }
+    };
 
     let UserFunctionBody(body) = &func.body;
-    let body_is_function_derived = is_function_derived(body, &function_derived);
     let substituted_body = substitute_fn_params(body, &substitutions);
-    let evaluated = try_evaluate_fn_value(substituted_body, &child_ctx)?;
-    let result_is_function_derived = body_is_function_derived || evaluated.function_derived;
-    let result = evaluated.value.canonicalize();
+    let result = try_evaluate_fn_value(substituted_body, &child_ctx)?.canonicalize();
     // Check return type if annotated
     if let Some(ref return_type) = func.return_type {
-        check_fn_return_type(
-            &func.name,
-            return_type,
-            &result,
-            result_is_function_derived,
-            child_ctx.config,
-        )?;
+        check_fn_return_type(&func.name, return_type, &result, child_ctx.config)?;
     }
     Ok(result)
 }
 
-pub(crate) fn contains_function_call(value: &Value) -> bool {
+pub fn contains_function_call(value: &Value) -> bool {
     match value {
         Value::Deferred(DeferredValue::FunctionCall { .. }) => true,
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_function_call),
@@ -494,27 +447,6 @@ pub(crate) fn contains_function_call(value: &Value) -> bool {
             matches!(part, crate::resource::InterpolationPart::Expr(value) if contains_function_call(value))
         }),
         Value::Deferred(DeferredValue::Secret(inner)) => contains_function_call(inner),
-        _ => false,
-    }
-}
-
-fn is_function_derived(value: &Value, bindings: &HashMap<String, bool>) -> bool {
-    match value {
-        Value::Deferred(DeferredValue::Unknown(UnknownReason::FnParam { name }))
-        | Value::Deferred(DeferredValue::Unknown(UnknownReason::FnLocal { name })) => {
-            bindings.get(name).copied().unwrap_or(false)
-        }
-        Value::Deferred(DeferredValue::FunctionCall { .. }) => true,
-        Value::Concrete(ConcreteValue::List(items)) => {
-            items.iter().any(|item| is_function_derived(item, bindings))
-        }
-        Value::Concrete(ConcreteValue::Map(entries)) => entries
-            .values()
-            .any(|item| is_function_derived(item, bindings)),
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
-            matches!(part, crate::resource::InterpolationPart::Expr(value) if is_function_derived(value, bindings))
-        }),
-        Value::Deferred(DeferredValue::Secret(inner)) => is_function_derived(inner, bindings),
         _ => false,
     }
 }
@@ -571,48 +503,16 @@ fn substitute_fn_params(value: &Value, substitutions: &HashMap<String, Value>) -
     }
 }
 
-struct EvaluatedFnValue {
-    value: Value,
-    function_derived: bool,
-}
-
-impl EvaluatedFnValue {
-    fn authored(value: Value) -> Self {
-        Self {
-            value,
-            function_derived: false,
-        }
-    }
-
-    fn derived(value: Value) -> Self {
-        Self {
-            value,
-            function_derived: true,
-        }
-    }
-}
-
 /// Try to evaluate a value (resolve function calls including user-defined ones).
-/// The provenance bit is intentionally kept out of [`Value`]: it exists only
-/// while crossing a typed evaluator boundary, where diagnostics must avoid
-/// rendering generated plaintext as though it were an authored literal.
-fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<EvaluatedFnValue, ParseError> {
+fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, ParseError> {
     match value {
         Value::Deferred(DeferredValue::FunctionCall { ref name, ref args }) => {
             // First, recursively evaluate arguments
-            let evaluated_args: Result<Vec<EvaluatedFnValue>, ParseError> = args
+            let evaluated_args: Result<Vec<Value>, ParseError> = args
                 .iter()
                 .map(|a| try_evaluate_fn_value(a.clone(), ctx))
                 .collect();
             let evaluated_args = evaluated_args?;
-            let argument_origins = evaluated_args
-                .iter()
-                .map(|evaluated| evaluated.function_derived)
-                .collect::<Vec<_>>();
-            let evaluated_args = evaluated_args
-                .into_iter()
-                .map(|evaluated| evaluated.value)
-                .collect::<Vec<_>>();
 
             // Check if the name refers to a Closure variable
             if let Some(EvalValue::Closure {
@@ -646,8 +546,7 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<EvaluatedFn
                          finish the partial application before using the result as data",
                             leak.name, leak.remaining_arity
                         ),
-                    })
-                    .map(EvaluatedFnValue::derived);
+                    });
             }
 
             // Try built-in first (with config for decrypt support)
@@ -666,18 +565,11 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<EvaluatedFn
                          finish the partial application before using the result as data",
                             name, leak.name, leak.remaining_arity
                         ),
-                    })
-                    .map(EvaluatedFnValue::derived),
+                    }),
                 Err(_builtin_err) => {
                     // Try user-defined function declared in *this* file.
                     if let Some(user_fn) = ctx.user_functions.get(name) {
-                        evaluate_user_function_with_origins(
-                            user_fn,
-                            &evaluated_args,
-                            &argument_origins,
-                            ctx,
-                        )
-                        .map(EvaluatedFnValue::derived)
+                        evaluate_user_function(user_fn, &evaluated_args, ctx)
                     } else {
                         // Defer the call — the user-fn may live in a
                         // sibling `.crn` and only become visible after
@@ -692,63 +584,41 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<EvaluatedFn
                         // `resource_bindings` are seeded — so this
                         // defer path remains the route by which a
                         // sibling-defined user fn becomes resolvable.
-                        Ok(EvaluatedFnValue::authored(Value::Deferred(
-                            DeferredValue::FunctionCall {
-                                name: name.clone(),
-                                args: evaluated_args,
-                            },
-                        )))
+                        Ok(Value::Deferred(DeferredValue::FunctionCall {
+                            name: name.clone(),
+                            args: evaluated_args,
+                        }))
                     }
                 }
             }
         }
         Value::Concrete(ConcreteValue::List(items)) => {
-            let evaluated: Result<Vec<EvaluatedFnValue>, ParseError> = items
+            let evaluated: Result<Vec<Value>, ParseError> = items
                 .into_iter()
                 .map(|v| try_evaluate_fn_value(v, ctx))
                 .collect();
-            let evaluated = evaluated?;
-            let function_derived = evaluated.iter().any(|value| value.function_derived);
-            let values = evaluated.into_iter().map(|value| value.value).collect();
-            Ok(EvaluatedFnValue {
-                value: Value::Concrete(ConcreteValue::List(values)),
-                function_derived,
-            })
+            Ok(Value::Concrete(ConcreteValue::List(evaluated?)))
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
-            let evaluated: Result<IndexMap<String, EvaluatedFnValue>, ParseError> = map
+            let evaluated: Result<IndexMap<String, Value>, ParseError> = map
                 .into_iter()
-                .map(|(k, v)| try_evaluate_fn_value(v, ctx).map(|ev| (k, ev)))
+                .map(|(k, v)| try_evaluate_fn_value(v, ctx).map(|value| (k, value)))
                 .collect();
-            let evaluated = evaluated?;
-            let function_derived = evaluated.values().any(|value| value.function_derived);
-            let values = evaluated
-                .into_iter()
-                .map(|(key, value)| (key, value.value))
-                .collect();
-            Ok(EvaluatedFnValue {
-                value: Value::Concrete(ConcreteValue::Map(values)),
-                function_derived,
-            })
+            Ok(Value::Concrete(ConcreteValue::Map(evaluated?)))
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            let mut function_derived = false;
             let mut evaluated = Vec::with_capacity(parts.len());
             for part in parts {
                 match part {
                     crate::resource::InterpolationPart::Expr(value) => {
                         let value = try_evaluate_fn_value(value, ctx)?;
-                        function_derived |= value.function_derived;
-                        evaluated.push(crate::resource::InterpolationPart::Expr(value.value));
+                        evaluated.push(crate::resource::InterpolationPart::Expr(value));
                     }
                     other => evaluated.push(other),
                 }
             }
-            Ok(EvaluatedFnValue {
-                value: Value::Deferred(DeferredValue::Interpolation(evaluated)),
-                function_derived,
-            })
+            Ok(Value::Deferred(DeferredValue::Interpolation(evaluated)))
         }
-        other => Ok(EvaluatedFnValue::authored(other)),
+        other => Ok(other),
     }
 }

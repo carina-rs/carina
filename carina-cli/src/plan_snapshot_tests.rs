@@ -1496,7 +1496,7 @@ fn plan_snapshot_exports_multifile() {
         "exports.crn definitions must be merged when loading a multi-file project"
     );
 
-    let export_changes = compute_export_diffs(&fp.export_params, &HashMap::new());
+    let export_changes = compute_export_diffs(&fp.resolved_export_params, &HashMap::new());
     let output = format_plan(
         &fp.plan,
         DetailLevel::Full,
@@ -1728,7 +1728,7 @@ fn plan_snapshot_export_changes_mixed() {
         ExportChange::Added {
             name: "new_export".to_string(),
             type_expr: Some(TypeExpr::String),
-            new_value: Value::Concrete(ConcreteValue::String("hello".to_string())),
+            new_value: Value::Concrete(ConcreteValue::String("hello".into())),
         },
         ExportChange::Modified {
             name: "changed".to_string(),

@@ -4,7 +4,9 @@
 //! (interpolated) string forms, plus the related unescape routines.
 
 use crate::parser::{ParseContext, ParseError, Rule, first_inner, parse_expression};
-use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value};
+use crate::resource::{
+    ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value, ValueString,
+};
 
 /// Encode a string value as canonical, parseable Carina source.
 ///
@@ -139,7 +141,7 @@ pub(crate) fn parse_string_value(
             .next()
             .map(|p| unescape_single_quoted(p.as_str()))
             .unwrap_or_default();
-        return Ok(Value::Concrete(ConcreteValue::String(content)));
+        return Ok(Value::Concrete(ConcreteValue::String(content.into())));
     }
 
     // Double-quoted string (original behavior)
@@ -152,7 +154,7 @@ pub(crate) fn parse_string_value(
             match inner.as_rule() {
                 Rule::string_literal => {
                     let s = unescape_string(inner.as_str());
-                    parts.push(InterpolationPart::Literal(s));
+                    parts.push(InterpolationPart::Literal(s.into()));
                 }
                 Rule::interpolation => {
                     has_interpolation = true;
@@ -184,13 +186,13 @@ pub(crate) fn parse_string_value(
         Ok(Value::Deferred(DeferredValue::Interpolation(parts)).canonicalize())
     } else {
         // No interpolation — collapse to a plain String
-        let s = parts
-            .into_iter()
-            .map(|p| match p {
-                InterpolationPart::Literal(s) => s,
+        let mut s: ValueString = "".into();
+        for part in parts {
+            match part {
+                InterpolationPart::Literal(part) => s.push_derived(&part),
                 _ => unreachable!(),
-            })
-            .collect::<String>();
+            }
+        }
         Ok(Value::Concrete(ConcreteValue::String(s)))
     }
 }
@@ -324,7 +326,9 @@ mod tests {
 
             assert_eq!(
                 parsed.variables.get("rendered"),
-                Some(&Value::Concrete(ConcreteValue::String(value.to_string()))),
+                Some(&Value::Concrete(ConcreteValue::String(
+                    value.to_string().into()
+                ))),
                 "literal {literal} did not round-trip"
             );
         }

@@ -1114,7 +1114,7 @@ pub fn merge_default_tags_for_provider(
                 Value::Concrete(ConcreteValue::List(
                     default_tag_keys
                         .into_iter()
-                        .map(|s| Value::Concrete(ConcreteValue::String(s)))
+                        .map(|s| Value::Concrete(ConcreteValue::String(s.into())))
                         .collect(),
                 )),
             );
@@ -1556,7 +1556,7 @@ fn collect_validators_from_type(
                 let validate_fn = validate.clone();
                 Box::new(move |s: &str| {
                     validate_fn(&crate::resource::Value::Concrete(
-                        crate::resource::ConcreteValue::String(s.to_string()),
+                        crate::resource::ConcreteValue::String(s.to_string().into()),
                     ))
                     .map_err(|e| e.to_string())
                 })
@@ -1742,7 +1742,7 @@ mod tests {
             orphan.clone(),
             HashMap::from([(
                 "status".to_string(),
-                Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+                Value::Concrete(ConcreteValue::String("Enabled".into())),
             )]),
         )]));
 
@@ -1763,7 +1763,7 @@ mod tests {
             from.clone(),
             HashMap::from([(
                 "status".to_string(),
-                Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+                Value::Concrete(ConcreteValue::String("Enabled".into())),
             )]),
         )]));
         let registry = widget_status_registry();
@@ -1808,7 +1808,7 @@ mod tests {
                 "statement".to_string(),
                 Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                     "action".to_string(),
-                    Value::Concrete(ConcreteValue::String("s3:GetObject".to_string())),
+                    Value::Concrete(ConcreteValue::String("s3:GetObject".into())),
                 )]))),
             )]),
         )]));
@@ -1820,7 +1820,7 @@ mod tests {
         };
         assert_eq!(
             statement["action"],
-            Value::Concrete(ConcreteValue::StringList(vec!["s3:GetObject".to_string()])),
+            Value::Concrete(ConcreteValue::StringList(vec!["s3:GetObject".into()])),
             "carina#3740: RawSavedAttrs::lift must apply the shared structural canonicalizer"
         );
     }
@@ -1828,7 +1828,7 @@ mod tests {
     #[test]
     fn raw_saved_attrs_lift_preserves_attribute_absent_from_schema() {
         let id = ResourceId::with_provider_identity("aws", "service.Widget", "widget", None);
-        let original = Value::Concrete(ConcreteValue::String("opaque".to_string()));
+        let original = Value::Concrete(ConcreteValue::String("opaque".into()));
         let raw = RawSavedAttrs::from_persisted(HashMap::from([(
             id.clone(),
             HashMap::from([("provider_extension".to_string(), original.clone())]),
@@ -1846,7 +1846,7 @@ mod tests {
     #[test]
     fn raw_saved_attrs_lift_skips_resource_type_absent_from_registry() {
         let id = ResourceId::with_provider_identity("aws", "service.Unknown", "unknown", None);
-        let original = Value::Concrete(ConcreteValue::String("Enabled".to_string()));
+        let original = Value::Concrete(ConcreteValue::String("Enabled".into()));
         let raw = RawSavedAttrs::from_persisted(HashMap::from([(
             id.clone(),
             HashMap::from([("status".to_string(), original.clone())]),
@@ -1893,11 +1893,11 @@ mod tests {
             HashMap::from([
                 (
                     "status".to_string(),
-                    Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+                    Value::Concrete(ConcreteValue::String("Enabled".into())),
                 ),
                 (
                     "subjects".to_string(),
-                    Value::Concrete(ConcreteValue::String("repo:foo:*".to_string())),
+                    Value::Concrete(ConcreteValue::String("repo:foo:*".into())),
                 ),
             ]),
         )]));
@@ -1949,7 +1949,7 @@ mod tests {
                 "config".to_string(),
                 Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                     "password".to_string(),
-                    Value::Concrete(ConcreteValue::String(secret_hash.clone())),
+                    Value::Concrete(ConcreteValue::String(secret_hash.clone().into())),
                 )]))),
             )]),
         )]));
@@ -1961,7 +1961,7 @@ mod tests {
         };
         assert_eq!(
             config["password"],
-            Value::Concrete(ConcreteValue::String(secret_hash)),
+            Value::Concrete(ConcreteValue::String(secret_hash.into())),
             "carina#3740: a persisted secret hash is an opaque scalar sentinel, never a list"
         );
     }
@@ -2343,11 +2343,11 @@ mod tests {
         let mut resource = DataSource::new("identitystore.user", "mizzy");
         resource.set_attr(
             "identity_store_id".to_string(),
-            Value::Concrete(ConcreteValue::String("d-9567916d09".to_string())),
+            Value::Concrete(ConcreteValue::String("d-9567916d09".into())),
         );
         resource.set_attr(
             "user_name".to_string(),
-            Value::Concrete(ConcreteValue::String("gosukenator@gmail.com".to_string())),
+            Value::Concrete(ConcreteValue::String("gosukenator@gmail.com".into())),
         );
         let resource = ready_data_source_for_test(resource);
 
@@ -2356,13 +2356,13 @@ mod tests {
         assert_eq!(
             state.attributes.get("identity_store_id"),
             Some(&Value::Concrete(ConcreteValue::String(
-                "d-9567916d09".to_string()
+                "d-9567916d09".into()
             )))
         );
         assert_eq!(
             state.attributes.get("user_name"),
             Some(&Value::Concrete(ConcreteValue::String(
-                "gosukenator@gmail.com".to_string()
+                "gosukenator@gmail.com".into()
             )))
         );
     }
@@ -2376,14 +2376,14 @@ mod tests {
         let mut resource = DataSource::new("identitystore.user", "mizzy");
         resource.set_attr(
             "user_name".to_string(),
-            Value::Concrete(ConcreteValue::String("x".to_string())),
+            Value::Concrete(ConcreteValue::String("x".into())),
         );
         let resource = ready_data_source_for_test(resource);
         let state = provider.read_data_source(&resource).await.unwrap();
         assert!(state.exists);
         assert_eq!(
             state.attributes.get("user_name"),
-            Some(&Value::Concrete(ConcreteValue::String("x".to_string())))
+            Some(&Value::Concrete(ConcreteValue::String("x".into())))
         );
     }
 
@@ -2398,14 +2398,14 @@ mod tests {
             DataSource::with_provider("input-aware", "identitystore.user", "mizzy", None);
         resource.set_attr(
             "user_name".to_string(),
-            Value::Concrete(ConcreteValue::String("x".to_string())),
+            Value::Concrete(ConcreteValue::String("x".into())),
         );
         let resource = ready_data_source_for_test(resource);
         let state = router.read_data_source(&resource).await.unwrap();
         assert!(state.exists);
         assert_eq!(
             state.attributes.get("user_name"),
-            Some(&Value::Concrete(ConcreteValue::String("x".to_string())))
+            Some(&Value::Concrete(ConcreteValue::String("x".into())))
         );
     }
 
@@ -2991,7 +2991,7 @@ mod tests {
             let mut attrs = HashMap::new();
             attrs.insert(
                 "tag".to_string(),
-                Value::Concrete(ConcreteValue::String(self.tag.to_string())),
+                Value::Concrete(ConcreteValue::String(self.tag.to_string().into())),
             );
             let state = State::existing(id.clone(), attrs);
             Box::pin(async move { Ok(state) })
@@ -3054,9 +3054,7 @@ mod tests {
         let state = router.read(&default_id, None, ReadRequest).await.unwrap();
         assert_eq!(
             state.attributes.get("tag"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "default".to_string()
-            ))),
+            Some(&Value::Concrete(ConcreteValue::String("default".into()))),
             "resources without provider_instance must route to the kind's default instance"
         );
 
@@ -3064,7 +3062,7 @@ mod tests {
         let state = router.read(&us_id, None, ReadRequest).await.unwrap();
         assert_eq!(
             state.attributes.get("tag"),
-            Some(&Value::Concrete(ConcreteValue::String("us".to_string()))),
+            Some(&Value::Concrete(ConcreteValue::String("us".into()))),
             "resources tagged with binding=Some('us') must route to that named instance"
         );
     }
@@ -3254,7 +3252,7 @@ mod tests {
                     for resource in resources.iter_mut() {
                         for value in resource.attributes.values_mut() {
                             if let Value::Concrete(ConcreteValue::String(s)) = value {
-                                *s = format!("normalized:{}", s);
+                                *s = format!("normalized:{}", s.expose_plaintext()).into();
                             }
                         }
                     }
@@ -3303,13 +3301,13 @@ mod tests {
         let ext = SchemaOnlyProvider;
         let mut resources = vec![Resource::new("test", "example").with_attribute(
             "key",
-            Value::Concrete(ConcreteValue::String("value".to_string())),
+            Value::Concrete(ConcreteValue::String("value".into())),
         )];
         ext.normalize_desired(&mut resources).await.unwrap();
         assert_eq!(
             resources[0].get_attr("key"),
             Some(&Value::Concrete(ConcreteValue::String(
-                "normalized:value".to_string()
+                "normalized:value".into()
             )))
         );
 
@@ -3322,13 +3320,13 @@ mod tests {
             id.clone(),
             HashMap::from([(
                 "restored".to_string(),
-                Value::Concrete(ConcreteValue::String("data".to_string())),
+                Value::Concrete(ConcreteValue::String("data".into())),
             )]),
         );
         ext.hydrate_read_state(&mut states, &saved).await.unwrap();
         assert_eq!(
             states.get(&id).unwrap().attributes.get("restored"),
-            Some(&Value::Concrete(ConcreteValue::String("data".to_string())))
+            Some(&Value::Concrete(ConcreteValue::String("data".into())))
         );
     }
 
@@ -3417,7 +3415,7 @@ mod tests {
                         if resource.id.provider == "normalizing" {
                             for value in resource.attributes.values_mut() {
                                 if let Value::Concrete(ConcreteValue::String(s)) = value {
-                                    *s = format!("norm:{}", s);
+                                    *s = format!("norm:{}", s.expose_plaintext()).into();
                                 }
                             }
                         }
@@ -3456,17 +3454,13 @@ mod tests {
         router.add_normalizer("normalizing", Box::new(TestNormalizer));
 
         let mut resources = vec![
-            Resource::with_provider("normalizing", "test", "example", None).with_attribute(
-                "key",
-                Value::Concrete(ConcreteValue::String("val".to_string())),
-            ),
+            Resource::with_provider("normalizing", "test", "example", None)
+                .with_attribute("key", Value::Concrete(ConcreteValue::String("val".into()))),
         ];
         router.normalize_desired(&mut resources).await.unwrap();
         assert_eq!(
             resources[0].get_attr("key"),
-            Some(&Value::Concrete(ConcreteValue::String(
-                "norm:val".to_string()
-            )))
+            Some(&Value::Concrete(ConcreteValue::String("norm:val".into())))
         );
     }
 }

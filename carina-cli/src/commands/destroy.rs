@@ -1869,7 +1869,7 @@ mod tests {
         assert_eq!(
             *received_role_arn.lock().unwrap(),
             Some(Value::Concrete(ConcreteValue::String(
-                "arn:aws:iam::123456789012:role/upstream".to_string()
+                "arn:aws:iam::123456789012:role/upstream".into()
             )))
         );
     }

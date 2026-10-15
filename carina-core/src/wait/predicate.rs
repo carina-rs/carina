@@ -133,7 +133,7 @@ mod tests {
         let attr = AttrPath::single("status");
         let predicate = WaitPredicate::Equals {
             attr: attr.clone(),
-            value: Value::Concrete(ConcreteValue::String("ready".to_string())),
+            value: Value::Concrete(ConcreteValue::String("ready".into())),
         };
 
         assert_eq!(predicate.watched_attrs(), vec![&attr]);
@@ -186,7 +186,7 @@ mod tests {
     fn resolve_returns_none_for_missing_attr() {
         let attrs = HashMap::from([(
             "status".to_string(),
-            Value::Concrete(ConcreteValue::String("pending".to_string())),
+            Value::Concrete(ConcreteValue::String("pending".into())),
         )]);
         let path = AttrPath::single("missing");
 

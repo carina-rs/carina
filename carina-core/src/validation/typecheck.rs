@@ -45,21 +45,6 @@ impl TypeExprValueError {
         }
         self
     }
-
-    /// Collapse an error produced from an evaluated function result to its
-    /// boundary shape. Function results may contain decrypted/environment
-    /// plaintext, validator messages derived from that plaintext, or map keys;
-    /// none of those are safe diagnostic material once provenance is no longer
-    /// an authored literal.
-    pub(crate) fn redact_evaluated_value(self, expected: &TypeExpr, actual: &Value) -> Self {
-        Self::Mismatch {
-            path: Vec::new(),
-            expected: Box::new(expected.clone()),
-            actual: Box::new(ValueDescription::type_only(actual)),
-            validator_message: None,
-            hint: None,
-        }
-    }
 }
 
 fn write_path(f: &mut fmt::Formatter<'_>, path: &[TypeExprValuePathSegment]) -> fmt::Result {
@@ -237,8 +222,9 @@ pub fn check_type_expr_value(
             Value::Concrete(ConcreteValue::CanonicalEnum(canonical)) => {
                 let identity =
                     crate::schema::TypeIdentity::from_schema_type(provider, path, type_name);
-                let validator_value =
-                    Value::Concrete(ConcreteValue::String(canonical.api_value().to_string()));
+                let validator_value = Value::Concrete(ConcreteValue::String(
+                    canonical.api_value().to_string().into(),
+                ));
                 validate_custom_type(&identity, &validator_value, config)
                     .map_err(|message| validation_mismatch(expected, value, message))
             }
@@ -315,7 +301,8 @@ fn validation_mismatch(expected: &TypeExpr, value: &Value, message: String) -> T
         path: Vec::new(),
         expected: Box::new(expected.clone()),
         actual: Box::new(ValueDescription::of(value)),
-        validator_message: Some(message.into_boxed_str()),
+        validator_message: (!value.contains_diagnostic_sensitive_string())
+            .then(|| message.into_boxed_str()),
         hint: None,
     }
 }
@@ -355,7 +342,7 @@ mod tests {
     }
 
     fn string(value: &str) -> Value {
-        Value::Concrete(ConcreteValue::String(value.to_string()))
+        Value::Concrete(ConcreteValue::String(value.to_string().into()))
     }
 
     fn all_type_shapes() -> Vec<TypeExpr> {
@@ -463,8 +450,8 @@ mod tests {
         ));
 
         let list = Value::Concrete(ConcreteValue::StringList(vec![
-            "dev".to_string(),
-            "production".to_string(),
+            "dev".into(),
+            "production".into(),
         ]));
         let error = check(&TypeExpr::List(Box::new(environment.clone())), &list).unwrap_err();
         assert!(matches!(
@@ -543,7 +530,7 @@ mod tests {
         );
 
         let interpolation = Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Literal("value".to_string()),
+            InterpolationPart::Literal("value".into()),
         ]));
         for expected in [
             TypeExpr::String,
