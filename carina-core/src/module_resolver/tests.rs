@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use indexmap::IndexMap;
 
+use super::resolver::ModuleResolver;
 use super::*;
 use crate::parser::{ArgumentParameter, ModuleCall, ParsedFile, ProviderContext, TypeExpr};
 use crate::resource::{
@@ -209,7 +210,7 @@ fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
     };
 
     let expanded = resolver
-        .expand_module_call(&call, "bootstrap", None)
+        .expand_module_call(&call, "bootstrap")
         .unwrap()
         .resources;
     assert_eq!(expanded.len(), 1);
@@ -254,14 +255,14 @@ fn anonymous_module_resource_instantiated_twice_has_distinct_pending_ids() {
     };
 
     let first = resolver
-        .expand_module_call(&call, "first", None)
+        .expand_module_call(&call, "first")
         .unwrap()
         .resources
         .into_iter()
         .next()
         .unwrap();
     let second = resolver
-        .expand_module_call(&call, "second", None)
+        .expand_module_call(&call, "second")
         .unwrap()
         .resources
         .into_iter()
@@ -303,7 +304,7 @@ fn test_expand_module_call() {
     };
 
     let expanded = resolver
-        .expand_module_call(&call, "my_instance", None)
+        .expand_module_call(&call, "my_instance")
         .unwrap()
         .resources;
     assert_eq!(expanded.len(), 1);
@@ -412,7 +413,7 @@ fn test_expand_module_call_preserves_provider_instance_on_id() {
     };
 
     let expanded = resolver
-        .expand_module_call(&call, "acme", None)
+        .expand_module_call(&call, "acme")
         .unwrap()
         .resources;
     assert_eq!(expanded.len(), 1);
@@ -601,11 +602,11 @@ fn test_multiple_module_instances_no_collision() {
     };
 
     let expanded_a = resolver
-        .expand_module_call(&call_a, "prod", None)
+        .expand_module_call(&call_a, "prod")
         .unwrap()
         .resources;
     let expanded_b = resolver
-        .expand_module_call(&call_b, "staging", None)
+        .expand_module_call(&call_b, "staging")
         .unwrap()
         .resources;
 
@@ -695,15 +696,15 @@ fn create_module_with_attributes() -> ParsedFile {
         uses: vec![],
         module_calls: vec![],
         arguments: vec![],
-        attribute_params: vec![AttributeParameter {
-            name: "security_group".to_string(),
-            type_expr: None,
-            value: Some(Value::resource_ref(
+        attribute_params: vec![AttributeParameter::new(
+            "security_group".to_string(),
+            None,
+            Some(Value::resource_ref(
                 "sg".to_string(),
                 "id".to_string(),
                 vec![],
             )),
-        }],
+        )],
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
@@ -734,7 +735,7 @@ fn test_expand_module_call_creates_composition() {
         arguments: HashMap::new(),
     };
 
-    let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
+    let expanded = resolver.expand_module_call(&call, "web").unwrap();
     // carina#3181 PR C: `resources` is managed-only — 1 real resource.
     assert_eq!(expanded.resources.len(), 1);
     // The composition resource lives in the typed `compositions` slice.
@@ -788,7 +789,7 @@ fn test_expand_module_call_populates_compositions_slice() {
         arguments: HashMap::new(),
     };
 
-    let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
+    let expanded = resolver.expand_module_call(&call, "web").unwrap();
 
     // `resources` is managed-only — the synthetic composition is NOT here.
     assert_eq!(expanded.resources.len(), 1);
@@ -822,7 +823,7 @@ fn test_expand_module_call_populates_expansion_trace_single_level() {
         arguments: HashMap::new(),
     };
 
-    let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
+    let expanded = resolver.expand_module_call(&call, "web").unwrap();
 
     // One leaf produced (the security_group resource).
     assert_eq!(expanded.resources.len(), 1);
@@ -873,7 +874,7 @@ fn test_expand_module_call_records_use_source_path_on_call_site() {
         arguments: HashMap::new(),
     };
 
-    let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
+    let expanded = resolver.expand_module_call(&call, "web").unwrap();
     let leaf = &expanded.resources[0];
     let chain = expanded
         .expansion_trace
@@ -910,7 +911,7 @@ fn test_expand_module_call_call_site_source_path_none_when_unmapped() {
         arguments: HashMap::new(),
     };
 
-    let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
+    let expanded = resolver.expand_module_call(&call, "web").unwrap();
     let leaf = &expanded.resources[0];
     let chain = expanded
         .expansion_trace
@@ -1011,13 +1012,13 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
                 validations: vec![],
             },
         ],
-        attribute_params: vec![AttributeParameter {
-            name: "endpoint".to_string(),
-            type_expr: None,
-            value: Some(Value::Concrete(ConcreteValue::String(
+        attribute_params: vec![AttributeParameter::new(
+            "endpoint".to_string(),
+            None,
+            Some(Value::Concrete(ConcreteValue::String(
                 "fixed-endpoint".to_string(),
             ))),
-        }],
+        )],
         export_params: vec![],
         backend: None,
         state_blocks: vec![],
@@ -1054,7 +1055,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         arguments: call_arguments,
     };
 
-    let expanded = resolver.expand_module_call(&call, "api", None).unwrap();
+    let expanded = resolver.expand_module_call(&call, "api").unwrap();
     assert_eq!(expanded.compositions.len(), 1);
     let composition = &expanded.compositions[0];
 
@@ -1125,9 +1126,7 @@ fn test_expand_module_call_without_binding_still_records_boundary_composition() 
         arguments: HashMap::new(),
     };
 
-    let expanded = resolver
-        .expand_module_call(&call, "web_tier", None)
-        .unwrap();
+    let expanded = resolver.expand_module_call(&call, "web_tier").unwrap();
     assert_eq!(expanded.compositions.len(), 1);
     assert_eq!(expanded.compositions[0].binding, None);
     assert_eq!(expanded.compositions[0].module_name, "web_tier");
@@ -1821,7 +1820,7 @@ fn test_missing_required_argument() {
         arguments: HashMap::new(), // Missing vpc_id
     };
 
-    let result = resolver.expand_module_call(&call, "my_instance", None);
+    let result = resolver.expand_module_call(&call, "my_instance");
     assert!(matches!(result, Err(ModuleError::MissingArgument { .. })));
 }
 
@@ -1849,7 +1848,7 @@ fn test_expand_module_call_uses_dot_path_addressing() {
     };
 
     let expanded = resolver
-        .expand_module_call(&call, "my_instance", None)
+        .expand_module_call(&call, "my_instance")
         .unwrap()
         .resources;
     assert_eq!(expanded.len(), 1);
@@ -1886,7 +1885,7 @@ fn test_module_dot_path_bindings_and_refs() {
     };
 
     let expanded = resolver
-        .expand_module_call(&call, "prod", None)
+        .expand_module_call(&call, "prod")
         .unwrap()
         .resources;
 
@@ -1983,7 +1982,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
         },
     };
 
-    let expanded = resolver.expand_module_call(&call, "prod", None).unwrap();
+    let expanded = resolver.expand_module_call(&call, "prod").unwrap();
 
     // The wait binding survived expansion and every binding-name field
     // is instance-prefixed.
@@ -2038,7 +2037,7 @@ fn test_module_composition_dot_path_refs() {
         arguments: HashMap::new(),
     };
 
-    let expanded = resolver.expand_module_call(&call, "web", None).unwrap();
+    let expanded = resolver.expand_module_call(&call, "web").unwrap();
 
     // carina#3181 PR C: the composition resource lives in the typed slice.
     let composition_res = expanded
@@ -2120,7 +2119,7 @@ fn test_unknown_argument_rejected() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "my_instance", None);
+    let result = resolver.expand_module_call(&call, "my_instance");
     assert!(
         matches!(result, Err(ModuleError::UnknownArgument { .. })),
         "Expected UnknownArgument error, got {:?}",
@@ -2266,7 +2265,7 @@ fn test_expand_module_call_with_interpolation() {
     };
 
     let expanded = resolver
-        .expand_module_call(&call, "dev_vpc", None)
+        .expand_module_call(&call, "dev_vpc")
         .unwrap()
         .resources;
     assert_eq!(expanded.len(), 1);
@@ -2483,7 +2482,7 @@ fn test_expand_module_call_with_function_call_argument() {
     };
 
     let expanded = resolver
-        .expand_module_call(&call, "dev_vpc", None)
+        .expand_module_call(&call, "dev_vpc")
         .unwrap()
         .resources;
     assert_eq!(expanded.len(), 1);
@@ -2819,7 +2818,7 @@ fn test_argument_validation_passes_with_valid_value() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "web", None).unwrap();
+    let result = resolver.expand_module_call(&call, "web").unwrap();
     assert!(
         result.compositions[0]
             .signature
@@ -2864,7 +2863,7 @@ fn test_argument_validation_with_resource_reference_is_pending() {
     };
 
     let expanded = resolver
-        .expand_module_call(&call, "web", None)
+        .expand_module_call(&call, "web")
         .expect("a reference-valued constraint must remain pending");
     let constraints = &expanded.compositions[0].signature.pending_constraints;
     assert_eq!(constraints.len(), 1);
@@ -2974,7 +2973,7 @@ fn nested_pending_constraint_keeps_local_names_while_value_is_rewritten() {
         )]),
     };
 
-    let expanded = resolver.expand_module_call(&call, "root", None).unwrap();
+    let expanded = resolver.expand_module_call(&call, "root").unwrap();
     let nested = expanded
         .compositions
         .iter()
@@ -3018,7 +3017,7 @@ fn test_argument_validation_passes_with_default_value() {
         arguments: HashMap::new(), // Uses default 8080
     };
 
-    let result = resolver.expand_module_call(&call, "web", None);
+    let result = resolver.expand_module_call(&call, "web");
     assert!(result.is_ok());
 }
 
@@ -3044,7 +3043,7 @@ fn test_argument_validation_fails_with_invalid_value() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "web", None);
+    let result = resolver.expand_module_call(&call, "web");
     assert!(result.is_err());
     let err = result.unwrap_err();
     let rendered = err.to_string();
@@ -3089,7 +3088,7 @@ fn test_argument_validation_fails_with_negative_value() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "web", None);
+    let result = resolver.expand_module_call(&call, "web");
     assert!(result.is_err());
 }
 
@@ -3118,7 +3117,7 @@ fn test_argument_validation_fails_too_large() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "web", None);
+    let result = resolver.expand_module_call(&call, "web");
     assert!(result.is_err());
 }
 
@@ -3178,7 +3177,7 @@ fn test_argument_validation_no_message_uses_default() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "c", None);
+    let result = resolver.expand_module_call(&call, "c");
     assert!(result.is_err());
     let err = result.unwrap_err();
     match err {
@@ -3253,7 +3252,7 @@ fn test_argument_validation_len_with_list() {
             args
         },
     };
-    assert!(resolver.expand_module_call(&call, "t", None).is_ok());
+    assert!(resolver.expand_module_call(&call, "t").is_ok());
 
     // Invalid: empty list
     let call = ModuleCall {
@@ -3269,7 +3268,7 @@ fn test_argument_validation_len_with_list() {
             args
         },
     };
-    let result = resolver.expand_module_call(&call, "t", None);
+    let result = resolver.expand_module_call(&call, "t");
     assert!(result.is_err());
     match result.unwrap_err() {
         ModuleError::Constraint(diagnostic) => {
@@ -3361,7 +3360,7 @@ fn test_require_block_passes() {
             args
         },
     };
-    assert!(resolver.expand_module_call(&call, "w", None).is_ok());
+    assert!(resolver.expand_module_call(&call, "w").is_ok());
 }
 
 #[test]
@@ -3438,7 +3437,7 @@ fn test_require_block_fails_with_not_expr() {
             args
         },
     };
-    let result = resolver.expand_module_call(&call, "w", None);
+    let result = resolver.expand_module_call(&call, "w");
     assert!(result.is_err());
     match result.unwrap_err() {
         ModuleError::Constraint(diagnostic) => {
@@ -3514,7 +3513,7 @@ fn test_require_block_len_function() {
             args
         },
     };
-    assert!(resolver.expand_module_call(&call, "lb", None).is_ok());
+    assert!(resolver.expand_module_call(&call, "lb").is_ok());
 
     // One subnet: should fail
     let call = ModuleCall {
@@ -3532,7 +3531,7 @@ fn test_require_block_len_function() {
             args
         },
     };
-    let result = resolver.expand_module_call(&call, "lb", None);
+    let result = resolver.expand_module_call(&call, "lb");
     assert!(result.is_err());
     match result.unwrap_err() {
         ModuleError::Constraint(diagnostic) => {
@@ -3615,7 +3614,7 @@ fn test_require_block_multiple_constraints() {
             args
         },
     };
-    assert!(resolver.expand_module_call(&call, "a", None).is_ok());
+    assert!(resolver.expand_module_call(&call, "a").is_ok());
 
     // min_size > max_size: should fail
     let call = ModuleCall {
@@ -3635,7 +3634,7 @@ fn test_require_block_multiple_constraints() {
             args
         },
     };
-    let result = resolver.expand_module_call(&call, "a", None);
+    let result = resolver.expand_module_call(&call, "a");
     assert!(result.is_err());
     let error = result.unwrap_err();
     let rendered = error.to_string();
@@ -3681,7 +3680,7 @@ fn test_argument_type_mismatch_int_for_string() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "my_instance", None);
+    let result = resolver.expand_module_call(&call, "my_instance");
     assert!(
         matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
         "Expected InvalidArgumentType error, got {:?}",
@@ -3717,7 +3716,7 @@ fn test_argument_type_mismatch_string_for_bool() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "my_instance", None);
+    let result = resolver.expand_module_call(&call, "my_instance");
     assert!(
         matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
         "Expected InvalidArgumentType error, got {:?}",
@@ -3780,7 +3779,7 @@ fn test_argument_type_custom_validator() {
             args
         },
     };
-    assert!(resolver.expand_module_call(&call, "a", None).is_ok());
+    assert!(resolver.expand_module_call(&call, "a").is_ok());
 
     // Invalid ARN fails
     let call_bad = ModuleCall {
@@ -3796,7 +3795,7 @@ fn test_argument_type_custom_validator() {
             args
         },
     };
-    let result = resolver.expand_module_call(&call_bad, "b", None);
+    let result = resolver.expand_module_call(&call_bad, "b");
     assert!(
         matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
         "Expected InvalidArgumentType error for invalid ARN, got {:?}",
@@ -3863,7 +3862,7 @@ fn test_argument_type_list_of_custom_type() {
             args
         },
     };
-    assert!(resolver.expand_module_call(&call, "a", None).is_ok());
+    assert!(resolver.expand_module_call(&call, "a").is_ok());
 
     // List with invalid ARN fails
     let call_bad = ModuleCall {
@@ -3884,7 +3883,7 @@ fn test_argument_type_list_of_custom_type() {
             args
         },
     };
-    let result = resolver.expand_module_call(&call_bad, "b", None);
+    let result = resolver.expand_module_call(&call_bad, "b");
     assert!(
         matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
         "Expected InvalidArgumentType for list with invalid ARN, got {:?}",
@@ -4565,13 +4564,10 @@ let prod = outer {}
         .expect("map(String) should flow through usecase to inner module");
 }
 
-/// A `String`-typed outer arg forwarded into a `list(String)` inner arg
-/// is a type mismatch and must be rejected at the inner call site, even
-/// though the inner call typechecks before the parent's arg substitution
-/// runs. The inner typecheck looks the ref up in the enclosing module's
-/// argument signatures and compares declared types.
+/// The checked-graph gate runs BindingIndex before expansion, including when a
+/// product command has skipped provider/resource validation.
 #[test]
-fn test_mismatched_argument_passthrough_is_rejected() {
+fn test_mismatched_argument_passthrough_is_rejected_before_expansion() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let inner_dir = tmp.path().join("modules/inner");
@@ -4629,19 +4625,19 @@ let prod = outer {
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
     let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
-    let result = resolve_modules(&mut parsed, &root_dir);
+    let error = resolve_modules(&mut parsed, &root_dir)
+        .expect_err("the checked graph must reject String -> list(String)");
     assert!(
-        matches!(&result, Err(ModuleError::InvalidArgumentType { .. })),
-        "String forwarded to list(String) should be rejected, got {:?}",
-        result
+        error
+            .to_string()
+            .contains("cannot assign String to 'patterns'"),
+        "{error}"
     );
 }
 
-/// Cross-scalar mismatch (Int → String) on a pass-through arg ref must
-/// also be rejected — exercises `type_expr_compatible` on plain scalars,
-/// which the list/map cases don't cover.
+/// Cross-scalar forwarding is rejected by the same BindingIndex authority.
 #[test]
-fn test_int_argument_forwarded_to_string_arg_is_rejected() {
+fn test_int_argument_forwarded_to_string_arg_is_rejected_before_expansion() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let inner_dir = tmp.path().join("modules/inner");
@@ -4699,20 +4695,17 @@ let prod = outer {
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
     let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
-    let result = resolve_modules(&mut parsed, &root_dir);
+    let error = resolve_modules(&mut parsed, &root_dir)
+        .expect_err("the checked graph must reject Int -> String");
     assert!(
-        matches!(&result, Err(ModuleError::InvalidArgumentType { .. })),
-        "Int forwarded to String should be rejected, got {:?}",
-        result
+        error.to_string().contains("cannot assign Int to 'name'"),
+        "{error}"
     );
 }
 
-/// Pass-through where the inner element type itself differs (`list(Int)`
-/// → `list(String)`) must reject — exercises the recursive `(List, List)`
-/// arm of `type_expr_compatible` rather than the top-level container
-/// shape.
+/// Nested container declarations are checked by BindingIndex before expansion.
 #[test]
-fn test_list_inner_element_mismatch_is_rejected() {
+fn test_list_inner_element_mismatch_is_rejected_before_expansion() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let inner_dir = tmp.path().join("modules/inner");
@@ -4770,12 +4763,83 @@ let prod = outer {
 
     let content = fs::read_to_string(root_dir.join("main.crn")).unwrap();
     let mut parsed = crate::parser::parse(&content, &ProviderContext::default()).unwrap();
-    let result = resolve_modules(&mut parsed, &root_dir);
+    let error = resolve_modules(&mut parsed, &root_dir)
+        .expect_err("the checked graph must reject list(Int) -> list(String)");
     assert!(
-        matches!(&result, Err(ModuleError::InvalidArgumentType { .. })),
-        "list(Int) forwarded to list(String) should be rejected, got {:?}",
-        result
+        error
+            .to_string()
+            .contains("cannot assign List<Int> to 'patterns'"),
+        "{error}"
     );
+}
+
+fn resolve_ref_forwarding_fixture(inner_type: &str) -> Result<(), ModuleError> {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let outer_dir = tmp.path().join("outer");
+    let inner_dir = outer_dir.join("inner");
+    fs::create_dir_all(&inner_dir).expect("nested module directories");
+    fs::write(
+        inner_dir.join("main.crn"),
+        format!("arguments {{\n  x: {inner_type}\n}}\n"),
+    )
+    .expect("inner module");
+    fs::write(
+        outer_dir.join("main.crn"),
+        r#"let inner = use { source = './inner' }
+arguments {
+  a: mock.test.resource
+}
+inner {
+  x = a
+}
+"#,
+    )
+    .expect("outer module");
+    fs::write(
+        tmp.path().join("main.crn"),
+        r#"let r = mock.test.resource { name = 'r' }
+let outer = use { source = './outer' }
+outer {
+  a = r
+}
+"#,
+    )
+    .expect("root configuration");
+
+    let mut config = ProviderContext::default();
+    config
+        .resource_types
+        .insert(("mock".to_string(), "test.resource".to_string()));
+    let content = fs::read_to_string(tmp.path().join("main.crn")).expect("root source");
+    let mut parsed =
+        crate::parser::parse(&content, &config).expect("root configuration must parse");
+    resolve_modules_with_config(
+        &mut parsed,
+        tmp.path(),
+        &config,
+        &crate::schema::SchemaRegistry::new(),
+    )
+}
+
+/// A declared resource reference is a typed handle for boundary checking even
+/// though its runtime transport remains the resource id string (#3803).
+#[test]
+fn ref_argument_forwarded_to_scalar_is_rejected_before_expansion() {
+    let error = resolve_ref_forwarding_fixture("Int")
+        .expect_err("a resource handle must not flow into an Int argument");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot assign mock.test.resource to 'x'")
+            && error.to_string().contains("expected Int"),
+        "{error}"
+    );
+}
+
+#[test]
+fn ref_argument_forwarded_to_string_remains_supported() {
+    resolve_ref_forwarding_fixture("String")
+        .expect("Ref-typed arguments still transport id strings across module boundaries");
 }
 
 /// Three-deep pass-through: outer → middle → inner all forwarding the
@@ -4867,7 +4931,7 @@ let prod = outer {
 // These tests cover the *caller* side — when a module is declared
 // with `env: 'dev' | 'prod' = 'dev'`, the call site
 // `mod_call { env = 'dpv' }` must be rejected by typecheck. Without
-// the StringLiteral/Union arms in `module_resolver::typecheck`, the
+// the StringLiteral/Union arms in `validation::typecheck`, the
 // typo would slip through to plan because the parser's pre-#2611
 // fallback was `String`.
 
@@ -4931,7 +4995,7 @@ fn caller_side_typo_against_string_literal_union_is_rejected() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "my_env", None);
+    let result = resolver.expand_module_call(&call, "my_env");
     assert!(
         matches!(result, Err(ModuleError::InvalidArgumentType { .. })),
         "Caller passing 'dpv' to `'dev' | 'prod'` must be rejected — \
@@ -4965,7 +5029,7 @@ fn caller_side_value_in_string_literal_union_is_accepted() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "my_env", None);
+    let result = resolver.expand_module_call(&call, "my_env");
     assert!(
         result.is_ok(),
         "Caller passing 'prod' (in the declared union) must be accepted. Got: {:?}",
@@ -5181,7 +5245,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
         },
     };
 
-    let expanded = resolver.expand_module_call(&call, "r", None).unwrap();
+    let expanded = resolver.expand_module_call(&call, "r").unwrap();
 
     // The structural invariant: the module-internal deferred-for
     // reached the caller instead of vanishing at the expansion
@@ -5279,7 +5343,7 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
     };
 
     let first = resolver
-        .expand_module_call(&call, "first", None)
+        .expand_module_call(&call, "first")
         .unwrap()
         .deferred_for_expressions
         .into_iter()
@@ -5287,7 +5351,7 @@ fn module_deferred_template_instantiated_twice_has_distinct_pending_ids() {
         .unwrap()
         .template_resource;
     let second = resolver
-        .expand_module_call(&call, "second", None)
+        .expand_module_call(&call, "second")
         .unwrap()
         .deferred_for_expressions
         .into_iter()
@@ -5362,7 +5426,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
         },
     };
 
-    let expanded = resolver.expand_module_call(&call, "prod", None).unwrap();
+    let expanded = resolver.expand_module_call(&call, "prod").unwrap();
     let d = &expanded.deferred_for_expressions[0];
     // `binding_name` is a synthesized address prefix → always prefixed.
     assert_eq!(d.binding_name, "prod._list");
@@ -5535,8 +5599,13 @@ let registry_publish = registry {
 
     let config = ProviderContext::default();
     let mut parsed = crate::parser::parse(root_body, &config).expect("root must parse");
-    resolve_modules_with_config(&mut parsed, &root_dir, &config)
-        .expect("production module resolution must succeed");
+    resolve_modules_with_config(
+        &mut parsed,
+        &root_dir,
+        &config,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("production module resolution must succeed");
 
     let consumer = parsed
         .resources
@@ -5674,8 +5743,13 @@ let outer = outer_module {}
 
     let config = ProviderContext::default();
     let mut parsed = crate::parser::parse(root_body, &config).expect("root must parse");
-    resolve_modules_with_config(&mut parsed, &root_dir, &config)
-        .expect("nested production module resolution must succeed");
+    resolve_modules_with_config(
+        &mut parsed,
+        &root_dir,
+        &config,
+        &crate::schema::SchemaRegistry::new(),
+    )
+    .expect("nested production module resolution must succeed");
 
     let target = parsed
         .resources
@@ -5750,7 +5824,7 @@ fn argument_type_list_accepts_resource_ref() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "a", None);
+    let result = resolver.expand_module_call(&call, "a");
     assert!(
         result.is_ok(),
         "list(T) argument should accept ResourceRef (carina#3238); got {:?}",
@@ -5793,7 +5867,7 @@ fn argument_type_map_accepts_resource_ref() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "a", None);
+    let result = resolver.expand_module_call(&call, "a");
     assert!(
         result.is_ok(),
         "map(T) argument should accept ResourceRef (carina#3238); got {:?}",
@@ -5837,11 +5911,46 @@ fn argument_type_struct_accepts_resource_ref() {
         },
     };
 
-    let result = resolver.expand_module_call(&call, "a", None);
+    let result = resolver.expand_module_call(&call, "a");
     assert!(
         result.is_ok(),
         "struct argument should accept ResourceRef (carina#3238); got {:?}",
         result
+    );
+}
+
+#[test]
+fn argument_type_int_accepts_resource_ref_for_later_ref_type_validation() {
+    let mut module = create_test_module();
+    module.arguments = vec![ArgumentParameter {
+        name: "count".to_string(),
+        type_expr: TypeExpr::Int,
+        default: None,
+        description: None,
+        validations: Vec::new(),
+    }];
+
+    let resolver = {
+        let mut resolver = ModuleResolver::new(".");
+        resolver
+            .imported_modules
+            .insert("test_module".to_string(), module);
+        resolver
+    };
+    let call = ModuleCall {
+        module_name: "test_module".to_string(),
+        binding_name: Some("a".to_string()),
+        source: Default::default(),
+        arguments: HashMap::from([(
+            "count".to_string(),
+            Value::resource_ref("source", "count", Vec::new()),
+        )]),
+    };
+
+    let result = resolver.expand_module_call(&call, "a");
+    assert!(
+        result.is_ok(),
+        "ResourceRef type is checked by the BindingIndex pass; expansion must defer it: {result:?}"
     );
 }
 
@@ -5940,15 +6049,6 @@ fn argument_type_mismatch_error_shows_actual_value() {
 }
 
 fn module_argument_type_error(arg_name: &str, type_expr: TypeExpr, value: Value) -> String {
-    module_argument_type_error_with_enclosing_args(arg_name, type_expr, value, None)
-}
-
-fn module_argument_type_error_with_enclosing_args(
-    arg_name: &str,
-    type_expr: TypeExpr,
-    value: Value,
-    enclosing_args: Option<&[ArgumentParameter]>,
-) -> String {
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: arg_name.to_string(),
@@ -5973,7 +6073,7 @@ fn module_argument_type_error_with_enclosing_args(
         arguments: HashMap::from([(arg_name.to_string(), value)]),
     };
 
-    let result = resolver.expand_module_call(&call, "web", enclosing_args);
+    let result = resolver.expand_module_call(&call, "web");
     let Err(err) = result else {
         panic!("expected InvalidArgumentType error, got Ok");
     };
@@ -5994,9 +6094,10 @@ fn argument_type_mismatch_error_shows_string_literal_value() {
 
     let msg = module_argument_type_error("environment", environment_type(), value);
 
-    assert!(
-        msg.contains("got string \"production\""),
-        "error should include the mismatched string value; got: {msg}"
+    assert_eq!(
+        msg,
+        "Invalid argument type for 'environment' in module 'web_tier': expected 'dev' | 'stg' | 'prod', got string \"production\"",
+        "the #3804 root diagnostic must remain stable"
     );
 }
 
@@ -6045,8 +6146,10 @@ fn argument_type_mismatch_error_shows_nested_list_element_value() {
     );
 
     assert!(
-        msg.contains("got list containing string \"production\""),
-        "error should include the mismatched list element; got: {msg}"
+        msg.contains(
+            "at list element 1: expected 'dev' | 'stg' | 'prod', got string \"production\""
+        ),
+        "error should include the mismatched list element and path; got: {msg}"
     );
 }
 
@@ -6064,8 +6167,8 @@ fn argument_type_mismatch_error_shows_string_list_element_value() {
     let msg = module_argument_type_error("environments", type_expr, value);
 
     assert!(
-        msg.contains("got list containing string \"production\""),
-        "error should include the mismatched StringList element; got: {msg}"
+        msg.contains("at list element 1: expected 'dev' | 'stg', got string \"production\""),
+        "error should include the mismatched StringList element and path; got: {msg}"
     );
 }
 
@@ -6083,36 +6186,69 @@ fn argument_type_mismatch_error_shows_complete_nested_list_path() {
     let msg = module_argument_type_error("environments", type_expr, value);
 
     assert!(
-        msg.contains("got list containing list containing string \"production\""),
+        msg.contains(
+            "at list element 0 -> list element 0: expected 'dev', got string \"production\""
+        ),
         "error should report the complete path to the innermost mismatched list element; got: {msg}"
     );
 }
 
 #[test]
-fn argument_type_mismatch_error_describes_nested_enclosing_arg_binding_ref() {
-    let enclosing_args = vec![ArgumentParameter {
-        name: "outer_environments".to_string(),
-        type_expr: TypeExpr::List(Box::new(TypeExpr::List(Box::new(TypeExpr::Int)))),
+fn binding_ref_argument_defers_to_binding_index() {
+    let mut module = create_test_module();
+    module.arguments = vec![ArgumentParameter {
+        name: "environment".to_string(),
+        type_expr: TypeExpr::Union(vec![
+            TypeExpr::StringLiteral("dev".to_string()),
+            TypeExpr::StringLiteral("prod".to_string()),
+        ]),
         default: None,
         description: None,
         validations: Vec::new(),
     }];
-    let expected = TypeExpr::List(Box::new(TypeExpr::List(Box::new(TypeExpr::String))));
-    let value = Value::Deferred(DeferredValue::BindingRef {
-        binding: "outer_environments".to_string(),
-    });
+    let mut resolver = ModuleResolver::new(".");
+    resolver
+        .imported_modules
+        .insert("inner".to_string(), module);
+    let call = ModuleCall {
+        module_name: "inner".to_string(),
+        binding_name: Some("inner_instance".to_string()),
+        source: Default::default(),
+        arguments: HashMap::from([(
+            "environment".to_string(),
+            Value::Deferred(DeferredValue::BindingRef {
+                binding: "outer_environment".to_string(),
+            }),
+        )]),
+    };
+    // Expansion only checks concrete value shapes. BindingIndex owns the
+    // declared source-to-sink relation for binding references.
+    assert!(resolver.expand_module_call(&call, "inner_instance").is_ok());
+}
 
-    let msg = module_argument_type_error_with_enclosing_args(
-        "environments",
-        expected,
-        value,
-        Some(&enclosing_args),
-    );
+#[test]
+fn directory_module_loader_preserves_parameter_diagnostic_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let attributes_path = temp.path().join("attributes.crn");
+    let exports_path = temp.path().join("exports.crn");
+    std::fs::write(
+        &attributes_path,
+        "attributes {\n  output: String = 'value'\n}\n",
+    )
+    .unwrap();
+    std::fs::write(&exports_path, "exports {\n  result: String = 'value'\n}\n").unwrap();
 
-    assert!(
-        msg.contains("got binding reference"),
-        "error should describe the enclosing-argument reference; got: {msg}"
-    );
+    let parsed = load_directory_module(temp.path()).expect("directory module");
+    let attribute_source = parsed.attribute_params[0]
+        .diagnostic_source()
+        .expect("attribute source");
+    assert_eq!(attribute_source.file, attributes_path);
+    assert_eq!(attribute_source.call_span.start_line, 2);
+    let export_source = parsed.export_params[0]
+        .diagnostic_source()
+        .expect("export source");
+    assert_eq!(export_source.file, exports_path);
+    assert_eq!(export_source.call_span.start_line, 2);
 }
 
 #[test]
@@ -6127,7 +6263,7 @@ fn argument_type_mismatch_error_redacts_secret_list_element() {
     let msg = module_argument_type_error("counts", TypeExpr::List(Box::new(TypeExpr::Int)), value);
 
     assert!(
-        msg.contains("got list containing secret"),
+        msg.contains("at list element 0: expected Int, got secret"),
         "error should describe a secret list element by shape; got: {msg}"
     );
     assert!(
@@ -6156,8 +6292,10 @@ fn argument_type_mismatch_error_shows_nested_map_value() {
     );
 
     assert!(
-        msg.contains("got map containing string \"production\""),
-        "error should include the mismatched map value; got: {msg}"
+        msg.contains(
+            "at map key 'secondary': expected 'dev' | 'stg' | 'prod', got string \"production\""
+        ),
+        "error should include the mismatched map value and path; got: {msg}"
     );
 }
 
@@ -6174,8 +6312,10 @@ fn argument_type_mismatch_error_shows_nested_struct_field_value() {
     let msg = module_argument_type_error("settings", type_expr, value);
 
     assert!(
-        msg.contains("got map containing string \"production\""),
-        "error should include the mismatched struct field value; got: {msg}"
+        msg.contains(
+            "at struct field 'environment': expected 'dev' | 'stg' | 'prod', got string \"production\""
+        ),
+        "error should include the mismatched struct field value and path; got: {msg}"
     );
 }
 

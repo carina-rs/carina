@@ -6161,9 +6161,9 @@ fn user_fn_typed_param_type_mismatch() {
 
     let err = parse(input, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
-    assert!(
-        msg.contains("expects type 'String'"),
-        "Expected type mismatch error, got: {msg}"
+    assert_eq!(
+        msg,
+        "User-defined function error: function 'greet': parameter 'name': expected String, got int (42)"
     );
 }
 
@@ -6181,10 +6181,152 @@ fn user_fn_typed_param_int() {
 
     let err = parse(input, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
-    assert!(
-        msg.contains("expects type 'Int'"),
-        "Expected type mismatch error, got: {msg}"
+    assert_eq!(
+        msg,
+        "User-defined function error: function 'double': parameter 'x': expected Int, got string \"not_int\""
     );
+}
+
+#[test]
+fn user_fn_float_param_accepts_int_widening() {
+    let input = r#"
+        fn number(value: Float) {
+            value
+        }
+
+        let result = aws.s3_bucket {
+            name = number(42)
+        }
+    "#;
+
+    let parsed = parse(input, &ProviderContext::default());
+    assert!(
+        parsed.is_ok(),
+        "an Int function argument must widen to Float: {:?}",
+        parsed.err()
+    );
+}
+
+#[test]
+fn user_fn_checks_evaluated_builtin_string_results_at_the_parameter_boundary() {
+    for (label, expression) in [("upper", "upper('x')"), ("join", "join(',', ['a'])")] {
+        let input = format!(
+            r#"
+fn f(x: Int): String {{ 'a' }}
+let result = mock.test.resource {{
+    name = f({expression})
+}}
+"#
+        );
+
+        let error = parse(&input, &ProviderContext::default())
+            .expect_err("a concrete String builtin result must not satisfy Int")
+            .to_string();
+        assert!(
+            error.contains("function 'f': parameter 'x': expected Int, got string"),
+            "{label}: {error}"
+        );
+        assert!(!error.contains("return value"), "{label}: {error}");
+    }
+}
+
+#[test]
+fn user_fn_evaluated_decrypt_result_is_redacted_at_parameter_boundary() {
+    let config = ProviderContext {
+        decryptor: Some(Box::new(|_, _| Ok("hunter2plaintext".to_string()))),
+        ..ProviderContext::default()
+    };
+    let input = r#"
+fn f(x: Int): String { 'ok' }
+let result = mock.test.resource {
+    name = f(decrypt('ciphertext'))
+}
+"#;
+
+    let error = parse(input, &config)
+        .expect_err("a decrypted String must not satisfy an Int parameter")
+        .to_string();
+    assert!(
+        error.contains("function 'f': parameter 'x': expected Int, got string"),
+        "{error}"
+    );
+    assert!(!error.contains("hunter2plaintext"), "{error}");
+    assert!(!error.contains("ciphertext"), "{error}");
+}
+
+#[test]
+fn user_fn_evaluated_decrypt_result_is_redacted_at_return_boundary() {
+    let config = ProviderContext {
+        decryptor: Some(Box::new(|_, _| Ok("hunter2plaintext".to_string()))),
+        ..ProviderContext::default()
+    };
+    let input = r#"
+fn f(): Int { decrypt('ciphertext') }
+let result = mock.test.resource { name = f() }
+"#;
+
+    let error = parse(input, &config)
+        .expect_err("a decrypted String must not satisfy an Int return")
+        .to_string();
+    assert!(
+        error.contains("function 'f': return value: expected Int, got string"),
+        "{error}"
+    );
+    assert!(!error.contains("hunter2plaintext"), "{error}");
+    assert!(!error.contains("ciphertext"), "{error}");
+}
+
+#[test]
+fn user_fn_checks_evaluated_secret_result_at_the_parameter_boundary() {
+    let input = r#"
+fn g(x: Int): Int { x }
+let result = mock.test.resource {
+    name = g(secret('Z'))
+}
+"#;
+
+    let error = parse(input, &ProviderContext::default())
+        .expect_err("a secret String must not satisfy an Int parameter")
+        .to_string();
+    assert!(
+        error.contains("function 'g': parameter 'x': expected Int, got secret"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("return value"),
+        "the call site must be blamed before evaluating the return: {error}"
+    );
+}
+
+#[test]
+fn user_fn_accepts_evaluated_builtin_int_result_at_the_parameter_boundary() {
+    let input = r#"
+fn g(x: Int): Int { x }
+let result = mock.test.resource {
+    name = g(length([1, 2]))
+}
+"#;
+
+    parse(input, &ProviderContext::default())
+        .expect("length(list) returns an Int accepted by an Int parameter");
+}
+
+#[test]
+fn user_fn_list_param_checks_element_types() {
+    let input = r#"
+        fn numbers(values: list(Int)) {
+            values
+        }
+
+        let result = aws.s3_bucket {
+            name = numbers(["not-an-int"])
+        }
+    "#;
+
+    let error = parse(input, &ProviderContext::default())
+        .expect_err("a String element must not satisfy list(Int)")
+        .to_string();
+    assert!(error.contains("list element 0"), "{error}");
 }
 
 #[test]
@@ -6243,9 +6385,9 @@ fn user_fn_typed_param_bool_mismatch() {
 
     let err = parse(input, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
-    assert!(
-        msg.contains("expects type 'Bool'"),
-        "Expected type mismatch error, got: {msg}"
+    assert_eq!(
+        msg,
+        "User-defined function error: function 'check': parameter 'flag': expected Bool, got string \"not_bool\". Use true or false."
     );
 }
 
@@ -6380,10 +6522,79 @@ fn user_fn_return_type_mismatch_value() {
 
     let err = parse(input, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
-    assert!(
-        msg.contains("return type"),
-        "Expected return type error, got: {msg}"
+    assert_eq!(
+        msg,
+        "User-defined function error: function 'bad': return value: expected String, got int (42)"
     );
+}
+
+#[test]
+fn user_fn_float_return_accepts_int_widening() {
+    let input = r#"
+        fn number(): Float {
+            42
+        }
+
+        let result = aws.s3_bucket {
+            name = number()
+        }
+    "#;
+
+    let parsed = parse(input, &ProviderContext::default());
+    assert!(
+        parsed.is_ok(),
+        "an Int function return must widen to Float: {:?}",
+        parsed.err()
+    );
+}
+
+#[test]
+fn user_fn_list_return_checks_element_types() {
+    let input = r#"
+        fn numbers(): list(Int) {
+            ["not-an-int"]
+        }
+
+        let result = aws.s3_bucket {
+            name = numbers()
+        }
+    "#;
+
+    let error = parse(input, &ProviderContext::default())
+        .expect_err("a String element must not satisfy list(Int)")
+        .to_string();
+    assert!(error.contains("list element 0"), "{error}");
+}
+
+#[test]
+fn user_fn_literal_union_checks_parameters_and_returns() {
+    let bad_argument = r#"
+        fn environment(value: 'dev' | 'prod'): 'dev' | 'prod' {
+            value
+        }
+
+        let result = aws.s3_bucket {
+            name = environment("stg")
+        }
+    "#;
+    let error = parse(bad_argument, &ProviderContext::default())
+        .expect_err("an out-of-set function argument must be rejected")
+        .to_string();
+    assert!(error.contains("'dev' | 'prod'"), "{error}");
+
+    let bad_return = r#"
+        fn environment(): 'dev' | 'prod' {
+            "stg"
+        }
+
+        let result = aws.s3_bucket {
+            name = environment()
+        }
+    "#;
+    let error = parse(bad_return, &ProviderContext::default())
+        .expect_err("an out-of-set function return must be rejected")
+        .to_string();
+    assert!(error.contains("'dev' | 'prod'"), "{error}");
 }
 
 #[test]
@@ -6548,7 +6759,7 @@ fn user_fn_custom_type_cidr_arg_invalid() {
     let err = parse(input, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("type 'ipv4_cidr' validation failed"),
+        msg.contains("parameter 'x': expected Ipv4Cidr"),
         "Expected ipv4_cidr validation error, got: {msg}"
     );
 }
@@ -6578,7 +6789,7 @@ fn user_fn_custom_type_ipv4_address_arg_invalid() {
     let err = parse(input, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("type 'ipv4_address' validation failed"),
+        msg.contains("parameter 'x': expected Ipv4Address"),
         "Expected ipv4_address validation error, got: {msg}"
     );
 }
@@ -6608,7 +6819,7 @@ fn user_fn_custom_type_ipv6_cidr_arg_invalid() {
     let err = parse(input, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("type 'ipv6_cidr' validation failed"),
+        msg.contains("parameter 'x': expected Ipv6Cidr"),
         "Expected ipv6_cidr validation error, got: {msg}"
     );
 }
@@ -6651,7 +6862,7 @@ fn user_fn_custom_type_http_response_status_code_arg_invalid() {
     let err = parse(input, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("type 'http_response_status_code' validation failed"),
+        msg.contains("parameter 'x': expected HttpResponseStatusCode"),
         "Expected http_response_status_code validation error, got: {msg}"
     );
 }
@@ -6678,7 +6889,7 @@ fn user_fn_custom_type_redirect_protocol_arg_valid_invalid() {
     let err = parse(invalid, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("type 'redirect_protocol' validation failed"),
+        msg.contains("parameter 'x': expected RedirectProtocol"),
         "Expected redirect_protocol validation error, got: {msg}"
     );
 }
@@ -6705,7 +6916,7 @@ fn user_fn_custom_type_redirect_host_arg_valid_invalid() {
     let err = parse(invalid, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("type 'redirect_host' validation failed"),
+        msg.contains("parameter 'x': expected RedirectHost"),
         "Expected redirect_host validation error, got: {msg}"
     );
 }
@@ -6732,7 +6943,7 @@ fn user_fn_custom_type_redirect_port_arg_valid_invalid() {
     let err = parse(invalid, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("type 'redirect_port' validation failed"),
+        msg.contains("parameter 'x': expected RedirectPort"),
         "Expected redirect_port validation error, got: {msg}"
     );
 }
@@ -6759,7 +6970,7 @@ fn user_fn_custom_type_redirect_path_arg_valid_invalid() {
     let err = parse(invalid, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("type 'redirect_path' validation failed"),
+        msg.contains("parameter 'x': expected RedirectPath"),
         "Expected redirect_path validation error, got: {msg}"
     );
 }
@@ -6786,7 +6997,7 @@ fn user_fn_custom_type_redirect_query_arg_valid_invalid() {
     let err = parse(invalid, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("type 'redirect_query' validation failed"),
+        msg.contains("parameter 'x': expected RedirectQuery"),
         "Expected redirect_query validation error, got: {msg}"
     );
 }
@@ -6803,7 +7014,7 @@ fn user_fn_custom_type_ipv6_address_arg_invalid() {
     let err = parse(input, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("type 'ipv6_address' validation failed"),
+        msg.contains("parameter 'x': expected Ipv6Address"),
         "Expected ipv6_address validation error, got: {msg}"
     );
 }
@@ -6867,7 +7078,7 @@ fn user_fn_custom_type_return_cidr_invalid() {
     let err = parse(input, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("return type 'ipv4_cidr' validation failed"),
+        msg.contains("return value: expected Ipv4Cidr"),
         "Expected ipv4_cidr validation error, got: {msg}"
     );
 }
@@ -6884,7 +7095,7 @@ fn user_fn_custom_type_return_ipv4_address_invalid() {
     let err = parse(input, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("return type 'ipv4_address' validation failed"),
+        msg.contains("return value: expected Ipv4Address"),
         "Expected ipv4_address validation error, got: {msg}"
     );
 }
@@ -6914,7 +7125,7 @@ fn user_fn_custom_type_return_http_response_status_code_invalid() {
     let err = parse(input, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("return type 'http_response_status_code' validation failed"),
+        msg.contains("return value: expected HttpResponseStatusCode"),
         "Expected http_response_status_code validation error, got: {msg}"
     );
 }
@@ -6941,7 +7152,7 @@ fn user_fn_custom_type_return_redirect_protocol_valid_invalid() {
     let err = parse(invalid, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("return type 'redirect_protocol' validation failed"),
+        msg.contains("return value: expected RedirectProtocol"),
         "Expected redirect_protocol validation error, got: {msg}"
     );
 }
@@ -6968,7 +7179,7 @@ fn user_fn_custom_type_return_redirect_host_valid_invalid() {
     let err = parse(invalid, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("return type 'redirect_host' validation failed"),
+        msg.contains("return value: expected RedirectHost"),
         "Expected redirect_host validation error, got: {msg}"
     );
 }
@@ -6995,7 +7206,7 @@ fn user_fn_custom_type_return_redirect_port_valid_invalid() {
     let err = parse(invalid, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("return type 'redirect_port' validation failed"),
+        msg.contains("return value: expected RedirectPort"),
         "Expected redirect_port validation error, got: {msg}"
     );
 }
@@ -7022,7 +7233,7 @@ fn user_fn_custom_type_return_redirect_path_valid_invalid() {
     let err = parse(invalid, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("return type 'redirect_path' validation failed"),
+        msg.contains("return value: expected RedirectPath"),
         "Expected redirect_path validation error, got: {msg}"
     );
 }
@@ -7049,7 +7260,7 @@ fn user_fn_custom_type_return_redirect_query_valid_invalid() {
     let err = parse(invalid, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("return type 'redirect_query' validation failed"),
+        msg.contains("return value: expected RedirectQuery"),
         "Expected redirect_query validation error, got: {msg}"
     );
 }
@@ -7066,7 +7277,7 @@ fn user_fn_custom_type_return_ipv6_cidr_invalid() {
     let err = parse(input, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("return type 'ipv6_cidr' validation failed"),
+        msg.contains("return value: expected Ipv6Cidr"),
         "Expected ipv6_cidr validation error, got: {msg}"
     );
 }
@@ -7083,7 +7294,7 @@ fn user_fn_custom_type_return_ipv6_address_invalid() {
     let err = parse(input, &ProviderContext::default()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("return type 'ipv6_address' validation failed"),
+        msg.contains("return value: expected Ipv6Address"),
         "Expected ipv6_address validation error, got: {msg}"
     );
 }
@@ -9493,11 +9704,7 @@ fn type_expr_unknown_serde_round_trips() {
 
 #[test]
 fn parsed_export_param_keeps_optional_type_expr() {
-    let p = ParsedExportParam {
-        name: "vpc_id".to_string(),
-        type_expr: None,
-        value: None,
-    };
+    let p = ParsedExportParam::new("vpc_id".to_string(), None, None);
     assert!(p.type_expr.is_none());
 }
 

@@ -39,7 +39,7 @@ pub use error::{
     ParseError, ParseWarning, ParseWarningSpan, SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE,
     WarningKind,
 };
-pub(crate) use functions::evaluate_user_function;
+pub(crate) use functions::{evaluate_user_function, evaluate_user_function_with_origins};
 pub use functions::{provider_context_lookup, validate_custom_type};
 pub use resolve::{
     ProviderConfigInvariantError, ProviderConfigResolutionError, ResolvedProviderConfig,
@@ -50,6 +50,7 @@ pub use resolve::{
 };
 pub(crate) use resolve::{
     collect_seed_bindings_from_parts, reject_cyclic_let_bindings_in_variables,
+    resolve_resource_refs_defer_unknown_functions, resolve_resource_refs_for_diagnostics,
 };
 pub use static_eval::evaluate_static_value_for_validation;
 pub use types::BUILTIN_BARE_CUSTOM_TYPES;

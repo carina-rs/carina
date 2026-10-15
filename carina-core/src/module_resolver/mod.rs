@@ -12,8 +12,6 @@
 //! - `loader`: filesystem helpers — `load_module`, `load_directory_module`,
 //!   `load_module_from_directory`, `get_parsed_file`, `derive_module_name`.
 //!   All loader entry points are directory-scoped.
-//! - `typecheck`: validates module call argument values against declared
-//!   `TypeExpr`s.
 //! - `expander`: `expand_module_call` plus argument substitution and
 //!   intra-module reference rewriting; also hosts the
 //!   `reconcile_anonymous_module_instances` post-pass.
@@ -26,7 +24,6 @@ mod expander;
 mod loader;
 mod resolver;
 mod signature;
-mod typecheck;
 mod validation;
 
 pub use error::ModuleError;
@@ -35,9 +32,10 @@ pub use loader::{
     LoadedModule, derive_module_name, get_parsed_file, load_directory_module, load_module,
     load_module_from_directory, load_module_with_diagnostics,
 };
+pub(crate) use resolver::resolve_upstream_modules_with_config;
 pub use resolver::{
     ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleCallSystemIdentity,
-    ModuleResolutionDiagnosticReport, ModuleResolver, ResolvedModuleConstraintOutcome,
+    ModuleResolutionDiagnosticReport, RefCheckedModuleGraph, ResolvedModuleConstraintOutcome,
     ResolvedModuleConstraintStatus, resolve_modules, resolve_modules_with_config,
     resolve_modules_with_diagnostics,
 };

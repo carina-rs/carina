@@ -11,9 +11,7 @@ use crate::resource::{ConcreteValue, DeferredValue, Value};
 /// values retain only their shape, which keeps their diagnostics concise and
 /// prevents deferred secrets from exposing their contents.
 ///
-/// Descriptions built with `containing` prefix an inner description with the
-/// outer value's shape and the word `containing`.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueDescription(String);
 
 impl ValueDescription {
@@ -43,9 +41,34 @@ impl ValueDescription {
         })
     }
 
-    /// Describe `outer` as a container holding an offending inner value.
-    pub(crate) fn containing(outer: &Value, inner: Self) -> Self {
-        Self(format!("{} containing {inner}", Self::of(outer)))
+    /// Describe only the runtime shape of a value.
+    ///
+    /// Function evaluation can turn `env()` / `decrypt()` results into an
+    /// ordinary concrete string. Diagnostics at the next typed boundary must
+    /// not mistake that generated value for an authored literal and print its
+    /// contents.
+    pub(crate) fn type_only(value: &Value) -> Self {
+        Self(
+            match value {
+                Value::Concrete(ConcreteValue::String(_)) => "string",
+                Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "enum identifier",
+                Value::Concrete(ConcreteValue::CanonicalEnum(_)) => "canonical enum",
+                Value::Concrete(ConcreteValue::Int(_)) => "int",
+                Value::Concrete(ConcreteValue::Float(_)) => "float",
+                Value::Concrete(ConcreteValue::Bool(_)) => "bool",
+                Value::Concrete(ConcreteValue::Duration(_)) => "duration",
+                Value::Concrete(ConcreteValue::List(_))
+                | Value::Concrete(ConcreteValue::StringList(_)) => "list",
+                Value::Concrete(ConcreteValue::Map(_)) => "map",
+                Value::Deferred(DeferredValue::ResourceRef { .. }) => "resource reference",
+                Value::Deferred(DeferredValue::BindingRef { .. }) => "binding reference",
+                Value::Deferred(DeferredValue::Interpolation(_)) => "interpolation",
+                Value::Deferred(DeferredValue::FunctionCall { .. }) => "function call",
+                Value::Deferred(DeferredValue::Secret(_)) => "secret",
+                Value::Deferred(DeferredValue::Unknown(_)) => "unknown",
+            }
+            .to_string(),
+        )
     }
 }
 

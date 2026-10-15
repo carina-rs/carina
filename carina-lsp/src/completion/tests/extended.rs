@@ -4117,6 +4117,68 @@ awscc.ec2.Vpc {
 }
 
 #[test]
+fn value_position_filters_literal_union_by_lifted_string_type() {
+    let provider = test_provider_with_vpc_and_security_group();
+    let completions_at = |attribute: &str| {
+        let text = format!(
+            "arguments {{\n  environment: 'dev' | 'prod'\n}}\n\nawscc.ec2.Vpc {{\n  {attribute} =\n}}\n"
+        );
+        let doc = create_document(&text);
+        let position = Position {
+            line: 5,
+            character: format!("  {attribute} = ").chars().count() as u32,
+        };
+        provider
+            .complete(&doc, position, None)
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>()
+    };
+
+    let plain_string = completions_at("cidr_block");
+    assert!(
+        plain_string.iter().any(|label| label == "environment"),
+        "literal-union argument must remain available at a plain String sink: {plain_string:?}"
+    );
+
+    let identified_string = completions_at("vpc_id");
+    assert!(
+        identified_string.iter().all(|label| label != "environment"),
+        "literal-union argument must not satisfy an identified String sink: {identified_string:?}"
+    );
+
+    let int_schema = ResourceSchema::new("foo.bar")
+        .attribute(AttributeSchema::new("count", AttributeType::int()));
+    let mut int_schemas = SchemaRegistry::new();
+    int_schemas.insert("test", int_schema);
+    let int_provider = CompletionProvider::new(
+        Arc::new(int_schemas),
+        vec!["test".to_string()],
+        vec![],
+        vec![],
+    );
+    let int_text =
+        "arguments {\n  environment: 'dev' | 'prod'\n}\n\ntest.foo.bar {\n  count =\n}\n";
+    let int_doc = create_document(int_text);
+    let int_labels = int_provider
+        .complete(
+            &int_doc,
+            Position {
+                line: 5,
+                character: "  count = ".chars().count() as u32,
+            },
+            None,
+        )
+        .into_iter()
+        .map(|item| item.label)
+        .collect::<Vec<_>>();
+    assert!(
+        int_labels.iter().all(|label| label != "environment"),
+        "literal-union argument must not satisfy an Int sink: {int_labels:?}"
+    );
+}
+
+#[test]
 fn value_position_suppresses_all_builtins() {
     // Builtins are intentionally NOT emitted at the bare value
     // position regardless of target type. Even String-returning

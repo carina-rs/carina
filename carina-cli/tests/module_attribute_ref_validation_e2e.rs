@@ -231,10 +231,11 @@ fn unannotated_module_attribute_rejects_unknown_resource_attribute() {
 
     assert_unknown_arn(&diags);
     assert!(
-        diags
-            .iter()
-            .any(|diag| diag.contains("instance.target_group.arn")),
-        "diagnostic should identify the expanded module resource: {diags:#?}",
+        diags.iter().any(|diag| {
+            diag.contains("reference target_group.arn")
+                && !diag.contains("instance.target_group.arn")
+        }),
+        "diagnostic should preserve the authored module resource path: {diags:#?}",
     );
 }
 
@@ -348,10 +349,11 @@ let outer_instance = outer_module { }
 
     assert_unknown_arn(&diags);
     assert!(
-        diags
-            .iter()
-            .any(|diag| { diag.contains("outer_instance.inner_instance.target_group.arn") }),
-        "nested diagnostic should identify the fully expanded resource path: {diags:#?}",
+        diags.iter().any(|diag| {
+            diag.contains("reference target_group.arn")
+                && !diag.contains("outer_instance.inner_instance.target_group.arn")
+        }),
+        "nested diagnostic should preserve the authored resource path: {diags:#?}",
     );
 }
 

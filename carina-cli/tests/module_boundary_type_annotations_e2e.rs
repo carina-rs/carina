@@ -470,22 +470,19 @@ let b = m { vpc_ids = [a.sg, c.sg] }
     );
 
     let diagnostics = fixture.validate();
-    let mismatches: Vec<_> = diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            diagnostic.contains("module call 'b': argument 'vpc_ids'")
-                && diagnostic.contains("expected aws.ec2.Vpc.Id")
-                && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
-        })
-        .collect();
+    let rendered = diagnostics.join("\n");
 
     assert_eq!(
-        mismatches.len(),
+        rendered
+            .matches("module call 'b': argument 'vpc_ids'")
+            .count(),
         2,
         "both argument references with the same error kind must survive dedup: {diagnostics:#?}",
     );
-    assert!(mismatches.iter().any(|error| error.contains("a.sg")));
-    assert!(mismatches.iter().any(|error| error.contains("c.sg")));
+    assert!(rendered.contains("expected aws.ec2.Vpc.Id"));
+    assert!(rendered.contains("got aws.ec2.SecurityGroup.Id"));
+    assert!(rendered.contains("a.sg"));
+    assert!(rendered.contains("c.sg"));
 }
 
 #[test]
@@ -1128,7 +1125,7 @@ web_tier {
     let diagnostics = fixture.validate();
     assert!(
         diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("module call 'web_tier (anonymous call)'")
+            diagnostic.contains("module call 'web_tier'")
                 && diagnostic.contains("argument 'vpc_id'")
                 && diagnostic.contains("expected aws.ec2.Vpc.Id")
                 && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
@@ -1295,9 +1292,10 @@ fn attribute_declaration_rejects_security_group_id_as_vpc_id() {
         "one authored output declaration should report once regardless of call count: {diagnostics:#?}",
     );
     assert!(
-        mismatches[0].contains("module '../web_tier'")
-            && mismatches[0].contains("from web.web_sg.group_id"),
-        "the declaration diagnostic should identify its module and one source path: {diagnostics:#?}",
+        mismatches[0].contains("../web_tier:")
+            && mismatches[0].contains("from web_sg.group_id")
+            && !mismatches[0].contains("from web.web_sg.group_id"),
+        "the declaration diagnostic should identify its module and authored source path: {diagnostics:#?}",
     );
 }
 
@@ -1495,10 +1493,12 @@ fn assert_nested_module_call_mismatch(attribute_declaration: &str) {
     let mismatches: Vec<_> = diagnostics
         .iter()
         .filter(|diagnostic| {
-            diagnostic.contains("module call 'instance.b': argument 'vpc_id'")
+            (diagnostic.contains("module call 'b': argument 'vpc_id'")
+                && diagnostic.contains("from a.sg_id")
+                || diagnostic.contains("module call 'instance.b': argument 'vpc_id'")
+                    && diagnostic.contains("from instance.a.sg_id"))
                 && diagnostic.contains("expected aws.ec2.Vpc.Id")
                 && diagnostic.contains("got aws.ec2.SecurityGroup.Id")
-                && diagnostic.contains("from instance.a.sg_id")
         })
         .collect();
 

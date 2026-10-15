@@ -1,10 +1,26 @@
 use super::*;
 use crate::backend::document_end_position;
+use carina_core::parser::TypeExpr;
+use carina_core::resource::Value;
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 
 const ATTRIBUTE_DERIVED_IDENTITY_ERROR: &str = "Anonymous resource identity is derived from \
 mutable attributes for multiple 'mock.test.resource' declarations using provider instance \
 '<default>' in the root scope. Use `let` bindings to give them distinct stable identities.";
+
+fn render_value_type_error(
+    engine: &DiagnosticEngine,
+    type_expr: &TypeExpr,
+    value: &Value,
+) -> Option<String> {
+    carina_core::validation::typecheck::check_type_expr_value(
+        type_expr,
+        value,
+        &engine.provider_context,
+    )
+    .err()
+    .map(|error| error.to_string())
+}
 
 fn unused_binding_messages(diagnostics: &[Diagnostic]) -> Vec<&str> {
     diagnostics
@@ -1828,11 +1844,11 @@ let name = join("-", parts)
 }
 
 #[test]
-fn validate_module_arg_type_ipv4_address_invalid() {
+fn shared_typecheck_ipv4_address_invalid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv4_address".to_string());
     let value = Value::Concrete(ConcreteValue::String("not-an-ip".to_string()));
-    let result = engine.validate_module_arg_type(&type_expr, &value);
+    let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
         result.is_some(),
         "Should return error for invalid ipv4_address"
@@ -1840,11 +1856,11 @@ fn validate_module_arg_type_ipv4_address_invalid() {
 }
 
 #[test]
-fn validate_module_arg_type_ipv4_address_valid() {
+fn shared_typecheck_ipv4_address_valid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv4_address".to_string());
     let value = Value::Concrete(ConcreteValue::String("192.168.1.1".to_string()));
-    let result = engine.validate_module_arg_type(&type_expr, &value);
+    let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
         result.is_none(),
         "Should not return error for valid ipv4_address. Got: {:?}",
@@ -1853,11 +1869,11 @@ fn validate_module_arg_type_ipv4_address_valid() {
 }
 
 #[test]
-fn validate_module_arg_type_ipv6_cidr_invalid() {
+fn shared_typecheck_ipv6_cidr_invalid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_cidr".to_string());
     let value = Value::Concrete(ConcreteValue::String("not-a-cidr".to_string()));
-    let result = engine.validate_module_arg_type(&type_expr, &value);
+    let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
         result.is_some(),
         "Should return error for invalid ipv6_cidr"
@@ -1865,11 +1881,11 @@ fn validate_module_arg_type_ipv6_cidr_invalid() {
 }
 
 #[test]
-fn validate_module_arg_type_ipv6_cidr_valid() {
+fn shared_typecheck_ipv6_cidr_valid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_cidr".to_string());
     let value = Value::Concrete(ConcreteValue::String("2001:db8::/32".to_string()));
-    let result = engine.validate_module_arg_type(&type_expr, &value);
+    let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
         result.is_none(),
         "Should not return error for valid ipv6_cidr. Got: {:?}",
@@ -1878,11 +1894,11 @@ fn validate_module_arg_type_ipv6_cidr_valid() {
 }
 
 #[test]
-fn validate_module_arg_type_ipv6_address_invalid() {
+fn shared_typecheck_ipv6_address_invalid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_address".to_string());
     let value = Value::Concrete(ConcreteValue::String("not-an-ipv6".to_string()));
-    let result = engine.validate_module_arg_type(&type_expr, &value);
+    let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
         result.is_some(),
         "Should return error for invalid ipv6_address"
@@ -1890,11 +1906,11 @@ fn validate_module_arg_type_ipv6_address_invalid() {
 }
 
 #[test]
-fn validate_module_arg_type_ipv6_address_valid() {
+fn shared_typecheck_ipv6_address_valid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_address".to_string());
     let value = Value::Concrete(ConcreteValue::String("2001:db8::1".to_string()));
-    let result = engine.validate_module_arg_type(&type_expr, &value);
+    let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
         result.is_none(),
         "Should not return error for valid ipv6_address. Got: {:?}",
@@ -1903,7 +1919,7 @@ fn validate_module_arg_type_ipv6_address_valid() {
 }
 
 #[test]
-fn validate_module_arg_type_list_ipv4_address_invalid() {
+fn shared_typecheck_list_ipv4_address_invalid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::List(Box::new(
         carina_core::parser::TypeExpr::Simple("ipv4_address".to_string()),
@@ -1912,20 +1928,20 @@ fn validate_module_arg_type_list_ipv4_address_invalid() {
         Value::Concrete(ConcreteValue::String("192.168.1.1".to_string())),
         Value::Concrete(ConcreteValue::String("bad-ip".to_string())),
     ]));
-    let result = engine.validate_module_arg_type(&type_expr, &value);
+    let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
         result.is_some(),
         "Should return error for invalid ipv4_address in list"
     );
     assert!(
-        result.as_ref().unwrap().contains("Element 1"),
+        result.as_ref().unwrap().contains("list element 1"),
         "Error should reference element index. Got: {:?}",
         result
     );
 }
 
 #[test]
-fn validate_module_arg_type_list_ipv6_cidr_valid() {
+fn shared_typecheck_list_ipv6_cidr_valid() {
     let engine = test_engine();
     let type_expr = carina_core::parser::TypeExpr::List(Box::new(
         carina_core::parser::TypeExpr::Simple("ipv6_cidr".to_string()),
@@ -1934,7 +1950,7 @@ fn validate_module_arg_type_list_ipv6_cidr_valid() {
         Value::Concrete(ConcreteValue::String("2001:db8::/32".to_string())),
         Value::Concrete(ConcreteValue::String("::/0".to_string())),
     ]));
-    let result = engine.validate_module_arg_type(&type_expr, &value);
+    let result = render_value_type_error(&engine, &type_expr, &value);
     assert!(
         result.is_none(),
         "Should not return error for valid ipv6_cidr list. Got: {:?}",
@@ -3655,65 +3671,6 @@ fn module_boundary_identity_engine() -> DiagnosticEngine {
 }
 
 #[test]
-fn module_call_ref_fallback_anchors_second_anonymous_call() {
-    use carina_core::binding_index::BindingIndex;
-    use carina_core::module_resolver::ResolvedModuleSignature;
-    use carina_core::parser::{ArgumentParameter, TypeExpr};
-    use indexmap::IndexMap;
-    use std::collections::HashMap;
-
-    let engine = module_boundary_identity_engine();
-    let source = r#"let needs = use { source = '../needs' }
-
-let vpc = aws.ec2.Vpc {
-  name = "vpc"
-}
-
-let sg = aws.ec2.SecurityGroup {
-  name = "sg"
-}
-
-needs {
-  vpc_id = vpc.vpc_id
-}
-
-needs {
-  vpc_id = sg.group_id
-}
-"#;
-    let doc = create_document(source);
-    let parsed = doc.parsed().expect("fixture must parse");
-    let imported_modules = HashMap::from([(
-        "needs".to_string(),
-        ResolvedModuleSignature {
-            arguments: vec![ArgumentParameter {
-                name: "vpc_id".to_string(),
-                type_expr: TypeExpr::SchemaType {
-                    provider: "aws".to_string(),
-                    path: "ec2.Vpc".to_string(),
-                    type_name: "Id".to_string(),
-                },
-                default: None,
-                description: None,
-                validations: Vec::new(),
-            }],
-            attributes: IndexMap::new(),
-            requires: Vec::new(),
-        },
-    )]);
-    let bindings = BindingIndex::from_parsed(parsed, &engine.schemas);
-
-    let diagnostics =
-        engine.check_module_call_ref_types(&doc, parsed, &imported_modules, &bindings);
-    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-    assert_eq!(
-        diagnostics[0].range.start.line, 15,
-        "only the second anonymous call is invalid: {diagnostics:?}",
-    );
-    assert_eq!(diagnostics[0].range.start.character, 2);
-}
-
-#[test]
 fn module_argument_types_are_sources_in_open_module_document() {
     let engine = module_boundary_identity_engine();
     let tmp = tempfile::tempdir().unwrap();
@@ -3835,9 +3792,16 @@ let first = unrelated { }
     );
     binding_input.compositions.extend([source, consumer]);
     let bindings = BindingIndex::from_parsed(&binding_input, &engine.schemas);
+    let semantic_view =
+        super::super::checks::SemanticView::for_analysis(parsed, Some(&binding_input), None, true);
 
-    let diagnostics =
-        engine.check_composition_ref_types(&doc, parsed, &binding_input.compositions, &bindings);
+    let diagnostics = engine.check_composition_ref_types(
+        &doc,
+        parsed,
+        &semantic_view,
+        &binding_input.compositions,
+        &bindings,
+    );
 
     assert!(
         diagnostics.is_empty(),
@@ -4811,10 +4775,10 @@ fn annotated_nested_module_call_is_reported_when_root_module_is_opened() {
 
     let diagnostics = analyze_with_buffer(&engine, &fixture.root, "main.crn", &fixture.root_source);
 
-    assert_one_nested_lsp_mismatch(&diagnostics, "instance.b", "instance.a.sg_id");
+    assert_one_nested_lsp_mismatch(&diagnostics, "b", "a.sg_id");
     let mismatch = diagnostics
         .iter()
-        .find(|diagnostic| diagnostic.message.contains("module call 'instance.b'"))
+        .find(|diagnostic| diagnostic.message.contains("module call 'b'"))
         .unwrap();
     assert_eq!(mismatch.range.start.line, 6);
     assert_eq!(mismatch.range.start.character, 15);
@@ -7435,6 +7399,78 @@ provider awscc {
 }
 
 #[test]
+fn provider_finalize_keeps_independent_diagnostic_after_module_witness_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let module = root.path().join("module");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(module.join("main.crn"), "arguments { count: Int }\n").unwrap();
+    let main = r#"let module = use { source = './module' }
+let instance = module {
+  count = 'wrong'
+}
+"#;
+    let providers = r#"let bad = 'not a map'
+provider awscc {
+  default_tags = bad
+}
+"#;
+    std::fs::write(root.path().join("main.crn"), main).unwrap();
+    std::fs::write(root.path().join("providers.crn"), providers).unwrap();
+
+    let engine = test_engine();
+    let doc = create_document(providers);
+    let finalize_error = engine
+        .finalize_provider_diagnostic(&doc, Some("providers.crn"), root.path())
+        .expect("independent provider finalization must survive a module witness failure");
+    assert!(finalize_error.to_string().contains("default_tags"));
+
+    let diagnostics = analyze_with_buffer(&engine, root.path(), "providers.crn", providers);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("default_tags")),
+        "an independent provider error must not be hidden by failed expansion: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn provider_finalize_suppresses_only_value_dependent_on_failed_module() {
+    let root = tempfile::tempdir().unwrap();
+    let module = root.path().join("module");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        "arguments { count: Int }\nattributes { tags: map(String) = { env = 'dev' } }\n",
+    )
+    .unwrap();
+    let main = r#"let module = use { source = './module' }
+let instance = module { count = 'wrong' }
+"#;
+    let providers = r#"provider awscc {
+  default_tags = instance.tags
+}
+"#;
+    std::fs::write(root.path().join("main.crn"), main).unwrap();
+    std::fs::write(root.path().join("providers.crn"), providers).unwrap();
+
+    let engine = test_engine();
+    let doc = create_document(providers);
+    assert!(
+        engine
+            .finalize_provider_diagnostic(&doc, Some("providers.crn"), root.path())
+            .is_none(),
+        "a provider value downstream of failed expansion cannot be finalized independently"
+    );
+    let diagnostics = analyze_with_buffer(&engine, root.path(), "providers.crn", providers);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("default_tags")),
+        "the dependent provider value must not create a misleading shape error: {diagnostics:#?}"
+    );
+}
+
+#[test]
 fn lsp_flags_wait_unknown_target() {
     let engine = test_engine_with_wait_target();
     let src = r#"
@@ -7761,6 +7797,474 @@ fn write_tag_key_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
         std::fs::write(path, source).unwrap();
     }
     temp
+}
+
+#[test]
+fn module_call_reports_literal_union_and_bool_value_mismatches() {
+    let main = r#"let web_tier = use { source = './modules/web_tier' }
+
+web_tier {
+    environment = 'production'
+    enable = 'yes'
+}
+"#;
+    let module = r#"arguments {
+    environment: 'dev' | 'stg' | 'prod'
+    enable: Bool
+}
+"#;
+    let temp = write_tag_key_fixture(&[("main.crn", main), ("modules/web_tier/main.crn", module)]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let type_errors = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("expected 'dev' | 'stg' | 'prod'")
+                || diagnostic
+                    .message
+                    .contains("expected Bool, got string \"yes\"")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(type_errors.len(), 2, "diagnostics: {diagnostics:#?}");
+    assert!(
+        type_errors.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("expected 'dev' | 'stg' | 'prod', got string \"production\"")),
+        "literal-union mismatch missing: {diagnostics:#?}"
+    );
+    assert!(
+        type_errors.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("expected Bool, got string \"yes\". Use true or false.")),
+        "Bool mismatch missing: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn module_output_reference_mismatch_uses_pre_expansion_signature_and_authored_names() {
+    let main = r#"let m = use { source = './modules/m' }
+let x = m { n = 1 }
+let y = m { n = x.s }
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("modules/m/arguments.crn", "arguments { n: Int }\n"),
+        (
+            "modules/m/attributes.crn",
+            "attributes {\n  s: String = 'str'\n}\n",
+        ),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("module call 'y'")
+                && diagnostic.message.contains("expected Int")
+                && diagnostic.message.contains("got String")
+                && diagnostic.message.contains("from x.s")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(mismatches.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("module call 'm_")),
+        "diagnostics must never expose synthetic instance hashes: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn module_call_uses_argument_type_declared_in_sibling_file() {
+    let main = r#"let inner = use { source = './modules/inner' }
+
+inner {
+    name = count
+}
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("arguments.crn", "arguments {\n    count: Int\n}\n"),
+        ("main.crn", main),
+        (
+            "modules/inner/main.crn",
+            "arguments {\n    name: String\n}\n",
+        ),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("cannot assign Int to 'name': expected String, got Int (from count)")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "BindingIndex must report the merged directory argument type once: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn module_call_uses_values_resolved_from_sibling_let_bindings() {
+    let main = r#"let inner = use { source = './modules/inner' }
+
+inner {
+    count = my_count
+    environment = my_env
+    names = my_names
+    enable = my_flag
+}
+"#;
+    let values = r#"let my_count = 3
+let my_env = 'dev'
+let my_names = ['a', 'b']
+let my_flag = true
+"#;
+    let module = r#"arguments {
+    count: Int
+    environment: 'dev' | 'prod'
+    names: list(String)
+    enable: Bool
+}
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("values.crn", values),
+        ("modules/inner/main.crn", module),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    let warnings = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        warnings.is_empty(),
+        "directory-resolved sibling let values must not warn: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn export_uses_value_resolved_from_sibling_let_binding() {
+    let exports = "exports {\n    c: Int = my_count\n}\n";
+    let temp = write_tag_key_fixture(&[
+        ("values.crn", "let my_count = 3\n"),
+        ("exports.crn", exports),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "exports.crn", exports);
+    let warnings = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        warnings.is_empty(),
+        "directory-resolved sibling export values must not warn: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn attribute_uses_value_resolved_from_sibling_let_binding() {
+    let attributes = "attributes {\n    c: Int = my_count\n}\n";
+    let temp = write_tag_key_fixture(&[
+        ("values.crn", "let my_count = 3\n"),
+        ("attributes.crn", attributes),
+    ]);
+
+    let diagnostics =
+        analyze_with_buffer(&test_engine(), temp.path(), "attributes.crn", attributes);
+    let warnings = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        warnings.is_empty(),
+        "directory-resolved sibling attribute values must not warn: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn module_call_value_typecheck_skips_buffer_guess_when_directory_merge_fails() {
+    let main = r#"let inner = use { source = './modules/inner' }
+
+inner {
+    environment = the_env
+}
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("values.crn", "let the_env = 'dev'\n"),
+        ("broken.crn", "let broken = {\n"),
+        (
+            "modules/inner/main.crn",
+            "arguments {\n    environment: String\n}\n",
+        ),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains("expected String")
+                || !diagnostic.message.contains("the_env")
+        }),
+        "a buffer-only enum guess must not be value-type-checked: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn broken_sibling_still_checks_context_free_module_literals_only() {
+    let main = r#"let inner = use { source = './modules/inner' }
+
+inner {
+    count = 'wrong'
+    environment = the_env
+}
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("values.crn", "let the_env = 'dev'\n"),
+        ("broken.crn", "let broken = {\n"),
+        (
+            "modules/inner/main.crn",
+            "arguments {\n    count: Int\n    environment: String\n}\n",
+        ),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", main);
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("expected Int, got string \"wrong\"")),
+        "the context-free literal mismatch must survive a broken sibling: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains("expected String")
+                || !diagnostic.message.contains("the_env")
+        }),
+        "the sibling-dependent value must remain quiet: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn broken_sibling_uses_source_local_module_reference_fallback() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let main = r#"provider mock {}
+let inner = use { source = './modules/inner' }
+let r = mock.test.resource { name = 'r' }
+
+inner {
+    count = r.name
+}
+"#;
+    let temp = write_tag_key_fixture(&[
+        ("main.crn", main),
+        ("broken.crn", "let broken = {\n"),
+        ("modules/inner/main.crn", "arguments {\n    count: Int\n}\n"),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&engine, temp.path(), "main.crn", main);
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("module call 'inner'")
+                && diagnostic.message.contains("expected Int")
+                && diagnostic.message.contains("got String")
+        }),
+        "the source-local BindingIndex fallback must still fire: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn user_function_reference_arguments_and_returns_use_binding_index_types() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let engine = custom_engine(schemas);
+    let source = r#"provider mock {}
+let r = mock.test.resource { name = 'r' }
+fn takes_int(x: Int) { 'fixed' }
+fn returns_int(): Int { r.name }
+fn returns_string(): String { r.name }
+let a = mock.test.resource { name = takes_int(r.name) }
+let b = mock.test.resource { name = returns_int() }
+let c = mock.test.resource { name = returns_string() }
+"#;
+    let temp = write_tag_key_fixture(&[("main.crn", source)]);
+
+    let diagnostics = analyze_with_buffer(&engine, temp.path(), "main.crn", source);
+    let function_mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("function '")
+                && diagnostic.message.contains("expected Int")
+                && diagnostic.message.contains("got String")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        function_mismatches.len(),
+        2,
+        "function argument and return mismatches must both surface, while the matching return stays quiet: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn nested_user_function_return_mismatch_surfaces_across_sibling_files() {
+    let root = tempfile::tempdir().unwrap();
+    let main = "fn f(x: Int): String { 'ok' }\nlet result = f(g(1))\n";
+    std::fs::write(root.path().join("main.crn"), main).unwrap();
+    std::fs::write(
+        root.path().join("funcs.crn"),
+        "fn g(y: Int): String { 'str' }\n",
+    )
+    .unwrap();
+
+    let diagnostics = analyze_with_buffer(&test_engine(), root.path(), "main.crn", main);
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("function 'f'")
+                && diagnostic.message.contains("expected Int")
+                && diagnostic.message.contains("got String")
+        }),
+        "the directory-merged function table must type g() before f evaluates: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("\"str\"")),
+        "evaluated nested-call contents must stay redacted: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn nested_forward_declared_user_function_return_mismatch_surfaces() {
+    let root = tempfile::tempdir().unwrap();
+    let main = r#"fn f(x: Int): String { 'ok' }
+let result = f(g(1))
+fn g(y: Int): String { 'str' }
+"#;
+    std::fs::write(root.path().join("main.crn"), main).unwrap();
+
+    let diagnostics = analyze_with_buffer(&test_engine(), root.path(), "main.crn", main);
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("function 'f'")
+                && diagnostic.message.contains("expected Int")
+                && diagnostic.message.contains("got String")
+        }),
+        "forward declaration order must not bypass the parameter check: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("\"str\"")),
+        "evaluated nested-call contents must stay redacted: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn export_value_typecheck_skips_buffer_guess_when_directory_merge_fails() {
+    let exports = "exports {\n    bad: Int = 'wrong'\n    e1: String = the_env\n}\n";
+    let temp = write_tag_key_fixture(&[
+        ("values.crn", "let the_env = 'dev'\n"),
+        ("broken.crn", "let broken = {\n"),
+        ("exports.crn", exports),
+    ]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "exports.crn", exports);
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("expected Int, got string \"wrong\"")),
+        "a context-free export literal must still be checked: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains("expected String")
+                || !diagnostic.message.contains("the_env")
+        }),
+        "a buffer-only export value guess must not be type-checked: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn attribute_value_typecheck_skips_buffer_guess_when_directory_merge_fails() {
+    let attributes = "attributes {\n    bad: Int = 'wrong'\n    e1: String = the_env\n}\n";
+    let temp = write_tag_key_fixture(&[
+        ("arguments.crn", "arguments {\n    input: String\n}\n"),
+        ("values.crn", "let the_env = 'dev'\n"),
+        ("broken.crn", "let broken = {\n"),
+        ("attributes.crn", attributes),
+    ]);
+
+    let diagnostics =
+        analyze_with_buffer(&test_engine(), temp.path(), "attributes.crn", attributes);
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("expected Int, got string \"wrong\"")),
+        "a context-free attribute literal must still be checked: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains("expected String")
+                || !diagnostic.message.contains("the_env")
+        }),
+        "a buffer-only attribute value guess must not be type-checked: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn export_argument_type_mismatch_is_reported_once_by_binding_index() {
+    let source = r#"arguments {
+    count: Int
+}
+
+exports {
+    z: Bool = count
+}
+"#;
+    let temp = write_tag_key_fixture(&[("main.crn", source)]);
+
+    let diagnostics = analyze_with_buffer(&test_engine(), temp.path(), "main.crn", source);
+    let type_mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("expected Bool"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        type_mismatches.len(),
+        1,
+        "BindingIndex must be the sole authority for reference-valued exports: {diagnostics:#?}"
+    );
+    assert!(
+        type_mismatches[0].message.contains("export 'z'"),
+        "the sole diagnostic must come from BindingIndex: {diagnostics:#?}"
+    );
 }
 
 fn tag_key_style_diagnostics(

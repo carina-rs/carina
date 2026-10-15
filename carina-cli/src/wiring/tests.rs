@@ -3963,11 +3963,7 @@ fn validate_rejects_empty_interpolation_in_export_value() {
         Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
     )]));
     let parsed = ParsedFile {
-        export_params: vec![ParsedExportParam {
-            name: "url".to_string(),
-            type_expr: None,
-            value: Some(bad),
-        }],
+        export_params: vec![ParsedExportParam::new("url".to_string(), None, Some(bad))],
         ..ParsedFile::default()
     };
 
@@ -3998,11 +3994,11 @@ fn validate_rejects_empty_interpolation_in_attribute_param_default() {
         Value::Deferred(DeferredValue::Unknown(UnknownReason::EmptyInterpolation)),
     )]));
     let parsed = ParsedFile {
-        attribute_params: vec![AttributeParameter {
-            name: "region".to_string(),
-            type_expr: None,
-            value: Some(bad),
-        }],
+        attribute_params: vec![AttributeParameter::new(
+            "region".to_string(),
+            None,
+            Some(bad),
+        )],
         ..ParsedFile::default()
     };
 

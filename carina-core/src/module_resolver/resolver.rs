@@ -3,15 +3,16 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 
 use crate::parser::{
-    ArgumentParameter, ModuleCallDiagnosticSource, ParseError, ParsedFile, ProviderContext,
-    UseStatement,
+    ModuleCallDiagnosticSource, ParseError, ParsedFile, ProviderContext, UseStatement,
 };
 use crate::resource::ModuleConstraintId;
+use crate::schema::SchemaRegistry;
 
 use super::error::ModuleError;
 use super::expander::instance_prefix_for_call;
@@ -79,8 +80,103 @@ pub struct ModuleResolutionDiagnosticReport {
     pub error: Option<ModuleError>,
 }
 
+/// Opaque proof that every reachable module definition has passed the shared
+/// BindingIndex reference-type validation before expansion.
+///
+/// Expansion is exposed only as [`Self::expand`]; the resolver and the witness
+/// consumed by its internal expansion primitive are private. Consequently a
+/// command may skip provider/resource validation, but cannot construct an
+/// expansion path that skips reference-type validation.
+///
+/// ```compile_fail
+/// use carina_core::module_resolver::ModuleResolver;
+/// // ModuleResolver is private; callers must obtain RefCheckedModuleGraph.
+/// let _ = ModuleResolver::new(".");
+/// ```
+///
+/// A checked graph owns exclusive access to the exact parse it checked, so a
+/// caller cannot swap in a different parse at expansion time:
+///
+/// ```compile_fail
+/// use std::path::Path;
+/// use carina_core::module_resolver::RefCheckedModuleGraph;
+/// use carina_core::parser::{ParsedFile, ProviderContext};
+/// use carina_core::schema::SchemaRegistry;
+///
+/// let mut first = ParsedFile::default();
+/// let mut second = ParsedFile::default();
+/// let config = ProviderContext::default();
+/// let schemas = SchemaRegistry::new();
+/// let checked = RefCheckedModuleGraph::check(
+///     &mut first,
+///     Path::new("."),
+///     &config,
+///     &schemas,
+/// ).unwrap();
+/// checked.expand(&mut second).unwrap();
+/// ```
+pub struct RefCheckedModuleGraph<'parsed, 'cfg, E> {
+    parsed: &'parsed mut crate::parser::File<E>,
+    resolver: ModuleResolver<'cfg, StrictTypeResolution>,
+    root_witness: RefCheckWitness,
+}
+
+/// Upstream expansion has a deliberately weaker type-name-resolution policy:
+/// the consumer need not load every provider used by the upstream project.
+/// Keeping that policy in a distinct, private graph prevents ordinary module
+/// expansion from opting into it accidentally.
+struct UpstreamRefCheckedModuleGraph<'parsed, 'cfg, E> {
+    parsed: &'parsed mut crate::parser::File<E>,
+    resolver: ModuleResolver<'cfg, DeferredUpstreamTypeResolution>,
+    root_witness: RefCheckWitness,
+}
+
+/// Private capability produced only by `ModuleResolver::validate_reference_types`.
+pub(super) struct RefCheckWitness(pub(super) ());
+
+/// Compile-time policy for resolving type annotations in loaded modules.
+pub(crate) trait TypeResolutionPolicy {
+    fn resolve_file_type_exprs<E: crate::parser::ExportParamLike>(
+        parsed: &mut crate::parser::File<E>,
+        config: &ProviderContext,
+    ) -> Result<(), ModuleError>;
+}
+
+/// Normal module resolution requires every declared type to resolve.
+pub(crate) struct StrictTypeResolution;
+
+impl TypeResolutionPolicy for StrictTypeResolution {
+    fn resolve_file_type_exprs<E: crate::parser::ExportParamLike>(
+        parsed: &mut crate::parser::File<E>,
+        config: &ProviderContext,
+    ) -> Result<(), ModuleError> {
+        let type_errors = crate::validation::resolve_file_type_exprs(parsed, config);
+        if let Some(first) = type_errors.into_iter().next() {
+            return Err(ModuleError::Parse(ParseError::InvalidExpression {
+                line: 0,
+                message: first,
+            }));
+        }
+        Ok(())
+    }
+}
+
+/// Upstream projects are interpreted with the consumer's incomplete provider
+/// registry, so unknown provider-owned types carry no usable constraint.
+struct DeferredUpstreamTypeResolution;
+
+impl TypeResolutionPolicy for DeferredUpstreamTypeResolution {
+    fn resolve_file_type_exprs<E: crate::parser::ExportParamLike>(
+        parsed: &mut crate::parser::File<E>,
+        config: &ProviderContext,
+    ) -> Result<(), ModuleError> {
+        crate::validation::resolve_file_type_exprs_or_unknown(parsed, config);
+        Ok(())
+    }
+}
+
 /// Context for module resolution
-pub struct ModuleResolver<'cfg> {
+pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     /// Base directory for resolving relative imports
     pub(super) base_dir: PathBuf,
     /// Cache of loaded modules: path -> ParsedFile
@@ -96,21 +192,70 @@ pub struct ModuleResolver<'cfg> {
     pub(super) module_paths: HashMap<String, String>,
     /// Parser configuration (decryptor, custom validators)
     pub(super) config: &'cfg ProviderContext,
+    /// Schema authority used by the mandatory pre-expansion reference check.
+    pub(super) schemas: &'cfg SchemaRegistry,
     /// Present only for the editor-facing resolution entry point. Expansion
     /// records into it at the same seam that evaluates fixed-point arguments.
     pub(super) constraint_reports: RefCell<Option<ModuleCallConstraintReports>>,
+    /// The type-resolution mode is selected by the resolver's type. This field
+    /// is private so callers cannot construct a resolver with a new policy.
+    type_resolution: PhantomData<P>,
 }
 
-impl<'cfg> ModuleResolver<'cfg> {
+impl<'cfg> ModuleResolver<'cfg, StrictTypeResolution> {
     /// Create a new resolver with the given base directory and default config
-    pub fn new(base_dir: impl AsRef<Path>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(base_dir: impl AsRef<Path>) -> Self {
         static DEFAULT_CONFIG: std::sync::LazyLock<ProviderContext> =
             std::sync::LazyLock::new(ProviderContext::default);
-        Self::with_config(base_dir, &DEFAULT_CONFIG)
+        static EMPTY_SCHEMAS: std::sync::LazyLock<SchemaRegistry> =
+            std::sync::LazyLock::new(SchemaRegistry::new);
+        Self::with_config_and_schemas(base_dir, &DEFAULT_CONFIG, &EMPTY_SCHEMAS)
     }
 
     /// Create a new resolver with the given base directory and parser configuration
-    pub fn with_config(base_dir: impl AsRef<Path>, config: &'cfg ProviderContext) -> Self {
+    pub(crate) fn with_config_and_schemas(
+        base_dir: impl AsRef<Path>,
+        config: &'cfg ProviderContext,
+        schemas: &'cfg SchemaRegistry,
+    ) -> Self {
+        Self::with_type_resolution(base_dir, config, schemas)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_config(base_dir: impl AsRef<Path>, config: &'cfg ProviderContext) -> Self {
+        static EMPTY_SCHEMAS: std::sync::LazyLock<SchemaRegistry> =
+            std::sync::LazyLock::new(SchemaRegistry::new);
+        Self::with_config_and_schemas(base_dir, config, &EMPTY_SCHEMAS)
+    }
+
+    fn with_constraint_reports(
+        base_dir: impl AsRef<Path>,
+        config: &'cfg ProviderContext,
+        schemas: &'cfg SchemaRegistry,
+    ) -> Self {
+        let resolver = Self::with_config_and_schemas(base_dir, config, schemas);
+        *resolver.constraint_reports.borrow_mut() = Some(IndexMap::new());
+        resolver
+    }
+}
+
+impl<'cfg> ModuleResolver<'cfg, DeferredUpstreamTypeResolution> {
+    fn for_upstream(
+        base_dir: impl AsRef<Path>,
+        config: &'cfg ProviderContext,
+        schemas: &'cfg SchemaRegistry,
+    ) -> Self {
+        Self::with_type_resolution(base_dir, config, schemas)
+    }
+}
+
+impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
+    fn with_type_resolution(
+        base_dir: impl AsRef<Path>,
+        config: &'cfg ProviderContext,
+        schemas: &'cfg SchemaRegistry,
+    ) -> Self {
         Self {
             base_dir: base_dir.as_ref().to_path_buf(),
             module_cache: HashMap::new(),
@@ -118,14 +263,10 @@ impl<'cfg> ModuleResolver<'cfg> {
             imported_modules: HashMap::new(),
             module_paths: HashMap::new(),
             config,
+            schemas,
             constraint_reports: RefCell::new(None),
+            type_resolution: PhantomData,
         }
-    }
-
-    fn with_constraint_reports(base_dir: impl AsRef<Path>, config: &'cfg ProviderContext) -> Self {
-        let resolver = Self::with_config(base_dir, config);
-        *resolver.constraint_reports.borrow_mut() = Some(IndexMap::new());
-        resolver
     }
 
     pub(super) fn record_constraint_report(
@@ -140,6 +281,40 @@ impl<'cfg> ModuleResolver<'cfg> {
 
     pub(super) fn records_constraint_reports(&self) -> bool {
         self.constraint_reports.borrow().is_some()
+    }
+
+    /// Produce the private witness required by every expansion call.
+    ///
+    /// This is intentionally the only constructor for `RefCheckWitness`.
+    /// Resource/provider validation may be skipped by a command, but the
+    /// BindingIndex reference relation at module and function boundaries may
+    /// not be skipped.
+    fn validate_reference_types<E: crate::parser::ExportParamLike>(
+        &self,
+        parsed: &crate::parser::File<E>,
+    ) -> Result<RefCheckWitness, ModuleError> {
+        let imported_modules = self
+            .imported_modules
+            .iter()
+            .map(|(alias, module)| {
+                (
+                    alias.clone(),
+                    super::signature::resolved_signature(module, self.config),
+                )
+            })
+            .collect();
+        let bindings = crate::binding_index::BindingIndex::from_parsed_with_module_signatures(
+            parsed,
+            self.schemas,
+            &imported_modules,
+        );
+        crate::validation::validate_expansion_boundary_ref_types_with_bindings(
+            parsed,
+            &imported_modules,
+            &bindings,
+        )
+        .map(|()| RefCheckWitness(()))
+        .map_err(ModuleError::ReferenceType)
     }
 
     /// Load and cache a module from a directory path.
@@ -252,19 +427,8 @@ impl<'cfg> ModuleResolver<'cfg> {
         let parsed_files = crate::config_loader::parse_directory_files(&files, self.config)?;
 
         let mut merged = ParsedFile::default();
-        for (file, parsed) in parsed_files {
-            let mut parsed = parsed.into_inner();
-            for call in &mut parsed.module_calls {
-                call.set_source_file(file.clone());
-            }
-            let file_path = Some(file.display().to_string());
-            for w in &mut parsed.warnings {
-                w.file = file_path.clone();
-            }
-            for d in &mut parsed.deferred_for_expressions {
-                d.file = file_path.clone();
-            }
-            crate::config_loader::merge_parsed_file(&mut merged, parsed);
+        for (_, parsed) in parsed_files {
+            crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
         }
 
         // Resolve references while the module's own binding namespace is still
@@ -274,13 +438,7 @@ impl<'cfg> ModuleResolver<'cfg> {
         crate::parser::resolve_resource_refs_with_config(&mut merged, self.config)
             .map_err(ModuleError::Parse)?;
 
-        let type_errors = crate::validation::resolve_file_type_exprs(&mut merged, self.config);
-        if let Some(first) = type_errors.into_iter().next() {
-            return Err(ModuleError::Parse(ParseError::InvalidExpression {
-                line: 0,
-                message: first,
-            }));
-        }
+        P::resolve_file_type_exprs(&mut merged, self.config)?;
         Ok(merged)
     }
 
@@ -315,10 +473,6 @@ impl<'cfg> ModuleResolver<'cfg> {
         parsed: &mut ParsedFile,
         base_dir: &Path,
     ) -> Result<(), ModuleError> {
-        if parsed.uses.is_empty() || parsed.module_calls.is_empty() {
-            return Ok(());
-        }
-
         // Save and temporarily replace the base_dir and imported_modules
         let original_base_dir = std::mem::replace(&mut self.base_dir, base_dir.to_path_buf());
         let original_imported = std::mem::take(&mut self.imported_modules);
@@ -336,28 +490,28 @@ impl<'cfg> ModuleResolver<'cfg> {
             return Err(e);
         }
 
-        // Expand the module's own module_calls. Pass the parent module's
-        // argument signature so the inner type-check can resolve any
-        // pass-through arg refs (#2549). `module_calls` and
-        // `enclosing_args` are cloned because the loop body now folds
-        // the contribution in via `merge_parsed_file(parsed, …)` — a
+        let ref_check = match self.validate_reference_types(parsed) {
+            Ok(witness) => witness,
+            Err(error) => {
+                self.base_dir = original_base_dir;
+                self.imported_modules = original_imported;
+                self.module_paths = original_paths;
+                return Err(error);
+            }
+        };
+
+        // Expand the module's own module_calls. `module_calls` is cloned
+        // because the loop body now folds the contribution in via
+        // `merge_parsed_file(parsed, …)` — a
         // whole-`&mut parsed` borrow that conflicts with any live
         // immutable borrow of a `parsed` field (the old per-field
         // `.extend()` only needed a disjoint field borrow; the single
         // merge surface needs the whole struct).
-        //
-        // The pre-loop `enclosing_args` snapshot is behaviour-equivalent
-        // to the old live `&parsed.arguments` borrow *because* a module
-        // contribution never adds `arguments` (`expand_module_call`'s
-        // exhaustive literal pins `arguments: Vec::new()`), so the merge
-        // can't grow `parsed.arguments` mid-loop. That invariant is
-        // enforced by the same exhaustive literal this PR introduces.
         let module_calls = parsed.module_calls.clone();
-        let enclosing_args: Vec<ArgumentParameter> = parsed.arguments.clone();
         for call in &module_calls {
             let instance_prefix = instance_prefix_for_call(call);
 
-            match self.expand_module_call(call, &instance_prefix, Some(&enclosing_args)) {
+            match self.expand_module_call_checked(call, &instance_prefix, &ref_check) {
                 Ok(expanded) => {
                     // The module contribution is a `ParsedFile`; fold it
                     // in via the one shared merge surface so no field can
@@ -380,16 +534,101 @@ impl<'cfg> ModuleResolver<'cfg> {
 
         Ok(())
     }
+}
 
-    /// Get an imported module by alias
-    pub fn get_module(&self, alias: &str) -> Option<&ParsedFile> {
-        self.imported_modules.get(alias)
+impl<'parsed, 'cfg, E: crate::parser::ExportParamLike> RefCheckedModuleGraph<'parsed, 'cfg, E> {
+    /// Load the complete reachable module graph and validate every reference
+    /// boundary before making expansion available.
+    pub fn check(
+        parsed: &'parsed mut crate::parser::File<E>,
+        base_dir: &Path,
+        config: &'cfg ProviderContext,
+        schemas: &'cfg SchemaRegistry,
+    ) -> Result<Self, ModuleError> {
+        let resolver = ModuleResolver::with_config_and_schemas(base_dir, config, schemas);
+        Self::check_with_resolver(parsed, resolver)
+    }
+
+    fn check_with_reporting(
+        parsed: &'parsed mut crate::parser::File<E>,
+        base_dir: &Path,
+        config: &'cfg ProviderContext,
+        schemas: &'cfg SchemaRegistry,
+    ) -> Result<Self, ModuleError> {
+        let resolver = ModuleResolver::with_constraint_reports(base_dir, config, schemas);
+        Self::check_with_resolver(parsed, resolver)
+    }
+
+    fn check_with_resolver(
+        parsed: &'parsed mut crate::parser::File<E>,
+        mut resolver: ModuleResolver<'cfg, StrictTypeResolution>,
+    ) -> Result<Self, ModuleError> {
+        resolver.process_imports(&parsed.uses)?;
+        let root_witness = resolver.validate_reference_types(parsed)?;
+        Ok(Self {
+            parsed,
+            resolver,
+            root_witness,
+        })
+    }
+
+    /// Consume the checked graph and expand its root configuration.
+    pub fn expand(mut self) -> Result<(), ModuleError> {
+        resolve_modules_with_resolver(self.parsed, &mut self.resolver, &self.root_witness)
+    }
+
+    fn expand_with_diagnostics(mut self) -> ModuleResolutionDiagnosticReport {
+        let error =
+            resolve_modules_with_resolver(self.parsed, &mut self.resolver, &self.root_witness)
+                .err();
+        let constraint_reports = self
+            .resolver
+            .constraint_reports
+            .into_inner()
+            .expect("diagnostic resolver always records constraint reports");
+        ModuleResolutionDiagnosticReport {
+            constraint_reports,
+            error,
+        }
+    }
+}
+
+impl<'parsed, 'cfg, E: crate::parser::ExportParamLike>
+    UpstreamRefCheckedModuleGraph<'parsed, 'cfg, E>
+{
+    /// The sole constructor for the upstream-only, unknown-type-deferring
+    /// resolver. Ordinary callers can construct only `RefCheckedModuleGraph`.
+    fn check(
+        parsed: &'parsed mut crate::parser::File<E>,
+        base_dir: &Path,
+        config: &'cfg ProviderContext,
+        schemas: &'cfg SchemaRegistry,
+    ) -> Result<Self, ModuleError> {
+        let mut resolver = ModuleResolver::<DeferredUpstreamTypeResolution>::for_upstream(
+            base_dir, config, schemas,
+        );
+        resolver.process_imports(&parsed.uses)?;
+        let root_witness = resolver.validate_reference_types(parsed)?;
+        Ok(Self {
+            parsed,
+            resolver,
+            root_witness,
+        })
+    }
+
+    fn expand(mut self) -> Result<(), ModuleError> {
+        resolve_modules_with_resolver(self.parsed, &mut self.resolver, &self.root_witness)
     }
 }
 
 /// Resolve all modules in a parsed file
 pub fn resolve_modules(parsed: &mut ParsedFile, base_dir: &Path) -> Result<(), ModuleError> {
-    resolve_modules_with_config(parsed, base_dir, &ProviderContext::default())
+    resolve_modules_with_config(
+        parsed,
+        base_dir,
+        &ProviderContext::default(),
+        &SchemaRegistry::new(),
+    )
 }
 
 /// Resolve all modules in a parsed file with the given parser configuration.
@@ -397,42 +636,50 @@ pub fn resolve_modules(parsed: &mut ParsedFile, base_dir: &Path) -> Result<(), M
 /// Generic over the export-parameter shape so callers can pass either
 /// `ParsedFile` (parser phase) or `InferredFile` (post-loader phase) —
 /// the resolver only touches `uses`, `module_calls`, and `resources`.
-pub fn resolve_modules_with_config<E>(
+pub fn resolve_modules_with_config<E: crate::parser::ExportParamLike>(
     parsed: &mut crate::parser::File<E>,
     base_dir: &Path,
     config: &ProviderContext,
+    schemas: &SchemaRegistry,
 ) -> Result<(), ModuleError> {
-    let mut resolver = ModuleResolver::with_config(base_dir, config);
+    RefCheckedModuleGraph::check(parsed, base_dir, config, schemas)?.expand()
+}
 
-    resolve_modules_with_resolver(parsed, &mut resolver)
+/// Expand an upstream project's modules using the consumer's necessarily
+/// partial provider context. Unresolvable custom type names remain unchecked;
+/// all concrete value and liftable boundary mismatches still use the normal
+/// witness and shared value checker.
+pub(crate) fn resolve_upstream_modules_with_config<E: crate::parser::ExportParamLike>(
+    parsed: &mut crate::parser::File<E>,
+    base_dir: &Path,
+    config: &ProviderContext,
+    schemas: &SchemaRegistry,
+) -> Result<(), ModuleError> {
+    UpstreamRefCheckedModuleGraph::check(parsed, base_dir, config, schemas)?.expand()
 }
 
 /// Resolve modules while retaining the expander's own per-call constraint
 /// outcomes and source locations for editor diagnostics.
-pub fn resolve_modules_with_diagnostics<E>(
+pub fn resolve_modules_with_diagnostics<E: crate::parser::ExportParamLike>(
     parsed: &mut crate::parser::File<E>,
     base_dir: &Path,
     config: &ProviderContext,
+    schemas: &SchemaRegistry,
 ) -> ModuleResolutionDiagnosticReport {
-    let mut resolver = ModuleResolver::with_constraint_reports(base_dir, config);
-    let error = resolve_modules_with_resolver(parsed, &mut resolver).err();
-    let constraint_reports = resolver
-        .constraint_reports
-        .into_inner()
-        .expect("diagnostic resolver always records constraint reports");
-    ModuleResolutionDiagnosticReport {
-        constraint_reports,
-        error,
+    match RefCheckedModuleGraph::check_with_reporting(parsed, base_dir, config, schemas) {
+        Ok(checked) => checked.expand_with_diagnostics(),
+        Err(error) => ModuleResolutionDiagnosticReport {
+            constraint_reports: IndexMap::new(),
+            error: Some(error),
+        },
     }
 }
 
-fn resolve_modules_with_resolver<E>(
+fn resolve_modules_with_resolver<E, P: TypeResolutionPolicy>(
     parsed: &mut crate::parser::File<E>,
-    resolver: &mut ModuleResolver<'_>,
+    resolver: &mut ModuleResolver<'_, P>,
+    ref_check: &RefCheckWitness,
 ) -> Result<(), ModuleError> {
-    // Process imports
-    resolver.process_imports(&parsed.uses)?;
-
     // Expand module calls. `module_calls` is cloned because the loop
     // body folds each contribution in via `merge_parsed_file(parsed,
     // …)`, a whole-`&mut parsed` borrow that conflicts with iterating
@@ -440,7 +687,7 @@ fn resolve_modules_with_resolver<E>(
     let module_calls = parsed.module_calls.clone();
     for call in &module_calls {
         let instance_prefix = instance_prefix_for_call(call);
-        let expanded = resolver.expand_module_call(call, &instance_prefix, None)?;
+        let expanded = resolver.expand_module_call_checked(call, &instance_prefix, ref_check)?;
         // `expand_module_call` returns a parser-phase `ParsedFile`;
         // this caller's `parsed` is a generic `File<E>` (the CLI
         // validate path passes an `InferredFile`). Relabel the
@@ -452,4 +699,26 @@ fn resolve_modules_with_resolver<E>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod type_resolution_policy_tests {
+    use super::*;
+
+    fn assert_strict(_: &ModuleResolver<'_, StrictTypeResolution>) {}
+
+    fn assert_upstream(_: &ModuleResolver<'_, DeferredUpstreamTypeResolution>) {}
+
+    #[test]
+    fn resolver_constructors_choose_distinct_type_resolution_policies() {
+        let config = ProviderContext::default();
+        let schemas = SchemaRegistry::new();
+
+        let strict = ModuleResolver::with_config_and_schemas(".", &config, &schemas);
+        let upstream =
+            ModuleResolver::<DeferredUpstreamTypeResolution>::for_upstream(".", &config, &schemas);
+
+        assert_strict(&strict);
+        assert_upstream(&upstream);
+    }
 }

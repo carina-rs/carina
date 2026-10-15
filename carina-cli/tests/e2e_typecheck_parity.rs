@@ -106,8 +106,360 @@ fn lsp_diagnostics(
 /// Run the CLI path on a fixture directory and return the diagnostic
 /// strings the CLI would surface.
 fn cli_diagnostics(factories: Vec<Box<dyn ProviderFactory>>, fixture: &TempDir) -> Vec<String> {
-    let path = fixture.path().to_path_buf();
-    carina_cli::commands::validate::validate_with_factories(&path, factories)
+    cli_diagnostics_at(factories, fixture.path())
+}
+
+fn cli_diagnostics_at(
+    factories: Vec<Box<dyn ProviderFactory>>,
+    path: &std::path::Path,
+) -> Vec<String> {
+    carina_cli::commands::validate::validate_with_factories(path, factories)
+}
+
+#[test]
+fn cli_module_call_uses_argument_type_declared_in_sibling_file() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let inner = fixture.path().join("modules/inner");
+    std::fs::create_dir_all(&inner).expect("create inner module");
+    std::fs::write(
+        fixture.path().join("arguments.crn"),
+        "arguments {\n  count: Int\n}\n",
+    )
+    .expect("write directory arguments");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"let inner = use { source = './modules/inner' }
+
+inner {
+  name = count
+}
+"#,
+    )
+    .expect("write module call");
+    std::fs::write(inner.join("main.crn"), "arguments {\n  name: String\n}\n")
+        .expect("write inner module");
+
+    let diagnostics = cli_diagnostics(Vec::new(), &fixture);
+    let mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .contains("cannot assign Int to 'name': expected String, got Int (from count)")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "BindingIndex must report the merged directory argument type once: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn nested_string_argument_to_literal_union_is_accepted_consistently() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let outer = fixture.path().join("modules/outer");
+    let inner = fixture.path().join("modules/inner");
+    std::fs::create_dir_all(&outer).expect("create outer module");
+    std::fs::create_dir_all(&inner).expect("create inner module");
+    let root = r#"let outer = use { source = './modules/outer' }
+
+outer {
+  outer_env = 'dev'
+}
+"#;
+    std::fs::write(fixture.path().join("main.crn"), root).expect("write root");
+    std::fs::write(
+        outer.join("main.crn"),
+        r#"let inner = use { source = '../inner' }
+
+arguments {
+  outer_env: String
+}
+
+inner {
+  env = outer_env
+}
+"#,
+    )
+    .expect("write outer module");
+    std::fs::write(
+        inner.join("main.crn"),
+        "arguments {\n  env: 'dev' | 'prod'\n}\n",
+    )
+    .expect("write inner module");
+
+    // #2648 lifts the literal-only union to plain String, so a declared String
+    // source remains assignable in both CLI and LSP validation.
+    let cli = cli_diagnostics(Vec::new(), &fixture);
+    assert!(
+        cli.iter()
+            .all(|message| !message.contains("Invalid argument type")),
+        "CLI validation must use schema assignability policy: {cli:#?}"
+    );
+    let outer_text = std::fs::read_to_string(outer.join("main.crn")).expect("read outer module");
+    let outer_doc = Document::new(
+        outer_text,
+        Arc::new(carina_core::parser::ProviderContext::default()),
+    );
+    let lsp = engine_with_schemas(SchemaRegistry::new()).analyze_with_filename(
+        &outer_doc,
+        Some("main.crn"),
+        Some(&outer),
+    );
+    assert!(
+        lsp.iter()
+            .all(|diagnostic| !diagnostic.message.contains("Invalid argument type")),
+        "LSP and CLI must agree on the String boundary: {lsp:#?}"
+    );
+}
+
+#[test]
+fn nested_int_argument_to_literal_union_is_rejected_by_cli_and_lsp() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let outer = fixture.path().join("modules/outer");
+    let inner = outer.join("inner");
+    std::fs::create_dir_all(&inner).expect("create nested modules");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        "let outer = use { source = './modules/outer' }\nouter {\n  n = 1\n}\n",
+    )
+    .expect("write root");
+    std::fs::write(
+        outer.join("main.crn"),
+        "let inner = use { source = './inner' }\narguments {\n  n: Int\n}\ninner {\n  env = n\n}\n",
+    )
+    .expect("write outer module");
+    std::fs::write(
+        inner.join("main.crn"),
+        "arguments {\n  env: 'dev' | 'prod'\n}\n",
+    )
+    .expect("write inner module");
+
+    let cli = cli_diagnostics(Vec::new(), &fixture);
+    assert!(
+        cli.iter().any(|message| {
+            message.contains("cannot assign Int to 'env'")
+                && message.contains("expected 'dev' | 'prod', got Int (from n)")
+        }),
+        "CLI BindingIndex must reject Int forwarded to a literal-string union: {cli:#?}"
+    );
+
+    let outer_text = std::fs::read_to_string(outer.join("main.crn")).expect("read outer module");
+    let outer_doc = Document::new(
+        outer_text,
+        Arc::new(carina_core::parser::ProviderContext::default()),
+    );
+    let lsp = engine_with_schemas(SchemaRegistry::new()).analyze_with_filename(
+        &outer_doc,
+        Some("main.crn"),
+        Some(&outer),
+    );
+    assert!(
+        lsp.iter().any(|diagnostic| {
+            diagnostic.message.contains("cannot assign Int to 'env'")
+                && diagnostic
+                    .message
+                    .contains("expected 'dev' | 'prod', got Int (from n)")
+        }),
+        "LSP BindingIndex must reject the same nested forwarding: {lsp:#?}"
+    );
+}
+
+#[test]
+fn resource_handle_forwarding_is_checked_in_root_module_and_lsp() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let outer = fixture.path().join("outer");
+    let inner = outer.join("inner");
+    std::fs::create_dir_all(&inner).expect("nested module directories");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"provider mock {}
+let r = mock.test.resource { name = 'r' }
+let outer = use { source = './outer' }
+outer { a = r }
+"#,
+    )
+    .expect("root configuration");
+    let outer_source = r#"let inner = use { source = './inner' }
+arguments { a: mock.test.resource }
+inner { x = a }
+"#;
+    std::fs::write(outer.join("main.crn"), outer_source).expect("outer module");
+    std::fs::write(inner.join("main.crn"), "arguments { x: Int }\n").expect("inner module");
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    let expected = "cannot assign mock.test.resource to 'x': expected Int";
+
+    let root_cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    assert!(
+        cli_messages_contain(&root_cli, expected),
+        "root validation must reject Ref -> Int forwarding: {root_cli:#?}"
+    );
+    let module_cli = cli_diagnostics_at(factories_for(&schemas), &outer);
+    assert!(
+        cli_messages_contain(&module_cli, expected),
+        "validating the module directory must reject Ref -> Int forwarding: {module_cli:#?}"
+    );
+    let lsp = engine_with_schemas(schemas.clone()).analyze_with_filename(
+        &Document::new(
+            outer_source.to_string(),
+            Arc::new(carina_core::parser::ProviderContext::default()),
+        ),
+        Some("main.crn"),
+        Some(&outer),
+    );
+    assert!(
+        lsp_messages_contain(&lsp, expected),
+        "LSP must reject Ref -> Int forwarding: {lsp:#?}"
+    );
+
+    std::fs::write(inner.join("main.crn"), "arguments { x: String }\n")
+        .expect("String sink module");
+    let root_cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let module_cli = cli_diagnostics_at(factories_for(&schemas), &outer);
+    let lsp = engine_with_schemas(schemas).analyze_with_filename(
+        &Document::new(
+            outer_source.to_string(),
+            Arc::new(carina_core::parser::ProviderContext::default()),
+        ),
+        Some("main.crn"),
+        Some(&outer),
+    );
+    assert!(
+        root_cli
+            .iter()
+            .chain(&module_cli)
+            .all(|message| { !message.contains("cannot assign mock.test.resource to 'x'") })
+            && lsp.iter().all(|diagnostic| {
+                !diagnostic
+                    .message
+                    .contains("cannot assign mock.test.resource to 'x'")
+            }),
+        "Ref -> String must preserve id-string compatibility; root={root_cli:#?}, module={module_cli:#?}, lsp={lsp:#?}"
+    );
+}
+
+#[test]
+fn cli_checks_reference_types_at_user_function_arguments_and_returns() {
+    let fx1 = r#"provider mock {}
+let r = mock.test.resource { name = 'r' }
+fn f(x: Int) { 'fixed' }
+mock.test.resource { name = f(r.name) }
+"#;
+    let fn14 = r#"provider mock {}
+let r = mock.test.resource { name = 'r' }
+fn f(): Int { r.name }
+mock.test.resource { name = f() }
+"#;
+    let matching = r#"provider mock {}
+let r = mock.test.resource { name = 'r' }
+fn f(x: String): String { x }
+mock.test.resource { name = f(r.name) }
+"#;
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+
+    for (name, source) in [("fx1", fx1), ("fn14", fn14)] {
+        let fixture = write_fixture(&[("main.crn", source)]);
+        let diagnostics = cli_diagnostics(factories_for(&schemas), &fixture);
+        assert!(
+            diagnostics.iter().any(|message| {
+                message.contains("function 'f'") && message.contains("expected Int")
+            }),
+            "{name} must reject the reference-valued function boundary: {diagnostics:#?}"
+        );
+    }
+
+    let fixture = write_fixture(&[("main.crn", matching)]);
+    let diagnostics = cli_diagnostics(factories_for(&schemas), &fixture);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|message| !message.contains("function 'f'")),
+        "matching function argument and return types must pass: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn cli_checks_nested_user_function_return_types_across_declaration_order_and_files() {
+    let forward_declared = write_fixture(&[(
+        "main.crn",
+        r#"fn f(x: Int): String { 'ok' }
+let result = f(g(1))
+fn g(y: Int): String { 'str' }
+"#,
+    )]);
+    let sibling_declared = write_fixture(&[
+        (
+            "main.crn",
+            "fn f(x: Int): String { 'ok' }\nlet result = f(g(1))\n",
+        ),
+        ("funcs.crn", "fn g(y: Int): String { 'str' }\n"),
+    ]);
+
+    for (label, fixture) in [
+        ("forward-declared", &forward_declared),
+        ("sibling-declared", &sibling_declared),
+    ] {
+        let diagnostics = cli_diagnostics(Vec::new(), fixture);
+        assert!(
+            diagnostics.iter().any(|message| {
+                message.contains("function 'f'")
+                    && message.contains("expected Int")
+                    && (message.contains("got String") || message.contains("got string"))
+            }),
+            "{label} g(): String must not satisfy f(Int): {diagnostics:#?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|message| !message.contains("\"str\"")),
+            "evaluated nested-call contents must stay redacted: {diagnostics:#?}"
+        );
+    }
+
+    let matching = write_fixture(&[
+        (
+            "main.crn",
+            "fn f(x: Int): String { 'ok' }\nlet result = f(g(1))\n",
+        ),
+        ("funcs.crn", "fn g(y: Int): Int { y }\n"),
+    ]);
+    let diagnostics = cli_diagnostics(Vec::new(), &matching);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|message| !message.contains("function 'f'")),
+        "an Int-returning nested function must remain accepted: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn cli_rejects_concrete_attribute_literal_mismatch() {
+    let fixture = write_fixture(&[("main.crn", "attributes {\n  y: 'dev' = 'prod'\n}\n")]);
+
+    let diagnostics = cli_diagnostics(Vec::new(), &fixture);
+    let mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.contains("attribute 'y'")
+                && diagnostic.contains("expected 'dev', got string \"prod\"")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "carina validate must type-check concrete attributes values: {diagnostics:#?}"
+    );
 }
 
 #[test]

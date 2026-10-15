@@ -652,6 +652,24 @@ fn attribute_type_to_type_expr(attr_type: &AttributeType) -> TypeExpr {
             None => TypeExpr::Simple(crate::parser::pascal_to_snake(&id.kind)),
         },
         AttrTypeKind::String { .. } => TypeExpr::String,
+        AttrTypeKind::ResourceHandle {
+            provider,
+            resource_type,
+            ..
+        } => TypeExpr::Ref(crate::parser::ResourceTypePath::new(
+            provider.clone(),
+            resource_type.clone(),
+        )),
+        AttrTypeKind::StringLiteralSet { values, .. } => match values.as_slice() {
+            [value] => TypeExpr::StringLiteral(value.clone()),
+            values => TypeExpr::Union(
+                values
+                    .iter()
+                    .cloned()
+                    .map(TypeExpr::StringLiteral)
+                    .collect(),
+            ),
+        },
         AttrTypeKind::Int { .. } => TypeExpr::Int,
         AttrTypeKind::Float { .. } => TypeExpr::Float,
         AttrTypeKind::Bool => TypeExpr::Bool,
@@ -1449,15 +1467,17 @@ mod tests {
         let res = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
             .with_binding("main");
         parsed.resources.push(res); // allow: direct — fixture test inspection
-        parsed.export_params.push(crate::parser::ParsedExportParam {
-            name: "vpc_id".to_string(),
-            type_expr: None,
-            value: Some(Value::resource_ref(
-                "main".to_string(),
+        parsed
+            .export_params
+            .push(crate::parser::ParsedExportParam::new(
                 "vpc_id".to_string(),
-                vec![],
-            )),
-        });
+                None,
+                Some(Value::resource_ref(
+                    "main".to_string(),
+                    "vpc_id".to_string(),
+                    vec![],
+                )),
+            ));
 
         let (inferred, errors) = apply_inference(parsed, &schemas_with_vpc());
         assert!(errors.is_empty(), "no errors expected, got {:?}", errors);
@@ -1471,15 +1491,17 @@ mod tests {
     #[test]
     fn apply_inference_substitutes_unknown_for_failed_inference() {
         let mut parsed = crate::parser::ParsedFile::default();
-        parsed.export_params.push(crate::parser::ParsedExportParam {
-            name: "zone_id".to_string(),
-            type_expr: None,
-            // `lookup` returns Any: inference fails, sentinel produced.
-            value: Some(Value::Deferred(DeferredValue::FunctionCall {
-                name: "lookup".to_string(),
-                args: vec![],
-            })),
-        });
+        parsed
+            .export_params
+            .push(crate::parser::ParsedExportParam::new(
+                "zone_id".to_string(),
+                None,
+                // `lookup` returns Any: inference fails, sentinel produced.
+                Some(Value::Deferred(DeferredValue::FunctionCall {
+                    name: "lookup".to_string(),
+                    args: vec![],
+                })),
+            ));
 
         let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
         assert_eq!(inferred.export_params.len(), 1);
@@ -1499,15 +1521,17 @@ mod tests {
         let resource = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
             .with_binding("main");
         parsed.resources.push(resource); // allow: direct — fixture test inspection
-        parsed.export_params.push(crate::parser::ParsedExportParam {
-            name: "vpc_id".to_string(),
-            type_expr: None,
-            value: Some(Value::resource_ref(
-                "main".to_string(),
-                "vpc_i".to_string(),
-                vec![],
-            )),
-        });
+        parsed
+            .export_params
+            .push(crate::parser::ParsedExportParam::new(
+                "vpc_id".to_string(),
+                None,
+                Some(Value::resource_ref(
+                    "main".to_string(),
+                    "vpc_i".to_string(),
+                    vec![],
+                )),
+            ));
 
         let (inferred, initial_errors) = apply_inference(parsed, &SchemaRegistry::new());
         assert!(
@@ -1536,15 +1560,17 @@ mod tests {
         let resource = crate::resource::Resource::with_provider("awscc", "ec2.Vpc", "main", None)
             .with_binding("main");
         parsed.resources.push(resource); // allow: direct — fixture test inspection
-        parsed.export_params.push(crate::parser::ParsedExportParam {
-            name: "vpc_id".to_string(),
-            type_expr: None,
-            value: Some(Value::resource_ref(
-                "main".to_string(),
+        parsed
+            .export_params
+            .push(crate::parser::ParsedExportParam::new(
                 "vpc_id".to_string(),
-                vec![],
-            )),
-        });
+                None,
+                Some(Value::resource_ref(
+                    "main".to_string(),
+                    "vpc_id".to_string(),
+                    vec![],
+                )),
+            ));
 
         let (inferred, initial_errors) = apply_inference(parsed, &SchemaRegistry::new());
         assert!(initial_errors.is_empty());
@@ -1564,13 +1590,15 @@ mod tests {
     #[test]
     fn apply_inference_preserves_explicit_annotation() {
         let mut parsed = crate::parser::ParsedFile::default();
-        parsed.export_params.push(crate::parser::ParsedExportParam {
-            name: "vpc_id".to_string(),
-            type_expr: Some(TypeExpr::Simple("vpc_id".to_string())),
-            value: Some(Value::Concrete(ConcreteValue::String(
-                "vpc-abc".to_string(),
-            ))),
-        });
+        parsed
+            .export_params
+            .push(crate::parser::ParsedExportParam::new(
+                "vpc_id".to_string(),
+                Some(TypeExpr::Simple("vpc_id".to_string())),
+                Some(Value::Concrete(ConcreteValue::String(
+                    "vpc-abc".to_string(),
+                ))),
+            ));
 
         let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
         assert!(errors.is_empty(), "no errors expected, got {:?}", errors);
@@ -1639,15 +1667,17 @@ mod tests {
             quoted_string_attrs: std::collections::HashSet::new(),
         };
         parsed.compositions.push(virt); // allow: direct — fixture test inspection
-        parsed.export_params.push(crate::parser::ParsedExportParam {
-            name: "role_id".to_string(),
-            type_expr: None,
-            value: Some(Value::resource_ref(
-                "github_actions_carina".to_string(),
+        parsed
+            .export_params
+            .push(crate::parser::ParsedExportParam::new(
                 "role_id".to_string(),
-                vec![],
-            )),
-        });
+                None,
+                Some(Value::resource_ref(
+                    "github_actions_carina".to_string(),
+                    "role_id".to_string(),
+                    vec![],
+                )),
+            ));
 
         let (inferred, errors) = apply_inference(parsed, &schemas_with_vpc());
         assert!(
@@ -1681,15 +1711,17 @@ mod tests {
             source: Default::default(),
             arguments: std::collections::HashMap::new(),
         });
-        parsed.export_params.push(crate::parser::ParsedExportParam {
-            name: "role_arn".to_string(),
-            type_expr: None,
-            value: Some(Value::resource_ref(
-                "github_actions_carina".to_string(),
+        parsed
+            .export_params
+            .push(crate::parser::ParsedExportParam::new(
                 "role_arn".to_string(),
-                vec![],
-            )),
-        });
+                None,
+                Some(Value::resource_ref(
+                    "github_actions_carina".to_string(),
+                    "role_arn".to_string(),
+                    vec![],
+                )),
+            ));
 
         let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
         assert!(
@@ -1706,11 +1738,13 @@ mod tests {
         // → Unknown sentinel, no error (the value-less shape is the
         // parser-tombstoned state, not an inference failure).
         let mut parsed = crate::parser::ParsedFile::default();
-        parsed.export_params.push(crate::parser::ParsedExportParam {
-            name: "vpc_id".to_string(),
-            type_expr: None,
-            value: None,
-        });
+        parsed
+            .export_params
+            .push(crate::parser::ParsedExportParam::new(
+                "vpc_id".to_string(),
+                None,
+                None,
+            ));
 
         let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
         assert!(errors.is_empty());

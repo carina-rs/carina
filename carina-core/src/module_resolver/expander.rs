@@ -6,9 +6,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use indexmap::IndexMap;
 
 use crate::identifier::SimHash;
-use crate::parser::{
-    ArgumentParameter, BindingName, DeferredForExpression, ModuleCall, ParsedFile, WaitBinding,
-};
+use crate::parser::{BindingName, DeferredForExpression, ModuleCall, ParsedFile, WaitBinding};
 use crate::resource::{
     Composition, CompositionCall, CompositionProvenance, ConcreteValue, DataSource, DeferredValue,
     ModuleInstanceScope, ModuleSource, Resource, ResourceId, ResourceIdentity,
@@ -16,14 +14,13 @@ use crate::resource::{
 };
 
 use super::error::ModuleError;
-use super::resolver::ModuleResolver;
 use super::resolver::{
-    ModuleCallConstraintReport, ResolvedModuleConstraintOutcome, ResolvedModuleConstraintStatus,
+    ModuleCallConstraintReport, ModuleResolver, ResolvedModuleConstraintOutcome,
+    ResolvedModuleConstraintStatus, TypeResolutionPolicy,
 };
-use super::typecheck::check_module_arg_type;
 use super::validation::{ConstraintEvaluation, ModuleConstraints, evaluate_module_constraints};
 
-impl ModuleResolver<'_> {
+impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
     /// Expand a module call into resources.
     ///
     /// Every module call creates a [`Composition`]. Bound calls expose module
@@ -31,12 +28,6 @@ impl ModuleResolver<'_> {
     /// one post-expansion validation pass. Virtual resources are skipped by
     /// the differ.
     ///
-    /// `enclosing_args` is the argument signature of the module the call
-    /// lives inside (`None` for a top-level call). When this call is being
-    /// expanded from inside another module, the inner type-check needs the
-    /// enclosing module's declared types so a pass-through arg ref like
-    /// `inner_arg = outer_arg` can be checked structurally before the
-    /// parent's argument substitution erases the type tag (#2549).
     /// Returns the contribution as a concrete `ParsedFile` — module
     /// expansion is a parser-phase operation (it reads parser-phase
     /// module data from `imported_modules`), so the honest return type
@@ -60,11 +51,11 @@ impl ModuleResolver<'_> {
     /// empty contribution and its relabel are enforced by the module
     /// boundary). The recursive parser-phase caller
     /// (`resolve_nested_modules`) merges directly.
-    pub fn expand_module_call(
+    pub(super) fn expand_module_call_checked(
         &self,
         call: &ModuleCall,
         instance_prefix: &str,
-        enclosing_args: Option<&[ArgumentParameter]>,
+        _ref_check: &super::resolver::RefCheckWitness,
     ) -> Result<ParsedFile, ModuleError> {
         let module = self
             .imported_modules
@@ -147,14 +138,12 @@ impl ModuleResolver<'_> {
         // Type-check argument values against declared types
         for arg in &module.arguments {
             let value = argument_values.get(&arg.name).unwrap();
-            check_module_arg_type(
-                &call.module_name,
-                &arg.name,
-                &arg.type_expr,
-                value,
-                self.config,
-                enclosing_args,
-            )?;
+            crate::validation::typecheck::check_type_expr_value(&arg.type_expr, value, self.config)
+                .map_err(|mismatch| ModuleError::InvalidArgumentType {
+                    module: call.module_name.clone(),
+                    argument: arg.name.clone(),
+                    mismatch,
+                })?;
         }
 
         // Collect and evaluate argument-local validations and module-level
@@ -518,6 +507,21 @@ impl ModuleResolver<'_> {
             // call's leaves before the struct literal moved them.
             expansion_trace,
         })
+    }
+
+    /// Unit tests exercise isolated expansion mechanics with synthetic module
+    /// maps. Production has no witness-free entry point.
+    #[cfg(test)]
+    pub(super) fn expand_module_call(
+        &self,
+        call: &ModuleCall,
+        instance_prefix: &str,
+    ) -> Result<ParsedFile, ModuleError> {
+        self.expand_module_call_checked(
+            call,
+            instance_prefix,
+            &super::resolver::RefCheckWitness(()),
+        )
     }
 }
 

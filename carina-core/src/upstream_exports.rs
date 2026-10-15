@@ -226,11 +226,21 @@ pub fn resolve_upstream_exports_with_schemas(
                 // `resolve_modules_with_config` is the same expansion
                 // pass `load_configuration` runs, so the inference reach
                 // here matches what the CLI sees post-expansion.
-                let _ = crate::module_resolver::resolve_modules_with_config(
+                let empty_schemas = crate::schema::SchemaRegistry::new();
+                let expansion_schemas = schemas.unwrap_or(&empty_schemas);
+                if let Err(reason) = crate::module_resolver::resolve_upstream_modules_with_config(
                     &mut parsed,
                     &source_abs,
                     config,
-                );
+                    expansion_schemas,
+                ) {
+                    errors.push(UpstreamResolveError {
+                        binding: us.binding.clone(),
+                        source: us.source.clone(),
+                        reason: reason.to_string(),
+                    });
+                    continue;
+                }
                 let declared_export_names: HashSet<String> = parsed
                     .export_params
                     .iter()
@@ -3685,5 +3695,85 @@ mod tests {
             .and_then(|e| e.type_expr.as_ref())
             .expect("region should be inferred");
         assert_eq!(region_type, &TypeExpr::String);
+    }
+
+    #[test]
+    fn module_expansion_failure_is_reported_instead_of_inferred_as_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_dir = tmp.path().join("upstream");
+        let module_dir = upstream_dir.join("module");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_crn(
+            &module_dir,
+            "main.crn",
+            "arguments { count: Int }\nattributes { out: Int = count }\n",
+        );
+        write_crn(
+            &upstream_dir,
+            "main.crn",
+            r#"let module = use { source = './module' }
+let instance = module { count = 'wrong' }
+exports { out: Int = instance.out }
+"#,
+        );
+
+        let (exports, errors) = resolve_upstream_exports_with_schemas(
+            tmp.path(),
+            &[upstream("ups", "upstream")],
+            &ctx(),
+            Some(&crate::schema::SchemaRegistry::new()),
+        );
+
+        assert!(
+            !exports.contains_key("ups"),
+            "a failed expansion must not publish Unknown exports: {exports:?}"
+        );
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(
+            errors[0]
+                .reason
+                .contains("expected Int, got string \"wrong\""),
+            "{}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn upstream_module_unknown_consumer_custom_type_is_unchecked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_dir = tmp.path().join("upstream");
+        let module_dir = upstream_dir.join("module");
+        fs::create_dir_all(&module_dir).unwrap();
+        write_crn(
+            &module_dir,
+            "main.crn",
+            "arguments { vpc: awscc.ec2.VpcId }\nattributes { out: String = vpc }\n",
+        );
+        write_crn(
+            &upstream_dir,
+            "main.crn",
+            r#"let module = use { source = './module' }
+let instance = module { vpc = 'vpc-123' }
+exports { out: String = instance.out }
+"#,
+        );
+
+        let (exports, errors) = resolve_upstream_exports_with_schemas(
+            tmp.path(),
+            &[upstream("ups", "upstream")],
+            &ctx(),
+            Some(&crate::schema::SchemaRegistry::new()),
+        );
+
+        assert!(
+            errors.is_empty(),
+            "unknown consumer type must defer: {errors:?}"
+        );
+        assert!(
+            exports
+                .get("ups")
+                .is_some_and(|values| values.contains_key("out")),
+            "the upstream export must remain available: {exports:?}"
+        );
     }
 }

@@ -5,7 +5,9 @@
 
 use crate::parser::ProviderContext;
 use crate::parser::Rule;
-use crate::parser::ast::{ArgumentParameter, AttributeParameter, ExportParameter, ValidationBlock};
+use crate::parser::ast::{
+    ArgumentParameter, AttributeParameter, ExportParameter, ModuleCallSourceSpan, ValidationBlock,
+};
 use crate::parser::context::{ParseContext, first_inner, next_pair};
 use crate::parser::error::{ParseError, ParseWarning};
 use crate::parser::expressions::string_literal::parse_string_value;
@@ -169,6 +171,7 @@ pub(in crate::parser) fn parse_attributes_block(
 
     for param in pair.into_inner() {
         if param.as_rule() == Rule::attributes_param {
+            let source_span = parameter_source_span(&param);
             let mut param_inner = param.into_inner();
             let name = next_pair(&mut param_inner, "parameter name", "attributes block")?
                 .as_str()
@@ -192,11 +195,9 @@ pub(in crate::parser) fn parse_attributes_block(
                 (None, value)
             };
 
-            attribute_params.push(AttributeParameter {
-                name,
-                type_expr,
-                value,
-            });
+            attribute_params.push(
+                AttributeParameter::new(name, type_expr, value).with_source_span(source_span),
+            );
         }
     }
 
@@ -212,6 +213,7 @@ pub(in crate::parser) fn parse_exports_block(
 
     for param in pair.into_inner() {
         if param.as_rule() == Rule::exports_param {
+            let source_span = parameter_source_span(&param);
             let mut param_inner = param.into_inner();
             let name = next_pair(&mut param_inner, "parameter name", "exports block")?
                 .as_str()
@@ -228,15 +230,26 @@ pub(in crate::parser) fn parse_exports_block(
                 (None, value)
             };
 
-            export_params.push(ExportParameter {
-                name,
-                type_expr,
-                value,
-            });
+            export_params
+                .push(ExportParameter::new(name, type_expr, value).with_source_span(source_span));
         }
     }
 
     Ok(export_params)
+}
+
+fn parameter_source_span(param: &pest::iterators::Pair<'_, Rule>) -> ModuleCallSourceSpan {
+    let span = param.as_span();
+    let (start_line, start_column) = span.start_pos().line_col();
+    let (end_line, end_column) = span.end_pos().line_col();
+    ModuleCallSourceSpan {
+        start_byte: span.start(),
+        end_byte: span.end(),
+        start_line,
+        start_column,
+        end_line,
+        end_column,
+    }
 }
 
 /// Extract Carina-side directives from a resource's attributes.

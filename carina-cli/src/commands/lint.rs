@@ -67,6 +67,10 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
     module_boundary_findings.extend(validate_no_upstream_states_in_modules(&module_walk));
     module_boundary_findings.extend(validate_no_exports_in_modules(&module_walk));
 
+    let (provider_factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
+    let ctx = WiringContext::new(provider_factories, &parsed.providers);
+    let schemas = ctx.schemas();
+
     // Report invalid root-owned module blocks through lint's collected,
     // path-prefixed output. The resolver enforces the same invariants as
     // expansion backstops, so do not expand after this gate fails or lint
@@ -78,13 +82,14 @@ pub fn run_lint(path: &Path, provider_context: &ProviderContext) -> Result<(), A
     // is more useful than aborting lint entirely. Full schema-backed
     // suggestions return once the blocking finding is fixed.
     if module_boundary_findings.is_empty() {
-        module_resolver::resolve_modules_with_config(&mut parsed, base_dir, provider_context)
-            .map_err(|e| format!("Module resolution error: {}", e))?;
+        module_resolver::resolve_modules_with_config(
+            &mut parsed,
+            base_dir,
+            provider_context,
+            schemas,
+        )
+        .map_err(|e| format!("Module resolution error: {}", e))?;
     }
-
-    let (provider_factories, _) = build_factories_from_providers(&parsed.providers, base_dir)?;
-    let ctx = WiringContext::new(provider_factories, &parsed.providers);
-    let schemas = ctx.schemas();
 
     // Collect source texts for each .crn file
     let source_texts: Vec<(PathBuf, String)> = {

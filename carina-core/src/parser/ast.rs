@@ -481,6 +481,35 @@ pub struct AttributeParameter {
     pub name: String,
     pub type_expr: Option<TypeExpr>,
     pub value: Option<Value>,
+    source: ModuleCallSource,
+}
+
+impl AttributeParameter {
+    pub fn new(name: String, type_expr: Option<TypeExpr>, value: Option<Value>) -> Self {
+        Self {
+            name,
+            type_expr,
+            value,
+            source: ModuleCallSource::default(),
+        }
+    }
+
+    pub(crate) fn with_source_span(mut self, span: ModuleCallSourceSpan) -> Self {
+        self.source.call_span = Some(span);
+        self
+    }
+
+    pub(crate) fn set_source_file(&mut self, file: std::path::PathBuf) {
+        self.source.file = Some(file);
+    }
+
+    pub fn diagnostic_source(&self) -> Option<ModuleCallDiagnosticSource> {
+        self.source.diagnostic_source()
+    }
+
+    pub fn source_span(&self) -> Option<ModuleCallSourceSpan> {
+        self.source.call_span
+    }
 }
 
 /// An export parameter in an `exports { }` block, as produced by the
@@ -490,11 +519,58 @@ pub struct AttributeParameter {
 /// omitted the annotation. The loader then runs `apply_inference`
 /// (#2360 stage 2) to resolve the effective type and emits
 /// [`InferredExportParam`] downstream.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ParsedExportParam {
     pub name: String,
     pub type_expr: Option<TypeExpr>,
     pub value: Option<Value>,
+    source: ModuleCallSource,
+}
+
+impl ParsedExportParam {
+    pub fn new(name: String, type_expr: Option<TypeExpr>, value: Option<Value>) -> Self {
+        Self {
+            name,
+            type_expr,
+            value,
+            source: ModuleCallSource::default(),
+        }
+    }
+
+    pub(crate) fn with_source_span(mut self, span: ModuleCallSourceSpan) -> Self {
+        self.source.call_span = Some(span);
+        self
+    }
+
+    pub(crate) fn set_source_file(&mut self, file: std::path::PathBuf) {
+        self.source.file = Some(file);
+    }
+
+    pub fn diagnostic_source(&self) -> Option<ModuleCallDiagnosticSource> {
+        self.source.diagnostic_source()
+    }
+
+    pub fn source_span(&self) -> Option<ModuleCallSourceSpan> {
+        self.source.call_span
+    }
+}
+
+impl PartialEq for ParsedExportParam {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            name,
+            type_expr,
+            value,
+            source: _,
+        } = self;
+        let Self {
+            name: other_name,
+            type_expr: other_type_expr,
+            value: other_value,
+            source: _,
+        } = other;
+        name == other_name && type_expr == other_type_expr && value == other_value
+    }
 }
 
 /// Alias kept so the parser's own construct sites (which always
@@ -828,13 +904,14 @@ impl ModuleCall {
         self.source.expansion_key = Some(expansion_key);
     }
 
-    pub(crate) fn diagnostic_source(&self) -> Option<ModuleCallDiagnosticSource> {
-        Some(ModuleCallDiagnosticSource {
-            file: self.source.file.clone()?,
-            call_span: self.source.call_span?,
-            argument_spans: self.source.argument_spans.clone(),
-            expansion_key: self.source.expansion_key.clone(),
-        })
+    /// Parser-authored span before a source file is attached by directory loading.
+    pub fn source_span(&self) -> Option<ModuleCallSourceSpan> {
+        self.source.call_span
+    }
+
+    /// Source identity retained by a directory-loaded module call.
+    pub fn diagnostic_source(&self) -> Option<ModuleCallDiagnosticSource> {
+        self.source.diagnostic_source()
     }
 }
 
@@ -846,11 +923,23 @@ pub(crate) struct ModuleCallSource {
     pub(crate) expansion_key: Option<String>,
 }
 
-/// A parser-authored source span for a module call or one of its arguments.
+impl ModuleCallSource {
+    fn diagnostic_source(&self) -> Option<ModuleCallDiagnosticSource> {
+        Some(ModuleCallDiagnosticSource {
+            file: self.file.clone()?,
+            call_span: self.call_span?,
+            argument_spans: self.argument_spans.clone(),
+            expansion_key: self.expansion_key.clone(),
+        })
+    }
+}
+
+/// A parser-authored source span used to retain declaration identity.
 ///
-/// Lines and columns are one-indexed, matching pest positions. Byte offsets
-/// are retained as the stable, parser-assigned identity of the authored call
-/// within its source file.
+/// Module calls, their arguments, and declaration parameters share this
+/// representation. Lines and columns are one-indexed, matching pest positions.
+/// Byte offsets are retained as the stable parser-assigned identity within a
+/// source file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ModuleCallSourceSpan {
     pub start_byte: usize,

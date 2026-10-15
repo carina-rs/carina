@@ -337,6 +337,116 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
     );
 }
 
+#[test]
+fn bootstrap_reload_rejects_nested_forwarding_mismatch() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    let outer = fixture.path().join("outer");
+    let inner = outer.join("inner");
+    std::fs::create_dir_all(&inner).expect("nested module directories");
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        r#"provider mock {}
+let outer = use { source = './outer' }
+outer { a = 'wrong' }
+"#,
+    )
+    .expect("root configuration");
+    std::fs::write(
+        outer.join("main.crn"),
+        r#"let inner = use { source = './inner' }
+arguments { a: String }
+inner { x = a }
+"#,
+    )
+    .expect("outer module");
+    std::fs::write(inner.join("main.crn"), "arguments { x: Int }\n").expect("inner module");
+
+    let error = reload_apply_configuration_after_bootstrap(
+        fixture.path(),
+        fixture.path(),
+        &ProviderContext::default(),
+    )
+    .expect_err("apply bootstrap reload must retain the reference-type gate");
+    let message = error.to_string();
+    assert!(
+        message.contains("cannot assign String to 'x'") && message.contains("expected Int"),
+        "{message}"
+    );
+}
+
+fn write_module_output_mismatch_fixture(nested: bool) -> tempfile::TempDir {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    if nested {
+        let mid = fixture.path().join("mid");
+        let leaf = mid.join("leaf");
+        std::fs::create_dir_all(&leaf).expect("nested module directories");
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            "provider mock {}\nlet mid = use { source = './mid' }\nmid { a = 'hello' }\n",
+        )
+        .expect("root configuration");
+        std::fs::write(mid.join("arguments.crn"), "arguments { a: String }\n")
+            .expect("mid arguments");
+        std::fs::write(
+            mid.join("calls.crn"),
+            r#"let leaf = use { source = './leaf' }
+let x = leaf { n = 1 }
+let y = leaf { n = x.s }
+"#,
+        )
+        .expect("nested calls");
+        std::fs::write(leaf.join("arguments.crn"), "arguments { n: Int }\n")
+            .expect("leaf arguments");
+        std::fs::write(
+            leaf.join("attributes.crn"),
+            "attributes { s: String = 'str' }\n",
+        )
+        .expect("leaf attributes");
+    } else {
+        let module = fixture.path().join("m");
+        std::fs::create_dir_all(&module).expect("module directory");
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            r#"provider mock {}
+let m = use { source = './m' }
+let x = m { n = 1 }
+let y = m { n = x.s }
+"#,
+        )
+        .expect("root configuration");
+        std::fs::write(module.join("arguments.crn"), "arguments { n: Int }\n")
+            .expect("module arguments");
+        std::fs::write(
+            module.join("attributes.crn"),
+            "attributes { s: String = 'str' }\n",
+        )
+        .expect("module attributes");
+    }
+    fixture
+}
+
+#[test]
+fn bootstrap_reload_rejects_module_output_forwarding_mismatch() {
+    for nested in [false, true] {
+        let fixture = write_module_output_mismatch_fixture(nested);
+        let error = reload_apply_configuration_after_bootstrap(
+            fixture.path(),
+            fixture.path(),
+            &ProviderContext::default(),
+        )
+        .expect_err("apply bootstrap reload must reject module-output type mismatch");
+        let message = error.to_string();
+        assert!(message.contains("module call 'y'"), "{message}");
+        assert!(message.contains("expected Int"), "{message}");
+        assert!(message.contains("got String"), "{message}");
+        assert!(message.contains("from x.s"), "{message}");
+        assert!(
+            !message.contains("module call 'mid_"),
+            "diagnostic must retain authored call names: {message}"
+        );
+    }
+}
+
 struct FailBCreateProvider;
 
 impl Provider for FailBCreateProvider {

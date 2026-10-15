@@ -56,6 +56,7 @@ use carina_provider_mock::{BUILTIN_PROVIDER_NAME, MockProvider};
 use carina_state::{BackendError, StateFile};
 
 use crate::commands::shared::progress::{RefreshProgress, refresh_multi_progress};
+use crate::commands::split_validation_message;
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
 
@@ -434,10 +435,18 @@ fn lift_validation_result(res: Result<(), String>) -> Vec<AppError> {
     let Err(joined) = res else {
         return Vec::new();
     };
-    joined
-        .split('\n')
-        .filter(|s| !s.is_empty())
-        .map(|s| AppError::Validation(s.to_string()))
+    split_validation_message(&joined)
+}
+
+fn prefixed_validation_messages(joined: &str, prefix: impl std::fmt::Display) -> Vec<AppError> {
+    split_validation_message(joined)
+        .into_iter()
+        .map(|error| {
+            let AppError::Validation(message) = error else {
+                unreachable!("split_validation_message only creates validation errors")
+            };
+            AppError::Validation(format!("{prefix}: {message}"))
+        })
         .collect()
 }
 
@@ -1400,9 +1409,10 @@ pub(crate) fn validate_module_attribute_refs_after_expansion_failure(
             &parsed.attribute_params,
             &bindings,
         ) {
-            errors.extend(joined.lines().filter(|line| !line.is_empty()).map(|line| {
-                AppError::Validation(format!("{}: {line}", module.diagnostic_path().display()))
-            }));
+            errors.extend(prefixed_validation_messages(
+                &joined,
+                module.diagnostic_path().display(),
+            ));
         }
     }
     errors
@@ -1426,46 +1436,38 @@ pub(crate) fn validate_module_internal_ref_types(
         // dotted argument types can act as sources before expansion.
         let _ = validation::resolve_file_type_exprs(&mut parsed, config);
 
-        let bindings =
-            carina_core::binding_index::BindingIndex::from_parsed(&parsed, ctx.schemas());
-        let argument_names: HashSet<String> = parsed
-            .arguments
-            .iter()
-            .map(|argument| argument.name.clone())
-            .collect();
-        if let Err(joined) = validation::validate_resource_ref_types_for_bindings(
-            &parsed,
-            ctx.schemas(),
-            &argument_names,
-            &bindings,
-        ) {
-            errors.extend(
-                joined
-                    .lines()
-                    .filter(|line| !line.is_empty())
-                    .map(|line| AppError::Validation(format!("{prefix}: {line}"))),
-            );
-        }
-        if let Err(joined) = validation::validate_attribute_param_ref_types_for_bindings(
-            &parsed.attribute_params,
-            &argument_names,
-            &bindings,
-        ) {
-            errors.extend(
-                joined
-                    .lines()
-                    .filter(|line| !line.is_empty())
-                    .map(|line| AppError::Validation(format!("{prefix}: {line}"))),
-            );
+        if let Err(joined) = validation::validate_attribute_params(&parsed.attribute_params, config)
+        {
+            errors.extend(prefixed_validation_messages(&joined, &prefix));
         }
 
         let imported =
             module_resolver::load_resolved_module_signatures(&parsed, module.module_path(), config);
+        let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_module_signatures(
+            &parsed,
+            ctx.schemas(),
+            &imported,
+        );
+        if let Err(joined) = validation::validate_resource_ref_types(
+            &parsed,
+            ctx.schemas(),
+            &HashSet::new(),
+            &bindings,
+        ) {
+            errors.extend(prefixed_validation_messages(&joined, &prefix));
+        }
+        if let Err(joined) = validation::validate_attribute_param_ref_types_with_bindings(
+            &parsed.attribute_params,
+            &bindings,
+        ) {
+            errors.extend(prefixed_validation_messages(&joined, &prefix));
+        }
+
         errors.extend(
-            validation::validate_module_call_argument_ref_types_for_bindings(
+            validation::validate_module_call_argument_ref_types_with_bindings(
                 &parsed.module_calls,
                 &imported,
-                &argument_names,
+                &HashSet::new(),
                 &bindings,
             )
             .into_iter()

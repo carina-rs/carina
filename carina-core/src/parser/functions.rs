@@ -6,7 +6,7 @@ use super::ast::{FnParam, TypeExpr, UserFunction, UserFunctionBody};
 use super::context::{ParseContext, next_pair};
 use super::error::{ParseError, ParseWarning};
 use super::types::parse_type_expr;
-use super::util::{snake_to_pascal, value_type_name};
+use super::util::value_type_name;
 use super::{ProviderContext, Rule, parse_expression};
 use crate::eval_value::EvalValue;
 use crate::resource::{ConcreteValue, DeferredValue, UnknownReason, Value};
@@ -138,13 +138,23 @@ pub(super) fn parse_fn_def(
     })
 }
 
+enum PreparedUserFunctionCall<'cfg> {
+    Ready {
+        child_ctx: Box<ParseContext<'cfg>>,
+        substitutions: HashMap<String, Value>,
+        function_derived: HashMap<String, bool>,
+    },
+    Deferred(Vec<Value>),
+}
+
 /// Prepare a user-defined function call: validate args, build substitutions, and return
 /// the child context with all parameters and local lets resolved.
-pub(super) fn prepare_user_function_call<'cfg>(
+fn prepare_user_function_call<'cfg>(
     func: &UserFunction,
     args: &[Value],
+    argument_origins: &[bool],
     ctx: &ParseContext<'cfg>,
-) -> Result<(ParseContext<'cfg>, HashMap<String, Value>), ParseError> {
+) -> Result<PreparedUserFunctionCall<'cfg>, ParseError> {
     let fn_name = &func.name;
 
     // Check recursion
@@ -170,17 +180,44 @@ pub(super) fn prepare_user_function_call<'cfg>(
 
     // Build substitution map: param_name -> value, and type-check annotated params
     let mut substitutions: HashMap<String, Value> = HashMap::new();
+    let mut function_derived: HashMap<String, bool> = HashMap::new();
+    let mut effective_args = Vec::with_capacity(func.params.len());
     for (i, param) in func.params.iter().enumerate() {
-        let value = if i < args.len() {
-            args[i].clone()
+        let (value, authored_origin) = if i < args.len() {
+            (
+                args[i].clone(),
+                argument_origins.get(i).copied().unwrap_or(false),
+            )
         } else {
-            param.default.clone().unwrap()
+            let value = param.default.clone().unwrap();
+            let origin = contains_function_call(&value);
+            (value, origin)
         };
+        // A direct parser call can reach this seam with a nested builtin still
+        // represented as `DeferredValue::FunctionCall`. The shared value
+        // checker intentionally defers unknown call results, so evaluate what
+        // is knowable first and validate the actual argument value. This also
+        // ensures a bad secret argument is blamed on the parameter rather than
+        // flowing into the body and being blamed on the return annotation.
+        let evaluated = try_evaluate_fn_value(value, ctx)?;
+        let value = evaluated.value;
+        let derived = authored_origin || evaluated.function_derived;
         // Type-check if the parameter has a type annotation
         if let Some(ref type_expr) = param.param_type {
-            check_fn_arg_type(fn_name, &param.name, type_expr, &value, ctx)?;
+            check_fn_arg_type(fn_name, &param.name, type_expr, &value, derived, ctx)?;
         }
-        substitutions.insert(param.name.clone(), value);
+        substitutions.insert(param.name.clone(), value.clone());
+        function_derived.insert(param.name.clone(), derived);
+        effective_args.push(value);
+    }
+
+    // A sibling- or forward-declared call is not resolvable in this file's
+    // parse context. Keep the *outer* call intact so the directory-merged
+    // resolver can check the same parameter after it learns the nested
+    // callee's result. Evaluating the body now would silently discard an
+    // unused deferred argument (`f(g(1))` where `f` returns a constant).
+    if effective_args.iter().any(contains_function_call) {
+        return Ok(PreparedUserFunctionCall::Deferred(effective_args));
     }
 
     // Create a child context with recursion tracking
@@ -189,13 +226,20 @@ pub(super) fn prepare_user_function_call<'cfg>(
 
     // Evaluate local lets, substituting and resolving each one
     for (let_name, let_expr) in &func.local_lets {
+        let derived = is_function_derived(let_expr, &function_derived);
         let substituted = substitute_fn_params(let_expr, &substitutions);
         let evaluated = try_evaluate_fn_value(substituted, &child_ctx)?;
-        child_ctx.set_variable(let_name.clone(), evaluated.clone());
-        substitutions.insert(let_name.clone(), evaluated);
+        let derived = derived || evaluated.function_derived;
+        child_ctx.set_variable(let_name.clone(), evaluated.value.clone());
+        substitutions.insert(let_name.clone(), evaluated.value);
+        function_derived.insert(let_name.clone(), derived);
     }
 
-    Ok((child_ctx, substitutions))
+    Ok(PreparedUserFunctionCall::Ready {
+        child_ctx: Box::new(child_ctx),
+        substitutions,
+        function_derived,
+    })
 }
 
 /// Adapter that turns a [`ProviderContext`] into the
@@ -306,151 +350,59 @@ fn check_fn_arg_type(
     param_name: &str,
     type_expr: &TypeExpr,
     value: &Value,
+    function_derived: bool,
     ctx: &ParseContext,
 ) -> Result<(), ParseError> {
-    // `Value::Deferred(DeferredValue::Unknown)` resolves at upstream apply; the concrete type
-    // is unknowable at parse time. Skip the type check — same convention
-    // the schema validator follows.
-    if matches!(value, Value::Deferred(DeferredValue::Unknown(_))) {
-        return Ok(());
+    if let Err(mismatch) =
+        crate::validation::typecheck::check_type_expr_value(type_expr, value, ctx.config)
+    {
+        let mismatch = if function_derived {
+            mismatch.redact_evaluated_value(type_expr, value)
+        } else {
+            mismatch
+        };
+        return Err(function_argument_type_error(fn_name, param_name, mismatch));
     }
-    let type_matches = match type_expr {
-        TypeExpr::String => matches!(
-            value,
-            Value::Concrete(ConcreteValue::String(_))
-                | Value::Deferred(DeferredValue::Interpolation(_))
-                | Value::Deferred(DeferredValue::ResourceRef { .. })
-        ),
-        TypeExpr::Int => matches!(value, Value::Concrete(ConcreteValue::Int(_))),
-        TypeExpr::Float => matches!(value, Value::Concrete(ConcreteValue::Float(_))),
-        TypeExpr::Bool => matches!(value, Value::Concrete(ConcreteValue::Bool(_))),
-        TypeExpr::Duration => matches!(value, Value::Concrete(ConcreteValue::Duration(_))),
-        TypeExpr::List(_) => matches!(value, Value::Concrete(ConcreteValue::List(_))),
-        TypeExpr::Map(_) => matches!(value, Value::Concrete(ConcreteValue::Map(_))),
-        // Simple types (cidr, ipv4_address, arn, etc.) are string subtypes at runtime
-        TypeExpr::Simple(name) => {
-            if !matches!(
-                value,
-                Value::Concrete(ConcreteValue::String(_))
-                    | Value::Deferred(DeferredValue::Interpolation(_))
-                    | Value::Deferred(DeferredValue::ResourceRef { .. })
-            ) {
-                false
-            } else {
-                // `Simple` annotations name a built-in DSL custom type
-                // (snake-cased, e.g. `ipv4_cidr`); project it onto a
-                // bare, provider-agnostic identity.
-                let identity = TypeIdentity::bare(snake_to_pascal(name));
-                if let Err(e) = validate_custom_type(&identity, value, ctx.config) {
-                    return Err(ParseError::UserFunctionError(format!(
-                        "function '{fn_name}': parameter '{param_name}' type '{name}' validation failed: {e}"
-                    )));
-                }
-                true
-            }
+
+    // A parser placeholder string can name a known resource binding. Feed
+    // that source handle through the same lifted TypeInSchema relation used by
+    // BindingIndex; do not maintain a parser-local resource-type relation.
+    if let TypeExpr::Ref(expected_path) = type_expr
+        && let Value::Concrete(ConcreteValue::String(value)) = value
+        && let Some(ref_name) = value
+            .strip_prefix("${")
+            .and_then(|value| value.strip_suffix('}'))
+        && let Some(resource) = ctx.resource_bindings.get(ref_name)
+    {
+        let actual_provider = &resource.id.provider;
+        let actual_type = &resource.id.resource_type;
+        let source = crate::schema::AttributeType::resource_handle(
+            actual_provider.clone(),
+            actual_type.clone(),
+        );
+        let sink = crate::validation::lift_type_expr(type_expr)
+            .expect("TypeExpr::Ref always lifts to a resource handle");
+        if !source
+            .in_schema(crate::schema::empty_defs_for_schema_walks())
+            .is_assignable_to(crate::schema::TypeInSchema::schemaless(&sink))
+        {
+            return Err(ParseError::UserFunctionError(format!(
+                "function '{fn_name}': parameter '{param_name}' expects resource type '{expected_path}', got {actual_provider}.{actual_type}"
+            )));
         }
-        // Resource type refs: check that the argument is a binding of the correct resource type
-        TypeExpr::Ref(expected_path) => {
-            // The argument is passed as a ResourceRef-like string "${binding_name}"
-            // or as a direct ResourceRef. Check if it corresponds to a resource binding
-            // of the expected type.
-            if let Value::Concrete(ConcreteValue::String(s)) = value
-                && let Some(ref_name) = s.strip_prefix("${").and_then(|s| s.strip_suffix('}'))
-                && let Some(resource) = ctx.resource_bindings.get(ref_name)
-            {
-                let actual_provider = &resource.id.provider;
-                let actual_type = &resource.id.resource_type;
-                if actual_provider != &expected_path.provider
-                    || actual_type != &expected_path.resource_type
-                {
-                    return Err(ParseError::UserFunctionError(format!(
-                        "function '{fn_name}': parameter '{param_name}' expects resource type '{expected_path}', got {actual_provider}.{actual_type}"
-                    )));
-                }
-            }
-            // If not found in bindings, skip validation (forward ref or dynamic)
-            true
-        }
-        // Unresolved dotted types should normally be classified before
-        // function type checking. If one reaches here through an early parse
-        // path, it still has string runtime shape.
-        TypeExpr::DottedUnresolved(_) => matches!(
-            value,
-            Value::Concrete(ConcreteValue::String(_))
-                | Value::Deferred(DeferredValue::Interpolation(_))
-                | Value::Deferred(DeferredValue::ResourceRef { .. })
-        ),
-        // Schema types (awscc.ec2.VpcId, etc.) are string subtypes with provider validators
-        TypeExpr::SchemaType {
-            provider,
-            path,
-            type_name,
-        } => {
-            if !matches!(
-                value,
-                Value::Concrete(ConcreteValue::String(_))
-                    | Value::Deferred(DeferredValue::Interpolation(_))
-                    | Value::Deferred(DeferredValue::ResourceRef { .. })
-            ) {
-                false
-            } else {
-                let identity = TypeIdentity::from_schema_type(provider, path, type_name);
-                if let Err(e) = validate_custom_type(&identity, value, ctx.config) {
-                    return Err(ParseError::UserFunctionError(format!(
-                        "function '{fn_name}': parameter '{param_name}' type '{type_expr}' validation failed: {e}"
-                    )));
-                }
-                true
-            }
-        }
-        TypeExpr::Struct { .. } => matches!(value, Value::Concrete(ConcreteValue::Map(_))),
-        // Closed-set string literal: only the exact string matches.
-        // Interpolations and ResourceRefs are rejected here because
-        // their runtime expansion is not knowable at parse time.
-        // See carina-rs/carina#2611.
-        TypeExpr::StringLiteral(expected) => {
-            matches!(value, Value::Concrete(ConcreteValue::String(s)) if s == expected)
-        }
-        // Union: matches if at least one member's structural-shape
-        // arm accepts the value. We only inspect literal/string-shape
-        // members here — that is what `'dev' | 'prod'`-style unions
-        // need today. Mixed unions (`String | Int`) become reachable
-        // when the grammar opens up further; this arm is the
-        // single point that needs updating then.
-        TypeExpr::Union(members) => members.iter().any(|m| match m {
-            TypeExpr::StringLiteral(expected) => {
-                matches!(value, Value::Concrete(ConcreteValue::String(s)) if s == expected)
-            }
-            TypeExpr::String => matches!(
-                value,
-                Value::Concrete(ConcreteValue::String(_))
-                    | Value::Deferred(DeferredValue::Interpolation(_))
-                    | Value::Deferred(DeferredValue::ResourceRef { .. })
-            ),
-            TypeExpr::Simple(_)
-            | TypeExpr::Ref(_)
-            | TypeExpr::DottedUnresolved(_)
-            | TypeExpr::SchemaType { .. }
-            | TypeExpr::Int
-            | TypeExpr::Float
-            | TypeExpr::Bool
-            | TypeExpr::Duration
-            | TypeExpr::List(_)
-            | TypeExpr::Map(_)
-            | TypeExpr::Struct { .. }
-            | TypeExpr::Union(_)
-            | TypeExpr::Unknown => false,
-        }),
-        // Inference sentinel: never matches a concrete value.
-        TypeExpr::Unknown => false,
-    };
-    if !type_matches {
-        let actual_type = value_type_name(value);
-        return Err(ParseError::UserFunctionError(format!(
-            "function '{fn_name}': parameter '{param_name}' expects type '{type_expr}', got {actual_type}"
-        )));
     }
+
     Ok(())
+}
+
+fn function_argument_type_error(
+    fn_name: &str,
+    param_name: &str,
+    mismatch: crate::validation::typecheck::TypeExprValueError,
+) -> ParseError {
+    ParseError::UserFunctionError(format!(
+        "function '{fn_name}': parameter '{param_name}': {mismatch}"
+    ))
 }
 
 /// Check that a function's return value matches the declared return type.
@@ -458,118 +410,27 @@ fn check_fn_return_type(
     fn_name: &str,
     type_expr: &TypeExpr,
     value: &Value,
+    function_derived: bool,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
-    // Same skip as `check_fn_arg_type`: a `Value::Deferred(DeferredValue::Unknown)` propagated
-    // through a typed user fn carries no concrete type at parse time.
-    if matches!(value, Value::Deferred(DeferredValue::Unknown(_))) {
-        return Ok(());
-    }
-    let type_matches = match type_expr {
-        TypeExpr::String => matches!(
-            value,
-            Value::Concrete(ConcreteValue::String(_))
-                | Value::Deferred(DeferredValue::Interpolation(_))
-                | Value::Deferred(DeferredValue::ResourceRef { .. })
-        ),
-        TypeExpr::Int => matches!(value, Value::Concrete(ConcreteValue::Int(_))),
-        TypeExpr::Float => matches!(value, Value::Concrete(ConcreteValue::Float(_))),
-        TypeExpr::Bool => matches!(value, Value::Concrete(ConcreteValue::Bool(_))),
-        TypeExpr::Duration => matches!(value, Value::Concrete(ConcreteValue::Duration(_))),
-        TypeExpr::List(_) => matches!(value, Value::Concrete(ConcreteValue::List(_))),
-        TypeExpr::Map(_) => matches!(value, Value::Concrete(ConcreteValue::Map(_))),
-        // Simple types (cidr, ipv4_address, arn, etc.) — validate the value
-        TypeExpr::Simple(name) => {
-            if !matches!(
-                value,
-                Value::Concrete(ConcreteValue::String(_))
-                    | Value::Deferred(DeferredValue::Interpolation(_))
-                    | Value::Deferred(DeferredValue::ResourceRef { .. })
-            ) {
-                false
-            } else {
-                let identity = TypeIdentity::bare(snake_to_pascal(name));
-                if let Err(e) = validate_custom_type(&identity, value, config) {
-                    return Err(ParseError::UserFunctionError(format!(
-                        "function '{fn_name}': return type '{name}' validation failed: {e}"
-                    )));
-                }
-                true
-            }
-        }
-        // Resource type refs are string-shaped for value functions.
-        TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_) => matches!(
-            value,
-            Value::Concrete(ConcreteValue::String(_))
-                | Value::Deferred(DeferredValue::Interpolation(_))
-                | Value::Deferred(DeferredValue::ResourceRef { .. })
-        ),
-        // Schema types: validate returned value against the provider validator
-        TypeExpr::SchemaType {
-            provider,
-            path,
-            type_name,
-        } => {
-            if !matches!(
-                value,
-                Value::Concrete(ConcreteValue::String(_))
-                    | Value::Deferred(DeferredValue::Interpolation(_))
-                    | Value::Deferred(DeferredValue::ResourceRef { .. })
-            ) {
-                false
-            } else {
-                let identity = TypeIdentity::from_schema_type(provider, path, type_name);
-                if let Err(e) = validate_custom_type(&identity, value, config) {
-                    return Err(ParseError::UserFunctionError(format!(
-                        "function '{fn_name}': return type '{type_name}' validation failed: {e}"
-                    )));
-                }
-                true
-            }
-        }
-        TypeExpr::Struct { .. } => matches!(value, Value::Concrete(ConcreteValue::Map(_))),
-        // Closed-set string literal: only the exact string matches.
-        // See carina-rs/carina#2611.
-        TypeExpr::StringLiteral(expected) => {
-            matches!(value, Value::Concrete(ConcreteValue::String(s)) if s == expected)
-        }
-        // Union: matches if at least one member accepts the value.
-        // Same shape as in `check_fn_arg_type` — only literal/string
-        // members are inspected today.
-        TypeExpr::Union(members) => members.iter().any(|m| match m {
-            TypeExpr::StringLiteral(expected) => {
-                matches!(value, Value::Concrete(ConcreteValue::String(s)) if s == expected)
-            }
-            TypeExpr::String => matches!(
-                value,
-                Value::Concrete(ConcreteValue::String(_))
-                    | Value::Deferred(DeferredValue::Interpolation(_))
-                    | Value::Deferred(DeferredValue::ResourceRef { .. })
-            ),
-            TypeExpr::Simple(_)
-            | TypeExpr::Ref(_)
-            | TypeExpr::DottedUnresolved(_)
-            | TypeExpr::SchemaType { .. }
-            | TypeExpr::Int
-            | TypeExpr::Float
-            | TypeExpr::Bool
-            | TypeExpr::Duration
-            | TypeExpr::List(_)
-            | TypeExpr::Map(_)
-            | TypeExpr::Struct { .. }
-            | TypeExpr::Union(_)
-            | TypeExpr::Unknown => false,
-        }),
-        // Inference sentinel: never matches a concrete value.
-        TypeExpr::Unknown => false,
-    };
-    if !type_matches {
-        let actual_type = value_type_name(value);
-        return Err(ParseError::UserFunctionError(format!(
-            "function '{fn_name}': return type '{type_expr}' does not match actual return value of type {actual_type}"
-        )));
+    if let Err(mismatch) =
+        crate::validation::typecheck::check_type_expr_value(type_expr, value, config)
+    {
+        let mismatch = if function_derived {
+            mismatch.redact_evaluated_value(type_expr, value)
+        } else {
+            mismatch
+        };
+        return Err(function_return_type_error(fn_name, mismatch));
     }
     Ok(())
+}
+
+fn function_return_type_error(
+    fn_name: &str,
+    mismatch: crate::validation::typecheck::TypeExprValueError,
+) -> ParseError {
+    ParseError::UserFunctionError(format!("function '{fn_name}': return value: {mismatch}"))
 }
 
 /// Evaluate a user-defined function call by substituting arguments into the body
@@ -578,16 +439,84 @@ pub(crate) fn evaluate_user_function(
     args: &[Value],
     ctx: &ParseContext,
 ) -> Result<Value, ParseError> {
-    let (child_ctx, substitutions) = prepare_user_function_call(func, args, ctx)?;
+    let argument_origins = args.iter().map(contains_function_call).collect::<Vec<_>>();
+    evaluate_user_function_with_origins(func, args, &argument_origins, ctx)
+}
+
+pub(crate) fn evaluate_user_function_with_origins(
+    func: &UserFunction,
+    args: &[Value],
+    argument_origins: &[bool],
+    ctx: &ParseContext,
+) -> Result<Value, ParseError> {
+    let (child_ctx, substitutions, function_derived) =
+        match prepare_user_function_call(func, args, argument_origins, ctx)? {
+            PreparedUserFunctionCall::Ready {
+                child_ctx,
+                substitutions,
+                function_derived,
+            } => (child_ctx, substitutions, function_derived),
+            PreparedUserFunctionCall::Deferred(args) => {
+                return Ok(Value::Deferred(DeferredValue::FunctionCall {
+                    name: func.name.clone(),
+                    args,
+                }));
+            }
+        };
 
     let UserFunctionBody(body) = &func.body;
+    let body_is_function_derived = is_function_derived(body, &function_derived);
     let substituted_body = substitute_fn_params(body, &substitutions);
-    let result = try_evaluate_fn_value(substituted_body, &child_ctx)?.canonicalize();
+    let evaluated = try_evaluate_fn_value(substituted_body, &child_ctx)?;
+    let result_is_function_derived = body_is_function_derived || evaluated.function_derived;
+    let result = evaluated.value.canonicalize();
     // Check return type if annotated
     if let Some(ref return_type) = func.return_type {
-        check_fn_return_type(&func.name, return_type, &result, child_ctx.config)?;
+        check_fn_return_type(
+            &func.name,
+            return_type,
+            &result,
+            result_is_function_derived,
+            child_ctx.config,
+        )?;
     }
     Ok(result)
+}
+
+pub(crate) fn contains_function_call(value: &Value) -> bool {
+    match value {
+        Value::Deferred(DeferredValue::FunctionCall { .. }) => true,
+        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(contains_function_call),
+        Value::Concrete(ConcreteValue::Map(entries)) => {
+            entries.values().any(contains_function_call)
+        }
+        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
+            matches!(part, crate::resource::InterpolationPart::Expr(value) if contains_function_call(value))
+        }),
+        Value::Deferred(DeferredValue::Secret(inner)) => contains_function_call(inner),
+        _ => false,
+    }
+}
+
+fn is_function_derived(value: &Value, bindings: &HashMap<String, bool>) -> bool {
+    match value {
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::FnParam { name }))
+        | Value::Deferred(DeferredValue::Unknown(UnknownReason::FnLocal { name })) => {
+            bindings.get(name).copied().unwrap_or(false)
+        }
+        Value::Deferred(DeferredValue::FunctionCall { .. }) => true,
+        Value::Concrete(ConcreteValue::List(items)) => {
+            items.iter().any(|item| is_function_derived(item, bindings))
+        }
+        Value::Concrete(ConcreteValue::Map(entries)) => entries
+            .values()
+            .any(|item| is_function_derived(item, bindings)),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
+            matches!(part, crate::resource::InterpolationPart::Expr(value) if is_function_derived(value, bindings))
+        }),
+        Value::Deferred(DeferredValue::Secret(inner)) => is_function_derived(inner, bindings),
+        _ => false,
+    }
 }
 
 /// Recursively substitute function parameter placeholders with actual values
@@ -642,16 +571,48 @@ fn substitute_fn_params(value: &Value, substitutions: &HashMap<String, Value>) -
     }
 }
 
-/// Try to evaluate a value (resolve function calls including user-defined ones)
-fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, ParseError> {
+struct EvaluatedFnValue {
+    value: Value,
+    function_derived: bool,
+}
+
+impl EvaluatedFnValue {
+    fn authored(value: Value) -> Self {
+        Self {
+            value,
+            function_derived: false,
+        }
+    }
+
+    fn derived(value: Value) -> Self {
+        Self {
+            value,
+            function_derived: true,
+        }
+    }
+}
+
+/// Try to evaluate a value (resolve function calls including user-defined ones).
+/// The provenance bit is intentionally kept out of [`Value`]: it exists only
+/// while crossing a typed evaluator boundary, where diagnostics must avoid
+/// rendering generated plaintext as though it were an authored literal.
+fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<EvaluatedFnValue, ParseError> {
     match value {
         Value::Deferred(DeferredValue::FunctionCall { ref name, ref args }) => {
             // First, recursively evaluate arguments
-            let evaluated_args: Result<Vec<Value>, ParseError> = args
+            let evaluated_args: Result<Vec<EvaluatedFnValue>, ParseError> = args
                 .iter()
                 .map(|a| try_evaluate_fn_value(a.clone(), ctx))
                 .collect();
             let evaluated_args = evaluated_args?;
+            let argument_origins = evaluated_args
+                .iter()
+                .map(|evaluated| evaluated.function_derived)
+                .collect::<Vec<_>>();
+            let evaluated_args = evaluated_args
+                .into_iter()
+                .map(|evaluated| evaluated.value)
+                .collect::<Vec<_>>();
 
             // Check if the name refers to a Closure variable
             if let Some(EvalValue::Closure {
@@ -685,7 +646,8 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, Pars
                          finish the partial application before using the result as data",
                             leak.name, leak.remaining_arity
                         ),
-                    });
+                    })
+                    .map(EvaluatedFnValue::derived);
             }
 
             // Try built-in first (with config for decrypt support)
@@ -704,11 +666,18 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, Pars
                          finish the partial application before using the result as data",
                             name, leak.name, leak.remaining_arity
                         ),
-                    }),
+                    })
+                    .map(EvaluatedFnValue::derived),
                 Err(_builtin_err) => {
                     // Try user-defined function declared in *this* file.
                     if let Some(user_fn) = ctx.user_functions.get(name) {
-                        evaluate_user_function(user_fn, &evaluated_args, ctx)
+                        evaluate_user_function_with_origins(
+                            user_fn,
+                            &evaluated_args,
+                            &argument_origins,
+                            ctx,
+                        )
+                        .map(EvaluatedFnValue::derived)
                     } else {
                         // Defer the call — the user-fn may live in a
                         // sibling `.crn` and only become visible after
@@ -723,40 +692,63 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, Pars
                         // `resource_bindings` are seeded — so this
                         // defer path remains the route by which a
                         // sibling-defined user fn becomes resolvable.
-                        Ok(Value::Deferred(DeferredValue::FunctionCall {
-                            name: name.clone(),
-                            args: evaluated_args,
-                        }))
+                        Ok(EvaluatedFnValue::authored(Value::Deferred(
+                            DeferredValue::FunctionCall {
+                                name: name.clone(),
+                                args: evaluated_args,
+                            },
+                        )))
                     }
                 }
             }
         }
         Value::Concrete(ConcreteValue::List(items)) => {
-            let evaluated: Result<Vec<Value>, ParseError> = items
+            let evaluated: Result<Vec<EvaluatedFnValue>, ParseError> = items
                 .into_iter()
                 .map(|v| try_evaluate_fn_value(v, ctx))
                 .collect();
-            Ok(Value::Concrete(ConcreteValue::List(evaluated?)))
+            let evaluated = evaluated?;
+            let function_derived = evaluated.iter().any(|value| value.function_derived);
+            let values = evaluated.into_iter().map(|value| value.value).collect();
+            Ok(EvaluatedFnValue {
+                value: Value::Concrete(ConcreteValue::List(values)),
+                function_derived,
+            })
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
-            let evaluated: Result<IndexMap<String, Value>, ParseError> = map
+            let evaluated: Result<IndexMap<String, EvaluatedFnValue>, ParseError> = map
                 .into_iter()
                 .map(|(k, v)| try_evaluate_fn_value(v, ctx).map(|ev| (k, ev)))
                 .collect();
-            Ok(Value::Concrete(ConcreteValue::Map(evaluated?)))
+            let evaluated = evaluated?;
+            let function_derived = evaluated.values().any(|value| value.function_derived);
+            let values = evaluated
+                .into_iter()
+                .map(|(key, value)| (key, value.value))
+                .collect();
+            Ok(EvaluatedFnValue {
+                value: Value::Concrete(ConcreteValue::Map(values)),
+                function_derived,
+            })
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            let evaluated: Result<Vec<crate::resource::InterpolationPart>, ParseError> = parts
-                .into_iter()
-                .map(|p| match p {
-                    crate::resource::InterpolationPart::Expr(v) => {
-                        try_evaluate_fn_value(v, ctx).map(crate::resource::InterpolationPart::Expr)
+            let mut function_derived = false;
+            let mut evaluated = Vec::with_capacity(parts.len());
+            for part in parts {
+                match part {
+                    crate::resource::InterpolationPart::Expr(value) => {
+                        let value = try_evaluate_fn_value(value, ctx)?;
+                        function_derived |= value.function_derived;
+                        evaluated.push(crate::resource::InterpolationPart::Expr(value.value));
                     }
-                    other => Ok(other),
-                })
-                .collect();
-            Ok(Value::Deferred(DeferredValue::Interpolation(evaluated?)))
+                    other => evaluated.push(other),
+                }
+            }
+            Ok(EvaluatedFnValue {
+                value: Value::Deferred(DeferredValue::Interpolation(evaluated)),
+                function_derived,
+            })
         }
-        other => Ok(other),
+        other => Ok(EvaluatedFnValue::authored(other)),
     }
 }
