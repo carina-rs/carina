@@ -9,13 +9,22 @@ use crate::eval_value::EvalValue;
 use crate::parser::expressions::if_expr::parse_if_value_expr;
 use crate::parser::expressions::string_literal::parse_string_value;
 use crate::parser::{
-    ParseContext, ParseError, Rule, evaluate_user_function, extract_key_string, first_inner,
-    is_static_value, next_pair, parse_block_contents, parse_expression, parse_expression_eval,
+    ParseContext, ParseError, Rule, evaluate_user_function_with_origins, extract_key_string,
+    first_inner, is_static_value, next_pair, parse_block_contents, parse_expression,
+    parse_expression_eval,
 };
 use crate::resource::{
     AccessPath, ConcreteValue, DeferredValue, PathSegment, Subscript, UnknownReason, Value,
 };
 use indexmap::IndexMap;
+
+fn contains_function_call_syntax(pair: &pest::iterators::Pair<'_, Rule>) -> bool {
+    pair.as_rule() == Rule::function_call
+        || pair
+            .clone()
+            .into_inner()
+            .any(|inner| contains_function_call_syntax(&inner))
+}
 
 /// Resolve a field-access path rooted at a **bound variable** (a
 /// `for`-loop value var, a `let`-of-struct), shared by the two parser
@@ -392,9 +401,14 @@ pub(crate) fn parse_primary_eval(
             let func_name = next_pair(&mut fc_inner, "function name", "function call")?
                 .as_str()
                 .to_string();
-            let args: Result<Vec<Value>, ParseError> =
-                fc_inner.map(|arg| parse_expression(arg, ctx)).collect();
-            let args = args?;
+            let parsed_args: Result<Vec<(Value, bool)>, ParseError> = fc_inner
+                .map(|arg| {
+                    let function_derived = contains_function_call_syntax(&arg);
+                    parse_expression(arg, ctx).map(|value| (value, function_derived))
+                })
+                .collect();
+            let parsed_args = parsed_args?;
+            let (args, argument_origins): (Vec<_>, Vec<_>) = parsed_args.into_iter().unzip();
 
             // Check if the name refers to a Closure variable (direct call on closure)
             if let Some(EvalValue::Closure {
@@ -422,7 +436,13 @@ pub(crate) fn parse_primary_eval(
             // Try to eagerly evaluate user-defined function calls
             if ctx.user_functions.contains_key(&func_name) && args.iter().all(is_static_value) {
                 let user_fn = ctx.user_functions.get(&func_name).unwrap().clone();
-                return evaluate_user_function(&user_fn, &args, ctx).map(EvalValue::from_value);
+                return evaluate_user_function_with_origins(
+                    &user_fn,
+                    &args,
+                    &argument_origins,
+                    ctx,
+                )
+                .map(EvalValue::from_value);
             }
 
             // Eagerly evaluate partial application (fewer args than arity → Closure)

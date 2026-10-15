@@ -7,6 +7,29 @@ use crate::resource::{
 use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
 use std::collections::HashMap;
 
+fn rendered_typecheck_result(
+    type_expr: &TypeExpr,
+    value: &Value,
+    config: &ProviderContext,
+) -> Option<String> {
+    typecheck::check_type_expr_value(type_expr, value, config)
+        .err()
+        .map(|error| error.to_string())
+}
+
+fn rendered_struct_typecheck_result(
+    fields: &[(String, TypeExpr)],
+    entries: &IndexMap<String, Value>,
+) -> Option<String> {
+    rendered_typecheck_result(
+        &TypeExpr::Struct {
+            fields: fields.to_vec(),
+        },
+        &Value::Concrete(ConcreteValue::Map(entries.clone())),
+        &ProviderContext::default(),
+    )
+}
+
 fn empty_parsed() -> ParsedFile {
     ParsedFile {
         providers: Vec::new(),
@@ -65,6 +88,111 @@ fn validate_resource_ref_types_for_test<E>(
 ) -> Result<(), String> {
     let bindings = crate::binding_index::BindingIndex::from_parsed(parsed, schemas);
     super::validate_resource_ref_types(parsed, schemas, argument_names, &bindings)
+}
+
+fn function_ref_schema() -> SchemaRegistry {
+    use crate::schema::AttributeSchema;
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::string())),
+    );
+    schemas
+}
+
+#[test]
+fn function_call_reference_arguments_use_the_declared_parameter_type() {
+    let parsed = crate::parser::parse(
+        r#"
+let r = mock.test.resource { name = "r" }
+fn f(x: Int) { "fixed" }
+mock.test.resource { name = f(r.name) }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    let schemas = function_ref_schema();
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+
+    let error = validate_user_function_ref_types_with_bindings(&parsed, &bindings)
+        .expect_err("String resource attribute passed to Int must be rejected");
+    assert!(
+        error.contains("expected Int") && error.contains("got String"),
+        "{error}"
+    );
+}
+
+#[test]
+fn function_return_reference_uses_the_declared_return_type_and_matching_refs_pass() {
+    let mismatch = crate::parser::parse(
+        r#"
+let r = mock.test.resource { name = "r" }
+fn f(): Int { r.name }
+let r2 = mock.test.resource { name = f() }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    let schemas = function_ref_schema();
+    let mismatch_bindings = crate::binding_index::BindingIndex::from_parsed(&mismatch, &schemas);
+    let error = validate_user_function_ref_types_with_bindings(&mismatch, &mismatch_bindings)
+        .expect_err("String function result passed to Int must be rejected");
+    assert!(
+        error.contains("expected Int") && error.contains("got String"),
+        "{error}"
+    );
+
+    let matching = crate::parser::parse(
+        r#"
+let r = mock.test.resource { name = "r" }
+fn f(): String { r.name }
+let r2 = mock.test.resource { name = f() }
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("fixture must parse");
+    let matching_bindings = crate::binding_index::BindingIndex::from_parsed(&matching, &schemas);
+    assert!(validate_user_function_ref_types_with_bindings(&matching, &matching_bindings).is_ok());
+}
+
+#[test]
+fn nested_user_function_call_uses_declared_return_type_as_argument_source() {
+    fn parsed_with_nested_call(g_return: &str) -> ParsedFile {
+        let mut parsed = crate::parser::parse(
+            &format!("fn f(x: Int): String {{ 'ok' }}\nfn g(y: Int): {g_return} {{ y }}\n"),
+            &ProviderContext::default(),
+        )
+        .expect("function declarations must parse");
+        parsed.variables.insert(
+            "result".to_string(),
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: "f".to_string(),
+                args: vec![Value::Deferred(DeferredValue::FunctionCall {
+                    name: "g".to_string(),
+                    args: vec![Value::Concrete(ConcreteValue::Int(1))],
+                })],
+            }),
+        );
+        parsed
+    }
+
+    let schemas = SchemaRegistry::new();
+    let mismatch = parsed_with_nested_call("String");
+    let bindings = BindingIndex::from_parsed(&mismatch, &schemas);
+    let error = validate_user_function_ref_types_with_bindings(&mismatch, &bindings)
+        .expect_err("g(): String must not satisfy f(Int)");
+    assert!(
+        error.contains("function 'f': argument 1")
+            && error.contains("expected Int")
+            && error.contains("got String"),
+        "{error}"
+    );
+
+    let matching = parsed_with_nested_call("Int");
+    let bindings = BindingIndex::from_parsed(&matching, &schemas);
+    assert!(validate_user_function_ref_types_with_bindings(&matching, &bindings).is_ok());
 }
 
 /// Directional test adapter for the module-boundary relation: `type_expr` is
@@ -155,7 +283,7 @@ fn lift_type_expr_maps_schema_identity_directionally() {
 }
 
 #[test]
-fn lift_type_expr_recurses_and_leaves_nonrepresentable_forms_unchecked() {
+fn lift_type_expr_recurses_and_only_unknown_remains_unchecked() {
     let structured = TypeExpr::List(Box::new(TypeExpr::Map(Box::new(TypeExpr::Union(vec![
         TypeExpr::String,
         TypeExpr::Int,
@@ -172,10 +300,60 @@ fn lift_type_expr_recurses_and_leaves_nonrepresentable_forms_unchecked() {
 
     let resource_ref =
         crate::parser::ResourceTypePath::new("aws".to_string(), "ec2.Vpc".to_string());
-    assert!(lift_type_expr(&TypeExpr::Ref(resource_ref.clone())).is_none());
-    assert!(lift_type_expr(&TypeExpr::DottedUnresolved(resource_ref)).is_none());
-    assert!(lift_type_expr(&TypeExpr::StringLiteral("x".to_string())).is_none());
+    for type_expr in [
+        TypeExpr::Ref(resource_ref.clone()),
+        TypeExpr::DottedUnresolved(resource_ref),
+    ] {
+        let handle = lift_type_expr(&type_expr).expect("resource paths lift to typed handles");
+        assert!(
+            crate::schema::TypeInSchema::schemaless(&handle).is_assignable_to(
+                crate::schema::TypeInSchema::schemaless(&AttributeType::string())
+            )
+        );
+        assert!(
+            !crate::schema::TypeInSchema::schemaless(&handle).is_assignable_to(
+                crate::schema::TypeInSchema::schemaless(&AttributeType::int())
+            )
+        );
+    }
+    let literal = lift_type_expr(&TypeExpr::StringLiteral("x".to_string()))
+        .expect("string literals lift to a closed string set");
+    assert!(
+        crate::schema::TypeInSchema::schemaless(&literal).is_assignable_to(
+            crate::schema::TypeInSchema::schemaless(&AttributeType::string())
+        )
+    );
     assert!(lift_type_expr(&TypeExpr::Unknown).is_none());
+}
+
+#[test]
+fn literal_union_lifts_directionally_for_schema_assignment() {
+    let literals = TypeExpr::Union(vec![
+        TypeExpr::StringLiteral("dev".to_string()),
+        TypeExpr::StringLiteral("prod".to_string()),
+    ]);
+    let identified_string = AttributeType::refined_string(
+        Some(TypeIdentity::bare("EnvironmentName")),
+        None,
+        None,
+        None,
+    );
+
+    assert!(!lifted_source_is_assignable_to_schema(
+        &literals,
+        &AttributeType::int(),
+        crate::schema::empty_defs_for_schema_walks(),
+    ));
+    assert!(!lifted_source_is_assignable_to_schema(
+        &literals,
+        &identified_string,
+        crate::schema::empty_defs_for_schema_walks(),
+    ));
+    assert!(lifted_source_is_assignable_to_schema(
+        &literals,
+        &AttributeType::string(),
+        crate::schema::empty_defs_for_schema_walks(),
+    ));
 }
 
 #[test]
@@ -433,15 +611,15 @@ fn binding_referenced_in_attributes_not_warned() {
 
     parsed
         .attribute_params
-        .push(crate::parser::AttributeParameter {
-            name: "vpc_id".to_string(),
-            type_expr: Some(TypeExpr::String),
-            value: Some(Value::resource_ref(
+        .push(crate::parser::AttributeParameter::new(
+            "vpc_id".to_string(),
+            Some(TypeExpr::String),
+            Some(Value::resource_ref(
                 "vpc".to_string(),
                 "vpc_id".to_string(),
                 vec![],
             )),
-        });
+        ));
 
     assert!(check_unused_bindings(&parsed).is_empty());
 }
@@ -453,15 +631,17 @@ fn binding_referenced_in_exports_not_warned() {
     let vpc = Resource::with_provider("awscc", "ec2.Vpc", "main-vpc", None).with_binding("vpc");
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
 
-    parsed.export_params.push(crate::parser::ExportParameter {
-        name: "vpc_id".to_string(),
-        type_expr: Some(TypeExpr::String),
-        value: Some(Value::resource_ref(
-            "vpc".to_string(),
+    parsed
+        .export_params
+        .push(crate::parser::ExportParameter::new(
             "vpc_id".to_string(),
-            vec![],
-        )),
-    });
+            Some(TypeExpr::String),
+            Some(Value::resource_ref(
+                "vpc".to_string(),
+                "vpc_id".to_string(),
+                vec![],
+            )),
+        ));
 
     assert!(
         check_unused_bindings(&parsed).is_empty(),
@@ -1432,11 +1612,11 @@ fn provider_in_module_with_attributes_errors() {
     });
     parsed
         .attribute_params
-        .push(crate::parser::AttributeParameter {
-            name: "vpc_id".to_string(),
-            type_expr: Some(TypeExpr::String),
-            value: Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
-        });
+        .push(crate::parser::AttributeParameter::new(
+            "vpc_id".to_string(),
+            Some(TypeExpr::String),
+            Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
+        ));
 
     let result = validate_no_provider_in_module(&parsed);
     assert!(result.is_err());
@@ -1540,11 +1720,11 @@ fn state_block_in_module_with_attributes_errors() {
     );
     parsed
         .attribute_params
-        .push(crate::parser::AttributeParameter {
-            name: "resource_id".to_string(),
-            type_expr: Some(TypeExpr::String),
-            value: Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
-        });
+        .push(crate::parser::AttributeParameter::new(
+            "resource_id".to_string(),
+            Some(TypeExpr::String),
+            Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
+        ));
 
     let result = validate_no_state_blocks_in_module(&parsed);
 
@@ -1607,11 +1787,11 @@ fn backend_in_module_with_attributes_errors() {
     let mut parsed = empty_parsed();
     parsed
         .attribute_params
-        .push(crate::parser::AttributeParameter {
-            name: "resource_id".to_string(),
-            type_expr: Some(TypeExpr::String),
-            value: Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
-        });
+        .push(crate::parser::AttributeParameter::new(
+            "resource_id".to_string(),
+            Some(TypeExpr::String),
+            Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
+        ));
     parsed.backend = Some(crate::parser::BackendConfig {
         backend_type: "local".to_string(),
         attributes: HashMap::new(),
@@ -1670,11 +1850,11 @@ fn upstream_state_in_module_with_attributes_errors() {
         parse_root_owned_declaration("let up = upstream_state { source = '../other' }\n");
     parsed
         .attribute_params
-        .push(crate::parser::AttributeParameter {
-            name: "resource_id".to_string(),
-            type_expr: Some(TypeExpr::String),
-            value: Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
-        });
+        .push(crate::parser::AttributeParameter::new(
+            "resource_id".to_string(),
+            Some(TypeExpr::String),
+            Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
+        ));
 
     let result = validate_no_upstream_states_in_module(&parsed);
 
@@ -1718,11 +1898,11 @@ fn exports_in_module_with_attributes_errors() {
     let mut parsed = parse_root_owned_declaration("exports {\n  module_value = 'module'\n}\n");
     parsed
         .attribute_params
-        .push(crate::parser::AttributeParameter {
-            name: "resource_id".to_string(),
-            type_expr: Some(TypeExpr::String),
-            value: Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
-        });
+        .push(crate::parser::AttributeParameter::new(
+            "resource_id".to_string(),
+            Some(TypeExpr::String),
+            Some(Value::Concrete(ConcreteValue::String("dummy".to_string()))),
+        ));
 
     let result = validate_no_exports_in_module(&parsed);
 
@@ -1818,11 +1998,11 @@ fn empty_arguments_in_root_ok() {
     assert!(result.is_ok());
 }
 
-// --- validate_type_expr_value tests ---
+// --- rendered_typecheck_result tests ---
 
 #[test]
-fn validate_type_expr_value_error_uses_pascal_case() {
-    let msg = validate_type_expr_value(
+fn rendered_typecheck_result_error_uses_pascal_case() {
+    let msg = rendered_typecheck_result(
         &TypeExpr::String,
         &Value::Concrete(ConcreteValue::Int(42)),
         &ProviderContext::default(),
@@ -1839,7 +2019,7 @@ fn validate_type_expr_struct_error_uses_pascal_case_in_field_type() {
         Value::Concrete(ConcreteValue::String("x".into())),
     );
     let fields = vec![("count".to_string(), TypeExpr::Int)];
-    let msg = validate_type_expr_value(
+    let msg = rendered_typecheck_result(
         &TypeExpr::Struct { fields },
         &Value::Concrete(ConcreteValue::Map(map)),
         &ProviderContext::default(),
@@ -1852,8 +2032,8 @@ fn validate_type_expr_struct_error_uses_pascal_case_in_field_type() {
 }
 
 #[test]
-fn validate_type_expr_value_ipv4_cidr_valid() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_ipv4_cidr_valid() {
+    let result = rendered_typecheck_result(
         &TypeExpr::Simple("ipv4_cidr".to_string()),
         &Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
         &ProviderContext::default(),
@@ -1862,8 +2042,8 @@ fn validate_type_expr_value_ipv4_cidr_valid() {
 }
 
 #[test]
-fn validate_type_expr_value_ipv4_cidr_invalid() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_ipv4_cidr_invalid() {
+    let result = rendered_typecheck_result(
         &TypeExpr::Simple("ipv4_cidr".to_string()),
         &Value::Concrete(ConcreteValue::String("not-a-cidr".to_string())),
         &ProviderContext::default(),
@@ -1872,8 +2052,8 @@ fn validate_type_expr_value_ipv4_cidr_invalid() {
 }
 
 #[test]
-fn validate_type_expr_value_ipv4_address_valid() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_ipv4_address_valid() {
+    let result = rendered_typecheck_result(
         &TypeExpr::Simple("ipv4_address".to_string()),
         &Value::Concrete(ConcreteValue::String("192.168.1.1".to_string())),
         &ProviderContext::default(),
@@ -1882,8 +2062,8 @@ fn validate_type_expr_value_ipv4_address_valid() {
 }
 
 #[test]
-fn validate_type_expr_value_ipv4_address_invalid() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_ipv4_address_invalid() {
+    let result = rendered_typecheck_result(
         &TypeExpr::Simple("ipv4_address".to_string()),
         &Value::Concrete(ConcreteValue::String("999.999.999.999".to_string())),
         &ProviderContext::default(),
@@ -1892,8 +2072,8 @@ fn validate_type_expr_value_ipv4_address_invalid() {
 }
 
 #[test]
-fn validate_type_expr_value_ipv6_cidr_valid() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_ipv6_cidr_valid() {
+    let result = rendered_typecheck_result(
         &TypeExpr::Simple("ipv6_cidr".to_string()),
         &Value::Concrete(ConcreteValue::String("2001:db8::/32".to_string())),
         &ProviderContext::default(),
@@ -1902,8 +2082,8 @@ fn validate_type_expr_value_ipv6_cidr_valid() {
 }
 
 #[test]
-fn validate_type_expr_value_ipv6_cidr_invalid() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_ipv6_cidr_invalid() {
+    let result = rendered_typecheck_result(
         &TypeExpr::Simple("ipv6_cidr".to_string()),
         &Value::Concrete(ConcreteValue::String("not-ipv6-cidr".to_string())),
         &ProviderContext::default(),
@@ -1912,8 +2092,8 @@ fn validate_type_expr_value_ipv6_cidr_invalid() {
 }
 
 #[test]
-fn validate_type_expr_value_ipv6_address_valid() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_ipv6_address_valid() {
+    let result = rendered_typecheck_result(
         &TypeExpr::Simple("ipv6_address".to_string()),
         &Value::Concrete(ConcreteValue::String("2001:db8::1".to_string())),
         &ProviderContext::default(),
@@ -1922,8 +2102,8 @@ fn validate_type_expr_value_ipv6_address_valid() {
 }
 
 #[test]
-fn validate_type_expr_value_ipv6_address_invalid() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_ipv6_address_invalid() {
+    let result = rendered_typecheck_result(
         &TypeExpr::Simple("ipv6_address".to_string()),
         &Value::Concrete(ConcreteValue::String("zzz::zzz".to_string())),
         &ProviderContext::default(),
@@ -1932,8 +2112,8 @@ fn validate_type_expr_value_ipv6_address_invalid() {
 }
 
 #[test]
-fn validate_type_expr_value_bool_mismatch() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_bool_mismatch() {
+    let result = rendered_typecheck_result(
         &TypeExpr::Bool,
         &Value::Concrete(ConcreteValue::String("yes".to_string())),
         &ProviderContext::default(),
@@ -1943,8 +2123,8 @@ fn validate_type_expr_value_bool_mismatch() {
 }
 
 #[test]
-fn validate_type_expr_value_int_mismatch() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_int_mismatch() {
+    let result = rendered_typecheck_result(
         &TypeExpr::Int,
         &Value::Concrete(ConcreteValue::String("42".to_string())),
         &ProviderContext::default(),
@@ -1954,8 +2134,8 @@ fn validate_type_expr_value_int_mismatch() {
 }
 
 #[test]
-fn validate_type_expr_value_float_mismatch() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_float_mismatch() {
+    let result = rendered_typecheck_result(
         &TypeExpr::Float,
         &Value::Concrete(ConcreteValue::String("3.14".to_string())),
         &ProviderContext::default(),
@@ -1965,23 +2145,23 @@ fn validate_type_expr_value_float_mismatch() {
 }
 
 #[test]
-fn validate_type_expr_value_list_of_ipv4_address() {
+fn rendered_typecheck_result_list_of_ipv4_address() {
     let items = vec![
         Value::Concrete(ConcreteValue::String("192.168.1.1".to_string())),
         Value::Concrete(ConcreteValue::String("999.0.0.1".to_string())),
     ];
-    let result = validate_type_expr_value(
+    let result = rendered_typecheck_result(
         &TypeExpr::List(Box::new(TypeExpr::Simple("ipv4_address".to_string()))),
         &Value::Concrete(ConcreteValue::List(items)),
         &ProviderContext::default(),
     );
     assert!(result.is_some());
-    assert!(result.unwrap().contains("Element 1"));
+    assert!(result.unwrap().contains("list element 1"));
 }
 
 #[test]
-fn validate_type_expr_value_string_type_accepts_string() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_string_type_accepts_string() {
+    let result = rendered_typecheck_result(
         &TypeExpr::String,
         &Value::Concrete(ConcreteValue::String("hello".to_string())),
         &ProviderContext::default(),
@@ -1990,8 +2170,8 @@ fn validate_type_expr_value_string_type_accepts_string() {
 }
 
 #[test]
-fn validate_type_expr_value_string_got_bool() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_string_got_bool() {
+    let result = rendered_typecheck_result(
         &TypeExpr::String,
         &Value::Concrete(ConcreteValue::Bool(true)),
         &ProviderContext::default(),
@@ -2001,8 +2181,8 @@ fn validate_type_expr_value_string_got_bool() {
 }
 
 #[test]
-fn validate_type_expr_value_string_got_int() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_string_got_int() {
+    let result = rendered_typecheck_result(
         &TypeExpr::String,
         &Value::Concrete(ConcreteValue::Int(42)),
         &ProviderContext::default(),
@@ -2012,8 +2192,8 @@ fn validate_type_expr_value_string_got_int() {
 }
 
 #[test]
-fn validate_type_expr_value_string_got_float() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_string_got_float() {
+    let result = rendered_typecheck_result(
         &TypeExpr::String,
         &Value::Concrete(ConcreteValue::Float(1.5)),
         &ProviderContext::default(),
@@ -2023,8 +2203,8 @@ fn validate_type_expr_value_string_got_float() {
 }
 
 #[test]
-fn validate_type_expr_value_bool_got_int() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_bool_got_int() {
+    let result = rendered_typecheck_result(
         &TypeExpr::Bool,
         &Value::Concrete(ConcreteValue::Int(1)),
         &ProviderContext::default(),
@@ -2034,8 +2214,8 @@ fn validate_type_expr_value_bool_got_int() {
 }
 
 #[test]
-fn validate_type_expr_value_int_got_bool() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_int_got_bool() {
+    let result = rendered_typecheck_result(
         &TypeExpr::Int,
         &Value::Concrete(ConcreteValue::Bool(true)),
         &ProviderContext::default(),
@@ -2045,8 +2225,8 @@ fn validate_type_expr_value_int_got_bool() {
 }
 
 #[test]
-fn validate_type_expr_value_float_got_bool() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_float_got_bool() {
+    let result = rendered_typecheck_result(
         &TypeExpr::Float,
         &Value::Concrete(ConcreteValue::Bool(false)),
         &ProviderContext::default(),
@@ -2056,9 +2236,9 @@ fn validate_type_expr_value_float_got_bool() {
 }
 
 #[test]
-fn validate_type_expr_value_bool_got_float_is_rejected() {
+fn rendered_typecheck_result_bool_got_float_is_rejected() {
     // Regression for #2864: Float must not silently coerce into Bool.
-    let result = validate_type_expr_value(
+    let result = rendered_typecheck_result(
         &TypeExpr::Bool,
         &Value::Concrete(ConcreteValue::Float(1.5)),
         &ProviderContext::default(),
@@ -2068,9 +2248,9 @@ fn validate_type_expr_value_bool_got_float_is_rejected() {
 }
 
 #[test]
-fn validate_type_expr_value_int_got_float_is_rejected() {
+fn rendered_typecheck_result_int_got_float_is_rejected() {
     // Regression for #2864: Float must not silently coerce into Int.
-    let result = validate_type_expr_value(
+    let result = rendered_typecheck_result(
         &TypeExpr::Int,
         &Value::Concrete(ConcreteValue::Float(1.5)),
         &ProviderContext::default(),
@@ -2080,8 +2260,8 @@ fn validate_type_expr_value_int_got_float_is_rejected() {
 }
 
 #[test]
-fn validate_type_expr_value_escapes_string_literal_value() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_escapes_string_literal_value() {
+    let result = rendered_typecheck_result(
         &TypeExpr::Bool,
         &Value::Concrete(ConcreteValue::String("yes\"\nno".to_string())),
         &ProviderContext::default(),
@@ -2094,22 +2274,22 @@ fn validate_type_expr_value_escapes_string_literal_value() {
 }
 
 #[test]
-fn validate_type_expr_value_preserves_float_fraction() {
-    let result = validate_type_expr_value(
+fn rendered_typecheck_result_preserves_float_fraction() {
+    let result = rendered_typecheck_result(
         &TypeExpr::Int,
         &Value::Concrete(ConcreteValue::Float(1.0)),
         &ProviderContext::default(),
     );
 
-    assert_eq!(result.as_deref(), Some("expected Int, got float (1.0)."));
+    assert_eq!(result.as_deref(), Some("expected Int, got float (1.0)"));
 }
 
 #[test]
-fn validate_type_expr_value_struct_got_string_includes_literal() {
+fn rendered_typecheck_result_struct_got_string_includes_literal() {
     let type_expr = TypeExpr::Struct {
         fields: vec![("environment".to_string(), TypeExpr::String)],
     };
-    let result = validate_type_expr_value(
+    let result = rendered_typecheck_result(
         &type_expr,
         &Value::Concrete(ConcreteValue::String("production".to_string())),
         &ProviderContext::default(),
@@ -2123,9 +2303,9 @@ fn validate_type_expr_value_struct_got_string_includes_literal() {
 }
 
 #[test]
-fn validate_type_expr_value_float_got_int_is_accepted() {
+fn rendered_typecheck_result_float_got_int_is_accepted() {
     // Intentional one-way widening: Int flows into Float (see #2864).
-    let result = validate_type_expr_value(
+    let result = rendered_typecheck_result(
         &TypeExpr::Float,
         &Value::Concrete(ConcreteValue::Int(42)),
         &ProviderContext::default(),
@@ -2134,13 +2314,13 @@ fn validate_type_expr_value_float_got_int_is_accepted() {
 }
 
 #[test]
-fn validate_type_expr_value_schema_type_accepts_string() {
+fn rendered_typecheck_result_schema_type_accepts_string() {
     let schema_type = TypeExpr::SchemaType {
         provider: "awscc".to_string(),
         path: "ec2".to_string(),
         type_name: "VpcId".to_string(),
     };
-    let result = validate_type_expr_value(
+    let result = rendered_typecheck_result(
         &schema_type,
         &Value::Concrete(ConcreteValue::String("vpc-12345678".to_string())),
         &ProviderContext::default(),
@@ -2149,13 +2329,13 @@ fn validate_type_expr_value_schema_type_accepts_string() {
 }
 
 #[test]
-fn validate_type_expr_value_schema_type_rejects_bool() {
+fn rendered_typecheck_result_schema_type_rejects_bool() {
     let schema_type = TypeExpr::SchemaType {
         provider: "awscc".to_string(),
         path: "ec2".to_string(),
         type_name: "VpcId".to_string(),
     };
-    let result = validate_type_expr_value(
+    let result = rendered_typecheck_result(
         &schema_type,
         &Value::Concrete(ConcreteValue::Bool(true)),
         &ProviderContext::default(),
@@ -2165,13 +2345,13 @@ fn validate_type_expr_value_schema_type_rejects_bool() {
 }
 
 #[test]
-fn validate_type_expr_value_schema_type_rejects_int() {
+fn rendered_typecheck_result_schema_type_rejects_int() {
     let schema_type = TypeExpr::SchemaType {
         provider: "awscc".to_string(),
         path: "ec2".to_string(),
         type_name: "VpcId".to_string(),
     };
-    let result = validate_type_expr_value(
+    let result = rendered_typecheck_result(
         &schema_type,
         &Value::Concrete(ConcreteValue::Int(42)),
         &ProviderContext::default(),
@@ -2195,7 +2375,7 @@ fn discard_binding_no_warning() {
 fn validate_type_expr_custom_type_rejects_invalid() {
     let config = context_with_iam_policy_arn_validator();
 
-    let result = validate_type_expr_value(
+    let result = rendered_typecheck_result(
         &TypeExpr::Simple("iam_policy_arn".to_string()),
         &Value::Concrete(ConcreteValue::String("aaaa".to_string())),
         &config,
@@ -2203,7 +2383,7 @@ fn validate_type_expr_custom_type_rejects_invalid() {
     assert!(result.is_some(), "Expected validation error for 'aaaa'");
     assert!(result.unwrap().contains("invalid IAM policy ARN"));
 
-    let result = validate_type_expr_value(
+    let result = rendered_typecheck_result(
         &TypeExpr::Simple("iam_policy_arn".to_string()),
         &Value::Concrete(ConcreteValue::String(
             "arn:aws:iam::123456789012:policy/MyPolicy".to_string(),
@@ -2217,7 +2397,7 @@ fn validate_type_expr_custom_type_rejects_invalid() {
 fn validate_type_expr_list_custom_type_rejects_invalid() {
     let config = context_with_iam_policy_arn_validator();
 
-    let result = validate_type_expr_value(
+    let result = rendered_typecheck_result(
         &TypeExpr::List(Box::new(TypeExpr::Simple("iam_policy_arn".to_string()))),
         &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::String("aaaa".to_string()),
@@ -2228,7 +2408,7 @@ fn validate_type_expr_list_custom_type_rejects_invalid() {
         result.is_some(),
         "Expected validation error for list element"
     );
-    assert!(result.unwrap().contains("Element 0"));
+    assert!(result.unwrap().contains("list element 0"));
 }
 
 fn struct_type_name_value() -> TypeExpr {
@@ -2248,7 +2428,7 @@ fn validate_type_expr_struct_accepts_well_formed_map() {
         Value::Concrete(ConcreteValue::String("x".to_string())),
     );
     map.insert("value".to_string(), Value::Concrete(ConcreteValue::Int(1)));
-    let result = validate_type_expr_value(
+    let result = rendered_typecheck_result(
         &struct_type_name_value(),
         &Value::Concrete(ConcreteValue::Map(map)),
         &ProviderContext::default(),
@@ -2263,7 +2443,7 @@ fn validate_type_expr_struct_rejects_missing_field() {
         "name".to_string(),
         Value::Concrete(ConcreteValue::String("x".to_string())),
     );
-    let result = validate_type_expr_value(
+    let result = rendered_typecheck_result(
         &struct_type_name_value(),
         &Value::Concrete(ConcreteValue::Map(map)),
         &ProviderContext::default(),
@@ -2286,7 +2466,7 @@ fn validate_type_expr_struct_rejects_unknown_field() {
         "extra".to_string(),
         Value::Concrete(ConcreteValue::String("y".to_string())),
     );
-    let result = validate_type_expr_value(
+    let result = rendered_typecheck_result(
         &struct_type_name_value(),
         &Value::Concrete(ConcreteValue::Map(map)),
         &ProviderContext::default(),
@@ -2308,7 +2488,7 @@ fn validate_type_expr_struct_rejects_wrong_field_type() {
         "value".to_string(),
         Value::Concrete(ConcreteValue::String("not-an-int".to_string())),
     );
-    let result = validate_type_expr_value(
+    let result = rendered_typecheck_result(
         &struct_type_name_value(),
         &Value::Concrete(ConcreteValue::Map(map)),
         &ProviderContext::default(),
@@ -2320,7 +2500,7 @@ fn validate_type_expr_struct_rejects_wrong_field_type() {
 
 #[test]
 fn validate_type_expr_struct_rejects_non_map_value() {
-    let result = validate_type_expr_value(
+    let result = rendered_typecheck_result(
         &struct_type_name_value(),
         &Value::Concrete(ConcreteValue::String("oops".to_string())),
         &ProviderContext::default(),
@@ -2330,7 +2510,7 @@ fn validate_type_expr_struct_rejects_non_map_value() {
 }
 
 #[test]
-fn struct_field_shape_errors_is_deterministic_for_multiple_unknowns() {
+fn rendered_struct_typecheck_result_is_deterministic_for_multiple_unknowns() {
     // Multiple unknown keys must produce the *same* alphabetically-first
     // error on every call, independent of HashMap's per-process random
     // hash seed.
@@ -2353,9 +2533,9 @@ fn struct_field_shape_errors_is_deterministic_for_multiple_unknowns() {
         Value::Concrete(ConcreteValue::String("z".into())),
     );
 
-    let first = struct_field_shape_errors(&fields, &entries);
+    let first = rendered_struct_typecheck_result(&fields, &entries);
     for _ in 0..20 {
-        assert_eq!(first, struct_field_shape_errors(&fields, &entries));
+        assert_eq!(first, rendered_struct_typecheck_result(&fields, &entries));
     }
     assert_eq!(
         first.as_deref(),
@@ -2690,6 +2870,89 @@ fn validate_module_calls_rejects_custom_type() {
 }
 
 #[test]
+fn validate_module_calls_rejects_literal_union_mismatch() {
+    use crate::parser::ArgumentParameter;
+
+    let module_calls = vec![ModuleCall {
+        module_name: "web_tier".to_string(),
+        binding_name: None,
+        source: Default::default(),
+        arguments: HashMap::from([(
+            "environment".to_string(),
+            Value::Concrete(ConcreteValue::String("production".to_string())),
+        )]),
+    }];
+    let imported_modules = HashMap::from([(
+        "web_tier".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "environment".to_string(),
+                type_expr: TypeExpr::Union(vec![
+                    TypeExpr::StringLiteral("dev".to_string()),
+                    TypeExpr::StringLiteral("stg".to_string()),
+                    TypeExpr::StringLiteral("prod".to_string()),
+                ]),
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+
+    let error = validate_module_calls(
+        &module_calls,
+        &imported_modules,
+        &ProviderContext::default(),
+    )
+    .expect_err("a string outside the literal union must be rejected");
+
+    assert!(
+        error.contains("expected 'dev' | 'stg' | 'prod', got string \"production\""),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn validate_module_calls_defers_binding_refs_to_the_binding_index() {
+    use crate::parser::ArgumentParameter;
+
+    let module_calls = vec![ModuleCall {
+        module_name: "inner".to_string(),
+        binding_name: None,
+        source: Default::default(),
+        arguments: HashMap::from([(
+            "name".to_string(),
+            Value::Deferred(DeferredValue::BindingRef {
+                binding: "count".to_string(),
+            }),
+        )]),
+    }];
+    let imported_modules = HashMap::from([(
+        "inner".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "name".to_string(),
+                type_expr: TypeExpr::String,
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+
+    validate_module_calls(
+        &module_calls,
+        &imported_modules,
+        &ProviderContext::default(),
+    )
+    .expect("reference-valued module arguments are owned by BindingIndex");
+}
+
+#[test]
 fn attribute_param_ref_type_mismatch_detected() {
     use crate::parser::AttributeParameter;
     use crate::schema::{AttributeSchema, ResourceSchema};
@@ -2729,15 +2992,15 @@ fn attribute_param_ref_type_mismatch_detected() {
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
 
     // Attribute param: role_arn: iam_role_arn = role.role_name (MISMATCH: String vs iam_role_arn)
-    let params_mismatch = vec![AttributeParameter {
-        name: "role_arn".to_string(),
-        type_expr: Some(TypeExpr::Simple("iam_role_arn".to_string())),
-        value: Some(Value::resource_ref(
+    let params_mismatch = vec![AttributeParameter::new(
+        "role_arn".to_string(),
+        Some(TypeExpr::Simple("iam_role_arn".to_string())),
+        Some(Value::resource_ref(
             "role".to_string(),
             "role_name".to_string(),
             vec![],
         )),
-    }];
+    )];
 
     let result = validate_attribute_param_ref_types_with_bindings(&params_mismatch, &bindings);
     assert!(
@@ -2749,15 +3012,15 @@ fn attribute_param_ref_type_mismatch_detected() {
     assert!(err.contains("IamRoleArn"), "Error: {err}");
 
     // Attribute param: role_arn: iam_role_arn = role.arn (MATCH: IamRoleArn matches iam_role_arn)
-    let params_match = vec![AttributeParameter {
-        name: "role_arn".to_string(),
-        type_expr: Some(TypeExpr::Simple("iam_role_arn".to_string())),
-        value: Some(Value::resource_ref(
+    let params_match = vec![AttributeParameter::new(
+        "role_arn".to_string(),
+        Some(TypeExpr::Simple("iam_role_arn".to_string())),
+        Some(Value::resource_ref(
             "role".to_string(),
             "arn".to_string(),
             vec![],
         )),
-    }];
+    )];
 
     let result = validate_attribute_param_ref_types_with_bindings(&params_match, &bindings);
     assert!(
@@ -2788,15 +3051,15 @@ fn attribute_param_ref_type_resolves_terminal_schema_ref() {
     let mut parsed = empty_parsed();
     parsed.resources.push(source); // allow: direct — fixture test inspection
     let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
-    let params = vec![AttributeParameter {
-        name: "value".to_string(),
-        type_expr: Some(TypeExpr::String),
-        value: Some(Value::resource_ref(
+    let params = vec![AttributeParameter::new(
+        "value".to_string(),
+        Some(TypeExpr::String),
+        Some(Value::resource_ref(
             "source".to_string(),
             "value".to_string(),
             vec![],
         )),
-    }];
+    )];
 
     let result = validate_attribute_param_ref_types_with_bindings(&params, &bindings);
     assert!(
@@ -2810,24 +3073,24 @@ fn attribute_param_ref_existence_checks_composition_attribute_membership_only() 
     use crate::parser::AttributeParameter;
 
     let params = vec![
-        AttributeParameter {
-            name: "valid".to_string(),
-            type_expr: None,
-            value: Some(Value::resource_ref(
+        AttributeParameter::new(
+            "valid".to_string(),
+            None,
+            Some(Value::resource_ref(
                 "instance".to_string(),
                 "target_group_arn".to_string(),
                 vec!["runtime_field".to_string()],
             )),
-        },
-        AttributeParameter {
-            name: "invalid".to_string(),
-            type_expr: None,
-            value: Some(Value::resource_ref(
+        ),
+        AttributeParameter::new(
+            "invalid".to_string(),
+            None,
+            Some(Value::resource_ref(
                 "instance".to_string(),
                 "target_group_ar".to_string(),
                 vec![],
             )),
-        },
+        ),
     ];
     let mut parsed = empty_parsed();
     parsed
@@ -2854,24 +3117,24 @@ fn attribute_param_ref_type_checks_composition_attribute_membership_only() {
     use crate::parser::AttributeParameter;
 
     let params = vec![
-        AttributeParameter {
-            name: "valid".to_string(),
-            type_expr: Some(TypeExpr::Simple("unrelated_type".to_string())),
-            value: Some(Value::resource_ref(
+        AttributeParameter::new(
+            "valid".to_string(),
+            Some(TypeExpr::Simple("unrelated_type".to_string())),
+            Some(Value::resource_ref(
                 "instance".to_string(),
                 "target_group_arn".to_string(),
                 vec!["runtime_field".to_string()],
             )),
-        },
-        AttributeParameter {
-            name: "invalid".to_string(),
-            type_expr: Some(TypeExpr::Simple("unrelated_type".to_string())),
-            value: Some(Value::resource_ref(
+        ),
+        AttributeParameter::new(
+            "invalid".to_string(),
+            Some(TypeExpr::Simple("unrelated_type".to_string())),
+            Some(Value::resource_ref(
                 "instance".to_string(),
                 "target_group_ar".to_string(),
                 vec![],
             )),
-        },
+        ),
     ];
     let mut parsed = empty_parsed();
     parsed
@@ -3224,6 +3487,59 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
 }
 
 #[test]
+fn module_call_argument_ref_type_widens_int_source_to_float_sink() {
+    use crate::parser::ArgumentParameter;
+    use crate::schema::AttributeSchema;
+
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("counter")
+            .attribute(AttributeSchema::new("count", AttributeType::int())),
+    );
+    let mut parsed = empty_parsed();
+    parsed
+        .resources
+        .push(Resource::with_provider("mock", "counter", "source", None).with_binding("source"));
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas);
+    let call = ModuleCall {
+        module_name: "consumer".to_string(),
+        binding_name: None,
+        source: Default::default(),
+        arguments: HashMap::from([(
+            "number".to_string(),
+            Value::resource_ref("source", "count", Vec::new()),
+        )]),
+    };
+    let imported_modules = HashMap::from([(
+        "consumer".to_string(),
+        crate::module_resolver::ResolvedModuleSignature {
+            arguments: vec![ArgumentParameter {
+                name: "number".to_string(),
+                type_expr: TypeExpr::Float,
+                default: None,
+                description: None,
+                validations: Vec::new(),
+            }],
+            attributes: IndexMap::new(),
+            requires: Vec::new(),
+        },
+    )]);
+
+    let errors = validate_module_call_argument_ref_types_with_bindings(
+        &[call],
+        &imported_modules,
+        &HashSet::new(),
+        &bindings,
+    );
+
+    assert!(
+        errors.is_empty(),
+        "an Int-typed resource attribute must widen into a Float module argument: {errors:?}"
+    );
+}
+
+#[test]
 fn attribute_param_ref_types_flags_unknown_attribute_inside_nested_struct() {
     use crate::parser::AttributeParameter;
     use crate::schema::{AttributeSchema, ResourceSchema};
@@ -3246,11 +3562,11 @@ fn attribute_param_ref_types_flags_unknown_attribute_inside_nested_struct() {
         "id".to_string(),
         Value::resource_ref("vpc".to_string(), "bad_attr".to_string(), vec![]),
     );
-    let params = vec![AttributeParameter {
-        name: "network".to_string(),
-        type_expr: Some(TypeExpr::Simple("vpc_id".to_string())),
-        value: Some(Value::Concrete(ConcreteValue::Map(nested))),
-    }];
+    let params = vec![AttributeParameter::new(
+        "network".to_string(),
+        Some(TypeExpr::Simple("vpc_id".to_string())),
+        Some(Value::Concrete(ConcreteValue::Map(nested))),
+    )];
 
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
@@ -3284,15 +3600,15 @@ fn attribute_param_ref_types_flags_unknown_attribute_through_wait_binding() {
     let mut schemas = SchemaRegistry::new();
     schemas.insert("aws", cert_schema);
 
-    let params = vec![AttributeParameter {
-        name: "certificate_arn".to_string(),
-        type_expr: Some(TypeExpr::Simple("string".to_string())),
-        value: Some(Value::resource_ref(
+    let params = vec![AttributeParameter::new(
+        "certificate_arn".to_string(),
+        Some(TypeExpr::Simple("string".to_string())),
+        Some(Value::resource_ref(
             "cert_issued".to_string(),
             "bad_attr".to_string(),
             vec![],
         )),
-    }];
+    )];
 
     let mut parsed = empty_parsed();
     parsed.resources.push(cert); // allow: direct — fixture test inspection
@@ -3341,11 +3657,11 @@ fn attribute_param_ref_types_does_not_misreport_type_mismatch_for_nested_ref_to_
         "id".to_string(),
         Value::resource_ref("vpc".to_string(), "cidr_block".to_string(), vec![]),
     );
-    let params = vec![AttributeParameter {
-        name: "network".to_string(),
-        type_expr: Some(TypeExpr::Simple("vpc_id".to_string())),
-        value: Some(Value::Concrete(ConcreteValue::Map(nested))),
-    }];
+    let params = vec![AttributeParameter::new(
+        "network".to_string(),
+        Some(TypeExpr::Simple("vpc_id".to_string())),
+        Some(Value::Concrete(ConcreteValue::Map(nested))),
+    )];
 
     let mut parsed = empty_parsed();
     parsed.resources.push(vpc); // allow: direct — fixture test inspection
@@ -3425,15 +3741,15 @@ fn validate_attribute_params_against_target_group_tags(
 fn attribute_param_nested_unknown_field_reports_suggestion() {
     use crate::parser::AttributeParameter;
 
-    let params = vec![AttributeParameter {
-        name: "x".to_string(),
-        type_expr: None,
-        value: Some(Value::resource_ref(
+    let params = vec![AttributeParameter::new(
+        "x".to_string(),
+        None,
+        Some(Value::resource_ref(
             "target_group".to_string(),
             "tags".to_string(),
             vec!["bad_field".to_string()],
         )),
-    }];
+    )];
 
     let err = validate_attribute_params_against_target_group_tags(&params).unwrap_err();
 
@@ -3455,15 +3771,15 @@ fn attribute_param_nested_unknown_field_reports_suggestion() {
 fn attribute_param_nested_known_field_is_valid() {
     use crate::parser::AttributeParameter;
 
-    let params = vec![AttributeParameter {
-        name: "x".to_string(),
-        type_expr: None,
-        value: Some(Value::resource_ref(
+    let params = vec![AttributeParameter::new(
+        "x".to_string(),
+        None,
+        Some(Value::resource_ref(
             "target_group".to_string(),
             "tags".to_string(),
             vec!["environment".to_string()],
         )),
-    }];
+    )];
 
     let result = validate_attribute_params_against_target_group_tags(&params);
 
@@ -3477,15 +3793,15 @@ fn attribute_param_nested_known_field_is_valid() {
 fn attribute_param_nested_simple_annotation_uses_leaf_type() {
     use crate::parser::AttributeParameter;
 
-    let params = vec![AttributeParameter {
-        name: "x".to_string(),
-        type_expr: Some(TypeExpr::Simple("environment_name".to_string())),
-        value: Some(Value::resource_ref(
+    let params = vec![AttributeParameter::new(
+        "x".to_string(),
+        Some(TypeExpr::Simple("environment_name".to_string())),
+        Some(Value::resource_ref(
             "target_group".to_string(),
             "tags".to_string(),
             vec!["environment".to_string()],
         )),
-    }];
+    )];
 
     let result = validate_attribute_params_against_target_group_tags(&params);
 
@@ -3499,15 +3815,15 @@ fn attribute_param_nested_simple_annotation_uses_leaf_type() {
 fn unannotated_attribute_param_flags_unknown_resource_attribute_with_suggestion() {
     use crate::parser::AttributeParameter;
 
-    let params = vec![AttributeParameter {
-        name: "target_group_arn".to_string(),
-        type_expr: None,
-        value: Some(Value::resource_ref(
+    let params = vec![AttributeParameter::new(
+        "target_group_arn".to_string(),
+        None,
+        Some(Value::resource_ref(
             "target_group".to_string(),
             "target_group_ar".to_string(),
             vec![],
         )),
-    }];
+    )];
 
     let err = validate_attribute_params_against_target_group(&params).unwrap_err();
 
@@ -3525,15 +3841,15 @@ fn unannotated_attribute_param_flags_unknown_resource_attribute_with_suggestion(
 fn primitive_annotated_attribute_param_flags_unknown_resource_attribute() {
     use crate::parser::AttributeParameter;
 
-    let params = vec![AttributeParameter {
-        name: "target_group_arn".to_string(),
-        type_expr: Some(TypeExpr::String),
-        value: Some(Value::resource_ref(
+    let params = vec![AttributeParameter::new(
+        "target_group_arn".to_string(),
+        Some(TypeExpr::String),
+        Some(Value::resource_ref(
             "target_group".to_string(),
             "arn".to_string(),
             vec![],
         )),
-    }];
+    )];
 
     let err = validate_attribute_params_against_target_group(&params).unwrap_err();
 
@@ -3544,13 +3860,13 @@ fn primitive_annotated_attribute_param_flags_unknown_resource_attribute() {
 fn unannotated_attribute_param_flags_unknown_resource_attribute_in_nested_value() {
     use crate::parser::AttributeParameter;
 
-    let params = vec![AttributeParameter {
-        name: "target_group_arns".to_string(),
-        type_expr: None,
-        value: Some(Value::Concrete(ConcreteValue::List(vec![
+    let params = vec![AttributeParameter::new(
+        "target_group_arns".to_string(),
+        None,
+        Some(Value::Concrete(ConcreteValue::List(vec![
             Value::resource_ref("target_group".to_string(), "arn".to_string(), vec![]),
         ]))),
-    }];
+    )];
 
     let err = validate_attribute_params_against_target_group(&params).unwrap_err();
 
@@ -3561,15 +3877,15 @@ fn unannotated_attribute_param_flags_unknown_resource_attribute_in_nested_value(
 fn simple_annotated_plain_ref_reports_unknown_attribute_once() {
     use crate::parser::AttributeParameter;
 
-    let params = vec![AttributeParameter {
-        name: "target_group_arn".to_string(),
-        type_expr: Some(TypeExpr::Simple("target_group_arn".to_string())),
-        value: Some(Value::resource_ref(
+    let params = vec![AttributeParameter::new(
+        "target_group_arn".to_string(),
+        Some(TypeExpr::Simple("target_group_arn".to_string())),
+        Some(Value::resource_ref(
             "target_group".to_string(),
             "target_group_ar".to_string(),
             vec![],
         )),
-    }];
+    )];
 
     let err = validate_attribute_params_against_target_group(&params).unwrap_err();
 
@@ -3622,7 +3938,7 @@ fn validate_export_params_rejects_invalid_list_element() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.contains("export 'policies'"), "err={err}");
-    assert!(err.contains("Element 1"), "err={err}");
+    assert!(err.contains("list element 1"), "err={err}");
 }
 
 #[test]
@@ -4844,7 +5160,7 @@ fn read_against_managed_only_type_is_rejected() {
 }
 
 #[test]
-fn validate_type_expr_value_skips_value_unknown() {
+fn rendered_typecheck_result_skips_value_unknown() {
     // RFC #2371 stage 3: a `Value::Deferred(DeferredValue::Unknown)` reaching this validator
     // (e.g. from a deferred-for body where a typed module-call argument
     // is bound to the loop var) must short-circuit rather than emit
@@ -4855,20 +5171,20 @@ fn validate_type_expr_value_skips_value_unknown() {
     let unknown = Value::Deferred(DeferredValue::Unknown(UnknownReason::ForValue));
     let cfg = ProviderContext::default();
 
-    assert!(super::validate_type_expr_value(&TypeExpr::String, &unknown, &cfg).is_none());
-    assert!(super::validate_type_expr_value(&TypeExpr::Int, &unknown, &cfg).is_none());
-    assert!(super::validate_type_expr_value(&TypeExpr::Bool, &unknown, &cfg).is_none());
+    assert!(rendered_typecheck_result(&TypeExpr::String, &unknown, &cfg).is_none());
+    assert!(rendered_typecheck_result(&TypeExpr::Int, &unknown, &cfg).is_none());
+    assert!(rendered_typecheck_result(&TypeExpr::Bool, &unknown, &cfg).is_none());
 
     let struct_ty = TypeExpr::Struct {
         fields: vec![("name".to_string(), TypeExpr::String)],
     };
-    assert!(super::validate_type_expr_value(&struct_ty, &unknown, &cfg).is_none());
+    assert!(rendered_typecheck_result(&struct_ty, &unknown, &cfg).is_none());
 
     let upstream = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
         path: crate::resource::AccessPath::with_fields("net", "vpc", vec!["vpc_id".into()]),
     }));
-    assert!(super::validate_type_expr_value(&TypeExpr::String, &upstream, &cfg).is_none());
-    assert!(super::validate_type_expr_value(&struct_ty, &upstream, &cfg).is_none());
+    assert!(rendered_typecheck_result(&TypeExpr::String, &upstream, &cfg).is_none());
+    assert!(rendered_typecheck_result(&struct_ty, &upstream, &cfg).is_none());
 }
 
 /// carina#3028: when a `ResourceRef` chains `[idx]` followed by

@@ -191,6 +191,11 @@ fn factories_with_generic_arn() -> Vec<Box<dyn ProviderFactory>> {
 /// the imported module through `module_resolver::load_module`.
 fn write_fixture(arg_type: &str) -> TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
+    let argument_value = if arg_type.trim_start().starts_with("list(") {
+        "['anything']"
+    } else {
+        "'anything'"
+    };
 
     std::fs::create_dir(dir.path().join("inner")).unwrap();
     std::fs::create_dir(dir.path().join("caller")).unwrap();
@@ -224,12 +229,14 @@ let vpc = awscc.ec2.Vpc {{
 
     std::fs::write(
         dir.path().join("caller/main.crn"),
-        r#"let inner = use { source = '../inner' }
+        format!(
+            r#"let inner = use {{ source = '../inner' }}
 
-let m = inner {
-  bad_arg = 'anything'
-}
-"#,
+let m = inner {{
+  bad_arg = {argument_value}
+}}
+"#
+        ),
     )
     .unwrap();
 

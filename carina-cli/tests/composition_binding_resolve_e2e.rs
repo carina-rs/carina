@@ -272,6 +272,7 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
         &mut parsed,
         &caller,
         &provider_context,
+        &SchemaRegistry::new(),
     )
     .expect("module expansion should succeed");
 

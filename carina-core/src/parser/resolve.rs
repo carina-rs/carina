@@ -304,6 +304,40 @@ pub fn resolve_resource_refs_with_config(
     parsed: &mut ParsedFile,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
+    resolve_resource_refs_with_policy(parsed, config, false, false)
+}
+
+/// Resolve one file before its sibling declarations have been merged.
+/// Unknown function names are preserved for the directory-wide pass, where
+/// the complete function table can distinguish a sibling function from a
+/// genuinely unknown call.
+pub(crate) fn resolve_resource_refs_defer_unknown_functions(
+    parsed: &mut ParsedFile,
+    config: &ProviderContext,
+) -> Result<(), ParseError> {
+    resolve_resource_refs_with_policy(parsed, config, true, false)
+}
+
+/// Resolve the directory-wide semantic view used by diagnostics.
+///
+/// This keeps an authored user-function call when eager evaluation fails. The
+/// boundary checker can then compare nested calls using the merged function
+/// declarations instead of losing the call behind the evaluation error.
+/// Truly unknown function names remain errors once this directory-wide pass
+/// has the complete function table.
+pub(crate) fn resolve_resource_refs_for_diagnostics(
+    parsed: &mut ParsedFile,
+    config: &ProviderContext,
+) -> Result<(), ParseError> {
+    resolve_resource_refs_with_policy(parsed, config, false, true)
+}
+
+fn resolve_resource_refs_with_policy(
+    parsed: &mut ParsedFile,
+    config: &ProviderContext,
+    defer_unknown_functions: bool,
+    preserve_failed_user_calls: bool,
+) -> Result<(), ParseError> {
     // Save dependency bindings before resolution may change ResourceRef binding names.
     // This preserves direct dependencies that would be lost by recursive resolution
     // (e.g., tgw_attach.transit_gateway_id resolves to tgw.id, losing the tgw_attach dep).
@@ -389,7 +423,13 @@ pub fn resolve_resource_refs_with_config(
         let mut resolved_attrs: IndexMap<String, Value> = IndexMap::new();
 
         for (key, expr) in resource.attributes().iter() {
-            let resolved = resolve_value_with_config(expr, &binding_map, &fn_ctx)?;
+            let resolved = resolve_value_with_config(
+                expr,
+                &binding_map,
+                &fn_ctx,
+                defer_unknown_functions,
+                preserve_failed_user_calls,
+            )?;
             resolved_attrs.insert(key.clone(), resolved);
         }
 
@@ -407,7 +447,13 @@ pub fn resolve_resource_refs_with_config(
     let var_keys: Vec<String> = parsed.variables.keys().cloned().collect();
     for key in var_keys {
         let expr = parsed.variables[&key].clone();
-        let resolved = resolve_function_calls_only(&expr, &binding_map, &fn_ctx)?;
+        let resolved = resolve_function_calls_only(
+            &expr,
+            &binding_map,
+            &fn_ctx,
+            defer_unknown_functions,
+            preserve_failed_user_calls,
+        )?;
         parsed.variables[&key] = resolved;
     }
 
@@ -825,6 +871,8 @@ fn resolve_value_with_config(
     value: &Value,
     binding_map: &HashMap<String, HashMap<String, Value>>,
     fn_ctx: &super::ParseContext<'_>,
+    defer_unknown_functions: bool,
+    preserve_failed_user_calls: bool,
 ) -> Result<Value, ParseError> {
     match value {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
@@ -832,7 +880,13 @@ fn resolve_value_with_config(
                 Some(attributes) => match attributes.get(path.attribute()) {
                     Some(attr_value) => {
                         // Recursively resolve in case the attribute itself is a reference
-                        resolve_value_with_config(attr_value, binding_map, fn_ctx)
+                        resolve_value_with_config(
+                            attr_value,
+                            binding_map,
+                            fn_ctx,
+                            defer_unknown_functions,
+                            preserve_failed_user_calls,
+                        )
                     }
                     None => {
                         // Attribute not found, keep as reference (might be resolved at runtime)
@@ -854,7 +908,15 @@ fn resolve_value_with_config(
         Value::Concrete(ConcreteValue::List(items)) => {
             let resolved: Result<Vec<Value>, ParseError> = items
                 .iter()
-                .map(|item| resolve_value_with_config(item, binding_map, fn_ctx))
+                .map(|item| {
+                    resolve_value_with_config(
+                        item,
+                        binding_map,
+                        fn_ctx,
+                        defer_unknown_functions,
+                        preserve_failed_user_calls,
+                    )
+                })
                 .collect();
             Ok(Value::Concrete(ConcreteValue::List(resolved?)))
         }
@@ -863,7 +925,13 @@ fn resolve_value_with_config(
             for (k, v) in map {
                 resolved.insert(
                     k.clone(),
-                    resolve_value_with_config(v, binding_map, fn_ctx)?,
+                    resolve_value_with_config(
+                        v,
+                        binding_map,
+                        fn_ctx,
+                        defer_unknown_functions,
+                        preserve_failed_user_calls,
+                    )?,
                 );
             }
             Ok(Value::Concrete(ConcreteValue::Map(resolved)))
@@ -873,18 +941,36 @@ fn resolve_value_with_config(
             let resolved: Result<Vec<InterpolationPart>, ParseError> = parts
                 .iter()
                 .map(|p| match p {
-                    InterpolationPart::Expr(v) => Ok(InterpolationPart::Expr(
-                        resolve_value_with_config(v, binding_map, fn_ctx)?,
-                    )),
+                    InterpolationPart::Expr(v) => {
+                        Ok(InterpolationPart::Expr(resolve_value_with_config(
+                            v,
+                            binding_map,
+                            fn_ctx,
+                            defer_unknown_functions,
+                            preserve_failed_user_calls,
+                        )?))
+                    }
                     other => Ok(other.clone()),
                 })
                 .collect();
             Ok(Value::Deferred(DeferredValue::Interpolation(resolved?)).canonicalize())
         }
         Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+            let argument_origins = args
+                .iter()
+                .map(super::functions::contains_function_call)
+                .collect::<Vec<_>>();
             let resolved_args: Result<Vec<Value>, ParseError> = args
                 .iter()
-                .map(|a| resolve_value_with_config(a, binding_map, fn_ctx))
+                .map(|a| {
+                    resolve_value_with_config(
+                        a,
+                        binding_map,
+                        fn_ctx,
+                        defer_unknown_functions,
+                        preserve_failed_user_calls,
+                    )
+                })
                 .collect();
             let resolved_args = resolved_args?;
 
@@ -914,13 +1000,18 @@ fn resolve_value_with_config(
                     // Truly-undefined names with all-static args still
                     // error.
                     if let Some(user_fn) = fn_ctx.user_functions.get(name) {
-                        return super::functions::evaluate_user_function(
+                        let evaluated = super::functions::evaluate_user_function_with_origins(
                             user_fn,
                             &resolved_args,
+                            &argument_origins,
                             fn_ctx,
                         );
+                        if preserve_failed_user_calls && evaluated.is_err() {
+                            return Ok(value.clone());
+                        }
+                        return evaluated;
                     }
-                    if all_args_resolved {
+                    if all_args_resolved && !defer_unknown_functions {
                         // All args are resolved but builtin failed — propagate the error
                         Err(ParseError::InvalidExpression {
                             line: 0,
@@ -951,16 +1042,30 @@ fn resolve_function_calls_only(
     value: &Value,
     binding_map: &HashMap<String, HashMap<String, Value>>,
     fn_ctx: &super::ParseContext<'_>,
+    defer_unknown_functions: bool,
+    preserve_failed_user_calls: bool,
 ) -> Result<Value, ParseError> {
     use crate::resource::InterpolationPart;
     match value {
-        Value::Deferred(DeferredValue::FunctionCall { .. }) => {
-            resolve_value_with_config(value, binding_map, fn_ctx)
-        }
+        Value::Deferred(DeferredValue::FunctionCall { .. }) => resolve_value_with_config(
+            value,
+            binding_map,
+            fn_ctx,
+            defer_unknown_functions,
+            preserve_failed_user_calls,
+        ),
         Value::Concrete(ConcreteValue::List(items)) => {
             let resolved: Result<Vec<Value>, ParseError> = items
                 .iter()
-                .map(|v| resolve_function_calls_only(v, binding_map, fn_ctx))
+                .map(|v| {
+                    resolve_function_calls_only(
+                        v,
+                        binding_map,
+                        fn_ctx,
+                        defer_unknown_functions,
+                        preserve_failed_user_calls,
+                    )
+                })
                 .collect();
             Ok(Value::Concrete(ConcreteValue::List(resolved?)))
         }
@@ -969,7 +1074,13 @@ fn resolve_function_calls_only(
             for (k, v) in map {
                 resolved.insert(
                     k.clone(),
-                    resolve_function_calls_only(v, binding_map, fn_ctx)?,
+                    resolve_function_calls_only(
+                        v,
+                        binding_map,
+                        fn_ctx,
+                        defer_unknown_functions,
+                        preserve_failed_user_calls,
+                    )?,
                 );
             }
             Ok(Value::Concrete(ConcreteValue::Map(resolved)))
@@ -978,9 +1089,15 @@ fn resolve_function_calls_only(
             let resolved: Result<Vec<InterpolationPart>, ParseError> = parts
                 .iter()
                 .map(|p| match p {
-                    InterpolationPart::Expr(v) => Ok(InterpolationPart::Expr(
-                        resolve_function_calls_only(v, binding_map, fn_ctx)?,
-                    )),
+                    InterpolationPart::Expr(v) => {
+                        Ok(InterpolationPart::Expr(resolve_function_calls_only(
+                            v,
+                            binding_map,
+                            fn_ctx,
+                            defer_unknown_functions,
+                            preserve_failed_user_calls,
+                        )?))
+                    }
                     other => Ok(other.clone()),
                 })
                 .collect();
@@ -1040,7 +1157,7 @@ pub fn resolve_provider_unresolved_attributes<E>(
     for provider in &mut parsed.providers {
         let mut resolved: IndexMap<String, Value> = IndexMap::new();
         for (key, expr) in &provider.unresolved_attributes {
-            let r = resolve_value_with_config(expr, &binding_map, &fn_ctx)?;
+            let r = resolve_value_with_config(expr, &binding_map, &fn_ctx, false, false)?;
             resolved.insert(key.clone(), r);
         }
         provider.unresolved_attributes = resolved;
@@ -1090,7 +1207,7 @@ pub fn resolve_provider_attributes_with_remote<E>(
         let mut provider = provider.clone();
         let mut resolved = IndexMap::new();
         for (key, expr) in &provider.attributes {
-            let r = resolve_value_with_config(expr, &binding_map, &fn_ctx)?;
+            let r = resolve_value_with_config(expr, &binding_map, &fn_ctx, false, false)?;
             resolved.insert(key.clone(), r);
         }
         provider.attributes = resolved;

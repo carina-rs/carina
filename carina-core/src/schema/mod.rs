@@ -306,7 +306,10 @@ fn walk_custom_lookup_on_path<'a>(
                 errors.extend(b);
             }
         }
-        AttrTypeKind::Bool | AttrTypeKind::Duration => {}
+        AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. } => {}
         // `Ref`: resolve via the schema's def map and continue the
         // walk. The resolved target (typically a `Struct`) may carry
         // identity-bearing custom types whose validators must run.
@@ -597,6 +600,23 @@ pub(crate) enum AttrTypeKind {
         length: Option<(Option<u64>, Option<u64>)>,
         validate: CustomValidator,
         to_dsl: Option<DslTransform>,
+    },
+    /// A resource handle used only by the schema-level boundary relation.
+    ///
+    /// Handles are string-backed until #3803's transport work lands, but they
+    /// retain the declared resource path so assignability can reject a handle
+    /// flowing into a scalar or a different resource type.
+    ResourceHandle {
+        provider: String,
+        resource_type: String,
+        validate: CustomValidator,
+    },
+    /// A closed set of string literals lifted from a module-boundary type.
+    /// Kept distinct from plain String so a ResourceHandle cannot satisfy a
+    /// closed literal sink merely because handles are currently string-backed.
+    StringLiteralSet {
+        values: Vec<String>,
+        validate: CustomValidator,
     },
     /// Integer
     Int {
@@ -1549,6 +1569,19 @@ impl fmt::Debug for AttributeType {
                 .field("to_dsl", to_dsl)
                 .field("validate", &"<closure>")
                 .finish(),
+            AttrTypeKind::ResourceHandle {
+                provider,
+                resource_type,
+                validate: _,
+            } => f
+                .debug_struct("ResourceHandle")
+                .field("provider", provider)
+                .field("resource_type", resource_type)
+                .finish(),
+            AttrTypeKind::StringLiteralSet {
+                values,
+                validate: _,
+            } => f.debug_tuple("StringLiteralSet").field(values).finish(),
             AttrTypeKind::Int {
                 identity,
                 range,
@@ -1880,6 +1913,14 @@ impl AttributeType {
                 validate,
                 to_dsl: to_dsl.as_ref(),
             },
+            AttrTypeKind::ResourceHandle { validate, .. }
+            | AttrTypeKind::StringLiteralSet { validate, .. } => Shape::String {
+                identity: None,
+                pattern: None,
+                length: None,
+                validate,
+                to_dsl: None,
+            },
             AttrTypeKind::Int {
                 identity,
                 range,
@@ -1972,6 +2013,14 @@ impl AttributeType {
                 validate,
                 to_dsl: to_dsl.as_ref(),
             },
+            AttrTypeKind::ResourceHandle { validate, .. }
+            | AttrTypeKind::StringLiteralSet { validate, .. } => RawShape::String {
+                identity: None,
+                pattern: None,
+                length: None,
+                validate,
+                to_dsl: None,
+            },
             AttrTypeKind::Int {
                 identity,
                 range,
@@ -2049,6 +2098,33 @@ impl AttributeType {
                 length: None,
                 validate: noop_validator(),
                 to_dsl: None,
+            },
+        }
+    }
+
+    /// Lift a module `Ref(provider.resource)` declaration into the one schema
+    /// relation used by BindingIndex. This is intentionally crate-private:
+    /// resource handles are not part of the provider schema transport yet.
+    pub(crate) fn resource_handle(
+        provider: impl Into<String>,
+        resource_type: impl Into<String>,
+    ) -> Self {
+        AttributeType {
+            kind: AttrTypeKind::ResourceHandle {
+                provider: provider.into(),
+                resource_type: resource_type.into(),
+                validate: noop_validator(),
+            },
+        }
+    }
+
+    /// Lift a closed module string-literal type without widening away the
+    /// distinction needed for resource-handle assignability.
+    pub(crate) fn string_literal_set(values: Vec<String>) -> Self {
+        AttributeType {
+            kind: AttrTypeKind::StringLiteralSet {
+                values,
+                validate: noop_validator(),
             },
         }
     }
@@ -2451,6 +2527,8 @@ impl AttributeType {
             AttrTypeKind::Struct { .. } => self.validate_struct(value),
             AttrTypeKind::Union(_) => self.validate_union(value),
             AttrTypeKind::String { .. }
+            | AttrTypeKind::ResourceHandle { .. }
+            | AttrTypeKind::StringLiteralSet { .. }
             | AttrTypeKind::Int { .. }
             | AttrTypeKind::Float { .. }
             | AttrTypeKind::Bool
@@ -2490,6 +2568,16 @@ impl AttributeType {
             ) => {
                 validate_string_refinement(identity.as_ref(), pattern.as_deref(), *length, s)?;
                 validate(&value.to_owned_value())
+            }
+            (
+                AttrTypeKind::ResourceHandle { validate, .. },
+                ConcreteValueRef::String(_) | ConcreteValueRef::EnumIdentifier(_),
+            ) => validate(&value.to_owned_value()),
+            (
+                AttrTypeKind::StringLiteralSet { values, validate },
+                ConcreteValueRef::String(value),
+            ) if values.iter().any(|candidate| candidate == value) => {
+                validate(&ConcreteValueRef::String(value).to_owned_value())
             }
             (
                 AttrTypeKind::Int {
@@ -2861,6 +2949,16 @@ impl AttributeType {
                 length,
                 ..
             } => custom_display_name(identity.as_ref(), pattern.as_deref(), length.as_ref()),
+            AttrTypeKind::ResourceHandle {
+                provider,
+                resource_type,
+                ..
+            } => format!("{provider}.{resource_type}"),
+            AttrTypeKind::StringLiteralSet { values, .. } => values
+                .iter()
+                .map(|value| format!("'{value}'"))
+                .collect::<Vec<_>>()
+                .join(" | "),
             AttrTypeKind::Int { identity, .. } => identity
                 .as_ref()
                 .map(ToString::to_string)
@@ -3096,6 +3194,46 @@ impl<'source> TypeInSchema<'source> {
         }
         match (&self.attr.kind, &sink.attr.kind) {
             (
+                ResourceHandle {
+                    provider: source_provider,
+                    resource_type: source_resource,
+                    ..
+                },
+                ResourceHandle {
+                    provider: sink_provider,
+                    resource_type: sink_resource,
+                    ..
+                },
+            ) => source_provider == sink_provider && source_resource == sink_resource,
+            // #3803 transport is not implemented yet, so resource handles are
+            // represented by id strings at runtime. Preserve main's
+            // compatibility with every open string-shaped sink while keeping
+            // closed literal sets closed.
+            (ResourceHandle { .. }, String { .. }) => true,
+            (ResourceHandle { .. }, StringLiteralSet { .. }) => false,
+            (ResourceHandle { .. }, _) => false,
+            // Literal declarations carry string evidence but not the identity
+            // evidence required by a provider custom type (#2648).
+            (StringLiteralSet { .. }, String { identity: None, .. }) => true,
+            (
+                StringLiteralSet { .. },
+                String {
+                    identity: Some(_), ..
+                },
+            ) => false,
+            (StringLiteralSet { values: source, .. }, StringLiteralSet { values: sink, .. }) => {
+                source.iter().all(|value| sink.contains(value))
+            }
+            // String-backed values and attributes may still flow into a Ref
+            // sink until resource-handle transport is implemented. Numeric and
+            // structural sources never reach this arm.
+            (String { .. } | Enum { .. } | StringLiteralSet { .. }, ResourceHandle { .. }) => true,
+            // Preserve the pre-existing declared String -> literal-union
+            // behavior while ensuring ResourceHandle took the rejecting arm
+            // above.
+            (String { .. }, StringLiteralSet { .. }) => true,
+            (_, ResourceHandle { .. } | StringLiteralSet { .. }) => false,
+            (
                 List {
                     element_type: source_element,
                     ..
@@ -3219,6 +3357,33 @@ impl<'source> TypeInSchema<'source> {
                     identity: Some(_), ..
                 },
             ) => false,
+            // Numeric widening is directional: an Int source may flow into
+            // a Float sink, matching concrete-value validation. Preserve
+            // identity and range evidence when either side carries it.
+            (
+                Int {
+                    identity: source_identity,
+                    range: source_range,
+                    ..
+                },
+                Float {
+                    identity: sink_identity,
+                    range: sink_range,
+                    ..
+                },
+            ) => {
+                if let Some(sink_identity) = sink_identity
+                    && !source_identity
+                        .as_ref()
+                        .is_some_and(|source_identity| source_identity.assignable_to(sink_identity))
+                {
+                    return false;
+                }
+                if source_range.is_none() && sink_identity.is_none() {
+                    return true;
+                }
+                i64_range_assignable_to_f64(source_range.as_ref(), sink_range.as_ref())
+            }
             // A completely unrefined primitive source carries no competing
             // refinement evidence. Identity-less sink metadata is a value
             // constraint checked when the concrete value is known (#3805).
@@ -3965,6 +4130,23 @@ fn f64_range_contains(
     let k_min = k_min.unwrap_or(f64::NEG_INFINITY);
     let k_max = k_max.unwrap_or(f64::INFINITY);
     k_min <= s_min && s_max <= k_max
+}
+
+fn i64_range_assignable_to_f64(
+    source: Option<&(Option<i64>, Option<i64>)>,
+    sink: Option<&(Option<f64>, Option<f64>)>,
+) -> bool {
+    let Some((source_min, source_max)) = source else {
+        return sink.is_none();
+    };
+    let Some((sink_min, sink_max)) = sink else {
+        return true;
+    };
+    let source_min = source_min.map_or(f64::NEG_INFINITY, |value| value as f64);
+    let source_max = source_max.map_or(f64::INFINITY, |value| value as f64);
+    let sink_min = sink_min.unwrap_or(f64::NEG_INFINITY);
+    let sink_max = sink_max.unwrap_or(f64::INFINITY);
+    sink_min <= source_min && source_max <= sink_max
 }
 
 impl fmt::Display for AttributeType {
@@ -6027,6 +6209,8 @@ fn collect_block_names_from_type(attr_type: &AttributeType, result: &mut HashMap
         // schemas (carina#3340).
         AttrTypeKind::Ref(_) => {}
         AttrTypeKind::String { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
         | AttrTypeKind::Int { .. }
         | AttrTypeKind::Float { .. }
         | AttrTypeKind::Bool

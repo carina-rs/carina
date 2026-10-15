@@ -1,7 +1,7 @@
 //! Module resolution error type.
 
-use crate::ValueDescription;
 use crate::parser::ParseError;
+use crate::validation::typecheck::TypeExprValueError;
 
 use super::validation::ModuleConstraintDiagnostic;
 
@@ -17,23 +17,15 @@ pub enum ModuleError {
     #[error("Missing required argument '{argument}' for module '{module}'")]
     MissingArgument { module: String, argument: String },
 
-    #[error(
-        "Invalid argument type for '{argument}' in module '{module}': expected {expected}, got {actual}"
-    )]
+    #[error("Invalid argument type for '{argument}' in module '{module}': {mismatch}")]
     InvalidArgumentType {
         module: String,
         argument: String,
-        expected: String,
-        /// Value-derived description of the argument. Concrete scalar values
-        /// except `Duration` include their literal, while duration, structural,
-        /// and deferred values expose only their shape (e.g. `list`, `map`,
-        /// `resource reference`, or `secret`). Nested mismatches use
-        /// `<outer shape> containing <inner>`, such as
-        /// `list containing string "production"`. For a `ValidationError`, the
-        /// outer value is described because the validator message carries the
-        /// mismatch detail.
-        actual: ValueDescription,
+        mismatch: TypeExprValueError,
     },
+
+    #[error("Reference type validation failed: {0}")]
+    ReferenceType(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

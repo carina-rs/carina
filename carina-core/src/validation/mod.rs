@@ -2,18 +2,17 @@
 
 pub mod deferred_populate;
 pub mod depends_on;
+pub mod typecheck;
 pub mod wait;
 
 use std::collections::HashSet;
 
 use indexmap::IndexMap;
 
-use crate::ValueDescription;
 use crate::binding_index::{BindingIndex, RefType, RefTypeError, ResolvedRefType};
 use crate::deps::collect_dependencies;
 use crate::parser::{
     ModuleCall, ProviderContext, ResourceContext, ResourceRef, ResourceTypePath, TypeExpr,
-    validate_custom_type,
 };
 use crate::provider::ProviderFactory;
 use crate::resource::{
@@ -29,17 +28,21 @@ use crate::schema::{AttributeType, SchemaRegistry, Shape, TypeIdentity};
 /// sink belongs on the right-hand side of `source.is_assignable_to(sink)`,
 /// while a declared upstream type used as a source belongs on the left.
 ///
-/// Resource-handle annotations ([`TypeExpr::Ref`]) deliberately remain
-/// unchecked because a resource handle is not representable as an
-/// [`AttributeType`] yet (carina#3803). String literals, unresolved dotted
-/// paths, and failed-inference sentinels also remain unchecked rather than
-/// being widened to `String`; inventing a wider type would make identity sinks
-/// accept values without evidence.
+/// String literals retain a closed-set marker while remaining assignable to a
+/// plain string. This supplies #2648's scalar shape without letting a lifted
+/// resource handle satisfy a closed set by accident. Resource annotations
+/// (`Ref` and its pre-resolution `DottedUnresolved` form) lift to a distinct,
+/// string-backed handle kind. The handle's path is retained for BindingIndex's
+/// single declared-type assignability relation; the runtime transport remains
+/// an id string until #3803 lands. Failed-inference sentinels remain unchecked.
 pub fn lift_type_expr(type_expr: &TypeExpr) -> Option<AttributeType> {
     use crate::schema::StructField;
 
     match type_expr {
         TypeExpr::String => Some(AttributeType::string()),
+        TypeExpr::StringLiteral(value) => {
+            Some(AttributeType::string_literal_set(vec![value.clone()]))
+        }
         TypeExpr::Bool => Some(AttributeType::bool()),
         TypeExpr::Int => Some(AttributeType::int()),
         TypeExpr::Float => Some(AttributeType::float()),
@@ -70,18 +73,32 @@ pub fn lift_type_expr(type_expr: &TypeExpr) -> Option<AttributeType> {
             })
             .collect::<Option<Vec<_>>>()
             .map(|fields| AttributeType::struct_("anonymous", fields)),
+        TypeExpr::Union(members)
+            if !members.is_empty()
+                && members
+                    .iter()
+                    .all(|member| matches!(member, TypeExpr::StringLiteral(_))) =>
+        {
+            Some(AttributeType::string_literal_set(
+                members
+                    .iter()
+                    .filter_map(|member| match member {
+                        TypeExpr::StringLiteral(value) => Some(value.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            ))
+        }
         TypeExpr::Union(members) => members
             .iter()
             .map(lift_type_expr)
             .collect::<Option<Vec<_>>>()
             .filter(|members| !members.is_empty())
             .map(AttributeType::union),
-        // Ref denotes a resource handle, not an Id/Arn projection. See #3803.
-        TypeExpr::Ref(_)
-        // These forms have no conservative schema-level representation.
-        | TypeExpr::StringLiteral(_)
-        | TypeExpr::DottedUnresolved(_)
-        | TypeExpr::Unknown => None,
+        TypeExpr::Ref(path) | TypeExpr::DottedUnresolved(path) => Some(
+            AttributeType::resource_handle(path.provider.clone(), path.resource_type.clone()),
+        ),
+        TypeExpr::Unknown => None,
     }
 }
 
@@ -259,8 +276,8 @@ pub(crate) fn visit_refs_with_sink<'a>(
         }
         Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
             // The enclosing sink constrains the function result, not its
-            // inputs. Parameter signatures are unavailable here, so carrying
-            // that sink into an argument would be unsound.
+            // inputs. Function parameter sites are walked separately with
+            // BindingIndex's signature authority.
             for argument in args {
                 visit_refs_with_sink(argument, None, f);
             }
@@ -311,6 +328,12 @@ pub enum ModuleCallRefErrorKind {
         declared: Option<String>,
     },
     UnknownAttribute(RefTypeError),
+}
+
+#[derive(Clone, Copy)]
+enum UnknownReferencePolicy {
+    Report,
+    Defer,
 }
 
 /// Structured module-call reference error shared by CLI and LSP surfaces.
@@ -380,26 +403,11 @@ pub fn validate_module_call_argument_ref_types_with_bindings(
     _argument_names: &HashSet<String>,
     bindings: &BindingIndex<'_>,
 ) -> Vec<ModuleCallRefError> {
-    validate_module_call_argument_ref_types_inner(module_calls, imported_modules, bindings, None)
-}
-
-/// Validate only references rooted in one of `source_bindings`.
-///
-/// This is used by the module-definition pre-expansion pass: argument-backed
-/// references must be checked in their declaring module, while all other
-/// references retain the established post-expansion diagnostics and source
-/// provenance.
-pub fn validate_module_call_argument_ref_types_for_bindings(
-    module_calls: &[ModuleCall],
-    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
-    source_bindings: &HashSet<String>,
-    bindings: &BindingIndex<'_>,
-) -> Vec<ModuleCallRefError> {
     validate_module_call_argument_ref_types_inner(
         module_calls,
         imported_modules,
         bindings,
-        Some(source_bindings),
+        UnknownReferencePolicy::Report,
     )
 }
 
@@ -407,7 +415,7 @@ fn validate_module_call_argument_ref_types_inner(
     module_calls: &[ModuleCall],
     imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
     bindings: &BindingIndex<'_>,
-    source_bindings: Option<&HashSet<String>>,
+    unknown_policy: UnknownReferencePolicy,
 ) -> Vec<ModuleCallRefError> {
     let mut errors = Vec::new();
 
@@ -431,10 +439,9 @@ fn validate_module_call_argument_ref_types_inner(
                 value,
                 declared_sink.map(RefSink::TypeExpr),
                 &mut |path, sink| {
-                    if source_bindings.is_some_and(|bindings| !bindings.contains(path.binding())) {
-                        return;
-                    }
-                    let Some(kind) = composition_ref_error_kind(path, sink, bindings) else {
+                    let Some(kind) =
+                        composition_ref_error_kind(path, sink, bindings, unknown_policy)
+                    else {
                         return;
                     };
                     errors.push(ModuleCallRefError {
@@ -652,6 +659,7 @@ fn composition_ref_error_kind(
     path: ReferencePathRef<'_>,
     sink: Option<RefSink<'_>>,
     bindings: &BindingIndex<'_>,
+    unknown_policy: UnknownReferencePolicy,
 ) -> Option<ModuleCallRefErrorKind> {
     match bindings.ref_type(path) {
         RefType::Typed(source) => {
@@ -668,8 +676,343 @@ fn composition_ref_error_kind(
                     declared: mismatch.declared_type_name().map(str::to_string),
                 })
         }
-        RefType::UnknownAttribute(error) => Some(ModuleCallRefErrorKind::UnknownAttribute(error)),
+        RefType::UnknownAttribute(error) => match unknown_policy {
+            UnknownReferencePolicy::Report => Some(ModuleCallRefErrorKind::UnknownAttribute(error)),
+            UnknownReferencePolicy::Defer => None,
+        },
         RefType::Unchecked | RefType::UnknownBinding { .. } => None,
+    }
+}
+
+/// Validate resource/binding references at user-function parameter and return
+/// boundaries using the same BindingIndex + TypeInSchema relation as module,
+/// export, attribute, and provider-attribute references.
+///
+/// The shared value checker deliberately defers references. This pass supplies
+/// the missing binding authority: function-call arguments use their declared
+/// parameter type, and function bodies use the declared return type.
+pub fn validate_user_function_ref_types_with_bindings<E: crate::parser::ExportParamLike>(
+    parsed: &crate::parser::File<E>,
+    bindings: &BindingIndex<'_>,
+) -> Result<(), String> {
+    validate_user_function_ref_types_inner(parsed, bindings, UnknownReferencePolicy::Report)
+}
+
+fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
+    parsed: &crate::parser::File<E>,
+    bindings: &BindingIndex<'_>,
+    unknown_policy: UnknownReferencePolicy,
+) -> Result<(), String> {
+    fn check_refs(
+        value: &Value,
+        sink: Option<RefSink<'_>>,
+        context: &str,
+        bindings: &BindingIndex<'_>,
+        unknown_policy: UnknownReferencePolicy,
+        errors: &mut Vec<String>,
+    ) {
+        visit_refs_with_sink(value, sink, &mut |path, sink| {
+            let Some(sink) = sink else {
+                return;
+            };
+            let Some(kind) = composition_ref_error_kind(path, Some(sink), bindings, unknown_policy)
+            else {
+                return;
+            };
+            let message = match kind {
+                ModuleCallRefErrorKind::TypeMismatch {
+                    expected,
+                    actual,
+                    declared,
+                } => format!(
+                    "{context}: reference {}: expected {expected}, got {actual} ({})",
+                    path.to_dot_string(),
+                    declared.map_or_else(
+                        || format!("from {}", path.to_dot_string()),
+                        |declared| format!("from {}, declared {declared}", path.to_dot_string()),
+                    )
+                ),
+                ModuleCallRefErrorKind::UnknownAttribute(error) => {
+                    format!("{context}: {error}")
+                }
+            };
+            errors.push(message);
+        });
+    }
+
+    fn declared_result_mismatch(source: &TypeExpr, sink: &TypeExpr) -> Option<(String, String)> {
+        let source = lift_type_expr(source)?;
+        let sink = lift_type_expr(sink)?;
+        let source = crate::schema::TypeInSchema::schemaless(&source);
+        let sink = crate::schema::TypeInSchema::schemaless(&sink);
+        (!source.is_assignable_to(sink))
+            .then(|| (sink.resolved_type_name(), source.resolved_type_name()))
+    }
+
+    fn list_sink(type_expr: &TypeExpr) -> Option<&TypeExpr> {
+        match type_expr {
+            TypeExpr::List(inner) => Some(inner),
+            TypeExpr::Union(members) => exactly_one(members.iter().filter_map(list_sink)),
+            _ => None,
+        }
+    }
+
+    fn map_sink<'a>(type_expr: &'a TypeExpr, key: &str) -> Option<&'a TypeExpr> {
+        match type_expr {
+            TypeExpr::Map(inner) => Some(inner),
+            TypeExpr::Struct { fields } => fields
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, field_type)| field_type),
+            TypeExpr::Union(members) => {
+                exactly_one(members.iter().filter_map(|member| map_sink(member, key)))
+            }
+            _ => None,
+        }
+    }
+
+    fn check_function_calls(
+        value: &Value,
+        result_sink: Option<&TypeExpr>,
+        context: Option<&str>,
+        bindings: &BindingIndex<'_>,
+        unknown_policy: UnknownReferencePolicy,
+        errors: &mut Vec<String>,
+    ) {
+        match value {
+            Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+                let function = bindings.user_function(name);
+                if let (Some(source), Some(sink), Some(context)) = (
+                    function.and_then(|function| function.return_type.as_ref()),
+                    result_sink,
+                    context,
+                ) && let Some((expected, actual)) = declared_result_mismatch(source, sink)
+                {
+                    errors.push(format!(
+                        "{context}: expected {expected}, got {actual} (from function '{name}' return type)"
+                    ));
+                }
+                for (index, argument) in args.iter().enumerate() {
+                    let parameter_sink = function
+                        .and_then(|function| function.params.get(index))
+                        .and_then(|parameter| parameter.param_type.as_ref());
+                    let argument_context = format!("function '{name}': argument {}", index + 1);
+                    if let Some(sink) = parameter_sink {
+                        check_refs(
+                            argument,
+                            Some(RefSink::TypeExpr(sink)),
+                            &argument_context,
+                            bindings,
+                            unknown_policy,
+                            errors,
+                        );
+                    }
+                    check_function_calls(
+                        argument,
+                        parameter_sink,
+                        Some(&argument_context),
+                        bindings,
+                        unknown_policy,
+                        errors,
+                    );
+                }
+            }
+            Value::Concrete(ConcreteValue::List(items)) => {
+                for (index, item) in items.iter().enumerate() {
+                    let sink = result_sink.and_then(list_sink);
+                    let item_context =
+                        context.map(|context| format!("{context}, list item {index}"));
+                    check_function_calls(
+                        item,
+                        sink,
+                        item_context.as_deref(),
+                        bindings,
+                        unknown_policy,
+                        errors,
+                    );
+                }
+            }
+            Value::Concrete(ConcreteValue::Map(entries)) => {
+                for (key, item) in entries {
+                    let sink = result_sink.and_then(|sink| map_sink(sink, key));
+                    let item_context = context.map(|context| format!("{context}, map key '{key}'"));
+                    check_function_calls(
+                        item,
+                        sink,
+                        item_context.as_deref(),
+                        bindings,
+                        unknown_policy,
+                        errors,
+                    );
+                }
+            }
+            Value::Deferred(DeferredValue::Interpolation(parts)) => {
+                for part in parts {
+                    if let crate::resource::InterpolationPart::Expr(value) = part {
+                        check_function_calls(
+                            value,
+                            Some(&STRING_REF_SINK),
+                            context,
+                            bindings,
+                            unknown_policy,
+                            errors,
+                        );
+                    }
+                }
+            }
+            Value::Deferred(DeferredValue::Secret(inner)) => check_function_calls(
+                inner,
+                result_sink,
+                context,
+                bindings,
+                unknown_policy,
+                errors,
+            ),
+            Value::Concrete(ConcreteValue::String(_))
+            | Value::Concrete(ConcreteValue::EnumIdentifier(_))
+            | Value::Concrete(ConcreteValue::CanonicalEnum(_))
+            | Value::Concrete(ConcreteValue::Int(_))
+            | Value::Concrete(ConcreteValue::Float(_))
+            | Value::Concrete(ConcreteValue::Bool(_))
+            | Value::Concrete(ConcreteValue::Duration(_))
+            | Value::Concrete(ConcreteValue::StringList(_))
+            | Value::Deferred(DeferredValue::ResourceRef { .. })
+            | Value::Deferred(DeferredValue::BindingRef { .. })
+            | Value::Deferred(DeferredValue::Unknown(_)) => {}
+        }
+    }
+
+    let mut errors = Vec::new();
+
+    // Calls can appear in any value-bearing top-level construct. Ordinary
+    // references remain owned by their existing validators.
+    for resource in parsed.iter_all_resources() {
+        let attributes = resource.attributes();
+        for value in attributes.values() {
+            check_function_calls(value, None, None, bindings, unknown_policy, &mut errors);
+        }
+    }
+    for call in &parsed.module_calls {
+        for value in call.arguments.values() {
+            check_function_calls(value, None, None, bindings, unknown_policy, &mut errors);
+        }
+    }
+    for parameter in &parsed.arguments {
+        if let Some(value) = &parameter.default {
+            let context = format!("argument '{}' default", parameter.name);
+            check_function_calls(
+                value,
+                Some(&parameter.type_expr),
+                Some(&context),
+                bindings,
+                unknown_policy,
+                &mut errors,
+            );
+        }
+    }
+    for parameter in &parsed.attribute_params {
+        if let Some(value) = &parameter.value {
+            let context = format!("attribute '{}'", parameter.name);
+            check_function_calls(
+                value,
+                parameter.type_expr.as_ref(),
+                Some(&context),
+                bindings,
+                unknown_policy,
+                &mut errors,
+            );
+        }
+    }
+    for parameter in &parsed.export_params {
+        if let Some(value) = parameter.value() {
+            let context = format!("export '{}'", parameter.name());
+            check_function_calls(
+                value,
+                parameter.type_expr_opt(),
+                Some(&context),
+                bindings,
+                unknown_policy,
+                &mut errors,
+            );
+        }
+    }
+    for provider in &parsed.providers {
+        for value in provider
+            .attributes
+            .values()
+            .chain(provider.default_tags.values())
+            .chain(provider.unresolved_attributes.values())
+        {
+            check_function_calls(value, None, None, bindings, unknown_policy, &mut errors);
+        }
+    }
+    if let Some(backend) = &parsed.backend {
+        for value in backend.attributes.values() {
+            check_function_calls(value, None, None, bindings, unknown_policy, &mut errors);
+        }
+    }
+    for state_block in &parsed.state_blocks {
+        if let crate::parser::StateBlock::Import { id, .. } = state_block {
+            check_function_calls(id, None, None, bindings, unknown_policy, &mut errors);
+        }
+    }
+    for wait in &parsed.wait_bindings {
+        check_function_calls(
+            &wait.until_predicate.rhs,
+            None,
+            None,
+            bindings,
+            unknown_policy,
+            &mut errors,
+        );
+    }
+    for value in parsed.variables.values() {
+        check_function_calls(value, None, None, bindings, unknown_policy, &mut errors);
+    }
+
+    for function in parsed.user_functions.values() {
+        for parameter in &function.params {
+            if let Some(value) = &parameter.default {
+                let context = format!(
+                    "function '{}': parameter '{}' default",
+                    function.name, parameter.name
+                );
+                check_function_calls(
+                    value,
+                    parameter.param_type.as_ref(),
+                    Some(&context),
+                    bindings,
+                    unknown_policy,
+                    &mut errors,
+                );
+            }
+        }
+        for (_, value) in &function.local_lets {
+            check_function_calls(value, None, None, bindings, unknown_policy, &mut errors);
+        }
+        check_refs(
+            &function.body.0,
+            function.return_type.as_ref().map(RefSink::TypeExpr),
+            &format!("function '{}': return value", function.name),
+            bindings,
+            unknown_policy,
+            &mut errors,
+        );
+        let context = format!("function '{}': return value", function.name);
+        check_function_calls(
+            &function.body.0,
+            function.return_type.as_ref(),
+            Some(&context),
+            bindings,
+            unknown_policy,
+            &mut errors,
+        );
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
     }
 }
 
@@ -703,7 +1046,12 @@ pub fn validate_composition_ref_types_with_bindings(
                 &mut |path, sink| {
                     let current_position = reference_position;
                     reference_position += 1;
-                    let Some(kind) = composition_ref_error_kind(path, sink, bindings) else {
+                    let Some(kind) = composition_ref_error_kind(
+                        path,
+                        sink,
+                        bindings,
+                        UnknownReferencePolicy::Report,
+                    ) else {
                         return;
                     };
                     errors.push(CompositionRefError::ModuleCall(
@@ -736,7 +1084,12 @@ pub fn validate_composition_ref_types_with_bindings(
                 &mut |path, sink| {
                     let current_position = reference_position;
                     reference_position += 1;
-                    let Some(kind) = composition_ref_error_kind(path, sink, bindings) else {
+                    let Some(kind) = composition_ref_error_kind(
+                        path,
+                        sink,
+                        bindings,
+                        UnknownReferencePolicy::Report,
+                    ) else {
                         return;
                     };
                     errors.push(CompositionRefError::Attribute(
@@ -998,24 +1351,13 @@ pub fn validate_resource_ref_types<E>(
     _argument_names: &HashSet<String>,
     bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
-    validate_resource_ref_types_inner(parsed, registry, bindings, None)
-}
-
-/// Validate resource-attribute references rooted in `source_bindings` only.
-pub fn validate_resource_ref_types_for_bindings<E>(
-    parsed: &crate::parser::File<E>,
-    registry: &SchemaRegistry,
-    source_bindings: &HashSet<String>,
-    bindings: &BindingIndex<'_>,
-) -> Result<(), String> {
-    validate_resource_ref_types_inner(parsed, registry, bindings, Some(source_bindings))
+    validate_resource_ref_types_inner(parsed, registry, bindings)
 }
 
 fn validate_resource_ref_types_inner<E>(
     parsed: &crate::parser::File<E>,
     registry: &SchemaRegistry,
     bindings: &BindingIndex<'_>,
-    source_bindings: Option<&HashSet<String>>,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
 
@@ -1054,9 +1396,6 @@ fn validate_resource_ref_types_inner<E>(
                 });
             let string_sink = AttributeType::string();
             visit_refs_with_sink(attr_value, sink, &mut |reference, sink| {
-                if source_bindings.is_some_and(|bindings| !bindings.contains(reference.binding())) {
-                    return;
-                }
                 let Some(source) =
                     resolve_resource_reference(resource_id, reference, bindings, &mut all_errors)
                 else {
@@ -1108,22 +1447,17 @@ pub fn validate_attribute_param_ref_types_with_bindings(
     attribute_params: &[crate::parser::AttributeParameter],
     bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
-    validate_attribute_param_ref_types_inner(attribute_params, bindings, None)
-}
-
-/// Validate attribute-declaration references rooted in `source_bindings` only.
-pub fn validate_attribute_param_ref_types_for_bindings(
-    attribute_params: &[crate::parser::AttributeParameter],
-    source_bindings: &HashSet<String>,
-    bindings: &BindingIndex<'_>,
-) -> Result<(), String> {
-    validate_attribute_param_ref_types_inner(attribute_params, bindings, Some(source_bindings))
+    validate_attribute_param_ref_types_inner(
+        attribute_params,
+        bindings,
+        UnknownReferencePolicy::Report,
+    )
 }
 
 fn validate_attribute_param_ref_types_inner(
     attribute_params: &[crate::parser::AttributeParameter],
     bindings: &BindingIndex<'_>,
-    source_bindings: Option<&HashSet<String>>,
+    unknown_policy: UnknownReferencePolicy,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
 
@@ -1136,14 +1470,12 @@ fn validate_attribute_param_ref_types_inner(
             value,
             param.type_expr.as_ref().map(RefSink::TypeExpr),
             &mut |path, sink| {
-                if source_bindings.is_some_and(|bindings| !bindings.contains(path.binding())) {
-                    return;
-                }
                 check_attribute_param_ref(
                     &param.name,
                     sink.and_then(RefSink::as_type_expr),
                     path,
                     bindings,
+                    unknown_policy,
                     &mut errors,
                 );
             },
@@ -1162,6 +1494,7 @@ fn check_attribute_param_ref(
     expected_type: Option<&TypeExpr>,
     path: ReferencePathRef<'_>,
     bindings: &BindingIndex<'_>,
+    unknown_policy: UnknownReferencePolicy,
     errors: &mut Vec<String>,
 ) {
     match bindings.ref_type(path) {
@@ -1181,7 +1514,9 @@ fn check_attribute_param_ref(
             }
         }
         RefType::UnknownAttribute(error) => {
-            errors.push(format!("attribute '{}': {}", param_name, error));
+            if matches!(unknown_policy, UnknownReferencePolicy::Report) {
+                errors.push(format!("attribute '{}': {}", param_name, error));
+            }
         }
         RefType::Unchecked | RefType::UnknownBinding { .. } => {}
     }
@@ -1197,28 +1532,48 @@ pub fn validate_export_param_ref_types_with_bindings(
     bindings: &BindingIndex<'_>,
     reported_inference_error_indices: &HashSet<usize>,
 ) -> Result<(), String> {
+    validate_export_param_ref_types_inner(
+        export_params,
+        bindings,
+        Some(reported_inference_error_indices),
+        UnknownReferencePolicy::Report,
+    )
+}
+
+fn validate_export_param_ref_types_inner<E: crate::parser::ExportParamLike>(
+    export_params: &[E],
+    bindings: &BindingIndex<'_>,
+    reported_inference_error_indices: Option<&HashSet<usize>>,
+    unknown_policy: UnknownReferencePolicy,
+) -> Result<(), String> {
     let mut errors = Vec::new();
 
     for (index, param) in export_params.iter().enumerate() {
-        let Some(ref value) = param.value else {
+        let Some(value) = param.value() else {
             continue;
         };
-        let unknown_type = matches!(&param.type_expr, crate::parser::TypeExpr::Unknown);
+        let type_expr = param.type_expr_opt();
+        let unknown_type = matches!(type_expr, Some(crate::parser::TypeExpr::Unknown));
         // Inference and this walk share one dedup rule: if inference has
         // already reported this exact export-param index, skip its Unknown
         // existence walk entirely. Names are display text, not identity, and
         // can collide across sibling files.
-        if unknown_type && reported_inference_error_indices.contains(&index) {
+        if unknown_type
+            && reported_inference_error_indices.is_some_and(|reported| reported.contains(&index))
+        {
             continue;
         }
 
-        let sink = (!unknown_type).then_some(RefSink::TypeExpr(&param.type_expr));
+        let sink = type_expr
+            .filter(|type_expr| !matches!(type_expr, crate::parser::TypeExpr::Unknown))
+            .map(RefSink::TypeExpr);
         visit_refs_with_sink(value, sink, &mut |path, sink| {
             check_export_ref(
-                &param.name,
+                param.name(),
                 sink.and_then(RefSink::as_type_expr),
                 path,
                 bindings,
+                unknown_policy,
                 &mut errors,
             );
         });
@@ -1236,6 +1591,7 @@ fn check_export_ref(
     expected_type: Option<&TypeExpr>,
     path: ReferencePathRef<'_>,
     bindings: &BindingIndex<'_>,
+    unknown_policy: UnknownReferencePolicy,
     errors: &mut Vec<String>,
 ) {
     match bindings.ref_type(path) {
@@ -1262,9 +1618,65 @@ fn check_export_ref(
             }
         }
         RefType::UnknownAttribute(error) => {
-            errors.push(format!("export '{}': {}", param_name, error));
+            if matches!(unknown_policy, UnknownReferencePolicy::Report) {
+                errors.push(format!("export '{}': {}", param_name, error));
+            }
         }
         RefType::Unchecked | RefType::UnknownBinding { .. } => {}
+    }
+}
+
+/// Validate only the reference relations that expansion relies on.
+///
+/// Ordinary resource attribute references deliberately stay out of this
+/// mandatory witness: recovery commands may skip provider/resource validation.
+/// Missing schemas and unknown attributes are likewise deferred here, while a
+/// known source and sink still use BindingIndex + TypeInSchema as the sole
+/// declared-type assignability authority.
+pub(crate) fn validate_expansion_boundary_ref_types_with_bindings<
+    E: crate::parser::ExportParamLike,
+>(
+    parsed: &crate::parser::File<E>,
+    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
+    bindings: &BindingIndex<'_>,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+
+    if let Err(message) = validate_attribute_param_ref_types_inner(
+        &parsed.attribute_params,
+        bindings,
+        UnknownReferencePolicy::Defer,
+    ) {
+        errors.extend(message.lines().map(str::to_string));
+    }
+    if let Err(message) = validate_export_param_ref_types_inner(
+        &parsed.export_params,
+        bindings,
+        None,
+        UnknownReferencePolicy::Defer,
+    ) {
+        errors.extend(message.lines().map(str::to_string));
+    }
+    errors.extend(
+        validate_module_call_argument_ref_types_inner(
+            &parsed.module_calls,
+            imported_modules,
+            bindings,
+            UnknownReferencePolicy::Defer,
+        )
+        .into_iter()
+        .map(|error| error.to_string()),
+    );
+    if let Err(message) =
+        validate_user_function_ref_types_inner(parsed, bindings, UnknownReferencePolicy::Defer)
+    {
+        errors.extend(message.lines().map(str::to_string));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
     }
 }
 
@@ -1508,6 +1920,32 @@ pub fn resolve_file_type_exprs<E: crate::parser::ExportParamLike>(
     errors
 }
 
+/// Resolve declarations with an intentionally incomplete provider context.
+///
+/// Upstream export discovery runs in the consumer process, whose providers
+/// need not include every provider used by the upstream project. A type that
+/// cannot be named in that context carries no sound consumer-side constraint,
+/// so replace it with [`TypeExpr::Unknown`] rather than interpreting the raw
+/// dotted spelling as a resource handle.
+pub(crate) fn resolve_file_type_exprs_or_unknown<E: crate::parser::ExportParamLike>(
+    parsed: &mut crate::parser::File<E>,
+    config: &ProviderContext,
+) {
+    for arg in &mut parsed.arguments {
+        arg.type_expr = resolve_type_expr(&arg.type_expr, config).unwrap_or(TypeExpr::Unknown);
+    }
+    for parameter in &mut parsed.attribute_params {
+        if let Some(type_expr) = &mut parameter.type_expr {
+            *type_expr = resolve_type_expr(type_expr, config).unwrap_or(TypeExpr::Unknown);
+        }
+    }
+    for parameter in &mut parsed.export_params {
+        if let Some(type_expr) = parameter.type_expr_opt_mut() {
+            *type_expr = resolve_type_expr(type_expr, config).unwrap_or(TypeExpr::Unknown);
+        }
+    }
+}
+
 /// Recursively walk a [`TypeExpr`] and push one diagnostic per
 /// [`TypeExpr::Simple`] whose name is not a known bare custom type
 /// under `config`. Helper for [`validate_argument_custom_types`].
@@ -1739,8 +2177,8 @@ pub fn validate_module_calls(
             let module_args = &signature.arguments;
             for (arg_name, arg_value) in &call.arguments {
                 if let Some(arg_param) = module_args.iter().find(|a| &a.name == arg_name)
-                    && let Some(error) =
-                        validate_type_expr_value(&arg_param.type_expr, arg_value, config)
+                    && let Err(error) =
+                        typecheck::check_type_expr_value(&arg_param.type_expr, arg_value, config)
                 {
                     errors.push(format!(
                         "module {} argument '{}': {}",
@@ -1761,7 +2199,7 @@ pub fn validate_module_calls(
 /// Validate export parameter values against their declared type annotations.
 ///
 /// For each export with both a `type_expr` and a `value`, validates the value
-/// using `validate_type_expr_value`. Accumulates all errors.
+/// using [`typecheck::check_type_expr_value`]. Accumulates all errors.
 ///
 /// Accepts post-inference [`InferredExportParam`]s (#2360 stage 2):
 /// `type_expr` is bare. Sentinel-bearing exports (`TypeExpr::Unknown`)
@@ -1775,13 +2213,36 @@ pub fn validate_export_params(
     let mut errors = Vec::new();
 
     for param in export_params {
-        if matches!(&param.type_expr, crate::parser::TypeExpr::Unknown) {
-            continue;
-        }
         if let Some(value) = &param.value
-            && let Some(error) = validate_type_expr_value(&param.type_expr, value, config)
+            && let Err(error) = typecheck::check_type_expr_value(&param.type_expr, value, config)
         {
             errors.push(format!("export '{}': {}", param.name, error));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+/// Validate concrete module attribute values against their declared types.
+///
+/// Reference-valued attributes are deferred here and checked separately by
+/// [`validate_attribute_param_ref_types_with_bindings`], whose binding index
+/// has the source type authority needed for directional checks.
+pub fn validate_attribute_params(
+    attribute_params: &[crate::parser::AttributeParameter],
+    config: &ProviderContext,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+
+    for param in attribute_params {
+        if let (Some(type_expr), Some(value)) = (&param.type_expr, &param.value)
+            && let Err(error) = typecheck::check_type_expr_value(type_expr, value, config)
+        {
+            errors.push(format!("attribute '{}': {}", param.name, error));
         }
     }
 
@@ -1894,121 +2355,6 @@ pub fn check_unused_bindings_with_identity_requirements<E: crate::parser::Export
         .into_iter()
         .filter(|binding| !identity_required.contains(binding))
         .collect()
-}
-
-/// Validate a value against a TypeExpr, returning an error message if invalid.
-///
-/// Shared validation logic used by both CLI module call validation and LSP diagnostics.
-/// `config` provides custom type validators from providers (e.g., `iam_policy_arn`).
-pub fn validate_type_expr_value(
-    type_expr: &TypeExpr,
-    value: &Value,
-    config: &ProviderContext,
-) -> Option<String> {
-    // `Value::Deferred(DeferredValue::Unknown)` resolves at upstream apply — the concrete type
-    // is unknowable here. Same skip rule the schema validator and
-    // `check_fn_arg_type` follow.
-    if matches!(value, Value::Deferred(DeferredValue::Unknown(_))) {
-        return None;
-    }
-    match (type_expr, value) {
-        (TypeExpr::Simple(name), _) => {
-            let identity = crate::schema::TypeIdentity::bare(crate::parser::snake_to_pascal(name));
-            validate_custom_type(&identity, value, config).err()
-        }
-        (TypeExpr::List(inner), Value::Concrete(ConcreteValue::List(items))) => {
-            for (i, item) in items.iter().enumerate() {
-                if let Some(e) = validate_type_expr_value(inner, item, config) {
-                    return Some(format!("Element {}: {}", i, e));
-                }
-            }
-            None
-        }
-        (TypeExpr::Struct { fields }, Value::Concrete(ConcreteValue::Map(entries))) => {
-            validate_struct_fields(fields, entries, config)
-        }
-        (TypeExpr::Struct { .. }, _) => Some(format!(
-            "expected {type_expr}, got {}.",
-            ValueDescription::of(value)
-        )),
-        (TypeExpr::Bool, Value::Concrete(ConcreteValue::String(_))) => Some(format!(
-            "expected {type_expr}, got {}. Use true or false.",
-            ValueDescription::of(value)
-        )),
-        (TypeExpr::Int | TypeExpr::Float, Value::Concrete(ConcreteValue::String(_))) => Some(
-            format!("expected {type_expr}, got {}.", ValueDescription::of(value)),
-        ),
-        (
-            TypeExpr::String,
-            Value::Concrete(
-                ConcreteValue::Bool(_) | ConcreteValue::Int(_) | ConcreteValue::Float(_),
-            ),
-        )
-        | (TypeExpr::Bool, Value::Concrete(ConcreteValue::Int(_) | ConcreteValue::Float(_)))
-        | (TypeExpr::Int, Value::Concrete(ConcreteValue::Bool(_) | ConcreteValue::Float(_)))
-        | (TypeExpr::Float, Value::Concrete(ConcreteValue::Bool(_))) => Some(format!(
-            "expected {type_expr}, got {}.",
-            ValueDescription::of(value)
-        )),
-        // Intentional one-way widening: an Int may flow into a Float sink.
-        // The reverse (Float -> Int) is rejected above. Mirrors the schema
-        // validator's `(Float, Int) => Ok` rule in `schema/mod.rs`.
-        (TypeExpr::Float, Value::Concrete(ConcreteValue::Int(_))) => None,
-        // Schema and unresolved dotted types are string subtypes — reject non-string values.
-        (
-            TypeExpr::SchemaType { .. } | TypeExpr::DottedUnresolved(_),
-            Value::Concrete(
-                ConcreteValue::Bool(_) | ConcreteValue::Int(_) | ConcreteValue::Float(_),
-            ),
-        ) => Some(format!(
-            "expected {type_expr}, got {}.",
-            ValueDescription::of(value)
-        )),
-        _ => None,
-    }
-}
-
-/// Check shape-level problems of a `Value::Concrete(ConcreteValue::Map)` against a struct field
-/// list: extra keys and missing keys. Returns `None` when the key sets
-/// match. Callers then walk each field with their own type-check pass.
-pub fn struct_field_shape_errors(
-    fields: &[(String, TypeExpr)],
-    entries: &IndexMap<String, Value>,
-) -> Option<String> {
-    // Sort unknown keys so the diagnostic is stable across HashMap's
-    // per-process random hash seed.
-    let mut unknown: Vec<&String> = entries
-        .keys()
-        .filter(|k| !fields.iter().any(|(name, _)| &name == k))
-        .collect();
-    unknown.sort();
-    if let Some(key) = unknown.first() {
-        return Some(format!("expected struct, unknown field '{key}'."));
-    }
-    for (name, _) in fields {
-        if !entries.contains_key(name) {
-            return Some(format!("expected struct, missing field '{}'.", name));
-        }
-    }
-    None
-}
-
-fn validate_struct_fields(
-    fields: &[(String, TypeExpr)],
-    entries: &IndexMap<String, Value>,
-    config: &ProviderContext,
-) -> Option<String> {
-    if let Some(e) = struct_field_shape_errors(fields, entries) {
-        return Some(e);
-    }
-    for (name, ty) in fields {
-        if let Some(v) = entries.get(name)
-            && let Some(e) = validate_type_expr_value(ty, v, config)
-        {
-            return Some(format!("field '{}': {}", name, e));
-        }
-    }
-    None
 }
 
 /// Walk `field_path` against `start`. Return `Ok(tail_type)` on a

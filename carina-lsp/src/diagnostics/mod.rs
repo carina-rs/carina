@@ -428,17 +428,20 @@ impl DiagnosticEngine {
             // deliberately gives both composition-attribute existence checks
             // and `check_resource_ref_type_mismatch` directory-wide targets.
             let binding_input = merged.unwrap_or(parsed);
+            let current_file_path = base_path
+                .zip(current_file_name)
+                .map(|(base, file_name)| base.join(file_name));
+            let semantic_view = checks::SemanticView::for_analysis(
+                parsed,
+                merged,
+                current_file_path.as_deref(),
+                base_path.is_some(),
+            );
             let empty_upstream_exports = Default::default();
             let upstream_exports = upstream_resolution
                 .as_ref()
                 .map(|(exports, _)| exports)
                 .unwrap_or(&empty_upstream_exports);
-            let binding_index =
-                carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports(
-                    binding_input,
-                    &self.schemas,
-                    upstream_exports,
-                );
             let module_signatures = base_path
                 .map(|base| {
                     carina_core::module_resolver::load_resolved_module_signatures(
@@ -448,8 +451,20 @@ impl DiagnosticEngine {
                     )
                 })
                 .unwrap_or_default();
+            let binding_index = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures(
+                binding_input,
+                &self.schemas,
+                upstream_exports,
+                &module_signatures,
+            );
+            diagnostics.extend(self.check_user_function_ref_types(doc, parsed, &binding_index));
             if base_path.is_some() {
-                diagnostics.extend(self.check_module_calls(doc, parsed, &module_signatures));
+                diagnostics.extend(self.check_module_calls(
+                    doc,
+                    parsed,
+                    &semantic_view,
+                    &module_signatures,
+                ));
                 let constraint_diagnostics = base_path
                     .zip(current_file_name)
                     .zip(merged_result.as_ref())
@@ -466,7 +481,7 @@ impl DiagnosticEngine {
                     && let Some(error) = merged_result
                         .as_ref()
                         .and_then(|result| result.module_error.as_ref())
-                    && let Some(diagnostic) = self.module_resolver_constraint_diagnostic(
+                    && let Some(diagnostic) = self.module_resolver_error_diagnostic(
                         doc,
                         parsed,
                         error,
@@ -478,21 +493,26 @@ impl DiagnosticEngine {
                     diagnostics.push(diagnostic);
                 }
             }
-            if let (Some(_), Some(expanded)) = (base_path, merged) {
+            let expansion_succeeded = merged_result
+                .as_ref()
+                .is_some_and(|result| result.module_error.is_none());
+            // Successful expansion supplies inferred types for unannotated
+            // forwarded outputs. Declared module outputs were already checked
+            // by the mandatory graph pass; both branches use BindingIndex's
+            // single TypeInSchema relation.
+            if let (Some(_), Some(expanded), true) = (base_path, merged, expansion_succeeded) {
                 diagnostics.extend(self.check_composition_ref_types(
                     doc,
                     parsed,
+                    &semantic_view,
                     &expanded.compositions,
                     &binding_index,
                 ));
             } else {
-                // Orphaned files and directory parses that did not produce an
-                // expanded view retain the source-local fallback. It can
-                // validate schema bindings, while composition inference is
-                // intentionally owned by the expanded pass above.
                 diagnostics.extend(self.check_module_call_ref_types(
                     doc,
                     parsed,
+                    &semantic_view,
                     &module_signatures,
                     &binding_index,
                 ));
@@ -1140,11 +1160,12 @@ impl DiagnosticEngine {
             diagnostics.extend(self.check_attributes_blocks(
                 doc,
                 parsed,
+                &semantic_view,
                 &binding_index,
                 &known_bindings,
             ));
 
-            diagnostics.extend(self.check_exports_blocks(doc, parsed, merged));
+            diagnostics.extend(self.check_exports_blocks(doc, parsed, &semantic_view));
 
             // Unused `let` detection. When a merged parse is available,
             // run the core check against it (so references from sibling

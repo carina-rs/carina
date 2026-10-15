@@ -4438,6 +4438,25 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
             "Union<String | Int>",
             TypeExpr::Union(vec![TypeExpr::String, TypeExpr::Int]),
         ),
+        (
+            "StringLiteral(dev)",
+            TypeExpr::StringLiteral("dev".to_string()),
+        ),
+        (
+            "Union<'dev' | 'prod'>",
+            TypeExpr::Union(vec![
+                TypeExpr::StringLiteral("dev".to_string()),
+                TypeExpr::StringLiteral("prod".to_string()),
+            ]),
+        ),
+        (
+            "Ref(aws.ec2.Vpc)",
+            TypeExpr::Ref(ResourceTypePath::new("aws", "ec2.Vpc")),
+        ),
+        (
+            "DottedUnresolved(aws.ec2.Vpc)",
+            TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "ec2.Vpc")),
+        ),
     ];
 
     for (name, type_expr) in liftable {
@@ -4449,24 +4468,7 @@ fn lifted_type_expr_finite_universe_is_reflexive() {
         );
     }
 
-    let resource_path = ResourceTypePath::new("aws".to_string(), "ec2.Vpc".to_string());
-    for (name, type_expr) in [
-        ("Ref(aws.ec2.Vpc)", TypeExpr::Ref(resource_path.clone())),
-        (
-            "StringLiteral(dev)",
-            TypeExpr::StringLiteral("dev".to_string()),
-        ),
-        (
-            "DottedUnresolved(aws.ec2.Vpc)",
-            TypeExpr::DottedUnresolved(resource_path),
-        ),
-        ("Unknown", TypeExpr::Unknown),
-    ] {
-        assert!(
-            crate::validation::lift_type_expr(&type_expr).is_none(),
-            "non-liftable TypeExpr {name} must lift to None",
-        );
-    }
+    assert!(crate::validation::lift_type_expr(&TypeExpr::Unknown).is_none());
 }
 
 fn contains_unrefined_primitive(attr: &AttributeType) -> bool {
@@ -4496,6 +4498,8 @@ fn contains_unrefined_primitive(attr: &AttributeType) -> bool {
             .iter()
             .any(contains_unrefined_primitive),
         AttrTypeKind::String { .. }
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
         | AttrTypeKind::Int { .. }
         | AttrTypeKind::Float { .. }
         | AttrTypeKind::Bool
@@ -5392,6 +5396,23 @@ fn assignable_plain_float_accepts_identityless_range_sink() {
     let sink = AttributeType::refined_float(None, Some((Some(1.0), Some(65_535.0))));
 
     assert!(assignable(&AttributeType::float(), &sink));
+}
+
+#[test]
+fn assignable_int_source_widens_to_float_sink() {
+    assert!(assignable(&AttributeType::int(), &AttributeType::float()));
+    assert!(!assignable(&AttributeType::float(), &AttributeType::int()));
+}
+
+#[test]
+fn assignable_identified_int_without_range_widens_to_ranged_float_sink() {
+    let source = AttributeType::refined_int(Some(TypeIdentity::bare("Count")), None);
+    let sink = AttributeType::refined_float(None, Some((Some(0.0), Some(100.0))));
+
+    assert!(
+        assignable(&source, &sink),
+        "an identity must not make an otherwise plain Int source less assignable"
+    );
 }
 
 #[test]

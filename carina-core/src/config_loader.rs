@@ -439,21 +439,10 @@ pub fn load_configuration_with_config(
 
         for (file, resolved) in parsed_files {
             let mut parsed = resolved.into_inner();
-            // Stamp the full source path onto warnings and deferred
-            // for-expressions. Bare filenames are ambiguous when a
-            // project spans multiple `.crn` files (and identically
-            // named files in sibling directories), and they break
-            // editor jump-to-location.
-            let file_path = Some(file.display().to_string());
-            for w in &mut parsed.warnings {
-                w.file = file_path.clone();
-            }
-            for d in &mut parsed.deferred_for_expressions {
-                d.file = file_path.clone();
-            }
-
             let mut unresolved = parsed.clone();
-            if let Err(e) = parser::resolve_resource_refs_with_config(&mut parsed, config) {
+            if let Err(e) =
+                parser::resolve_resource_refs_defer_unknown_functions(&mut parsed, config)
+            {
                 parse_errors.push(format!("{}: {}", file.display(), e));
                 continue;
             }
@@ -548,8 +537,7 @@ pub fn parse_directory_with_overrides(
     config: &ProviderContext,
     overrides: &HashMap<String, String>,
 ) -> Result<ParsedFile, String> {
-    parse_directory_with_overrides_and_diagnostics(dir, config, overrides)
-        .map(|result| result.parsed)
+    parse_directory_with_overrides_impl(dir, config, overrides, false).map(|result| result.parsed)
 }
 
 /// Directory parse result for editor and other non-blocking consumers that
@@ -569,6 +557,15 @@ pub fn parse_directory_with_overrides_and_diagnostics(
     dir: &Path,
     config: &ProviderContext,
     overrides: &HashMap<String, String>,
+) -> Result<DirectoryParseResult, String> {
+    parse_directory_with_overrides_impl(dir, config, overrides, true)
+}
+
+fn parse_directory_with_overrides_impl(
+    dir: &Path,
+    config: &ProviderContext,
+    overrides: &HashMap<String, String>,
+    preserve_failed_user_calls: bool,
 ) -> Result<DirectoryParseResult, String> {
     let files = find_crn_files_in_dir(dir)?;
     let mut paths: Vec<(std::path::PathBuf, String)> = files
@@ -608,23 +605,17 @@ pub fn parse_directory_with_overrides_and_diagnostics(
     let duplicate_declarations = find_duplicate_declarations(dir, &parsed_files);
 
     let mut merged = ParsedFile::default();
-    for (file, resolved) in parsed_files {
-        let mut parsed = resolved.into_inner();
-        for call in &mut parsed.module_calls {
-            call.set_source_file(file.clone());
-        }
-        let file_path = Some(file.display().to_string());
-        for w in &mut parsed.warnings {
-            w.file = file_path.clone();
-        }
-        for d in &mut parsed.deferred_for_expressions {
-            d.file = file_path.clone();
-        }
-        merge_parsed_file(&mut merged, parsed);
+    for (_, resolved) in parsed_files {
+        merge_parsed_file(&mut merged, resolved.into_inner());
     }
 
     // Resolve cross-file references on the merged result
-    if let Err(e) = parser::resolve_resource_refs_with_config(&mut merged, config) {
+    let resolve_result = if preserve_failed_user_calls {
+        parser::resolve_resource_refs_for_diagnostics(&mut merged, config)
+    } else {
+        parser::resolve_resource_refs_with_config(&mut merged, config)
+    };
+    if let Err(e) = resolve_result {
         return Err(e.to_string());
     }
     // `finalize_provider_configs` is intentionally NOT called here. The
@@ -779,7 +770,9 @@ pub(crate) fn merge_parsed_file<E>(target: &mut File<E>, source: File<E>) {
 ///
 /// The returned vector preserves the input order. Any per-file parse
 /// error short-circuits and is returned to the caller; earlier passes
-/// swallow nothing.
+/// swallow nothing. Pass 2 also stamps each returned declaration with its
+/// source file, completing parser-authored spans through the same path for
+/// configuration loading, module resolution, and editor diagnostics.
 ///
 /// A K-hop sibling-let chain costs roughly (K+2) full directory parses
 /// (Pass 1.a + K fixed-point iterations + Pass 2). Each call to
@@ -840,7 +833,8 @@ pub fn parse_directory_files(
     // Pass 2: re-parse each file with the sibling-aware union seeded into `ctx`.
     let mut out = Vec::with_capacity(files.len());
     for ((path, content), local_variable_names) in files.iter().zip(pass_1a_local_variables) {
-        let parsed = parser::parse_with_seeded_bindings(content, config, &final_seeds)?;
+        let mut parsed = parser::parse_with_seeded_bindings(content, config, &final_seeds)?;
+        stamp_parsed_file_source(&mut parsed, path);
         out.push((
             path.clone(),
             DirectoryResolvedFile {
@@ -850,6 +844,25 @@ pub fn parse_directory_files(
         ));
     }
     Ok(out)
+}
+
+fn stamp_parsed_file_source(parsed: &mut ParsedFile, path: &Path) {
+    for call in &mut parsed.module_calls {
+        call.set_source_file(path.to_path_buf());
+    }
+    for parameter in &mut parsed.attribute_params {
+        parameter.set_source_file(path.to_path_buf());
+    }
+    for parameter in &mut parsed.export_params {
+        parameter.set_source_file(path.to_path_buf());
+    }
+    let file = Some(path.display().to_string());
+    for warning in &mut parsed.warnings {
+        warning.file = file.clone();
+    }
+    for deferred in &mut parsed.deferred_for_expressions {
+        deferred.file = file.clone();
+    }
 }
 
 fn local_variable_names(parsed: &ParsedFile) -> HashSet<String> {
@@ -1712,6 +1725,48 @@ awscc.ec2.SecurityGroup {
         );
     }
 
+    #[test]
+    fn shared_directory_parse_stamps_parameter_diagnostic_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let attributes_path = temp.path().join("attributes.crn");
+        let exports_path = temp.path().join("exports.crn");
+        fs::write(
+            &attributes_path,
+            "attributes {\n    output: String = 'value'\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            &exports_path,
+            "exports {\n    result: String = 'value'\n}\n",
+        )
+        .unwrap();
+
+        let files = vec![
+            (
+                attributes_path.clone(),
+                fs::read_to_string(&attributes_path).unwrap(),
+            ),
+            (
+                exports_path.clone(),
+                fs::read_to_string(&exports_path).unwrap(),
+            ),
+        ];
+        let parsed =
+            parse_directory_files(&files, &ProviderContext::default()).expect("directory parse");
+        let attribute_file = parsed[0].1.parsed();
+        let attribute_source = attribute_file.attribute_params[0]
+            .diagnostic_source()
+            .expect("attribute source");
+        assert_eq!(attribute_source.file, attributes_path);
+        assert_eq!(attribute_source.call_span.start_line, 2);
+        let export_file = parsed[1].1.parsed();
+        let export_source = export_file.export_params[0]
+            .diagnostic_source()
+            .expect("export source");
+        assert_eq!(export_source.file, exports_path);
+        assert_eq!(export_source.call_span.start_line, 2);
+    }
+
     fn duplicate_messages(dir: &Path, sources: &[(&str, &str)]) -> Vec<String> {
         let files: Vec<_> = sources
             .iter()
@@ -1780,11 +1835,11 @@ awscc.ec2.SecurityGroup {
             .into_iter()
             .map(|name| {
                 let parsed = ParsedFile {
-                    export_params: vec![crate::parser::ParsedExportParam {
-                        name: "_".to_string(),
-                        type_expr: None,
-                        value: None,
-                    }],
+                    export_params: vec![crate::parser::ParsedExportParam::new(
+                        "_".to_string(),
+                        None,
+                        None,
+                    )],
                     ..ParsedFile::default()
                 };
                 (

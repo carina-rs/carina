@@ -23,7 +23,10 @@ pub type ResolvedModuleSignatures = HashMap<String, ResolvedModuleSignature>;
 // resolve_file_type_exprs over the imported module itself and rejects the
 // authored declaration before expansion. The end-to-end guarantee is pinned
 // by `carina-cli/tests/validate_unknown_custom_type_e2e.rs`.
-fn resolved_signature(parsed: &ParsedFile, config: &ProviderContext) -> ResolvedModuleSignature {
+pub(super) fn resolved_signature(
+    parsed: &ParsedFile,
+    config: &ProviderContext,
+) -> ResolvedModuleSignature {
     let arguments = parsed
         .arguments
         .iter()

@@ -367,7 +367,7 @@ let b = consumer_component {
 
     let call_diags: Vec<_> = diags
         .iter()
-        .filter(|diag| diag.starts_with("module call 'b':"))
+        .filter(|diag| diag.contains("module call 'b':"))
         .collect();
     assert_eq!(
         call_diags.len(),
@@ -425,7 +425,7 @@ let b = consumer_component {
 
     let call_diags: Vec<_> = diags
         .iter()
-        .filter(|diag| diag.starts_with("module call 'b':"))
+        .filter(|diag| diag.contains("module call 'b':"))
         .collect();
     assert_eq!(
         call_diags.len(),
@@ -750,8 +750,9 @@ let outer_instance = outer_module { }
     );
     assert!(
         diags[0].contains("attribute 'target_group_arn': unknown attribute 'target_group_ar'")
-            && diags[0].contains("outer_instance.inner_instance.target_group_ar")
+            && diags[0].contains("reference inner_instance.target_group_ar")
+            && !diags[0].contains("outer_instance.inner_instance.target_group_ar")
             && diags[0].contains("Did you mean 'target_group_arn'?"),
-        "diagnostic should identify the expanded inner output path: {diags:#?}",
+        "diagnostic should preserve the authored inner output path: {diags:#?}",
     );
 }

@@ -525,9 +525,12 @@ pub(crate) fn validate_and_resolve_errors_with_context(
         return errors;
     }
 
-    if let Err(e) =
-        module_resolver::resolve_modules_with_config(parsed, base_dir, &enriched_context)
-    {
+    if let Err(e) = module_resolver::resolve_modules_with_config(
+        parsed,
+        base_dir,
+        &enriched_context,
+        ctx.schemas(),
+    ) {
         // A cycle or other expansion failure leaves no complete composition
         // graph for the unified boundary pass. Preserve source-local
         // `attributes {}` diagnostics that do not depend on expansion; this
@@ -614,6 +617,11 @@ pub(crate) fn validate_and_resolve_errors_with_context(
             ctx.schemas(),
             &upstream_exports,
         );
+        // The mandatory pre-expansion graph check has already validated every
+        // declared module-output boundary. Keep the expanded walk for
+        // unannotated forwarded outputs, whose inferred source type exists
+        // only on compositions; it uses the same BindingIndex + TypeInSchema
+        // relation rather than a second assignability authority.
         errors.extend(
             carina_core::validation::validate_composition_ref_types_with_bindings(
                 &parsed.compositions,
@@ -636,6 +644,12 @@ pub(crate) fn validate_and_resolve_errors_with_context(
                 &bindings,
             )
         {
+            errors.extend(split_validation_message(&message));
+        }
+        if let Err(message) = carina_core::validation::validate_attribute_params(
+            &parsed.attribute_params,
+            &enriched_context,
+        ) {
             errors.extend(split_validation_message(&message));
         }
         if let Err(msg) = carina_core::validation::validate_export_params(
@@ -735,10 +749,10 @@ pub(crate) fn validate_and_resolve_errors_with_context(
 }
 
 /// Split the newline-joined error strings that `carina_core::validation::*`
-/// helpers return into individual `AppError::Validation` entries. Mirrors
-/// the `lift_validation_result` helper in `wiring.rs` for the two
-/// `validate_export_*` core functions that are still called inline here.
-fn split_validation_message(joined: &str) -> Vec<AppError> {
+/// helpers return into individual `AppError::Validation` entries. Command and
+/// wiring validation paths share this renderer so multi-error results retain
+/// identical splitting behavior.
+pub(crate) fn split_validation_message(joined: &str) -> Vec<AppError> {
     joined
         .split('\n')
         .filter(|s| !s.is_empty())

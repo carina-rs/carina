@@ -57,6 +57,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub enum BindingTarget<'a> {
     Schema(&'a ResourceSchema),
     Composition(&'a Composition),
+    ModuleCall(&'a crate::module_resolver::ResolvedModuleSignature),
     Argument(&'a crate::parser::TypeExpr),
     UpstreamState(&'a crate::upstream_exports::UpstreamExportEntries),
 }
@@ -355,7 +356,7 @@ impl std::fmt::Display for RefTypeError {
 pub enum RefType {
     Typed(ResolvedRefType),
     /// The binding exists but no sound schema type can be represented. This
-    /// includes derived composition values and resource-handle annotations.
+    /// includes derived composition values and `TypeExpr::Unknown`.
     Unchecked,
     UnknownBinding {
         binding: String,
@@ -374,15 +375,17 @@ fn suggestion_suffix(unknown: &str, known: &[&str]) -> String {
 /// declared in `parsed`. Lifetime `'a` ties the index to its inputs so callers
 /// can keep it borrowed without cloning.
 ///
-/// `entries` contains every composition binding plus managed/data bindings
-/// whose schemas resolved successfully. `known_names` records every named
-/// binding regardless of schema status, so callers can tell "unknown binding"
-/// apart from "binding exists but its schema is missing" — those are separate
-/// diagnostics.
-#[derive(Debug, Default)]
+/// `entries` contains typed arguments, upstream exports, compositions,
+/// pre-expansion module calls with loaded signatures, and managed/data
+/// bindings whose schemas resolved successfully. `known_names` records every
+/// named addressable binding even when its type surface is unavailable, so
+/// callers can distinguish "unknown binding" from "known but unchecked".
+#[derive(Debug)]
 pub struct BindingIndex<'a> {
     entries: HashMap<String, BindingEntry<'a>>,
     known_names: std::collections::HashSet<String>,
+    resource_handles: HashMap<String, AttributeType>,
+    user_functions: &'a HashMap<String, crate::parser::UserFunction>,
 }
 
 impl<'a> BindingIndex<'a> {
@@ -399,7 +402,19 @@ impl<'a> BindingIndex<'a> {
         parsed: &'a crate::parser::File<E>,
         registry: &'a SchemaRegistry,
     ) -> Self {
-        Self::build(parsed, registry, None)
+        Self::build(parsed, registry, None, None)
+    }
+
+    /// Build the index with the declared output surfaces of imported modules.
+    /// This is the pre-expansion authority for references such as `web.url`:
+    /// the module call is not a [`Composition`] yet, but its imported
+    /// signature already declares the output type.
+    pub fn from_parsed_with_module_signatures<E>(
+        parsed: &'a crate::parser::File<E>,
+        registry: &'a SchemaRegistry,
+        module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+    ) -> Self {
+        Self::build(parsed, registry, None, Some(module_signatures))
     }
 
     /// Build the index with statically resolved `upstream_state` exports.
@@ -410,16 +425,33 @@ impl<'a> BindingIndex<'a> {
         registry: &'a SchemaRegistry,
         upstream_exports: &'a crate::upstream_exports::UpstreamExports,
     ) -> Self {
-        Self::build(parsed, registry, Some(upstream_exports))
+        Self::build(parsed, registry, Some(upstream_exports), None)
+    }
+
+    /// Build the complete pre-expansion validation index used by the LSP.
+    pub fn from_parsed_with_upstream_exports_and_module_signatures<E>(
+        parsed: &'a crate::parser::File<E>,
+        registry: &'a SchemaRegistry,
+        upstream_exports: &'a crate::upstream_exports::UpstreamExports,
+        module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
+    ) -> Self {
+        Self::build(
+            parsed,
+            registry,
+            Some(upstream_exports),
+            Some(module_signatures),
+        )
     }
 
     fn build<E>(
         parsed: &'a crate::parser::File<E>,
         registry: &'a SchemaRegistry,
         upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports>,
+        module_signatures: Option<&'a crate::module_resolver::ResolvedModuleSignatures>,
     ) -> Self {
         let mut entries = HashMap::new();
         let mut known_names = std::collections::HashSet::new();
+        let mut resource_handles = HashMap::new();
         // Walk top-level resources only — managed resources, data
         // sources, and compositions (carina#3181: `iter_top_level_resources`
         // chains the typed slices and excludes deferred for-body
@@ -436,6 +468,13 @@ impl<'a> BindingIndex<'a> {
                 continue;
             };
             known_names.insert(binding_name.to_string());
+            if !matches!(rref, ResourceRef::Composition(_)) {
+                let id = rref.id();
+                resource_handles.insert(
+                    binding_name.to_string(),
+                    AttributeType::resource_handle(id.provider.clone(), id.resource_type.clone()),
+                );
+            }
             // Schema lookup routes by the typestate arm: managed resources
             // via `get_for`, data sources via `get_for_data_source`.
             // Compositions carry their own statically known attribute map.
@@ -453,6 +492,27 @@ impl<'a> BindingIndex<'a> {
             };
             entries.insert(binding_name.to_string(), BindingEntry { target });
         }
+        // Module-call bindings expose the imported module's declared output
+        // surface before expansion. Record the binding even when its import
+        // could not be loaded, preserving the known-but-untyped distinction.
+        // Resource/composition entries above retain precedence on malformed
+        // duplicate names.
+        for call in &parsed.module_calls {
+            let Some(binding_name) = call.binding_name.as_deref() else {
+                continue;
+            };
+            known_names.insert(binding_name.to_string());
+            if let Some(signature) =
+                module_signatures.and_then(|signatures| signatures.get(&call.module_name))
+            {
+                entries
+                    .entry(binding_name.to_string())
+                    .or_insert(BindingEntry {
+                        target: BindingTarget::ModuleCall(signature),
+                    });
+            }
+        }
+
         // Wait bindings are addressable aliases for their target
         // resource (`let ready = wait cert { ... }` means
         // `ready.certificate_arn` has the same validation surface as
@@ -466,6 +526,9 @@ impl<'a> BindingIndex<'a> {
             known_names.insert(wait_name.to_string());
             if let Some(target) = entries.get(wb.target.as_str()).map(|entry| entry.target) {
                 entries.insert(wait_name.to_string(), BindingEntry { target });
+            }
+            if let Some(handle) = resource_handles.get(wb.target.as_str()).cloned() {
+                resource_handles.insert(wait_name.to_string(), handle);
             }
         }
 
@@ -500,11 +563,17 @@ impl<'a> BindingIndex<'a> {
         Self {
             entries,
             known_names,
+            resource_handles,
+            user_functions: &parsed.user_functions,
         }
     }
 
     pub fn get(&self, name: &str) -> Option<&BindingEntry<'a>> {
         self.entries.get(name)
+    }
+
+    pub(crate) fn user_function(&self, name: &str) -> Option<&'a crate::parser::UserFunction> {
+        self.user_functions.get(name)
     }
 
     /// Resolve the static type of one complete reference path.
@@ -513,7 +582,7 @@ impl<'a> BindingIndex<'a> {
     /// bindings preserve a liftable declared boundary type together with all
     /// inferable forwarded-source constraints; otherwise a forwarded output
     /// recursively inherits the target path's type. Derived values and
-    /// non-representable annotations remain unchecked. The active path set
+    /// `TypeExpr::Unknown` remains unchecked. The active path set
     /// bounds malformed/cyclic forwarded chains.
     pub fn ref_type<'p>(&self, path: impl Into<ReferencePathRef<'p>>) -> RefType {
         self.ref_type_inner(path.into(), &mut HashSet::new())
@@ -527,6 +596,16 @@ impl<'a> BindingIndex<'a> {
         let key = reference.to_dot_string();
         if !visiting.insert(key.clone()) {
             return RefType::Unchecked;
+        }
+
+        if let ReferencePathRef::Binding(binding) = reference
+            && let Some(handle) = self.resource_handles.get(binding)
+        {
+            visiting.remove(&key);
+            return RefType::Typed(ResolvedRefType::new(
+                handle.clone(),
+                crate::schema::empty_defs_for_schema_walks().clone(),
+            ));
         }
 
         let result = match self.entries.get(reference.binding()) {
@@ -610,9 +689,9 @@ impl<'a> BindingIndex<'a> {
                         && attribute.declared_type().is_some()
                     {
                         // The declaration is the source of truth for a directly
-                        // forwarded module argument. Non-liftable argument
-                        // types (notably `TypeExpr::Ref`) stay unchecked rather
-                        // than inheriting the caller's substituted value type.
+                        // forwarded module argument. An unknown declaration
+                        // stays unchecked rather than inheriting the caller's
+                        // substituted value type.
                         RefType::Unchecked
                     } else if let Some(forwarded) = attribute.forwarded_path() {
                         match self.ref_type_inner(ReferencePathRef::Access(forwarded), visiting) {
@@ -627,6 +706,35 @@ impl<'a> BindingIndex<'a> {
                         }
                     } else {
                         RefType::Unchecked
+                    }
+                }
+                BindingTarget::ModuleCall(signature) => {
+                    let ReferencePathRef::Access(path) = reference else {
+                        visiting.remove(&key);
+                        return RefType::Unchecked;
+                    };
+                    let Some(declared) = signature.attributes.get(path.attribute()) else {
+                        visiting.remove(&key);
+                        return RefType::UnknownAttribute(unknown_attribute(
+                            path,
+                            signature.attributes.keys(),
+                            RefTargetKind::Composition,
+                        ));
+                    };
+                    let Some(declared) = declared
+                        .as_ref()
+                        .and_then(crate::validation::lift_type_expr)
+                    else {
+                        visiting.remove(&key);
+                        return RefType::Unchecked;
+                    };
+                    let defs = crate::schema::empty_defs_for_schema_walks();
+                    match narrow_type(&declared, path.segments(), defs, path) {
+                        Ok(Some(attr_type)) => {
+                            RefType::Typed(ResolvedRefType::new(attr_type.clone(), defs.clone()))
+                        }
+                        Ok(None) => RefType::Unchecked,
+                        Err(error) => RefType::UnknownAttribute(error),
                     }
                 }
                 BindingTarget::Argument(type_expr) => {
@@ -726,6 +834,7 @@ impl<'a> BindingIndex<'a> {
             .filter_map(|(name, entry)| match entry.target {
                 BindingTarget::Schema(schema) => Some((name.as_str(), schema)),
                 BindingTarget::Composition(_)
+                | BindingTarget::ModuleCall(_)
                 | BindingTarget::Argument(_)
                 | BindingTarget::UpstreamState(_) => None,
             })
@@ -1576,6 +1685,53 @@ let existing = read aws.ec2.Vpc {
     }
 
     #[test]
+    fn pre_expansion_module_call_binding_exposes_declared_attribute_types() {
+        let parsed = parse(
+            "let m = use { source = './m' }\nlet x = m {}\n",
+            &Default::default(),
+        )
+        .expect("module-call fixture must parse");
+        let signatures = HashMap::from([(
+            "m".to_string(),
+            crate::module_resolver::ResolvedModuleSignature {
+                arguments: Vec::new(),
+                attributes: indexmap::indexmap! {
+                    "count".to_string() => Some(TypeExpr::Int),
+                    "name".to_string() => Some(TypeExpr::String),
+                },
+                requires: Vec::new(),
+            },
+        )]);
+        let registry = SchemaRegistry::new();
+        let index =
+            BindingIndex::from_parsed_with_module_signatures(&parsed, &registry, &signatures);
+
+        let RefType::Typed(count) = index.ref_type(&AccessPath::new("x", "count")) else {
+            panic!("module output must be typed before composition expansion");
+        };
+        assert_eq!(count.display_type_name(), "Int");
+        assert!(
+            count
+                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::int()))
+                .is_ok()
+        );
+        assert!(
+            count
+                .is_assignable_to_sink(TypeInSchema::schemaless(&AttributeType::string()))
+                .is_err()
+        );
+
+        assert!(matches!(
+            index.ref_type(&AccessPath::new("x", "missing")),
+            RefType::UnknownAttribute(RefTypeError::UnknownAttribute { .. })
+        ));
+        assert!(
+            !index.schemas_by_name().contains_key("x"),
+            "module signatures are typed surfaces, not provider schemas",
+        );
+    }
+
+    #[test]
     fn wait_binding_aliases_composition_target() {
         let mut parsed = parse("", &Default::default()).expect("parse");
         parsed.compositions.push(composition("instance"));
@@ -1968,7 +2124,7 @@ let vpc = aws.ec2.Vpc {
     }
 
     #[test]
-    fn ref_type_leaves_resource_handle_argument_unchecked() {
+    fn ref_type_lifts_resource_handle_argument_and_enforces_boundary_matrix() {
         let mut parsed = parse("", &Default::default()).expect("parse");
         parsed.arguments.push(ArgumentParameter {
             name: "vpc".to_string(),
@@ -1980,7 +2136,59 @@ let vpc = aws.ec2.Vpc {
         let registry = SchemaRegistry::new();
         let index = BindingIndex::from_parsed(&parsed, &registry);
 
-        assert!(matches!(index.ref_type("vpc"), RefType::Unchecked));
+        let RefType::Typed(vpc) = index.ref_type("vpc") else {
+            panic!("Ref-typed module argument must resolve to a resource handle");
+        };
+        let same = crate::validation::lift_type_expr(&TypeExpr::Ref(ResourceTypePath::new(
+            "aws", "ec2.Vpc",
+        )))
+        .expect("Ref must be liftable");
+        let different = crate::validation::lift_type_expr(&TypeExpr::Ref(ResourceTypePath::new(
+            "aws",
+            "ec2.Subnet",
+        )))
+        .expect("Ref must be liftable");
+        let literal_union = crate::validation::lift_type_expr(&TypeExpr::Union(vec![
+            TypeExpr::StringLiteral("dev".to_string()),
+            TypeExpr::StringLiteral("prod".to_string()),
+        ]))
+        .expect("literal union must be liftable");
+
+        for accepted in [AttributeType::string(), same] {
+            assert!(
+                vpc.is_assignable_to_sink(TypeInSchema::schemaless(&accepted))
+                    .is_ok(),
+                "resource handles retain main's string-shaped compatibility"
+            );
+        }
+        for rejected in [AttributeType::int(), different, literal_union] {
+            assert!(
+                vpc.is_assignable_to_sink(TypeInSchema::schemaless(&rejected))
+                    .is_err(),
+                "resource handles must not flow into non-string, closed-literal, or different-handle sinks"
+            );
+        }
+    }
+
+    #[test]
+    fn ref_type_lifts_bare_resource_binding_as_a_handle() {
+        let parsed = parse(
+            r#"
+let vpc = aws.ec2.Vpc {
+    name = "v"
+    cidr_block = "10.0.0.0/16"
+}
+"#,
+            &Default::default(),
+        )
+        .expect("parse");
+        let registry = registry_with_vpc();
+        let index = BindingIndex::from_parsed(&parsed, &registry);
+
+        let RefType::Typed(vpc) = index.ref_type("vpc") else {
+            panic!("a bare resource binding must resolve to its resource-handle type");
+        };
+        assert_eq!(vpc.display_type_name(), "aws.ec2.Vpc");
     }
 
     #[test]
