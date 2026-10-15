@@ -9,12 +9,12 @@ use crate::wait::predicate::{AttrPath, WaitPredicate};
 fn equals_returns_true_when_attribute_matches() {
     let pred = WaitPredicate::Equals {
         attr: AttrPath::single("status"),
-        value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
     };
     let mut attrs = HashMap::new();
     attrs.insert(
         "status".to_string(),
-        Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        Value::Concrete(ConcreteValue::String("ISSUED".into())),
     );
     assert!(pred.evaluate(&attrs));
 }
@@ -23,12 +23,12 @@ fn equals_returns_true_when_attribute_matches() {
 fn equals_returns_false_when_attribute_differs() {
     let pred = WaitPredicate::Equals {
         attr: AttrPath::single("status"),
-        value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
     };
     let mut attrs = HashMap::new();
     attrs.insert(
         "status".to_string(),
-        Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".to_string())),
+        Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".into())),
     );
     assert!(!pred.evaluate(&attrs));
 }
@@ -37,7 +37,7 @@ fn equals_returns_false_when_attribute_differs() {
 fn equals_returns_false_when_attribute_absent() {
     let pred = WaitPredicate::Equals {
         attr: AttrPath::single("status"),
-        value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
     };
     let attrs: HashMap<String, Value> = HashMap::new();
     assert!(!pred.evaluate(&attrs));

@@ -238,7 +238,7 @@ pub(crate) fn parse_for_expr(
                 bind(
                     &mut iter_ctx,
                     key_var,
-                    Value::Concrete(ConcreteValue::String(key.clone())),
+                    Value::Concrete(ConcreteValue::String(key.clone().into())),
                 );
                 bind(&mut iter_ctx, val_var, val.clone());
                 let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
@@ -346,8 +346,10 @@ pub(crate) fn parse_for_expr(
             // from #2038 / #2100. See #2101 / #2138.
             let bare_ident_text: Option<String> = match &iterable {
                 Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.to_string()),
-                Value::Concrete(ConcreteValue::String(s)) if is_bare_identifier(s) => {
-                    Some(s.clone())
+                Value::Concrete(ConcreteValue::String(s))
+                    if s.diagnostic_literal().is_some_and(is_bare_identifier) =>
+                {
+                    s.diagnostic_literal().map(str::to_owned)
                 }
                 _ => None,
             };
@@ -416,10 +418,13 @@ pub(crate) fn parse_for_expr(
                 return Ok((resources, data_sources, module_calls));
             }
             let iterable_type = match &iterable {
-                Value::Concrete(ConcreteValue::String(s)) => {
-                    let (truncated, marker) = crate::utils::truncate_chars_for_display(s, 50);
-                    format!("string {}{marker}", display_string_literal(&truncated))
-                }
+                Value::Concrete(ConcreteValue::String(s)) => match s.diagnostic_literal() {
+                    Some(s) => {
+                        let (truncated, marker) = crate::utils::truncate_chars_for_display(s, 50);
+                        format!("string {}{marker}", display_string_literal(&truncated))
+                    }
+                    None => "string".to_string(),
+                },
                 Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
                     let (truncated, marker) =
                         crate::utils::truncate_chars_for_display(s.as_str(), 50);

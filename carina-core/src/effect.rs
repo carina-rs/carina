@@ -617,7 +617,7 @@ impl Effect {
             (
                 Effect::Import {
                     id: crate::resource::ResolvedResourceId::new(id.clone()),
-                    identifier: Value::Concrete(ConcreteValue::String("x-1".to_string())),
+                    identifier: Value::Concrete(ConcreteValue::String("x-1".into())),
                 },
                 Effect::Import { .. }
             ),
@@ -642,7 +642,7 @@ impl Effect {
                     target_id: crate::resource::ResolvedResourceId::new(id.clone()),
                     until: WaitPredicate::Equals {
                         attr: AttrPath::single("status"),
-                        value: Value::Concrete(ConcreteValue::String("ready".to_string())),
+                        value: Value::Concrete(ConcreteValue::String("ready".into())),
                     },
                     until_surface: "status == 'ready'".to_string(),
                     timeout: Duration::from_secs(60),
@@ -1230,13 +1230,13 @@ impl Effect {
 pub fn format_import_identifier(identifier: &crate::resource::Value) -> String {
     use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
     match identifier {
-        Value::Concrete(ConcreteValue::String(s)) => s.clone(),
+        Value::Concrete(ConcreteValue::String(s)) => s.expose_plaintext().to_owned(),
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => s.to_string(),
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             let mut out = String::new();
             for part in parts {
                 match part {
-                    InterpolationPart::Literal(s) => out.push_str(s),
+                    InterpolationPart::Literal(s) => out.push_str(s.expose_plaintext()),
                     // Recurse so a nested `Value::Deferred(Interpolation)`
                     // produced by canonicalization stays unquoted and
                     // un-`${…}`-wrapped at every level. Falling through
@@ -1268,7 +1268,7 @@ pub fn format_import_identifier(identifier: &crate::resource::Value) -> String {
 pub fn resolve_import_identifier(identifier: &crate::resource::Value) -> Result<&str, String> {
     use crate::resource::{ConcreteValue, Value};
     match identifier {
-        Value::Concrete(ConcreteValue::String(s)) => Ok(s.as_str()),
+        Value::Concrete(ConcreteValue::String(s)) => Ok(s.expose_plaintext()),
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Ok(s.as_str()),
         other => Err(format!(
             "import identifier did not resolve to a concrete string at apply time \
@@ -1381,7 +1381,7 @@ mod tests {
                 "Import",
                 Effect::Import {
                     id: crate::resource::ResolvedResourceId::new(rid.clone()),
-                    identifier: Value::Concrete(ConcreteValue::String("x-1".to_string())),
+                    identifier: Value::Concrete(ConcreteValue::String("x-1".into())),
                 },
             ),
             (
@@ -1406,7 +1406,7 @@ mod tests {
                     target_id: crate::resource::ResolvedResourceId::new(rid),
                     until: WaitPredicate::Equals {
                         attr: AttrPath::single("status"),
-                        value: Value::Concrete(ConcreteValue::String("ready".to_string())),
+                        value: Value::Concrete(ConcreteValue::String("ready".into())),
                     },
                     until_surface: "status == 'ready'".to_string(),
                     timeout: Duration::from_secs(60),
@@ -1751,7 +1751,7 @@ mod tests {
         use crate::resource::{ConcreteValue, Value};
         let resource = Resource::new("test", "no_binding").with_attribute(
             "name",
-            Value::Concrete(ConcreteValue::String("test".to_string())),
+            Value::Concrete(ConcreteValue::String("test".into())),
         );
         let effect = Effect::Create(ResolvedResource::new(resource));
         assert_eq!(effect.binding_name(), None);
@@ -1775,12 +1775,12 @@ mod tests {
                     ResourceId::with_identity("s3.Bucket", "my-bucket"),
                     HashMap::from([(
                         "versioning".to_string(),
-                        Value::Concrete(ConcreteValue::String("Disabled".to_string())),
+                        Value::Concrete(ConcreteValue::String("Disabled".into())),
                     )]),
                 )),
                 to: ResolvedResource::new(Resource::new("s3.Bucket", "my-bucket").with_attribute(
                     "versioning",
-                    Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+                    Value::Concrete(ConcreteValue::String("Enabled".into())),
                 )),
                 changed_attributes: vec!["versioning".to_string()],
             },
@@ -1866,7 +1866,7 @@ mod tests {
                 "b",
             )),
             identifier: crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
-                "x".to_string(),
+                "x".into(),
             )),
         };
         let rem = Effect::Remove {
@@ -1937,7 +1937,7 @@ mod tests {
             )),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+                value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
             },
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(75 * 60),
@@ -1960,7 +1960,7 @@ mod tests {
             )),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+                value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
             },
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(60),
@@ -1984,7 +1984,7 @@ mod tests {
             )),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+                value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
             },
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: Duration::from_secs(60),
@@ -2009,7 +2009,7 @@ mod tests {
             )),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+                value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
             },
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(4500),
@@ -2082,7 +2082,7 @@ mod tests {
         let import = Effect::Import {
             id: crate::resource::ResolvedResourceId::new(rid.clone()),
             identifier: crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
-                "x-1".to_string(),
+                "x-1".into(),
             )),
         };
         let remove = Effect::Remove {
@@ -2098,7 +2098,7 @@ mod tests {
             until: WaitPredicate::Equals {
                 attr: crate::wait::predicate::AttrPath::single("status"),
                 value: crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
-                    "ready".to_string(),
+                    "ready".into(),
                 )),
             },
             until_surface: "status == 'ready'".to_string(),

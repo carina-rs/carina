@@ -432,7 +432,9 @@ fn build_create_rows(
                 items
                     .iter()
                     .filter_map(|item| match item {
-                        Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
+                        Value::Concrete(ConcreteValue::String(s)) => {
+                            Some(s.expose_plaintext().to_owned())
+                        }
                         _ => None,
                     })
                     .collect(),
@@ -1810,11 +1812,11 @@ mod tests {
         let resource = Resource::new("s3.Bucket", "my-bucket")
             .with_attribute(
                 "bucket",
-                Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+                Value::Concrete(ConcreteValue::String("my-bucket".into())),
             )
             .with_attribute(
                 "region",
-                Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+                Value::Concrete(ConcreteValue::String("us-east-1".into())),
             );
         let effect = Effect::Create(resolved(resource));
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
@@ -1829,14 +1831,14 @@ mod tests {
             ResourceId::with_identity("s3.Bucket", "my-bucket"),
             [(
                 "versioning".to_string(),
-                Value::Concrete(ConcreteValue::String("Disabled".to_string())),
+                Value::Concrete(ConcreteValue::String("Disabled".into())),
             )]
             .into_iter()
             .collect(),
         );
         let to = Resource::new("s3.Bucket", "my-bucket").with_attribute(
             "versioning",
-            Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+            Value::Concrete(ConcreteValue::String("Enabled".into())),
         );
         let effect = Effect::Update {
             from: Box::new(from),
@@ -1856,15 +1858,15 @@ mod tests {
             [
                 (
                     "name".to_string(),
-                    Value::Concrete(ConcreteValue::String("test".to_string())),
+                    Value::Concrete(ConcreteValue::String("test".into())),
                 ),
                 (
                     "region".to_string(),
-                    Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+                    Value::Concrete(ConcreteValue::String("us-east-1".into())),
                 ),
                 (
                     "versioning".to_string(),
-                    Value::Concrete(ConcreteValue::String("Disabled".to_string())),
+                    Value::Concrete(ConcreteValue::String("Disabled".into())),
                 ),
             ]
             .into_iter()
@@ -1873,15 +1875,15 @@ mod tests {
         let to = Resource::new("s3.Bucket", "my-bucket")
             .with_attribute(
                 "name",
-                Value::Concrete(ConcreteValue::String("test".to_string())),
+                Value::Concrete(ConcreteValue::String("test".into())),
             )
             .with_attribute(
                 "region",
-                Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+                Value::Concrete(ConcreteValue::String("us-east-1".into())),
             )
             .with_attribute(
                 "versioning",
-                Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+                Value::Concrete(ConcreteValue::String("Enabled".into())),
             );
         let effect = Effect::Update {
             from: Box::new(from),
@@ -1909,15 +1911,15 @@ mod tests {
             [
                 (
                     "authored".to_string(),
-                    Value::Concrete(ConcreteValue::String("a".to_string())),
+                    Value::Concrete(ConcreteValue::String("a".into())),
                 ),
                 (
                     "server_only".to_string(),
-                    Value::Concrete(ConcreteValue::String("s".to_string())),
+                    Value::Concrete(ConcreteValue::String("s".into())),
                 ),
                 (
                     "trigger_diff".to_string(),
-                    Value::Concrete(ConcreteValue::String("old-value".to_string())),
+                    Value::Concrete(ConcreteValue::String("old-value".into())),
                 ),
             ]
             .into_iter()
@@ -1926,15 +1928,15 @@ mod tests {
         let to = Resource::new("s3.Bucket", "my-bucket")
             .with_attribute(
                 "authored",
-                Value::Concrete(ConcreteValue::String("a".to_string())),
+                Value::Concrete(ConcreteValue::String("a".into())),
             )
             .with_attribute(
                 "server_only",
-                Value::Concrete(ConcreteValue::String("s".to_string())),
+                Value::Concrete(ConcreteValue::String("s".into())),
             )
             .with_attribute(
                 "trigger_diff",
-                Value::Concrete(ConcreteValue::String("new-value".to_string())),
+                Value::Concrete(ConcreteValue::String("new-value".into())),
             );
         let effect = Effect::Update {
             from: Box::new(from),
@@ -1997,7 +1999,7 @@ mod tests {
             id.clone(),
             [(
                 "bucket".to_string(),
-                Value::Concrete(ConcreteValue::String("old-bucket".to_string())),
+                Value::Concrete(ConcreteValue::String("old-bucket".into())),
             )]
             .into_iter()
             .collect(),
@@ -2014,11 +2016,11 @@ mod tests {
             [
                 (
                     "name".to_string(),
-                    Value::Concrete(ConcreteValue::String("test".to_string())),
+                    Value::Concrete(ConcreteValue::String("test".into())),
                 ),
                 (
                     "removed_attr".to_string(),
-                    Value::Concrete(ConcreteValue::String("old-val".to_string())),
+                    Value::Concrete(ConcreteValue::String("old-val".into())),
                 ),
             ]
             .into_iter()
@@ -2026,7 +2028,7 @@ mod tests {
         );
         let to = Resource::new("s3.Bucket", "my-bucket").with_attribute(
             "name",
-            Value::Concrete(ConcreteValue::String("test".to_string())),
+            Value::Concrete(ConcreteValue::String("test".into())),
         );
         let effect = Effect::Update {
             from: Box::new(from),
@@ -2042,11 +2044,11 @@ mod tests {
     fn replace_detail_rows_from_display_diff_previous_attributes_against_create() {
         let to = Resource::new("ec2.Vpc", "vpc").with_attribute(
             "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
         );
         let previous_attributes = HashMap::from([(
             "cidr_block".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         )]);
         let changed_create_only = vec!["cidr_block".to_string()];
         let replacement = ReplaceDisplayInfo {
@@ -2082,7 +2084,7 @@ mod tests {
         let mut rule = IndexMap::new();
         rule.insert(
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("legacy".to_string())),
+            Value::Concrete(ConcreteValue::String("legacy".into())),
         );
         rule.insert(
             "priority".to_string(),
@@ -2116,7 +2118,7 @@ mod tests {
                         fields: vec![
                             (
                                 "name".to_string(),
-                                Value::Concrete(ConcreteValue::String("legacy".to_string())),
+                                Value::Concrete(ConcreteValue::String("legacy".into())),
                             ),
                             (
                                 "priority".to_string(),
@@ -2135,11 +2137,11 @@ mod tests {
         let mut tags = IndexMap::new();
         tags.insert(
             "Name".to_string(),
-            Value::Concrete(ConcreteValue::String("test".to_string())),
+            Value::Concrete(ConcreteValue::String("test".into())),
         );
         tags.insert(
             "Environment".to_string(),
-            Value::Concrete(ConcreteValue::String("prod".to_string())),
+            Value::Concrete(ConcreteValue::String("prod".into())),
         );
         let resource = Resource::new("s3.Bucket", "my-bucket")
             .with_attribute("tags", Value::Concrete(ConcreteValue::Map(tags)));
@@ -2153,13 +2155,13 @@ mod tests {
                 assert_eq!(entries[0].key, "Environment");
                 assert_eq!(
                     entries[0].value,
-                    Value::Concrete(ConcreteValue::String("prod".to_string()))
+                    Value::Concrete(ConcreteValue::String("prod".into()))
                 );
                 assert!(entries[0].annotation.is_none());
                 assert_eq!(entries[1].key, "Name");
                 assert_eq!(
                     entries[1].value,
-                    Value::Concrete(ConcreteValue::String("test".to_string()))
+                    Value::Concrete(ConcreteValue::String("test".into()))
                 );
                 assert!(entries[1].annotation.is_none());
             }
@@ -2177,25 +2179,25 @@ mod tests {
         let mut statement1 = IndexMap::new();
         statement1.insert(
             "sid".to_string(),
-            Value::Concrete(ConcreteValue::String("AllowRead".to_string())),
+            Value::Concrete(ConcreteValue::String("AllowRead".into())),
         );
         statement1.insert(
             "effect".to_string(),
-            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+            Value::Concrete(ConcreteValue::String("Allow".into())),
         );
         let mut statement2 = IndexMap::new();
         statement2.insert(
             "sid".to_string(),
-            Value::Concrete(ConcreteValue::String("DenyWrite".to_string())),
+            Value::Concrete(ConcreteValue::String("DenyWrite".into())),
         );
         statement2.insert(
             "effect".to_string(),
-            Value::Concrete(ConcreteValue::String("Deny".to_string())),
+            Value::Concrete(ConcreteValue::String("Deny".into())),
         );
         let mut policy = IndexMap::new();
         policy.insert(
             "version".to_string(),
-            Value::Concrete(ConcreteValue::String("2012-10-17".to_string())),
+            Value::Concrete(ConcreteValue::String("2012-10-17".into())),
         );
         policy.insert(
             "statement".to_string(),
@@ -2254,7 +2256,7 @@ mod tests {
         let mut tags = IndexMap::new();
         tags.insert(
             "Name".to_string(),
-            Value::Concrete(ConcreteValue::String("test".to_string())),
+            Value::Concrete(ConcreteValue::String("test".into())),
         );
         let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
         delete_attrs.insert(
@@ -2275,7 +2277,7 @@ mod tests {
                 assert_eq!(entries[0].key, "Name");
                 assert_eq!(
                     entries[0].value,
-                    Value::Concrete(ConcreteValue::String("test".to_string()))
+                    Value::Concrete(ConcreteValue::String("test".into()))
                 );
             }
             other => panic!("expected MapExpanded, got {:?}", other),
@@ -2302,13 +2304,11 @@ mod tests {
         let mut entry = IndexMap::new();
         entry.insert(
             "domain_name".to_string(),
-            Value::Concrete(ConcreteValue::String(
-                "registry-dev.carina-rs.dev".to_string(),
-            )),
+            Value::Concrete(ConcreteValue::String("registry-dev.carina-rs.dev".into())),
         );
         entry.insert(
             "validation_method".to_string(),
-            Value::Concrete(ConcreteValue::String("DNS".to_string())),
+            Value::Concrete(ConcreteValue::String("DNS".into())),
         );
         let dvo = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::Map(entry),
@@ -2348,14 +2348,14 @@ mod tests {
             ResourceId::with_identity("ec2.Vpc", "my-vpc"),
             [(
                 "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             )]
             .into_iter()
             .collect(),
         );
         let to = Resource::new("ec2.Vpc", "my-vpc").with_attribute(
             "cidr_block",
-            Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
         );
         let rows = replace_rows_for_test(
             from,
@@ -2378,7 +2378,7 @@ mod tests {
             ResourceId::with_identity("test.Widget", "beta"),
             [(
                 "legacy_token".to_string(),
-                Value::Concrete(ConcreteValue::String("tok".to_string())),
+                Value::Concrete(ConcreteValue::String("tok".into())),
             )]
             .into_iter()
             .collect(),
@@ -2407,7 +2407,7 @@ mod tests {
         let mut settings = IndexMap::new();
         settings.insert(
             "mode".to_string(),
-            Value::Concrete(ConcreteValue::String("legacy".to_string())),
+            Value::Concrete(ConcreteValue::String("legacy".into())),
         );
         settings.insert(
             "version".to_string(),
@@ -2450,7 +2450,7 @@ mod tests {
         let mut rule = IndexMap::new();
         rule.insert(
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("legacy".to_string())),
+            Value::Concrete(ConcreteValue::String("legacy".into())),
         );
         rule.insert(
             "priority".to_string(),
@@ -2478,7 +2478,7 @@ mod tests {
                         fields: vec![
                             (
                                 "name".to_string(),
-                                Value::Concrete(ConcreteValue::String("legacy".to_string())),
+                                Value::Concrete(ConcreteValue::String("legacy".into())),
                             ),
                             (
                                 "priority".to_string(),
@@ -2499,23 +2499,23 @@ mod tests {
             [
                 (
                     "name".to_string(),
-                    Value::Concrete(ConcreteValue::String("edge-old".to_string())),
+                    Value::Concrete(ConcreteValue::String("edge-old".into())),
                 ),
                 (
                     "description".to_string(),
-                    Value::Concrete(ConcreteValue::String("old description".to_string())),
+                    Value::Concrete(ConcreteValue::String("old description".into())),
                 ),
                 (
                     "metric_name".to_string(),
-                    Value::Concrete(ConcreteValue::String("edge-old-metric".to_string())),
+                    Value::Concrete(ConcreteValue::String("edge-old-metric".into())),
                 ),
                 (
                     "rule_metric_name".to_string(),
-                    Value::Concrete(ConcreteValue::String("rule-old".to_string())),
+                    Value::Concrete(ConcreteValue::String("rule-old".into())),
                 ),
                 (
                     "scope".to_string(),
-                    Value::Concrete(ConcreteValue::String("CLOUDFRONT".to_string())),
+                    Value::Concrete(ConcreteValue::String("CLOUDFRONT".into())),
                 ),
             ]
             .into_iter()
@@ -2524,23 +2524,23 @@ mod tests {
         let to = Resource::new("wafv2.WebAcl", "edge")
             .with_attribute(
                 "name",
-                Value::Concrete(ConcreteValue::String("edge-new".to_string())),
+                Value::Concrete(ConcreteValue::String("edge-new".into())),
             )
             .with_attribute(
                 "description",
-                Value::Concrete(ConcreteValue::String("new description".to_string())),
+                Value::Concrete(ConcreteValue::String("new description".into())),
             )
             .with_attribute(
                 "metric_name",
-                Value::Concrete(ConcreteValue::String("edge-new-metric".to_string())),
+                Value::Concrete(ConcreteValue::String("edge-new-metric".into())),
             )
             .with_attribute(
                 "rule_metric_name",
-                Value::Concrete(ConcreteValue::String("rule-new".to_string())),
+                Value::Concrete(ConcreteValue::String("rule-new".into())),
             )
             .with_attribute(
                 "scope",
-                Value::Concrete(ConcreteValue::String("CLOUDFRONT".to_string())),
+                Value::Concrete(ConcreteValue::String("CLOUDFRONT".into())),
             );
         let rows = replace_rows_for_test(from, to, &["name"], DetailLevel::Full, vec![], None);
 
@@ -2588,14 +2588,14 @@ mod tests {
             ResourceId::with_identity("test.Widget", "w"),
             [(
                 "arn".to_string(),
-                Value::Concrete(ConcreteValue::String("arn:old".to_string())),
+                Value::Concrete(ConcreteValue::String("arn:old".into())),
             )]
             .into_iter()
             .collect(),
         );
         let to = Resource::new("test.Widget", "w").with_attribute(
             "arn",
-            Value::Concrete(ConcreteValue::String("arn:old".to_string())),
+            Value::Concrete(ConcreteValue::String("arn:old".into())),
         );
         let rows = replace_rows_for_test(
             from,
@@ -2622,14 +2622,14 @@ mod tests {
             ResourceId::with_identity("test.Widget", "w"),
             [(
                 "arn".to_string(),
-                Value::Concrete(ConcreteValue::String("arn:old".to_string())),
+                Value::Concrete(ConcreteValue::String("arn:old".into())),
             )]
             .into_iter()
             .collect(),
         );
         let to = Resource::new("test.Widget", "w").with_attribute(
             "arn",
-            Value::Concrete(ConcreteValue::String("arn:old".to_string())),
+            Value::Concrete(ConcreteValue::String("arn:old".into())),
         );
         let rows = replace_rows_for_test(from, to, &["arn"], DetailLevel::Explicit, vec![], None);
 
@@ -2648,19 +2648,19 @@ mod tests {
         let mut old_condition = IndexMap::new();
         old_condition.insert(
             "string_equals".to_string(),
-            Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()])),
+            Value::Concrete(ConcreteValue::StringList(vec!["x".into()])),
         );
         let mut new_condition = IndexMap::new();
         new_condition.insert(
             "string_equals".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("x".to_string()),
+                ConcreteValue::String("x".into()),
             )])),
         );
         let mut old_item = IndexMap::new();
         old_item.insert(
             "sid".to_string(),
-            Value::Concrete(ConcreteValue::String("shared".to_string())),
+            Value::Concrete(ConcreteValue::String("shared".into())),
         );
         old_item.insert(
             "condition".to_string(),
@@ -2669,7 +2669,7 @@ mod tests {
         let mut new_item = IndexMap::new();
         new_item.insert(
             "sid".to_string(),
-            Value::Concrete(ConcreteValue::String("shared".to_string())),
+            Value::Concrete(ConcreteValue::String("shared".into())),
         );
         new_item.insert(
             "condition".to_string(),
@@ -2709,14 +2709,14 @@ mod tests {
         old_settings.insert(
             "principal".to_string(),
             Value::Concrete(ConcreteValue::StringList(vec![
-                "arn:aws:iam::123:oidc-provider/x".to_string(),
+                "arn:aws:iam::123:oidc-provider/x".into(),
             ])),
         );
         let mut new_settings = IndexMap::new();
         new_settings.insert(
             "principal".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("arn:aws:iam::123:oidc-provider/x".to_string()),
+                ConcreteValue::String("arn:aws:iam::123:oidc-provider/x".into()),
             )])),
         );
         let from = State::existing(
@@ -2749,7 +2749,7 @@ mod tests {
             ResourceId::with_identity("test.Widget", "w"),
             [(
                 "aliases".to_string(),
-                Value::Concrete(ConcreteValue::StringList(vec!["only-one".to_string()])),
+                Value::Concrete(ConcreteValue::StringList(vec!["only-one".into()])),
             )]
             .into_iter()
             .collect(),
@@ -2757,7 +2757,7 @@ mod tests {
         let to = Resource::new("test.Widget", "w").with_attribute(
             "aliases",
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("only-one".to_string()),
+                ConcreteValue::String("only-one".into()),
             )])),
         );
         let rows = replace_rows_for_test(from, to, &["aliases"], DetailLevel::Full, vec![], None);
@@ -2782,11 +2782,11 @@ mod tests {
             [
                 (
                     "server_defaulted_name".to_string(),
-                    Value::Concrete(ConcreteValue::String("old-name".to_string())),
+                    Value::Concrete(ConcreteValue::String("old-name".into())),
                 ),
                 (
                     "authored".to_string(),
-                    Value::Concrete(ConcreteValue::String("kept".to_string())),
+                    Value::Concrete(ConcreteValue::String("kept".into())),
                 ),
             ]
             .into_iter()
@@ -2795,11 +2795,11 @@ mod tests {
         let to = Resource::new("test.Widget", "w")
             .with_attribute(
                 "server_defaulted_name",
-                Value::Concrete(ConcreteValue::String("new-name".to_string())),
+                Value::Concrete(ConcreteValue::String("new-name".into())),
             )
             .with_attribute(
                 "authored",
-                Value::Concrete(ConcreteValue::String("kept".to_string())),
+                Value::Concrete(ConcreteValue::String("kept".into())),
             );
         let explicit = HashMap::from([(
             id,
@@ -2836,11 +2836,11 @@ mod tests {
             [
                 (
                     "external_name".to_string(),
-                    Value::Concrete(ConcreteValue::String("old-name".to_string())),
+                    Value::Concrete(ConcreteValue::String("old-name".into())),
                 ),
                 (
                     "tag".to_string(),
-                    Value::Concrete(ConcreteValue::String("legacy".to_string())),
+                    Value::Concrete(ConcreteValue::String("legacy".into())),
                 ),
             ]
             .into_iter()
@@ -2848,7 +2848,7 @@ mod tests {
         );
         let to = Resource::new("test.Widget", "w").with_attribute(
             "external_name",
-            Value::Concrete(ConcreteValue::String("new-name".to_string())),
+            Value::Concrete(ConcreteValue::String("new-name".into())),
         );
         let rows = replace_rows_for_test(
             from,
@@ -2871,11 +2871,11 @@ mod tests {
         let mut entry = indexmap::IndexMap::new();
         entry.insert(
             "sid".to_string(),
-            Value::Concrete(ConcreteValue::String("S1".to_string())),
+            Value::Concrete(ConcreteValue::String("S1".into())),
         );
         entry.insert(
             "effect".to_string(),
-            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+            Value::Concrete(ConcreteValue::String("Allow".into())),
         );
         let resource = Resource::new("iam.RolePolicy", "test").with_attribute(
             "statement",
@@ -2907,7 +2907,7 @@ mod tests {
     fn create_row_scalar_attribute_unchanged() {
         let resource = Resource::new("iam.Role", "test").with_attribute(
             "role_name",
-            Value::Concrete(ConcreteValue::String("foo".to_string())),
+            Value::Concrete(ConcreteValue::String("foo".into())),
         );
         let effect = Effect::Create(resolved(resource));
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None, None);
@@ -2928,10 +2928,10 @@ mod tests {
             "managed_policy_arns",
             Value::Concrete(ConcreteValue::List(vec![
                 Value::Concrete(ConcreteValue::String(
-                    "arn:aws:iam::aws:policy/Policy1".to_string(),
+                    "arn:aws:iam::aws:policy/Policy1".into(),
                 )),
                 Value::Concrete(ConcreteValue::String(
-                    "arn:aws:iam::aws:policy/Policy2".to_string(),
+                    "arn:aws:iam::aws:policy/Policy2".into(),
                 )),
             ])),
         );
@@ -3030,7 +3030,7 @@ mod tests {
         stmt.insert("effect".to_string(), Value::Concrete(effect));
         stmt.insert(
             "action".to_string(),
-            Value::Concrete(ConcreteValue::String("s3:GetObject".to_string())),
+            Value::Concrete(ConcreteValue::String("s3:GetObject".into())),
         );
         let mut policy = indexmap::IndexMap::new();
         policy.insert("version".to_string(), Value::Concrete(version));
@@ -3067,8 +3067,8 @@ mod tests {
         let to = Resource::new("iam.Role", "r").with_attribute(
             "policy",
             iam_policy_value(
-                ConcreteValue::String("Allow".to_string()),
-                ConcreteValue::String("2012-10-17".to_string()),
+                ConcreteValue::String("Allow".into()),
+                ConcreteValue::String("2012-10-17".into()),
             ),
         );
         let effect = Effect::Update {
@@ -3101,7 +3101,7 @@ mod tests {
                 ),
                 (
                     "description".to_string(),
-                    Value::Concrete(ConcreteValue::String("old".to_string())),
+                    Value::Concrete(ConcreteValue::String("old".into())),
                 ),
             ]
             .into_iter()
@@ -3111,13 +3111,13 @@ mod tests {
             .with_attribute(
                 "policy",
                 iam_policy_value(
-                    ConcreteValue::String("Allow".to_string()),
-                    ConcreteValue::String("2012-10-17".to_string()),
+                    ConcreteValue::String("Allow".into()),
+                    ConcreteValue::String("2012-10-17".into()),
                 ),
             )
             .with_attribute(
                 "description",
-                Value::Concrete(ConcreteValue::String("new".to_string())),
+                Value::Concrete(ConcreteValue::String("new".into())),
             );
         let effect = Effect::Update {
             from: Box::new(from),
@@ -3158,8 +3158,8 @@ mod tests {
         let to = Resource::new("iam.Role", "r").with_attribute(
             "policy",
             iam_policy_value(
-                ConcreteValue::String("Allow".to_string()),
-                ConcreteValue::String("2012-10-17".to_string()),
+                ConcreteValue::String("Allow".into()),
+                ConcreteValue::String("2012-10-17".into()),
             ),
         );
         let effect = Effect::Update {
@@ -3197,8 +3197,8 @@ mod tests {
         let to = Resource::new("iam.Role", "r").with_attribute(
             "policy",
             iam_policy_value(
-                ConcreteValue::String("Allow".to_string()),
-                ConcreteValue::String("2012-10-17".to_string()),
+                ConcreteValue::String("Allow".into()),
+                ConcreteValue::String("2012-10-17".into()),
             ),
         );
         let effect = Effect::Update {
@@ -3261,7 +3261,7 @@ mod tests {
             .collect(),
         );
         let to = Resource::new("x.Thing", "t")
-            .with_attribute("modes", mk(ConcreteValue::String("On".to_string())));
+            .with_attribute("modes", mk(ConcreteValue::String("On".into())));
         let effect = Effect::Update {
             from: Box::new(from),
             to: resolved(to),
@@ -3297,8 +3297,8 @@ mod tests {
         let to = Resource::new("iam.Role", "r").with_attribute(
             "policy",
             iam_policy_value(
-                ConcreteValue::String("Deny".to_string()),
-                ConcreteValue::String("2012-10-17".to_string()),
+                ConcreteValue::String("Deny".into()),
+                ConcreteValue::String("2012-10-17".into()),
             ),
         );
         let effect = Effect::Update {
@@ -3335,11 +3335,11 @@ mod tests {
                 ),
                 (
                     "description".to_string(),
-                    Value::Concrete(ConcreteValue::String("old".to_string())),
+                    Value::Concrete(ConcreteValue::String("old".into())),
                 ),
                 (
                     "region".to_string(),
-                    Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+                    Value::Concrete(ConcreteValue::String("us-east-1".into())),
                 ),
             ]
             .into_iter()
@@ -3349,17 +3349,17 @@ mod tests {
             .with_attribute(
                 "policy",
                 iam_policy_value(
-                    ConcreteValue::String("Allow".to_string()),
-                    ConcreteValue::String("2012-10-17".to_string()),
+                    ConcreteValue::String("Allow".into()),
+                    ConcreteValue::String("2012-10-17".into()),
                 ),
             )
             .with_attribute(
                 "description",
-                Value::Concrete(ConcreteValue::String("new".to_string())),
+                Value::Concrete(ConcreteValue::String("new".into())),
             )
             .with_attribute(
                 "region",
-                Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+                Value::Concrete(ConcreteValue::String("us-east-1".into())),
             );
         let effect = Effect::Update {
             from: Box::new(from),
@@ -3580,14 +3580,16 @@ mod tests {
         old_oidc.insert(
             "action".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("sts:AssumeRoleWithWebIdentity".to_string()),
+                ConcreteValue::String("sts:AssumeRoleWithWebIdentity".into()),
             )])),
         );
         // The shape-mismatched field that breaks Phase 1 exact match.
         old_oidc.insert(
             "principal_federated".to_string(),
             Value::Concrete(ConcreteValue::StringList(vec![
-                "arn:aws:iam::123:oidc-provider/token.example.com".to_string(),
+                "arn:aws:iam::123:oidc-provider/token.example.com"
+                    .to_string()
+                    .into(),
             ])),
         );
 
@@ -3595,14 +3597,16 @@ mod tests {
         new_oidc.insert(
             "action".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("sts:AssumeRoleWithWebIdentity".to_string()),
+                ConcreteValue::String("sts:AssumeRoleWithWebIdentity".into()),
             )])),
         );
         new_oidc.insert(
             "principal_federated".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::String(
-                    "arn:aws:iam::123:oidc-provider/token.example.com".to_string(),
+                    "arn:aws:iam::123:oidc-provider/token.example.com"
+                        .to_string()
+                        .into(),
                 ),
             )])),
         );
@@ -3614,7 +3618,7 @@ mod tests {
         let mut new_admin = indexmap::IndexMap::new();
         new_admin.insert(
             "action".to_string(),
-            Value::Concrete(ConcreteValue::String("sts:AssumeRole".to_string())),
+            Value::Concrete(ConcreteValue::String("sts:AssumeRole".into())),
         );
 
         let old_value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -3664,26 +3668,26 @@ mod tests {
         old_principal.insert(
             "federated".to_string(),
             Value::Concrete(ConcreteValue::StringList(vec![
-                "arn:aws:iam::123:oidc-provider/x".to_string(),
+                "arn:aws:iam::123:oidc-provider/x".into(),
             ])),
         );
         // A genuinely different sibling key forces the parent map onto
         // the Changed path so the recursion is exercised.
         old_principal.insert(
             "service".to_string(),
-            Value::Concrete(ConcreteValue::String("old.example.com".to_string())),
+            Value::Concrete(ConcreteValue::String("old.example.com".into())),
         );
 
         let mut new_principal = indexmap::IndexMap::new();
         new_principal.insert(
             "federated".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("arn:aws:iam::123:oidc-provider/x".to_string()),
+                ConcreteValue::String("arn:aws:iam::123:oidc-provider/x".into()),
             )])),
         );
         new_principal.insert(
             "service".to_string(),
-            Value::Concrete(ConcreteValue::String("new.example.com".to_string())),
+            Value::Concrete(ConcreteValue::String("new.example.com".into())),
         );
 
         let old_value = Value::Concrete(ConcreteValue::Map(old_principal));
@@ -3725,7 +3729,7 @@ mod tests {
             ResourceId::with_identity("x.Thing", "t"),
             [(
                 "tags".to_string(),
-                Value::Concrete(ConcreteValue::StringList(vec!["only-one".to_string()])),
+                Value::Concrete(ConcreteValue::StringList(vec!["only-one".into()])),
             )]
             .into_iter()
             .collect(),
@@ -3733,7 +3737,7 @@ mod tests {
         let to = Resource::new("x.Thing", "t").with_attribute(
             "tags",
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("only-one".to_string()),
+                ConcreteValue::String("only-one".into()),
             )])),
         );
         let effect = Effect::Update {
@@ -3766,7 +3770,7 @@ mod tests {
             [(
                 "password".to_string(),
                 Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("old-secret".to_string()),
+                    ConcreteValue::String("old-secret".into()),
                 )))),
             )]
             .into_iter()
@@ -3775,7 +3779,7 @@ mod tests {
         let to = Resource::new("x.Thing", "t").with_attribute(
             "password",
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("new-secret".to_string()),
+                ConcreteValue::String("new-secret".into()),
             )))),
         );
         let effect = Effect::Update {
@@ -3808,13 +3812,13 @@ mod tests {
         let mut old_condition = indexmap::IndexMap::new();
         old_condition.insert(
             "string_equals".to_string(),
-            Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()])),
+            Value::Concrete(ConcreteValue::StringList(vec!["x".into()])),
         );
         let mut new_condition = indexmap::IndexMap::new();
         new_condition.insert(
             "string_equals".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("x".to_string()),
+                ConcreteValue::String("x".into()),
             )])),
         );
 
@@ -3825,11 +3829,11 @@ mod tests {
         let mut old_stmt = indexmap::IndexMap::new();
         old_stmt.insert(
             "sid".to_string(),
-            Value::Concrete(ConcreteValue::String("shared".to_string())),
+            Value::Concrete(ConcreteValue::String("shared".into())),
         );
         old_stmt.insert(
             "effect".to_string(),
-            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+            Value::Concrete(ConcreteValue::String("Allow".into())),
         );
         old_stmt.insert(
             "condition".to_string(),
@@ -3839,11 +3843,11 @@ mod tests {
         let mut new_stmt = indexmap::IndexMap::new();
         new_stmt.insert(
             "sid".to_string(),
-            Value::Concrete(ConcreteValue::String("shared".to_string())),
+            Value::Concrete(ConcreteValue::String("shared".into())),
         );
         new_stmt.insert(
             "effect".to_string(),
-            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+            Value::Concrete(ConcreteValue::String("Allow".into())),
         );
         new_stmt.insert(
             "condition".to_string(),
@@ -3889,14 +3893,14 @@ mod tests {
         old_map.insert(
             "password".to_string(),
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("old".to_string()),
+                ConcreteValue::String("old".into()),
             )))),
         );
         let mut new_map = indexmap::IndexMap::new();
         new_map.insert(
             "password".to_string(),
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("new".to_string()),
+                ConcreteValue::String("new".into()),
             )))),
         );
         let old_value = Value::Concrete(ConcreteValue::Map(old_map));
@@ -3925,10 +3929,10 @@ mod tests {
     #[test]
     fn list_of_maps_modified_keeps_secret_rotation_visible() {
         let secret_old = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("old".to_string()),
+            ConcreteValue::String("old".into()),
         ))));
         let secret_new = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("new".to_string()),
+            ConcreteValue::String("new".into()),
         ))));
 
         // Same `sid` on both sides so the similarity score is positive → Phase 2
@@ -3937,22 +3941,22 @@ mod tests {
         let mut old_stmt = indexmap::IndexMap::new();
         old_stmt.insert(
             "sid".to_string(),
-            Value::Concrete(ConcreteValue::String("shared".to_string())),
+            Value::Concrete(ConcreteValue::String("shared".into())),
         );
         old_stmt.insert(
             "effect".to_string(),
-            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+            Value::Concrete(ConcreteValue::String("Allow".into())),
         );
         old_stmt.insert("password".to_string(), secret_old);
 
         let mut new_stmt = indexmap::IndexMap::new();
         new_stmt.insert(
             "sid".to_string(),
-            Value::Concrete(ConcreteValue::String("shared".to_string())),
+            Value::Concrete(ConcreteValue::String("shared".into())),
         );
         new_stmt.insert(
             "effect".to_string(),
-            Value::Concrete(ConcreteValue::String("Deny".to_string())),
+            Value::Concrete(ConcreteValue::String("Deny".into())),
         );
         new_stmt.insert("password".to_string(), secret_new);
 
@@ -3987,7 +3991,7 @@ mod tests {
     /// steal the only old statement from a more-similar modified statement.
     #[test]
     fn list_of_maps_best_first_pairing_prevents_greedy_steal() {
-        let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string()));
+        let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
         let strings = |values: &[&str]| {
             Value::Concrete(ConcreteValue::List(
                 values.iter().map(|value| string(value)).collect(),
@@ -4096,25 +4100,25 @@ mod tests {
             ),
             (
                 "description".to_string(),
-                Value::Concrete(ConcreteValue::String("before".to_string())),
+                Value::Concrete(ConcreteValue::String("before".into())),
             ),
         ])));
         let new_item = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
             (
                 "effect".to_string(),
-                Value::Concrete(ConcreteValue::String("Allow".to_string())),
+                Value::Concrete(ConcreteValue::String("Allow".into())),
             ),
             (
                 "mode".to_string(),
-                Value::Concrete(ConcreteValue::String("Enabled".to_string())),
+                Value::Concrete(ConcreteValue::String("Enabled".into())),
             ),
             (
                 "scope".to_string(),
-                Value::Concrete(ConcreteValue::String("Regional".to_string())),
+                Value::Concrete(ConcreteValue::String("Regional".into())),
             ),
             (
                 "description".to_string(),
-                Value::Concrete(ConcreteValue::String("after".to_string())),
+                Value::Concrete(ConcreteValue::String("after".into())),
             ),
         ])));
         let old_value = Value::Concrete(ConcreteValue::List(vec![old_item]));

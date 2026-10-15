@@ -340,7 +340,7 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
     assert_eq!(
         policy.get_attr("role_name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "carina-bootstrap".to_string()
+            "carina-bootstrap".into()
         ))),
         "expected RolePolicy.role_name to resolve to the concrete literal; got: {:?}",
         policy.get_attr("role_name")

@@ -44,7 +44,7 @@ fn create_test_module() -> ParsedFile {
                 let mut attrs = HashMap::new();
                 attrs.insert(
                     "name".to_string(),
-                    Value::Concrete(ConcreteValue::String("sg".to_string())),
+                    Value::Concrete(ConcreteValue::String("sg".into())),
                 );
                 attrs.insert(
                     "vpc_id".to_string(),
@@ -54,7 +54,7 @@ fn create_test_module() -> ParsedFile {
                 );
                 attrs.insert(
                     "_type".to_string(),
-                    Value::Concrete(ConcreteValue::String("aws.security_group".to_string())),
+                    Value::Concrete(ConcreteValue::String("aws.security_group".into())),
                 );
                 attrs.into_iter().collect()
             },
@@ -104,7 +104,7 @@ fn test_substitute_arguments() {
     let mut inputs = HashMap::new();
     inputs.insert(
         "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+        Value::Concrete(ConcreteValue::String("vpc-123".into())),
     );
 
     // Argument params are lexically scoped: binding_name is the param name itself
@@ -115,7 +115,7 @@ fn test_substitute_arguments() {
 
     assert_eq!(
         result,
-        Value::Concrete(ConcreteValue::String("vpc-123".to_string()))
+        Value::Concrete(ConcreteValue::String("vpc-123".into()))
     );
 }
 
@@ -162,7 +162,7 @@ fn create_test_module_with_anonymous_resource() -> ParsedFile {
                 let mut attrs = IndexMap::new();
                 attrs.insert(
                     "policy_name".to_string(),
-                    Value::Concrete(ConcreteValue::String("inline".to_string())),
+                    Value::Concrete(ConcreteValue::String("inline".into())),
                 );
                 attrs
             },
@@ -297,7 +297,7 @@ fn test_expand_module_call() {
             let mut args = HashMap::new();
             args.insert(
                 "vpc_id".to_string(),
-                Value::Concrete(ConcreteValue::String("vpc-456".to_string())),
+                Value::Concrete(ConcreteValue::String("vpc-456".into())),
             );
             args
         },
@@ -316,9 +316,7 @@ fn test_expand_module_call() {
     );
     assert_eq!(
         sg.get_attr("vpc_id"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "vpc-456".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("vpc-456".into())))
     );
     assert_eq!(
         sg.module_source,
@@ -361,7 +359,7 @@ fn create_module_with_named_provider_instance() -> ParsedFile {
                 let mut attrs = IndexMap::new();
                 attrs.insert(
                     "domain_name".to_string(),
-                    Value::Concrete(ConcreteValue::String("example.com".to_string())),
+                    Value::Concrete(ConcreteValue::String("example.com".into())),
                 );
                 attrs
             },
@@ -460,7 +458,7 @@ fn test_reconcile_anonymous_module_instances_preserves_provider_instance() {
             let mut attrs = IndexMap::new();
             attrs.insert(
                 "role_name".to_string(),
-                Value::Concrete(ConcreteValue::String("r".to_string())),
+                Value::Concrete(ConcreteValue::String("r".into())),
             );
             attrs
         },
@@ -582,7 +580,7 @@ fn test_multiple_module_instances_no_collision() {
             let mut args = HashMap::new();
             args.insert(
                 "cidr".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             );
             args
         },
@@ -595,7 +593,7 @@ fn test_multiple_module_instances_no_collision() {
             let mut args = HashMap::new();
             args.insert(
                 "cidr".to_string(),
-                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             );
             args
         },
@@ -677,11 +675,11 @@ fn create_module_with_attributes() -> ParsedFile {
                 let mut attrs = HashMap::new();
                 attrs.insert(
                     "name".to_string(),
-                    Value::Concrete(ConcreteValue::String("sg".to_string())),
+                    Value::Concrete(ConcreteValue::String("sg".into())),
                 );
                 attrs.insert(
                     "_type".to_string(),
-                    Value::Concrete(ConcreteValue::String("aws.security_group".to_string())),
+                    Value::Concrete(ConcreteValue::String("aws.security_group".into())),
                 );
                 attrs.into_iter().collect()
             },
@@ -1016,7 +1014,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
             "endpoint".to_string(),
             None,
             Some(Value::Concrete(ConcreteValue::String(
-                "fixed-endpoint".to_string(),
+                "fixed-endpoint".into(),
             ))),
         )],
         export_params: vec![],
@@ -1041,7 +1039,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
     let mut call_arguments: HashMap<String, Value> = HashMap::new();
     call_arguments.insert(
         "region".to_string(),
-        Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string())),
+        Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
     );
     call_arguments.insert(
         "instance_count".to_string(),
@@ -1068,7 +1066,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
             .get("region")
             .map(|argument| argument.value()),
         Some(&Value::Concrete(ConcreteValue::String(
-            "ap-northeast-1".to_string()
+            "ap-northeast-1".into()
         ))),
         "region argument must be recorded on the composition signature",
     );
@@ -1104,7 +1102,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
             .get("endpoint")
             .map(|a| a.to_value()),
         Some(Value::Concrete(ConcreteValue::String(
-            "fixed-endpoint".to_string()
+            "fixed-endpoint".into()
         ))),
     );
 }
@@ -1171,7 +1169,7 @@ fn role_names(parsed: &ParsedFile) -> HashSet<String> {
         .iter()
         .filter(|r| r.id.resource_type == "iam.Role")
         .filter_map(|r| match r.get_attr("role_name")? {
-            Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
+            Value::Concrete(ConcreteValue::String(s)) => Some(s.expose_plaintext().to_owned()),
             _ => None,
         })
         .collect()
@@ -1187,7 +1185,7 @@ fn test_anonymous_module_calls_get_distinct_prefixes() {
             let mut args = HashMap::new();
             args.insert(
                 "github_repo".to_string(),
-                Value::Concrete(ConcreteValue::String("carina-rs/infra".to_string())),
+                Value::Concrete(ConcreteValue::String("carina-rs/infra".into())),
             );
             args
         },
@@ -1200,7 +1198,7 @@ fn test_anonymous_module_calls_get_distinct_prefixes() {
             let mut args = HashMap::new();
             args.insert(
                 "github_repo".to_string(),
-                Value::Concrete(ConcreteValue::String("carina-rs/other".to_string())),
+                Value::Concrete(ConcreteValue::String("carina-rs/other".into())),
             );
             args
         },
@@ -1233,17 +1231,19 @@ fn test_anonymous_module_call_prefix_is_locality_sensitive() {
             let mut args = HashMap::new();
             args.insert(
                 "github_repo".to_string(),
-                Value::Concrete(ConcreteValue::String(repo.to_string())),
+                Value::Concrete(ConcreteValue::String(repo.to_string().into())),
             );
             args.insert(
                 "role_name".to_string(),
-                Value::Concrete(ConcreteValue::String("github-actions".to_string())),
+                Value::Concrete(ConcreteValue::String("github-actions".into())),
             );
             args.insert(
                 "managed_policy_arns".to_string(),
                 Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                     ConcreteValue::String(
-                        "arn:aws:iam::aws:policy/AdministratorAccess".to_string(),
+                        "arn:aws:iam::aws:policy/AdministratorAccess"
+                            .to_string()
+                            .into(),
                     ),
                 )])),
             );
@@ -1841,7 +1841,7 @@ fn test_expand_module_call_uses_dot_path_addressing() {
             let mut args = HashMap::new();
             args.insert(
                 "vpc_id".to_string(),
-                Value::Concrete(ConcreteValue::String("vpc-456".to_string())),
+                Value::Concrete(ConcreteValue::String("vpc-456".into())),
             );
             args
         },
@@ -1878,7 +1878,7 @@ fn test_module_dot_path_bindings_and_refs() {
             let mut args = HashMap::new();
             args.insert(
                 "cidr".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             );
             args
         },
@@ -1953,7 +1953,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
             until_raw: "main_vpc.state == \"available\"".to_string(),
             until_predicate: UntilPredicateAst {
                 lhs_segments: vec!["main_vpc".to_string(), "state".to_string()],
-                rhs: Value::Concrete(ConcreteValue::String("available".to_string())),
+                rhs: Value::Concrete(ConcreteValue::String("available".into())),
             },
             timeout_secs: Some(300),
             depends_on: vec!["subnet".into()],
@@ -1976,7 +1976,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
             let mut args = HashMap::new();
             args.insert(
                 "cidr".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             );
             args
         },
@@ -1998,7 +1998,7 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
     // RHS value and surface text are not binding names — unchanged.
     assert_eq!(
         wb.until_predicate.rhs,
-        Value::Concrete(ConcreteValue::String("available".to_string()))
+        Value::Concrete(ConcreteValue::String("available".into()))
     );
     assert_eq!(wb.timeout_secs, Some(300));
 
@@ -2067,16 +2067,16 @@ fn test_substitute_arguments_interpolation() {
     let mut inputs = HashMap::new();
     inputs.insert(
         "env_name".to_string(),
-        Value::Concrete(ConcreteValue::String("dev".to_string())),
+        Value::Concrete(ConcreteValue::String("dev".into())),
     );
 
     // Interpolation like "prefix-${env_name}-suffix" where env_name is a module argument
     let value = Value::Deferred(DeferredValue::Interpolation(vec![
-        InterpolationPart::Literal("prefix-".to_string()),
+        InterpolationPart::Literal("prefix-".into()),
         InterpolationPart::Expr(Value::Deferred(DeferredValue::BindingRef {
             binding: "env_name".to_string(),
         })),
-        InterpolationPart::Literal("-suffix".to_string()),
+        InterpolationPart::Literal("-suffix".into()),
     ]));
     let result = substitute_arguments(&value, &inputs);
 
@@ -2084,9 +2084,9 @@ fn test_substitute_arguments_interpolation() {
     assert_eq!(
         result,
         Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Literal("prefix-".to_string()),
-            InterpolationPart::Expr(Value::Concrete(ConcreteValue::String("dev".to_string()))),
-            InterpolationPart::Literal("-suffix".to_string()),
+            InterpolationPart::Literal("prefix-".into()),
+            InterpolationPart::Expr(Value::Concrete(ConcreteValue::String("dev".into()))),
+            InterpolationPart::Literal("-suffix".into()),
         ]))
     );
 }
@@ -2108,12 +2108,12 @@ fn test_unknown_argument_rejected() {
             let mut args = HashMap::new();
             args.insert(
                 "vpc_id".to_string(),
-                Value::Concrete(ConcreteValue::String("vpc-456".to_string())),
+                Value::Concrete(ConcreteValue::String("vpc-456".into())),
             );
             // Unknown argument: not declared in the module
             args.insert(
                 "unknown_arg".to_string(),
-                Value::Concrete(ConcreteValue::String("should-fail".to_string())),
+                Value::Concrete(ConcreteValue::String("should-fail".into())),
             );
             args
         },
@@ -2132,7 +2132,7 @@ fn test_substitute_arguments_function_call() {
     let mut inputs = HashMap::new();
     inputs.insert(
         "cidr".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
 
     // FunctionCall like cidr_subnet(cidr, 8, 0) where cidr is a module argument
@@ -2153,7 +2153,7 @@ fn test_substitute_arguments_function_call() {
         Value::Deferred(DeferredValue::FunctionCall {
             name: "cidr_subnet".to_string(),
             args: vec![
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                 Value::Concrete(ConcreteValue::Int(8)),
                 Value::Concrete(ConcreteValue::Int(0)),
             ],
@@ -2182,7 +2182,7 @@ fn create_module_with_interpolation() -> ParsedFile {
                 attrs.insert(
                     "name".to_string(),
                     Value::Deferred(DeferredValue::Interpolation(vec![
-                        InterpolationPart::Literal("test-".to_string()),
+                        InterpolationPart::Literal("test-".into()),
                         InterpolationPart::Expr(Value::Deferred(DeferredValue::BindingRef {
                             binding: "env_name".to_string(),
                         })),
@@ -2254,11 +2254,11 @@ fn test_expand_module_call_with_interpolation() {
             let mut args = HashMap::new();
             args.insert(
                 "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             );
             args.insert(
                 "env_name".to_string(),
-                Value::Concrete(ConcreteValue::String("dev".to_string())),
+                Value::Concrete(ConcreteValue::String("dev".into())),
             );
             args
         },
@@ -2276,12 +2276,12 @@ fn test_expand_module_call_with_interpolation() {
     assert_eq!(
         vpc.get_attr("cidr_block"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "10.0.0.0/16".to_string()
+            "10.0.0.0/16".into()
         )))
     );
     assert_eq!(
         vpc.get_attr("env"),
-        Some(&Value::Concrete(ConcreteValue::String("dev".to_string())))
+        Some(&Value::Concrete(ConcreteValue::String("dev".into())))
     );
 
     // Interpolation with argument substitutes and canonicalizes back to
@@ -2291,9 +2291,7 @@ fn test_expand_module_call_with_interpolation() {
     // `Interpolation([Literal("test-"), Expr(String("dev"))])` (#2815, #2817).
     assert_eq!(
         vpc.get_attr("name"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "test-dev".to_string()
-        ))),
+        Some(&Value::Concrete(ConcreteValue::String("test-dev".into()))),
     );
 }
 
@@ -2314,7 +2312,7 @@ fn test_nested_module_two_level() {
         .iter()
         .filter_map(|r| {
             r.get_attr("_type").and_then(|v| match v {
-                Value::Concrete(ConcreteValue::String(s)) => Some(s.as_str()),
+                Value::Concrete(ConcreteValue::String(s)) => Some(s.expose_plaintext()),
                 _ => None,
             })
         })
@@ -2411,7 +2409,7 @@ fn test_nested_module_three_level() {
         .iter()
         .filter_map(|r| {
             r.get_attr("_type").and_then(|v| match v {
-                Value::Concrete(ConcreteValue::String(s)) => Some(s.as_str()),
+                Value::Concrete(ConcreteValue::String(s)) => Some(s.expose_plaintext()),
                 _ => None,
             })
         })
@@ -2467,7 +2465,7 @@ fn test_expand_module_call_with_function_call_argument() {
                 Value::Deferred(DeferredValue::FunctionCall {
                     name: "cidr_subnet".to_string(),
                     args: vec![
-                        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                         Value::Concrete(ConcreteValue::Int(8)),
                         Value::Concrete(ConcreteValue::Int(0)),
                     ],
@@ -2475,7 +2473,7 @@ fn test_expand_module_call_with_function_call_argument() {
             );
             args.insert(
                 "env_name".to_string(),
-                Value::Concrete(ConcreteValue::String("dev".to_string())),
+                Value::Concrete(ConcreteValue::String("dev".into())),
             );
             args
         },
@@ -2495,7 +2493,7 @@ fn test_expand_module_call_with_function_call_argument() {
         Some(&Value::Deferred(DeferredValue::FunctionCall {
             name: "cidr_subnet".to_string(),
             args: vec![
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                 Value::Concrete(ConcreteValue::Int(8)),
                 Value::Concrete(ConcreteValue::Int(0)),
             ],
@@ -3246,7 +3244,7 @@ fn test_argument_validation_len_with_list() {
             args.insert(
                 "tags".to_string(),
                 Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::String("env:prod".to_string()),
+                    ConcreteValue::String("env:prod".into()),
                 )])),
             );
             args
@@ -3301,7 +3299,7 @@ fn test_require_block_passes() {
                 name: "cert_arn".to_string(),
                 type_expr: TypeExpr::String,
                 default: Some(Value::Concrete(ConcreteValue::String(
-                    "arn:aws:acm:us-east-1:123:cert/abc".to_string(),
+                    "arn:aws:acm:us-east-1:123:cert/abc".into(),
                 ))),
                 description: None,
                 validations: Vec::new(),
@@ -3354,7 +3352,7 @@ fn test_require_block_passes() {
             args.insert(
                 "cert_arn".to_string(),
                 Value::Concrete(ConcreteValue::String(
-                    "arn:aws:acm:us-east-1:123:cert/abc".to_string(),
+                    "arn:aws:acm:us-east-1:123:cert/abc".into(),
                 )),
             );
             args
@@ -3506,8 +3504,8 @@ fn test_require_block_len_function() {
             args.insert(
                 "subnet_ids".to_string(),
                 Value::Concrete(ConcreteValue::List(vec![
-                    Value::Concrete(ConcreteValue::String("subnet-a".to_string())),
-                    Value::Concrete(ConcreteValue::String("subnet-b".to_string())),
+                    Value::Concrete(ConcreteValue::String("subnet-a".into())),
+                    Value::Concrete(ConcreteValue::String("subnet-b".into())),
                 ])),
             );
             args
@@ -3525,7 +3523,7 @@ fn test_require_block_len_function() {
             args.insert(
                 "subnet_ids".to_string(),
                 Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::String("subnet-a".to_string()),
+                    ConcreteValue::String("subnet-a".into()),
                 )])),
             );
             args
@@ -3705,12 +3703,12 @@ fn test_argument_type_mismatch_string_for_bool() {
             let mut args = HashMap::new();
             args.insert(
                 "vpc_id".to_string(),
-                Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+                Value::Concrete(ConcreteValue::String("vpc-123".into())),
             );
             // enable_flag expects bool, pass string
             args.insert(
                 "enable_flag".to_string(),
-                Value::Concrete(ConcreteValue::String("not-a-bool".to_string())),
+                Value::Concrete(ConcreteValue::String("not-a-bool".into())),
             );
             args
         },
@@ -3773,7 +3771,9 @@ fn test_argument_type_custom_validator() {
             args.insert(
                 "policy_arn".to_string(),
                 Value::Concrete(ConcreteValue::String(
-                    "arn:aws:iam::123456789012:policy/MyPolicy".to_string(),
+                    "arn:aws:iam::123456789012:policy/MyPolicy"
+                        .to_string()
+                        .into(),
                 )),
             );
             args
@@ -3790,7 +3790,7 @@ fn test_argument_type_custom_validator() {
             let mut args = HashMap::new();
             args.insert(
                 "policy_arn".to_string(),
-                Value::Concrete(ConcreteValue::String("not-an-arn".to_string())),
+                Value::Concrete(ConcreteValue::String("not-an-arn".into())),
             );
             args
         },
@@ -3851,12 +3851,8 @@ fn test_argument_type_list_of_custom_type() {
             args.insert(
                 "policy_arns".to_string(),
                 Value::Concrete(ConcreteValue::List(vec![
-                    Value::Concrete(ConcreteValue::String(
-                        "arn:aws:iam::123:policy/A".to_string(),
-                    )),
-                    Value::Concrete(ConcreteValue::String(
-                        "arn:aws:iam::123:policy/B".to_string(),
-                    )),
+                    Value::Concrete(ConcreteValue::String("arn:aws:iam::123:policy/A".into())),
+                    Value::Concrete(ConcreteValue::String("arn:aws:iam::123:policy/B".into())),
                 ])),
             );
             args
@@ -3874,10 +3870,8 @@ fn test_argument_type_list_of_custom_type() {
             args.insert(
                 "policy_arns".to_string(),
                 Value::Concrete(ConcreteValue::List(vec![
-                    Value::Concrete(ConcreteValue::String(
-                        "arn:aws:iam::123:policy/A".to_string(),
-                    )),
-                    Value::Concrete(ConcreteValue::String("not-an-arn".to_string())),
+                    Value::Concrete(ConcreteValue::String("arn:aws:iam::123:policy/A".into())),
+                    Value::Concrete(ConcreteValue::String("not-an-arn".into())),
                 ])),
             );
             args
@@ -4001,7 +3995,7 @@ m {
     assert_eq!(items.len(), 1);
     assert_eq!(
         items[0],
-        Value::Concrete(ConcreteValue::String("repo:carina-rs/infra:*".to_string())),
+        Value::Concrete(ConcreteValue::String("repo:carina-rs/infra:*".into())),
         "default's ${{github_repo}} interpolation must resolve against the caller's value"
     );
 }
@@ -4036,7 +4030,7 @@ m {
 
     assert_eq!(
         role_attr(&parsed, "role_name"),
-        &Value::Concrete(ConcreteValue::String("repo:carina-rs/infra:*".to_string())),
+        &Value::Concrete(ConcreteValue::String("repo:carina-rs/infra:*".into())),
         "block-form default's `${{github_repo}}` must resolve against the caller's value"
     );
 }
@@ -4069,7 +4063,7 @@ m {
 
     assert_eq!(
         role_attr(&parsed, "role_name"),
-        &Value::Concrete(ConcreteValue::String("p".to_string())),
+        &Value::Concrete(ConcreteValue::String("p".into())),
         "bare-identifier default `secondary = primary` must resolve to caller's `primary`"
     );
 }
@@ -4104,7 +4098,7 @@ m {}
 
     assert_eq!(
         role_attr(&parsed, "role_name"),
-        &Value::Concrete(ConcreteValue::String("X-X!".to_string())),
+        &Value::Concrete(ConcreteValue::String("X-X!".into())),
         "transitive default chain `a → b → c` must collapse to a flat string"
     );
 }
@@ -4151,7 +4145,7 @@ m {
     assert_eq!(
         tag_map.get("region"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "ap-northeast-1-tag".to_string()
+            "ap-northeast-1-tag".into()
         ))),
         "interpolation inside a nested map default must resolve recursively"
     );
@@ -4187,7 +4181,7 @@ m {
 
     assert_eq!(
         role_attr(&parsed, "role_name"),
-        &Value::Concrete(ConcreteValue::String("hello".to_string())),
+        &Value::Concrete(ConcreteValue::String("hello".into())),
     );
     let policy = role_attr(&parsed, "assume_role_policy_document");
     let Value::Concrete(ConcreteValue::Map(policy_map)) = policy else {
@@ -4235,7 +4229,7 @@ m {}
 
     assert_eq!(
         role_attr(&parsed, "role_name"),
-        &Value::Concrete(ConcreteValue::String("L".to_string())),
+        &Value::Concrete(ConcreteValue::String("L".into())),
         "forward-ref default `prefix = later` resolves to `later`'s value `'L'` \
          once the fix-point loop runs in `expander.rs::substitute_arguments`"
     );
@@ -4950,7 +4944,7 @@ fn create_module_with_environment_union() -> ParsedFile {
                 TypeExpr::StringLiteral("dev".to_string()),
                 TypeExpr::StringLiteral("prod".to_string()),
             ]),
-            default: Some(Value::Concrete(ConcreteValue::String("dev".to_string()))),
+            default: Some(Value::Concrete(ConcreteValue::String("dev".into()))),
             description: None,
             validations: Vec::new(),
         }],
@@ -4989,7 +4983,7 @@ fn caller_side_typo_against_string_literal_union_is_rejected() {
             // Typo: 'dpv' is outside the declared 'dev' | 'prod' union.
             args.insert(
                 "environment".to_string(),
-                Value::Concrete(ConcreteValue::String("dpv".to_string())),
+                Value::Concrete(ConcreteValue::String("dpv".into())),
             );
             args
         },
@@ -5023,7 +5017,7 @@ fn caller_side_value_in_string_literal_union_is_accepted() {
             let mut args = HashMap::new();
             args.insert(
                 "environment".to_string(),
-                Value::Concrete(ConcreteValue::String("prod".to_string())),
+                Value::Concrete(ConcreteValue::String("prod".into())),
             );
             args
         },
@@ -5290,7 +5284,7 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
             let mut args = HashMap::new();
             args.insert(
                 "cidr".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             );
             args
         },
@@ -5471,7 +5465,7 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
             let mut args = HashMap::new();
             args.insert(
                 "cidr".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             );
             args
         },
@@ -5680,7 +5674,7 @@ let registry_publish = registry {
     assert_eq!(
         consumer.attributes.get("description"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "module-target:caller-label".to_string(),
+            "module-target:caller-label".into(),
         ))),
         "module-local references must resolve before argument substitution"
     );
@@ -5698,7 +5692,7 @@ let registry_publish = registry {
     assert_eq!(
         roles.attributes.get("name_regex"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "^module-target$".to_string(),
+            "^module-target$".into(),
         ))),
         "module data-source input must resolve through the production loader"
     );
@@ -6090,7 +6084,7 @@ fn argument_type_mismatch_error_shows_actual_value() {
     let msg = module_argument_type_error(
         "role_arns",
         TypeExpr::List(Box::new(TypeExpr::Simple("arn".to_string()))),
-        Value::Concrete(ConcreteValue::String("arn:aws:iam::123:role/A".to_string())),
+        Value::Concrete(ConcreteValue::String("arn:aws:iam::123:role/A".into())),
     );
 
     assert!(
@@ -6100,6 +6094,15 @@ fn argument_type_mismatch_error_shows_actual_value() {
 }
 
 fn module_argument_type_error(arg_name: &str, type_expr: TypeExpr, value: Value) -> String {
+    module_argument_type_error_with_config(arg_name, type_expr, value, &ProviderContext::default())
+}
+
+fn module_argument_type_error_with_config(
+    arg_name: &str,
+    type_expr: TypeExpr,
+    value: Value,
+    config: &ProviderContext,
+) -> String {
     let mut module = create_test_module();
     module.arguments = vec![ArgumentParameter {
         name: arg_name.to_string(),
@@ -6110,7 +6113,7 @@ fn module_argument_type_error(arg_name: &str, type_expr: TypeExpr, value: Value)
     }];
 
     let resolver = {
-        let mut resolver = ModuleResolver::new(".");
+        let mut resolver = ModuleResolver::with_config(".", config);
         resolver
             .imported_modules
             .insert("web_tier".to_string(), module);
@@ -6141,7 +6144,7 @@ fn environment_type() -> TypeExpr {
 
 #[test]
 fn argument_type_mismatch_error_shows_string_literal_value() {
-    let value = Value::Concrete(ConcreteValue::String("production".to_string()));
+    let value = Value::Concrete(ConcreteValue::String("production".into()));
 
     let msg = module_argument_type_error("environment", environment_type(), value);
 
@@ -6168,7 +6171,7 @@ fn argument_type_mismatch_error_shows_int_literal_value() {
 fn argument_type_mismatch_error_redacts_secret_value() {
     let secret = "issue-3804-secret-plaintext";
     let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String(secret.to_string()),
+        ConcreteValue::String(secret.to_string().into()),
     ))));
 
     let msg = module_argument_type_error("environment", TypeExpr::Int, value);
@@ -6184,10 +6187,30 @@ fn argument_type_mismatch_error_redacts_secret_value() {
 }
 
 #[test]
+fn decrypted_module_argument_is_secret_by_value_type() {
+    let plaintext = "hunter2SECRET";
+    let config = ProviderContext {
+        decryptor: Some(Box::new(move |_, _| Ok(plaintext.to_string()))),
+        ..ProviderContext::default()
+    };
+    let value = crate::builtins::evaluate_builtin_with_config_to_value(
+        "decrypt",
+        &[Value::Concrete(ConcreteValue::String("ciphertext".into()))],
+        &config,
+    )
+    .expect("test decryptor");
+
+    let message = module_argument_type_error_with_config("enabled", TypeExpr::Bool, value, &config);
+
+    assert!(message.contains("got secret"), "message={message}");
+    assert!(!message.contains(plaintext), "message={message}");
+}
+
+#[test]
 fn argument_type_mismatch_error_shows_nested_list_element_value() {
     let value = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("dev".to_string())),
-        Value::Concrete(ConcreteValue::String("production".to_string())),
+        Value::Concrete(ConcreteValue::String("dev".into())),
+        Value::Concrete(ConcreteValue::String("production".into())),
     ]));
 
     let msg = module_argument_type_error(
@@ -6209,8 +6232,8 @@ fn argument_type_mismatch_error_shows_string_list_element_value() {
         TypeExpr::StringLiteral("stg".to_string()),
     ])));
     let value = Value::Concrete(ConcreteValue::StringList(vec![
-        "dev".to_string(),
-        "production".to_string(),
+        "dev".into(),
+        "production".into(),
     ]));
 
     let msg = module_argument_type_error("environments", type_expr, value);
@@ -6228,7 +6251,7 @@ fn argument_type_mismatch_error_shows_complete_nested_list_path() {
     )))));
     let value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
         ConcreteValue::List(vec![Value::Concrete(ConcreteValue::String(
-            "production".to_string(),
+            "production".into(),
         ))]),
     )]));
 
@@ -6305,7 +6328,7 @@ fn argument_type_mismatch_error_redacts_secret_list_element() {
     let secret = "issue-3804-nested-secret-plaintext";
     let value = Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
         DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::String(
-            secret.to_string(),
+            secret.to_string().into(),
         )))),
     )]));
 
@@ -6326,11 +6349,11 @@ fn argument_type_mismatch_error_shows_nested_map_value() {
     let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "primary".to_string(),
-            Value::Concrete(ConcreteValue::String("dev".to_string())),
+            Value::Concrete(ConcreteValue::String("dev".into())),
         ),
         (
             "secondary".to_string(),
-            Value::Concrete(ConcreteValue::String("production".to_string())),
+            Value::Concrete(ConcreteValue::String("production".into())),
         ),
     ])));
 
@@ -6352,7 +6375,7 @@ fn argument_type_mismatch_error_shows_nested_map_value() {
 fn argument_type_mismatch_error_shows_nested_struct_field_value() {
     let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
         "environment".to_string(),
-        Value::Concrete(ConcreteValue::String("production".to_string())),
+        Value::Concrete(ConcreteValue::String("production".into())),
     )])));
     let type_expr = TypeExpr::Struct {
         fields: vec![("environment".to_string(), environment_type())],
@@ -6370,7 +6393,7 @@ fn argument_type_mismatch_error_shows_nested_struct_field_value() {
 
 #[test]
 fn argument_type_mismatch_error_escapes_string_literal_value() {
-    let value = Value::Concrete(ConcreteValue::String("production\"\nnext".to_string()));
+    let value = Value::Concrete(ConcreteValue::String("production\"\nnext".into()));
 
     let msg = module_argument_type_error("environment", environment_type(), value);
 
@@ -6394,7 +6417,7 @@ fn argument_type_mismatch_error_preserves_float_fraction() {
 
 #[test]
 fn argument_type_validation_error_shows_actual_string_literal() {
-    let value = Value::Concrete(ConcreteValue::String("not-an-ipv4-cidr".to_string()));
+    let value = Value::Concrete(ConcreteValue::String("not-an-ipv4-cidr".into()));
 
     let msg =
         module_argument_type_error("network", TypeExpr::Simple("ipv4_cidr".to_string()), value);

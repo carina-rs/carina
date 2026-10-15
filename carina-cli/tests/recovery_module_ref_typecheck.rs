@@ -9,6 +9,18 @@ fn ordinary_resource_reference_fixture(source: &str) -> tempfile::TempDir {
     fixture
 }
 
+fn multi_file_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    for (relative_path, source) in files {
+        let path = fixture.path().join(relative_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("fixture directory");
+        }
+        std::fs::write(path, source).expect("fixture file");
+    }
+    fixture
+}
+
 fn run_carina(fixture: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_carina"))
         .current_dir(fixture.path())
@@ -353,6 +365,96 @@ let result = f(env('CARINA_3848_SECRET'))
         "stderr={stderr}"
     );
     assert!(!stderr.contains(plaintext), "stderr={stderr}");
+}
+
+#[test]
+fn environment_plaintext_is_redacted_across_cli_directory_typecheck_paths() {
+    let cases: &[(&str, &[(&str, &str)])] = &[
+        (
+            "module literal union argument",
+            &[
+                (
+                    "main.crn",
+                    "let m = use { source = './m' }\nm { n = f() }\n",
+                ),
+                ("functions.crn", "fn f() { env('LEAKX') }\n"),
+                ("m/main.crn", "arguments { n: 'dev' | 'prod' }\n"),
+            ],
+        ),
+        (
+            "module list argument",
+            &[
+                (
+                    "main.crn",
+                    "let m = use { source = './m' }\nm { l = list_values() }\n",
+                ),
+                (
+                    "functions.crn",
+                    "fn list_values() { [env('LEAKX'), 'b'] }\n",
+                ),
+                ("m/main.crn", "arguments { l: list(Int) }\n"),
+            ],
+        ),
+        (
+            "literal union export",
+            &[
+                ("functions.crn", "fn f() { env('LEAKX') }\n"),
+                ("exports.crn", "exports { e: 'dev' | 'prod' = f() }\n"),
+            ],
+        ),
+        (
+            "nested function export",
+            &[
+                ("functions.crn", "fn k(x) { x }\n"),
+                ("exports.crn", "exports { q: Int = k(env('LEAKX')) }\n"),
+            ],
+        ),
+    ];
+
+    for (label, files) in cases {
+        let fixture = multi_file_fixture(files);
+        let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+            .current_dir(fixture.path())
+            .env("NO_COLOR", "1")
+            .env("LEAKX", "hunter2SECRET")
+            .args(["validate", "."])
+            .output()
+            .expect("run carina validate");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            !output.status.success(),
+            "{label} must fail; stderr={stderr}"
+        );
+        assert!(stderr.contains("got string"), "{label}: stderr={stderr}");
+        assert!(
+            !stderr.contains("hunter2SECRET"),
+            "{label} leaked env plaintext: stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn authored_literal_mismatch_still_displays_plaintext_in_cli() {
+    let fixture = multi_file_fixture(&[
+        (
+            "main.crn",
+            "let m = use { source = './m' }\nm { n = 'production' }\n",
+        ),
+        ("m/main.crn", "arguments { n: 'dev' | 'prod' }\n"),
+    ]);
+
+    let output = run_carina(&fixture, &["validate", "."]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "validate must fail; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("got string 'production'"),
+        "authored literal detail must remain visible; stderr={stderr}"
+    );
 }
 
 #[test]

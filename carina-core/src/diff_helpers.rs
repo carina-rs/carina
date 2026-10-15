@@ -487,11 +487,11 @@ mod tests {
         let from: HashMap<String, Value> = [
             (
                 "name".to_string(),
-                Value::Concrete(ConcreteValue::String("test".to_string())),
+                Value::Concrete(ConcreteValue::String("test".into())),
             ),
             (
                 "region".to_string(),
-                Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+                Value::Concrete(ConcreteValue::String("us-east-1".into())),
             ),
             ("size".to_string(), Value::Concrete(ConcreteValue::Int(10))),
         ]
@@ -501,11 +501,11 @@ mod tests {
         let to: HashMap<String, Value> = [
             (
                 "name".to_string(),
-                Value::Concrete(ConcreteValue::String("test".to_string())),
+                Value::Concrete(ConcreteValue::String("test".into())),
             ),
             (
                 "region".to_string(),
-                Value::Concrete(ConcreteValue::String("us-west-2".to_string())),
+                Value::Concrete(ConcreteValue::String("us-west-2".into())),
             ),
             ("size".to_string(), Value::Concrete(ConcreteValue::Int(10))),
         ]
@@ -520,11 +520,11 @@ mod tests {
         let from: HashMap<String, Value> = [
             (
                 "name".to_string(),
-                Value::Concrete(ConcreteValue::String("test".to_string())),
+                Value::Concrete(ConcreteValue::String("test".into())),
             ),
             (
                 "_internal".to_string(),
-                Value::Concrete(ConcreteValue::String("hidden".to_string())),
+                Value::Concrete(ConcreteValue::String("hidden".into())),
             ),
         ]
         .into_iter()
@@ -533,11 +533,11 @@ mod tests {
         let to: HashMap<String, Value> = [
             (
                 "name".to_string(),
-                Value::Concrete(ConcreteValue::String("test".to_string())),
+                Value::Concrete(ConcreteValue::String("test".into())),
             ),
             (
                 "_internal".to_string(),
-                Value::Concrete(ConcreteValue::String("hidden".to_string())),
+                Value::Concrete(ConcreteValue::String("hidden".into())),
             ),
         ]
         .into_iter()
@@ -551,11 +551,11 @@ mod tests {
         let from: HashMap<String, Value> = [
             (
                 "name".to_string(),
-                Value::Concrete(ConcreteValue::String("test".to_string())),
+                Value::Concrete(ConcreteValue::String("test".into())),
             ),
             (
                 "region".to_string(),
-                Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+                Value::Concrete(ConcreteValue::String("us-east-1".into())),
             ),
         ]
         .into_iter()
@@ -564,11 +564,11 @@ mod tests {
         let to: HashMap<String, Value> = [
             (
                 "name".to_string(),
-                Value::Concrete(ConcreteValue::String("test".to_string())),
+                Value::Concrete(ConcreteValue::String("test".into())),
             ),
             (
                 "region".to_string(),
-                Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+                Value::Concrete(ConcreteValue::String("us-east-1".into())),
             ),
         ]
         .into_iter()
@@ -584,11 +584,11 @@ mod tests {
         let new: IndexMap<String, Value> = [
             (
                 "key1".to_string(),
-                Value::Concrete(ConcreteValue::String("val1".to_string())),
+                Value::Concrete(ConcreteValue::String("val1".into())),
             ),
             (
                 "key2".to_string(),
-                Value::Concrete(ConcreteValue::String("val2".to_string())),
+                Value::Concrete(ConcreteValue::String("val2".into())),
             ),
         ]
         .into_iter()
@@ -606,7 +606,7 @@ mod tests {
     fn test_compute_map_diff_removed_only() {
         let old: IndexMap<String, Value> = [(
             "key1".to_string(),
-            Value::Concrete(ConcreteValue::String("val1".to_string())),
+            Value::Concrete(ConcreteValue::String("val1".into())),
         )]
         .into_iter()
         .collect();
@@ -624,11 +624,11 @@ mod tests {
         let old: IndexMap<String, Value> = [
             (
                 "key1".to_string(),
-                Value::Concrete(ConcreteValue::String("old_val".to_string())),
+                Value::Concrete(ConcreteValue::String("old_val".into())),
             ),
             (
                 "key2".to_string(),
-                Value::Concrete(ConcreteValue::String("same".to_string())),
+                Value::Concrete(ConcreteValue::String("same".into())),
             ),
         ]
         .into_iter()
@@ -636,11 +636,11 @@ mod tests {
         let new: IndexMap<String, Value> = [
             (
                 "key1".to_string(),
-                Value::Concrete(ConcreteValue::String("new_val".to_string())),
+                Value::Concrete(ConcreteValue::String("new_val".into())),
             ),
             (
                 "key2".to_string(),
-                Value::Concrete(ConcreteValue::String("same".to_string())),
+                Value::Concrete(ConcreteValue::String("same".into())),
             ),
         ]
         .into_iter()
@@ -653,11 +653,11 @@ mod tests {
         assert_eq!(diff.changed[0].key, "key1");
         assert_eq!(
             diff.changed[0].old_value,
-            Value::Concrete(ConcreteValue::String("old_val".to_string()))
+            Value::Concrete(ConcreteValue::String("old_val".into()))
         );
         assert_eq!(
             diff.changed[0].new_value,
-            Value::Concrete(ConcreteValue::String("new_val".to_string()))
+            Value::Concrete(ConcreteValue::String("new_val".into()))
         );
     }
 
@@ -666,15 +666,15 @@ mod tests {
         let old: IndexMap<String, Value> = [
             (
                 "keep".to_string(),
-                Value::Concrete(ConcreteValue::String("same".to_string())),
+                Value::Concrete(ConcreteValue::String("same".into())),
             ),
             (
                 "change".to_string(),
-                Value::Concrete(ConcreteValue::String("old".to_string())),
+                Value::Concrete(ConcreteValue::String("old".into())),
             ),
             (
                 "remove".to_string(),
-                Value::Concrete(ConcreteValue::String("gone".to_string())),
+                Value::Concrete(ConcreteValue::String("gone".into())),
             ),
         ]
         .into_iter()
@@ -682,15 +682,15 @@ mod tests {
         let new: IndexMap<String, Value> = [
             (
                 "keep".to_string(),
-                Value::Concrete(ConcreteValue::String("same".to_string())),
+                Value::Concrete(ConcreteValue::String("same".into())),
             ),
             (
                 "change".to_string(),
-                Value::Concrete(ConcreteValue::String("new".to_string())),
+                Value::Concrete(ConcreteValue::String("new".into())),
             ),
             (
                 "add".to_string(),
-                Value::Concrete(ConcreteValue::String("fresh".to_string())),
+                Value::Concrete(ConcreteValue::String("fresh".into())),
             ),
         ]
         .into_iter()

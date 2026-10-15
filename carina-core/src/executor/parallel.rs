@@ -942,7 +942,7 @@ mod tests {
             let mut attrs = HashMap::new();
             attrs.insert(
                 "status".to_string(),
-                Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".to_string())),
+                Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".into())),
             );
             let state = State::existing(id.clone(), attrs).with_identifier("cert-id");
             Box::pin(async move { Ok(state) })
@@ -1095,7 +1095,7 @@ mod tests {
             target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+                value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
             },
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: std::time::Duration::from_secs(60),
@@ -1193,7 +1193,7 @@ mod tests {
             target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+                value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
             },
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: std::time::Duration::from_secs(60),

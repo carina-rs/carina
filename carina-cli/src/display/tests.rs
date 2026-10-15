@@ -438,7 +438,7 @@ fn test_extract_compact_hint_string_fallback() {
     let mut r = Resource::new("ec2.route", "hash456");
     r.set_attr(
         "destination_cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
+        Value::Concrete(ConcreteValue::String("0.0.0.0/0".into())),
     );
 
     let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
@@ -459,7 +459,7 @@ fn test_extract_compact_hint_prefers_string_over_resource_ref() {
     let mut r = Resource::new("ec2.route", "hash_mixed");
     r.set_attr(
         "destination".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/8".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/8".into())),
     );
     r.set_attr(
         "gateway_id".to_string(),
@@ -478,7 +478,7 @@ fn test_extract_compact_hint_service_name_shortening() {
     r.set_attr(
         "service_name".to_string(),
         Value::Concrete(ConcreteValue::String(
-            "com.amazonaws.ap-northeast-1.ecr.dkr".to_string(),
+            "com.amazonaws.ap-northeast-1.ecr.dkr".into(),
         )),
     );
 
@@ -490,7 +490,7 @@ fn test_extract_compact_hint_service_name_shortening() {
     r2.set_attr(
         "service_name".to_string(),
         Value::Concrete(ConcreteValue::String(
-            "com.amazonaws.ap-northeast-1.s3".to_string(),
+            "com.amazonaws.ap-northeast-1.s3".into(),
         )),
     );
 
@@ -508,7 +508,7 @@ fn test_extract_compact_hint_all_refs_match_parent() {
     );
     r.set_attr(
         "description".to_string(),
-        Value::Concrete(ConcreteValue::String("Allow HTTPS from VPC".to_string())),
+        Value::Concrete(ConcreteValue::String("Allow HTTPS from VPC".into())),
     );
 
     // When parent is endpoint_sg, should skip group_id and use description
@@ -526,7 +526,7 @@ fn test_extract_compact_hint_prefers_string_for_vpc_endpoint() {
     r.set_attr(
         "service_name".to_string(),
         Value::Concrete(ConcreteValue::String(
-            "com.amazonaws.ap-northeast-1.ecr.dkr".to_string(),
+            "com.amazonaws.ap-northeast-1.ecr.dkr".into(),
         )),
     );
     r.set_attr(
@@ -632,7 +632,7 @@ fn test_print_plan_compact_with_anonymous_resources() {
     let mut anon = Resource::new("ec2.route", "hash_anon");
     anon.set_attr(
         "destination_cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
+        Value::Concrete(ConcreteValue::String("0.0.0.0/0".into())),
     );
     anon.set_attr(
         "route_table_id".to_string(),
@@ -719,7 +719,7 @@ fn test_extract_compact_hint_resolves_dsl_enum() {
     r.set_attr(
         "availability_zone".to_string(),
         Value::Concrete(ConcreteValue::String(
-            "awscc.AvailabilityZone.ap_northeast_1a".to_string(),
+            "awscc.AvailabilityZone.ap_northeast_1a".into(),
         )),
     );
 
@@ -740,7 +740,7 @@ fn test_extract_compact_hint_skips_internal_attributes() {
     r.binding = Some("vpc".to_string());
     r.set_attr(
         "_hash".to_string(),
-        Value::Concrete(ConcreteValue::String("abc123".to_string())),
+        Value::Concrete(ConcreteValue::String("abc123".into())),
     );
 
     let hint = extract_compact_hint(carina_core::parser::ResourceRef::Resource(&r), None);
@@ -1033,7 +1033,7 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
         ResourceId::with_identity("ec2.Vpc", "vpc"),
         HashMap::from([(
             "cidr_block".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         )]),
     );
 
@@ -1045,11 +1045,11 @@ fn test_resolved_ref_loses_dependency_for_tree_nesting() {
     // This is the resolved value — a plain string, NOT a ResourceRef
     sg.set_attr(
         "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-0123456789abcdef0".to_string())),
+        Value::Concrete(ConcreteValue::String("vpc-0123456789abcdef0".into())),
     );
     sg.set_attr(
         "group_description".to_string(),
-        Value::Concrete(ConcreteValue::String("Test security group".to_string())),
+        Value::Concrete(ConcreteValue::String("Test security group".into())),
     );
     // _dependency_bindings is saved by resolve_refs_with_state() before
     // ResourceRef values are resolved to strings.
@@ -1175,7 +1175,7 @@ fn format_effect_import_separates_type_and_name_with_space() {
             None,
         )),
         identifier: carina_core::resource::Value::Concrete(
-            carina_core::resource::ConcreteValue::String("my-logs-bucket".to_string()),
+            carina_core::resource::ConcreteValue::String("my-logs-bucket".into()),
         ),
     };
     assert_eq!(
@@ -1372,6 +1372,25 @@ fn format_export_value_duration_renders_canonical() {
 }
 
 #[test]
+fn format_export_value_shows_env_plaintext_in_plan_output() {
+    let name = "CARINA_TEST_ENV_EXPORT_PLAN_DISPLAY";
+    unsafe {
+        std::env::set_var(name, "hunter2SECRET");
+    }
+    let value = carina_core::builtins::evaluate_builtin_to_value(
+        "env",
+        &[Value::Concrete(ConcreteValue::String(name.into()))],
+    )
+    .expect("env value");
+
+    assert_eq!(format_export_value(&value), "'hunter2SECRET'");
+
+    unsafe {
+        std::env::remove_var(name);
+    }
+}
+
+#[test]
 fn format_deferred_value_duration_renders_canonical() {
     // Same shape as format_export_value but on the deferred-for path.
     let v = Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60)));
@@ -1412,7 +1431,7 @@ fn delete_pretty_attribute_does_not_strike_indentation() {
     let mut cache_behavior = IndexMap::new();
     cache_behavior.insert(
         "viewer_protocol_policy".to_string(),
-        Value::Concrete(ConcreteValue::String("redirect-to-https".to_string())),
+        Value::Concrete(ConcreteValue::String("redirect-to-https".into())),
     );
     cache_behavior.insert(
         "forwarded_values".to_string(),
@@ -1800,7 +1819,7 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
 fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
     let parent = make_resource("aws.s3.Bucket", "parent", "parent", &[]).with_attribute(
         "bucket",
-        Value::Concrete(ConcreteValue::String("parent".to_string())),
+        Value::Concrete(ConcreteValue::String("parent".into())),
     );
     let from_id = ResourceId::with_identity("aws.s3.Bucket", "old_child");
     let to_id = ResourceId::with_identity("aws.s3.Bucket", "new_child");

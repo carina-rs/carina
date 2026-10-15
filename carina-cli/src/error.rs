@@ -529,7 +529,7 @@ mod tests {
 
     #[test]
     fn from_string() {
-        let app_err: AppError = "some error".to_string().into();
+        let app_err: AppError = "some error".into();
         assert!(matches!(app_err, AppError::Config(_)));
         assert_eq!(app_err.to_string(), "some error");
     }

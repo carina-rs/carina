@@ -179,7 +179,7 @@ mod tests {
                 .with_binding("vpc")
                 .with_attribute(
                     "cidr_block",
-                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                    Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                 ),
         ));
         plan.add(create(

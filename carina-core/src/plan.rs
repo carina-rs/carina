@@ -869,9 +869,7 @@ mod tests {
     fn previous_attributes() -> HashMap<String, Value> {
         HashMap::from([(
             "cidr_block".to_string(),
-            Value::Concrete(crate::resource::ConcreteValue::String(
-                "10.0.0.0/16".to_string(),
-            )),
+            Value::Concrete(crate::resource::ConcreteValue::String("10.0.0.0/16".into())),
         )])
     }
 
@@ -990,7 +988,7 @@ mod tests {
             )),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+                value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
             },
             until_surface: "cert.status == aws.acm.Certificate.Status.Issued".to_string(),
             timeout: Duration::from_secs(75 * 60),
@@ -1022,7 +1020,7 @@ mod tests {
             )),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+                value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
             },
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: Duration::from_secs(60),

@@ -2,7 +2,7 @@ use super::comparison::SavedAttr;
 use super::{create_plan_for_tests as create_plan, *};
 
 use crate::explicit::ExplicitFields;
-use crate::resource::{CanonicalEnumValue, ConcreteValue, DeferredValue, Value};
+use crate::resource::{CanonicalEnumValue, ConcreteValue, DeferredValue, Value, ValueString};
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
 
@@ -86,7 +86,7 @@ fn type_aware_struct_per_field() {
         ("count".to_string(), Value::Concrete(ConcreteValue::Int(5))),
         (
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("test".to_string())),
+            Value::Concrete(ConcreteValue::String("test".into())),
         ),
     ])));
     let b = Value::Concrete(ConcreteValue::Map(IndexMap::from([
@@ -96,7 +96,7 @@ fn type_aware_struct_per_field() {
         ),
         (
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("test".to_string())),
+            Value::Concrete(ConcreteValue::String("test".into())),
         ),
     ])));
     assert!(type_aware_equal(
@@ -192,7 +192,7 @@ fn type_aware_struct_ignores_default_bool_false() {
     // Desired: only sse_algorithm specified (no bucket_key_enabled)
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
         "sse_algorithm".to_string(),
-        Value::Concrete(ConcreteValue::String("AES256".to_string())),
+        Value::Concrete(ConcreteValue::String("AES256".into())),
     )])));
 
     // Current (from AWS): includes bucket_key_enabled: false as default
@@ -203,7 +203,7 @@ fn type_aware_struct_ignores_default_bool_false() {
         ),
         (
             "sse_algorithm".to_string(),
-            Value::Concrete(ConcreteValue::String("AES256".to_string())),
+            Value::Concrete(ConcreteValue::String("AES256".into())),
         ),
     ])));
 
@@ -234,7 +234,7 @@ fn type_aware_struct_does_not_ignore_non_default_bool() {
     // Desired: only sse_algorithm
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
         "sse_algorithm".to_string(),
-        Value::Concrete(ConcreteValue::String("AES256".to_string())),
+        Value::Concrete(ConcreteValue::String("AES256".into())),
     )])));
 
     // Current: bucket_key_enabled is true (non-default) — should NOT be equal
@@ -245,7 +245,7 @@ fn type_aware_struct_does_not_ignore_non_default_bool() {
         ),
         (
             "sse_algorithm".to_string(),
-            Value::Concrete(ConcreteValue::String("AES256".to_string())),
+            Value::Concrete(ConcreteValue::String("AES256".into())),
         ),
     ])));
 
@@ -283,9 +283,11 @@ fn type_aware_enum_namespaced_vs_raw() {
     assert!(
         type_aware_equal(
             &Value::Concrete(ConcreteValue::String(
-                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
+                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256"
+                    .to_string()
+                    .into()
             )),
-            &Value::Concrete(ConcreteValue::String("AES256".to_string())),
+            &Value::Concrete(ConcreteValue::String("AES256".into())),
             Some(&enum_type),
             crate::schema::empty_defs_for_schema_walks(),
             None,
@@ -297,10 +299,14 @@ fn type_aware_enum_namespaced_vs_raw() {
     assert!(
         type_aware_equal(
             &Value::Concrete(ConcreteValue::String(
-                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
+                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256"
+                    .to_string()
+                    .into()
             )),
             &Value::Concrete(ConcreteValue::String(
-                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
+                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256"
+                    .to_string()
+                    .into()
             )),
             Some(&enum_type),
             crate::schema::empty_defs_for_schema_walks(),
@@ -313,9 +319,11 @@ fn type_aware_enum_namespaced_vs_raw() {
     assert!(
         !type_aware_equal(
             &Value::Concrete(ConcreteValue::String(
-                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
+                "awscc.s3.Bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256"
+                    .to_string()
+                    .into()
             )),
-            &Value::Concrete(ConcreteValue::String("aws:kms".to_string())),
+            &Value::Concrete(ConcreteValue::String("aws:kms".into())),
             Some(&enum_type),
             crate::schema::empty_defs_for_schema_walks(),
             None,
@@ -348,9 +356,9 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
     // the same dotted form. Both shapes need to compare equal.
     assert!(
         type_aware_equal(
-            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
+            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".into())),
             &Value::Concrete(ConcreteValue::String(
-                "aws.AvailabilityZone.ap_northeast_1a".to_string()
+                "aws.AvailabilityZone.ap_northeast_1a".into()
             )),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
@@ -361,9 +369,9 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
     assert!(
         type_aware_equal(
             &Value::Concrete(ConcreteValue::String(
-                "aws.AvailabilityZone.ap_northeast_1a".to_string()
+                "aws.AvailabilityZone.ap_northeast_1a".into()
             )),
-            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
+            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".into())),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
             None,
@@ -375,10 +383,10 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
     assert!(
         type_aware_equal(
             &Value::Concrete(ConcreteValue::String(
-                "aws.AvailabilityZone.ap_northeast_1a".to_string()
+                "aws.AvailabilityZone.ap_northeast_1a".into()
             )),
             &Value::Concrete(ConcreteValue::String(
-                "aws.AvailabilityZone.ap_northeast_1a".to_string()
+                "aws.AvailabilityZone.ap_northeast_1a".into()
             )),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
@@ -390,8 +398,8 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
     // Bare canonical form on both sides — identical strings, trivially equal.
     assert!(
         type_aware_equal(
-            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
-            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
+            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".into())),
+            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".into())),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
             None,
@@ -404,7 +412,7 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
     // before resolve_enum_value_recursive rewrites it).
     assert!(
         type_aware_equal(
-            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
+            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".into())),
             &Value::Concrete(ConcreteValue::enum_identifier(
                 "aws.AvailabilityZone.ap_northeast_1a".to_string()
             )),
@@ -418,9 +426,9 @@ fn type_aware_enum_canonical_vs_namespaced_identifier() {
     // Different values must still produce a real diff (don't over-fold).
     assert!(
         !type_aware_equal(
-            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".to_string())),
+            &Value::Concrete(ConcreteValue::String("ap-northeast-1a".into())),
             &Value::Concrete(ConcreteValue::String(
-                "aws.AvailabilityZone.ap_northeast_1c".to_string()
+                "aws.AvailabilityZone.ap_northeast_1c".into()
             )),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
@@ -447,7 +455,7 @@ fn type_aware_enum_canonical_enum_value_compares_against_string() {
                 CanonicalEnumValue::new_for_test(az_identity.clone(), "ap-northeast-1a"),
             )),
             &Value::Concrete(ConcreteValue::String(
-                "aws.AvailabilityZone.ap_northeast_1a".to_string()
+                "aws.AvailabilityZone.ap_northeast_1a".into()
             )),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
@@ -462,7 +470,7 @@ fn type_aware_enum_canonical_enum_value_compares_against_string() {
                 CanonicalEnumValue::new_for_test(az_identity, "ap-northeast-1a"),
             )),
             &Value::Concrete(ConcreteValue::String(
-                "aws.AvailabilityZone.ap_northeast_1c".to_string()
+                "aws.AvailabilityZone.ap_northeast_1c".into()
             )),
             Some(&az_type),
             crate::schema::empty_defs_for_schema_walks(),
@@ -496,18 +504,18 @@ fn type_aware_struct_ignores_default_enum_empty() {
     // Desired: only name specified
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
         "name".to_string(),
-        Value::Concrete(ConcreteValue::String("test".to_string())),
+        Value::Concrete(ConcreteValue::String("test".into())),
     )])));
 
     // Current: includes status: "" as default
     let current = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("test".to_string())),
+            Value::Concrete(ConcreteValue::String("test".into())),
         ),
         (
             "status".to_string(),
-            Value::Concrete(ConcreteValue::String(String::new())),
+            Value::Concrete(ConcreteValue::String(String::new().into())),
         ),
     ])));
 
@@ -545,14 +553,14 @@ fn type_aware_struct_ignores_default_custom_type() {
     // Desired: only name specified
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
         "name".to_string(),
-        Value::Concrete(ConcreteValue::String("test".to_string())),
+        Value::Concrete(ConcreteValue::String("test".into())),
     )])));
 
     // Current: includes port: 0 as default
     let current = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("test".to_string())),
+            Value::Concrete(ConcreteValue::String("test".into())),
         ),
         ("port".to_string(), Value::Concrete(ConcreteValue::Int(0))),
     ])));
@@ -590,14 +598,14 @@ fn type_aware_struct_ignores_default_nested_struct_empty() {
     // Desired: only name specified
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
         "name".to_string(),
-        Value::Concrete(ConcreteValue::String("test".to_string())),
+        Value::Concrete(ConcreteValue::String("test".into())),
     )])));
 
     // Current: includes inner: {} as default
     let current = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("test".to_string())),
+            Value::Concrete(ConcreteValue::String("test".into())),
         ),
         (
             "inner".to_string(),
@@ -624,12 +632,12 @@ fn type_aware_ordered_list_detects_reorder() {
 
     // Same elements, different order
     let a = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("a".to_string())),
-        Value::Concrete(ConcreteValue::String("b".to_string())),
+        Value::Concrete(ConcreteValue::String("a".into())),
+        Value::Concrete(ConcreteValue::String("b".into())),
     ]));
     let b = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("b".to_string())),
-        Value::Concrete(ConcreteValue::String("a".to_string())),
+        Value::Concrete(ConcreteValue::String("b".into())),
+        Value::Concrete(ConcreteValue::String("a".into())),
     ]));
 
     assert!(
@@ -645,8 +653,8 @@ fn type_aware_ordered_list_detects_reorder() {
 
     // Same elements, same order should still be equal
     let c = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("a".to_string())),
-        Value::Concrete(ConcreteValue::String("b".to_string())),
+        Value::Concrete(ConcreteValue::String("a".into())),
+        Value::Concrete(ConcreteValue::String("b".into())),
     ]));
     assert!(
         type_aware_equal(
@@ -666,12 +674,12 @@ fn type_aware_unordered_list_ignores_reorder() {
     let unordered_list_type = AttributeType::unordered_list(AttributeType::string());
 
     let a = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("a".to_string())),
-        Value::Concrete(ConcreteValue::String("b".to_string())),
+        Value::Concrete(ConcreteValue::String("a".into())),
+        Value::Concrete(ConcreteValue::String("b".into())),
     ]));
     let b = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("b".to_string())),
-        Value::Concrete(ConcreteValue::String("a".to_string())),
+        Value::Concrete(ConcreteValue::String("b".into())),
+        Value::Concrete(ConcreteValue::String("a".into())),
     ]));
 
     assert!(
@@ -699,7 +707,7 @@ fn write_only_attr_in_desired_not_in_current_no_diff() {
     let desired = HashMap::from([
         (
             "cidr_block".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         ),
         (
             "ipv4_netmask_length".to_string(),
@@ -709,7 +717,7 @@ fn write_only_attr_in_desired_not_in_current_no_diff() {
     // CloudControl Read API does not return write-only attributes
     let current = HashMap::from([(
         "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     )]);
 
     let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema), None);
@@ -731,7 +739,7 @@ fn write_only_attr_in_both_same_value_no_diff() {
     let desired = HashMap::from([
         (
             "cidr_block".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         ),
         (
             "ipv4_netmask_length".to_string(),
@@ -741,7 +749,7 @@ fn write_only_attr_in_both_same_value_no_diff() {
     let current = HashMap::from([
         (
             "cidr_block".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         ),
         (
             "ipv4_netmask_length".to_string(),
@@ -768,7 +776,7 @@ fn write_only_attr_in_both_different_value_detects_diff() {
     let desired = HashMap::from([
         (
             "cidr_block".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         ),
         (
             "ipv4_netmask_length".to_string(),
@@ -778,7 +786,7 @@ fn write_only_attr_in_both_different_value_detects_diff() {
     let current = HashMap::from([
         (
             "cidr_block".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         ),
         (
             "ipv4_netmask_length".to_string(),
@@ -804,7 +812,7 @@ fn non_write_only_attr_in_desired_not_in_current_detects_diff() {
     let desired = HashMap::from([
         (
             "cidr_block".to_string(),
-            Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+            Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         ),
         (
             "enable_dns".to_string(),
@@ -813,7 +821,7 @@ fn non_write_only_attr_in_desired_not_in_current_detects_diff() {
     ]);
     let current = HashMap::from([(
         "cidr_block".to_string(),
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     )]);
 
     let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema), None);
@@ -828,7 +836,7 @@ fn secret_unchanged_same_hash() {
     use crate::value::value_to_json;
 
     let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("my-password".to_string()),
+        ConcreteValue::String("my-password".into()),
     ))));
     // Compute the hash that would be stored in state
     let hash_json = value_to_json(&secret_value).unwrap();
@@ -837,14 +845,14 @@ fn secret_unchanged_same_hash() {
     // State has the hash string, desired has the Secret wrapper
     assert!(type_aware_equal(
         &secret_value,
-        &Value::Concrete(ConcreteValue::String(hash_str.clone())),
+        &Value::Concrete(ConcreteValue::String(hash_str.clone().into())),
         None,
         crate::schema::empty_defs_for_schema_walks(),
         None,
     ));
     // Reversed order should also work
     assert!(type_aware_equal(
-        &Value::Concrete(ConcreteValue::String(hash_str)),
+        &Value::Concrete(ConcreteValue::String(hash_str.into())),
         &secret_value,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -857,10 +865,10 @@ fn secret_changed_different_hash() {
     use crate::value::value_to_json;
 
     let old_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("old-password".to_string()),
+        ConcreteValue::String("old-password".into()),
     ))));
     let new_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("new-password".to_string()),
+        ConcreteValue::String("new-password".into()),
     ))));
     // Compute the hash for the OLD secret (stored in state)
     let old_hash_json = value_to_json(&old_secret).unwrap();
@@ -869,7 +877,7 @@ fn secret_changed_different_hash() {
     // New desired vs old state hash should be different
     assert!(!type_aware_equal(
         &new_secret,
-        &Value::Concrete(ConcreteValue::String(old_hash_str)),
+        &Value::Concrete(ConcreteValue::String(old_hash_str.into())),
         None,
         crate::schema::empty_defs_for_schema_walks(),
         None,
@@ -881,7 +889,7 @@ fn secret_in_find_changed_attributes_no_change() {
     use crate::value::value_to_json;
 
     let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("my-password".to_string()),
+        ConcreteValue::String("my-password".into()),
     ))));
     let hash_json = value_to_json(&secret_value).unwrap();
     let hash_str = hash_json.as_str().unwrap().to_string();
@@ -889,7 +897,7 @@ fn secret_in_find_changed_attributes_no_change() {
     let desired = HashMap::from([("password".to_string(), secret_value)]);
     let current = HashMap::from([(
         "password".to_string(),
-        Value::Concrete(ConcreteValue::String(hash_str)),
+        Value::Concrete(ConcreteValue::String(hash_str.into())),
     )]);
 
     let changed = find_changed_attributes(&desired, &current, None, None, None, None);
@@ -901,14 +909,34 @@ fn secret_in_find_changed_attributes_no_change() {
 }
 
 #[test]
+fn diagnostic_sensitive_string_matches_plain_state_without_diff() {
+    let desired = HashMap::from([(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
+            "hunter2SECRET",
+        ))),
+    )]);
+    let current = HashMap::from([(
+        "name".to_string(),
+        Value::Concrete(ConcreteValue::String("hunter2SECRET".into())),
+    )]);
+
+    let changed = find_changed_attributes(&desired, &current, None, None, None, None);
+    assert!(
+        changed.is_empty(),
+        "marker must not create diff churn: {changed:?}"
+    );
+}
+
+#[test]
 fn secret_in_find_changed_attributes_changed() {
     use crate::value::value_to_json;
 
     let old_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("old-password".to_string()),
+        ConcreteValue::String("old-password".into()),
     ))));
     let new_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("new-password".to_string()),
+        ConcreteValue::String("new-password".into()),
     ))));
     let old_hash_json = value_to_json(&old_secret).unwrap();
     let old_hash_str = old_hash_json.as_str().unwrap().to_string();
@@ -916,7 +944,7 @@ fn secret_in_find_changed_attributes_changed() {
     let desired = HashMap::from([("password".to_string(), new_secret)]);
     let current = HashMap::from([(
         "password".to_string(),
-        Value::Concrete(ConcreteValue::String(old_hash_str)),
+        Value::Concrete(ConcreteValue::String(old_hash_str.into())),
     )]);
 
     let changed = find_changed_attributes(&desired, &current, None, None, None, None);
@@ -932,25 +960,25 @@ fn key_should_enter_patch_saved_merge_preserves_unmanaged_nested_fields() {
     let current = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "Name".to_string(),
-            Value::Concrete(ConcreteValue::String("new".to_string())),
+            Value::Concrete(ConcreteValue::String("new".into())),
         ),
         (
             "ManagedBy".to_string(),
-            Value::Concrete(ConcreteValue::String("carina".to_string())),
+            Value::Concrete(ConcreteValue::String("carina".into())),
         ),
     ])));
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
         "Name".to_string(),
-        Value::Concrete(ConcreteValue::String("new".to_string())),
+        Value::Concrete(ConcreteValue::String("new".into())),
     )])));
     let saved = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "Name".to_string(),
-            Value::Concrete(ConcreteValue::String("old".to_string())),
+            Value::Concrete(ConcreteValue::String("old".into())),
         ),
         (
             "ManagedBy".to_string(),
-            Value::Concrete(ConcreteValue::String("carina".to_string())),
+            Value::Concrete(ConcreteValue::String("carina".into())),
         ),
     ])));
 
@@ -979,12 +1007,12 @@ fn secret_in_map_no_change_when_hash_matches() {
 
     // Desired: tags map with a secret value
     let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("super-secret".to_string()),
+        ConcreteValue::String("super-secret".into()),
     ))));
     let desired_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "Name".to_string(),
-            Value::Concrete(ConcreteValue::String("test".to_string())),
+            Value::Concrete(ConcreteValue::String("test".into())),
         ),
         ("SecretTag".to_string(), secret_value.clone()),
     ])));
@@ -995,11 +1023,11 @@ fn secret_in_map_no_change_when_hash_matches() {
     let state_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "Name".to_string(),
-            Value::Concrete(ConcreteValue::String("test".to_string())),
+            Value::Concrete(ConcreteValue::String("test".into())),
         ),
         (
             "SecretTag".to_string(),
-            Value::Concrete(ConcreteValue::String(hash_str)),
+            Value::Concrete(ConcreteValue::String(hash_str.into())),
         ),
     ])));
 
@@ -1032,7 +1060,7 @@ fn secret_with_context_no_change_when_hash_matches() {
     );
 
     let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("my-password".to_string()),
+        ConcreteValue::String("my-password".into()),
     ))));
     // Hash with context (as from_provider_state would do)
     let hash_json = value_to_json_with_context(&secret_value, Some(&ctx)).unwrap();
@@ -1041,7 +1069,7 @@ fn secret_with_context_no_change_when_hash_matches() {
     let desired = HashMap::from([("master_password".to_string(), secret_value)]);
     let current = HashMap::from([(
         "master_password".to_string(),
-        Value::Concrete(ConcreteValue::String(hash_str)),
+        Value::Concrete(ConcreteValue::String(hash_str.into())),
     )]);
 
     // find_changed_attributes builds context from resource_id
@@ -1071,10 +1099,10 @@ fn secret_with_context_detects_change() {
     );
 
     let old_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("old-password".to_string()),
+        ConcreteValue::String("old-password".into()),
     ))));
     let new_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("new-password".to_string()),
+        ConcreteValue::String("new-password".into()),
     ))));
     // Hash the OLD secret with context
     let hash_json = value_to_json_with_context(&old_secret, Some(&ctx)).unwrap();
@@ -1083,7 +1111,7 @@ fn secret_with_context_detects_change() {
     let desired = HashMap::from([("master_password".to_string(), new_secret)]);
     let current = HashMap::from([(
         "master_password".to_string(),
-        Value::Concrete(ConcreteValue::String(hash_str)),
+        Value::Concrete(ConcreteValue::String(hash_str.into())),
     )]);
 
     let changed = find_changed_attributes(&desired, &current, None, None, None, Some(&resource_id));
@@ -1099,7 +1127,7 @@ fn secret_same_password_different_resources_produces_different_hashes() {
     use crate::value::{SecretHashContext, value_to_json_with_context};
 
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("shared-password".to_string()),
+        ConcreteValue::String("shared-password".into()),
     ))));
 
     let ctx1 = SecretHashContext::new("awscc.rds.db_instance", "db-1", "master_password");
@@ -1123,7 +1151,9 @@ fn secret_same_password_different_resources_produces_different_hashes() {
     let desired1 = HashMap::from([("master_password".to_string(), secret.clone())]);
     let current1 = HashMap::from([(
         "master_password".to_string(),
-        Value::Concrete(ConcreteValue::String(hash1.as_str().unwrap().to_string())),
+        Value::Concrete(ConcreteValue::String(
+            hash1.as_str().unwrap().to_string().into(),
+        )),
     )]);
     let changed1 = find_changed_attributes(&desired1, &current1, None, None, None, Some(&id1));
     assert!(
@@ -1141,7 +1171,9 @@ fn secret_same_password_different_resources_produces_different_hashes() {
     let desired2 = HashMap::from([("master_password".to_string(), secret)]);
     let current2 = HashMap::from([(
         "master_password".to_string(),
-        Value::Concrete(ConcreteValue::String(hash1.as_str().unwrap().to_string())),
+        Value::Concrete(ConcreteValue::String(
+            hash1.as_str().unwrap().to_string().into(),
+        )),
     )]);
     let changed2 = find_changed_attributes(&desired2, &current2, None, None, None, Some(&id2));
     assert!(
@@ -1156,9 +1188,9 @@ fn secret_same_password_different_resources_produces_different_hashes() {
 #[test]
 fn secret_matches_plain_text_state_value() {
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("my-password".to_string()),
+        ConcreteValue::String("my-password".into()),
     ))));
-    let plain = Value::Concrete(ConcreteValue::String("my-password".to_string()));
+    let plain = Value::Concrete(ConcreteValue::String("my-password".into()));
     assert!(
         type_aware_equal(
             &secret,
@@ -1185,9 +1217,9 @@ fn secret_matches_plain_text_state_value() {
 #[test]
 fn secret_does_not_match_different_plain_text() {
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("my-password".to_string()),
+        ConcreteValue::String("my-password".into()),
     ))));
-    let plain = Value::Concrete(ConcreteValue::String("other-password".to_string()));
+    let plain = Value::Concrete(ConcreteValue::String("other-password".into()));
     assert!(
         !type_aware_equal(
             &secret,
@@ -1221,12 +1253,12 @@ fn secret_in_map_with_refresh_no_false_diff() {
     let desired_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "Name".to_string(),
-            Value::Concrete(ConcreteValue::String("test".to_string())),
+            Value::Concrete(ConcreteValue::String("test".into())),
         ),
         (
             "SecretTag".to_string(),
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("super-secret-value".to_string()),
+                ConcreteValue::String("super-secret-value".into()),
             )))),
         ),
     ])));
@@ -1235,11 +1267,11 @@ fn secret_in_map_with_refresh_no_false_diff() {
     let current_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "Name".to_string(),
-            Value::Concrete(ConcreteValue::String("test".to_string())),
+            Value::Concrete(ConcreteValue::String("test".into())),
         ),
         (
             "SecretTag".to_string(),
-            Value::Concrete(ConcreteValue::String("super-secret-value".to_string())),
+            Value::Concrete(ConcreteValue::String("super-secret-value".into())),
         ),
     ])));
 
@@ -1285,8 +1317,8 @@ fn type_aware_equal_self_cyclic_union_ref_uses_concrete_member() {
         "A".to_string(),
         AttributeType::union(vec![AttributeType::ref_("A"), AttributeType::string()]),
     )]);
-    let x = Value::Concrete(ConcreteValue::String("x".to_string()));
-    let y = Value::Concrete(ConcreteValue::String("y".to_string()));
+    let x = Value::Concrete(ConcreteValue::String("x".into()));
+    let y = Value::Concrete(ConcreteValue::String("y".into()));
 
     assert!(type_aware_equal(&x, &x, Some(&root), &defs, None));
     assert!(!type_aware_equal(&x, &y, Some(&root), &defs, None));
@@ -1299,7 +1331,7 @@ fn type_aware_equal_skips_cyclic_union_member_and_reaches_sibling() {
         "A".to_string(),
         AttributeType::union(vec![AttributeType::ref_("A"), AttributeType::int()]),
     )]);
-    let value = Value::Concrete(ConcreteValue::String("x".to_string()));
+    let value = Value::Concrete(ConcreteValue::String("x".into()));
 
     assert!(type_aware_equal(&value, &value, Some(&root), &defs, None));
 }
@@ -1310,8 +1342,8 @@ fn union_string_or_list_canonical_string_list_equal_to_self() {
     // equal under the differ for the `Union[String, list(String)]`
     // type. Sanity check that the canonical form is comparable at all.
     let union = string_or_list_of_strings_type();
-    let a = Value::Concrete(ConcreteValue::StringList(vec!["repo:foo:*".to_string()]));
-    let b = Value::Concrete(ConcreteValue::StringList(vec!["repo:foo:*".to_string()]));
+    let a = Value::Concrete(ConcreteValue::StringList(vec!["repo:foo:*".into()]));
+    let b = Value::Concrete(ConcreteValue::StringList(vec!["repo:foo:*".into()]));
     assert!(type_aware_equal(
         &a,
         &b,
@@ -1324,8 +1356,8 @@ fn union_string_or_list_canonical_string_list_equal_to_self() {
 #[test]
 fn union_string_or_list_canonical_string_list_diff_on_different_content() {
     let union = string_or_list_of_strings_type();
-    let a = Value::Concrete(ConcreteValue::StringList(vec!["repo:foo:*".to_string()]));
-    let b = Value::Concrete(ConcreteValue::StringList(vec!["repo:bar:*".to_string()]));
+    let a = Value::Concrete(ConcreteValue::StringList(vec!["repo:foo:*".into()]));
+    let b = Value::Concrete(ConcreteValue::StringList(vec!["repo:bar:*".into()]));
     assert!(!type_aware_equal(
         &a,
         &b,
@@ -1344,8 +1376,8 @@ fn union_string_or_list_non_canonical_mixed_shapes_fail_to_equal() {
     // paper over it. Adding a special-case equality here would defeat
     // the type-level canonicalization design.
     let union = string_or_list_of_strings_type();
-    let scalar = Value::Concrete(ConcreteValue::String("repo:foo:*".to_string()));
-    let canonical = Value::Concrete(ConcreteValue::StringList(vec!["repo:foo:*".to_string()]));
+    let scalar = Value::Concrete(ConcreteValue::String("repo:foo:*".into()));
+    let canonical = Value::Concrete(ConcreteValue::StringList(vec!["repo:foo:*".into()]));
     assert!(!type_aware_equal(
         &scalar,
         &canonical,
@@ -1355,7 +1387,7 @@ fn union_string_or_list_non_canonical_mixed_shapes_fail_to_equal() {
     ));
 
     let legacy_list = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-        ConcreteValue::String("repo:foo:*".to_string()),
+        ConcreteValue::String("repo:foo:*".into()),
     )]));
     assert!(!type_aware_equal(
         &legacy_list,
@@ -1369,8 +1401,8 @@ fn union_string_or_list_non_canonical_mixed_shapes_fail_to_equal() {
 #[test]
 fn union_string_or_list_compares_string_list() {
     let union = string_or_list_of_strings_type();
-    let a = Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()]));
-    let b = Value::Concrete(ConcreteValue::StringList(vec!["x".to_string()]));
+    let a = Value::Concrete(ConcreteValue::StringList(vec!["x".into()]));
+    let b = Value::Concrete(ConcreteValue::StringList(vec!["x".into()]));
     assert!(type_aware_equal(
         &a,
         &b,
@@ -1394,9 +1426,7 @@ fn into_plan_input_map_canonicalizes_string_or_list_state() {
 
     let mut desired = Resource::new("iam.policy", "assume-role-policy").with_attribute(
         "action",
-        Value::Concrete(ConcreteValue::StringList(vec![
-            "sts:AssumeRole".to_string(),
-        ])),
+        Value::Concrete(ConcreteValue::StringList(vec!["sts:AssumeRole".into()])),
     );
     desired.id.provider = "aws".to_string();
     let resources = vec![desired];
@@ -1405,7 +1435,7 @@ fn into_plan_input_map_canonicalizes_string_or_list_state() {
     state_attrs.insert(
         "action".to_string(),
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::String("sts:AssumeRole".to_string()),
+            ConcreteValue::String("sts:AssumeRole".into()),
         )])),
     );
     let mut id = ResourceId::with_identity("iam.policy", "assume-role-policy");
@@ -1467,7 +1497,7 @@ fn into_plan_input_map_canonicalizes_separator_folded_enum_state_before_diffing(
     let mut state_attrs = HashMap::new();
     state_attrs.insert(
         "key_algorithm".to_string(),
-        Value::Concrete(ConcreteValue::String("RSA-2048".to_string())),
+        Value::Concrete(ConcreteValue::String("RSA-2048".into())),
     );
     let mut id = ResourceId::with_identity("acm.Certificate", "cert");
     id.provider = "aws".to_string();
@@ -1533,9 +1563,7 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
     let mut desired_inner = IndexMap::new();
     desired_inner.insert(
         "service".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            "cloudfront.amazonaws.com".to_string(),
-        )),
+        Value::Concrete(ConcreteValue::String("cloudfront.amazonaws.com".into())),
     );
     let mut resources = vec![Resource::new("iam.policy", "p1").with_attribute(
         "principal",
@@ -1550,7 +1578,7 @@ fn carina3080_principal_scalar_vs_singleton_is_no_change_via_pipeline() {
     state_inner.insert(
         "service".to_string(),
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::String("cloudfront.amazonaws.com".to_string()),
+            ConcreteValue::String("cloudfront.amazonaws.com".into()),
         )])),
     );
     let mut state_attrs = HashMap::new();
@@ -1607,7 +1635,7 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
     let mut desired_statement = IndexMap::new();
     desired_statement.insert(
         "effect".to_string(),
-        Value::Concrete(ConcreteValue::String("Allow".to_string())),
+        Value::Concrete(ConcreteValue::String("Allow".into())),
     );
     let mut resources = vec![Resource::new("iam.policy", "p1").with_attribute(
         "statement",
@@ -1620,11 +1648,11 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
         IndexMap::from([
             (
                 "effect".to_string(),
-                Value::Concrete(ConcreteValue::String("Allow".to_string())),
+                Value::Concrete(ConcreteValue::String("Allow".into())),
             ),
             (
                 "action".to_string(),
-                Value::Concrete(ConcreteValue::String("s3:GetObject".to_string())),
+                Value::Concrete(ConcreteValue::String("s3:GetObject".into())),
             ),
         ])
     };
@@ -1712,7 +1740,7 @@ fn carina3740_saved_nested_secret_hash_union_scalar_is_no_change() {
             ),
             (
                 "password".to_string(),
-                Value::Concrete(ConcreteValue::String(secret_hash.clone())),
+                Value::Concrete(ConcreteValue::String(secret_hash.clone().into())),
             ),
         ])
     };
@@ -1850,9 +1878,9 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     // Both sides are the SAME namespaced DSL String shape (per the
     // live plan JSON); only element order differs.
     let ns_method = |type_name: &str, alias: &str| {
-        Value::Concrete(ConcreteValue::String(format!(
-            "awscc.cloudfront.Distribution.{type_name}.{alias}"
-        )))
+        Value::Concrete(ConcreteValue::String(
+            format!("awscc.cloudfront.Distribution.{type_name}.{alias}").into(),
+        ))
     };
     let methods = |type_name: &str, a: &str, b: &str| {
         Value::Concrete(ConcreteValue::List(vec![
@@ -1865,7 +1893,7 @@ fn carina3122_cloudfront_allowed_methods_set_is_no_change_via_pipeline() {
     // scalar fields so they survive `prev_explicit` projection and are
     // compared (equal) on both sides — distinct from the read-back
     // defaults below which are projected away.
-    let s = |v: &str| Value::Concrete(ConcreteValue::String(v.to_string()));
+    let s = |v: &str| Value::Concrete(ConcreteValue::String(v.to_string().into()));
     let mut desired_dcb = IndexMap::new();
     desired_dcb.insert(
         "allowed_methods".to_string(),
@@ -2080,9 +2108,9 @@ fn carina3122_cloudfront_allowed_methods_ordered_list_does_change_via_pipeline()
     registry.insert("awscc", schema.clone());
 
     let ns = |alias: &str| {
-        Value::Concrete(ConcreteValue::String(format!(
-            "awscc.cloudfront.Distribution.AllowedMethods.{alias}"
-        )))
+        Value::Concrete(ConcreteValue::String(
+            format!("awscc.cloudfront.Distribution.AllowedMethods.{alias}").into(),
+        ))
     };
     let list = |a: &str, b: &str| Value::Concrete(ConcreteValue::List(vec![ns(a), ns(b)]));
     let dcb = |a: &str, b: &str| {
@@ -2147,11 +2175,11 @@ fn find_changed_attributes_unrecorded_prev_explicit_is_no_change_when_values_mat
     let desired: HashMap<String, Value> = HashMap::from([
         (
             "principal_type".to_string(),
-            Value::Concrete(ConcreteValue::String("GROUP".to_string())),
+            Value::Concrete(ConcreteValue::String("GROUP".into())),
         ),
         (
             "target_id".to_string(),
-            Value::Concrete(ConcreteValue::String("123".to_string())),
+            Value::Concrete(ConcreteValue::String("123".into())),
         ),
     ]);
     let current = desired.clone();
@@ -2177,11 +2205,11 @@ fn find_changed_attributes_unrecorded_prev_explicit_still_detects_real_drift() {
 
     let desired: HashMap<String, Value> = HashMap::from([(
         "principal_type".to_string(),
-        Value::Concrete(ConcreteValue::String("GROUP".to_string())),
+        Value::Concrete(ConcreteValue::String("GROUP".into())),
     )]);
     let current: HashMap<String, Value> = HashMap::from([(
         "principal_type".to_string(),
-        Value::Concrete(ConcreteValue::String("USER".to_string())),
+        Value::Concrete(ConcreteValue::String("USER".into())),
     )]);
     let prev_explicit = ExplicitFields::Unrecorded;
     let changed =

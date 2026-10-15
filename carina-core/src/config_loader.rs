@@ -1933,9 +1933,7 @@ awscc.ec2.SecurityGroup {
                 until_raw: "target.status == 'ready'".to_string(),
                 until_predicate: crate::parser::UntilPredicateAst {
                     lhs_segments: vec!["target".to_string(), "status".to_string()],
-                    rhs: Value::Concrete(crate::resource::ConcreteValue::String(
-                        "ready".to_string(),
-                    )),
+                    rhs: Value::Concrete(crate::resource::ConcreteValue::String("ready".into())),
                 },
                 timeout_secs: None,
                 depends_on: Vec::new(),

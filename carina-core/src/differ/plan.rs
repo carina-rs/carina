@@ -182,11 +182,15 @@ pub fn generate_temporary_name(
         .map(|attr| !attr.create_only)
         .unwrap_or(false);
 
-    let temporary_value = format!("{}-{}", original_value, generate_random_suffix());
+    let temporary_value = format!(
+        "{}-{}",
+        original_value.expose_plaintext(),
+        generate_random_suffix()
+    );
 
     Ok(Some(TemporaryName {
         attribute: name_attr.clone(),
-        original_value,
+        original_value: original_value.into_plaintext(),
         temporary_value,
         can_rename,
     }))
@@ -531,7 +535,7 @@ fn create_plan_parts(
             }
             let identifier = state.identifier.clone().unwrap_or_default();
             let binding = state.attributes.get("_binding").and_then(|v| match v {
-                Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
+                Value::Concrete(ConcreteValue::String(s)) => Some(s.expose_plaintext().to_owned()),
                 _ => None,
             });
             // Use stored dependency bindings from state file if available,
@@ -883,7 +887,7 @@ fn apply_temporary_name(
     if let Some(temp) = temporary_name {
         resource.set_attr(
             temp.attribute.clone(),
-            Value::Concrete(ConcreteValue::String(temp.temporary_value.clone())),
+            Value::Concrete(ConcreteValue::String(temp.temporary_value.clone().into())),
         );
     }
     resource

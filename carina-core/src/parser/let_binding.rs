@@ -72,7 +72,9 @@ pub(super) fn parse_let_binding_extended(
     // else it is a parse error.
     if rhs_pair.as_rule() == Rule::use_expr {
         let use_stmt = parse_use_expr(rhs_pair, &name, ctx)?;
-        let value = Value::Concrete(ConcreteValue::String(format!("${{use:{}}}", use_stmt.path)));
+        let value = Value::Concrete(ConcreteValue::String(
+            format!("${{use:{}}}", use_stmt.path).into(),
+        ));
         return Ok((
             name,
             EvalValue::from_value(value),
@@ -317,8 +319,9 @@ fn parse_primary_with_resource_or_module(
     match inner.as_rule() {
         Rule::read_resource_expr => {
             let data_source = parse_read_resource_expr(inner, ctx, binding_name)?;
-            let ref_value =
-                Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
+            let ref_value = Value::Concrete(ConcreteValue::String(
+                format!("${{{}}}", binding_name).into(),
+            ));
             Ok((
                 EvalValue::from_value(ref_value),
                 vec![],
@@ -337,8 +340,9 @@ fn parse_primary_with_resource_or_module(
                 });
             }
             ctx.upstream_states.insert(us.binding.clone(), us);
-            let ref_value =
-                Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
+            let ref_value = Value::Concrete(ConcreteValue::String(
+                format!("${{{}}}", binding_name).into(),
+            ));
             Ok((
                 EvalValue::from_value(ref_value),
                 vec![],
@@ -361,8 +365,9 @@ fn parse_primary_with_resource_or_module(
                 });
             }
             ctx.named_provider_instances.push(config);
-            let ref_value =
-                Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
+            let ref_value = Value::Concrete(ConcreteValue::String(
+                format!("${{{}}}", binding_name).into(),
+            ));
             Ok((
                 EvalValue::from_value(ref_value),
                 vec![],
@@ -387,8 +392,9 @@ fn parse_primary_with_resource_or_module(
             // `<wait-binding>.<attr>` as passthrough of `<target>.<attr>`.
             // For now we mirror the upstream_state_expr pattern and emit
             // a placeholder `${binding}` reference.
-            let ref_value =
-                Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
+            let ref_value = Value::Concrete(ConcreteValue::String(
+                format!("${{{}}}", binding_name).into(),
+            ));
             Ok((
                 EvalValue::from_value(ref_value),
                 vec![],
@@ -399,8 +405,9 @@ fn parse_primary_with_resource_or_module(
         }
         Rule::resource_expr => {
             let resource = parse_resource_expr(inner, ctx, binding_name)?;
-            let ref_value =
-                Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
+            let ref_value = Value::Concrete(ConcreteValue::String(
+                format!("${{{}}}", binding_name).into(),
+            ));
             Ok((
                 EvalValue::from_value(ref_value),
                 vec![resource],
@@ -411,8 +418,9 @@ fn parse_primary_with_resource_or_module(
         }
         Rule::for_expr => {
             let (resources, data_sources, module_calls) = parse_for_expr(inner, ctx, binding_name)?;
-            let ref_value =
-                Value::Concrete(ConcreteValue::String(format!("${{for:{}}}", binding_name)));
+            let ref_value = Value::Concrete(ConcreteValue::String(
+                format!("${{for:{}}}", binding_name).into(),
+            ));
             Ok((
                 EvalValue::from_value(ref_value),
                 resources,
@@ -428,10 +436,9 @@ fn parse_primary_with_resource_or_module(
         }
         Rule::module_call => {
             let call = parse_module_call(inner, ctx)?;
-            let value = Value::Concrete(ConcreteValue::String(format!(
-                "${{module:{}}}",
-                call.module_name
-            )));
+            let value = Value::Concrete(ConcreteValue::String(
+                format!("${{module:{}}}", call.module_name).into(),
+            ));
             Ok((
                 EvalValue::from_value(value),
                 vec![],

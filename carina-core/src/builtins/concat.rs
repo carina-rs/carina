@@ -89,20 +89,20 @@ mod tests {
         // concat(items=["c"], base=["a", "b"]) => ["a", "b", "c"]
         let args = vec![
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("c".to_string()),
+                ConcreteValue::String("c".into()),
             )])),
             Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("a".to_string())),
-                Value::Concrete(ConcreteValue::String("b".to_string())),
+                Value::Concrete(ConcreteValue::String("a".into())),
+                Value::Concrete(ConcreteValue::String("b".into())),
             ])),
         ];
         let result = evaluate_builtin("concat", &args).unwrap();
         assert_eq!(
             result,
             Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("a".to_string())),
-                Value::Concrete(ConcreteValue::String("b".to_string())),
-                Value::Concrete(ConcreteValue::String("c".to_string())),
+                Value::Concrete(ConcreteValue::String("a".into())),
+                Value::Concrete(ConcreteValue::String("b".into())),
+                Value::Concrete(ConcreteValue::String("c".into())),
             ]))
         );
     }
@@ -116,7 +116,7 @@ mod tests {
             )])),
             Value::Concrete(ConcreteValue::List(vec![
                 Value::Concrete(ConcreteValue::Int(1)),
-                Value::Concrete(ConcreteValue::String("two".to_string())),
+                Value::Concrete(ConcreteValue::String("two".into())),
             ])),
         ];
         let result = evaluate_builtin("concat", &args).unwrap();
@@ -124,7 +124,7 @@ mod tests {
             result,
             Value::Concrete(ConcreteValue::List(vec![
                 Value::Concrete(ConcreteValue::Int(1)),
-                Value::Concrete(ConcreteValue::String("two".to_string())),
+                Value::Concrete(ConcreteValue::String("two".into())),
                 Value::Concrete(ConcreteValue::Bool(true)),
             ]))
         );
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn concat_first_arg_not_list() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("not a list".to_string())),
+            Value::Concrete(ConcreteValue::String("not a list".into())),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Int(1),
             )])),
@@ -225,7 +225,7 @@ mod tests {
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Int(1),
             )])),
-            Value::Concrete(ConcreteValue::String("not a list".to_string())),
+            Value::Concrete(ConcreteValue::String("not a list".into())),
         ];
         let result = evaluate_builtin("concat", &args);
         assert!(result.is_err());

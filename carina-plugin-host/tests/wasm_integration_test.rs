@@ -408,7 +408,7 @@ async fn test_wasm_mock_provider_normalizer() {
                 first_id.clone(),
                 HashMap::from([(
                     "__mock_normalize_state__".to_string(),
-                    Value::Concrete(ConcreteValue::String("first".to_string())),
+                    Value::Concrete(ConcreteValue::String("first".into())),
                 )]),
             ),
         ),
@@ -418,7 +418,7 @@ async fn test_wasm_mock_provider_normalizer() {
                 second_id.clone(),
                 HashMap::from([(
                     "__mock_normalize_state__".to_string(),
-                    Value::Concrete(ConcreteValue::String("second".to_string())),
+                    Value::Concrete(ConcreteValue::String("second".into())),
                 )]),
             ),
         ),
@@ -434,16 +434,14 @@ async fn test_wasm_mock_provider_normalizer() {
         pending_states[&first_id]
             .attributes
             .get("__mock_normalized_state__"),
-        Some(&Value::Concrete(ConcreteValue::String("first".to_string()))),
+        Some(&Value::Concrete(ConcreteValue::String("first".into()))),
         "the first pending state must receive its own normalized WASM result"
     );
     assert_eq!(
         pending_states[&second_id]
             .attributes
             .get("__mock_normalized_state__"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "second".to_string()
-        ))),
+        Some(&Value::Concrete(ConcreteValue::String("second".into()))),
         "the second pending state must receive its own normalized WASM result"
     );
 }
@@ -469,7 +467,7 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
                 ),
                 (
                     "__mock_normalize_state__".to_string(),
-                    Value::Concrete(ConcreteValue::String("rekeyed".to_string())),
+                    Value::Concrete(ConcreteValue::String("rekeyed".into())),
                 ),
             ]),
         ),
@@ -483,9 +481,7 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
         rekeyed_states[&rekeyed_id]
             .attributes
             .get("__mock_normalized_state__"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "rekeyed".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("rekeyed".into())))
     );
 
     let dropped_id = ResourceId::pending_with_provider("mock", "test.resource", None);
@@ -522,7 +518,7 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
         hydrate_id.clone(),
         HashMap::from([(
             "__mock_hydrate_read_state__".to_string(),
-            Value::Concrete(ConcreteValue::String("hydrated".to_string())),
+            Value::Concrete(ConcreteValue::String("hydrated".into())),
         )]),
     )]);
     normalizer
@@ -533,9 +529,7 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
         hydrate_states[&hydrate_id]
             .attributes
             .get("__mock_hydrated_read_state__"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "hydrated".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("hydrated".into())))
     );
 
     let dropped_hydrate_id = ResourceId::pending_with_provider("mock", "test.resource", None);
@@ -586,7 +580,7 @@ async fn test_wasm_resolved_wire_key_collisions_are_normalized_one_at_a_time() {
                 first_id.clone(),
                 HashMap::from([(
                     "__mock_normalize_state__".to_string(),
-                    Value::Concrete(ConcreteValue::String("first".to_string())),
+                    Value::Concrete(ConcreteValue::String("first".into())),
                 )]),
             ),
         ),
@@ -596,7 +590,7 @@ async fn test_wasm_resolved_wire_key_collisions_are_normalized_one_at_a_time() {
                 second_id.clone(),
                 HashMap::from([(
                     "__mock_normalize_state__".to_string(),
-                    Value::Concrete(ConcreteValue::String("second".to_string())),
+                    Value::Concrete(ConcreteValue::String("second".into())),
                 )]),
             ),
         ),
@@ -608,7 +602,7 @@ async fn test_wasm_resolved_wire_key_collisions_are_normalized_one_at_a_time() {
         assert_eq!(
             states[id].attributes.get("__mock_normalized_state__"),
             Some(&Value::Concrete(ConcreteValue::String(
-                expected.to_string()
+                expected.to_string().into()
             ))),
             "every host state sharing a wire key must be normalized"
         );
@@ -629,14 +623,14 @@ async fn test_wasm_resolved_wire_key_collisions_are_normalized_one_at_a_time() {
             first_id.clone(),
             HashMap::from([(
                 "__mock_hydrate_read_state__".to_string(),
-                Value::Concrete(ConcreteValue::String("first".to_string())),
+                Value::Concrete(ConcreteValue::String("first".into())),
             )]),
         ),
         (
             second_id.clone(),
             HashMap::from([(
                 "__mock_hydrate_read_state__".to_string(),
-                Value::Concrete(ConcreteValue::String("second".to_string())),
+                Value::Concrete(ConcreteValue::String("second".into())),
             )]),
         ),
     ]);
@@ -652,7 +646,7 @@ async fn test_wasm_resolved_wire_key_collisions_are_normalized_one_at_a_time() {
                 .attributes
                 .get("__mock_hydrated_read_state__"),
             Some(&Value::Concrete(ConcreteValue::String(
-                expected.to_string()
+                expected.to_string().into()
             ))),
             "every host state sharing a wire key must be hydrated"
         );
@@ -685,7 +679,7 @@ async fn test_wasm_create_normalizer_propagates_instance_initialization_failure(
     let (factory, _cache) = load_factory(&path).await;
     let attributes = indexmap::IndexMap::from([(
         "__mock_initialize_error__".to_string(),
-        Value::Concrete(ConcreteValue::String("normalizer init failed".to_string())),
+        Value::Concrete(ConcreteValue::String("normalizer init failed".into())),
     )]);
     let config = ready_config(&factory, &attributes);
 
@@ -728,7 +722,7 @@ async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() 
                     id,
                     HashMap::from([(
                         "original".to_string(),
-                        Value::Concrete(ConcreteValue::String("value".to_string())),
+                        Value::Concrete(ConcreteValue::String("value".into())),
                     )]),
                 ),
             ),
@@ -738,7 +732,7 @@ async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() 
                     update_id,
                     HashMap::from([(
                         "__mock_normalize_state__".to_string(),
-                        Value::Concrete(ConcreteValue::String("would-change".to_string())),
+                        Value::Concrete(ConcreteValue::String("would-change".into())),
                     )]),
                 ),
             ),
@@ -765,7 +759,7 @@ async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() 
                     id,
                     HashMap::from([(
                         "original".to_string(),
-                        Value::Concrete(ConcreteValue::String("value".to_string())),
+                        Value::Concrete(ConcreteValue::String("value".into())),
                     )]),
                 ),
             ),
@@ -779,7 +773,7 @@ async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() 
             update_id,
             HashMap::from([(
                 "__mock_hydrate_read_state__".to_string(),
-                Value::Concrete(ConcreteValue::String("would-change".to_string())),
+                Value::Concrete(ConcreteValue::String("would-change".into())),
             )]),
         )]);
 
@@ -817,7 +811,7 @@ async fn test_wasm_normalize_state_trap_is_an_error_and_does_not_mutate_state() 
             id,
             HashMap::from([(
                 "original".to_string(),
-                Value::Concrete(ConcreteValue::String("value".to_string())),
+                Value::Concrete(ConcreteValue::String("value".into())),
             )]),
         ),
     )]);
@@ -988,7 +982,7 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
             id.clone(),
             HashMap::from([(
                 "original".to_string(),
-                Value::Concrete(ConcreteValue::String("value".to_string())),
+                Value::Concrete(ConcreteValue::String("value".into())),
             )]),
         ),
     )]);
@@ -1021,7 +1015,7 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
             hydrate_id.clone(),
             HashMap::from([(
                 "original".to_string(),
-                Value::Concrete(ConcreteValue::String("value".to_string())),
+                Value::Concrete(ConcreteValue::String("value".into())),
             )]),
         ),
     )]);
@@ -1058,7 +1052,7 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
     let merge_before = merge_resources.clone();
     let default_tags = indexmap::IndexMap::from([(
         "Environment".to_string(),
-        Value::Concrete(ConcreteValue::String("test".to_string())),
+        Value::Concrete(ConcreteValue::String("test".into())),
     )]);
     let error = normalizer
         .merge_default_tags(
@@ -1268,7 +1262,7 @@ async fn test_wasm_normalize_desired_preserves_secret() {
         .expect("normalizer should initialize");
 
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("normalize-secret-plaintext".to_string()),
+        ConcreteValue::String("normalize-secret-plaintext".into()),
     ))));
     let mut resource = Resource::with_provider("mock", "test.resource", "secret-normalize", None);
     resource
@@ -1291,10 +1285,10 @@ async fn test_wasm_merge_default_tags_restores_secret_into_two_resources() {
         .expect("normalizer should initialize");
 
     let resource_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("resource-secret-plaintext".to_string()),
+        ConcreteValue::String("resource-secret-plaintext".into()),
     ))));
     let default_tag_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("default-tag-secret-plaintext".to_string()),
+        ConcreteValue::String("default-tag-secret-plaintext".into()),
     ))));
     let mut resources: Vec<_> = ["first-secret-tags", "second-secret-tags"]
         .into_iter()
@@ -1370,7 +1364,7 @@ async fn test_wasm_mock_provider_hydrate_read_state_preserves_host_ids() {
                 id.clone(),
                 HashMap::from([(
                     "__mock_hydrate_read_state__".to_string(),
-                    Value::Concrete(ConcreteValue::String(format!("marker-{index}"))),
+                    Value::Concrete(ConcreteValue::String(format!("marker-{index}").into())),
                 )]),
             )
         })
@@ -1387,9 +1381,9 @@ async fn test_wasm_mock_provider_hydrate_read_state_preserves_host_ids() {
         assert_eq!(&state.id, id, "the original host ResourceId must survive");
         assert_eq!(
             state.attributes.get("__mock_hydrated_read_state__"),
-            Some(&Value::Concrete(ConcreteValue::String(format!(
-                "marker-{index}"
-            )))),
+            Some(&Value::Concrete(ConcreteValue::String(
+                format!("marker-{index}").into()
+            ))),
             "each state must receive the saved attrs associated with its host ID"
         );
     }
@@ -1421,11 +1415,11 @@ async fn test_wasm_mock_provider_merge_default_tags_dispatches_through_wit() {
     let default_tags = indexmap::IndexMap::from([
         (
             "Env".to_string(),
-            Value::Concrete(ConcreteValue::String("dev".to_string())),
+            Value::Concrete(ConcreteValue::String("dev".into())),
         ),
         (
             "Owner".to_string(),
-            Value::Concrete(ConcreteValue::String("platform".to_string())),
+            Value::Concrete(ConcreteValue::String("platform".into())),
         ),
     ]);
 
@@ -1495,7 +1489,7 @@ async fn test_wasm_mock_provider_merge_default_tags_preserves_order() {
     ];
     let default_tags = indexmap::IndexMap::from([(
         "Env".to_string(),
-        Value::Concrete(ConcreteValue::String("dev".to_string())),
+        Value::Concrete(ConcreteValue::String("dev".into())),
     )]);
 
     normalizer

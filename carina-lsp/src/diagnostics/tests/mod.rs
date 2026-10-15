@@ -156,7 +156,10 @@ pub(super) fn test_engine_with_custom_namespaced_attr() -> DiagnosticEngine {
             ) if s == "test.r.Mode.fast" || s == "test.r.Mode.slow" => Ok(()),
             carina_core::resource::Value::Concrete(
                 carina_core::resource::ConcreteValue::String(s),
-            ) => Err(format!("invalid Mode '{}': expected fast or slow", s)),
+            ) => Err(format!(
+                "invalid Mode '{}': expected fast or slow",
+                s.expose_plaintext()
+            )),
             _ => Err("expected string".to_string()),
         }
     }

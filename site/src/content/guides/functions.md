@@ -91,9 +91,9 @@ let vpcs = for (i, env) in ['dev', 'stg'] {
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `env` | `env(name) -> string` | Reads an environment variable |
+| `env` | `env(name) -> string` | Reads an environment variable; diagnostics never display its contents |
 | `secret` | `secret(value) -> secret` | Marks a value as secret (stored as hash in state) |
-| `decrypt` | `decrypt(ciphertext, key?) -> string` | Decrypts using the provider's encryption service (e.g., AWS KMS) |
+| `decrypt` | `decrypt(ciphertext, key?) -> secret` | Decrypts using the provider's encryption service; the result is automatically masked and hashed in state |
 
 ## User-defined functions
 

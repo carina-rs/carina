@@ -202,7 +202,9 @@ fn format_compact_name(
 /// Format an export value for plan display.
 fn format_export_value(value: &Value) -> String {
     match value {
-        Value::Concrete(ConcreteValue::String(s)) => format!("'{}'", s),
+        Value::Concrete(ConcreteValue::String(s)) => {
+            format!("'{}'", s.expose_plaintext())
+        }
         Value::Concrete(ConcreteValue::Int(i)) => i.to_string(),
         Value::Concrete(ConcreteValue::Float(f)) => f.to_string(),
         Value::Concrete(ConcreteValue::Bool(b)) => b.to_string(),
@@ -213,7 +215,10 @@ fn format_export_value(value: &Value) -> String {
             format!("[{}]", formatted.join(", "))
         }
         Value::Concrete(ConcreteValue::StringList(items)) => {
-            let formatted: Vec<String> = items.iter().map(|s| format!("'{}'", s)).collect();
+            let formatted: Vec<String> = items
+                .iter()
+                .map(|s| format!("'{}'", s.expose_plaintext()))
+                .collect();
             format!("[{}]", formatted.join(", "))
         }
         Value::Concrete(ConcreteValue::Map(map)) => {

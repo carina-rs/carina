@@ -15,7 +15,8 @@ use carina_core::schema::collect_all_block_names;
 
 use crate::error::AppError;
 use crate::wiring::{
-    FormattingFactoryLoad, WiringContext, build_factories_from_providers_for_formatting,
+    FormattingFactoryLoad, ProviderFactoryDiagnostic, WiringContext,
+    build_factories_from_providers_for_formatting,
 };
 
 /// Controls how formatting changes are applied and reported.
@@ -83,7 +84,7 @@ impl FmtMode {
 #[derive(Default)]
 struct DirectoryBlockNames {
     block_names: HashMap<String, String>,
-    provider_load_diagnostics: HashMap<String, crate::wiring::ProviderFactoryDiagnostic>,
+    provider_load_diagnostics: HashMap<String, ProviderFactoryDiagnostic>,
 }
 
 #[derive(Default)]
@@ -559,7 +560,10 @@ mod tests {
         let failed = block_names_for_dir(tmp.path(), |_, _| {
             (
                 Vec::<Box<dyn ProviderFactory>>::new(),
-                HashMap::from([("example".to_string(), "load failed".to_string().into())]),
+                HashMap::from([(
+                    "example".to_string(),
+                    ProviderFactoryDiagnostic::Message("load failed".into()),
+                )]),
             )
         });
 

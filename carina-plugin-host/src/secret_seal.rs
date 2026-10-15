@@ -177,7 +177,8 @@ pub(crate) fn seal(
                     SerializationError::UnknownNotAllowed { .. }
                     | SerializationError::UnresolvedResourceRef { .. }
                     | SerializationError::UnresolvedInterpolation { .. }
-                    | SerializationError::UnresolvedFunctionCall { .. } => {
+                    | SerializationError::UnresolvedFunctionCall { .. }
+                    | SerializationError::SecretNotAllowed { .. } => {
                         log::error!(
                             "Skipping default_tag '{key}' with unresolvable value: {error}"
                         );
@@ -218,10 +219,9 @@ impl Sealer {
             Value::Deferred(DeferredValue::Secret(_)) => {
                 let index = self.secrets.len();
                 self.secrets.push(value.clone());
-                Value::Concrete(ConcreteValue::String(format!(
-                    "{}{index}",
-                    self.nonce_prefix
-                )))
+                Value::Concrete(ConcreteValue::String(
+                    format!("{}{index}", self.nonce_prefix).into(),
+                ))
             }
             Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
                 items.iter().map(|item| self.seal_value(item)).collect(),
@@ -283,7 +283,7 @@ impl Unsealer {
 
     fn restore_value(&self, value: &mut Value) -> bool {
         if let Value::Concrete(ConcreteValue::String(candidate)) = value {
-            return match self.token_index(candidate) {
+            return match self.token_index(candidate.expose_plaintext()) {
                 TokenIndex::NotSealed => true,
                 TokenIndex::Known(index) => {
                     *value = self.secrets[index].clone();
@@ -298,7 +298,10 @@ impl Unsealer {
                 items.iter_mut().all(|item| self.restore_value(item))
             }
             Value::Concrete(ConcreteValue::StringList(items)) => {
-                if items.iter().any(|item| item.contains(&self.nonce_prefix)) {
+                if items
+                    .iter()
+                    .any(|item| item.expose_plaintext().contains(&self.nonce_prefix))
+                {
                     let mut expanded: Vec<Value> = std::mem::take(items)
                         .into_iter()
                         .map(|item| Value::Concrete(ConcreteValue::String(item)))
@@ -319,7 +322,7 @@ impl Unsealer {
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 let token = match inner.as_ref() {
                     Value::Concrete(ConcreteValue::String(candidate)) => {
-                        self.token_index(candidate)
+                        self.token_index(candidate.expose_plaintext())
                     }
                     _ => return self.restore_value(inner),
                 };
@@ -374,7 +377,7 @@ mod tests {
     use super::*;
 
     fn string(value: &str) -> Value {
-        Value::Concrete(ConcreteValue::String(value.to_string()))
+        Value::Concrete(ConcreteValue::String(value.to_string().into()))
     }
 
     fn secret(value: Value) -> Value {
@@ -885,8 +888,8 @@ mod tests {
         assert_eq!(
             resources[0].get_attr("affected"),
             Some(&Value::Concrete(ConcreteValue::StringList(vec![
-                "first".to_string(),
-                "second".to_string(),
+                "first".into(),
+                "second".into(),
             ])))
         );
         assert_eq!(

@@ -130,11 +130,11 @@ fn region_schemas() -> SchemaRegistry {
         {
             // Same shape as `aws_region()`: strip any namespace prefix
             // (DSL form) and rewrite `_` → `-` to get the AWS form.
-            let normalized = fixture_enum_segment_as_aws_value(s);
+            let normalized = fixture_enum_segment_as_aws_value(s.expose_plaintext());
             if VALID.contains(&normalized.as_str()) {
                 return Ok(());
             }
-            return Err(format!("invalid Region '{}'", s));
+            return Err(format!("invalid Region '{}'", s.expose_plaintext()));
         }
         Err("expected string".to_string())
     }

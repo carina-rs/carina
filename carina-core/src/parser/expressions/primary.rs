@@ -9,22 +9,14 @@ use crate::eval_value::EvalValue;
 use crate::parser::expressions::if_expr::parse_if_value_expr;
 use crate::parser::expressions::string_literal::parse_string_value;
 use crate::parser::{
-    ParseContext, ParseError, Rule, evaluate_user_function_with_origins, extract_key_string,
-    first_inner, is_static_value, next_pair, parse_block_contents, parse_expression,
-    parse_expression_eval,
+    ParseContext, ParseError, Rule, evaluate_user_function, extract_key_string, first_inner,
+    is_static_value, next_pair, parse_block_contents, parse_expression, parse_expression_eval,
 };
 use crate::resource::{
     AccessPath, ConcreteValue, DeferredValue, PathSegment, Subscript, UnknownReason, Value,
+    ValueString,
 };
 use indexmap::IndexMap;
-
-fn contains_function_call_syntax(pair: &pest::iterators::Pair<'_, Rule>) -> bool {
-    pair.as_rule() == Rule::function_call
-        || pair
-            .clone()
-            .into_inner()
-            .any(|inner| contains_function_call_syntax(&inner))
-}
 
 /// Resolve a field-access path rooted at a **bound variable** (a
 /// `for`-loop value var, a `let`-of-struct), shared by the two parser
@@ -401,14 +393,9 @@ pub(crate) fn parse_primary_eval(
             let func_name = next_pair(&mut fc_inner, "function name", "function call")?
                 .as_str()
                 .to_string();
-            let parsed_args: Result<Vec<(Value, bool)>, ParseError> = fc_inner
-                .map(|arg| {
-                    let function_derived = contains_function_call_syntax(&arg);
-                    parse_expression(arg, ctx).map(|value| (value, function_derived))
-                })
-                .collect();
-            let parsed_args = parsed_args?;
-            let (args, argument_origins): (Vec<_>, Vec<_>) = parsed_args.into_iter().unzip();
+            let args: Result<Vec<Value>, ParseError> =
+                fc_inner.map(|arg| parse_expression(arg, ctx)).collect();
+            let args = args?;
 
             // Check if the name refers to a Closure variable (direct call on closure)
             if let Some(EvalValue::Closure {
@@ -436,13 +423,7 @@ pub(crate) fn parse_primary_eval(
             // Try to eagerly evaluate user-defined function calls
             if ctx.user_functions.contains_key(&func_name) && args.iter().all(is_static_value) {
                 let user_fn = ctx.user_functions.get(&func_name).unwrap().clone();
-                return evaluate_user_function_with_origins(
-                    &user_fn,
-                    &args,
-                    &argument_origins,
-                    ctx,
-                )
-                .map(EvalValue::from_value);
+                return evaluate_user_function(&user_fn, &args, ctx).map(EvalValue::from_value);
             }
 
             // Eagerly evaluate partial application (fewer args than arity → Closure)
@@ -517,7 +498,7 @@ pub(crate) fn parse_primary_eval(
                 // field after a post-field subscript (e.g.
                 // `a.b[0].c`) is rejected — runtime list-indexing of
                 // arbitrary structs isn't representable today.
-                let mut binding_name = first_ident.to_string();
+                let mut binding_name = ValueString::plain(first_ident);
                 let mut field_names: Vec<String> = Vec::new();
                 let mut subscripts: Vec<Subscript> = Vec::new();
                 let mut in_field_phase = false;
@@ -537,11 +518,16 @@ pub(crate) fn parse_primary_eval(
                                 // convention so `for`-iteration
                                 // addresses round-trip.
                                 binding_name = match subscript {
-                                    Subscript::Int { index } => {
-                                        format!("{}[{}]", binding_name, index)
-                                    }
+                                    Subscript::Int { index } => ValueString::derived_from(
+                                        format!("{}[{index}]", binding_name.expose_plaintext()),
+                                        [&binding_name],
+                                    ),
                                     Subscript::Str { key } => {
-                                        crate::utils::map_key_address(&binding_name, &key)
+                                        let address = crate::utils::map_key_address(
+                                            binding_name.expose_plaintext(),
+                                            key.expose_plaintext(),
+                                        );
+                                        ValueString::derived_from(address, [&binding_name, &key])
                                     }
                                 };
                             }
@@ -574,11 +560,18 @@ pub(crate) fn parse_primary_eval(
                     // was the source of the empty-field diagnostic in
                     // #2847; the new variant makes that representation
                     // unrepresentable.
-                    match ctx.get_variable(&binding_name) {
+                    match ctx.get_variable(binding_name.expose_plaintext()) {
                         Some(val) => Ok(val.clone()),
+                        None if binding_name.is_diagnostic_sensitive() => {
+                            Err(ParseError::InvalidExpression {
+                                line: 0,
+                                message: "unresolved binding containing a value from env()"
+                                    .to_string(),
+                            })
+                        }
                         None => Ok(EvalValue::from_value(Value::Deferred(
                             DeferredValue::BindingRef {
-                                binding: binding_name,
+                                binding: binding_name.into_plaintext(),
                             },
                         ))),
                     }
@@ -604,7 +597,7 @@ pub(crate) fn parse_primary_eval(
                     // no scalar-error arm (its no-field sibling already
                     // guards scalars upstream).
                     if let Some(crate::eval_value::EvalValue::User(bound)) =
-                        ctx.get_variable(&binding_name)
+                        ctx.get_variable(binding_name.expose_plaintext())
                         && let Some(ev) = resolve_bound_var_field_access(bound, &path)
                     {
                         Ok(ev)
@@ -619,7 +612,7 @@ pub(crate) fn parse_primary_eval(
         Rule::if_expr => parse_if_value_expr(inner, ctx).map(EvalValue::from_value),
         Rule::expression => parse_expression_eval(inner, ctx),
         _ => Ok(EvalValue::from_value(Value::Concrete(
-            ConcreteValue::String(inner.as_str().to_string()),
+            ConcreteValue::String(inner.as_str().to_string().into()),
         ))),
     }
 }

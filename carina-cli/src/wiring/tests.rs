@@ -362,7 +362,7 @@ fn resolved_invalid_provider_config() -> (
         "net".to_string(),
         HashMap::from([(
             "role_arn".to_string(),
-            Value::Concrete(ConcreteValue::String("not-an-arn".to_string())),
+            Value::Concrete(ConcreteValue::String("not-an-arn".into())),
         )]),
     )]);
     let configs = resolved_provider_configs_with_remote(&parsed, &remote);
@@ -541,7 +541,7 @@ impl Provider for CascadeCreateProvider {
                         id,
                         HashMap::from([(
                             "vpc_id".to_string(),
-                            Value::Concrete(ConcreteValue::String("vpc-new".to_string())),
+                            Value::Concrete(ConcreteValue::String("vpc-new".into())),
                         )]),
                     )
                     .with_identifier("vpc-new"),
@@ -554,7 +554,7 @@ impl Provider for CascadeCreateProvider {
                         id,
                         HashMap::from([(
                             "subnet_id".to_string(),
-                            Value::Concrete(ConcreteValue::String("subnet-new".to_string())),
+                            Value::Concrete(ConcreteValue::String("subnet-new".into())),
                         )]),
                     )
                     .with_identifier("subnet-new"),
@@ -734,7 +734,9 @@ fn test_resolve_enum_aliases_ip_protocol_all() {
     resource.set_attr(
         "ip_protocol".to_string(),
         Value::Concrete(ConcreteValue::String(
-            "awscc.ec2.security_group_egress.IpProtocol.all".to_string(),
+            "awscc.ec2.security_group_egress.IpProtocol.all"
+                .to_string()
+                .into(),
         )),
     );
 
@@ -743,7 +745,7 @@ fn test_resolve_enum_aliases_ip_protocol_all() {
 
     assert_eq!(
         resources[0].get_attr("ip_protocol"),
-        Some(&Value::Concrete(ConcreteValue::String("-1".to_string()))),
+        Some(&Value::Concrete(ConcreteValue::String("-1".into()))),
         "Alias 'all' should be resolved to canonical AWS value '-1'"
     );
 }
@@ -757,7 +759,9 @@ fn test_resolve_enum_aliases_no_alias() {
     resource.set_attr(
         "ip_protocol".to_string(),
         Value::Concrete(ConcreteValue::String(
-            "awscc.ec2.security_group_egress.IpProtocol.tcp".to_string(),
+            "awscc.ec2.security_group_egress.IpProtocol.tcp"
+                .to_string()
+                .into(),
         )),
     );
 
@@ -768,7 +772,9 @@ fn test_resolve_enum_aliases_no_alias() {
     assert_eq!(
         resources[0].get_attr("ip_protocol"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "awscc.ec2.security_group_egress.IpProtocol.tcp".to_string()
+            "awscc.ec2.security_group_egress.IpProtocol.tcp"
+                .to_string()
+                .into()
         ))),
     );
 }
@@ -782,7 +788,9 @@ fn test_resolve_enum_aliases_aws_provider() {
     resource.set_attr(
         "ip_protocol".to_string(),
         Value::Concrete(ConcreteValue::String(
-            "aws.ec2.security_group_ingress.IpProtocol.all".to_string(),
+            "aws.ec2.security_group_ingress.IpProtocol.all"
+                .to_string()
+                .into(),
         )),
     );
 
@@ -791,7 +799,7 @@ fn test_resolve_enum_aliases_aws_provider() {
 
     assert_eq!(
         resources[0].get_attr("ip_protocol"),
-        Some(&Value::Concrete(ConcreteValue::String("-1".to_string()))),
+        Some(&Value::Concrete(ConcreteValue::String("-1".into()))),
     );
 }
 
@@ -806,7 +814,9 @@ fn test_resolve_enum_aliases_in_states() {
     attrs.insert(
         "ip_protocol".to_string(),
         Value::Concrete(ConcreteValue::String(
-            "awscc.ec2.security_group_egress.IpProtocol.all".to_string(),
+            "awscc.ec2.security_group_egress.IpProtocol.all"
+                .to_string()
+                .into(),
         )),
     );
     let state = State::existing(id.clone(), attrs);
@@ -817,7 +827,7 @@ fn test_resolve_enum_aliases_in_states() {
 
     assert_eq!(
         current_states[&id].attributes.get("ip_protocol"),
-        Some(&Value::Concrete(ConcreteValue::String("-1".to_string()))),
+        Some(&Value::Concrete(ConcreteValue::String("-1".into()))),
     );
 }
 
@@ -830,12 +840,12 @@ fn test_resolve_enum_aliases_in_struct_field() {
     egress_map.insert(
         "ip_protocol".to_string(),
         Value::Concrete(ConcreteValue::String(
-            "awscc.ec2.SecurityGroup.IpProtocol.all".to_string(),
+            "awscc.ec2.SecurityGroup.IpProtocol.all".into(),
         )),
     );
     egress_map.insert(
         "cidr_ip".to_string(),
-        Value::Concrete(ConcreteValue::String("0.0.0.0/0".to_string())),
+        Value::Concrete(ConcreteValue::String("0.0.0.0/0".into())),
     );
     resource.set_attr(
         "security_group_egress".to_string(),
@@ -853,14 +863,12 @@ fn test_resolve_enum_aliases_in_struct_field() {
         if let Value::Concrete(ConcreteValue::Map(m)) = &items[0] {
             assert_eq!(
                 m.get("ip_protocol"),
-                Some(&Value::Concrete(ConcreteValue::String("-1".to_string()))),
+                Some(&Value::Concrete(ConcreteValue::String("-1".into()))),
                 "Alias in struct field should be resolved"
             );
             assert_eq!(
                 m.get("cidr_ip"),
-                Some(&Value::Concrete(ConcreteValue::String(
-                    "0.0.0.0/0".to_string()
-                ))),
+                Some(&Value::Concrete(ConcreteValue::String("0.0.0.0/0".into()))),
                 "Non-alias values should not be changed"
             );
         } else {
@@ -893,7 +901,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
     resource.set_attr(
         "instance_tenancy".to_string(),
         Value::Concrete(ConcreteValue::String(
-            "awscc.ec2.Vpc.InstanceTenancy.default".to_string(),
+            "awscc.ec2.Vpc.InstanceTenancy.default".into(),
         )),
     );
 
@@ -902,7 +910,7 @@ fn test_normalize_state_prevents_false_enum_diff() {
     let mut state_attrs = HashMap::new();
     state_attrs.insert(
         "instance_tenancy".to_string(),
-        Value::Concrete(ConcreteValue::String("default".to_string())),
+        Value::Concrete(ConcreteValue::String("default".into())),
     );
     let state = State::existing(id.clone(), state_attrs);
     let mut current_states = HashMap::new();
@@ -1012,7 +1020,7 @@ fn normalize_state_with_ctx_prepares_config_inside_multithread_runtime() {
         name: "block-in-place".to_string(),
         attributes: IndexMap::from([(
             "region".to_string(),
-            Value::Concrete(ConcreteValue::String("resolved-region".to_string())),
+            Value::Concrete(ConcreteValue::String("resolved-region".into())),
         )]),
         default_tags: IndexMap::new(),
         source: None,
@@ -1037,7 +1045,7 @@ fn normalize_state_with_ctx_prepares_config_inside_multithread_runtime() {
     assert_eq!(
         *received_region.lock().unwrap(),
         Some(Value::Concrete(ConcreteValue::String(
-            "resolved-region".to_string()
+            "resolved-region".into()
         ))),
         "state normalization must prepare the declared provider config"
     );
@@ -1085,7 +1093,7 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
         name: "capture".to_string(),
         attributes: IndexMap::from([(
             "region".to_string(),
-            Value::Concrete(ConcreteValue::String(region.to_string())),
+            Value::Concrete(ConcreteValue::String(region.to_string().into())),
         )]),
         default_tags: IndexMap::new(),
         source: None,
@@ -1105,7 +1113,7 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
     assert_eq!(
         ready.attributes().get("region"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "default-region".to_string()
+            "default-region".into()
         )))
     );
 
@@ -1118,7 +1126,7 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
     assert_eq!(
         ready.attributes().get("region"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "first-named-region".to_string()
+            "first-named-region".into()
         )))
     );
 
@@ -1162,7 +1170,7 @@ fn test_merge_default_tags_prevents_false_diff() {
     let mut tags = IndexMap::new();
     tags.insert(
         "Environment".to_string(),
-        Value::Concrete(ConcreteValue::String("production".to_string())),
+        Value::Concrete(ConcreteValue::String("production".into())),
     );
     state_attrs.insert(
         "tags".to_string(),
@@ -1176,7 +1184,7 @@ fn test_merge_default_tags_prevents_false_diff() {
         let mut m = IndexMap::new();
         m.insert(
             "Environment".to_string(),
-            Value::Concrete(ConcreteValue::String("production".to_string())),
+            Value::Concrete(ConcreteValue::String("production".into())),
         );
         m
     };
@@ -1276,11 +1284,11 @@ fn test_resolve_enum_aliases_non_enum_values_unchanged() {
     let mut resource = Resource::with_provider("awscc", "ec2.SecurityGroup", "test-sg", None);
     resource.set_attr(
         "group_description".to_string(),
-        Value::Concrete(ConcreteValue::String("My security group".to_string())),
+        Value::Concrete(ConcreteValue::String("My security group".into())),
     );
     resource.set_attr(
         "vpc_id".to_string(),
-        Value::Concrete(ConcreteValue::String("vpc-12345".to_string())),
+        Value::Concrete(ConcreteValue::String("vpc-12345".into())),
     );
 
     let mut resources = vec![resource];
@@ -1289,14 +1297,12 @@ fn test_resolve_enum_aliases_non_enum_values_unchanged() {
     assert_eq!(
         resources[0].get_attr("group_description"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "My security group".to_string()
+            "My security group".into()
         ))),
     );
     assert_eq!(
         resources[0].get_attr("vpc_id"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "vpc-12345".to_string()
-        ))),
+        Some(&Value::Concrete(ConcreteValue::String("vpc-12345".into()))),
     );
 }
 
@@ -1702,7 +1708,9 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
     let state_blocks = vec![StateBlock::Import {
         to: StateBlockAddress::new("aws", "route53.RecordSet", "r.delegation_ns"),
         id: Value::Concrete(ConcreteValue::String(
-            "|hosted-zone-id|registry-dev.carina-rs.dev|NS".to_string(),
+            "|hosted-zone-id|registry-dev.carina-rs.dev|NS"
+                .to_string()
+                .into(),
         )),
     }];
 
@@ -2023,11 +2031,11 @@ fn test_plan_fails_on_removed_from_colliding_with_desired() {
     );
     resource.set_attr(
         "route_table_id".to_string(),
-        Value::Concrete(ConcreteValue::String("rtb-private".to_string())),
+        Value::Concrete(ConcreteValue::String("rtb-private".into())),
     );
     resource.set_attr(
         "subnet_id".to_string(),
-        Value::Concrete(ConcreteValue::String("subnet-current".to_string())),
+        Value::Concrete(ConcreteValue::String("subnet-current".into())),
     );
     let mut desired = vec![resource];
     let mut state = StateFile::new();
@@ -2294,7 +2302,7 @@ fn desired_association(name: &str, route_table_binding: &str, subnet_id: &str) -
     );
     resource.set_attr(
         "subnet_id".to_string(),
-        Value::Concrete(ConcreteValue::String(subnet_id.to_string())),
+        Value::Concrete(ConcreteValue::String(subnet_id.to_string().into())),
     );
     resource
 }
@@ -2606,7 +2614,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     use carina_state::state::{ResourceState, StateFile};
 
     fn string(value: &str) -> Value {
-        Value::Concrete(ConcreteValue::String(value.to_string()))
+        Value::Concrete(ConcreteValue::String(value.to_string().into()))
     }
 
     fn compute_initial_anonymous_ids(
@@ -2977,7 +2985,7 @@ fn resolve_data_source_refs_for_refresh_defers_unresolved_apply_time_input() {
     target.binding = Some("target".to_string());
     target.set_attr(
         "name",
-        Value::Concrete(ConcreteValue::String("target".to_string())),
+        Value::Concrete(ConcreteValue::String("target".into())),
     );
 
     let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
@@ -3085,18 +3093,18 @@ fn resolve_data_source_refs_for_refresh_defers_resolvable_interpolation_when_tar
     target.binding = Some("target".to_string());
     target.set_attr(
         "role_name",
-        Value::Concrete(ConcreteValue::String("target-role".to_string())),
+        Value::Concrete(ConcreteValue::String("target-role".into())),
     );
 
     let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
     lookup.attributes.insert(
         "name_regex".to_string(),
         Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Literal("^".to_string()),
+            InterpolationPart::Literal("^".into()),
             InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::new("target", "role_name"),
             })),
-            InterpolationPart::Literal("$".to_string()),
+            InterpolationPart::Literal("$".into()),
         ])),
     );
 
@@ -3132,7 +3140,7 @@ fn resolve_data_source_refs_for_refresh_defers_folded_input_with_missing_depende
     lookup.binding = Some("registry_publish.roles".to_string());
     lookup.attributes.insert(
         "filter".to_string(),
-        Value::Concrete(ConcreteValue::String("^target$".to_string())),
+        Value::Concrete(ConcreteValue::String("^target$".into())),
     );
     lookup
         .dependency_bindings
@@ -3166,7 +3174,7 @@ fn resolve_data_source_refs_for_refresh_does_not_treat_missing_create_only_readb
     target.binding = Some("target".to_string());
     target.set_attr(
         "role_name",
-        Value::Concrete(ConcreteValue::String("same-name".to_string())),
+        Value::Concrete(ConcreteValue::String("same-name".into())),
     );
 
     let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
@@ -3236,7 +3244,7 @@ fn resolve_data_source_refs_for_refresh_defers_when_any_input_references_new_res
             existing.id.clone(),
             HashMap::from([(
                 "name".to_string(),
-                Value::Concrete(ConcreteValue::String("existing".to_string())),
+                Value::Concrete(ConcreteValue::String("existing".into())),
             )]),
         ),
     );
@@ -3316,7 +3324,7 @@ fn resolve_data_source_refs_for_refresh_reads_existing_resource_even_when_replac
     target.binding = Some("target".to_string());
     target.set_attr(
         "role_name",
-        Value::Concrete(ConcreteValue::String("new-name".to_string())),
+        Value::Concrete(ConcreteValue::String("new-name".into())),
     );
 
     let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
@@ -3335,11 +3343,11 @@ fn resolve_data_source_refs_for_refresh_reads_existing_resource_even_when_replac
             HashMap::from([
                 (
                     "role_name".to_string(),
-                    Value::Concrete(ConcreteValue::String("old-name".to_string())),
+                    Value::Concrete(ConcreteValue::String("old-name".into())),
                 ),
                 (
                     "arn".to_string(),
-                    Value::Concrete(ConcreteValue::String("old-arn".to_string())),
+                    Value::Concrete(ConcreteValue::String("old-arn".into())),
                 ),
             ]),
         )
@@ -3383,7 +3391,7 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
     let mut lookup = DataSource::with_provider("test", "Lookup", "roles", None);
     lookup.attributes.insert(
         "filter".to_string(),
-        Value::Concrete(ConcreteValue::String("literal".to_string())),
+        Value::Concrete(ConcreteValue::String("literal".into())),
     );
 
     let empty_registry = carina_core::schema::SchemaRegistry::new();
@@ -3434,7 +3442,7 @@ async fn invalid_data_source_preparation_keeps_typed_error_chain() {
 
     let lookup = DataSource::with_provider("test", "Lookup", "roles", None).with_attribute(
         "filter",
-        Value::Concrete(ConcreteValue::String("bad".to_string())),
+        Value::Concrete(ConcreteValue::String("bad".into())),
     );
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
@@ -3635,7 +3643,7 @@ fn anonymous_route_resource() -> Resource {
     let mut resource = Resource::pending_with_provider("awscc", "ec2.Route", None);
     resource.set_attr(
         "route_table_id".to_string(),
-        Value::Concrete(ConcreteValue::String("rtb-123".to_string())),
+        Value::Concrete(ConcreteValue::String("rtb-123".into())),
     );
     resource
 }
@@ -3832,11 +3840,11 @@ fn validate_rejects_top_level_empty_interpolation() {
     use carina_core::resource::{DeferredValue, InterpolationPart, UnknownReason, Value};
 
     let value = Value::Deferred(DeferredValue::Interpolation(vec![
-        InterpolationPart::Literal("arn:aws:iam::".to_string()),
+        InterpolationPart::Literal("arn:aws:iam::".into()),
         InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
             UnknownReason::EmptyInterpolation,
         ))),
-        InterpolationPart::Literal(":root".to_string()),
+        InterpolationPart::Literal(":root".into()),
     ]));
     let parsed = parsed_with_attr("aws", value);
 
@@ -3895,7 +3903,7 @@ fn validate_rejects_empty_interpolation_inside_function_call() {
     )]));
     let fn_call = Value::Deferred(DeferredValue::FunctionCall {
         name: "join".to_string(),
-        args: vec![Value::Concrete(ConcreteValue::String("-".to_string())), bad],
+        args: vec![Value::Concrete(ConcreteValue::String("-".into())), bad],
     });
     let parsed = parsed_with_attr("name", fn_call);
 
@@ -3916,7 +3924,7 @@ fn validate_rejects_empty_interpolation_nested_in_map() {
     use indexmap::IndexMap;
 
     let inner = Value::Deferred(DeferredValue::Interpolation(vec![
-        InterpolationPart::Literal("prefix-".to_string()),
+        InterpolationPart::Literal("prefix-".into()),
         InterpolationPart::Expr(Value::Deferred(DeferredValue::Unknown(
             UnknownReason::EmptyInterpolation,
         ))),
@@ -4017,10 +4025,8 @@ fn validate_passes_when_no_empty_interpolation() {
 
     // Non-empty interpolation: must not error.
     let value = Value::Deferred(DeferredValue::Interpolation(vec![
-        InterpolationPart::Literal("prefix-".to_string()),
-        InterpolationPart::Expr(Value::Concrete(ConcreteValue::String(
-            "real-value".to_string(),
-        ))),
+        InterpolationPart::Literal("prefix-".into()),
+        InterpolationPart::Expr(Value::Concrete(ConcreteValue::String("real-value".into()))),
     ]));
     let parsed = parsed_with_attr("aws", value);
 
@@ -4585,7 +4591,9 @@ mod expand_same_config_deferred_for_tests {
         let mut targets: Vec<String> = assignments
             .iter()
             .filter_map(|r| match r.get_attr("target_id") {
-                Some(Value::Concrete(ConcreteValue::String(s))) => Some(s.clone()),
+                Some(Value::Concrete(ConcreteValue::String(s))) => {
+                    Some(s.expose_plaintext().to_owned())
+                }
                 _ => None,
             })
             .collect();
@@ -4818,8 +4826,8 @@ mod expand_same_config_deferred_for_tests {
         orgs_attrs.insert(
             "accounts".to_string(),
             Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("111111111111".to_string())),
-                Value::Concrete(ConcreteValue::String("222222222222".to_string())),
+                Value::Concrete(ConcreteValue::String("111111111111".into())),
+                Value::Concrete(ConcreteValue::String("222222222222".into())),
             ])),
         );
         let mut remote = HashMap::new();
@@ -5638,7 +5646,7 @@ mod wait_until_enum_alias {
                 // Exactly what `lower_until_rhs` produces for the enum form:
                 // the raw dotted identifier, NOT the canonical value.
                 rhs: Value::Concrete(ConcreteValue::String(
-                    "aws.acm.Certificate.Status.issued".to_string(),
+                    "aws.acm.Certificate.Status.issued".into(),
                 )),
             },
             timeout_secs: Some(60),
@@ -5653,7 +5661,7 @@ mod wait_until_enum_alias {
         r.binding = Some("cert".to_string());
         r.set_attr(
             "status".to_string(),
-            Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+            Value::Concrete(ConcreteValue::String("ISSUED".into())),
         );
         r
     }
@@ -5672,7 +5680,7 @@ mod wait_until_enum_alias {
         let mut attrs = HashMap::new();
         attrs.insert(
             "status".to_string(),
-            Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+            Value::Concrete(ConcreteValue::String("ISSUED".into())),
         );
         let mut states = HashMap::new();
         states.insert(
@@ -5698,7 +5706,7 @@ mod wait_until_enum_alias {
 
         assert_eq!(
             waits[0].until_predicate.rhs,
-            Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+            Value::Concrete(ConcreteValue::String("ISSUED".into())),
             "until RHS enum identifier must resolve to the canonical AWS value"
         );
     }
@@ -6132,7 +6140,7 @@ mod resolved_value_constraint_gate {
     use carina_core::schema::{TypeError, TypeIdentity};
 
     fn text(value: &str) -> Value {
-        Value::Concrete(ConcreteValue::String(value.to_string()))
+        Value::Concrete(ConcreteValue::String(value.to_string().into()))
     }
 
     fn reject_bad_target(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
@@ -6758,7 +6766,7 @@ exports { team_prefix: String = "x" }"#,
             InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::new("net", "team_prefix"),
             })),
-            InterpolationPart::Literal("-logs".to_string()),
+            InterpolationPart::Literal("-logs".into()),
         ]));
         let consumer = Resource::with_provider("test", "consumer.Pattern", "sink", None)
             .with_binding("sink")

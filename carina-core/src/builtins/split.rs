@@ -1,6 +1,6 @@
 //! `split(separator, string)` built-in function
 
-use crate::resource::{ConcreteValue, Value};
+use crate::resource::{ConcreteValue, Value, ValueString};
 
 use super::value_type_name;
 
@@ -24,7 +24,7 @@ pub(crate) fn builtin_split(args: &[Value]) -> Result<Value, String> {
     }
 
     let separator = match &args[0] {
-        Value::Concrete(ConcreteValue::String(s)) => s.clone(),
+        Value::Concrete(ConcreteValue::String(s)) => s,
         other => {
             return Err(format!(
                 "split() first argument must be a string, got {}",
@@ -34,7 +34,7 @@ pub(crate) fn builtin_split(args: &[Value]) -> Result<Value, String> {
     };
 
     let input = match &args[1] {
-        Value::Concrete(ConcreteValue::String(s)) => s.clone(),
+        Value::Concrete(ConcreteValue::String(s)) => s,
         other => {
             return Err(format!(
                 "split() second argument must be a string, got {}",
@@ -44,8 +44,14 @@ pub(crate) fn builtin_split(args: &[Value]) -> Result<Value, String> {
     };
 
     let parts: Vec<Value> = input
-        .split(&separator)
-        .map(|s| Value::Concrete(ConcreteValue::String(s.to_string())))
+        .expose_plaintext()
+        .split(separator.expose_plaintext())
+        .map(|part| {
+            Value::Concrete(ConcreteValue::String(ValueString::derived_from(
+                part,
+                [separator, input],
+            )))
+        })
         .collect();
 
     Ok(Value::Concrete(ConcreteValue::List(parts)))
@@ -59,16 +65,16 @@ mod tests {
     #[test]
     fn split_basic() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("-".to_string())),
-            Value::Concrete(ConcreteValue::String("a-b-c".to_string())),
+            Value::Concrete(ConcreteValue::String("-".into())),
+            Value::Concrete(ConcreteValue::String("a-b-c".into())),
         ];
         let result = evaluate_builtin("split", &args).unwrap();
         assert_eq!(
             result,
             Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("a".to_string())),
-                Value::Concrete(ConcreteValue::String("b".to_string())),
-                Value::Concrete(ConcreteValue::String("c".to_string())),
+                Value::Concrete(ConcreteValue::String("a".into())),
+                Value::Concrete(ConcreteValue::String("b".into())),
+                Value::Concrete(ConcreteValue::String("c".into())),
             ]))
         );
     }
@@ -76,19 +82,19 @@ mod tests {
     #[test]
     fn split_empty_separator() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("".to_string())),
-            Value::Concrete(ConcreteValue::String("abc".to_string())),
+            Value::Concrete(ConcreteValue::String("".into())),
+            Value::Concrete(ConcreteValue::String("abc".into())),
         ];
         let result = evaluate_builtin("split", &args).unwrap();
         // Rust's split("") yields ["", "a", "b", "c", ""]
         assert_eq!(
             result,
             Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("".to_string())),
-                Value::Concrete(ConcreteValue::String("a".to_string())),
-                Value::Concrete(ConcreteValue::String("b".to_string())),
-                Value::Concrete(ConcreteValue::String("c".to_string())),
-                Value::Concrete(ConcreteValue::String("".to_string())),
+                Value::Concrete(ConcreteValue::String("".into())),
+                Value::Concrete(ConcreteValue::String("a".into())),
+                Value::Concrete(ConcreteValue::String("b".into())),
+                Value::Concrete(ConcreteValue::String("c".into())),
+                Value::Concrete(ConcreteValue::String("".into())),
             ]))
         );
     }
@@ -96,14 +102,14 @@ mod tests {
     #[test]
     fn split_no_match() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String(",".to_string())),
-            Value::Concrete(ConcreteValue::String("no-commas-here".to_string())),
+            Value::Concrete(ConcreteValue::String(",".into())),
+            Value::Concrete(ConcreteValue::String("no-commas-here".into())),
         ];
         let result = evaluate_builtin("split", &args).unwrap();
         assert_eq!(
             result,
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("no-commas-here".to_string())
+                ConcreteValue::String("no-commas-here".into())
             )]))
         );
     }
@@ -111,14 +117,14 @@ mod tests {
     #[test]
     fn split_empty_string() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("-".to_string())),
-            Value::Concrete(ConcreteValue::String("".to_string())),
+            Value::Concrete(ConcreteValue::String("-".into())),
+            Value::Concrete(ConcreteValue::String("".into())),
         ];
         let result = evaluate_builtin("split", &args).unwrap();
         assert_eq!(
             result,
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("".to_string())
+                ConcreteValue::String("".into())
             )]))
         );
     }
@@ -126,16 +132,16 @@ mod tests {
     #[test]
     fn split_multi_char_separator() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("::".to_string())),
-            Value::Concrete(ConcreteValue::String("a::b::c".to_string())),
+            Value::Concrete(ConcreteValue::String("::".into())),
+            Value::Concrete(ConcreteValue::String("a::b::c".into())),
         ];
         let result = evaluate_builtin("split", &args).unwrap();
         assert_eq!(
             result,
             Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("a".to_string())),
-                Value::Concrete(ConcreteValue::String("b".to_string())),
-                Value::Concrete(ConcreteValue::String("c".to_string())),
+                Value::Concrete(ConcreteValue::String("a".into())),
+                Value::Concrete(ConcreteValue::String("b".into())),
+                Value::Concrete(ConcreteValue::String("c".into())),
             ]))
         );
     }
@@ -143,14 +149,14 @@ mod tests {
     #[test]
     fn split_single_element() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("-".to_string())),
-            Value::Concrete(ConcreteValue::String("only".to_string())),
+            Value::Concrete(ConcreteValue::String("-".into())),
+            Value::Concrete(ConcreteValue::String("only".into())),
         ];
         let result = evaluate_builtin("split", &args).unwrap();
         assert_eq!(
             result,
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("only".to_string())
+                ConcreteValue::String("only".into())
             )]))
         );
     }
@@ -158,7 +164,7 @@ mod tests {
     #[test]
     fn split_partial_application() {
         use crate::builtins::evaluate_builtin_for_tests;
-        let args = vec![Value::Concrete(ConcreteValue::String("-".to_string()))];
+        let args = vec![Value::Concrete(ConcreteValue::String("-".into()))];
         let result = evaluate_builtin_for_tests("split", &args).unwrap();
         assert!(result.is_closure());
     }
@@ -167,7 +173,7 @@ mod tests {
     fn split_non_string_separator() {
         let args = vec![
             Value::Concrete(ConcreteValue::Int(1)),
-            Value::Concrete(ConcreteValue::String("a-b".to_string())),
+            Value::Concrete(ConcreteValue::String("a-b".into())),
         ];
         let result = evaluate_builtin("split", &args);
         assert!(result.is_err());
@@ -181,9 +187,9 @@ mod tests {
     #[test]
     fn split_non_string_second_arg() {
         let args = vec![
-            Value::Concrete(ConcreteValue::String("-".to_string())),
+            Value::Concrete(ConcreteValue::String("-".into())),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("a".to_string()),
+                ConcreteValue::String("a".into()),
             )])),
         ];
         let result = evaluate_builtin("split", &args);

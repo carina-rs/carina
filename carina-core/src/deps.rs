@@ -234,9 +234,7 @@ mod tests {
             )),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
-                value: Value::Concrete(crate::resource::ConcreteValue::String(
-                    "ISSUED".to_string(),
-                )),
+                value: Value::Concrete(crate::resource::ConcreteValue::String("ISSUED".into())),
             },
             until_surface: "cert.status == ISSUED".to_string(),
             timeout: std::time::Duration::from_secs(60),
@@ -400,12 +398,12 @@ mod tests {
         let mut alpha = Resource::pending("test.resource");
         alpha.set_attr(
             "name",
-            Value::Concrete(ConcreteValue::String("alpha".to_string())),
+            Value::Concrete(ConcreteValue::String("alpha".into())),
         );
         let mut beta = Resource::pending("test.resource");
         beta.set_attr(
             "name",
-            Value::Concrete(ConcreteValue::String("beta".to_string())),
+            Value::Concrete(ConcreteValue::String("beta".into())),
         );
 
         let sorted = sort_resources_by_dependencies(&[alpha.clone(), beta.clone()]).unwrap();

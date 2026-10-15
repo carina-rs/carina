@@ -608,7 +608,7 @@ impl BackendConfig {
         match self.attributes.get(key) {
             Some(carina_core::resource::Value::Concrete(
                 carina_core::resource::ConcreteValue::String(s),
-            )) => Some(s.as_str()),
+            )) => Some(s.expose_plaintext()),
             _ => None,
         }
     }
@@ -685,11 +685,11 @@ mod tests {
             attributes: [
                 (
                     "bucket".to_string(),
-                    Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+                    Value::Concrete(ConcreteValue::String("my-bucket".into())),
                 ),
                 (
                     "key".to_string(),
-                    Value::Concrete(ConcreteValue::String("state.json".to_string())),
+                    Value::Concrete(ConcreteValue::String("state.json".into())),
                 ),
             ]
             .into_iter()

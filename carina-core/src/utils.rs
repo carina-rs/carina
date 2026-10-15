@@ -1,6 +1,6 @@
 //! Shared utility functions for value normalization and conversion
 
-use crate::resource::{ConcreteValue, Value};
+use crate::resource::{ConcreteValue, Value, ValueString};
 use crate::schema::{AttributeType, EnumParts};
 
 pub(crate) fn truncate_chars_for_display(value: &str, max_chars: usize) -> (String, &'static str) {
@@ -304,10 +304,10 @@ pub fn expand_enum_shorthand(value: &Value, identity: &crate::schema::TypeIdenti
     // — same shape as the type's `TypeIdentity::Display`. For a bare
     // identity with no provider axis the shorthand passes through
     // unchanged (no namespace to prefix).
-    let text_form: Option<&str> = match value {
-        Value::Concrete(ConcreteValue::String(s)) => Some(s.as_str()),
-        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.as_str()),
-        _ => None,
+    let (text_form, sensitive_source) = match value {
+        Value::Concrete(ConcreteValue::String(s)) => (Some(s.expose_plaintext()), Some(s)),
+        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => (Some(s.as_str()), None),
+        _ => (None, None),
     };
     // The kind is the type's own name and matches the leading
     // `TypeName` of the 2-part `TypeName.value` shorthand:
@@ -315,14 +315,11 @@ pub fn expand_enum_shorthand(value: &Value, identity: &crate::schema::TypeIdenti
     // `InstanceTenancy`, or `ZoneName.us_east_1a` against the
     // zone-name AvailabilityZone type.
     let enum_type_name: &str = &identity.kind;
-    match text_form {
-        Some(s) if !s.contains('.') => {
-            if identity.provider.is_some() {
-                Value::Concrete(ConcreteValue::String(format!("{}.{}", identity, s)))
-            } else {
-                Value::Concrete(ConcreteValue::String(s.to_string()))
-            }
+    let text = match text_form {
+        Some(s) if !s.contains('.') && identity.provider.is_some() => {
+            format!("{identity}.{s}")
         }
+        Some(s) if !s.contains('.') => s.to_string(),
         Some(s) => {
             if let Some(NamespacedId::TypeQualified {
                 type_name: ident,
@@ -331,13 +328,17 @@ pub fn expand_enum_shorthand(value: &Value, identity: &crate::schema::TypeIdenti
                 && identity.provider.is_some()
                 && ident == enum_type_name
             {
-                Value::Concrete(ConcreteValue::String(format!("{}.{}", identity, member)))
+                format!("{identity}.{member}")
             } else {
-                Value::Concrete(ConcreteValue::String(s.to_string()))
+                s.to_string()
             }
         }
-        None => value.clone(),
-    }
+        None => return value.clone(),
+    };
+    Value::Concrete(ConcreteValue::String(ValueString::derived_from(
+        text,
+        sensitive_source,
+    )))
 }
 
 /// A `TypeName` segment — first char uppercase ASCII.
@@ -577,31 +578,28 @@ pub fn resolve_enum_value(value: &Value, parts: &EnumParts<'_>) -> Option<Value>
     let (identity, _, _, _, dsl_map) = parts;
     let type_name = identity.kind.as_str();
     let ns = identity.dotted_prefix()?;
-    let s = match value {
-        Value::Concrete(ConcreteValue::String(s)) => s.as_str(),
-        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => s.as_str(),
+    let (s, sensitive_source) = match value {
+        Value::Concrete(ConcreteValue::String(s)) => (s.expose_plaintext(), Some(s)),
+        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => (s.as_str(), None),
         _ => return None,
     };
-    if !s.contains('.') {
+    let resolved = if !s.contains('.') {
         // bare identifier: "Enabled" -> ns.TypeName.Enabled
         let dsl_val = dsl_map.dsl_for(s);
-        return Some(Value::Concrete(ConcreteValue::String(format!(
-            "{}.{}.{}",
-            ns, type_name, dsl_val
-        ))));
-    }
-    if let Some((ident, member)) = s.split_once('.')
+        format!("{ns}.{type_name}.{dsl_val}")
+    } else if let Some((ident, member)) = s.split_once('.')
         && ident == type_name
         && !member.contains('.')
     {
         // TypeName.value: "VersioningStatus.Enabled" -> ns.TypeName.Enabled
         let dsl_val = dsl_map.dsl_for(member);
-        return Some(Value::Concrete(ConcreteValue::String(format!(
-            "{}.{}.{}",
-            ns, type_name, dsl_val
-        ))));
-    }
-    None
+        format!("{ns}.{type_name}.{dsl_val}")
+    } else {
+        return None;
+    };
+    Some(Value::Concrete(ConcreteValue::String(
+        ValueString::derived_from(resolved, sensitive_source),
+    )))
 }
 
 /// Resolve every enum value reachable from `value` through `attr_type` to
@@ -646,7 +644,7 @@ pub fn resolve_enum_value(value: &Value, parts: &EnumParts<'_>) -> Option<Value>
 ///
 /// let mut inner = IndexMap::new();
 /// inner.insert("status".to_string(),
-///     Value::Concrete(ConcreteValue::String("Enabled".to_string())));
+///     Value::Concrete(ConcreteValue::String("Enabled".into())));
 /// let input = Value::Concrete(ConcreteValue::Map(inner));
 ///
 /// let resolved = resolve_enum_value_recursive(&input, &config).unwrap();
@@ -951,7 +949,9 @@ fn lift_enum_leaves_projected(
     // Leaf case: this position is itself an Enum.
     if let Some((identity, values, _, validate, dsl_map)) = attr_type.enum_parts() {
         let raw = match value {
-            Value::Concrete(ConcreteValue::String(s)) => Some((s.as_str(), EnumLeafSource::String)),
+            Value::Concrete(ConcreteValue::String(s)) => {
+                Some((s.expose_plaintext(), EnumLeafSource::String))
+            }
             Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
                 Some((s.as_str(), EnumLeafSource::EnumIdentifier))
             }
@@ -1059,7 +1059,7 @@ fn enum_member_is_recognized_for_state_lift(
         return false;
     }
     if let Some(validate) = validate {
-        return validate(&Value::Concrete(ConcreteValue::String(api))).is_ok();
+        return validate(&Value::Concrete(ConcreteValue::String(api.into()))).is_ok();
     }
     dynamic_enum_member_is_structural(identity, &dsl, value, source)
 }
@@ -1118,13 +1118,13 @@ pub fn normalize_state_enum_value(
         // Skip values already in namespaced DSL format.
         // A value that contains '.' but is not already namespaced is a raw enum value
         // like "ipsec.1" -- check if it matches a known valid enum value.
-        let already_namespaced = s.contains('.') && !enum_check.is_some_and(|check| check(s));
+        let already_namespaced = s.expose_plaintext().contains('.')
+            && !enum_check.is_some_and(|check| check(s.expose_plaintext()));
         if !already_namespaced {
-            let dsl_val = dsl_map.dsl_for(s);
-            return Some(Value::Concrete(ConcreteValue::String(format!(
-                "{}.{}.{}",
-                ns, type_name, dsl_val
-            ))));
+            let dsl_val = dsl_map.dsl_for(s.expose_plaintext());
+            return Some(Value::Concrete(ConcreteValue::String(
+                ValueString::derived_from(format!("{}.{}.{}", ns, type_name, dsl_val), [s]),
+            )));
         }
     }
     None
@@ -1199,7 +1199,9 @@ pub fn extract_region_from_attrs(
 ) -> String {
     use crate::resource::{ConcreteValue, Value};
     match attributes.get("region") {
-        Some(Value::Concrete(ConcreteValue::String(s))) => convert_region_value(s),
+        Some(Value::Concrete(ConcreteValue::String(s))) => {
+            convert_region_value(s.expose_plaintext())
+        }
         Some(Value::Concrete(ConcreteValue::EnumIdentifier(s))) => convert_region_value(s.as_str()),
         _ => default_region.to_string(),
     }
@@ -2238,7 +2240,7 @@ mod tests {
         }
 
         fn s(s: &str) -> Value {
-            Value::Concrete(ConcreteValue::String(s.to_string()))
+            Value::Concrete(ConcreteValue::String(s.to_string().into()))
         }
 
         fn ei(s: &str) -> Value {
@@ -2526,9 +2528,8 @@ mod tests {
 
         #[test]
         fn string_aws_sdk_form() {
-            let attrs = attrs_with_region(Value::Concrete(ConcreteValue::String(
-                "us-east-1".to_string(),
-            )));
+            let attrs =
+                attrs_with_region(Value::Concrete(ConcreteValue::String("us-east-1".into())));
             assert_eq!(
                 extract_region_from_attrs(&attrs, "ap-northeast-1"),
                 "us-east-1"
@@ -2542,7 +2543,7 @@ mod tests {
             // reduce it to the SDK form, matching the EnumIdentifier
             // path.
             let attrs = attrs_with_region(Value::Concrete(ConcreteValue::String(
-                "aws.Region.us_east_1".to_string(),
+                "aws.Region.us_east_1".into(),
             )));
             assert_eq!(
                 extract_region_from_attrs(&attrs, "ap-northeast-1"),
@@ -2598,7 +2599,7 @@ mod tests {
         let mut pd = indexmap::IndexMap::new();
         pd.insert(
             "version".to_string(),
-            Value::Concrete(ConcreteValue::String("2012-10-17".to_string())),
+            Value::Concrete(ConcreteValue::String("2012-10-17".into())),
         );
         let mut known_attrs = HashMap::new();
         known_attrs.insert(
@@ -2608,7 +2609,7 @@ mod tests {
         let mut unknown_attrs = HashMap::new();
         unknown_attrs.insert(
             "whatever".to_string(),
-            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+            Value::Concrete(ConcreteValue::String("Allow".into())),
         );
 
         let mut saved: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
@@ -2632,7 +2633,7 @@ mod tests {
         // Schema-less resource: untouched, no panic.
         assert_eq!(
             saved[&unknown.id]["whatever"],
-            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+            Value::Concrete(ConcreteValue::String("Allow".into())),
             "resource absent from registry is skipped unchanged"
         );
     }
@@ -2674,7 +2675,7 @@ mod tests {
         let mut pd = indexmap::IndexMap::new();
         pd.insert(
             "version".to_string(),
-            Value::Concrete(ConcreteValue::String("2012-10-17".to_string())),
+            Value::Concrete(ConcreteValue::String("2012-10-17".into())),
         );
         let mut attrs = HashMap::new();
         attrs.insert(

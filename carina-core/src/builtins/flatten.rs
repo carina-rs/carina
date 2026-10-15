@@ -77,20 +77,20 @@ mod tests {
     fn flatten_string_lists() {
         let args = vec![Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("a".to_string())),
-                Value::Concrete(ConcreteValue::String("b".to_string())),
+                Value::Concrete(ConcreteValue::String("a".into())),
+                Value::Concrete(ConcreteValue::String("b".into())),
             ])),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("c".to_string()),
+                ConcreteValue::String("c".into()),
             )])),
         ]))];
         let result = evaluate_builtin("flatten", &args).unwrap();
         assert_eq!(
             result,
             Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("a".to_string())),
-                Value::Concrete(ConcreteValue::String("b".to_string())),
-                Value::Concrete(ConcreteValue::String("c".to_string())),
+                Value::Concrete(ConcreteValue::String("a".into())),
+                Value::Concrete(ConcreteValue::String("b".into())),
+                Value::Concrete(ConcreteValue::String("c".into())),
             ]))
         );
     }
@@ -214,9 +214,7 @@ mod tests {
 
     #[test]
     fn flatten_invalid_type() {
-        let args = vec![Value::Concrete(ConcreteValue::String(
-            "not a list".to_string(),
-        ))];
+        let args = vec![Value::Concrete(ConcreteValue::String("not a list".into()))];
         let result = evaluate_builtin("flatten", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("must be a List"));

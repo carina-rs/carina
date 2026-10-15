@@ -186,7 +186,7 @@ fn mock_resource(name: &str, binding: &str) -> Resource {
 }
 
 fn string(value: &str) -> Value {
-    Value::Concrete(ConcreteValue::String(value.to_string()))
+    Value::Concrete(ConcreteValue::String(value.to_string().into()))
 }
 
 fn identity(value: &str) -> ResourceIdentity {
@@ -296,7 +296,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
             backend_type: "local".to_string(),
             attributes: HashMap::from([(
                 "path".to_string(),
-                Value::Concrete(ConcreteValue::String("carina.state.json".to_string())),
+                Value::Concrete(ConcreteValue::String("carina.state.json".into())),
             )]),
         }),
         plan,

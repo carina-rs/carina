@@ -600,6 +600,12 @@ pub type ExportParameter = ParsedExportParam;
 pub trait ExportParamLike {
     fn name(&self) -> &str;
     fn value(&self) -> Option<&Value>;
+    /// Replace the value after binding-aware export resolution.
+    ///
+    /// This mutator is intentionally part of the phase-agnostic trait so the
+    /// export boundary can return the same parser/inference shape wrapped in
+    /// a checked type instead of maintaining parallel representations.
+    fn set_value(&mut self, value: Option<Value>);
     /// The export's declared type, when one is available.
     ///
     /// The parser phase carries `Option<TypeExpr>` (the user may have
@@ -618,6 +624,9 @@ impl ExportParamLike for ParsedExportParam {
     }
     fn value(&self) -> Option<&Value> {
         self.value.as_ref()
+    }
+    fn set_value(&mut self, value: Option<Value>) {
+        self.value = value;
     }
     fn type_expr_opt(&self) -> Option<&TypeExpr> {
         self.type_expr.as_ref()
@@ -1224,6 +1233,9 @@ impl ExportParamLike for InferredExportParam {
     }
     fn value(&self) -> Option<&Value> {
         self.value.as_ref()
+    }
+    fn set_value(&mut self, value: Option<Value>) {
+        self.value = value;
     }
     fn type_expr_opt(&self) -> Option<&TypeExpr> {
         Some(&self.type_expr)
@@ -1895,7 +1907,7 @@ pub(super) fn substitute_placeholder(
             }
             UnknownReason::ForKey => {
                 if let Some(k) = key {
-                    *v = Value::Concrete(ConcreteValue::String(k.to_string()));
+                    *v = Value::Concrete(ConcreteValue::String(k.to_string().into()));
                 }
             }
             UnknownReason::ForIndex => {
@@ -2002,7 +2014,7 @@ mod substitute_placeholder_tests {
             until_raw: "resource_name.status == 'ready'".to_string(),
             until_predicate: UntilPredicateAst {
                 lhs_segments: vec!["resource_name".to_string(), "status".to_string()],
-                rhs: Value::Concrete(ConcreteValue::String("ready".to_string())),
+                rhs: Value::Concrete(ConcreteValue::String("ready".into())),
             },
             timeout_secs: None,
             depends_on: Vec::new(),
@@ -2037,7 +2049,7 @@ mod substitute_placeholder_tests {
             .insert("structural_name".to_string());
         parsed.variables.insert(
             "plain_value_name".to_string(),
-            Value::Concrete(ConcreteValue::String("literal".to_string())),
+            Value::Concrete(ConcreteValue::String("literal".into())),
         );
 
         let names = parsed.structural_binding_names();
@@ -2146,8 +2158,8 @@ mod substitute_placeholder_tests {
         let list_children = expand_deferred_children(
             &list_deferred,
             &Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("alpha".to_string())),
-                Value::Concrete(ConcreteValue::String("beta".to_string())),
+                Value::Concrete(ConcreteValue::String("alpha".into())),
+                Value::Concrete(ConcreteValue::String("beta".into())),
             ])),
         )
         .unwrap();
@@ -2162,11 +2174,11 @@ mod substitute_placeholder_tests {
             &Value::Concrete(ConcreteValue::Map(IndexMap::from([
                 (
                     "alpha".to_string(),
-                    Value::Concrete(ConcreteValue::String("one".to_string())),
+                    Value::Concrete(ConcreteValue::String("one".into())),
                 ),
                 (
                     "beta".to_string(),
-                    Value::Concrete(ConcreteValue::String("two".to_string())),
+                    Value::Concrete(ConcreteValue::String("two".into())),
                 ),
             ]))),
         )

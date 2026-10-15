@@ -58,7 +58,7 @@ pub(in crate::parser) fn parse_arguments_block(
                                         first_inner(inner_attr, "string", "arg_description_attr")?;
                                     let value = parse_string_value(string_pair, ctx)?;
                                     if let Value::Concrete(ConcreteValue::String(s)) = value {
-                                        description = Some(s);
+                                        description = Some(s.into_plaintext());
                                     }
                                 }
                                 Rule::arg_default_attr => {
@@ -98,7 +98,7 @@ pub(in crate::parser) fn parse_arguments_block(
                                                         s,
                                                     )) = value
                                                     {
-                                                        error_msg = Some(s);
+                                                        error_msg = Some(s.into_plaintext());
                                                     }
                                                 }
                                                 _ => {}
@@ -332,9 +332,10 @@ fn value_as_binding_name(value: &Value, context: &str) -> Result<String, ParseEr
         Value::Concrete(ConcreteValue::EnumIdentifier(name)) => Ok(name.to_string()),
         Value::Concrete(ConcreteValue::String(name)) => {
             let bare = name
+                .expose_plaintext()
                 .strip_prefix("${")
                 .and_then(|s| s.strip_suffix('}'))
-                .unwrap_or(name.as_str());
+                .unwrap_or(name.expose_plaintext());
             Ok(bare.to_string())
         }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {

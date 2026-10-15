@@ -7,7 +7,7 @@
 use super::ProviderContext;
 use super::error::ParseError;
 use crate::eval_value::EvalValue;
-use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
 
 /// Check whether a Value is fully static (no runtime dependencies).
 pub(crate) fn is_static_value(value: &Value) -> bool {
@@ -25,9 +25,14 @@ pub(crate) fn is_static_value(value: &Value) -> bool {
         Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
             args.iter().all(is_static_value)
         }
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            parts.iter().all(|part| match part {
+                InterpolationPart::Literal(_) => true,
+                InterpolationPart::Expr(value) => is_static_value(value),
+            })
+        }
         Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. })
-        | Value::Deferred(DeferredValue::Interpolation(_))
         | Value::Deferred(DeferredValue::Unknown(_)) => false,
         Value::Deferred(DeferredValue::Secret(inner)) => is_static_value(inner),
     }
@@ -67,6 +72,18 @@ pub(crate) fn evaluate_static_value(
         Value::Deferred(DeferredValue::Secret(inner)) => Ok(Value::Deferred(
             DeferredValue::Secret(Box::new(evaluate_static_value(*inner, config)?)),
         )),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            let evaluated = parts
+                .into_iter()
+                .map(|part| match part {
+                    InterpolationPart::Literal(value) => Ok(InterpolationPart::Literal(value)),
+                    InterpolationPart::Expr(value) => {
+                        evaluate_static_value(value, config).map(InterpolationPart::Expr)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Deferred(DeferredValue::Interpolation(evaluated)).canonicalize())
+        }
         Value::Deferred(DeferredValue::FunctionCall { ref name, ref args }) => {
             if !is_static_value(&value) {
                 return Err(ParseError::InvalidExpression {

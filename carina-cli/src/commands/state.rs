@@ -874,15 +874,19 @@ async fn run_state_bucket_delete(
         .attributes
         .get("bucket")
         .and_then(|v| match v {
-            Value::Concrete(ConcreteValue::String(s)) => Some(s.as_str()),
+            Value::Concrete(ConcreteValue::String(s)) => Some(s),
             _ => None,
         })
         .ok_or("Backend configuration missing 'bucket' attribute")?;
 
-    if config_bucket != bucket_name {
+    if config_bucket.expose_plaintext() != bucket_name {
+        let configured_bucket = match config_bucket.diagnostic_literal() {
+            Some(bucket) => format!("'{bucket}'"),
+            None => "value from env()".to_string(),
+        };
         return Err(AppError::Config(format!(
-            "Bucket name '{}' does not match backend configuration bucket '{}'.",
-            bucket_name, config_bucket
+            "Bucket name '{bucket_name}' does not match backend configuration bucket \
+             {configured_bucket}."
         )));
     }
 
@@ -1313,7 +1317,7 @@ async fn run_state_refresh_locked_with_ctx(
 
     // carina#3271: re-read every `read aws.*` data source. Without
     // this, `current_states` has no entry for any data source and
-    // the downstream `resolve_exports` (after #3266) cannot resolve
+    // the downstream post-apply export resolver (after #3266) cannot resolve
     // `<data_source>.<attr>` references in `exports {}`, so
     // `state.exports` keeps the pre-refresh literal for any export
     // whose value depends on a data source.
@@ -1474,22 +1478,32 @@ async fn run_state_refresh_locked_with_ctx(
             .collect();
         // State refresh path: no head-of-pipeline resolver pass has run,
         // so `parsed.compositions` still carry the authored
-        // `ResourceRef` snapshots that `resolve_exports`'s post-apply
+        // `ResourceRef` snapshots that post-apply export resolution
         // re-resolution needs (#3169 / #3177).
         let post_apply_states =
             crate::commands::shared::state_writeback::PostApplyStates::from_current_and_state(
                 &current_states,
                 &state,
             );
-        let resolution = crate::commands::shared::state_writeback::resolve_exports(
+        let checked_exports = carina_core::validation::check_export_values_pre_apply(
             &parsed.export_params,
-            &sorted_resources,
-            &parsed.data_sources,
-            &parsed.compositions,
-            &post_apply_states,
-            ctx.schemas(),
-            &wait_aliases,
+            &carina_core::binding_index::ResolvedBindings::for_validation(parsed),
+            provider_context,
+        )
+        .map_err(AppError::Validation)?;
+        let values = crate::commands::shared::state_writeback::resolve_export_values_post_apply(
+            crate::commands::shared::state_writeback::ResolveExportValuesPostApplyInput {
+                export_params: &checked_exports,
+                sorted_resources: &sorted_resources,
+                data_sources: &parsed.data_sources,
+                pre_resolve_compositions: &parsed.compositions,
+                post_apply_states: &post_apply_states,
+                schemas: ctx.schemas(),
+                wait_aliases: &wait_aliases,
+                provider_context,
+            },
         )?;
+        let resolution = crate::commands::shared::state_writeback::materialize_exports(&values)?;
         resolution.write_into(&mut state)
     } else {
         SkippedExports::default()
@@ -2206,7 +2220,7 @@ mod tests {
         assert_eq!(
             *received_role_arn.lock().unwrap(),
             Some(Value::Concrete(ConcreteValue::String(
-                "arn:aws:iam::123456789012:role/upstream".to_string()
+                "arn:aws:iam::123456789012:role/upstream".into()
             )))
         );
     }
@@ -2382,7 +2396,7 @@ mod tests {
         assert_eq!(
             received_role_arn.lock().unwrap().as_ref(),
             Some(&Value::Concrete(ConcreteValue::String(
-                "arn:aws:iam::123456789012:role/upstream".to_string()
+                "arn:aws:iam::123456789012:role/upstream".into()
             )))
         );
     }
@@ -2600,7 +2614,7 @@ mod tests {
                 arguments: IndexMap::from([(
                     "value".to_string(),
                     CompositionArgument::from_value(
-                        Value::Concrete(ConcreteValue::String("bad".to_string())),
+                        Value::Concrete(ConcreteValue::String("bad".into())),
                         TypeExpr::String,
                     ),
                 )]),
@@ -2625,7 +2639,7 @@ mod tests {
         let data_source = DataSource::with_provider("test", "lookup", "unrelated", None)
             .with_attribute(
                 "query",
-                Value::Concrete(ConcreteValue::String("literal".to_string())),
+                Value::Concrete(ConcreteValue::String("literal".into())),
             );
         let provider_config = carina_core::parser::ProviderConfig {
             name: "test".to_string(),
@@ -2862,7 +2876,7 @@ mod tests {
     }
 
     fn string_value(raw: &str) -> Value {
-        Value::Concrete(ConcreteValue::String(raw.to_string()))
+        Value::Concrete(ConcreteValue::String(raw.to_string().into()))
     }
 
     #[tokio::test]

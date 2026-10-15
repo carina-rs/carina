@@ -941,7 +941,7 @@ mod tests {
     #[test]
     fn literal_string_inferred_as_string() {
         let r = infer_type_from_value(
-            &Value::Concrete(ConcreteValue::String("hello".to_string())),
+            &Value::Concrete(ConcreteValue::String("hello".into())),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
         );
@@ -975,7 +975,7 @@ mod tests {
         use crate::resource::InterpolationPart;
         let r = infer_type_from_value(
             &Value::Deferred(DeferredValue::Interpolation(vec![
-                InterpolationPart::Literal("hello".to_string()),
+                InterpolationPart::Literal("hello".into()),
             ])),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
@@ -987,7 +987,7 @@ mod tests {
     fn secret_inferred_as_string() {
         let r = infer_type_from_value(
             &Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("hidden".to_string()),
+                ConcreteValue::String("hidden".into()),
             )))),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
@@ -999,8 +999,8 @@ mod tests {
     fn list_of_strings_inferred_as_list_string() {
         let r = infer_type_from_value(
             &Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("a".to_string())),
-                Value::Concrete(ConcreteValue::String("b".to_string())),
+                Value::Concrete(ConcreteValue::String("a".into())),
+                Value::Concrete(ConcreteValue::String("b".into())),
             ])),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
@@ -1012,7 +1012,7 @@ mod tests {
     fn list_with_mixed_types_fails() {
         let r = infer_type_from_value(
             &Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String("a".to_string())),
+                Value::Concrete(ConcreteValue::String("a".into())),
                 Value::Concrete(ConcreteValue::Int(1)),
             ])),
             &InferenceBindings::new(),
@@ -1029,11 +1029,11 @@ mod tests {
         let mut entries = indexmap::IndexMap::new();
         entries.insert(
             "a".to_string(),
-            Value::Concrete(ConcreteValue::String("x".to_string())),
+            Value::Concrete(ConcreteValue::String("x".into())),
         );
         entries.insert(
             "b".to_string(),
-            Value::Concrete(ConcreteValue::String("y".to_string())),
+            Value::Concrete(ConcreteValue::String("y".into())),
         );
         let r = infer_type_from_value(
             &Value::Concrete(ConcreteValue::Map(entries)),
@@ -1048,7 +1048,7 @@ mod tests {
         let mut entries = indexmap::IndexMap::new();
         entries.insert(
             "a".to_string(),
-            Value::Concrete(ConcreteValue::String("x".to_string())),
+            Value::Concrete(ConcreteValue::String("x".into())),
         );
         entries.insert("b".to_string(), Value::Concrete(ConcreteValue::Int(1)));
         let r = infer_type_from_value(
@@ -1099,7 +1099,7 @@ mod tests {
                     name: "lookup".to_string(),
                     args: vec![],
                 }),
-                Value::Concrete(ConcreteValue::String("extra".to_string())),
+                Value::Concrete(ConcreteValue::String("extra".into())),
             ])),
             &InferenceBindings::new(),
             &SchemaRegistry::new(),
@@ -1595,9 +1595,7 @@ mod tests {
             .push(crate::parser::ParsedExportParam::new(
                 "vpc_id".to_string(),
                 Some(TypeExpr::Simple("vpc_id".to_string())),
-                Some(Value::Concrete(ConcreteValue::String(
-                    "vpc-abc".to_string(),
-                ))),
+                Some(Value::Concrete(ConcreteValue::String("vpc-abc".into()))),
             ));
 
         let (inferred, errors) = apply_inference(parsed, &SchemaRegistry::new());
@@ -1847,17 +1845,11 @@ mod tests {
         let mut bindings = InferenceBindings::new();
         bindings.insert(
             "a".to_string(),
-            composition_binding(&[(
-                "x",
-                Value::Concrete(ConcreteValue::String("hi".to_string())),
-            )]),
+            composition_binding(&[("x", Value::Concrete(ConcreteValue::String("hi".into())))]),
         );
         bindings.insert(
             "b".to_string(),
-            composition_binding(&[(
-                "y",
-                Value::Concrete(ConcreteValue::String("there".to_string())),
-            )]),
+            composition_binding(&[("y", Value::Concrete(ConcreteValue::String("there".into())))]),
         );
 
         // List of two refs to *different* Virtual bindings. After the

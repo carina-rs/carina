@@ -408,7 +408,7 @@ mod tests {
         if let Some(description) = description {
             fields.insert(
                 "description".to_string(),
-                Value::Concrete(ConcreteValue::String(description.to_string())),
+                Value::Concrete(ConcreteValue::String(description.to_string().into())),
             );
         }
         Value::Concrete(ConcreteValue::Map(fields))
@@ -528,7 +528,7 @@ mod tests {
 
         let scalar_list = Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::Int(1)),
-            Value::Concrete(ConcreteValue::String("two".to_string())),
+            Value::Concrete(ConcreteValue::String("two".into())),
         ]));
         assert_eq!(
             build_from_value(&scalar_list),
@@ -579,8 +579,8 @@ mod tests {
 
         assert_eq!(
             build_from_value(&Value::Concrete(ConcreteValue::StringList(vec![
-                "one".to_string(),
-                "two".to_string(),
+                "one".into(),
+                "two".into(),
             ]))),
             ExplicitFields::Leaf
         );
@@ -672,17 +672,17 @@ mod tests {
             ),
             (
                 "description".to_string(),
-                Value::Concrete(ConcreteValue::String("authored".to_string())),
+                Value::Concrete(ConcreteValue::String("authored".into())),
             ),
         ])));
         let stored_item = Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "effect".to_string(),
-                Value::Concrete(ConcreteValue::String("Allow".to_string())),
+                Value::Concrete(ConcreteValue::String("Allow".into())),
             ),
             (
                 "description".to_string(),
-                Value::Concrete(ConcreteValue::String("provider".to_string())),
+                Value::Concrete(ConcreteValue::String("provider".into())),
             ),
         ])));
         let desired = Value::Concrete(ConcreteValue::List(vec![desired_item]));
@@ -761,7 +761,7 @@ mod tests {
             Some(Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(IndexMap::from([(
                     "name".to_string(),
-                    Value::Concrete(ConcreteValue::String("unrelated".to_string())),
+                    Value::Concrete(ConcreteValue::String("unrelated".into())),
                 )])),
             )]))),
         );
@@ -865,7 +865,7 @@ mod tests {
         for stored in [
             None,
             Some(Value::Concrete(ConcreteValue::String(
-                "shape-mismatch".to_string(),
+                "shape-mismatch".into(),
             ))),
         ] {
             let fallback = build_attribute_explicit(
@@ -1139,7 +1139,7 @@ mod tests {
             Value::Concrete(ConcreteValue::Map(IndexMap::from([
                 (
                     "sentinel".to_string(),
-                    Value::Concrete(ConcreteValue::String(sentinel.to_string())),
+                    Value::Concrete(ConcreteValue::String(sentinel.to_string().into())),
                 ),
                 (
                     "authored_a".to_string(),
@@ -1204,7 +1204,7 @@ mod tests {
                 else {
                     panic!("expected sentinel string");
                 };
-                sentinel.as_str()
+                sentinel.expose_plaintext()
             })
             .collect();
         assert_eq!(sentinels, vec!["third", "first", "second"]);

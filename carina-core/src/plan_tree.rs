@@ -517,11 +517,12 @@ pub fn extract_compact_hint(
     // Priority 1: First distinguishing string attribute (most identifying)
     for key in &keys {
         if let Some(Value::Concrete(ConcreteValue::String(s))) = attrs.get(*key)
-            && !s.is_empty()
+            && !s.expose_plaintext().is_empty()
         {
             let short_key = shorten_attr_name(key);
             // Strip namespace from DSL enum identifiers (e.g., awscc.AvailabilityZone.ap_northeast_1a -> "ap_northeast_1a")
-            let resolved = enum_display_value(s).unwrap_or(s);
+            let resolved =
+                enum_display_value(s.expose_plaintext()).unwrap_or_else(|| s.expose_plaintext());
             let display_value = shorten_service_name(key, resolved);
             return Some(format!("{}: {}", short_key, display_value));
         }
@@ -655,7 +656,7 @@ mod tests {
             consumer_updates: HashSet::new(),
             previous_attributes: HashMap::from([(
                 "cidr_block".to_string(),
-                Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             )]),
         });
 
@@ -690,7 +691,7 @@ mod tests {
             .with_binding("main")
             .with_attribute(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.1.0.0/16".to_string())),
+                Value::Concrete(ConcreteValue::String("10.1.0.0/16".into())),
             );
         let subnet = Resource::new("ec2.Subnet", "subnet")
             .with_binding("subnet")
@@ -700,7 +701,7 @@ mod tests {
             )
             .with_attribute(
                 "cidr_block",
-                Value::Concrete(ConcreteValue::String("10.1.1.0/24".to_string())),
+                Value::Concrete(ConcreteValue::String("10.1.1.0/24".into())),
             );
         let mut plan = Plan::new();
         plan.add(Effect::Update {
@@ -878,7 +879,7 @@ mod tests {
             )),
             until: WaitPredicate::Equals {
                 attr: AttrPath::single("status"),
-                value: Value::Concrete(ConcreteValue::String("ready".to_string())),
+                value: Value::Concrete(ConcreteValue::String("ready".into())),
             },
             until_surface: "status == 'ready'".to_string(),
             timeout: Duration::from_secs(60),

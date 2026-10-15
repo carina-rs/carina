@@ -22,7 +22,94 @@ mod upper_lower;
 
 use crate::eval_value::EvalValue;
 use crate::parser::ProviderContext;
-use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::resource::{
+    ConcreteValue, DeferredValue, InterpolationPart, Value, ValueString, peel_secrets,
+};
+
+/// Mark every string exposed from a `Secret` argument as diagnostic-only.
+///
+/// Builtin handlers still receive the plaintext needed for computation, but
+/// any handler-owned diagnostic can only render these strings through the
+/// safe [`ValueString`] diagnostic API. Runtime equality, hashing, and
+/// serialization remain byte-for-byte identical to an ordinary string.
+fn mark_secret_input_strings(value: Value) -> Value {
+    match value {
+        Value::Concrete(ConcreteValue::String(value)) => Value::Concrete(ConcreteValue::String(
+            ValueString::diagnostic_sensitive(value.into_plaintext()),
+        )),
+        Value::Concrete(ConcreteValue::StringList(values)) => {
+            Value::Concrete(ConcreteValue::StringList(
+                values
+                    .into_iter()
+                    .map(|value| ValueString::diagnostic_sensitive(value.into_plaintext()))
+                    .collect(),
+            ))
+        }
+        Value::Concrete(ConcreteValue::List(values)) => Value::Concrete(ConcreteValue::List(
+            values.into_iter().map(mark_secret_input_strings).collect(),
+        )),
+        Value::Concrete(ConcreteValue::Map(values)) => Value::Concrete(ConcreteValue::Map(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, mark_secret_input_strings(value)))
+                .collect(),
+        )),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            Value::Deferred(DeferredValue::Interpolation(
+                parts
+                    .into_iter()
+                    .map(|part| match part {
+                        InterpolationPart::Literal(value) => InterpolationPart::Literal(
+                            ValueString::diagnostic_sensitive(value.into_plaintext()),
+                        ),
+                        InterpolationPart::Expr(value) => {
+                            InterpolationPart::Expr(mark_secret_input_strings(value))
+                        }
+                    })
+                    .collect(),
+            ))
+        }
+        Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
+            Value::Deferred(DeferredValue::FunctionCall {
+                name,
+                args: args.into_iter().map(mark_secret_input_strings).collect(),
+            })
+        }
+        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
+            Box::new(mark_secret_input_strings(*inner)),
+        )),
+        value => value,
+    }
+}
+
+/// Built-ins evaluate secret inputs through their plaintext inner values, but
+/// the result remains secret. This keeps the sensitivity tag attached across
+/// every transformation instead of making each handler remember to preserve
+/// it. Nested wrappers are normalized to one wrapper.
+fn peel_secret_arguments(args: Vec<Value>) -> (Vec<Value>, bool) {
+    let mut contained_secret = false;
+    let args = args
+        .into_iter()
+        .map(|value| {
+            let (value, depth) = peel_secrets(value);
+            contained_secret |= depth > 0;
+            if depth > 0 {
+                mark_secret_input_strings(value)
+            } else {
+                value
+            }
+        })
+        .collect();
+    (args, contained_secret)
+}
+
+fn propagate_secret(value: Value, contained_secret: bool) -> Value {
+    if !contained_secret || matches!(value, Value::Deferred(DeferredValue::Secret(_))) {
+        value
+    } else {
+        Value::Deferred(DeferredValue::Secret(Box::new(value)))
+    }
+}
 
 /// Coarse-grained return type for a built-in function. Used by the LSP to
 /// filter value-position completion candidates to those whose return type
@@ -144,7 +231,11 @@ macro_rules! register_builtins {
                                 })
                             })
                             .collect();
-                        $handler(&lowered?).map(EvalValue::from_value)
+                        let (lowered, contained_secret) = peel_secret_arguments(lowered?);
+                        $handler(&lowered)
+                            .map(|value| {
+                                EvalValue::from_value(propagate_secret(value, contained_secret))
+                            })
                     }
                 )*
                 _ => Err(format!("Unknown built-in function: {name}")),
@@ -183,9 +274,9 @@ register_builtins! {
         return_type: BuiltinReturnType::List,
     },
     decrypt(decrypt::builtin_decrypt, arity: 1) {
-        signature: "decrypt(ciphertext: String, key?: String) -> String",
-        description: "Decrypts ciphertext using the configured provider's encryption service (e.g., AWS KMS). Key is optional when embedded in ciphertext.",
-        return_type: BuiltinReturnType::String,
+        signature: "decrypt(ciphertext: String, key?: String) -> Secret",
+        description: "Decrypts ciphertext using the configured provider's encryption service (e.g., AWS KMS) and marks the result as secret. Key is optional when embedded in ciphertext.",
+        return_type: BuiltinReturnType::Secret,
     },
     env(env::builtin_env, arity: 1) {
         signature: "env(name: String) -> String",
@@ -244,7 +335,7 @@ register_builtins! {
     },
     secret(secret::builtin_secret, arity: 1) {
         signature: "secret(value: Any) -> Secret",
-        description: "Marks a value as secret. The value is sent to the provider but stored only as a SHA256 hash in state.",
+        description: "Marks a value as secret. The value is sent to the provider but stored only as an Argon2id hash in state.",
         return_type: BuiltinReturnType::Secret,
     },
     split(split::builtin_split, arity: 2) {
@@ -306,10 +397,7 @@ pub(crate) fn apply_closure_with_config(
                     config,
                 )?;
             } else {
-                return Err(format!(
-                    "composed function chain contains a non-Closure value: {:?}",
-                    func
-                ));
+                return Err("composed function chain contains a non-function value".to_string());
             }
         }
         return Ok(result);
@@ -367,7 +455,9 @@ pub(crate) fn evaluate_builtin_with_config(
                     })
                 })
                 .collect();
-            decrypt::builtin_decrypt_with_config(&lowered?, config).map(EvalValue::from_value)
+            let (lowered, contained_secret) = peel_secret_arguments(lowered?);
+            decrypt::builtin_decrypt_with_config(&lowered, config)
+                .map(|value| EvalValue::from_value(propagate_secret(value, contained_secret)))
         }
         _ => evaluate_builtin(name, args),
     }
@@ -433,7 +523,23 @@ fn value_type_name(value: &Value) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use indexmap::IndexMap;
+
     use super::*;
+
+    fn string(value: &str) -> Value {
+        Value::Concrete(ConcreteValue::String(value.into()))
+    }
+
+    fn secret(value: Value) -> Value {
+        Value::Deferred(DeferredValue::Secret(Box::new(value)))
+    }
+
+    fn assert_secret_inner(actual: Value, expected: Value) {
+        assert_eq!(actual, secret(expected));
+    }
 
     #[test]
     fn test_registry_and_dispatch_are_in_sync() {
@@ -495,5 +601,142 @@ mod tests {
                 .unwrap_err()
                 .contains("Unknown built-in function: nonexistent_function")
         );
+    }
+
+    #[test]
+    fn builtins_evaluate_secret_inputs_and_propagate_the_secret_wrapper() {
+        let cases = [
+            ("upper", vec![secret(string("hello"))], string("HELLO")),
+            ("lower", vec![secret(string("HELLO"))], string("hello")),
+            ("trim", vec![secret(string("  hello  "))], string("hello")),
+            (
+                "replace",
+                vec![string("old"), string("new"), secret(string("old-value"))],
+                string("new-value"),
+            ),
+            (
+                "split",
+                vec![string("-"), secret(string("a-b"))],
+                Value::Concrete(ConcreteValue::List(vec![string("a"), string("b")])),
+            ),
+            (
+                "length",
+                vec![secret(string("hello"))],
+                Value::Concrete(ConcreteValue::Int(5)),
+            ),
+            (
+                "lookup",
+                vec![
+                    Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                        "key".to_string(),
+                        string("value"),
+                    )]))),
+                    secret(string("key")),
+                    string("default"),
+                ],
+                string("value"),
+            ),
+            (
+                "cidr_subnet",
+                vec![
+                    secret(string("10.0.0.0/16")),
+                    Value::Concrete(ConcreteValue::Int(8)),
+                    Value::Concrete(ConcreteValue::Int(1)),
+                ],
+                string("10.0.1.0/24"),
+            ),
+        ];
+
+        for (name, args, expected) in cases {
+            let actual = evaluate_builtin_to_value(name, &args)
+                .unwrap_or_else(|error| panic!("{name} failed: {error}"));
+            assert_secret_inner(actual, expected);
+        }
+    }
+
+    #[test]
+    fn decrypt_accepts_a_secret_from_another_decrypt_without_double_wrapping() {
+        let config = ProviderContext {
+            decryptor: Some(Box::new(|ciphertext, _| Ok(format!("plain:{ciphertext}")))),
+            validators: HashMap::new(),
+            custom_type_validator: None,
+            resource_types: Default::default(),
+            customs_loaded: false,
+        };
+        let first =
+            evaluate_builtin_with_config_to_value("decrypt", &[string("ciphertext")], &config)
+                .expect("first decrypt");
+
+        let second = evaluate_builtin_with_config_to_value("decrypt", &[first], &config)
+            .expect("second decrypt");
+
+        assert_secret_inner(second, string("plain:plain:ciphertext"));
+    }
+
+    #[test]
+    fn secret_input_errors_keep_builtin_reason_without_exposing_values() {
+        let marker = "hunter2SECRET";
+        let cases = [
+            (
+                "cidr_subnet newbits range",
+                "cidr_subnet",
+                vec![
+                    string("10.0.0.0/16"),
+                    secret(Value::Concrete(ConcreteValue::Int(424_242))),
+                    Value::Concrete(ConcreteValue::Int(0)),
+                ],
+                "resulting prefix length",
+                "424242",
+            ),
+            (
+                "join arity",
+                "join",
+                vec![
+                    secret(string(marker)),
+                    Value::Concrete(ConcreteValue::List(vec![])),
+                    string("extra"),
+                ],
+                "expects 2 arguments",
+                marker,
+            ),
+            (
+                "map accessor",
+                "map",
+                vec![
+                    secret(string(marker)),
+                    Value::Concrete(ConcreteValue::List(vec![])),
+                ],
+                "first argument must be a field accessor",
+                marker,
+            ),
+        ];
+
+        for (case, name, args, reason, forbidden) in cases {
+            let error = match evaluate_builtin_to_value(name, &args) {
+                Ok(value) => panic!("{case} unexpectedly returned {value:?}"),
+                Err(error) => error,
+            };
+            assert!(error.contains(reason), "{case}: {error}");
+            assert!(!error.contains(forbidden), "{case} leaked input: {error}");
+            assert!(
+                !error.contains("failed for a secret input"),
+                "{case} hid the actual reason: {error}",
+            );
+        }
+    }
+
+    #[test]
+    fn secret_collection_errors_do_not_expose_nested_plaintext() {
+        let marker = "nested-hunter2SECRET";
+        let secret_map = secret(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            marker.to_string(),
+            Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+        )]))));
+
+        let error = evaluate_builtin_to_value("map", &[string(".missing"), secret_map])
+            .expect_err("missing field must fail");
+
+        assert!(error.contains("field 'missing' not found"), "{error}");
+        assert!(!error.contains(marker), "nested secret leaked: {error}");
     }
 }

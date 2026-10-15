@@ -20,12 +20,15 @@ impl ValueDescription {
     /// Describe `value` for a type-mismatch diagnostic.
     pub fn of(value: &Value) -> Self {
         Self(match value {
-            Value::Concrete(ConcreteValue::String(value)) if value.starts_with(SECRET_PREFIX) => {
+            Value::Concrete(ConcreteValue::String(value))
+                if value.expose_plaintext().starts_with(SECRET_PREFIX) =>
+            {
                 "secret".to_string()
             }
-            Value::Concrete(ConcreteValue::String(value)) => {
-                format!("string {}", display_string_literal(value))
-            }
+            Value::Concrete(ConcreteValue::String(value)) => value
+                .diagnostic_literal()
+                .map(|value| format!("string {}", display_string_literal(value)))
+                .unwrap_or_else(|| "string".to_string()),
             Value::Concrete(ConcreteValue::Int(value)) => format!("int ({value})"),
             Value::Concrete(ConcreteValue::Float(value)) => format!("float ({value:?})"),
             Value::Concrete(ConcreteValue::Bool(value)) => format!("bool ({value})"),
@@ -47,36 +50,6 @@ impl ValueDescription {
             Value::Deferred(DeferredValue::Unknown(_)) => "unknown".to_string(),
         })
     }
-
-    /// Describe only the runtime shape of a value.
-    ///
-    /// Function evaluation can turn `env()` / `decrypt()` results into an
-    /// ordinary concrete string. Diagnostics at the next typed boundary must
-    /// not mistake that generated value for an authored literal and print its
-    /// contents.
-    pub(crate) fn type_only(value: &Value) -> Self {
-        Self(
-            match value {
-                Value::Concrete(ConcreteValue::String(_)) => "string",
-                Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "enum identifier",
-                Value::Concrete(ConcreteValue::CanonicalEnum(_)) => "canonical enum",
-                Value::Concrete(ConcreteValue::Int(_)) => "int",
-                Value::Concrete(ConcreteValue::Float(_)) => "float",
-                Value::Concrete(ConcreteValue::Bool(_)) => "bool",
-                Value::Concrete(ConcreteValue::Duration(_)) => "duration",
-                Value::Concrete(ConcreteValue::List(_))
-                | Value::Concrete(ConcreteValue::StringList(_)) => "list",
-                Value::Concrete(ConcreteValue::Map(_)) => "map",
-                Value::Deferred(DeferredValue::ResourceRef { .. }) => "resource reference",
-                Value::Deferred(DeferredValue::BindingRef { .. }) => "binding reference",
-                Value::Deferred(DeferredValue::Interpolation(_)) => "interpolation",
-                Value::Deferred(DeferredValue::FunctionCall { .. }) => "function call",
-                Value::Deferred(DeferredValue::Secret(_)) => "secret",
-                Value::Deferred(DeferredValue::Unknown(_)) => "unknown",
-            }
-            .to_string(),
-        )
-    }
 }
 
 impl fmt::Display for ValueDescription {
@@ -91,7 +64,7 @@ mod tests {
 
     #[test]
     fn string_value_uses_canonical_carina_literal() {
-        let value = Value::Concrete(ConcreteValue::String("production".to_string()));
+        let value = Value::Concrete(ConcreteValue::String("production".into()));
 
         assert_eq!(
             ValueDescription::of(&value).to_string(),
@@ -101,10 +74,9 @@ mod tests {
 
     #[test]
     fn hashed_secret_string_is_masked() {
-        let value = Value::Concrete(ConcreteValue::String(format!(
-            "{}deadbeef",
-            crate::value::SECRET_PREFIX
-        )));
+        let value = Value::Concrete(ConcreteValue::String(
+            format!("{}deadbeef", crate::value::SECRET_PREFIX).into(),
+        ));
 
         assert_eq!(ValueDescription::of(&value).to_string(), "secret");
     }

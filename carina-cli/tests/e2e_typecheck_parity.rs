@@ -928,11 +928,11 @@ fn region_schemas() -> SchemaRegistry {
     fn validate_region(v: &Value) -> Result<(), String> {
         const VALID: &[&str] = &["ap-northeast-1", "us-west-2"];
         if let Value::Concrete(ConcreteValue::String(s)) = v {
-            let normalized = fixture_enum_segment_as_aws_value(s);
+            let normalized = fixture_enum_segment_as_aws_value(s.expose_plaintext());
             if VALID.contains(&normalized.as_str()) {
                 return Ok(());
             }
-            return Err(format!("invalid Region '{}'", s));
+            return Err(format!("invalid Region '{}'", s.expose_plaintext()));
         }
         Err("expected string".to_string())
     }
@@ -1725,10 +1725,13 @@ awsccmock.ec2.subnet {
 // wrong reason).
 fn vpc_id_validate_2358(v: &Value) -> Result<(), String> {
     match v {
-        Value::Concrete(ConcreteValue::String(s)) if s.starts_with("vpc-") => Ok(()),
-        Value::Concrete(ConcreteValue::String(s)) => {
-            Err(format!("Invalid vpc_id '{}': must start with 'vpc-'", s))
+        Value::Concrete(ConcreteValue::String(s)) if s.expose_plaintext().starts_with("vpc-") => {
+            Ok(())
         }
+        Value::Concrete(ConcreteValue::String(s)) => Err(format!(
+            "Invalid vpc_id '{}': must start with 'vpc-'",
+            s.expose_plaintext()
+        )),
         _ => Ok(()),
     }
 }
@@ -1810,6 +1813,58 @@ exports {
         !cli_messages_contain_ci(&cli_diags, "mismatch"),
         "CLI must accept Custom-to-String widening, got {:?}",
         cli_diags,
+    );
+}
+
+#[test]
+fn secret_valued_exports_are_rejected_with_cli_lsp_parity() {
+    let fixture = write_fixture(&[(
+        "main.crn",
+        r#"
+let s = secret("topsecretXYZ")
+
+exports {
+    direct: String = s
+    builtin: String = upper(s)
+    interpolated: String = "x-${s}"
+    inline_interpolated = "x-${secret("topsecretXYZ")}"
+    nested_list: list(String) = [s]
+    nested_map: map(String) = { key = s }
+}
+"#,
+    )]);
+    let engine = engine_with_schemas(SchemaRegistry::new());
+
+    let lsp = lsp_diagnostics(&engine, &fixture, "main.crn");
+    let cli = cli_diagnostics(vec![], &fixture);
+
+    for name in [
+        "direct",
+        "builtin",
+        "interpolated",
+        "inline_interpolated",
+        "nested_list",
+        "nested_map",
+    ] {
+        let expected = format!("export '{name}' cannot hold a secret value");
+        assert!(
+            lsp.iter().any(|diagnostic| diagnostic.message == expected),
+            "LSP missing {expected:?}: {lsp:#?}",
+        );
+        assert!(
+            cli.iter().any(|diagnostic| diagnostic.contains(&expected)),
+            "CLI missing {expected:?}: {cli:#?}",
+        );
+    }
+    assert!(
+        lsp.iter()
+            .all(|diagnostic| !diagnostic.message.contains("topsecretXYZ")),
+        "LSP leaked secret: {lsp:#?}",
+    );
+    assert!(
+        cli.iter()
+            .all(|diagnostic| !diagnostic.contains("topsecretXYZ")),
+        "CLI leaked secret: {cli:#?}",
     );
 }
 

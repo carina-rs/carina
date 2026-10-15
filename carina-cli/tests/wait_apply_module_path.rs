@@ -172,14 +172,16 @@ impl Provider for NoopProvider {
                 attrs.insert(
                     "status".to_string(),
                     Value::Concrete(carina_core::resource::ConcreteValue::String(
-                        "ISSUED".to_string(),
+                        "ISSUED".into(),
                     )),
                 );
                 if publishes_arn {
                     attrs.insert(
                         "certificate_arn".to_string(),
                         Value::Concrete(carina_core::resource::ConcreteValue::String(
-                            "arn:aws:acm:us-east-1:111:certificate/abc".to_string(),
+                            "arn:aws:acm:us-east-1:111:certificate/abc"
+                                .to_string()
+                                .into(),
                         )),
                     );
                 }

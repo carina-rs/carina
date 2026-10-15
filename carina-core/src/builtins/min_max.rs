@@ -223,7 +223,7 @@ mod tests {
         let result = evaluate_builtin(
             "min",
             &[
-                Value::Concrete(ConcreteValue::String("a".to_string())),
+                Value::Concrete(ConcreteValue::String("a".into())),
                 Value::Concrete(ConcreteValue::Int(1)),
             ],
         );

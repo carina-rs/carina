@@ -141,7 +141,7 @@ fn type_aware_equal_on_path<'a>(
                     to_dsl: Some(transform),
                     ..
                 },
-            ) => transform.apply(sa) == transform.apply(sb),
+            ) => transform.apply(sa.expose_plaintext()) == transform.apply(sb.expose_plaintext()),
             (
                 Value::Concrete(ConcreteValue::String(sa)),
                 Value::Concrete(ConcreteValue::String(sb)),
@@ -267,7 +267,9 @@ fn type_aware_equal_on_path<'a>(
                 // flows do not produce phantom updates.
                 let text = |v: &Value| -> Option<String> {
                     match v {
-                        Value::Concrete(ConcreteValue::String(s)) => Some(s.clone()),
+                        Value::Concrete(ConcreteValue::String(s)) => {
+                            Some(s.expose_plaintext().to_owned())
+                        }
                         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Some(s.to_string()),
                         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => {
                             Some(c.api_value().to_string())
@@ -467,12 +469,12 @@ fn is_type_default(
             true
         }
         (Value::Concrete(ConcreteValue::String(s)), Some(crate::schema::Shape::String { .. }))
-            if s.is_empty() =>
+            if s.expose_plaintext().is_empty() =>
         {
             true
         }
         (Value::Concrete(ConcreteValue::String(s)), Some(crate::schema::Shape::Enum { .. }))
-            if s.is_empty() =>
+            if s.expose_plaintext().is_empty() =>
         {
             true
         }
@@ -514,7 +516,7 @@ fn secret_matches_state(
     };
 
     // Case 1: State has a hashed value (from state file / --refresh=false)
-    if let Some(state_hash) = state_str.strip_prefix(SECRET_PREFIX) {
+    if let Some(state_hash) = state_str.expose_plaintext().strip_prefix(SECRET_PREFIX) {
         let Ok(inner_json) = value_to_json_with_context(inner, context) else {
             return false;
         };
@@ -795,8 +797,8 @@ mod tests {
             None,
             Some(DslTransform::StripSuffix(".".to_string())),
         );
-        let state = Value::Concrete(ConcreteValue::String("foo.example.com.".to_string()));
-        let desired = Value::Concrete(ConcreteValue::String("foo.example.com".to_string()));
+        let state = Value::Concrete(ConcreteValue::String("foo.example.com.".into()));
+        let desired = Value::Concrete(ConcreteValue::String("foo.example.com".into()));
 
         assert!(type_aware_equal(
             &state,

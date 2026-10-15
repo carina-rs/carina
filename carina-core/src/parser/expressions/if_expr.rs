@@ -9,6 +9,7 @@
 //!   [`parse_if_value_expr`], which only allows a [`Value`] body and
 //!   requires an `else` clause.
 
+use crate::ValueDescription;
 use crate::eval_value::EvalValue;
 use crate::parser::{
     LetBindingRhs, ModuleCall, ParseContext, ParseError, Rule, evaluate_static_value, first_inner,
@@ -61,7 +62,10 @@ pub(crate) fn parse_if_expr(
         other => {
             return Err(ParseError::InvalidExpression {
                 line: 0,
-                message: format!("if condition must be a Bool value, got: {:?}", other),
+                message: format!(
+                    "if condition must be a Bool value, got: {}",
+                    ValueDescription::of(other)
+                ),
             });
         }
     };
@@ -81,7 +85,9 @@ pub(crate) fn parse_if_expr(
         parse_if_body_to_rhs(else_body, ctx, binding_name)
     } else {
         // No else clause and condition is false: produce nothing
-        let ref_value = Value::Concrete(ConcreteValue::String(format!("${{if:{}}}", binding_name)));
+        let ref_value = Value::Concrete(ConcreteValue::String(
+            format!("${{if:{}}}", binding_name).into(),
+        ));
         Ok((
             EvalValue::from_value(ref_value),
             vec![],
@@ -101,8 +107,9 @@ pub(crate) fn parse_if_body_to_rhs(
     let result = parse_if_body(pair, ctx, binding_name)?;
     match result {
         IfBodyResult::Resource(r) => {
-            let ref_value =
-                Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
+            let ref_value = Value::Concrete(ConcreteValue::String(
+                format!("${{{}}}", binding_name).into(),
+            ));
             Ok((
                 EvalValue::from_value(ref_value),
                 vec![*r],
@@ -112,8 +119,9 @@ pub(crate) fn parse_if_body_to_rhs(
             ))
         }
         IfBodyResult::DataSource(d) => {
-            let ref_value =
-                Value::Concrete(ConcreteValue::String(format!("${{{}}}", binding_name)));
+            let ref_value = Value::Concrete(ConcreteValue::String(
+                format!("${{{}}}", binding_name).into(),
+            ));
             Ok((
                 EvalValue::from_value(ref_value),
                 vec![],
@@ -123,10 +131,9 @@ pub(crate) fn parse_if_body_to_rhs(
             ))
         }
         IfBodyResult::ModuleCall(c) => {
-            let value = Value::Concrete(ConcreteValue::String(format!(
-                "${{module:{}}}",
-                c.module_name
-            )));
+            let value = Value::Concrete(ConcreteValue::String(
+                format!("${{module:{}}}", c.module_name).into(),
+            ));
             Ok((EvalValue::from_value(value), vec![], vec![], vec![c], None))
         }
         IfBodyResult::Value(v) => Ok((EvalValue::from_value(v), vec![], vec![], vec![], None)),
@@ -214,7 +221,10 @@ pub(crate) fn parse_if_value_expr(
         other => {
             return Err(ParseError::InvalidExpression {
                 line: 0,
-                message: format!("if condition must be a Bool value, got: {:?}", other),
+                message: format!(
+                    "if condition must be a Bool value, got: {}",
+                    ValueDescription::of(other)
+                ),
             });
         }
     };

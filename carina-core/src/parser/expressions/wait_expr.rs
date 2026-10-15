@@ -289,7 +289,7 @@ fn lower_until_rhs(pair: Pair<'_, Rule>, line: usize) -> Result<Value, ParseErro
                 });
             }
             Ok(Value::Concrete(ConcreteValue::String(
-                raw[1..raw.len() - 1].to_string(),
+                raw[1..raw.len() - 1].to_string().into(),
             )))
         }
         Rule::number => {
@@ -352,7 +352,9 @@ fn lower_until_rhs(pair: Pair<'_, Rule>, line: usize) -> Result<Value, ParseErro
             // wrote it; the differ's enum-resolution pass converts it to
             // the AWS canonical value when the target attribute is
             // declared as an enum.
-            Ok(Value::Concrete(ConcreteValue::String(segments.join("."))))
+            Ok(Value::Concrete(ConcreteValue::String(
+                segments.join(".").into(),
+            )))
         }
         Rule::null_literal => Err(ParseError::InvalidExpression {
             line,
@@ -403,7 +405,7 @@ mod tests {
         assert_eq!(
             we.until_predicate.rhs,
             Value::Concrete(ConcreteValue::String(
-                "aws.acm.Certificate.Status.Issued".to_string()
+                "aws.acm.Certificate.Status.Issued".into()
             ))
         );
         assert!(we.timeout_secs.is_none());
@@ -415,7 +417,7 @@ mod tests {
         let we = parse_one("wait cert {\n    until = cert.status == \"ISSUED\"\n}");
         assert_eq!(
             we.until_predicate.rhs,
-            Value::Concrete(ConcreteValue::String("ISSUED".to_string()))
+            Value::Concrete(ConcreteValue::String("ISSUED".into()))
         );
     }
 

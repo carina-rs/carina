@@ -831,9 +831,7 @@ mod provider_config_tests {
     #[test]
     fn prepare_provider_ready_config_accepts_valid_attributes() {
         let factory = ConfigFactory::successful();
-        let attributes = config(Value::Concrete(ConcreteValue::String(
-            "good-tokyo".to_string(),
-        )));
+        let attributes = config(Value::Concrete(ConcreteValue::String("good-tokyo".into())));
         let resolved = resolved_configs(attributes.clone());
 
         let ready = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
@@ -846,7 +844,7 @@ mod provider_config_tests {
     #[test]
     fn prepare_provider_ready_config_rejects_pattern_violation() {
         let factory = ConfigFactory::successful();
-        let attributes = config(Value::Concrete(ConcreteValue::String("bad".to_string())));
+        let attributes = config(Value::Concrete(ConcreteValue::String("bad".into())));
         let resolved = resolved_configs(attributes);
 
         let error = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
@@ -863,9 +861,7 @@ mod provider_config_tests {
     #[test]
     fn prepare_provider_ready_config_rejects_plugin_validation_failure() {
         let factory = ConfigFactory::failing("configured account is forbidden");
-        let attributes = config(Value::Concrete(ConcreteValue::String(
-            "good-tokyo".to_string(),
-        )));
+        let attributes = config(Value::Concrete(ConcreteValue::String("good-tokyo".into())));
         let resolved = resolved_configs(attributes);
 
         let error = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
@@ -886,7 +882,7 @@ mod provider_config_tests {
         let plaintext = "plaintext-must-not-leak";
         let factory = ConfigFactory::failing(plaintext);
         let attributes = config(Value::Deferred(DeferredValue::Secret(Box::new(
-            Value::Concrete(ConcreteValue::String("good-secret".to_string())),
+            Value::Concrete(ConcreteValue::String("good-secret".into())),
         ))));
         let resolved = resolved_configs(attributes);
 
@@ -897,5 +893,19 @@ mod provider_config_tests {
         assert!(message.contains("provider test"), "{message}");
         assert!(message.contains("secret"), "{message}");
         assert!(!message.contains(plaintext), "{message}");
+    }
+
+    #[test]
+    fn provider_boundary_unwraps_secret_builtin_results_to_plaintext() {
+        let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("prefix-decrypted:ciphertext-suffix".into()),
+        ))));
+
+        assert_eq!(
+            unwrap_secret(value),
+            Value::Concrete(ConcreteValue::String(
+                "prefix-decrypted:ciphertext-suffix".into()
+            ))
+        );
     }
 }

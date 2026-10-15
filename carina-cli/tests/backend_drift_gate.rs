@@ -22,7 +22,7 @@ fn local_backend_lock(path: &str) -> BackendLock {
     let mut attributes = std::collections::HashMap::new();
     attributes.insert(
         "path".to_string(),
-        Value::Concrete(ConcreteValue::String(path.to_string())),
+        Value::Concrete(ConcreteValue::String(path.to_string().into())),
     );
     let config = carina_core::parser::BackendConfig {
         backend_type: "local".to_string(),
@@ -35,15 +35,15 @@ fn s3_backend_lock(bucket: &str, key: &str) -> BackendLock {
     let mut attributes = std::collections::HashMap::new();
     attributes.insert(
         "bucket".to_string(),
-        Value::Concrete(ConcreteValue::String(bucket.to_string())),
+        Value::Concrete(ConcreteValue::String(bucket.to_string().into())),
     );
     attributes.insert(
         "key".to_string(),
-        Value::Concrete(ConcreteValue::String(key.to_string())),
+        Value::Concrete(ConcreteValue::String(key.to_string().into())),
     );
     attributes.insert(
         "region".to_string(),
-        Value::Concrete(ConcreteValue::String("us-east-1".to_string())),
+        Value::Concrete(ConcreteValue::String("us-east-1".into())),
     );
     let config = carina_core::parser::BackendConfig {
         backend_type: "s3".to_string(),

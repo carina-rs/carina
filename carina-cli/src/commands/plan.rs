@@ -13,7 +13,9 @@ use carina_core::parser::{
     BackendConfig, ProviderContext, ResolvedProviderConfigs, SavedProviderConfigs, UpstreamState,
 };
 use carina_core::plan::Plan;
-use carina_core::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State, Value};
+#[cfg(test)]
+use carina_core::resource::DeferredValue;
+use carina_core::resource::{ConcreteValue, Resource, ResourceId, State, Value};
 use carina_core::value::{
     redact_secrets_in_plan, redact_secrets_in_resource, redact_secrets_in_state,
 };
@@ -782,11 +784,14 @@ pub async fn run_plan(
 
                 if auto_create {
                     will_create_state_bucket = true;
-                    state_bucket_name = bucket_name;
+                    state_bucket_name = bucket_name.into_plaintext();
                 } else {
+                    let bucket = match bucket_name.diagnostic_literal() {
+                        Some(bucket) => format!("'{bucket}'"),
+                        None => "value from env()".to_string(),
+                    };
                     return Err(AppError::Config(format!(
-                        "Backend bucket '{}' not found and auto_create is disabled",
-                        bucket_name
+                        "Backend bucket {bucket} not found and auto_create is disabled"
                     )));
                 }
             }
@@ -963,6 +968,26 @@ pub async fn run_plan(
     let delete_attributes =
         collect_delete_attributes(&ctx.plan, &ctx.current_states, state_file.as_ref());
 
+    // Resolve exports against the same pre-apply binding view used for their
+    // display and reject secrets that were hidden behind references during
+    // the earlier syntax-level validation pass.
+    let export_wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
+        .wait_bindings
+        .iter()
+        .map(carina_core::binding_index::WaitAliasSpec::from)
+        .collect();
+    let checked_exports = check_exports_pre_apply(CheckExportsPreApplyInput {
+        export_params: &parsed.export_params,
+        resources: &ctx.sorted_resources,
+        compositions: &parsed.compositions,
+        data_sources: &parsed.data_sources,
+        current_states: &ctx.current_states,
+        schemas: wiring.schemas(),
+        wait_aliases: &export_wait_aliases,
+        provider_context,
+    })
+    .map_err(AppError::Validation)?;
+
     if json {
         if let Some(note) = drift_note.as_ref() {
             eprintln!("{}", note.yellow());
@@ -992,26 +1017,11 @@ pub async fn run_plan(
             crate::commands::iam_preflight::emit_warnings(result);
         }
     } else {
-        // Resolve export values for display
-        let export_wait_aliases: Vec<carina_core::binding_index::WaitAliasSpec> = parsed
-            .wait_bindings
-            .iter()
-            .map(carina_core::binding_index::WaitAliasSpec::from)
-            .collect();
-        let resolved_exports = resolve_export_values_for_display(
-            &parsed.export_params,
-            &ctx.sorted_resources,
-            &parsed.compositions,
-            &parsed.data_sources,
-            &ctx.current_states,
-            wiring.schemas(),
-            &export_wait_aliases,
-        );
         let current_exports = state_file
             .as_ref()
             .map(|s| s.exports.clone())
             .unwrap_or_default();
-        let export_changes = compute_export_diffs(&resolved_exports, &current_exports);
+        let export_changes = compute_export_diffs(&checked_exports, &current_exports);
         // Separate the refresh-progress block (printed above when `refresh`)
         // from the plan's terminal section so they don't read as a run-on
         // (#3148).
@@ -1083,81 +1093,54 @@ pub async fn run_plan(
     Ok(has_changes)
 }
 
-/// Load remote state files and build binding maps for reference resolution.
+/// Complete input needed to check exports and resolve their display-only
+/// values against the pre-apply binding view.
 ///
-/// For each `remote_state` block, reads the referenced state file and builds a
-/// map of resource bindings to their attributes. The result maps each remote_state
-/// binding name to a `HashMap<String, Value>` where keys are resource binding names
-/// and values are `Value::Concrete(ConcreteValue::Map)` of that resource's attributes.
-/// Resolve export value expressions for plan display.
-pub(crate) fn resolve_export_values_for_display(
-    export_params: &[carina_core::parser::InferredExportParam],
-    resources: &[Resource],
-    compositions: &[carina_core::resource::Composition],
-    data_sources: &[carina_core::resource::DataSource],
-    current_states: &HashMap<ResourceId, State>,
-    schemas: &carina_core::schema::SchemaRegistry,
-    wait_aliases: &[carina_core::binding_index::WaitAliasSpec],
-) -> Vec<carina_core::parser::InferredExportParam> {
+/// Every field is mandatory so plan and apply cannot accidentally omit a
+/// binding layer or the provider-aware builtin context.
+pub(crate) struct CheckExportsPreApplyInput<'a> {
+    pub export_params: &'a [carina_core::parser::InferredExportParam],
+    pub resources: &'a [Resource],
+    pub compositions: &'a [carina_core::resource::Composition],
+    pub data_sources: &'a [carina_core::resource::DataSource],
+    pub current_states: &'a HashMap<ResourceId, State>,
+    pub schemas: &'a carina_core::schema::SchemaRegistry,
+    pub wait_aliases: &'a [carina_core::binding_index::WaitAliasSpec],
+    pub provider_context: &'a ProviderContext,
+}
+
+/// Check export expressions against the pre-apply binding view while retaining
+/// their original unresolved form for a later post-apply resolution.
+pub(crate) fn check_exports_pre_apply(
+    input: CheckExportsPreApplyInput<'_>,
+) -> Result<
+    carina_core::validation::ExportsCheckedPreApply<carina_core::parser::InferredExportParam>,
+    String,
+> {
     // carina#3248: build the unified pre-apply bindings view so an
     // export referencing `<module_instance>.<attr>` chains through the
     // composition to the managed sibling literal (carina#3246).
-    let plan_input_states =
-        carina_core::resource::into_plan_input_map(current_states.clone(), schemas, resources);
+    let plan_input_states = carina_core::resource::into_plan_input_map(
+        input.current_states.clone(),
+        input.schemas,
+        input.resources,
+    );
     let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
         carina_core::binding_index::PreApplyInputs {
-            managed: resources,
-            compositions,
-            data_sources,
+            managed: input.resources,
+            compositions: input.compositions,
+            data_sources: input.data_sources,
             current_states: &plan_input_states,
             remote_bindings: &HashMap::new(),
-            wait_aliases,
+            wait_aliases: input.wait_aliases,
         },
     );
 
-    export_params
-        .iter()
-        .map(|param| {
-            let resolved_value = param
-                .value
-                .as_ref()
-                .map(|v| resolve_export_value(v, &bindings));
-            carina_core::parser::InferredExportParam {
-                name: param.name.clone(),
-                type_expr: param.type_expr.clone(),
-                value: resolved_value,
-            }
-        })
-        .collect()
-}
-
-/// Resolve a single export value, walking ResourceRef values inside lists and maps.
-pub(crate) fn resolve_export_value(
-    value: &Value,
-    bindings: &carina_core::binding_index::ResolvedBindings,
-) -> Value {
-    use carina_core::resolver::resolve_ref_value;
-
-    match value {
-        Value::Deferred(DeferredValue::ResourceRef { .. }) => {
-            resolve_ref_value(value, bindings).unwrap_or_else(|_| value.clone())
-        }
-        Value::Concrete(ConcreteValue::List(items)) => {
-            let resolved: Vec<Value> = items
-                .iter()
-                .map(|item| resolve_export_value(item, bindings))
-                .collect();
-            Value::Concrete(ConcreteValue::List(resolved))
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            let resolved: indexmap::IndexMap<String, Value> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), resolve_export_value(v, bindings)))
-                .collect();
-            Value::Concrete(ConcreteValue::Map(resolved))
-        }
-        _ => value.clone(),
-    }
+    carina_core::validation::check_export_values_pre_apply(
+        input.export_params,
+        &bindings,
+        input.provider_context,
+    )
 }
 
 /// Represents a change to an export value between current state and desired.
@@ -1192,17 +1175,19 @@ impl ExportChange {
 /// Compute the set of export changes by comparing desired (resolved) exports
 /// against current state-recorded exports.
 ///
-/// `resolved_params` contains the desired export values resolved against
-/// current resource states. `current_exports` is the JSON-serialized map
-/// from `StateFile.exports`.
+/// `checked_exports` exposes display-only values resolved against current
+/// resource states. `current_exports` is the JSON-serialized map from
+/// `StateFile.exports`.
 pub fn compute_export_diffs(
-    resolved_params: &[carina_core::parser::InferredExportParam],
+    checked_exports: &carina_core::validation::ExportsCheckedPreApply<
+        carina_core::parser::InferredExportParam,
+    >,
     current_exports: &HashMap<String, serde_json::Value>,
 ) -> Vec<ExportChange> {
     let mut changes = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for param in resolved_params {
+    for param in checked_exports.display_values() {
         seen.insert(param.name.clone());
         let Some(ref value) = param.value else {
             continue;
@@ -1215,9 +1200,7 @@ pub fn compute_export_diffs(
         // (the deferred-for body will resolve it later). Map both the
         // skip variants and the Unknown error to `None`; the diff
         // surfaces as a "value not yet known" change without a JSON.
-        let new_json = crate::commands::shared::state_writeback::dsl_value_to_json(value)
-            .ok()
-            .flatten();
+        let new_json = crate::commands::shared::state_writeback::dsl_value_to_json(value).ok();
         match (current_exports.get(&param.name), new_json) {
             (None, _) => changes.push(ExportChange::Added {
                 name: param.name.clone(),
@@ -1875,7 +1858,7 @@ mod load_upstream_states_tests {
                 .attributes
                 .get("role_arn"),
             Some(&Value::Concrete(ConcreteValue::String(
-                "arn:aws:iam::123456789012:role/upstream".to_string()
+                "arn:aws:iam::123456789012:role/upstream".into()
             )))
         );
     }
@@ -1937,7 +1920,7 @@ mod load_upstream_states_tests {
 
         assert_eq!(
             result["orgs"]["account_id"],
-            Value::Concrete(ConcreteValue::String("123".to_string()))
+            Value::Concrete(ConcreteValue::String("123".into()))
         );
     }
 
@@ -2157,7 +2140,7 @@ let internal = upstream_state {{ source = '{}' }}"#,
         );
         assert_eq!(
             bindings["bootstrap"]["oidc_provider_arn"],
-            Value::Concrete(ConcreteValue::String("arn:...".to_string())),
+            Value::Concrete(ConcreteValue::String("arn:...".into())),
             "B's exports must come through unchanged"
         );
     }
@@ -2301,7 +2284,7 @@ exports { region: String = "ap-northeast-1" }"#,
         .expect("upstream bindings");
         assert_eq!(
             bindings["a"]["region"],
-            Value::Concrete(ConcreteValue::String("ap-northeast-1".to_string()))
+            Value::Concrete(ConcreteValue::String("ap-northeast-1".into()))
         );
     }
 
@@ -2406,7 +2389,7 @@ mod run_plan_out_tests {
                 .attributes
                 .get("target"),
             Some(&Value::Concrete(ConcreteValue::String(
-                "pref-existing".to_string()
+                "pref-existing".into()
             )))
         );
     }
@@ -2461,7 +2444,7 @@ mod run_plan_out_tests {
         parsed_data_source.set_attr(
             "name_regex".to_string(),
             Value::Concrete(carina_core::resource::ConcreteValue::String(
-                "^target$".to_string(),
+                "^target$".into(),
             )),
         );
 
@@ -2513,7 +2496,7 @@ mod run_plan_out_tests {
         assert_eq!(
             plan_file.data_source_origins[0].get_attr("name_regex"),
             Some(&Value::Concrete(
-                carina_core::resource::ConcreteValue::String("^target$".to_string())
+                carina_core::resource::ConcreteValue::String("^target$".into())
             )),
             "saved plans must separately preserve the authored pre-normalization input"
         );
@@ -2598,6 +2581,7 @@ mod run_plan_out_tests {
 mod export_diff_tests {
     use super::*;
     use carina_core::parser::{InferredExportParam, TypeExpr};
+    use carina_core::resource::DeferredValue;
 
     fn param(name: &str, value: Value) -> InferredExportParam {
         InferredExportParam {
@@ -2607,9 +2591,23 @@ mod export_diff_tests {
         }
     }
 
+    fn checked(
+        params: Vec<InferredExportParam>,
+    ) -> carina_core::validation::ExportsCheckedPreApply<InferredExportParam> {
+        carina_core::validation::check_export_values_pre_apply(
+            &params,
+            &carina_core::binding_index::ResolvedBindings::default(),
+            &ProviderContext::default(),
+        )
+        .expect("test exports must pass the secret boundary")
+    }
+
     #[test]
     fn compute_export_diffs_added_when_state_empty() {
-        let params = vec![param("count", Value::Concrete(ConcreteValue::Int(42)))];
+        let params = checked(vec![param(
+            "count",
+            Value::Concrete(ConcreteValue::Int(42)),
+        )]);
         let current = HashMap::new();
         let changes = compute_export_diffs(&params, &current);
         assert_eq!(changes.len(), 1);
@@ -2618,7 +2616,10 @@ mod export_diff_tests {
 
     #[test]
     fn compute_export_diffs_modified_when_value_differs() {
-        let params = vec![param("count", Value::Concrete(ConcreteValue::Int(42)))];
+        let params = checked(vec![param(
+            "count",
+            Value::Concrete(ConcreteValue::Int(42)),
+        )]);
         let mut current = HashMap::new();
         current.insert("count".to_string(), serde_json::json!(7));
         let changes = compute_export_diffs(&params, &current);
@@ -2628,7 +2629,10 @@ mod export_diff_tests {
 
     #[test]
     fn compute_export_diffs_unchanged_when_value_matches() {
-        let params = vec![param("count", Value::Concrete(ConcreteValue::Int(42)))];
+        let params = checked(vec![param(
+            "count",
+            Value::Concrete(ConcreteValue::Int(42)),
+        )]);
         let mut current = HashMap::new();
         current.insert("count".to_string(), serde_json::json!(42));
         let changes = compute_export_diffs(&params, &current);
@@ -2637,7 +2641,7 @@ mod export_diff_tests {
 
     #[test]
     fn compute_export_diffs_removed_when_param_missing() {
-        let params = vec![];
+        let params = checked(Vec::new());
         let mut current = HashMap::new();
         current.insert("stale".to_string(), serde_json::json!("old"));
         let changes = compute_export_diffs(&params, &current);
@@ -2647,10 +2651,10 @@ mod export_diff_tests {
 
     #[test]
     fn compute_export_diffs_mixed_sorted_by_name() {
-        let params = vec![
+        let params = checked(vec![
             param("added", Value::Concrete(ConcreteValue::Int(1))),
             param("modified", Value::Concrete(ConcreteValue::Int(2))),
-        ];
+        ]);
         let mut current = HashMap::new();
         current.insert("modified".to_string(), serde_json::json!(99));
         current.insert("removed".to_string(), serde_json::json!("old"));
@@ -2667,7 +2671,7 @@ mod export_diff_tests {
             .with_binding("vpc")
             .with_attribute(
                 "vpc_id",
-                Value::Concrete(ConcreteValue::String("vpc-123".to_string())),
+                Value::Concrete(ConcreteValue::String("vpc-123".into())),
             );
         let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
             carina_core::binding_index::PreApplyInputs {
@@ -2679,9 +2683,50 @@ mod export_diff_tests {
                 wait_aliases: &[],
             },
         );
-        let value = Value::Concrete(ConcreteValue::String("vpc.vpc_id".to_string()));
+        let value = Value::Concrete(ConcreteValue::String("vpc.vpc_id".into()));
 
-        assert_eq!(resolve_export_value(&value, &bindings), value);
+        let params = vec![param("literal", value.clone())];
+        let resolved = carina_core::validation::check_export_values_pre_apply(
+            &params,
+            &bindings,
+            &ProviderContext::default(),
+        )
+        .expect("plain dotted string is a valid export");
+        assert_eq!(resolved.display_values()[0].value.as_ref(), Some(&value));
+    }
+
+    #[test]
+    fn resolved_resource_reference_exposes_secret_export_for_plan_rejection() {
+        let resource = Resource::with_provider("test", "r.Vpc", "vpc", None)
+            .with_binding("vpc")
+            .with_attribute(
+                "password",
+                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                    ConcreteValue::String("topsecretXYZ".into()),
+                )))),
+            );
+        let bindings = carina_core::binding_index::ResolvedBindings::pre_apply(
+            carina_core::binding_index::PreApplyInputs {
+                managed: &[resource],
+                compositions: &[],
+                data_sources: &[],
+                current_states: &HashMap::new(),
+                remote_bindings: &HashMap::new(),
+                wait_aliases: &[],
+            },
+        );
+        let params = vec![param(
+            "password",
+            Value::resource_ref("vpc", "password", vec![]),
+        )];
+        let error = carina_core::validation::check_export_values_pre_apply(
+            &params,
+            &bindings,
+            &ProviderContext::default(),
+        )
+        .expect_err("resolved secret reference must be rejected before display");
+        assert_eq!(error, "export 'password' cannot hold a secret value");
+        assert!(!error.contains("topsecretXYZ"));
     }
 }
 

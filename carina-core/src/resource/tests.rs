@@ -2,50 +2,111 @@ use super::*;
 use crate::explicit::ExplicitFields;
 
 #[test]
+fn diagnostic_sensitive_string_is_runtime_equivalent_but_formatting_safe() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let plain = ValueString::plain("hunter2SECRET");
+    let marked = ValueString::diagnostic_sensitive("hunter2SECRET");
+
+    assert_eq!(marked, plain);
+
+    let hash = |value: &ValueString| {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    };
+    assert_eq!(hash(&marked), hash(&plain));
+    assert_eq!(
+        serde_json::to_string(&marked).unwrap(),
+        r#""hunter2SECRET""#
+    );
+    assert_eq!(
+        serde_json::to_string(&marked).unwrap(),
+        serde_json::to_string(&plain).unwrap()
+    );
+
+    assert_eq!(marked.diagnostic_literal(), None);
+    assert!(!format!("{marked:?}").contains("hunter2SECRET"));
+    assert_eq!(marked.expose_plaintext(), "hunter2SECRET");
+}
+
+#[test]
+fn secret_debug_never_formats_the_inner_plaintext() {
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("hunter2SECRET".into()),
+    ))));
+
+    let rendered = format!("{secret:?}");
+
+    assert!(rendered.contains("Secret((secret))"), "rendered={rendered}");
+    assert!(!rendered.contains("hunter2SECRET"), "rendered={rendered}");
+}
+
+#[test]
+fn interpolation_inherits_diagnostic_sensitivity_from_string_expression() {
+    let value = Value::Deferred(DeferredValue::Interpolation(vec![
+        InterpolationPart::Literal("prefix-".into()),
+        InterpolationPart::Expr(Value::Concrete(ConcreteValue::String(
+            ValueString::diagnostic_sensitive("hunter2SECRET"),
+        ))),
+    ]))
+    .canonicalize();
+
+    assert_eq!(crate::ValueDescription::of(&value).to_string(), "string");
+    assert_eq!(
+        crate::value::format_value(&value),
+        r#""prefix-hunter2SECRET""#
+    );
+    assert_eq!(
+        crate::value::value_to_json(&value).unwrap(),
+        serde_json::json!("prefix-hunter2SECRET")
+    );
+}
+
+#[test]
 fn value_serde_round_trip() {
     let values = vec![
-        Value::Concrete(ConcreteValue::String("hello".to_string())),
+        Value::Concrete(ConcreteValue::String("hello".into())),
         Value::Concrete(ConcreteValue::Int(42)),
         Value::Concrete(ConcreteValue::Float(2.5)),
         Value::Concrete(ConcreteValue::Float(-0.5)),
         Value::Concrete(ConcreteValue::Bool(true)),
         Value::Concrete(ConcreteValue::List(vec![
-            Value::Concrete(ConcreteValue::String("a".to_string())),
+            Value::Concrete(ConcreteValue::String("a".into())),
             Value::Concrete(ConcreteValue::Int(1)),
         ])),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "key".to_string(),
-                Value::Concrete(ConcreteValue::String("val".to_string())),
+                Value::Concrete(ConcreteValue::String("val".into())),
             ),
             ("num".to_string(), Value::Concrete(ConcreteValue::Int(10))),
         ]))),
         Value::resource_ref("vpc".to_string(), "id".to_string(), vec![]),
-        Value::Concrete(ConcreteValue::String("dedicated".to_string())),
-        Value::Concrete(ConcreteValue::String(
-            "InstanceTenancy.dedicated".to_string(),
-        )),
+        Value::Concrete(ConcreteValue::String("dedicated".into())),
+        Value::Concrete(ConcreteValue::String("InstanceTenancy.dedicated".into())),
         Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Literal("prefix-".to_string()),
+            InterpolationPart::Literal("prefix-".into()),
             InterpolationPart::Expr(Value::resource_ref(
                 "vpc".to_string(),
                 "id".to_string(),
                 vec![],
             )),
-            InterpolationPart::Literal("-suffix".to_string()),
+            InterpolationPart::Literal("-suffix".into()),
         ])),
         Value::Deferred(DeferredValue::FunctionCall {
             name: "join".to_string(),
             args: vec![
-                Value::Concrete(ConcreteValue::String("-".to_string())),
+                Value::Concrete(ConcreteValue::String("-".into())),
                 Value::Concrete(ConcreteValue::List(vec![
-                    Value::Concrete(ConcreteValue::String("a".to_string())),
-                    Value::Concrete(ConcreteValue::String("b".to_string())),
+                    Value::Concrete(ConcreteValue::String("a".into())),
+                    Value::Concrete(ConcreteValue::String("b".into())),
                 ])),
             ],
         }),
         Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("my-password".to_string()),
+            ConcreteValue::String("my-password".into()),
         )))),
     ];
 
@@ -344,7 +405,7 @@ fn state_serde_round_trip() {
     let mut attrs = HashMap::new();
     attrs.insert(
         "name".to_string(),
-        Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+        Value::Concrete(ConcreteValue::String("my-bucket".into())),
     );
     attrs.insert(
         "versioning".to_string(),
@@ -534,14 +595,14 @@ fn semantically_equal_lists_of_maps_different_order() {
     map1.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(80)));
     map1.insert(
         "protocol".to_string(),
-        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+        Value::Concrete(ConcreteValue::String("tcp".into())),
     );
 
     let mut map2 = IndexMap::new();
     map2.insert("port".to_string(), Value::Concrete(ConcreteValue::Int(443)));
     map2.insert(
         "protocol".to_string(),
-        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+        Value::Concrete(ConcreteValue::String("tcp".into())),
     );
 
     let a = Value::Concrete(ConcreteValue::List(vec![
@@ -558,12 +619,12 @@ fn semantically_equal_lists_of_maps_different_order() {
 #[test]
 fn semantically_equal_lists_of_strings() {
     let a = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("b".to_string())),
-        Value::Concrete(ConcreteValue::String("a".to_string())),
+        Value::Concrete(ConcreteValue::String("b".into())),
+        Value::Concrete(ConcreteValue::String("a".into())),
     ]));
     let b = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("a".to_string())),
-        Value::Concrete(ConcreteValue::String("b".to_string())),
+        Value::Concrete(ConcreteValue::String("a".into())),
+        Value::Concrete(ConcreteValue::String("b".into())),
     ]));
     assert!(a.semantically_equal(&b));
 }
@@ -580,8 +641,8 @@ fn semantically_equal_non_list_values() {
             .semantically_equal(&Value::Concrete(ConcreteValue::Int(43)))
     );
     assert!(
-        Value::Concrete(ConcreteValue::String("hello".to_string()))
-            .semantically_equal(&Value::Concrete(ConcreteValue::String("hello".to_string())))
+        Value::Concrete(ConcreteValue::String("hello".into()))
+            .semantically_equal(&Value::Concrete(ConcreteValue::String("hello".into())))
     );
     assert!(
         Value::Concrete(ConcreteValue::Bool(true))
@@ -649,7 +710,7 @@ fn merge_with_saved_map_fills_extra_keys() {
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "hostname_type".to_string(),
-            Value::Concrete(ConcreteValue::String("ip-name".to_string())),
+            Value::Concrete(ConcreteValue::String("ip-name".into())),
         ),
         (
             "a_record".to_string(),
@@ -659,7 +720,7 @@ fn merge_with_saved_map_fills_extra_keys() {
     let saved = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "hostname_type".to_string(),
-            Value::Concrete(ConcreteValue::String("ip-name".to_string())),
+            Value::Concrete(ConcreteValue::String("ip-name".into())),
         ),
         (
             "a_record".to_string(),
@@ -681,7 +742,7 @@ fn merge_with_saved_map_fills_extra_keys() {
     let expected = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "hostname_type".to_string(),
-            Value::Concrete(ConcreteValue::String("ip-name".to_string())),
+            Value::Concrete(ConcreteValue::String("ip-name".into())),
         ),
         (
             "a_record".to_string(),
@@ -733,7 +794,7 @@ fn merge_with_saved_list_of_maps() {
             ("port".to_string(), Value::Concrete(ConcreteValue::Int(80))),
             (
                 "protocol".to_string(),
-                Value::Concrete(ConcreteValue::String("tcp".to_string())),
+                Value::Concrete(ConcreteValue::String("tcp".into())),
             ),
         ])),
     )]));
@@ -750,7 +811,7 @@ fn merge_with_saved_list_of_maps() {
             ("port".to_string(), Value::Concrete(ConcreteValue::Int(80))),
             (
                 "protocol".to_string(),
-                Value::Concrete(ConcreteValue::String("tcp".to_string())),
+                Value::Concrete(ConcreteValue::String("tcp".into())),
             ),
         ])),
     )]));
@@ -759,8 +820,8 @@ fn merge_with_saved_list_of_maps() {
 
 #[test]
 fn merge_with_saved_non_map() {
-    let desired = Value::Concrete(ConcreteValue::String("hello".to_string()));
-    let saved = Value::Concrete(ConcreteValue::String("world".to_string()));
+    let desired = Value::Concrete(ConcreteValue::String("hello".into()));
+    let saved = Value::Concrete(ConcreteValue::String("world".into()));
     let merged = merge_with_saved(
         &desired,
         SavedValueViews::same(&saved),
@@ -770,7 +831,7 @@ fn merge_with_saved_non_map() {
     );
     assert_eq!(
         merged,
-        Value::Concrete(ConcreteValue::String("hello".to_string()))
+        Value::Concrete(ConcreteValue::String("hello".into()))
     );
 
     let desired = Value::Concrete(ConcreteValue::Int(42));
@@ -790,7 +851,7 @@ fn merge_with_saved_does_not_reinject_authored_removed_key() {
     let desired = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
     let saved = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
         "web_acl_id".to_string(),
-        Value::Concrete(ConcreteValue::String("arn:aws:wafv2:acl/test".to_string())),
+        Value::Concrete(ConcreteValue::String("arn:aws:wafv2:acl/test".into())),
     )])));
     let prior = ExplicitFields::Struct {
         children: HashMap::from([("web_acl_id".to_string(), ExplicitFields::Leaf)]),
@@ -888,7 +949,7 @@ fn merge_with_saved_applies_authoring_recursively_to_maps_and_lists() {
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(IndexMap::from([(
                     "name".to_string(),
-                    Value::Concrete(ConcreteValue::String("primary".to_string())),
+                    Value::Concrete(ConcreteValue::String("primary".into())),
                 )])),
             )])),
         ),
@@ -917,7 +978,7 @@ fn merge_with_saved_applies_authoring_recursively_to_maps_and_lists() {
                 ConcreteValue::Map(IndexMap::from([
                     (
                         "name".to_string(),
-                        Value::Concrete(ConcreteValue::String("primary".to_string())),
+                        Value::Concrete(ConcreteValue::String("primary".into())),
                     ),
                     (
                         "removed".to_string(),
@@ -988,7 +1049,7 @@ fn merge_with_saved_applies_authoring_recursively_to_maps_and_lists() {
                 ConcreteValue::Map(IndexMap::from([
                     (
                         "name".to_string(),
-                        Value::Concrete(ConcreteValue::String("primary".to_string())),
+                        Value::Concrete(ConcreteValue::String("primary".into())),
                     ),
                     (
                         "removed".to_string(),
@@ -1012,7 +1073,7 @@ fn merge_with_saved_does_not_apply_union_authoring_to_individual_list_elements()
             ("port".to_string(), Value::Concrete(ConcreteValue::Int(80))),
             (
                 "description".to_string(),
-                Value::Concrete(ConcreteValue::String("web".to_string())),
+                Value::Concrete(ConcreteValue::String("web".into())),
             ),
         ]))),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -1025,14 +1086,14 @@ fn merge_with_saved_does_not_apply_union_authoring_to_individual_list_elements()
             ("port".to_string(), Value::Concrete(ConcreteValue::Int(80))),
             (
                 "description".to_string(),
-                Value::Concrete(ConcreteValue::String("web".to_string())),
+                Value::Concrete(ConcreteValue::String("web".into())),
             ),
         ]))),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
             ("port".to_string(), Value::Concrete(ConcreteValue::Int(443))),
             (
                 "description".to_string(),
-                Value::Concrete(ConcreteValue::String("provider-default".to_string())),
+                Value::Concrete(ConcreteValue::String("provider-default".into())),
             ),
         ]))),
     ]));
@@ -1066,7 +1127,7 @@ fn merge_with_saved_list_elements_drops_only_paired_authored_field_in_both_paths
         if let Some(description) = description {
             fields.insert(
                 "description".to_string(),
-                Value::Concrete(ConcreteValue::String(description.to_string())),
+                Value::Concrete(ConcreteValue::String(description.to_string().into())),
             );
         }
         Value::Concrete(ConcreteValue::Map(fields))
@@ -1131,7 +1192,7 @@ fn merge_with_saved_requires_raw_projected_corroboration_in_both_pairing_paths()
         if with_description {
             fields.insert(
                 "desc".to_string(),
-                Value::Concrete(ConcreteValue::String(String::new())),
+                Value::Concrete(ConcreteValue::String(String::new().into())),
             );
         }
         Value::Concrete(ConcreteValue::Map(fields))
@@ -1199,7 +1260,9 @@ fn merge_with_saved_requires_raw_projected_corroboration_in_both_pairing_paths()
         };
         assert_eq!(
             first.get("desc"),
-            Some(&Value::Concrete(ConcreteValue::String(String::new()))),
+            Some(&Value::Concrete(ConcreteValue::String(
+                String::new().into()
+            ))),
             "saved length {saved_len} must degrade divergent attribution to Unrecorded"
         );
     }
@@ -1207,7 +1270,7 @@ fn merge_with_saved_requires_raw_projected_corroboration_in_both_pairing_paths()
 
 #[test]
 fn pair_list_elements_commits_best_scores_before_lower_scores() {
-    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string()));
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
     let map = |entries: &[(&str, &str)]| {
         Value::Concrete(ConcreteValue::Map(
             entries
@@ -1259,7 +1322,7 @@ fn pair_list_elements_preserves_stable_indices_for_indistinguishable_peers_in_bo
     for len in [2, HASH_THRESHOLD] {
         let peer = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "effect".to_string(),
-            Value::Concrete(ConcreteValue::String("Allow".to_string())),
+            Value::Concrete(ConcreteValue::String("Allow".into())),
         )])));
         let desired = vec![peer.clone(); len];
         let saved = vec![peer; len];
@@ -1279,7 +1342,7 @@ fn pair_list_elements_preserves_stable_indices_for_indistinguishable_peers_in_bo
 
 #[test]
 fn pair_list_elements_handles_secrets_in_both_paths() {
-    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string()));
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
     let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
     let record = |id: i64, secret_value: &str| {
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
@@ -1321,7 +1384,7 @@ fn pair_list_elements_handles_secrets_in_both_paths() {
 
 #[test]
 fn pair_list_elements_secret_plaintext_pairing_is_threshold_independent() {
-    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string()));
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
     let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
     let attr_type = AttributeType::string();
     let defs = crate::schema::empty_defs_for_schema_walks();
@@ -1346,7 +1409,7 @@ fn pair_list_elements_secret_plaintext_pairing_is_threshold_independent() {
 
 #[test]
 fn pair_list_elements_struct_secret_field_pairing_is_threshold_independent() {
-    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string()));
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
     let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
     let record = |credential: Value, label: &str| {
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
@@ -1386,7 +1449,7 @@ fn pair_list_elements_struct_secret_field_pairing_is_threshold_independent() {
 
 #[test]
 fn pair_list_elements_secret_hash_pairing_is_threshold_independent() {
-    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string()));
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
     let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
     let serialized = serde_json::to_string("p").expect("string serialization must succeed");
     let state_hash = format!(
@@ -1417,7 +1480,7 @@ fn pair_list_elements_secret_hash_pairing_is_threshold_independent() {
 
 #[test]
 fn pair_list_elements_handles_unknown_and_mixed_shapes_in_both_paths() {
-    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string()));
+    let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
     let map = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
         "id".to_string(),
         Value::Concrete(ConcreteValue::Int(7)),
@@ -1517,19 +1580,19 @@ fn hashed_shared_field_pairing_matches_fully_materialized_best_first_reference()
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "sid".to_string(),
-                Value::Concrete(ConcreteValue::String(format!("Sid{sid}"))),
+                Value::Concrete(ConcreteValue::String(format!("Sid{sid}").into())),
             ),
             (
                 "effect".to_string(),
-                Value::Concrete(ConcreteValue::String("Allow".to_string())),
+                Value::Concrete(ConcreteValue::String("Allow".into())),
             ),
             (
                 "action".to_string(),
-                Value::Concrete(ConcreteValue::String(format!("Action{action}"))),
+                Value::Concrete(ConcreteValue::String(format!("Action{action}").into())),
             ),
             (
                 "resource".to_string(),
-                Value::Concrete(ConcreteValue::String(format!("Resource{resource}"))),
+                Value::Concrete(ConcreteValue::String(format!("Resource{resource}").into())),
             ),
         ])))
     };
@@ -1576,9 +1639,9 @@ fn union_typed_string_or_list_pairing_uses_the_list_element_schema() {
         AttributeType::unordered_list(enum_type),
     ]);
     let mut desired = vec![Value::Concrete(ConcreteValue::enum_identifier("allow"))];
-    let mut saved = vec![Value::Concrete(ConcreteValue::String("Allow".to_string()))];
+    let mut saved = vec![Value::Concrete(ConcreteValue::String("Allow".into()))];
     for index in 1..HASH_THRESHOLD {
-        let filler = Value::Concrete(ConcreteValue::String(format!("filler-{index}")));
+        let filler = Value::Concrete(ConcreteValue::String(format!("filler-{index}").into()));
         desired.push(filler.clone());
         saved.push(filler);
     }
@@ -1647,14 +1710,14 @@ fn merge_with_saved_malformed_list_elements_length_uses_conservative_full_merge(
             ("port".to_string(), Value::Concrete(ConcreteValue::Int(80))),
             (
                 "description".to_string(),
-                Value::Concrete(ConcreteValue::String("web".to_string())),
+                Value::Concrete(ConcreteValue::String("web".into())),
             ),
         ]))),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
             ("port".to_string(), Value::Concrete(ConcreteValue::Int(443))),
             (
                 "description".to_string(),
-                Value::Concrete(ConcreteValue::String("provider-default".to_string())),
+                Value::Concrete(ConcreteValue::String("provider-default".into())),
             ),
         ]))),
     ]));
@@ -1736,11 +1799,11 @@ fn lists_equal_large_list_of_maps() {
             ("port".to_string(), Value::Concrete(ConcreteValue::Int(i))),
             (
                 "protocol".to_string(),
-                Value::Concrete(ConcreteValue::String("tcp".to_string())),
+                Value::Concrete(ConcreteValue::String("tcp".into())),
             ),
             (
                 "cidr".to_string(),
-                Value::Concrete(ConcreteValue::String(format!("10.0.{}.0/24", i))),
+                Value::Concrete(ConcreteValue::String(format!("10.0.{}.0/24", i).into())),
             ),
         ])))
     };
@@ -1790,25 +1853,25 @@ fn pair_list_elements_performance_large_list() {
                 Value::Concrete(ConcreteValue::Map(IndexMap::from([
                     (
                         "sid".to_string(),
-                        Value::Concrete(ConcreteValue::String(format!("Statement{index}"))),
+                        Value::Concrete(ConcreteValue::String(format!("Statement{index}").into())),
                     ),
                     (
                         "effect".to_string(),
                         Value::Concrete(ConcreteValue::String(match fixture {
-                            Fixture::AllDistinct => format!("Effect{index}"),
-                            Fixture::SharedEffect => "Allow".to_string(),
+                            Fixture::AllDistinct => format!("Effect{index}").into(),
+                            Fixture::SharedEffect => "Allow".into(),
                         })),
                     ),
                     (
                         "action".to_string(),
                         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                            ConcreteValue::String(format!("service:Action{index}")),
+                            ConcreteValue::String(format!("service:Action{index}").into()),
                         )])),
                     ),
                     (
                         "resource".to_string(),
                         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                            ConcreteValue::String(format!("arn:carina:resource/{index}")),
+                            ConcreteValue::String(format!("arn:carina:resource/{index}").into()),
                         )])),
                     ),
                 ])))
@@ -1876,7 +1939,7 @@ fn merge_lists_large_list_correctness() {
                 ("port".to_string(), Value::Concrete(ConcreteValue::Int(i))),
                 (
                     "protocol".to_string(),
-                    Value::Concrete(ConcreteValue::String("tcp".to_string())),
+                    Value::Concrete(ConcreteValue::String("tcp".into())),
                 ),
             ])))
         })
@@ -2002,7 +2065,7 @@ fn resource_attributes_use_value_type() {
     let resource = Resource::new("s3.Bucket", "test")
         .with_attribute(
             "name",
-            Value::Concrete(ConcreteValue::String("my-bucket".to_string())),
+            Value::Concrete(ConcreteValue::String("my-bucket".into())),
         )
         .with_attribute(
             "vpc_id",
@@ -2023,13 +2086,13 @@ fn attrs_to_hashmap_clones_values() {
     let mut attrs = IndexMap::new();
     attrs.insert(
         "name".to_string(),
-        Value::Concrete(ConcreteValue::String("test".to_string())),
+        Value::Concrete(ConcreteValue::String("test".into())),
     );
     attrs.insert("count".to_string(), Value::Concrete(ConcreteValue::Int(5)));
     let resolved = attrs_to_hashmap(&attrs);
     assert_eq!(
         resolved.get("name"),
-        Some(&Value::Concrete(ConcreteValue::String("test".to_string())))
+        Some(&Value::Concrete(ConcreteValue::String("test".into())))
     );
     assert_eq!(
         resolved.get("count"),
@@ -2081,9 +2144,7 @@ fn access_path_subscripts_render_with_escapes() {
         "orgs",
         "accounts",
         Vec::new(),
-        vec![Subscript::Str {
-            key: "a\"b".to_string(),
-        }],
+        vec![Subscript::Str { key: "a\"b".into() }],
     );
     let rendered = str_path.to_dot_string();
     assert!(
@@ -2141,7 +2202,7 @@ fn value_ref_helpers() {
         )
     );
 
-    let non_ref = Value::Concrete(ConcreteValue::String("hello".to_string()));
+    let non_ref = Value::Concrete(ConcreteValue::String("hello".into()));
     assert_eq!(non_ref.ref_binding(), None);
 }
 
@@ -2158,7 +2219,7 @@ fn visit_resource_refs_collects_from_all_nested_variants() {
             Value::resource_ref("b", "id", vec![]),
         )]))),
         Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Literal("x".to_string()),
+            InterpolationPart::Literal("x".into()),
             InterpolationPart::Expr(Value::resource_ref("c", "id", vec![])),
         ])),
         Value::Deferred(DeferredValue::FunctionCall {
@@ -2170,7 +2231,7 @@ fn visit_resource_refs_collects_from_all_nested_variants() {
             "id",
             vec![],
         )))),
-        Value::Concrete(ConcreteValue::String("plain".to_string())),
+        Value::Concrete(ConcreteValue::String("plain".into())),
     ]));
 
     let mut collected: Vec<String> = Vec::new();
@@ -2194,7 +2255,7 @@ fn visit_binding_refs_collects_from_all_nested_variants() {
             }),
         )]))),
         Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Literal("x".to_string()),
+            InterpolationPart::Literal("x".into()),
             InterpolationPart::Expr(Value::Deferred(DeferredValue::BindingRef {
                 binding: "c".to_string(),
             })),
@@ -2416,33 +2477,29 @@ fn canonicalize_collapses_nested_interpolation() {
 }
 
 #[test]
-fn canonicalize_keeps_secret_expr_in_interpolation() {
-    // A `Secret(_)` inside an `Expr` must NOT be folded into a Literal:
-    // doing so would let the secret travel as plain text and bypass
-    // redaction in plan display, state serialization, and logging.
+fn canonicalize_resolves_secret_interpolation_to_a_secret_string() {
+    // A `Secret(_)` inside an interpolation participates in ordinary string
+    // evaluation, but the completed string must retain the Secret wrapper.
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
         ConcreteValue::String("password".into()),
     ))));
-    let parts = vec![
+    let v = Value::Deferred(DeferredValue::Interpolation(vec![
         InterpolationPart::Literal("db-".into()),
         InterpolationPart::Expr(secret.clone()),
-    ];
-    let v = Value::Deferred(DeferredValue::Interpolation(parts.clone()));
+    ]));
     assert_eq!(
         v.canonicalize(),
-        Value::Deferred(DeferredValue::Interpolation(parts))
+        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+            ConcreteValue::String("db-password".into()),
+        )))),
     );
 
-    // Even when the Secret is the only Expr part, it must stay wrapped.
+    // A sole Secret expression is normalized the same way, without nesting
+    // a second Secret wrapper.
     let only_secret = Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
         secret.clone(),
     )]));
-    assert_eq!(
-        only_secret.canonicalize(),
-        Value::Deferred(DeferredValue::Interpolation(vec![InterpolationPart::Expr(
-            secret
-        )])),
-    );
+    assert_eq!(only_secret.canonicalize(), secret,);
 }
 
 #[test]
@@ -2752,7 +2809,10 @@ fn as_concrete_borrows_inner_string_without_clone() {
     let Value::Concrete(ConcreteValue::String(ref original)) = v else {
         unreachable!("v constructed as Value::Concrete(ConcreteValue::String)");
     };
-    assert_eq!(borrowed.as_ptr(), original.as_str().as_ptr());
+    assert_eq!(
+        borrowed.expose_plaintext().as_ptr(),
+        original.expose_plaintext().as_ptr()
+    );
 }
 
 #[test]
@@ -2807,7 +2867,7 @@ mod navigate_value_path_tests {
     use super::*;
 
     fn s(v: &str) -> Value {
-        Value::Concrete(ConcreteValue::String(v.to_string()))
+        Value::Concrete(ConcreteValue::String(v.to_string().into()))
     }
     fn map(pairs: &[(&str, Value)]) -> Value {
         let mut m = indexmap::IndexMap::new();

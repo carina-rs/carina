@@ -2196,35 +2196,132 @@ pub fn validate_module_calls(
     }
 }
 
-/// Validate export parameter values against their declared type annotations.
+/// Export parameters checked against the pre-apply binding view.
 ///
-/// For each export with both a `type_expr` and a `value`, validates the value
-/// using [`typecheck::check_type_expr_value`]. Accumulates all errors.
+/// This deliberately retains both the original expressions and a resolved
+/// copy used only for plan display. A pre-apply resource binding can contain
+/// attributes copied from current state; replacing the original expression
+/// with that value would make post-apply export writeback persist stale data.
+/// Keeping the two representations behind a distinct type prevents the
+/// display snapshot from being passed to the post-apply writeback boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportsCheckedPreApply<P> {
+    original_params: Vec<P>,
+    display_params: Vec<P>,
+}
+
+impl<P> ExportsCheckedPreApply<P> {
+    /// Values resolved against the pre-apply binding view for plan display.
+    pub fn display_values(&self) -> &[P] {
+        &self.display_params
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.original_params.is_empty()
+    }
+}
+
+/// Export parameters resolved against the post-apply binding view and proven
+/// not to contain a secret.
 ///
-/// Accepts post-inference [`InferredExportParam`]s (#2360 stage 2):
-/// `type_expr` is bare. Sentinel-bearing exports (`TypeExpr::Unknown`)
-/// skip literal type compatibility here; reference existence is handled
-/// separately by [`validate_export_param_ref_types_with_bindings`], with
-/// inference-reported parameter indices suppressed there.
-pub fn validate_export_params(
-    export_params: &[crate::parser::InferredExportParam],
+/// The inner vector is private and the only constructor requires an
+/// [`ExportsCheckedPreApply`] proof. State serialization accepts this type,
+/// never the pre-apply display snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckedExportValues<P> {
+    params: Vec<P>,
+}
+
+impl<P> CheckedExportValues<P> {
+    pub fn as_slice(&self) -> &[P] {
+        &self.params
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, P> {
+        self.params.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.params.is_empty()
+    }
+}
+
+fn resolve_and_validate_export_values<P>(
+    export_params: &[P],
+    bindings: &crate::binding_index::ResolvedBindings,
     config: &ProviderContext,
-) -> Result<(), String> {
+) -> Result<Vec<P>, String>
+where
+    P: crate::parser::ExportParamLike + Clone,
+{
+    let mut checked = Vec::with_capacity(export_params.len());
     let mut errors = Vec::new();
 
     for param in export_params {
-        if let Some(value) = &param.value
-            && let Err(error) = typecheck::check_type_expr_value(&param.type_expr, value, config)
-        {
-            errors.push(format!("export '{}': {}", param.name, error));
+        let mut resolved_param = param.clone();
+        if let Some(value) = param.value() {
+            match crate::resolver::resolve_ref_value_with_config(value, bindings, config) {
+                Ok(resolved) if crate::value::contains_secret(&resolved) => {
+                    errors.push(format!(
+                        "export '{}' cannot hold a secret value",
+                        param.name()
+                    ));
+                }
+                Ok(resolved) => {
+                    resolved_param.set_value(Some(resolved));
+                    if let (Some(type_expr), Some(value)) =
+                        (resolved_param.type_expr_opt(), resolved_param.value())
+                        && let Err(error) =
+                            typecheck::check_type_expr_value(type_expr, value, config)
+                    {
+                        errors.push(format!("export '{}': {error}", param.name()));
+                    }
+                }
+                Err(error) => errors.push(format!("export '{}': {error}", param.name())),
+            }
         }
+        checked.push(resolved_param);
     }
 
     if errors.is_empty() {
-        Ok(())
+        Ok(checked)
     } else {
         Err(errors.join("\n"))
     }
+}
+
+/// Resolve every export through the pre-apply value binding graph, evaluate
+/// builtins that become concrete, and accumulate both secret-boundary and
+/// value-type errors in one pass.
+pub fn check_export_values_pre_apply<P>(
+    export_params: &[P],
+    bindings: &crate::binding_index::ResolvedBindings,
+    config: &ProviderContext,
+) -> Result<ExportsCheckedPreApply<P>, String>
+where
+    P: crate::parser::ExportParamLike + Clone,
+{
+    let display_params = resolve_and_validate_export_values(export_params, bindings, config)?;
+    Ok(ExportsCheckedPreApply {
+        original_params: export_params.to_vec(),
+        display_params,
+    })
+}
+
+/// Resolve the original export expressions against the post-apply binding
+/// view. This is the only constructor for [`CheckedExportValues`], so a
+/// pre-apply display snapshot cannot be serialized into state by mistake.
+pub fn resolve_export_values_post_apply<P>(
+    export_params: &ExportsCheckedPreApply<P>,
+    bindings: &crate::binding_index::ResolvedBindings,
+    config: &ProviderContext,
+) -> Result<CheckedExportValues<P>, String>
+where
+    P: crate::parser::ExportParamLike + Clone,
+{
+    let params =
+        resolve_and_validate_export_values(&export_params.original_params, bindings, config)?;
+    Ok(CheckedExportValues { params })
 }
 
 /// Validate concrete module attribute values against their declared types.

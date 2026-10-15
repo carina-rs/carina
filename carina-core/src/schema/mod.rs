@@ -13,7 +13,7 @@ use indexmap::{IndexMap, IndexSet};
 use crate::parser::display_string_literal;
 use crate::resource::{
     ConcreteValue, ConcreteValueRef, DeferredValue, EnumValueResolver, RawEnumIdentifier, Resource,
-    Value,
+    Value, ValueString,
 };
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
 use crate::value::format_value_with_key;
@@ -1739,7 +1739,7 @@ pub(crate) fn lift_map_key(key_type: &AttributeType, key: &str) -> Value {
             .map(|c| Value::Concrete(ConcreteValue::CanonicalEnum(c)))
             .unwrap_or_else(|_| Value::Concrete(ConcreteValue::enum_identifier(key.to_string())))
     } else {
-        Value::Concrete(ConcreteValue::String(key.to_string()))
+        Value::Concrete(ConcreteValue::String(key.to_string().into()))
     }
 }
 
@@ -2677,7 +2677,7 @@ impl AttributeType {
                 return Ok(());
             }
             return Err(TypeError::StringLiteralExpectedEnum {
-                user_typed: s.to_string().into(),
+                user_typed: s.into(),
                 attribute: None,
                 type_name: name.to_string(),
                 expected,
@@ -2706,12 +2706,12 @@ impl AttributeType {
             let direct_match = values
                 .into_iter()
                 .flatten()
-                .any(|v| enum_value_matches(s, v));
+                .any(|v| enum_value_matches(s.expose_plaintext(), v));
             let valid: Vec<&str> = values.into_iter().flatten().map(String::as_str).collect();
             let variant = if direct_match {
-                s.as_str()
+                s.expose_plaintext()
             } else {
-                extract_enum_value_with_values(s, &valid)
+                extract_enum_value_with_values(s.expose_plaintext(), &valid)
             };
 
             // Non-direct matches must have the exact form
@@ -2720,15 +2720,20 @@ impl AttributeType {
             // enum values that themselves contain dots (e.g., "ipsec.1").
             if !direct_match && let Some(ns) = prefix_ref {
                 let expected_prefix = format!("{}.{}.", ns, name);
-                let prefix_matches =
-                    s.starts_with(&expected_prefix) && &s[expected_prefix.len()..] == variant;
+                let prefix_matches = s.expose_plaintext().starts_with(&expected_prefix)
+                    && &s.expose_plaintext()[expected_prefix.len()..] == variant;
                 if !prefix_matches {
                     // Fall back to strict namespace validation, which
                     // produces a clear error for the common bare form.
-                    let user_form = user_input.unwrap_or(s.as_str());
-                    validate_enum_namespace(s, identity).map_err(|message| {
+                    let user_form = user_input
+                        .map(DiagnosticValue::from)
+                        .unwrap_or_else(|| DiagnosticValue::from(s));
+                    validate_enum_namespace(s.expose_plaintext(), identity).map_err(|message| {
                         TypeError::ValidationFailed {
-                            message: format!("Invalid {name} {user_form}: {message}"),
+                            message: format!(
+                                "Invalid {name} {}: {message}",
+                                user_form.render_enum_value(InvalidEnumValueKind::Identifier)
+                            ),
                         }
                     })?;
                 }
@@ -2762,7 +2767,9 @@ impl AttributeType {
                 Ok(())
             } else {
                 Err(TypeError::InvalidEnumVariant {
-                    value: user_input.unwrap_or(s.as_str()).to_string().into(),
+                    value: user_input
+                        .map(DiagnosticValue::from)
+                        .unwrap_or_else(|| DiagnosticValue::from(s)),
                     value_kind: InvalidEnumValueKind::Identifier,
                     attribute: None,
                     type_name: Some(name.to_string()),
@@ -3518,26 +3525,26 @@ fn validate_string_refinement(
     identity: Option<&TypeIdentity>,
     pattern: Option<&str>,
     length: Option<(Option<u64>, Option<u64>)>,
-    s: &str,
+    s: &ValueString,
 ) -> Result<(), TypeError> {
     let type_name = identity.map(|id| id.kind.clone());
     if let Some(pattern) = pattern
         && let Ok(re) = regex::Regex::new(pattern)
-        && !re.is_match(s)
+        && !re.is_match(s.expose_plaintext())
     {
         return Err(TypeError::PatternMismatch {
-            value: s.to_string().into(),
+            value: s.into(),
             pattern: pattern.to_string(),
             attribute: None,
             type_name,
         });
     }
     if let Some((min, max)) = length {
-        let count = s.chars().count();
+        let count = s.expose_plaintext().chars().count();
         let count_u64 = count as u64;
         if min.is_some_and(|min| count_u64 < min) || max.is_some_and(|max| count_u64 > max) {
             return Err(TypeError::LengthOutOfRange {
-                value: s.to_string().into(),
+                value: s.into(),
                 length: count,
                 min,
                 max,
@@ -4776,13 +4783,14 @@ pub enum InvalidEnumValueKind {
 pub enum DiagnosticValue {
     Plain(String),
     Masked,
+    TypeOnlyString,
 }
 
 impl DiagnosticValue {
     pub fn as_plain(&self) -> Option<&str> {
         match self {
             Self::Plain(value) => Some(value),
-            Self::Masked => None,
+            Self::Masked | Self::TypeOnlyString => None,
         }
     }
 
@@ -4790,6 +4798,7 @@ impl DiagnosticValue {
         match self {
             Self::Plain(value) => display_string_literal(value),
             Self::Masked => SECRET_VALUE_MASK.to_string(),
+            Self::TypeOnlyString => "string".to_string(),
         }
     }
 
@@ -4800,6 +4809,7 @@ impl DiagnosticValue {
                 InvalidEnumValueKind::Identifier => value.clone(),
             },
             Self::Masked => SECRET_VALUE_MASK.to_string(),
+            Self::TypeOnlyString => "string".to_string(),
         }
     }
 }
@@ -4813,6 +4823,21 @@ impl From<String> for DiagnosticValue {
 impl From<&str> for DiagnosticValue {
     fn from(value: &str) -> Self {
         Self::Plain(value.to_string())
+    }
+}
+
+impl From<ValueString> for DiagnosticValue {
+    fn from(value: ValueString) -> Self {
+        Self::from(&value)
+    }
+}
+
+impl From<&ValueString> for DiagnosticValue {
+    fn from(value: &ValueString) -> Self {
+        match value.diagnostic_literal() {
+            Some(value) => Self::Plain(value.to_owned()),
+            None => Self::TypeOnlyString,
+        }
     }
 }
 
@@ -5202,7 +5227,7 @@ impl ConcreteValueRef<'_> {
     /// be migrated to the projection without a wider API change.
     fn to_owned_value(self) -> Value {
         match self {
-            ConcreteValueRef::String(s) => Value::Concrete(ConcreteValue::String(s.to_string())),
+            ConcreteValueRef::String(s) => Value::Concrete(ConcreteValue::String(s.clone())),
             ConcreteValueRef::EnumIdentifier(s) => {
                 Value::Concrete(ConcreteValue::enum_identifier(s.to_string()))
             }
@@ -6529,7 +6554,7 @@ pub mod types {
             None,
             legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_ipv4_cidr(s)
+                    validate_ipv4_cidr(s.expose_plaintext())
                 } else {
                     Err("Expected string".to_string())
                 }
@@ -6546,7 +6571,7 @@ pub mod types {
             None,
             legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_ipv4_address(s)
+                    validate_ipv4_address(s.expose_plaintext())
                 } else {
                     Err("Expected string".to_string())
                 }
@@ -6563,7 +6588,7 @@ pub mod types {
             None,
             legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_ipv6_address(s)
+                    validate_ipv6_address(s.expose_plaintext())
                 } else {
                     Err("Expected string".to_string())
                 }
@@ -6580,7 +6605,7 @@ pub mod types {
             None,
             legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_ipv6_cidr(s)
+                    validate_ipv6_cidr(s.expose_plaintext())
                 } else {
                     Err("Expected string".to_string())
                 }
@@ -6606,7 +6631,7 @@ pub mod types {
             None,
             legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_email(s)
+                    validate_email(s.expose_plaintext())
                 } else {
                     Err("Expected string".to_string())
                 }
@@ -6628,7 +6653,7 @@ pub mod types {
             None,
             legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_http_response_status_code(s)
+                    validate_http_response_status_code(s.expose_plaintext())
                 } else {
                     Err("Expected string".to_string())
                 }
@@ -6652,7 +6677,7 @@ pub mod types {
             None,
             legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_redirect_protocol(s)
+                    validate_redirect_protocol(s.expose_plaintext())
                 } else {
                     Err("Expected string".to_string())
                 }
@@ -6675,7 +6700,7 @@ pub mod types {
             None,
             legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_redirect_host(s)
+                    validate_redirect_host(s.expose_plaintext())
                 } else {
                     Err("Expected string".to_string())
                 }
@@ -6698,7 +6723,7 @@ pub mod types {
             None,
             legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_redirect_port(s)
+                    validate_redirect_port(s.expose_plaintext())
                 } else {
                     Err("Expected string".to_string())
                 }
@@ -6721,7 +6746,7 @@ pub mod types {
             None,
             legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_redirect_path(s)
+                    validate_redirect_path(s.expose_plaintext())
                 } else {
                     Err("Expected string".to_string())
                 }
@@ -6744,7 +6769,7 @@ pub mod types {
             None,
             legacy_validator(|value| {
                 if let Value::Concrete(ConcreteValue::String(s)) = value {
-                    validate_redirect_query(s)
+                    validate_redirect_query(s.expose_plaintext())
                 } else {
                     Err("Expected string".to_string())
                 }

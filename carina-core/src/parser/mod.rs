@@ -43,8 +43,8 @@ pub(crate) use expressions::string_literal::{
     display_double_quoted_literal_part, escape_double_quoted_heredoc_part, unescape_string,
 };
 pub use expressions::string_literal::{display_string_literal, encode_string_literal};
-pub(crate) use functions::{evaluate_user_function, evaluate_user_function_with_origins};
-pub use functions::{provider_context_lookup, validate_custom_type};
+pub(crate) use functions::evaluate_user_function;
+pub use functions::{contains_function_call, provider_context_lookup, validate_custom_type};
 pub use resolve::{
     ProviderConfigInvariantError, ProviderConfigResolutionError, ResolvedProviderConfig,
     ResolvedProviderConfigs, SavedProviderConfigs, check_identifier_scope,

@@ -433,9 +433,9 @@ struct CanonicalizingNormalizer;
 
 fn canonicalize_value(v: &Value) -> Option<Value> {
     match v {
-        Value::Concrete(ConcreteValue::String(s)) if s == "raw_dsl" => Some(Value::Concrete(
-            ConcreteValue::String("CANONICAL".to_string()),
-        )),
+        Value::Concrete(ConcreteValue::String(s)) if s == "raw_dsl" => {
+            Some(Value::Concrete(ConcreteValue::String("CANONICAL".into())))
+        }
         Value::Concrete(ConcreteValue::Map(m)) => {
             let mut out = m.clone();
             let mut changed = false;
@@ -760,7 +760,7 @@ fn ok_state(id: &ResourceId) -> State {
     let mut attrs = HashMap::new();
     attrs.insert(
         "id".to_string(),
-        Value::Concrete(ConcreteValue::String("id-123".to_string())),
+        Value::Concrete(ConcreteValue::String("id-123".into())),
     );
     State::existing(id.clone(), attrs).with_identifier("id-123")
 }
@@ -961,7 +961,7 @@ impl Provider for PendingWaitProvider {
             let mut attrs = HashMap::new();
             attrs.insert(
                 "status".to_string(),
-                Value::Concrete(ConcreteValue::String("PENDING".to_string())),
+                Value::Concrete(ConcreteValue::String("PENDING".into())),
             );
             Ok(State::existing(id, attrs).with_identifier("pending-id"))
         })
@@ -1453,7 +1453,7 @@ async fn invalid_resolved_create_value_never_reaches_provider() {
     let mut resource = make_resource("invalid-create", &[]);
     resource.set_attr(
         "target",
-        Value::Concrete(ConcreteValue::String("bad".to_string())),
+        Value::Concrete(ConcreteValue::String("bad".into())),
     );
     let id = resource.id.clone();
     let mut plan = Plan::new();
@@ -1511,7 +1511,7 @@ async fn invalid_secret_create_value_is_masked_and_never_reaches_provider() {
         HashMap::from([(
             "value".to_string(),
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String(plaintext.to_string()),
+                ConcreteValue::String(plaintext.to_string().into()),
             )))),
         )]),
         BindingValueSource::Local,
@@ -1593,7 +1593,7 @@ async fn invalid_resolved_value_is_rejected_before_provider_normalization() {
     let mut resource = make_resource("invalid-before-normalize", &[]);
     resource.set_attr(
         "target",
-        Value::Concrete(ConcreteValue::String("bad".to_string())),
+        Value::Concrete(ConcreteValue::String("bad".into())),
     );
     let mut plan = Plan::new();
     plan.add(create_effect(resource));
@@ -1633,14 +1633,14 @@ async fn invalid_resolved_update_value_never_reaches_provider() {
     let mut resource = make_resource("invalid-update", &[]);
     resource.set_attr(
         "target",
-        Value::Concrete(ConcreteValue::String("bad".to_string())),
+        Value::Concrete(ConcreteValue::String("bad".into())),
     );
     let id = resource.id.clone();
     let from = State::existing(
         id.clone(),
         HashMap::from([(
             "target".to_string(),
-            Value::Concrete(ConcreteValue::String("good-before".to_string())),
+            Value::Concrete(ConcreteValue::String("good-before".into())),
         )]),
     )
     .with_identifier("id-123");
@@ -1685,19 +1685,19 @@ async fn invalid_resolved_update_value_never_reaches_provider() {
 async fn valid_checked_values_preserve_create_payload_and_update_patch() {
     let provider = MockProvider::new();
     let mut created = make_resource("valid-create", &[]);
-    let create_value = Value::Concrete(ConcreteValue::String("good-create".to_string()));
+    let create_value = Value::Concrete(ConcreteValue::String("good-create".into()));
     created.set_attr("target", create_value.clone());
     let create_id = created.id.clone();
 
     let mut updated = make_resource("valid-update", &[]);
-    let update_value = Value::Concrete(ConcreteValue::String("good-update".to_string()));
+    let update_value = Value::Concrete(ConcreteValue::String("good-update".into()));
     updated.set_attr("target", update_value.clone());
     let update_id = updated.id.clone();
     let from = State::existing(
         update_id.clone(),
         HashMap::from([(
             "target".to_string(),
-            Value::Concrete(ConcreteValue::String("good-before".to_string())),
+            Value::Concrete(ConcreteValue::String("good-before".into())),
         )]),
     )
     .with_identifier("id-123");
@@ -1767,7 +1767,7 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
         producer_id.clone(),
         HashMap::from([(
             "value".to_string(),
-            Value::Concrete(ConcreteValue::String("bad".to_string())),
+            Value::Concrete(ConcreteValue::String("bad".into())),
         )]),
     )
     .with_identifier("producer-id")));
@@ -1847,14 +1847,14 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
     let mut planned_consumer = unresolved_consumer.clone();
     planned_consumer.set_attr(
         "target",
-        Value::Concrete(ConcreteValue::String("good-before".to_string())),
+        Value::Concrete(ConcreteValue::String("good-before".into())),
     );
     let consumer_id = planned_consumer.id.clone();
     let from = State::existing(
         consumer_id.clone(),
         HashMap::from([(
             "target".to_string(),
-            Value::Concrete(ConcreteValue::String("good-before".to_string())),
+            Value::Concrete(ConcreteValue::String("good-before".into())),
         )]),
     )
     .with_identifier("consumer-id");
@@ -1863,7 +1863,7 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
         producer_id.clone(),
         HashMap::from([(
             "value".to_string(),
-            Value::Concrete(ConcreteValue::String("bad".to_string())),
+            Value::Concrete(ConcreteValue::String("bad".into())),
         )]),
     )
     .with_identifier("producer-id")));
@@ -1945,11 +1945,11 @@ async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
                     Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
                         (
                             "name".to_string(),
-                            Value::Concrete(ConcreteValue::String("good-name".to_string())),
+                            Value::Concrete(ConcreteValue::String("good-name".into())),
                         ),
                         (
                             "value".to_string(),
-                            Value::Concrete(ConcreteValue::String("bad".to_string())),
+                            Value::Concrete(ConcreteValue::String("bad".into())),
                         ),
                     ]))),
                 )])),
@@ -2020,7 +2020,7 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
         upstream_id.clone(),
         HashMap::from([(
             "value".to_string(),
-            Value::Concrete(ConcreteValue::String("bad".to_string())),
+            Value::Concrete(ConcreteValue::String("bad".into())),
         )]),
     )
     .with_identifier("producer-id")));
@@ -2097,7 +2097,7 @@ async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read
         upstream_id.clone(),
         HashMap::from([(
             "value".to_string(),
-            Value::Concrete(ConcreteValue::String("bad".to_string())),
+            Value::Concrete(ConcreteValue::String("bad".into())),
         )]),
     )
     .with_identifier("producer-id")));
@@ -2265,7 +2265,7 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
         upstream_id.clone(),
         HashMap::from([(
             "value".to_string(),
-            Value::Concrete(ConcreteValue::String("bad".to_string())),
+            Value::Concrete(ConcreteValue::String("bad".into())),
         )]),
     )
     .with_identifier("producer-id")));
@@ -2375,11 +2375,11 @@ async fn pending_module_validation_and_require_block_first_consuming_effect() {
         HashMap::from([
             (
                 "value".to_string(),
-                Value::Concrete(ConcreteValue::String("bad".to_string())),
+                Value::Concrete(ConcreteValue::String("bad".into())),
             ),
             (
                 "other".to_string(),
-                Value::Concrete(ConcreteValue::String("different".to_string())),
+                Value::Concrete(ConcreteValue::String("different".into())),
             ),
         ]),
     )
@@ -2448,7 +2448,7 @@ async fn nested_forwarded_module_constraint_blocks_provider_dispatch() {
         "forwarded",
         HashMap::from([(
             "value".to_string(),
-            Value::Concrete(ConcreteValue::String("bad".to_string())),
+            Value::Concrete(ConcreteValue::String("bad".into())),
         )]),
         BindingValueSource::Local,
     );
@@ -2485,7 +2485,7 @@ async fn outer_module_constraint_blocks_nested_inner_consumer_provider_dispatch(
     use crate::resource::CompositionAttribute;
 
     let provider = MockProvider::new();
-    let violating = Value::Concrete(ConcreteValue::String("bad".to_string()));
+    let violating = Value::Concrete(ConcreteValue::String("bad".into()));
     let mut outer = pending_module_composition(
         "root.outer",
         vec![("value", violating.clone())],
@@ -2555,7 +2555,7 @@ async fn module_export_constraint_blocks_top_level_consumer_provider_dispatch() 
     use crate::resource::CompositionAttribute;
 
     let provider = MockProvider::new();
-    let violating = Value::Concrete(ConcreteValue::String("bad".to_string()));
+    let violating = Value::Concrete(ConcreteValue::String("bad".into()));
     let mut composition = pending_module_composition(
         "root.exporter",
         vec![("value", violating.clone())],
@@ -2626,7 +2626,7 @@ async fn repeated_module_violation_blocks_every_dispatch_but_reports_once() {
         "root.checked",
         vec![(
             "value",
-            Value::Concrete(ConcreteValue::String("bad".to_string())),
+            Value::Concrete(ConcreteValue::String("bad".into())),
         )],
         vec![module_not_bad_constraint("value")],
     );
@@ -2692,7 +2692,7 @@ async fn module_constraint_rechecks_after_binding_changes_in_same_apply() {
         "source",
         HashMap::from([(
             "value".to_string(),
-            Value::Concrete(ConcreteValue::String("good".to_string())),
+            Value::Concrete(ConcreteValue::String("good".into())),
         )]),
         BindingValueSource::Local,
     );
@@ -2701,7 +2701,7 @@ async fn module_constraint_rechecks_after_binding_changes_in_same_apply() {
         updater_id.clone(),
         HashMap::from([(
             "value".to_string(),
-            Value::Concrete(ConcreteValue::String("bad".to_string())),
+            Value::Concrete(ConcreteValue::String("bad".into())),
         )]),
     )
     .with_identifier("source-id")));
@@ -2816,7 +2816,7 @@ async fn unapplied_module_argument_reference_stays_pending_at_early_gate() {
         producer_id.clone(),
         HashMap::from([(
             "value".to_string(),
-            Value::Concrete(ConcreteValue::String("good".to_string())),
+            Value::Concrete(ConcreteValue::String("good".into())),
         )]),
     )
     .with_identifier("producer-id")));
@@ -2873,7 +2873,7 @@ async fn terminal_module_constraint_sweep_rejects_unconsumed_violation() {
         "exported",
         HashMap::from([(
             "value".to_string(),
-            Value::Concrete(ConcreteValue::String("bad".to_string())),
+            Value::Concrete(ConcreteValue::String("bad".into())),
         )]),
         BindingValueSource::Local,
     );
@@ -3056,7 +3056,7 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
         target_id.clone(),
         HashMap::from([(
             "status".to_string(),
-            Value::Concrete(ConcreteValue::String("PENDING".to_string())),
+            Value::Concrete(ConcreteValue::String("PENDING".into())),
         )]),
     )
     .with_identifier("target-id");
@@ -3072,7 +3072,7 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
         target_id: crate::resource::ResolvedResourceId::new(target_id.clone()),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("READY".to_string())),
+            value: Value::Concrete(ConcreteValue::String("READY".into())),
         },
         until_surface: "wait-target.status == READY".to_string(),
         timeout: std::time::Duration::from_secs(60),
@@ -3117,7 +3117,7 @@ fn terminal_gate_still_reports_decidable_violations_when_pending_is_suppressed()
         "root.known",
         vec![(
             "value",
-            Value::Concrete(ConcreteValue::String("bad".to_string())),
+            Value::Concrete(ConcreteValue::String("bad".into())),
         )],
         vec![module_not_bad_constraint("value")],
     );
@@ -3255,7 +3255,7 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
         target_id: crate::resource::ResolvedResourceId::new(cert_id),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("READY".to_string())),
+            value: Value::Concrete(ConcreteValue::String("READY".into())),
         },
         until_surface: "cert.status == READY".to_string(),
         timeout: std::time::Duration::from_secs(60),
@@ -3319,7 +3319,7 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
         target_id: crate::resource::ResolvedResourceId::new(cert_id),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("READY".to_string())),
+            value: Value::Concrete(ConcreteValue::String("READY".into())),
         },
         until_surface: "cert.status == READY".to_string(),
         timeout: std::time::Duration::from_secs(60),
@@ -3648,7 +3648,7 @@ async fn test_apply_renormalizes_after_resolution() {
     // path so the provider never sees `"raw_dsl"`.
     resource.set_attr(
         "marker",
-        Value::Concrete(ConcreteValue::String("raw_dsl".to_string())),
+        Value::Concrete(ConcreteValue::String("raw_dsl".into())),
     );
     let rid = resource.id.clone();
 
@@ -3679,9 +3679,7 @@ async fn test_apply_renormalizes_after_resolution() {
     assert_eq!(captured.len(), 1);
     assert_eq!(
         captured[0].get_attr("marker"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "CANONICAL".to_string()
-        ))),
+        Some(&Value::Concrete(ConcreteValue::String("CANONICAL".into()))),
         "apply path must re-run normalize_desired so the provider \
          receives the canonical value, not the raw DSL spelling"
     );
@@ -3701,7 +3699,7 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
     let mut source = make_resource("normalized-literal", &[]);
     source.set_attr(
         "marker",
-        Value::Concrete(ConcreteValue::String("raw_dsl".to_string())),
+        Value::Concrete(ConcreteValue::String("raw_dsl".into())),
     );
     source.set_attr(
         "runtime",
@@ -3713,7 +3711,7 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
     let mut planned = source.clone();
     planned.set_attr(
         "marker",
-        Value::Concrete(ConcreteValue::String("CANONICAL".to_string())),
+        Value::Concrete(ConcreteValue::String("CANONICAL".into())),
     );
 
     let mut plan = Plan::new();
@@ -3736,7 +3734,7 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
         "runtime-value",
         HashMap::from([(
             "value".to_string(),
-            Value::Concrete(ConcreteValue::String("known-at-apply".to_string())),
+            Value::Concrete(ConcreteValue::String("known-at-apply".into())),
         )]),
         BindingValueSource::Local,
     );
@@ -3775,9 +3773,7 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
     assert_eq!(captured.len(), 1, "the provider must be called once");
     assert_eq!(
         captured[0].get_attr("marker"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "CANONICAL".to_string()
-        ))),
+        Some(&Value::Concrete(ConcreteValue::String("CANONICAL".into()))),
         "the provider still receives the normalized representation"
     );
 }
@@ -3794,7 +3790,7 @@ async fn plan_normalized_resource_without_authored_origin_is_an_invariant_error(
     let mut planned = make_resource("missing-origin", &[]);
     planned.set_attr(
         "marker",
-        Value::Concrete(ConcreteValue::String("CANONICAL".to_string())),
+        Value::Concrete(ConcreteValue::String("CANONICAL".into())),
     );
     let id = planned.id.clone();
     provider.push_create(Ok(ok_state(&id)));
@@ -3857,7 +3853,7 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
     authored.binding = Some("origin-check".to_string());
     authored.set_attr(
         "marker",
-        Value::Concrete(ConcreteValue::String("raw_dsl".to_string())),
+        Value::Concrete(ConcreteValue::String("raw_dsl".into())),
     );
     authored.set_attr(
         "runtime",
@@ -3868,14 +3864,14 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
     let mut planned = authored.clone();
     planned.set_attr(
         "marker",
-        Value::Concrete(ConcreteValue::String("CANONICAL".to_string())),
+        Value::Concrete(ConcreteValue::String("CANONICAL".into())),
     );
 
     provider.push_create(Ok(State::existing(
         producer_id.clone(),
         HashMap::from([(
             "value".to_string(),
-            Value::Concrete(ConcreteValue::String("known-at-apply".to_string())),
+            Value::Concrete(ConcreteValue::String("known-at-apply".into())),
         )]),
     )
     .with_identifier("producer-id")));
@@ -3963,7 +3959,7 @@ async fn test_apply_reapplies_enum_alias_stage() {
     resource.set_attr(
         "ip_protocol",
         Value::Concrete(ConcreteValue::String(
-            "test.ec2.SecurityGroup.IpProtocol.all".to_string(),
+            "test.ec2.SecurityGroup.IpProtocol.all".into(),
         )),
     );
     let rid = resource.id.clone();
@@ -3996,7 +3992,7 @@ async fn test_apply_reapplies_enum_alias_stage() {
     assert_eq!(captured.len(), 1);
     assert_eq!(
         captured[0].get_attr("ip_protocol"),
-        Some(&Value::Concrete(ConcreteValue::String("-1".to_string()))),
+        Some(&Value::Concrete(ConcreteValue::String("-1".into()))),
         "apply path must re-apply the enum-alias stage so the provider \
          receives the AWS canonical value, not the namespaced DSL form"
     );
@@ -4015,7 +4011,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
     to_resource.set_attr(
         "ip_protocol",
         Value::Concrete(ConcreteValue::String(
-            "test.ec2.SecurityGroup.IpProtocol.all".to_string(),
+            "test.ec2.SecurityGroup.IpProtocol.all".into(),
         )),
     );
     let rid = to_resource.id.clone();
@@ -4023,7 +4019,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
     let mut from_attrs = HashMap::new();
     from_attrs.insert(
         "ip_protocol".to_string(),
-        Value::Concrete(ConcreteValue::String("tcp".to_string())),
+        Value::Concrete(ConcreteValue::String("tcp".into())),
     );
     let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
 
@@ -4065,7 +4061,7 @@ async fn test_apply_reapplies_enum_alias_stage_update_path() {
         .expect("patch must contain the changed `ip_protocol` attribute");
     assert_eq!(
         op.value,
-        Some(Value::Concrete(ConcreteValue::String("-1".to_string()))),
+        Some(Value::Concrete(ConcreteValue::String("-1".into()))),
         "Update patch must carry the enum-alias-canonical value, not \
          the namespaced DSL form"
     );
@@ -4084,7 +4080,7 @@ async fn test_apply_reapplies_canonicalize_stage() {
     resource.binding = Some("a".to_string());
     resource.set_attr(
         "subject",
-        Value::Concrete(ConcreteValue::String("repo:foo:*".to_string())),
+        Value::Concrete(ConcreteValue::String("repo:foo:*".into())),
     );
     let rid = resource.id.clone();
 
@@ -4116,7 +4112,7 @@ async fn test_apply_reapplies_canonicalize_stage() {
     assert_eq!(
         captured[0].get_attr("subject"),
         Some(&Value::Concrete(ConcreteValue::StringList(vec![
-            "repo:foo:*".to_string()
+            "repo:foo:*".into()
         ]))),
         "apply path must re-apply the canonicalize stage so a scalar in \
          a Union[String,list] field reaches the provider as StringList"
@@ -4134,14 +4130,14 @@ async fn test_apply_renormalizes_update_path() {
     let mut to_resource = make_resource("a", &[]);
     to_resource.set_attr(
         "marker",
-        Value::Concrete(ConcreteValue::String("raw_dsl".to_string())),
+        Value::Concrete(ConcreteValue::String("raw_dsl".into())),
     );
     let rid = to_resource.id.clone();
 
     let mut from_attrs = HashMap::new();
     from_attrs.insert(
         "marker".to_string(),
-        Value::Concrete(ConcreteValue::String("old".to_string())),
+        Value::Concrete(ConcreteValue::String("old".into())),
     );
     let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
 
@@ -4182,9 +4178,7 @@ async fn test_apply_renormalizes_update_path() {
         .expect("patch must contain the changed `marker` attribute");
     assert_eq!(
         marker_op.value,
-        Some(Value::Concrete(ConcreteValue::String(
-            "CANONICAL".to_string()
-        ))),
+        Some(Value::Concrete(ConcreteValue::String("CANONICAL".into()))),
         "Update patch must carry the re-normalized value, not raw DSL"
     );
 }
@@ -4197,22 +4191,22 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
     let mut desired_tags = indexmap::IndexMap::new();
     desired_tags.insert(
         "Name".to_string(),
-        Value::Concrete(ConcreteValue::String("v1".to_string())),
+        Value::Concrete(ConcreteValue::String("v1".into())),
     );
     to_resource.set_attr("tags", Value::Concrete(ConcreteValue::Map(desired_tags)));
 
     let mut current_tags = indexmap::IndexMap::new();
     current_tags.insert(
         "Name".to_string(),
-        Value::Concrete(ConcreteValue::String("old".to_string())),
+        Value::Concrete(ConcreteValue::String("old".into())),
     );
     current_tags.insert(
         "ManagedBy".to_string(),
-        Value::Concrete(ConcreteValue::String("carina".to_string())),
+        Value::Concrete(ConcreteValue::String("carina".into())),
     );
     current_tags.insert(
         "Project".to_string(),
-        Value::Concrete(ConcreteValue::String("issue-3480".to_string())),
+        Value::Concrete(ConcreteValue::String("issue-3480".into())),
     );
     let mut from_attrs = HashMap::new();
     from_attrs.insert(
@@ -4224,11 +4218,11 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
     let mut default_tags = indexmap::IndexMap::new();
     default_tags.insert(
         "ManagedBy".to_string(),
-        Value::Concrete(ConcreteValue::String("carina".to_string())),
+        Value::Concrete(ConcreteValue::String("carina".into())),
     );
     default_tags.insert(
         "Project".to_string(),
-        Value::Concrete(ConcreteValue::String("issue-3480".to_string())),
+        Value::Concrete(ConcreteValue::String("issue-3480".into())),
     );
     let provider_configs = vec![provider_config_with_default_tags(default_tags)];
 
@@ -4275,19 +4269,15 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
     };
     assert_eq!(
         tags.get("Name"),
-        Some(&Value::Concrete(ConcreteValue::String("v1".to_string())))
+        Some(&Value::Concrete(ConcreteValue::String("v1".into())))
     );
     assert_eq!(
         tags.get("ManagedBy"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "carina".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("carina".into())))
     );
     assert_eq!(
         tags.get("Project"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "issue-3480".to_string()
-        )))
+        Some(&Value::Concrete(ConcreteValue::String("issue-3480".into())))
     );
 }
 
@@ -4300,13 +4290,13 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
 
     to_resource.set_attr(
         "description",
-        Value::Concrete(ConcreteValue::String("new".to_string())),
+        Value::Concrete(ConcreteValue::String("new".into())),
     );
     to_resource.set_attr("size", Value::Concrete(ConcreteValue::Float(1.0)));
     let mut desired_options = indexmap::IndexMap::new();
     desired_options.insert(
         "label".to_string(),
-        Value::Concrete(ConcreteValue::String("stable".to_string())),
+        Value::Concrete(ConcreteValue::String("stable".into())),
     );
     to_resource.set_attr(
         "options",
@@ -4320,13 +4310,13 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
     let mut from_attrs = HashMap::new();
     from_attrs.insert(
         "description".to_string(),
-        Value::Concrete(ConcreteValue::String("old".to_string())),
+        Value::Concrete(ConcreteValue::String("old".into())),
     );
     from_attrs.insert("size".to_string(), Value::Concrete(ConcreteValue::Int(1)));
     let mut current_options = indexmap::IndexMap::new();
     current_options.insert(
         "label".to_string(),
-        Value::Concrete(ConcreteValue::String("stable".to_string())),
+        Value::Concrete(ConcreteValue::String("stable".into())),
     );
     current_options.insert(
         "enabled".to_string(),
@@ -4338,7 +4328,7 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
     );
     from_attrs.insert(
         "mode".to_string(),
-        Value::Concrete(ConcreteValue::String("AES256".to_string())),
+        Value::Concrete(ConcreteValue::String("AES256".into())),
     );
     let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
 
@@ -4389,21 +4379,21 @@ async fn test_apply_effective_changed_skips_internal_and_write_only_attributes()
 
     to_resource.set_attr(
         "description",
-        Value::Concrete(ConcreteValue::String("new".to_string())),
+        Value::Concrete(ConcreteValue::String("new".into())),
     );
     to_resource.set_attr(
         "_provider_only",
-        Value::Concrete(ConcreteValue::String("metadata".to_string())),
+        Value::Concrete(ConcreteValue::String("metadata".into())),
     );
     to_resource.set_attr(
         "write_only_token",
-        Value::Concrete(ConcreteValue::String("secret-token".to_string())),
+        Value::Concrete(ConcreteValue::String("secret-token".into())),
     );
 
     let mut from_attrs = HashMap::new();
     from_attrs.insert(
         "description".to_string(),
-        Value::Concrete(ConcreteValue::String("old".to_string())),
+        Value::Concrete(ConcreteValue::String("old".into())),
     );
     let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
 
@@ -4453,7 +4443,7 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
     let rid = to_resource.id.clone();
 
     let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("my-password".to_string()),
+        ConcreteValue::String("my-password".into()),
     ))));
     to_resource.set_attr("master_password", secret_value.clone());
 
@@ -4472,7 +4462,7 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
     let mut from_attrs = HashMap::new();
     from_attrs.insert(
         "master_password".to_string(),
-        Value::Concrete(ConcreteValue::String(hash_str)),
+        Value::Concrete(ConcreteValue::String(hash_str.into())),
     );
     let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
 
@@ -4516,7 +4506,7 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
     let rid = to_resource.id.clone();
 
     let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("my-password".to_string()),
+        ConcreteValue::String("my-password".into()),
     ))));
     to_resource.set_attr(
         "master_password",
@@ -4541,7 +4531,7 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
     let mut from_attrs = HashMap::new();
     from_attrs.insert(
         "master_password".to_string(),
-        Value::Concrete(ConcreteValue::String(hash_str)),
+        Value::Concrete(ConcreteValue::String(hash_str.into())),
     );
     let from_state = State::existing(rid.clone(), from_attrs).with_identifier("id-123");
 
@@ -4600,7 +4590,7 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
     let mut config = indexmap::IndexMap::new();
     config.insert(
         "marker".to_string(),
-        Value::Concrete(ConcreteValue::String("raw_dsl".to_string())),
+        Value::Concrete(ConcreteValue::String("raw_dsl".into())),
     );
     rb.set_attr("config", Value::Concrete(ConcreteValue::Map(config)));
     let rb_id = rb.id.clone();
@@ -4640,18 +4630,14 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
     };
     assert_eq!(
         cfg.get("marker"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "CANONICAL".to_string()
-        ))),
+        Some(&Value::Concrete(ConcreteValue::String("CANONICAL".into()))),
         "nested value under a ref-bearing resource must be \
          re-normalized at apply, not reverted to raw DSL"
     );
     // The ref itself must still have resolved correctly.
     assert_eq!(
         b.get_attr("ref_a"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "id-123".to_string()
-        ))),
+        Some(&Value::Concrete(ConcreteValue::String("id-123".into()))),
         "ResourceRef must resolve from a's post-create state"
     );
 }
@@ -4703,7 +4689,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
                 for r in resources.iter_mut() {
                     r.set_attr(
                         "normalize_count",
-                        Value::Concrete(ConcreteValue::String(n.to_string())),
+                        Value::Concrete(ConcreteValue::String(n.to_string().into())),
                     );
                 }
                 Ok(())
@@ -4790,7 +4776,9 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
         .captured_create_resources()
         .iter()
         .filter_map(|r| match r.get_attr("normalize_count") {
-            Some(Value::Concrete(ConcreteValue::String(s))) => Some(s.clone()),
+            Some(Value::Concrete(ConcreteValue::String(s))) => {
+                Some(s.expose_plaintext().to_owned())
+            }
             _ => None,
         })
         .collect();
@@ -5275,7 +5263,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
                 let mut attrs = HashMap::new();
                 attrs.insert(
                     "id".to_string(),
-                    Value::Concrete(ConcreteValue::String("id-123".to_string())),
+                    Value::Concrete(ConcreteValue::String("id-123".into())),
                 );
                 Ok(crate::provider::CreateOutcome::Success {
                     state: State::existing(id_clone, attrs).with_identifier("id-123"),
@@ -5443,12 +5431,12 @@ impl Provider for YieldingUpdateProvider {
             let mut attrs = request.from().attributes.clone();
             attrs.insert(
                 "tags".to_string(),
-                Value::Concrete(ConcreteValue::String("new".to_string())),
+                Value::Concrete(ConcreteValue::String("new".into())),
             );
             if change_unrelated_id && id.identity_str().expect("resolved identity") == "vpc" {
                 attrs.insert(
                     "id".to_string(),
-                    Value::Concrete(ConcreteValue::String("provider-violated-id".to_string())),
+                    Value::Concrete(ConcreteValue::String("provider-violated-id".into())),
                 );
             }
             Ok(crate::provider::UpdateOutcome::Success {
@@ -5483,12 +5471,9 @@ fn tag_update_resource(binding: &str, parent_ref: Option<&str>) -> Resource {
     resource.binding = Some(binding.to_string());
     resource.set_attr(
         "id",
-        Value::Concrete(ConcreteValue::String(format!("{binding}-id"))),
+        Value::Concrete(ConcreteValue::String(format!("{binding}-id").into())),
     );
-    resource.set_attr(
-        "tags",
-        Value::Concrete(ConcreteValue::String("new".to_string())),
-    );
+    resource.set_attr("tags", Value::Concrete(ConcreteValue::String("new".into())));
     if let Some(parent) = parent_ref {
         resource.set_attr("vpc_id", Value::resource_ref(parent, "id", vec![]));
     }
@@ -5501,11 +5486,11 @@ fn tag_update_state(id: &ResourceId, binding: &str) -> State {
         HashMap::from([
             (
                 "id".to_string(),
-                Value::Concrete(ConcreteValue::String(format!("{binding}-id"))),
+                Value::Concrete(ConcreteValue::String(format!("{binding}-id").into())),
             ),
             (
                 "tags".to_string(),
-                Value::Concrete(ConcreteValue::String("old".to_string())),
+                Value::Concrete(ConcreteValue::String("old".into())),
             ),
         ]),
     )
@@ -5728,7 +5713,7 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
         let mut m = HashMap::new();
         m.insert(
             "id".to_string(),
-            Value::Concrete(ConcreteValue::String(val.to_string())),
+            Value::Concrete(ConcreteValue::String(val.to_string().into())),
         );
         m
     };
@@ -5839,7 +5824,7 @@ fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
         orphan_id.clone(),
         HashMap::from([(
             "_binding".to_string(),
-            Value::Concrete(ConcreteValue::String("dependency".to_string())),
+            Value::Concrete(ConcreteValue::String("dependency".into())),
         )]),
     )
     .with_identifier("dependency-id");
@@ -6056,7 +6041,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     vpc.binding = Some("vpc".to_string());
     vpc.set_attr(
         "cidr_block",
-        Value::Concrete(ConcreteValue::String("10.0.0.0/16".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
     );
     let vpc_id = vpc.id.clone();
 
@@ -6068,7 +6053,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     );
     subnet.set_attr(
         "cidr_block",
-        Value::Concrete(ConcreteValue::String("10.0.1.0/24".to_string())),
+        Value::Concrete(ConcreteValue::String("10.0.1.0/24".into())),
     );
     subnet.dependency_bindings = std::collections::BTreeSet::from(["vpc".to_string()]);
     let subnet_id = subnet.id.clone();
@@ -6082,7 +6067,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
         vpc_id.clone(),
         vec![(
             "vpc_id".to_string(),
-            Value::Concrete(ConcreteValue::String("vpc-12345".to_string())),
+            Value::Concrete(ConcreteValue::String("vpc-12345".into())),
         )]
         .into_iter()
         .collect(),
@@ -6095,7 +6080,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
         subnet_id.clone(),
         vec![(
             "subnet_id".to_string(),
-            Value::Concrete(ConcreteValue::String("subnet-67890".to_string())),
+            Value::Concrete(ConcreteValue::String("subnet-67890".into())),
         )]
         .into_iter()
         .collect(),
@@ -6136,9 +6121,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
     let subnet_attrs = &create_calls[1].1;
     assert_eq!(
         subnet_attrs.get("vpc_id"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "vpc-12345".to_string()
-        ))),
+        Some(&Value::Concrete(ConcreteValue::String("vpc-12345".into()))),
         "Subnet's vpc_id should be resolved from VPC state, got: {:?}",
         subnet_attrs.get("vpc_id")
     );
@@ -6300,7 +6283,7 @@ impl Provider for CascadeReplaceProvider {
                         id,
                         HashMap::from([(
                             "vpc_id".to_string(),
-                            Value::Concrete(ConcreteValue::String("vpc-new".to_string())),
+                            Value::Concrete(ConcreteValue::String("vpc-new".into())),
                         )]),
                     )
                     .with_identifier("vpc-new"),
@@ -6313,7 +6296,7 @@ impl Provider for CascadeReplaceProvider {
                         id,
                         HashMap::from([(
                             "subnet_id".to_string(),
-                            Value::Concrete(ConcreteValue::String("subnet-new".to_string())),
+                            Value::Concrete(ConcreteValue::String("subnet-new".into())),
                         )]),
                     )
                     .with_identifier("subnet-new"),
@@ -6364,7 +6347,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 
     fn string(value: &str) -> Value {
-        Value::Concrete(ConcreteValue::String(value.to_string()))
+        Value::Concrete(ConcreteValue::String(value.to_string().into()))
     }
 
     fn state(id: &ResourceId, attrs: &[(&str, Value)], identifier: &str) -> State {
@@ -6534,9 +6517,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         .unwrap_or_else(|| panic!("subnet create missing from calls: {calls:?}"));
     assert_eq!(
         subnet_create.1.get("vpc_id"),
-        Some(&Value::Concrete(ConcreteValue::String(
-            "vpc-new".to_string()
-        ))),
+        Some(&Value::Concrete(ConcreteValue::String("vpc-new".into()))),
         "subnet create must resolve vpc.vpc_id from the replacement VPC state; calls: {calls:?}"
     );
 
@@ -6574,7 +6555,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+            value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         until_surface: "cert.status == ISSUED".to_string(),
         timeout: std::time::Duration::from_secs(60),
@@ -6588,7 +6569,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
     let mut create_attrs = HashMap::new();
     create_attrs.insert(
         "status".to_string(),
-        Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".to_string())),
+        Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".into())),
     );
     provider.push_create(Ok(
         State::existing(cert_id.clone(), create_attrs).with_identifier("acm-cert-id")
@@ -6597,16 +6578,16 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
     let mut pending = HashMap::new();
     pending.insert(
         "status".to_string(),
-        Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".to_string())),
+        Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".into())),
     );
     let mut issued = HashMap::new();
     issued.insert(
         "status".to_string(),
-        Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        Value::Concrete(ConcreteValue::String("ISSUED".into())),
     );
     issued.insert(
         "arn".to_string(),
-        Value::Concrete(ConcreteValue::String("arn:aws:acm:...".to_string())),
+        Value::Concrete(ConcreteValue::String("arn:aws:acm:...".into())),
     );
     provider.push_read(Ok(State::existing(cert_id.clone(), pending.clone())));
     provider.push_read(Ok(State::existing(cert_id.clone(), pending)));
@@ -6727,7 +6708,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+            value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         until_surface: "cert.status == ISSUED".to_string(),
         timeout: std::time::Duration::from_secs(60),
@@ -6740,7 +6721,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
     let mut create_attrs = HashMap::new();
     create_attrs.insert(
         "status".to_string(),
-        Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".to_string())),
+        Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".into())),
     );
     provider.push_create(Ok(
         State::existing(cert_id.clone(), create_attrs).with_identifier("acm-cert-id")
@@ -6748,17 +6729,19 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
     let mut pending = HashMap::new();
     pending.insert(
         "status".to_string(),
-        Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".to_string())),
+        Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".into())),
     );
     let mut issued = HashMap::new();
     issued.insert(
         "status".to_string(),
-        Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        Value::Concrete(ConcreteValue::String("ISSUED".into())),
     );
     issued.insert(
         "certificate_arn".to_string(),
         Value::Concrete(ConcreteValue::String(
-            "arn:aws:acm:us-east-1:111:certificate/abc".to_string(),
+            "arn:aws:acm:us-east-1:111:certificate/abc"
+                .to_string()
+                .into(),
         )),
     );
     provider.push_read(Ok(State::existing(cert_id.clone(), pending)));
@@ -6829,7 +6812,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+            value: Value::Concrete(ConcreteValue::String("ISSUED".into())),
         },
         until_surface: "cert.status == ISSUED".to_string(),
         timeout: std::time::Duration::from_secs(60),
@@ -6840,7 +6823,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
     let mut issued = HashMap::new();
     issued.insert(
         "status".to_string(),
-        Value::Concrete(ConcreteValue::String("ISSUED".to_string())),
+        Value::Concrete(ConcreteValue::String("ISSUED".into())),
     );
     provider.push_create(Ok(
         State::existing(cert_id.clone(), issued.clone()).with_identifier("acm-cert-id")
@@ -6911,7 +6894,7 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
         r.binding = Some("cert".to_string());
         r.set_attr(
             "domain_name",
-            Value::Concrete(ConcreteValue::String("example.com".to_string())),
+            Value::Concrete(ConcreteValue::String("example.com".into())),
         );
         r
     };
@@ -7058,7 +7041,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
         r.binding = Some("cert".to_string());
         r.set_attr(
             "domain_name",
-            Value::Concrete(ConcreteValue::String("example.com".to_string())),
+            Value::Concrete(ConcreteValue::String("example.com".into())),
         );
         r
     };
@@ -7113,22 +7096,20 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
     let mut rr: IndexMap<String, Value> = IndexMap::new();
     rr.insert(
         "name".to_string(),
-        Value::Concrete(ConcreteValue::String("_abc.example.com.".to_string())),
+        Value::Concrete(ConcreteValue::String("_abc.example.com.".into())),
     );
     rr.insert(
         "type".to_string(),
-        Value::Concrete(ConcreteValue::String("CNAME".to_string())),
+        Value::Concrete(ConcreteValue::String("CNAME".into())),
     );
     rr.insert(
         "value".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            "_xyz.acm-validations.aws.".to_string(),
-        )),
+        Value::Concrete(ConcreteValue::String("_xyz.acm-validations.aws.".into())),
     );
     let mut dvo_entry: IndexMap<String, Value> = IndexMap::new();
     dvo_entry.insert(
         "domain_name".to_string(),
-        Value::Concrete(ConcreteValue::String("example.com".to_string())),
+        Value::Concrete(ConcreteValue::String("example.com".into())),
     );
     dvo_entry.insert(
         "resource_record".to_string(),
@@ -7199,7 +7180,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
     assert_eq!(
         record_attrs.get("name"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "_abc.example.com.".to_string()
+            "_abc.example.com.".into()
         ))),
         "record's `name` must resolve from chained access; got: {:?}",
         record_attrs.get("name"),
@@ -7211,7 +7192,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
     assert_eq!(
         resource_records,
         &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::String("_xyz.acm-validations.aws.".to_string())
+            ConcreteValue::String("_xyz.acm-validations.aws.".into())
         )])),
         "`resource_records` list element must resolve from chained \
          access into the post-create state; got: {resource_records:?}",
@@ -7347,7 +7328,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
     let mut created_attrs = HashMap::new();
     created_attrs.insert(
         "status".to_string(),
-        Value::Concrete(ConcreteValue::String("issued".to_string())),
+        Value::Concrete(ConcreteValue::String("issued".into())),
     );
     let created_state =
         State::existing(cert_id.clone(), created_attrs).with_identifier("cert-arn-real");
@@ -7361,7 +7342,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
         target_id: crate::resource::ResolvedResourceId::new(cert_id.clone()),
         until: WaitPredicate::Equals {
             attr: AttrPath::single("status"),
-            value: Value::Concrete(ConcreteValue::String("issued".to_string())),
+            value: Value::Concrete(ConcreteValue::String("issued".into())),
         },
         until_surface: "cert.status == \"issued\"".to_string(),
         timeout: std::time::Duration::from_secs(5),
@@ -7551,11 +7532,11 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
                     Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
                         (
                             "name".to_string(),
-                            Value::Concrete(ConcreteValue::String("_name".to_string())),
+                            Value::Concrete(ConcreteValue::String("_name".into())),
                         ),
                         (
                             "value".to_string(),
-                            Value::Concrete(ConcreteValue::String("_value".to_string())),
+                            Value::Concrete(ConcreteValue::String("_value".into())),
                         ),
                     ]))),
                 )])),
@@ -7664,11 +7645,11 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
                     Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
                         (
                             "name".to_string(),
-                            Value::Concrete(ConcreteValue::String("_name".to_string())),
+                            Value::Concrete(ConcreteValue::String("_name".into())),
                         ),
                         (
                             "value".to_string(),
-                            Value::Concrete(ConcreteValue::String("_value".to_string())),
+                            Value::Concrete(ConcreteValue::String("_value".into())),
                         ),
                     ]))),
                 )])),
@@ -8029,11 +8010,11 @@ fn cert_state_for_deferred_replace_deadlock(id: &ResourceId) -> State {
                     Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
                         (
                             "name".to_string(),
-                            Value::Concrete(ConcreteValue::String("_name".to_string())),
+                            Value::Concrete(ConcreteValue::String("_name".into())),
                         ),
                         (
                             "value".to_string(),
-                            Value::Concrete(ConcreteValue::String("_value".to_string())),
+                            Value::Concrete(ConcreteValue::String("_value".into())),
                         ),
                     ]))),
                 )])),
@@ -8085,7 +8066,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
     ds.attributes.insert(
         "path_prefix".to_string(),
         Value::Concrete(ConcreteValue::String(
-            "/aws-reserved/sso.amazonaws.com/".to_string(),
+            "/aws-reserved/sso.amazonaws.com/".into(),
         )),
     );
 
@@ -8098,7 +8079,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
             vec![(
                 "arns".to_string(),
                 Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::String(arn_value.to_string()),
+                    ConcreteValue::String(arn_value.to_string().into()),
                 )])),
             )]
             .into_iter()
@@ -8193,7 +8174,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
     assert_eq!(
         resolved,
         &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::String(arn_value.to_string())
+            ConcreteValue::String(arn_value.to_string().into())
         )])),
         "the ResourceRef must resolve to the data source's read-state \
          `arns`; got {resolved:?}",
@@ -8216,7 +8197,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
     upstream.binding = Some("target".to_string());
     upstream.set_attr(
         "name",
-        Value::Concrete(ConcreteValue::String("target".to_string())),
+        Value::Concrete(ConcreteValue::String("target".into())),
     );
 
     let ds_id = ResourceId::with_provider_identity("test", "Lookup", "roles", None);
@@ -8251,7 +8232,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
         upstream_id.clone(),
         HashMap::from([(
             "generated".to_string(),
-            Value::Concrete(ConcreteValue::String("target-generated".to_string())),
+            Value::Concrete(ConcreteValue::String("target-generated".into())),
         )]),
     )
     .with_identifier("target-id");
@@ -8262,7 +8243,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
         HashMap::from([(
             "names".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::String("target-generated".to_string()),
+                ConcreteValue::String("target-generated".into()),
             )])),
         )]),
     )
@@ -8336,7 +8317,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
     assert_eq!(
         read_requests[0].get_attr("filter"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "target-generated".to_string()
+            "target-generated".into()
         ))),
         "apply-time read input must resolve from the upstream create output",
     );
@@ -8349,7 +8330,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
     assert_eq!(
         consumer_create.get_attr("description"),
         Some(&Value::Concrete(ConcreteValue::String(
-            "target-generated".to_string()
+            "target-generated".into()
         ))),
         "consumer input must resolve from the read output",
     );
@@ -8368,7 +8349,7 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
     upstream.binding = Some("target".to_string());
     upstream.set_attr(
         "name",
-        Value::Concrete(ConcreteValue::String("target".to_string())),
+        Value::Concrete(ConcreteValue::String("target".into())),
     );
 
     let ds_id = ResourceId::with_provider_identity("test", "Lookup", "roles", None);
@@ -8403,7 +8384,7 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
         upstream_id.clone(),
         HashMap::from([(
             "generated".to_string(),
-            Value::Concrete(ConcreteValue::String("target-generated".to_string())),
+            Value::Concrete(ConcreteValue::String("target-generated".into())),
         )]),
     )
     .with_identifier("target-id")));
@@ -8489,7 +8470,7 @@ async fn test_apply_time_data_source_read_retries_throttling_errors() {
     data_source.binding = Some("roles".to_string());
     data_source.set_attr(
         "filter".to_string(),
-        Value::Concrete(ConcreteValue::String("literal".to_string())),
+        Value::Concrete(ConcreteValue::String("literal".into())),
     );
 
     provider.push_read(Err(ProviderError::api_error("ThrottlingException")));
@@ -8555,7 +8536,7 @@ async fn test_pre_apply_data_source_read_remains_noop_in_executor() {
     data_source.binding = Some("roles".to_string());
     data_source.attributes.insert(
         "filter".to_string(),
-        Value::Concrete(ConcreteValue::String("literal".to_string())),
+        Value::Concrete(ConcreteValue::String("literal".into())),
     );
 
     let consumer_id = ResourceId::with_provider_identity("test", "Consumer", "consumer", None);
@@ -8583,7 +8564,7 @@ async fn test_pre_apply_data_source_read_remains_noop_in_executor() {
             HashMap::from([(
                 "names".to_string(),
                 Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::String("literal-result".to_string()),
+                    ConcreteValue::String("literal-result".into()),
                 )])),
             )]),
         ),

@@ -41,7 +41,7 @@ fn wait_resolves_target_and_depends_on_across_sibling_files() {
     assert_eq!(
         wait.until_predicate.rhs,
         Value::Concrete(ConcreteValue::String(
-            "aws.acm.Certificate.Status.Issued".to_string()
+            "aws.acm.Certificate.Status.Issued".into()
         ))
     );
 

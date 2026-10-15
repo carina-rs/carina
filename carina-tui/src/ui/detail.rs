@@ -430,7 +430,7 @@ mod tests {
             let mut m = IndexMap::new();
             m.insert(
                 "sid".to_string(),
-                Value::Concrete(ConcreteValue::String(sid.to_string())),
+                Value::Concrete(ConcreteValue::String(sid.to_string().into())),
             );
             Value::Concrete(ConcreteValue::Map(m))
         };
@@ -444,7 +444,7 @@ mod tests {
                 },
                 MapExpandedEntry {
                     key: "version".to_string(),
-                    value: Value::Concrete(ConcreteValue::String("2012-10-17".to_string())),
+                    value: Value::Concrete(ConcreteValue::String("2012-10-17".into())),
                     annotation: None,
                 },
             ],
@@ -476,7 +476,7 @@ mod tests {
             let mut m = IndexMap::new();
             m.insert(
                 "sid".to_string(),
-                Value::Concrete(ConcreteValue::String(sid.to_string())),
+                Value::Concrete(ConcreteValue::String(sid.to_string().into())),
             );
             Value::Concrete(ConcreteValue::Map(m))
         };
@@ -485,7 +485,7 @@ mod tests {
             entries: vec![
                 MapExpandedEntry {
                     key: "version".to_string(),
-                    value: Value::Concrete(ConcreteValue::String("2012-10-17".to_string())),
+                    value: Value::Concrete(ConcreteValue::String("2012-10-17".into())),
                     annotation: None,
                 },
                 MapExpandedEntry {
@@ -541,7 +541,7 @@ mod tests {
                 vec![ListOfMapsDiffItem {
                     fields: vec![(
                         "name".to_string(),
-                        Value::Concrete(ConcreteValue::String("legacy".to_string())),
+                        Value::Concrete(ConcreteValue::String("legacy".into())),
                     )],
                 }],
             )

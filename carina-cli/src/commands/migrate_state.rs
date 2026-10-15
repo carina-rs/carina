@@ -391,7 +391,7 @@ mod tests {
                 m.insert(
                     "path".to_string(),
                     Value::Concrete(ConcreteValue::String(
-                        dst_path.to_string_lossy().into_owned(),
+                        dst_path.to_string_lossy().into_owned().into(),
                     )),
                 );
                 m
@@ -451,7 +451,7 @@ mod tests {
                 m.insert(
                     "path".to_string(),
                     Value::Concrete(ConcreteValue::String(
-                        dst_path.to_string_lossy().into_owned(),
+                        dst_path.to_string_lossy().into_owned().into(),
                     )),
                 );
                 m
