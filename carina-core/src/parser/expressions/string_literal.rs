@@ -6,11 +6,92 @@
 use crate::parser::{ParseContext, ParseError, Rule, first_inner, parse_expression};
 use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, UnknownReason, Value};
 
+/// Encode a string value as canonical, parseable Carina source.
+///
+/// Returns `None` when `value` contains a control character for which Carina
+/// has no escape sequence.
+pub fn encode_string_literal(value: &str) -> Option<String> {
+    let has_unrepresentable_control = value
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'));
+    if has_unrepresentable_control {
+        return None;
+    }
+
+    let use_single_quotes = !value.contains(['\'', '\n', '\r', '\t']) && !value.contains("${");
+
+    if use_single_quotes {
+        return Some(format!("'{}'", value.replace('\\', "\\\\")));
+    }
+
+    let escaped =
+        escape_double_quoted_literal_part(value, true, UnrepresentableControl::PreserveAuthored);
+    Some(format!("\"{escaped}\""))
+}
+
+/// Render a string value safely for diagnostics and other human-readable output.
+///
+/// The result uses canonical Carina source when possible. Unrepresentable
+/// controls are rendered as `\u{...}` escapes, so the fallback is display-only
+/// and is not guaranteed to parse as Carina source.
+pub fn display_string_literal(value: &str) -> String {
+    encode_string_literal(value)
+        .unwrap_or_else(|| format!("\"{}\"", display_double_quoted_literal_part(value)))
+}
+
+#[derive(Clone, Copy)]
+enum UnrepresentableControl {
+    EscapeForDisplay,
+    PreserveAuthored,
+}
+
+fn escape_double_quoted_literal_part(
+    value: &str,
+    escape_interpolation: bool,
+    unrepresentable: UnrepresentableControl,
+) -> String {
+    let mut rendered = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => rendered.push_str("\\\\"),
+            '"' => rendered.push_str("\\\""),
+            '\n' => rendered.push_str("\\n"),
+            '\r' => rendered.push_str("\\r"),
+            '\t' => rendered.push_str("\\t"),
+            '$' if escape_interpolation && chars.peek() == Some(&'{') => rendered.push_str("\\$"),
+            ch if ch.is_control() => match unrepresentable {
+                UnrepresentableControl::EscapeForDisplay => {
+                    rendered.push_str(&format!("\\u{{{:x}}}", ch as u32));
+                }
+                UnrepresentableControl::PreserveAuthored => rendered.push(ch),
+            },
+            _ => rendered.push(ch),
+        }
+    }
+    rendered
+}
+
+pub(crate) fn display_double_quoted_literal_part(value: &str) -> String {
+    escape_double_quoted_literal_part(value, true, UnrepresentableControl::EscapeForDisplay)
+}
+
+pub(crate) fn escape_double_quoted_heredoc_part(
+    value: &str,
+    preserve_interpolation: bool,
+) -> String {
+    escape_double_quoted_literal_part(
+        value,
+        !preserve_interpolation,
+        UnrepresentableControl::PreserveAuthored,
+    )
+}
+
 pub(crate) fn parse_string_literal(
     pair: pest::iterators::Pair<Rule>,
 ) -> Result<String, ParseError> {
     // string = single_quoted_string | double_quoted_string
-    let inner_pair = pair.into_inner().next().unwrap();
+    let inner_pair = first_inner(pair, "quoted string", "string literal")?;
 
     if inner_pair.as_rule() == Rule::single_quoted_string {
         return Ok(inner_pair
@@ -24,9 +105,19 @@ pub(crate) fn parse_string_literal(
     let mut result = String::new();
     for part in inner_pair.into_inner() {
         if part.as_rule() == Rule::string_part {
-            for inner in part.into_inner() {
-                if inner.as_rule() == Rule::string_literal {
-                    result.push_str(inner.as_str());
+            let inner = first_inner(part, "string content", "string literal")?;
+            match inner.as_rule() {
+                Rule::string_literal => result.push_str(&unescape_string(inner.as_str())),
+                Rule::interpolation => {
+                    let line = inner.as_span().start_pos().line_col().0;
+                    return Err(ParseError::InterpolationNotAllowedInLiteralString { line });
+                }
+                other => {
+                    let line = inner.as_span().start_pos().line_col().0;
+                    return Err(ParseError::InvalidExpression {
+                        line,
+                        message: format!("Unexpected rule in string literal: {other:?}"),
+                    });
                 }
             }
         }
@@ -151,4 +242,91 @@ pub(crate) fn unescape_single_quoted(s: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        UnrepresentableControl, display_string_literal, encode_string_literal,
+        escape_double_quoted_literal_part,
+    };
+    use crate::parser::{ProviderContext, parse};
+    use crate::resource::{ConcreteValue, Value};
+
+    #[test]
+    fn source_encoder_renders_canonical_string_literals() {
+        assert_eq!(
+            encode_string_literal("production").as_deref(),
+            Some("'production'")
+        );
+        assert_eq!(encode_string_literal("it's").as_deref(), Some("\"it's\""));
+        assert_eq!(encode_string_literal(r"a\b").as_deref(), Some(r"'a\\b'"));
+        assert_eq!(
+            encode_string_literal(r#"say "hi""#).as_deref(),
+            Some(r#"'say "hi"'"#)
+        );
+        assert_eq!(
+            encode_string_literal("line\nnext").as_deref(),
+            Some(r#""line\nnext""#)
+        );
+        assert_eq!(
+            encode_string_literal("${value}").as_deref(),
+            Some(r#""\${value}""#)
+        );
+    }
+
+    #[test]
+    fn source_encoder_rejects_unrepresentable_control_characters() {
+        assert_eq!(encode_string_literal("before\x1bafter"), None);
+    }
+
+    #[test]
+    fn display_renderer_escapes_control_characters_for_diagnostics() {
+        assert_eq!(
+            display_string_literal("before\x1bafter"),
+            r#""before\u{1b}after""#
+        );
+    }
+
+    #[test]
+    fn shared_double_quote_escaper_returns_rendered_text() {
+        let escaped: String = escape_double_quoted_literal_part(
+            "literal-${value}\x1b",
+            true,
+            UnrepresentableControl::EscapeForDisplay,
+        );
+        assert_eq!(escaped, r"literal-\${value}\u{1b}");
+    }
+
+    #[test]
+    fn rendered_string_literals_round_trip_through_the_parser() {
+        // Other control characters are diagnostic-only because Carina has no
+        // escape syntax that can represent them.
+        let values = [
+            "",
+            "production",
+            "it's",
+            r"a\b",
+            r#"say "hi""#,
+            "line\nnext",
+            "carriage\rreturn",
+            "tab\tseparated",
+            "${value}",
+            r#"'\"\n\r\t${value}"#,
+            "こんにちは",
+        ];
+
+        for value in values {
+            let literal = encode_string_literal(value).expect("value should be source-encodable");
+            let source = format!("let rendered = {literal}\n");
+            let parsed = parse(&source, &ProviderContext::default())
+                .unwrap_or_else(|error| panic!("failed to parse {literal}: {error}"));
+
+            assert_eq!(
+                parsed.variables.get("rendered"),
+                Some(&Value::Concrete(ConcreteValue::String(value.to_string()))),
+                "literal {literal} did not round-trip"
+            );
+        }
+    }
 }

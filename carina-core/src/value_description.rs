@@ -2,7 +2,9 @@
 
 use std::fmt;
 
+use crate::parser::display_string_literal;
 use crate::resource::{ConcreteValue, DeferredValue, Value};
+use crate::value::SECRET_PREFIX;
 
 /// Value-derived description used in type-mismatch diagnostics.
 ///
@@ -16,9 +18,14 @@ pub struct ValueDescription(String);
 
 impl ValueDescription {
     /// Describe `value` for a type-mismatch diagnostic.
-    pub(crate) fn of(value: &Value) -> Self {
+    pub fn of(value: &Value) -> Self {
         Self(match value {
-            Value::Concrete(ConcreteValue::String(value)) => format!("string {value:?}"),
+            Value::Concrete(ConcreteValue::String(value)) if value.starts_with(SECRET_PREFIX) => {
+                "secret".to_string()
+            }
+            Value::Concrete(ConcreteValue::String(value)) => {
+                format!("string {}", display_string_literal(value))
+            }
             Value::Concrete(ConcreteValue::Int(value)) => format!("int ({value})"),
             Value::Concrete(ConcreteValue::Float(value)) => format!("float ({value:?})"),
             Value::Concrete(ConcreteValue::Bool(value)) => format!("bool ({value})"),
@@ -75,5 +82,30 @@ impl ValueDescription {
 impl fmt::Display for ValueDescription {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn string_value_uses_canonical_carina_literal() {
+        let value = Value::Concrete(ConcreteValue::String("production".to_string()));
+
+        assert_eq!(
+            ValueDescription::of(&value).to_string(),
+            "string 'production'"
+        );
+    }
+
+    #[test]
+    fn hashed_secret_string_is_masked() {
+        let value = Value::Concrete(ConcreteValue::String(format!(
+            "{}deadbeef",
+            crate::value::SECRET_PREFIX
+        )));
+
+        assert_eq!(ValueDescription::of(&value).to_string(), "secret");
     }
 }

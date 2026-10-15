@@ -10,7 +10,7 @@ Module: module_info
     The VPC to deploy resources into
   environment: String  (required)
     Deployment environment name
-  instance_type: String = "t3.micro"  
+  instance_type: String = 't3.micro'  
     EC2 instance type
   enable_monitoring: Bool = true  
 

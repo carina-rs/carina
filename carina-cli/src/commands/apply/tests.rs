@@ -1833,7 +1833,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
     for expected in [
         "module 'checked_module' (call 'checked')",
         "value must not be bad",
-        "\"bad\"",
+        "'bad'",
     ] {
         assert!(message.contains(expected), "message: {message}");
     }

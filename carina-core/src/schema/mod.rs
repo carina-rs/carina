@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use indexmap::{IndexMap, IndexSet};
 
+use crate::parser::display_string_literal;
 use crate::resource::{
     ConcreteValue, ConcreteValueRef, DeferredValue, EnumValueResolver, RawEnumIdentifier, Resource,
     Value,
@@ -2676,7 +2677,7 @@ impl AttributeType {
                 return Ok(());
             }
             return Err(TypeError::StringLiteralExpectedEnum {
-                user_typed: s.to_string(),
+                user_typed: s.to_string().into(),
                 attribute: None,
                 type_name: name.to_string(),
                 expected,
@@ -2691,7 +2692,7 @@ impl AttributeType {
         // forms (`dedicated`) and dotted forms (`aws.s3.Bucket.VersioningStatus.Enabled`).
         // `resolve_enum_input` rewrites the non-dotted form into a
         // synthesized namespaced string for lookup. That synthesized form
-        // must stay internal: error messages should quote what the user
+        // must stay internal: error messages should show what the user
         // actually typed. See #2077.
         let user_input = match value {
             ConcreteValueRef::EnumIdentifier(s) => Some(s.as_str()),
@@ -2727,7 +2728,7 @@ impl AttributeType {
                     let user_form = user_input.unwrap_or(s.as_str());
                     validate_enum_namespace(s, identity).map_err(|message| {
                         TypeError::ValidationFailed {
-                            message: format!("Invalid {} '{}': {}", name, user_form, message),
+                            message: format!("Invalid {name} {user_form}: {message}"),
                         }
                     })?;
                 }
@@ -2761,7 +2762,8 @@ impl AttributeType {
                 Ok(())
             } else {
                 Err(TypeError::InvalidEnumVariant {
-                    value: user_input.unwrap_or(s.as_str()).to_string(),
+                    value: user_input.unwrap_or(s.as_str()).to_string().into(),
+                    value_kind: InvalidEnumValueKind::Identifier,
                     attribute: None,
                     type_name: Some(name.to_string()),
                     expected,
@@ -2956,7 +2958,7 @@ impl AttributeType {
             } => format!("{provider}.{resource_type}"),
             AttrTypeKind::StringLiteralSet { values, .. } => values
                 .iter()
-                .map(|value| format!("'{value}'"))
+                .map(|value| display_string_literal(value))
                 .collect::<Vec<_>>()
                 .join(" | "),
             AttrTypeKind::Int { identity, .. } => identity
@@ -3524,7 +3526,7 @@ fn validate_string_refinement(
         && !re.is_match(s)
     {
         return Err(TypeError::PatternMismatch {
-            value: s.to_string(),
+            value: s.to_string().into(),
             pattern: pattern.to_string(),
             attribute: None,
             type_name,
@@ -3535,7 +3537,7 @@ fn validate_string_refinement(
         let count_u64 = count as u64;
         if min.is_some_and(|min| count_u64 < min) || max.is_some_and(|max| count_u64 > max) {
             return Err(TypeError::LengthOutOfRange {
-                value: s.to_string(),
+                value: s.to_string().into(),
                 length: count,
                 min,
                 max,
@@ -3555,7 +3557,7 @@ fn validate_list_length(
         let count_u64 = count as u64;
         if min.is_some_and(|min| count_u64 < min) || max.is_some_and(|max| count_u64 > max) {
             return Err(TypeError::LengthOutOfRange {
-                value: format!("{count} items"),
+                value: format!("{count} items").into(),
                 length: count,
                 min,
                 max,
@@ -4267,8 +4269,10 @@ fn join_expected(expected: &[ExpectedEnumVariant]) -> String {
         .join(", ")
 }
 
+const SECRET_VALUE_MASK: &str = "(secret)";
+
 fn format_string_literal_expected_enum(
-    user_typed: &str,
+    user_typed: &DiagnosticValue,
     attribute: Option<&str>,
     type_name: &str,
     expected: &[ExpectedEnumVariant],
@@ -4287,18 +4291,21 @@ fn format_string_literal_expected_enum(
     } else {
         join_expected(expected)
     };
+    let user_typed = user_typed.render_string_literal();
     format!(
-        "{} expects an enum identifier, got a string literal \"{}\". Use one of: {}",
+        "{} expects an enum identifier, got a string literal {}. Use one of: {}",
         target, user_typed, tail
     )
 }
 
 fn format_invalid_enum(
-    value: &str,
+    value: &DiagnosticValue,
+    value_kind: InvalidEnumValueKind,
     attribute: Option<&str>,
     type_name: Option<&str>,
     expected: &[ExpectedEnumVariant],
 ) -> String {
+    let value = value.render_enum_value(value_kind);
     let joined = join_expected(expected);
     let qualifier = match (attribute, type_name) {
         (Some(a), Some(t)) => format!(" for '{}' ({})", a, t),
@@ -4307,33 +4314,28 @@ fn format_invalid_enum(
         (None, None) => String::new(),
     };
     if qualifier.is_empty() {
-        format!(
-            "Invalid enum variant '{}', expected one of: {}",
-            value, joined
-        )
+        format!("Invalid enum variant {value}, expected one of: {joined}")
     } else {
-        format!(
-            "Invalid value '{}'{}: expected one of {}",
-            value, qualifier, joined
-        )
+        format!("Invalid value {value}{qualifier}: expected one of {joined}")
     }
 }
 
 fn format_invalid_value_intro(
-    value: &str,
+    value: &DiagnosticValue,
     attribute: Option<&str>,
     type_name: Option<&str>,
 ) -> String {
+    let value = value.render_string_literal();
     match (attribute, type_name) {
-        (Some(a), Some(t)) => format!("Invalid value '{}' for '{}' ({})", value, a, t),
-        (Some(a), None) => format!("Invalid value '{}' for '{}'", value, a),
-        (None, Some(t)) => format!("Invalid {} value '{}'", t, value),
-        (None, None) => format!("Invalid value '{}'", value),
+        (Some(a), Some(t)) => format!("Invalid value {value} for '{a}' ({t})"),
+        (Some(a), None) => format!("Invalid value {value} for '{a}'"),
+        (None, Some(t)) => format!("Invalid {t} value {value}"),
+        (None, None) => format!("Invalid value {value}"),
     }
 }
 
 fn format_pattern_mismatch(
-    value: &str,
+    value: &DiagnosticValue,
     pattern: &str,
     attribute: Option<&str>,
     type_name: Option<&str>,
@@ -4346,7 +4348,7 @@ fn format_pattern_mismatch(
 }
 
 fn format_length_out_of_range(
-    value: &str,
+    value: &DiagnosticValue,
     length: usize,
     min: Option<u64>,
     max: Option<u64>,
@@ -4762,6 +4764,58 @@ fn format_union_struct_mismatch(
     }
 }
 
+/// Surface kind of a rejected enum value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidEnumValueKind {
+    String,
+    Identifier,
+}
+
+/// User-derived diagnostic text that may be replaced by a secret mask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiagnosticValue {
+    Plain(String),
+    Masked,
+}
+
+impl DiagnosticValue {
+    pub fn as_plain(&self) -> Option<&str> {
+        match self {
+            Self::Plain(value) => Some(value),
+            Self::Masked => None,
+        }
+    }
+
+    fn render_string_literal(&self) -> String {
+        match self {
+            Self::Plain(value) => display_string_literal(value),
+            Self::Masked => SECRET_VALUE_MASK.to_string(),
+        }
+    }
+
+    fn render_enum_value(&self, value_kind: InvalidEnumValueKind) -> String {
+        match self {
+            Self::Plain(value) => match value_kind {
+                InvalidEnumValueKind::String => display_string_literal(value),
+                InvalidEnumValueKind::Identifier => value.clone(),
+            },
+            Self::Masked => SECRET_VALUE_MASK.to_string(),
+        }
+    }
+}
+
+impl From<String> for DiagnosticValue {
+    fn from(value: String) -> Self {
+        Self::Plain(value)
+    }
+}
+
+impl From<&str> for DiagnosticValue {
+    fn from(value: &str) -> Self {
+        Self::Plain(value.to_string())
+    }
+}
+
 /// Type error
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
@@ -4770,10 +4824,11 @@ pub enum TypeError {
 
     #[error(
         "{}",
-        format_invalid_enum(value, attribute.as_deref(), type_name.as_deref(), expected)
+        format_invalid_enum(value, *value_kind, attribute.as_deref(), type_name.as_deref(), expected)
     )]
     InvalidEnumVariant {
-        value: String,
+        value: DiagnosticValue,
+        value_kind: InvalidEnumValueKind,
         /// Attribute the value was assigned to (e.g. `"target_id"`). Set by
         /// caller-side wrapping (see `TypeError::with_attribute`) — the
         /// `AttrTypeKind::validate` primitive itself doesn't know the name.
@@ -4796,7 +4851,7 @@ pub enum TypeError {
         format_pattern_mismatch(value, pattern, attribute.as_deref(), type_name.as_deref())
     )]
     PatternMismatch {
-        value: String,
+        value: DiagnosticValue,
         pattern: String,
         attribute: Option<String>,
         type_name: Option<String>,
@@ -4807,7 +4862,7 @@ pub enum TypeError {
         format_length_out_of_range(value, *length, *min, *max, attribute.as_deref(), type_name.as_deref())
     )]
     LengthOutOfRange {
-        value: String,
+        value: DiagnosticValue,
         length: usize,
         min: Option<u64>,
         max: Option<u64>,
@@ -4827,9 +4882,8 @@ pub enum TypeError {
         format_string_literal_expected_enum(user_typed, attribute.as_deref(), type_name, expected, extra_message.as_deref())
     )]
     StringLiteralExpectedEnum {
-        /// The string the user actually typed between the quotes
-        /// (e.g. `"aaa"`).
-        user_typed: String,
+        /// The string the user typed between the quotes, or a secret mask.
+        user_typed: DiagnosticValue,
         /// Attribute the value was assigned to (e.g. `"target_type"`).
         attribute: Option<String>,
         /// Name of the enum type the value was being matched against
@@ -4918,17 +4972,18 @@ impl TypeError {
     /// because providers and custom validators may echo the plaintext.
     #[must_use]
     fn masked_for_secret(self) -> Self {
-        const MASK: &str = "(secret)";
         const MASKED_MESSAGE: &str = "(secret) failed validation";
 
         match self {
             TypeError::InvalidEnumVariant {
+                value_kind,
                 attribute,
                 type_name,
                 expected,
                 ..
             } => TypeError::InvalidEnumVariant {
-                value: MASK.to_string(),
+                value: DiagnosticValue::Masked,
+                value_kind,
                 attribute,
                 type_name,
                 expected,
@@ -4939,7 +4994,7 @@ impl TypeError {
                 type_name,
                 ..
             } => TypeError::PatternMismatch {
-                value: MASK.to_string(),
+                value: DiagnosticValue::Masked,
                 pattern,
                 attribute,
                 type_name,
@@ -4952,7 +5007,7 @@ impl TypeError {
                 type_name,
                 ..
             } => TypeError::LengthOutOfRange {
-                value: MASK.to_string(),
+                value: DiagnosticValue::Masked,
                 length,
                 min,
                 max,
@@ -4966,7 +5021,7 @@ impl TypeError {
                 extra_message,
                 ..
             } => TypeError::StringLiteralExpectedEnum {
-                user_typed: MASK.to_string(),
+                user_typed: DiagnosticValue::Masked,
                 attribute,
                 type_name,
                 expected,
@@ -4982,12 +5037,12 @@ impl TypeError {
                 }
             }
             TypeError::UnknownAttribute { .. } => TypeError::UnknownAttribute {
-                name: MASK.to_string(),
+                name: SECRET_VALUE_MASK.to_string(),
                 suggestion: None,
             },
             TypeError::UnknownStructField { struct_name, .. } => TypeError::UnknownStructField {
                 struct_name,
-                field: MASK.to_string(),
+                field: SECRET_VALUE_MASK.to_string(),
                 suggestion: None,
             },
             TypeError::UnionStructMismatch {
@@ -5001,7 +5056,7 @@ impl TypeError {
                     }
                     UnionStructMismatchReason::NoAlternativeSatisfied { .. } => {
                         UnionStructMismatchReason::NoAlternativeSatisfied {
-                            unrecognized_fields: vec![MASK.to_string()],
+                            unrecognized_fields: vec![SECRET_VALUE_MASK.to_string()],
                         }
                     }
                 },
@@ -5013,15 +5068,15 @@ impl TypeError {
                 inner: Box::new(inner.masked_for_secret()),
             },
             TypeError::MapKeyError { inner, .. } => TypeError::MapKeyError {
-                key: MASK.to_string(),
+                key: SECRET_VALUE_MASK.to_string(),
                 inner: Box::new(inner.masked_for_secret()),
             },
             TypeError::MapValueError { inner, .. } => TypeError::MapValueError {
-                key: MASK.to_string(),
+                key: SECRET_VALUE_MASK.to_string(),
                 inner: Box::new(inner.masked_for_secret()),
             },
             TypeError::StructFieldError { inner, .. } => TypeError::StructFieldError {
-                field: MASK.to_string(),
+                field: SECRET_VALUE_MASK.to_string(),
                 inner: Box::new(inner.masked_for_secret()),
             },
             TypeError::TypeMismatch { .. }
@@ -5078,6 +5133,7 @@ impl TypeError {
         match self {
             TypeError::InvalidEnumVariant {
                 value,
+                value_kind: InvalidEnumValueKind::String,
                 attribute,
                 type_name: Some(type_name),
                 expected,
@@ -6702,7 +6758,10 @@ pub mod types {
 pub fn validate_ipv4_address(ip: &str) -> Result<(), String> {
     let octets: Vec<&str> = ip.split('.').collect();
     if octets.len() != 4 {
-        return Err(format!("Invalid IPv4 address '{}': expected 4 octets", ip));
+        return Err(format!(
+            "Invalid IPv4 address {}: expected 4 octets",
+            display_string_literal(ip)
+        ));
     }
 
     for octet in &octets {
@@ -6710,8 +6769,8 @@ pub fn validate_ipv4_address(ip: &str) -> Result<(), String> {
             Ok(_) => {}
             Err(_) => {
                 return Err(format!(
-                    "Invalid octet '{}' in IPv4 address: must be 0-255",
-                    octet
+                    "Invalid octet {} in IPv4 address: must be 0-255",
+                    display_string_literal(octet)
                 ));
             }
         }
@@ -6725,8 +6784,8 @@ pub fn validate_ipv4_cidr(cidr: &str) -> Result<(), String> {
     let parts: Vec<&str> = cidr.split('/').collect();
     if parts.len() != 2 {
         return Err(format!(
-            "Invalid CIDR format '{}': expected IP/prefix",
-            cidr
+            "Invalid CIDR format {}: expected IP/prefix",
+            display_string_literal(cidr)
         ));
     }
 
@@ -6739,10 +6798,13 @@ pub fn validate_ipv4_cidr(cidr: &str) -> Result<(), String> {
     // Validate prefix length
     match prefix.parse::<u8>() {
         Ok(p) if p <= 32 => Ok(()),
-        Ok(p) => Err(format!("Invalid prefix length '{}': must be 0-32", p)),
+        Ok(p) => Err(format!(
+            "Invalid prefix length {}: must be 0-32",
+            display_string_literal(&p.to_string())
+        )),
         Err(_) => Err(format!(
-            "Invalid prefix length '{}': must be a number",
-            prefix
+            "Invalid prefix length {}: must be a number",
+            display_string_literal(prefix)
         )),
     }
 }
@@ -6752,8 +6814,8 @@ pub fn validate_ipv6_cidr(cidr: &str) -> Result<(), String> {
     let parts: Vec<&str> = cidr.split('/').collect();
     if parts.len() != 2 {
         return Err(format!(
-            "Invalid IPv6 CIDR format '{}': expected address/prefix",
-            cidr
+            "Invalid IPv6 CIDR format {}: expected address/prefix",
+            display_string_literal(cidr)
         ));
     }
 
@@ -6766,10 +6828,13 @@ pub fn validate_ipv6_cidr(cidr: &str) -> Result<(), String> {
     // Validate prefix length (0-128)
     match prefix.parse::<u8>() {
         Ok(p) if p <= 128 => Ok(()),
-        Ok(p) => Err(format!("Invalid IPv6 prefix length '{}': must be 0-128", p)),
+        Ok(p) => Err(format!(
+            "Invalid IPv6 prefix length {}: must be 0-128",
+            display_string_literal(&p.to_string())
+        )),
         Err(_) => Err(format!(
-            "Invalid IPv6 prefix length '{}': must be a number",
-            prefix
+            "Invalid IPv6 prefix length {}: must be a number",
+            display_string_literal(prefix)
         )),
     }
 }
@@ -6784,14 +6849,17 @@ pub fn validate_ipv6_address(addr: &str) -> Result<(), String> {
     if addr.contains("::") {
         let halves: Vec<&str> = addr.splitn(2, "::").collect();
         if halves.len() != 2 {
-            return Err(format!("Invalid IPv6 address '{}': malformed '::'", addr));
+            return Err(format!(
+                "Invalid IPv6 address {}: malformed '::'",
+                display_string_literal(addr)
+            ));
         }
 
         // Check for multiple ::
         if halves[1].contains("::") {
             return Err(format!(
-                "Invalid IPv6 address '{}': only one '::' allowed",
-                addr
+                "Invalid IPv6 address {}: only one '::' allowed",
+                display_string_literal(addr)
             ));
         }
 
@@ -6809,8 +6877,8 @@ pub fn validate_ipv6_address(addr: &str) -> Result<(), String> {
         let total = left_groups.len() + right_groups.len();
         if total > 7 {
             return Err(format!(
-                "Invalid IPv6 address '{}': too many groups with '::'",
-                addr
+                "Invalid IPv6 address {}: too many groups with '::'",
+                display_string_literal(addr)
             ));
         }
 
@@ -6821,8 +6889,8 @@ pub fn validate_ipv6_address(addr: &str) -> Result<(), String> {
         let groups: Vec<&str> = addr.split(':').collect();
         if groups.len() != 8 {
             return Err(format!(
-                "Invalid IPv6 address '{}': expected 8 groups, got {}",
-                addr,
+                "Invalid IPv6 address {}: expected 8 groups, got {}",
+                display_string_literal(addr),
                 groups.len()
             ));
         }
@@ -6853,8 +6921,8 @@ pub fn validate_email(email: &str) -> Result<(), String> {
     let parts: Vec<&str> = email.split('@').collect();
     if parts.len() != 2 {
         return Err(format!(
-            "Invalid email '{}': expected exactly one '@'",
-            email
+            "Invalid email {}: expected exactly one '@'",
+            display_string_literal(email)
         ));
     }
 
@@ -6862,33 +6930,42 @@ pub fn validate_email(email: &str) -> Result<(), String> {
     let domain = parts[1];
 
     if local.is_empty() {
-        return Err(format!("Invalid email '{}': empty local part", email));
+        return Err(format!(
+            "Invalid email {}: empty local part",
+            display_string_literal(email)
+        ));
     }
     if local.chars().any(char::is_whitespace) {
         return Err(format!(
-            "Invalid email '{}': local part contains whitespace",
-            email
+            "Invalid email {}: local part contains whitespace",
+            display_string_literal(email)
         ));
     }
 
     if domain.is_empty() {
-        return Err(format!("Invalid email '{}': empty domain", email));
+        return Err(format!(
+            "Invalid email {}: empty domain",
+            display_string_literal(email)
+        ));
     }
     if !domain.contains('.') {
         return Err(format!(
-            "Invalid email '{}': domain must contain at least one dot",
-            email
+            "Invalid email {}: domain must contain at least one dot",
+            display_string_literal(email)
         ));
     }
 
     for label in domain.split('.') {
         if label.is_empty() {
-            return Err(format!("Invalid email '{}': domain has empty label", email));
+            return Err(format!(
+                "Invalid email {}: domain has empty label",
+                display_string_literal(email)
+            ));
         }
         if label.chars().any(char::is_whitespace) {
             return Err(format!(
-                "Invalid email '{}': domain label contains whitespace",
-                email
+                "Invalid email {}: domain label contains whitespace",
+                display_string_literal(email)
             ));
         }
     }
@@ -6909,7 +6986,10 @@ pub fn validate_http_response_status_code(code: &str) -> Result<(), String> {
     }
     let first = code.chars().next().expect("length checked above");
     if !matches!(first, '2' | '4' | '5') {
-        return Err(format!("must start with 2, 4, or 5 (got '{first}')"));
+        return Err(format!(
+            "must start with 2, 4, or 5 (got {})",
+            display_string_literal(&first.to_string())
+        ));
     }
     Ok(())
 }
@@ -6920,7 +7000,8 @@ pub fn validate_redirect_protocol(protocol: &str) -> Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "Invalid redirect protocol '{protocol}': expected HTTP, HTTPS, or #{{protocol}}"
+        "Invalid redirect protocol {}: expected HTTP, HTTPS, or #{{protocol}}",
+        display_string_literal(protocol)
     ))
 }
 
@@ -6937,16 +7018,19 @@ pub fn validate_redirect_port(port: &str) -> Result<(), String> {
     }
     if port.starts_with('+') || (port.len() > 1 && port.starts_with('0')) {
         return Err(format!(
-            "Invalid redirect port '{port}': expected decimal integer or #{{port}}"
+            "Invalid redirect port {}: expected decimal integer or #{{port}}",
+            display_string_literal(port)
         ));
     }
     match port.parse::<u32>() {
         Ok(value) if (1..=65535).contains(&value) => Ok(()),
         Ok(value) => Err(format!(
-            "Invalid redirect port '{port}': expected 1..=65535, got {value}"
+            "Invalid redirect port {}: expected 1..=65535, got {value}",
+            display_string_literal(port)
         )),
         Err(_) => Err(format!(
-            "Invalid redirect port '{port}': expected decimal integer or #{{port}}"
+            "Invalid redirect port {}: expected decimal integer or #{{port}}",
+            display_string_literal(port)
         )),
     }
 }
@@ -7046,14 +7130,16 @@ pub fn suggest_similar_name(unknown: &str, known: &[&str]) -> Option<String> {
 fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
     if group.is_empty() || group.len() > 4 {
         return Err(format!(
-            "Invalid IPv6 group '{}' in address '{}': must be 1-4 hex digits",
-            group, addr
+            "Invalid IPv6 group {} in address {}: must be 1-4 hex digits",
+            display_string_literal(group),
+            display_string_literal(addr)
         ));
     }
     if !group.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!(
-            "Invalid IPv6 group '{}' in address '{}': must be hex digits",
-            group, addr
+            "Invalid IPv6 group {} in address {}: must be hex digits",
+            display_string_literal(group),
+            display_string_literal(addr)
         ));
     }
     Ok(())

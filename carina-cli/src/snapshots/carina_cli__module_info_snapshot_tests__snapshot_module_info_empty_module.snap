@@ -8,7 +8,7 @@ Module: empty_module
 
   name: String  (required)
     Resource name prefix
-  env: String = "dev"  
+  env: String = 'dev'  
     Environment label
 
 === CREATES ===

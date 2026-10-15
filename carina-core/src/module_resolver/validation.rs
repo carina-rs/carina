@@ -4,11 +4,15 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use crate::binding_index::ResolvedBindings;
-use crate::parser::{ArgumentParameter, CompareOp, RequireBlock, ValidateExpr};
+use crate::parser::{
+    ArgumentParameter, CompareOp, RequireBlock, ValidateExpr, display_string_literal,
+};
 use crate::resource::{
     Composition, ConcreteValue, DeferredValue, ModuleConstraintId, PendingModuleConstraint,
     ResourceId, Value,
 };
+use crate::utils::enum_display_value;
+use crate::value::SECRET_PREFIX;
 
 use super::ModuleError;
 
@@ -432,7 +436,7 @@ fn evaluate_constraint_inner(
             let value = arguments
                 .get(name)
                 .expect("referenced variables were checked above");
-            (name.clone(), crate::value::format_value(value))
+            (name.clone(), format_constraint_actual(value))
         })
         .collect();
     Ok(ConstraintEvaluation::Violated(ModuleConstraintViolation {
@@ -584,11 +588,52 @@ fn constraint_actuals(
         .map(|name| {
             let rendered = values
                 .get(name)
-                .map(crate::value::format_value)
+                .map(format_constraint_actual)
                 .unwrap_or_else(|| "<missing>".to_string());
             (name.clone(), rendered)
         })
         .collect()
+}
+
+fn format_constraint_actual(value: &Value) -> String {
+    match value {
+        Value::Concrete(ConcreteValue::String(value)) => format_constraint_string(value),
+        Value::Concrete(ConcreteValue::List(values)) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(format_constraint_actual)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::Concrete(ConcreteValue::StringList(values)) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(|value| format_constraint_string(value))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::Concrete(ConcreteValue::Map(values)) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort();
+            format!(
+                "{{{}}}",
+                keys.into_iter()
+                    .map(|key| format!("{key}: {}", format_constraint_actual(&values[key])))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+        _ => crate::value::format_value(value),
+    }
+}
+
+fn format_constraint_string(value: &str) -> String {
+    if value.starts_with(SECRET_PREFIX) {
+        return "(secret)".to_string();
+    }
+    display_string_literal(enum_display_value(value).unwrap_or(value))
 }
 
 fn is_recursively_concrete(value: &Value) -> bool {
@@ -887,6 +932,48 @@ mod tests {
     }
 
     #[test]
+    fn list_string_constraint_actual_uses_carina_literals() {
+        let expression = length_at_least("items", 3);
+        let arguments = HashMap::from([(
+            "items".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("a".to_string())),
+                Value::Concrete(ConcreteValue::String("b".to_string())),
+            ])),
+        )]);
+
+        let result = evaluate_constraint(&expression, &arguments, "need three items");
+        let ConstraintEvaluation::Violated(violation) = result else {
+            panic!("expected a violation");
+        };
+        assert_eq!(
+            violation.actuals,
+            vec![("items".to_string(), "['a', 'b']".to_string())]
+        );
+
+        let nested = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            (
+                "list".to_string(),
+                Value::Concrete(ConcreteValue::StringList(vec![
+                    "a".to_string(),
+                    "b".to_string(),
+                ])),
+            ),
+            (
+                "secret".to_string(),
+                Value::Concrete(ConcreteValue::String(format!(
+                    "{}deadbeef",
+                    crate::value::SECRET_PREFIX
+                ))),
+            ),
+        ])));
+        assert_eq!(
+            format_constraint_actual(&nested),
+            "{list: ['a', 'b'], secret: (secret)}"
+        );
+    }
+
+    #[test]
     fn violation_contains_sorted_secret_masked_actuals() {
         let expression = ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::Var("password".to_string())),
@@ -914,6 +1001,41 @@ mod tests {
         assert!(!rendered.contains("plaintext"), "{rendered}");
         assert!(!rendered.contains("Deferred("), "{rendered}");
         assert!(!rendered.contains("ResourceRef"), "{rendered}");
+    }
+
+    #[test]
+    fn constraint_actuals_render_strings_and_mask_hashed_secrets() {
+        let names = vec![
+            "plain".to_string(),
+            "enum_text".to_string(),
+            "secret_hash".to_string(),
+        ];
+        let values = HashMap::from([
+            (
+                "plain".to_string(),
+                Value::Concrete(ConcreteValue::String("abc".to_string())),
+            ),
+            (
+                "enum_text".to_string(),
+                Value::Concrete(ConcreteValue::String("aws.Region.us_east_1".to_string())),
+            ),
+            (
+                "secret_hash".to_string(),
+                Value::Concrete(ConcreteValue::String(format!(
+                    "{}deadbeef",
+                    crate::value::SECRET_PREFIX
+                ))),
+            ),
+        ]);
+
+        assert_eq!(
+            constraint_actuals(&names, &values),
+            vec![
+                ("plain".to_string(), "'abc'".to_string()),
+                ("enum_text".to_string(), "'us_east_1'".to_string()),
+                ("secret_hash".to_string(), "(secret)".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -996,7 +1118,8 @@ mod tests {
             panic!("expected evaluation error");
         };
         let detail = format!("error evaluating constraint: {detail}");
-        let actuals = vec![("name".to_string(), "\"abc\"".to_string())];
+        let actuals = evaluated.actuals().to_vec();
+        assert_eq!(actuals, [("name".to_string(), "'abc'".to_string())]);
         let resolver_error = evaluated
             .module_error("mod", "c", Some("c"))
             .expect("evaluation error must render");
@@ -1029,7 +1152,7 @@ mod tests {
             detail: Some(detail.clone()),
         });
         let expected =
-            format!("module 'mod' (call 'c'): argument 'name': bad name (got \"abc\"); {detail}");
+            format!("module 'mod' (call 'c'): argument 'name': bad name (got 'abc'); {detail}");
 
         assert_eq!(resolver_error.to_string(), expected);
         assert_eq!(apply_failure.to_string(), expected);

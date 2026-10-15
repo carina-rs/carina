@@ -5037,6 +5037,57 @@ fn caller_side_value_in_string_literal_union_is_accepted() {
     );
 }
 
+#[test]
+fn escaped_string_literal_union_matches_decoded_module_arguments() {
+    let module = crate::parser::parse(
+        r#"
+arguments {
+  environment: 'it\'s' | 'b'
+}
+"#,
+        &ProviderContext::default(),
+    )
+    .expect("module argument type should parse");
+    let mut resolver = ModuleResolver::new(".");
+    resolver
+        .imported_modules
+        .insert("env_module".to_string(), module);
+
+    let parse_value = |literal: &str| {
+        let source = format!("let value = {literal}\n");
+        crate::parser::parse(&source, &ProviderContext::default())
+            .expect("argument value should parse")
+            .variables
+            .get("value")
+            .expect("value binding should exist")
+            .clone()
+    };
+    let call = |value| ModuleCall {
+        module_name: "env_module".to_string(),
+        binding_name: Some("instance".to_string()),
+        source: Default::default(),
+        arguments: HashMap::from([("environment".to_string(), value)]),
+    };
+
+    for literal in [r"'it\'s'", r#""it's""#] {
+        let result = resolver.expand_module_call(&call(parse_value(literal)), "instance");
+        assert!(
+            result.is_ok(),
+            "{literal} should satisfy the decoded type: {result:?}"
+        );
+    }
+
+    let error = resolver
+        .expand_module_call(&call(parse_value("'x'")), "instance")
+        .expect_err("a value outside the literal union must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains(r#"expected "it's" | 'b', got string 'x'"#),
+        "the decoded apostrophe must use the shared renderer: {error}"
+    );
+}
+
 /// Acceptance test for #2815 / #2817. An `arguments {}` block declared in
 /// `main.crn` must be visible to identifier references in *sibling* `.crn`
 /// files in the same module directory. Before #2817, the per-file
@@ -6043,7 +6094,7 @@ fn argument_type_mismatch_error_shows_actual_value() {
     );
 
     assert!(
-        msg.contains("got string \"arn:aws:iam::123:role/A\""),
+        msg.contains("got string 'arn:aws:iam::123:role/A'"),
         "error should show the actual string value for a string-into-list mismatch (carina#3238); got: {msg}"
     );
 }
@@ -6096,7 +6147,7 @@ fn argument_type_mismatch_error_shows_string_literal_value() {
 
     assert_eq!(
         msg,
-        "Invalid argument type for 'environment' in module 'web_tier': expected 'dev' | 'stg' | 'prod', got string \"production\"",
+        "Invalid argument type for 'environment' in module 'web_tier': expected 'dev' | 'stg' | 'prod', got string 'production'",
         "the #3804 root diagnostic must remain stable"
     );
 }
@@ -6146,9 +6197,7 @@ fn argument_type_mismatch_error_shows_nested_list_element_value() {
     );
 
     assert!(
-        msg.contains(
-            "at list element 1: expected 'dev' | 'stg' | 'prod', got string \"production\""
-        ),
+        msg.contains("at list element 1: expected 'dev' | 'stg' | 'prod', got string 'production'"),
         "error should include the mismatched list element and path; got: {msg}"
     );
 }
@@ -6167,7 +6216,7 @@ fn argument_type_mismatch_error_shows_string_list_element_value() {
     let msg = module_argument_type_error("environments", type_expr, value);
 
     assert!(
-        msg.contains("at list element 1: expected 'dev' | 'stg', got string \"production\""),
+        msg.contains("at list element 1: expected 'dev' | 'stg', got string 'production'"),
         "error should include the mismatched StringList element and path; got: {msg}"
     );
 }
@@ -6187,7 +6236,7 @@ fn argument_type_mismatch_error_shows_complete_nested_list_path() {
 
     assert!(
         msg.contains(
-            "at list element 0 -> list element 0: expected 'dev', got string \"production\""
+            "at list element 0 -> list element 0: expected 'dev', got string 'production'"
         ),
         "error should report the complete path to the innermost mismatched list element; got: {msg}"
     );
@@ -6293,7 +6342,7 @@ fn argument_type_mismatch_error_shows_nested_map_value() {
 
     assert!(
         msg.contains(
-            "at map key 'secondary': expected 'dev' | 'stg' | 'prod', got string \"production\""
+            "at map key 'secondary': expected 'dev' | 'stg' | 'prod', got string 'production'"
         ),
         "error should include the mismatched map value and path; got: {msg}"
     );
@@ -6313,7 +6362,7 @@ fn argument_type_mismatch_error_shows_nested_struct_field_value() {
 
     assert!(
         msg.contains(
-            "at struct field 'environment': expected 'dev' | 'stg' | 'prod', got string \"production\""
+            "at struct field 'environment': expected 'dev' | 'stg' | 'prod', got string 'production'"
         ),
         "error should include the mismatched struct field value and path; got: {msg}"
     );
@@ -6351,7 +6400,7 @@ fn argument_type_validation_error_shows_actual_string_literal() {
         module_argument_type_error("network", TypeExpr::Simple("ipv4_cidr".to_string()), value);
 
     assert!(
-        msg.contains("got string \"not-an-ipv4-cidr\""),
+        msg.contains("got string 'not-an-ipv4-cidr'"),
         "validation errors should include the actual scalar literal; got: {msg}"
     );
 }

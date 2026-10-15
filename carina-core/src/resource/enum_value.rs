@@ -5,8 +5,8 @@ use std::hash::{Hash, Hasher};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::schema::{
-    AttributeType, DslMap, EnumParts, ExpectedEnumVariant, TypeError, TypeIdentity,
-    enum_value_matches,
+    AttributeType, DslMap, EnumParts, ExpectedEnumVariant, InvalidEnumValueKind, TypeError,
+    TypeIdentity, enum_value_matches,
 };
 use crate::utils::{NamespacedId, extract_enum_value_with_values, validate_enum_namespace};
 
@@ -274,6 +274,7 @@ impl<'a> EnumValueResolver<'a> {
                 values,
                 dsl_aliases,
                 dsl_map,
+                phase,
             ));
         }
 
@@ -328,6 +329,7 @@ impl<'a> EnumValueResolver<'a> {
                 values,
                 dsl_aliases,
                 dsl_map,
+                phase,
             ))
         }
     }
@@ -442,9 +444,14 @@ fn invalid_enum_variant(
     values: Option<&[String]>,
     dsl_aliases: &[(String, String)],
     dsl_map: DslMap<'_>,
+    phase: EnumInputPhase,
 ) -> TypeError {
     TypeError::InvalidEnumVariant {
-        value: value.to_string(),
+        value: value.to_string().into(),
+        value_kind: match phase {
+            EnumInputPhase::RawDsl => InvalidEnumValueKind::Identifier,
+            EnumInputPhase::StateText => InvalidEnumValueKind::String,
+        },
         attribute: None,
         type_name: Some(identity.kind.clone()),
         expected: expected_variants(identity, values.unwrap_or_default(), dsl_aliases, dsl_map),

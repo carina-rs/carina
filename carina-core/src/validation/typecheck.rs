@@ -447,7 +447,7 @@ mod tests {
             check(&environment, &string("production"))
                 .unwrap_err()
                 .to_string(),
-            "expected 'dev' | 'stg' | 'prod', got string \"production\""
+            "expected 'dev' | 'stg' | 'prod', got string 'production'"
         );
 
         let map = Value::Concrete(ConcreteValue::Map(IndexMap::from([

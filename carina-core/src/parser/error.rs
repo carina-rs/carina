@@ -15,6 +15,11 @@ pub enum ParseError {
     #[error("Invalid expression at line {line}: {message}")]
     InvalidExpression { line: usize, message: String },
 
+    #[error(
+        "Invalid expression at line {line}: interpolation is not allowed in this string literal"
+    )]
+    InterpolationNotAllowedInLiteralString { line: usize },
+
     #[error("Invalid expression at line {line}: {source}")]
     InvalidResourceIdentity {
         line: usize,

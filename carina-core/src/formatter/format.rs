@@ -17,6 +17,7 @@ use super::config::FormatConfig;
 use super::cst::{Cst, CstChild, CstNode, NodeKind, Trivia};
 use super::cst_builder::build_cst;
 use super::parser::{self, FormatParseError};
+use crate::parser::{encode_string_literal, unescape_string};
 
 /// Format a .crn file
 pub fn format(source: &str, config: &FormatConfig) -> Result<String, FormatParseError> {
@@ -228,17 +229,27 @@ impl Formatter {
             return s.to_string();
         }
         let inner = &s[1..s.len() - 1];
-        if inner.contains("${") || inner.contains('\'') {
+        // Preserve authored layout for raw newlines, tabs, and other controls.
+        // `encode_string_literal` remains the independent source-safety gate.
+        if inner.contains(char::is_control) || Self::contains_interpolation(inner) {
             return s.to_string();
         }
-        if inner.contains("\\n")
-            || inner.contains("\\r")
-            || inner.contains("\\t")
-            || inner.contains("\\\"")
-        {
-            return s.to_string();
+
+        encode_string_literal(&unescape_string(inner)).unwrap_or_else(|| s.to_string())
+    }
+
+    fn contains_interpolation(s: &str) -> bool {
+        let mut chars = s.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' => {
+                    chars.next();
+                }
+                '$' if chars.peek() == Some(&'{') => return true,
+                _ => {}
+            }
         }
-        format!("'{}'", inner)
+        false
     }
 
     pub(in crate::formatter) fn write_token(&mut self, text: &str) {
@@ -1623,6 +1634,41 @@ require   port >= 1 && port <= 65535  , "port must be valid"
             "String containing single quote should keep double quotes. Got:\n{}",
             result
         );
+    }
+
+    #[test]
+    fn test_format_decodes_escaped_double_quote_before_normalizing() {
+        let input = "aws.s3.Bucket {\n  name = \"say \\\"hi\\\"\"\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        assert!(
+            result.contains("name = 'say \"hi\"'"),
+            "Escaped double quote should be decoded before normalization. Got:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_preserves_escaped_interpolation_as_a_plain_string() {
+        let input = "aws.s3.Bucket {\n  name = \"\\${literal}\"\n}\n";
+        let config = FormatConfig::default();
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+
+        assert!(first.contains(r#"name = "\${literal}""#));
+        assert_eq!(first, second, "Quote normalization should be idempotent");
+    }
+
+    #[test]
+    fn test_format_preserves_raw_newline_in_double_quoted_string() {
+        let input = "let message = \"first line\n    second line\"\n";
+        let config = FormatConfig::default();
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+
+        assert_eq!(first, input);
+        assert_eq!(second, first, "Formatting should be idempotent");
     }
 
     #[test]

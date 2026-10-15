@@ -2,6 +2,7 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
+use super::display_string_literal;
 use super::error::{ParseWarning, WarningKind};
 use super::expressions::for_expr::ForBinding;
 use super::expressions::validate_expr::CompareOp;
@@ -395,7 +396,7 @@ impl std::fmt::Display for TypeExpr {
                     write!(f, " }}")
                 }
             }
-            TypeExpr::StringLiteral(s) => write!(f, "'{}'", s),
+            TypeExpr::StringLiteral(s) => f.write_str(&display_string_literal(s)),
             TypeExpr::Union(members) => {
                 for (i, m) in members.iter().enumerate() {
                     if i > 0 {
@@ -407,6 +408,19 @@ impl std::fmt::Display for TypeExpr {
             }
             TypeExpr::Unknown => write!(f, "<unknown>"),
         }
+    }
+}
+
+#[cfg(test)]
+mod type_expr_display_tests {
+    use super::TypeExpr;
+
+    #[test]
+    fn string_literal_with_apostrophe_uses_canonical_quotes() {
+        assert_eq!(
+            TypeExpr::StringLiteral("it's".to_string()).to_string(),
+            "\"it's\""
+        );
     }
 }
 

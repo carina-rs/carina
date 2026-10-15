@@ -5,10 +5,11 @@
 
 use crate::parser::Rule;
 use crate::parser::ast::{BackendConfig, UpstreamState};
-use crate::parser::context::{ParseContext, next_pair};
+use crate::parser::context::{ParseContext, first_inner, next_pair};
 use crate::parser::error::ParseError;
+use crate::parser::expressions::string_literal::parse_string_literal;
 use crate::parser::parse_expression;
-use crate::parser::util::extract_string_from_pair;
+use crate::parser::util::unwrap_to_primary;
 use std::collections::HashMap;
 
 pub(in crate::parser) fn parse_backend_block(
@@ -74,14 +75,31 @@ pub(in crate::parser) fn parse_upstream_state_expr(
         match key.as_str() {
             "source" => {
                 let value_text = value_pair.as_str().to_string();
-                source = Some(extract_string_from_pair(value_pair).map_err(|_| {
+                let invalid_source = |without_interpolation: bool| {
+                    let requirement = if without_interpolation {
+                        "a string literal without interpolation"
+                    } else {
+                        "a string literal"
+                    };
                     ParseError::InvalidExpression {
                         line: attr_line,
                         message: format!(
-                            "upstream_state '{}': 'source' must be a string literal, got: {}",
-                            binding_name, value_text
+                            "upstream_state '{}': 'source' must be {}, got: {}",
+                            binding_name, requirement, value_text
                         ),
                     }
+                };
+                let primary = unwrap_to_primary(value_pair).ok_or_else(|| invalid_source(false))?;
+                let value = first_inner(primary, "string literal", "upstream_state source")?;
+                if value.as_rule() != Rule::string {
+                    return Err(invalid_source(false));
+                }
+                source = Some(parse_string_literal(value).map_err(|error| {
+                    let without_interpolation = matches!(
+                        error,
+                        ParseError::InterpolationNotAllowedInLiteralString { .. }
+                    );
+                    invalid_source(without_interpolation)
                 })?);
             }
             other => {

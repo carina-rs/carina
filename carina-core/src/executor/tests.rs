@@ -2419,8 +2419,8 @@ async fn pending_module_validation_and_require_block_first_consuming_effect() {
         "root.checked",
         "value must not be bad",
         "value and other must match",
-        "\"bad\"",
-        "\"different\"",
+        "'bad'",
+        "'different'",
     ] {
         assert!(events.contains(expected), "events: {events}");
     }
@@ -2903,7 +2903,7 @@ async fn terminal_module_constraint_sweep_rejects_unconsumed_violation() {
         "checked_module",
         "root.export_only",
         "value must not be bad",
-        "\"bad\"",
+        "'bad'",
     ] {
         assert!(events.contains(expected), "events: {events}");
     }

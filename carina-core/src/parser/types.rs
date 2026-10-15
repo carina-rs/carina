@@ -9,6 +9,7 @@ use crate::schema::{TypeIdentity, levenshtein_distance};
 
 use super::ast::{ResourceTypePath, TypeExpr};
 use super::error::{ParseError, ParseWarning};
+use super::expressions::string_literal::parse_string_literal;
 use super::util::{pascal_to_snake, snake_to_pascal};
 use super::{ProviderContext, Rule, first_inner, next_pair};
 
@@ -178,21 +179,8 @@ fn parse_type_expr_atom(
     let inner = first_inner(pair, "type", "type expression")?;
     match inner.as_rule() {
         Rule::type_string_literal => {
-            // type_string_literal wraps a `string` rule. Unquote and
-            // strip interpolation: type-position string literals are
-            // by construction simple literals (the grammar accepts
-            // only the same `string` form, but interpolation in a
-            // type position has no semantics and is rejected as
-            // "unknown type" upstream rather than crashed on here).
-            let raw = inner.as_str();
-            let unquoted = if (raw.starts_with('\'') && raw.ends_with('\''))
-                || (raw.starts_with('"') && raw.ends_with('"'))
-            {
-                &raw[1..raw.len() - 1]
-            } else {
-                raw
-            };
-            Ok(TypeExpr::StringLiteral(unquoted.to_string()))
+            let string = first_inner(inner, "string", "string literal type")?;
+            Ok(TypeExpr::StringLiteral(parse_string_literal(string)?))
         }
         Rule::type_simple => {
             let line = inner.as_span().start_pos().line_col().0;
@@ -335,6 +323,15 @@ mod tests {
             parse_type_expr_str("  String  ", &ctx),
             Some(TypeExpr::String)
         ));
+    }
+
+    #[test]
+    fn escaped_string_literal_round_trips_through_display() {
+        let ctx = ProviderContext::default();
+        let parsed = parse_type_expr_str(r"'a\\b'", &ctx).expect("type literal should parse");
+
+        assert_eq!(parsed, TypeExpr::StringLiteral(r"a\b".to_string()));
+        assert_eq!(parse_type_expr_str(&parsed.to_string(), &ctx), Some(parsed));
     }
 
     #[test]
