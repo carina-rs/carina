@@ -6697,7 +6697,7 @@ mod resolved_value_constraint_gate {
                 assert_eq!(diagnostic.message, "value must not be bad");
                 assert_eq!(
                     diagnostic.actuals,
-                    [("value".to_string(), "\"bad\"".to_string())]
+                    [("value".to_string(), "'bad'".to_string())]
                 );
             }
             other => panic!("unexpected plan error: {other:?}"),
@@ -6707,7 +6707,7 @@ mod resolved_value_constraint_gate {
             "module 'checked_module' (call 'checked')",
             "value",
             "value must not be bad",
-            "\"bad\"",
+            "'bad'",
         ] {
             assert!(rendered.contains(expected), "{rendered}");
         }
@@ -6930,8 +6930,8 @@ exports { team_prefix: String = "x" }"#,
                 assert_eq!(
                     diagnostic.actuals,
                     [
-                        ("left".to_string(), "\"left\"".to_string()),
-                        ("right".to_string(), "\"right\"".to_string()),
+                        ("left".to_string(), "'left'".to_string()),
+                        ("right".to_string(), "'right'".to_string()),
                     ]
                 );
             }

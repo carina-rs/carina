@@ -419,7 +419,7 @@ double_quoted_string = ${ "\"" ~ inner_string ~ "\"" }
 inner_string = @{ char* }
 char = {
     !("\"" | "\\") ~ ANY
-  | "\\" ~ ("\"" | "\\" | "n" | "r" | "t")
+  | "\\" ~ ("\"" | "\\" | "n" | "r" | "t" | "$")
 }
 single_quoted_string = ${ "'" ~ single_quoted_inner ~ "'" }
 single_quoted_inner = @{ single_quoted_char* }

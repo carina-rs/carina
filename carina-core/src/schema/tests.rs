@@ -128,7 +128,7 @@ fn validate_enum_rejects_quoted_string_literal() {
         .validate(&Value::Concrete(ConcreteValue::String("IPv4".to_string())))
         .unwrap_err();
     assert!(
-        matches!(err, TypeError::StringLiteralExpectedEnum { ref user_typed, .. } if user_typed == "IPv4"),
+        matches!(err, TypeError::StringLiteralExpectedEnum { ref user_typed, .. } if user_typed.as_plain() == Some("IPv4")),
         "expected StringLiteralExpectedEnum, got: {err:?}"
     );
 }
@@ -239,7 +239,8 @@ fn invalid_enum_variant_candidates_use_dsl_spelling_for_enum_aliases() {
 
     assert_iam_policy_version_candidates(&expected);
     let msg = TypeError::InvalidEnumVariant {
-        value: "bad_version".to_string(),
+        value: "bad_version".into(),
+        value_kind: InvalidEnumValueKind::Identifier,
         attribute: None,
         type_name: Some("Version".to_string()),
         expected,
@@ -269,7 +270,7 @@ fn string_literal_expected_enum_candidates_use_dsl_spelling_for_enum_aliases() {
 
     assert_iam_policy_version_candidates(&expected);
     let msg = TypeError::StringLiteralExpectedEnum {
-        user_typed: "2012-10-17".to_string(),
+        user_typed: "2012-10-17".into(),
         attribute: None,
         type_name: "Version".to_string(),
         expected,
@@ -409,9 +410,8 @@ fn invalid_enum_error_preserves_user_typed_string_literal() {
     // literal `target_type = "aaa"` now reaches the validator as
     // `ConcreteValue::String("aaa")` and is rejected as
     // `StringLiteralExpectedEnum`. The user-typed value must surface in
-    // the error verbatim (echoed inside double quotes per the
-    // `format_string_literal_expected_enum` shape) without leaking the
-    // synthesized namespaced form.
+    // the error verbatim (echoed as a canonical string literal) without
+    // leaking the synthesized namespaced form.
     let t = AttributeType::enum_(
         crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
         Some(vec!["AWS_ACCOUNT".to_string()]),
@@ -424,7 +424,7 @@ fn invalid_enum_error_preserves_user_typed_string_literal() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("\"aaa\""),
+        msg.contains("'aaa'"),
         "error should echo the user's typed value, got: {msg}"
     );
     assert!(
@@ -476,7 +476,7 @@ fn with_attribute_adds_attribute_name_to_enum_error() {
     );
     // String-literal path (strict-mode rejection): rendered as
     // `'target_id' (TargetType) expects an enum identifier, got a
-    // string literal "aaa"...`.
+    // string literal 'aaa'...`.
     let err = t
         .validate(&Value::Concrete(ConcreteValue::String("aaa".to_string())))
         .unwrap_err()
@@ -491,12 +491,12 @@ fn with_attribute_adds_attribute_name_to_enum_error() {
         "error should still name the enum type, got: {msg}"
     );
     assert!(
-        msg.contains("\"aaa\""),
+        msg.contains("'aaa'"),
         "error should still echo the user value, got: {msg}"
     );
 
-    // Identifier path (`InvalidEnumVariant`): the message keeps the
-    // single-quoted form for the bare value.
+    // Identifier path (`InvalidEnumVariant`): the message keeps the bare
+    // identifier form.
     let err = t
         .validate(&Value::Concrete(ConcreteValue::enum_identifier(
             "aaa".to_string(),
@@ -509,8 +509,8 @@ fn with_attribute_adds_attribute_name_to_enum_error() {
         "identifier-path error should quote attribute name, got: {msg}"
     );
     assert!(
-        msg.contains("'aaa'"),
-        "identifier-path error should single-quote the bare value, got: {msg}"
+        msg.contains("Invalid value aaa for 'target_id'"),
+        "identifier-path error should keep the bare value, got: {msg}"
     );
 }
 
@@ -531,22 +531,22 @@ fn with_attribute_is_noop_for_variants_that_dont_carry_attribute() {
 #[test]
 fn custom_constraint_errors_format_type_and_attribute_context() {
     let pattern = TypeError::PatternMismatch {
-        value: "ABC".to_string(),
+        value: "it's".into(),
         pattern: "^[a-z]+$".to_string(),
         attribute: None,
         type_name: Some("EntityDescription".to_string()),
     };
     assert_eq!(
         pattern.to_string(),
-        "Invalid EntityDescription value 'ABC': does not match required pattern /^[a-z]+$/"
+        "Invalid EntityDescription value \"it's\": does not match required pattern /^[a-z]+$/"
     );
     assert_eq!(
         pattern.with_attribute("description").to_string(),
-        "Invalid value 'ABC' for 'description' (EntityDescription): does not match required pattern /^[a-z]+$/"
+        "Invalid value \"it's\" for 'description' (EntityDescription): does not match required pattern /^[a-z]+$/"
     );
 
     let length = TypeError::LengthOutOfRange {
-        value: "".to_string(),
+        value: "".into(),
         length: 0,
         min: Some(1),
         max: None,
@@ -599,7 +599,7 @@ fn string_literal_expected_enum_formats_shape_message() {
     // The new variant's message must read as a shape complaint, not as
     // "unknown variant" — that's the whole point of the PR 2094 split.
     let err = TypeError::StringLiteralExpectedEnum {
-        user_typed: "aaa".to_string(),
+        user_typed: "aaa".into(),
         attribute: Some("target_type".to_string()),
         type_name: "TargetType".to_string(),
         expected: vec![ExpectedEnumVariant::from_namespaced(
@@ -616,7 +616,7 @@ fn string_literal_expected_enum_formats_shape_message() {
         "message should name the shape mismatch, got: {msg}"
     );
     assert!(
-        msg.contains("\"aaa\""),
+        msg.contains("'aaa'"),
         "message should echo the typed value in quotes, got: {msg}"
     );
     assert!(
@@ -635,7 +635,8 @@ fn into_string_literal_diagnostic_reshapes_invalid_enum_variant() {
     // shape is specifically a conversion of `InvalidEnumVariant` when
     // we know the value came from a string literal.
     let original = TypeError::InvalidEnumVariant {
-        value: "aaa".to_string(),
+        value: "aaa".into(),
+        value_kind: InvalidEnumValueKind::String,
         attribute: Some("target_type".to_string()),
         type_name: Some("TargetType".to_string()),
         expected: vec![ExpectedEnumVariant::from_namespaced(
@@ -654,7 +655,7 @@ fn into_string_literal_diagnostic_reshapes_invalid_enum_variant() {
             expected,
             extra_message,
         } => {
-            assert_eq!(user_typed, "aaa");
+            assert_eq!(user_typed.as_plain(), Some("aaa"));
             assert_eq!(attribute.as_deref(), Some("target_type"));
             assert_eq!(type_name, "TargetType");
             assert_eq!(expected.len(), 1);
@@ -674,7 +675,8 @@ fn into_string_literal_diagnostic_without_type_name_passes_through() {
     // plugin), there's nothing to reshape into — the original error
     // stays intact so we don't drop information on the floor.
     let original = TypeError::InvalidEnumVariant {
-        value: "aaa".to_string(),
+        value: "aaa".into(),
+        value_kind: InvalidEnumValueKind::String,
         attribute: Some("target_type".to_string()),
         type_name: None,
         expected: vec![],
@@ -869,6 +871,31 @@ fn invalid_enum_error_preserves_bare_identifier_form() {
     assert!(
         msg.contains(&input),
         "error should echo the user's namespaced input, got: {msg}"
+    );
+}
+
+#[test]
+fn invalid_enum_namespace_diagnostic_leaves_identifier_bare() {
+    let t = AttributeType::enum_(
+        crate::schema::enum_identity("TargetType", Some("awscc.sso.Assignment")),
+        Some(vec!["AWS_ACCOUNT".to_string()]),
+        vec![],
+        None,
+        None,
+    );
+    let input = "WrongType.NOT_REAL";
+    let err = t
+        .validate(&Value::Concrete(ConcreteValue::enum_identifier(input)))
+        .unwrap_err();
+    let msg = err.to_string();
+
+    assert!(
+        msg.contains(&format!("Invalid TargetType {input}:")),
+        "identifier should be bare in the namespace diagnostic: {msg}"
+    );
+    assert!(
+        !msg.contains(&format!("Invalid TargetType '{input}':")),
+        "identifier was quoted in the namespace diagnostic: {msg}"
     );
 }
 
@@ -2095,8 +2122,8 @@ fn secret_enum_literal_masks_typed_value_and_validator_message() {
     let TypeError::StringLiteralExpectedEnum { user_typed, .. } = enumerated else {
         unreachable!()
     };
-    assert_eq!(
-        user_typed, "(secret)",
+    assert!(
+        matches!(user_typed, DiagnosticValue::Masked),
         "StringLiteralExpectedEnum.user_typed leaked {enumerated_plaintext}"
     );
 
@@ -2120,7 +2147,7 @@ fn secret_enum_literal_masks_typed_value_and_validator_message() {
     else {
         unreachable!()
     };
-    assert_eq!(user_typed, "(secret)");
+    assert!(matches!(user_typed, DiagnosticValue::Masked));
     assert_eq!(
         extra_message.as_deref(),
         Some("(secret) failed validation"),
@@ -2138,6 +2165,15 @@ fn secret_enum_literal_masks_typed_value_and_validator_message() {
             "secret enum plaintext leaked: {rendered}"
         );
     }
+    assert_eq!(
+        rendered.matches("got a string literal (secret)").count(),
+        2,
+        "secret placeholders must not be rendered as string literals: {rendered}"
+    );
+    assert!(
+        !rendered.contains("got a string literal '(secret)'"),
+        "secret placeholder was quoted: {rendered}"
+    );
 }
 
 #[test]
@@ -2246,11 +2282,76 @@ fn secret_length_out_of_range_is_masked_without_pattern_error() {
 
     assert!(matches!(error, TypeError::LengthOutOfRange { .. }));
     let rendered = error.to_string();
-    assert!(rendered.contains("(secret)"), "error: {rendered}");
+    assert_eq!(
+        rendered,
+        "Invalid value (secret): length 5 is outside allowed range [8, ]"
+    );
+    assert!(!rendered.contains("'(secret)'"));
     assert!(
         !rendered.contains(plaintext),
         "LengthOutOfRange.value leaked secret content: {rendered}"
     );
+}
+
+#[test]
+fn secret_pattern_mismatch_is_masked_without_literal_quotes() {
+    let plaintext = "wrong";
+    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String(plaintext.to_string()),
+    ))));
+    let error = AttributeType::refined_string(None, Some("^allowed$".to_string()), None, None)
+        .validate(&value)
+        .expect_err("secret must fail the pattern constraint");
+
+    assert!(matches!(error, TypeError::PatternMismatch { .. }));
+    let rendered = error.to_string();
+    assert_eq!(
+        rendered,
+        "Invalid value (secret): does not match required pattern /^allowed$/"
+    );
+    assert!(!rendered.contains("'(secret)'"));
+    assert!(!rendered.contains(plaintext));
+}
+
+#[test]
+fn secret_structured_string_enum_error_is_masked_without_literal_quotes() {
+    let plaintext = "hidden-mode";
+    let attr = AttributeType::refined_string_with_validator(
+        Some(TypeIdentity::bare("Mode")),
+        None,
+        None,
+        validator(|value| match value {
+            Value::Concrete(ConcreteValue::String(value)) => Err(TypeError::InvalidEnumVariant {
+                value: value.clone().into(),
+                value_kind: InvalidEnumValueKind::String,
+                attribute: None,
+                type_name: Some("Mode".to_string()),
+                expected: vec![ExpectedEnumVariant::from_namespaced(
+                    None, "Mode", "allowed", false,
+                )],
+            }),
+            other => Err(TypeError::TypeMismatch {
+                expected: "String".to_string(),
+                got: other.type_name(),
+            }),
+        }),
+        None,
+    );
+    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String(plaintext.to_string()),
+    ))));
+    let error = attr
+        .validate(&value)
+        .expect_err("secret must fail the structured enum validator");
+
+    assert!(matches!(error, TypeError::InvalidEnumVariant { .. }));
+    let rendered = error.to_string();
+    assert_eq!(
+        rendered,
+        "Invalid value (secret) for Mode: expected one of allowed"
+    );
+    assert!(!rendered.contains("'(secret)'"));
+    assert!(!rendered.contains(plaintext));
 }
 
 #[test]
@@ -2645,6 +2746,14 @@ fn union_type_name() {
 
     let union_type = AttributeType::union(vec![type_a, type_b]);
     assert_eq!(union_type.type_name(), "TypeA | TypeB");
+}
+
+#[test]
+fn string_literal_set_type_name_uses_canonical_literals() {
+    let literal_set = AttributeType::string_literal_set(vec!["it's".to_string(), "b".to_string()]);
+
+    assert_eq!(literal_set.type_name(), r#""it's" | 'b'"#);
+    assert_eq!(literal_set.to_string(), r#""it's" | 'b'"#);
 }
 
 #[test]
@@ -5746,7 +5855,7 @@ fn custom_pattern_rejects_and_accepts_string_values() {
     assert_eq!(
         err,
         TypeError::PatternMismatch {
-            value: "ABC".to_string(),
+            value: "ABC".into(),
             pattern: "^[a-z]+$".to_string(),
             attribute: None,
             type_name: None,
@@ -5802,8 +5911,7 @@ fn custom_pattern_rejects_wafv2_description_parentheses() {
     assert_eq!(
         err,
         TypeError::PatternMismatch {
-            value: "Protects the Carina Provider Registry (dev) CloudFront distribution"
-                .to_string(),
+            value: "Protects the Carina Provider Registry (dev) CloudFront distribution".into(),
             pattern: pattern.to_string(),
             attribute: None,
             type_name: Some("EntityDescription".to_string()),
@@ -5835,7 +5943,7 @@ fn custom_length_uses_character_count_not_bytes() {
     assert_eq!(
         err,
         TypeError::LengthOutOfRange {
-            value: "abcdef".to_string(),
+            value: "abcdef".into(),
             length: 6,
             min: Some(1),
             max: Some(5),
@@ -5871,7 +5979,7 @@ fn custom_length_enforces_minimum_bound() {
     assert_eq!(
         err,
         TypeError::LengthOutOfRange {
-            value: "a".to_string(),
+            value: "a".into(),
             length: 1,
             min: Some(2),
             max: None,
@@ -5947,7 +6055,7 @@ fn schema_validate_attr_dispatches_to_custom_pattern_validation() {
     assert_eq!(
         err,
         TypeError::PatternMismatch {
-            value: "ABC".to_string(),
+            value: "ABC".into(),
             pattern: "^[a-z]+$".to_string(),
             attribute: None,
             type_name: Some("Slug".to_string()),
@@ -6151,6 +6259,42 @@ fn validate_redirect_port_function_directly() {
     assert!(validate_redirect_port("0443").is_err());
     assert!(validate_redirect_port("#{path}").is_err());
     assert!(validate_redirect_port("443?").is_err());
+}
+
+#[test]
+fn validator_errors_render_string_values_as_carina_literals() {
+    assert_eq!(
+        validate_ipv4_address("1.2.3.it's").unwrap_err(),
+        "Invalid octet \"it's\" in IPv4 address: must be 0-255"
+    );
+    assert_eq!(
+        validate_ipv4_cidr("it's").unwrap_err(),
+        "Invalid CIDR format \"it's\": expected IP/prefix"
+    );
+    assert_eq!(
+        validate_ipv4_cidr("1.2.3.4/it's").unwrap_err(),
+        "Invalid prefix length \"it's\": must be a number"
+    );
+    assert_eq!(
+        validate_ipv6_cidr("it's").unwrap_err(),
+        "Invalid IPv6 CIDR format \"it's\": expected address/prefix"
+    );
+    assert_eq!(
+        validate_email("it's").unwrap_err(),
+        "Invalid email \"it's\": expected exactly one '@'"
+    );
+    assert_eq!(
+        validate_redirect_protocol("HT'TP").unwrap_err(),
+        "Invalid redirect protocol \"HT'TP\": expected HTTP, HTTPS, or #{protocol}"
+    );
+    assert_eq!(
+        validate_redirect_port("44'3").unwrap_err(),
+        "Invalid redirect port \"44'3\": expected decimal integer or #{port}"
+    );
+    assert_eq!(
+        validate_http_response_status_code("300").unwrap_err(),
+        "must start with 2, 4, or 5 (got '3')"
+    );
 }
 
 #[test]
@@ -8159,7 +8303,7 @@ fn union_unique_enum_match_preserves_structured_variant_payload() {
         else {
             panic!("{path} discarded InvalidEnumVariant payload")
         };
-        assert_eq!(value, "zzz");
+        assert_eq!(value.as_plain(), Some("zzz"));
         assert_eq!(type_name.as_deref(), Some("Mode"));
         assert_eq!(
             expected.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -8520,7 +8664,8 @@ fn custom_validator_returns_structured_type_error_directly() {
         validator(|v| match v {
             Value::Concrete(ConcreteValue::String(s)) if s == "fast" || s == "slow" => Ok(()),
             Value::Concrete(ConcreteValue::String(s)) => Err(TypeError::InvalidEnumVariant {
-                value: s.clone(),
+                value: s.clone().into(),
+                value_kind: InvalidEnumValueKind::String,
                 attribute: None,
                 type_name: Some("Mode".to_string()),
                 expected: vec![
@@ -8536,10 +8681,12 @@ fn custom_validator_returns_structured_type_error_directly() {
         None,
     );
     let err = attr
-        .validate(&Value::Concrete(ConcreteValue::String(
-            "medium".to_string(),
-        )))
+        .validate(&Value::Concrete(ConcreteValue::String("it's".to_string())))
         .unwrap_err();
+    assert!(
+        err.to_string().contains("Invalid value \"it's\" for Mode"),
+        "string enum value should use a Carina literal: {err}"
+    );
     match err {
         TypeError::InvalidEnumVariant {
             value,
@@ -8547,7 +8694,7 @@ fn custom_validator_returns_structured_type_error_directly() {
             expected,
             ..
         } => {
-            assert_eq!(value, "medium");
+            assert_eq!(value.as_plain(), Some("it's"));
             assert_eq!(type_name.as_deref(), Some("Mode"));
             let values: Vec<&str> = expected.iter().map(|e| e.value.as_str()).collect();
             assert_eq!(values, vec!["fast", "slow"]);
@@ -9225,7 +9372,7 @@ mod enum_binding_collision {
         let value = Value::Concrete(ConcreteValue::String("vpc".to_string()));
         let err = t.validate(&value).unwrap_err();
         assert!(
-            matches!(err, TypeError::StringLiteralExpectedEnum { ref user_typed, .. } if user_typed == "vpc"),
+            matches!(err, TypeError::StringLiteralExpectedEnum { ref user_typed, .. } if user_typed.as_plain() == Some("vpc")),
             "expected StringLiteralExpectedEnum, got: {err:?}"
         );
     }

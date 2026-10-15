@@ -3732,7 +3732,7 @@ exports { out: Int = instance.out }
         assert!(
             errors[0]
                 .reason
-                .contains("expected Int, got string \"wrong\""),
+                .contains("expected Int, got string 'wrong'"),
             "{}",
             errors[0]
         );

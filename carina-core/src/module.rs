@@ -4,7 +4,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::parser::{ResourceTypePath, TypeExpr};
+use crate::parser::{
+    ResourceTypePath, TypeExpr, display_double_quoted_literal_part, display_string_literal,
+};
 use crate::resource::{ConcreteValue, DeferredValue, Resource, Value};
 
 /// Dependency between resources
@@ -119,21 +121,14 @@ impl DependencyGraph {
 fn format_value(value: &Value) -> String {
     match value {
         Value::Concrete(ConcreteValue::String(s)) => {
-            if s.len() > 50 {
-                format!("\"{}...\"", &s[..47])
-            } else {
-                format!("\"{}\"", s)
-            }
+            let (value, marker) = crate::utils::truncate_chars_for_display(s, 47);
+            format!("{}{marker}", display_string_literal(&value))
         }
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
             // Enum identifiers render unquoted to match how the user
             // typed them.
-            let s = s.as_str();
-            if s.len() > 50 {
-                format!("{}...", &s[..47])
-            } else {
-                s.to_string()
-            }
+            let (value, marker) = crate::utils::truncate_chars_for_display(s.as_str(), 47);
+            format!("{value}{marker}")
         }
         Value::Concrete(ConcreteValue::CanonicalEnum(c)) => c.api_value().to_string(),
         Value::Concrete(ConcreteValue::Int(n)) => n.to_string(),
@@ -161,7 +156,7 @@ fn format_value(value: &Value) -> String {
             if items.is_empty() {
                 "[]".to_string()
             } else if items.len() <= 3 {
-                let strs: Vec<_> = items.iter().map(|s| format!("\"{}\"", s)).collect();
+                let strs: Vec<_> = items.iter().map(|s| display_string_literal(s)).collect();
                 format!("[{}]", strs.join(", "))
             } else {
                 format!("[{} items]", items.len())
@@ -183,11 +178,11 @@ fn format_value(value: &Value) -> String {
             let inner: String = parts
                 .iter()
                 .map(|p| match p {
-                    InterpolationPart::Literal(s) => s.clone(),
+                    InterpolationPart::Literal(s) => display_double_quoted_literal_part(s),
                     InterpolationPart::Expr(v) => format!("${{{}}}", format_value(v)),
                 })
                 .collect();
-            format!("\"{}\"", inner)
+            format!("\"{inner}\"")
         }
         Value::Deferred(DeferredValue::FunctionCall { name, args }) => {
             let arg_strs: Vec<_> = args.iter().map(format_value).collect();
@@ -1343,6 +1338,58 @@ impl ModuleSignature {
 mod tests {
     use super::*;
     use crate::parser::TypeExpr;
+
+    #[test]
+    fn format_value_uses_canonical_string_literals() {
+        assert_eq!(
+            format_value(&Value::Concrete(ConcreteValue::String("hello".to_string()))),
+            "'hello'"
+        );
+        assert_eq!(
+            format_value(&Value::Concrete(ConcreteValue::StringList(vec![
+                "hello".to_string(),
+                "it's".to_string(),
+            ]))),
+            r#"['hello', "it's"]"#
+        );
+        assert_eq!(
+            format_value(&Value::Deferred(DeferredValue::Interpolation(vec![
+                crate::resource::InterpolationPart::Literal("prefix-".to_string()),
+                crate::resource::InterpolationPart::Expr(Value::Deferred(
+                    DeferredValue::BindingRef {
+                        binding: "name".to_string(),
+                    },
+                )),
+            ]))),
+            r#""prefix-${name}""#
+        );
+        assert_eq!(
+            format_value(&Value::Deferred(DeferredValue::Interpolation(vec![
+                crate::resource::InterpolationPart::Literal(r#"prefix-${literal}""#.to_string(),),
+                crate::resource::InterpolationPart::Expr(Value::Deferred(
+                    DeferredValue::BindingRef {
+                        binding: "name".to_string(),
+                    },
+                )),
+            ]))),
+            r#""prefix-\${literal}\"${name}""#
+        );
+    }
+
+    #[test]
+    fn format_value_truncates_multibyte_strings_by_chars() {
+        let value = format!("{}あいうえお", "a".repeat(46));
+        assert_eq!(value.chars().count(), 51);
+
+        assert_eq!(
+            format_value(&Value::Concrete(ConcreteValue::String(value.clone()))),
+            format!("'{}あ'…", "a".repeat(46))
+        );
+        assert_eq!(
+            format_value(&Value::Concrete(ConcreteValue::enum_identifier(value))),
+            format!("{}あ…", "a".repeat(46))
+        );
+    }
 
     #[test]
     fn test_cycle_detection() {

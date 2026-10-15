@@ -9,6 +9,8 @@
 //! - `<<'MARKER'` — literal heredoc (`${...}` is NOT expanded)
 //! - `<<-'MARKER'` — literal + indented
 
+use crate::parser::escape_double_quoted_heredoc_part;
+
 /// Result of preprocessing: the transformed source and a list of heredoc
 /// replacements (for the formatter to restore them in the output).
 #[derive(Debug)]
@@ -238,21 +240,12 @@ fn strip_common_indent(lines: &[&str]) -> String {
 
 /// Escape a string for embedding inside double quotes (literal — escapes `${`).
 fn escape_for_double_quote(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
-        .replace("${", "\\${")
+    escape_double_quoted_heredoc_part(s, false)
 }
 
 /// Escape for double quotes but preserve `${...}` for interpolation.
 fn escape_for_double_quote_interpolating(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    escape_double_quoted_heredoc_part(s, true)
 }
 
 /// Check if a line contains a heredoc start (`<<MARKER` or `<<-MARKER`),

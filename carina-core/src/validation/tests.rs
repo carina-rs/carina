@@ -2297,7 +2297,7 @@ fn rendered_typecheck_result_struct_got_string_includes_literal() {
 
     let message = result.expect("a string must not satisfy a struct type");
     assert!(
-        message.contains("got string \"production\""),
+        message.contains("got string 'production'"),
         "struct mismatch should include the scalar literal; got: {message}"
     );
 }
@@ -2909,7 +2909,7 @@ fn validate_module_calls_rejects_literal_union_mismatch() {
     .expect_err("a string outside the literal union must be rejected");
 
     assert!(
-        error.contains("expected 'dev' | 'stg' | 'prod', got string \"production\""),
+        error.contains("expected 'dev' | 'stg' | 'prod', got string 'production'"),
         "unexpected error: {error}"
     );
 }
@@ -5036,7 +5036,7 @@ fn quoted_literal_enum_value_yields_string_literal_diagnostic() {
         "quoted literal must emit the shape-mismatch diagnostic, got: {err}"
     );
     assert!(
-        err.contains("\"aaa\""),
+        err.contains("'aaa'"),
         "diagnostic must echo the user's literal, got: {err}"
     );
     assert!(

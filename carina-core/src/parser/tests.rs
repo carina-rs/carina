@@ -2908,7 +2908,7 @@ fn saved_plan_provider_configs_require_fully_resolved_attributes() {
 
     assert!(
         matches!(
-            error,
+            &error,
             ProviderConfigInvariantError::UnresolvedAttribute { .. }
         ),
         "unexpected validation error: {error}"
@@ -4401,6 +4401,37 @@ fn parse_removed_block() {
 }
 
 #[test]
+fn double_quoted_state_block_address_decodes_escapes() {
+    let input = r#"
+        removed {
+            from = awscc.ec2.Vpc "legacy-\"vpc"
+        }
+    "#;
+
+    let result = parse(input, &ProviderContext::default()).unwrap();
+    let StateBlock::Removed { from } = &result.state_blocks[0] else {
+        panic!("expected removed block");
+    };
+    assert_eq!(from.name_str(), r#"legacy-"vpc"#);
+}
+
+#[test]
+fn state_block_address_rejects_interpolation() {
+    let input = r#"
+        removed {
+            from = awscc.ec2.Vpc "legacy-${name}"
+        }
+    "#;
+
+    let error = parse(input, &ProviderContext::default())
+        .expect_err("interpolation has no meaning in a state block address");
+    assert!(
+        error.to_string().contains("interpolation is not allowed"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn empty_removed_identity_reports_its_source_line_and_preserves_the_cause() {
     let input = r#"
 removed { from = mock.test.resource "" }
@@ -4703,6 +4734,21 @@ fn parse_for_expression_with_runtime_function_call_errors() {
         err.contains("runtime"),
         "Expected error about runtime dependency, got: {}",
         err
+    );
+}
+
+#[test]
+fn invalid_for_iterable_truncates_unicode_by_chars_and_renders_as_a_literal() {
+    let value = format!("{}あいう", "a".repeat(49));
+    let input = format!("for item in (\"{value}\") {{ awscc.ec2.Vpc {{ name = item }} }}");
+
+    let error = parse(&input, &ProviderContext::default())
+        .expect_err("a string cannot be used as a for iterable");
+    let expected = format!("iterable is string '{}あ'… (expected list)", "a".repeat(49));
+
+    assert!(
+        error.to_string().contains(&expected),
+        "unexpected error: {error}"
     );
 }
 
@@ -6183,7 +6229,7 @@ fn user_fn_typed_param_int() {
     let msg = format!("{err}");
     assert_eq!(
         msg,
-        "User-defined function error: function 'double': parameter 'x': expected Int, got string \"not_int\""
+        "User-defined function error: function 'double': parameter 'x': expected Int, got string 'not_int'"
     );
 }
 
@@ -6387,7 +6433,7 @@ fn user_fn_typed_param_bool_mismatch() {
     let msg = format!("{err}");
     assert_eq!(
         msg,
-        "User-defined function error: function 'check': parameter 'flag': expected Bool, got string \"not_bool\". Use true or false."
+        "User-defined function error: function 'check': parameter 'flag': expected Bool, got string 'not_bool'. Use true or false."
     );
 }
 
@@ -8927,6 +8973,32 @@ fn parses_upstream_state_expr_with_source() {
 }
 
 #[test]
+fn upstream_state_source_decodes_double_quoted_escapes() {
+    let input = r#"let orgs = upstream_state { source = "../x\"y" }"#;
+    let parsed = parse(input, &ProviderContext::default()).expect("parse should succeed");
+
+    assert_eq!(
+        parsed.upstream_states[0].source,
+        std::path::PathBuf::from("../x\"y")
+    );
+}
+
+#[test]
+fn upstream_state_source_rejects_interpolation() {
+    let input = r#"let orgs = upstream_state { source = "./a${x}" }"#;
+    let error = parse(input, &ProviderContext::default())
+        .expect_err("interpolated source must be a parse error");
+    let message = error.to_string();
+
+    assert!(
+        message.contains(
+            "upstream_state 'orgs': 'source' must be a string literal without interpolation, got: \"./a${x}\""
+        ),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn old_top_level_upstream_state_syntax_is_rejected() {
     // The pre-#1926 form `upstream_state "name" { ... }` was a top-level
     // statement; with the let-binding form it should no longer parse.
@@ -8976,8 +9048,9 @@ fn upstream_state_source_must_be_string() {
         .expect_err("non-string source must be a parse error");
     let msg = err.to_string();
     assert!(
-        msg.contains("source") && msg.contains("orgs"),
-        "error should mention source and binding: {msg}",
+        msg.contains("upstream_state 'orgs': 'source' must be a string literal, got: 42")
+            && !msg.contains("without interpolation"),
+        "error should keep the generic non-string context: {msg}",
     );
 }
 
@@ -10776,6 +10849,29 @@ arguments {
             TypeExpr::StringLiteral("dev".to_string()),
             TypeExpr::StringLiteral("prod".to_string()),
         ])
+    );
+}
+
+#[test]
+fn arguments_param_rejects_interpolated_string_literal_type() {
+    let src = r#"
+arguments {
+  env: "${other}"
+}
+"#;
+
+    let error = parse(src, &ProviderContext::default())
+        .expect_err("interpolation has no meaning in a string literal type");
+    assert!(
+        matches!(
+            error,
+            ParseError::InterpolationNotAllowedInLiteralString { .. }
+        ),
+        "unexpected error variant: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("interpolation is not allowed"),
+        "unexpected error: {error}"
     );
 }
 

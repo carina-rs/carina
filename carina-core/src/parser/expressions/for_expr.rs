@@ -10,8 +10,8 @@
 use crate::parser::expressions::primary::parse_primary_eval;
 use crate::parser::{
     DeferredForExpression, ModuleCall, ParseContext, ParseError, ParseWarning, Rule, WarningKind,
-    evaluate_static_value, first_inner, next_pair, parse_expression, parse_module_call,
-    parse_read_resource_expr, parse_resource_expr,
+    display_string_literal, evaluate_static_value, first_inner, next_pair, parse_expression,
+    parse_module_call, parse_read_resource_expr, parse_resource_expr,
 };
 use crate::resource::{ConcreteValue, DataSource, DeferredValue, Resource, UnknownReason, Value};
 
@@ -417,11 +417,13 @@ pub(crate) fn parse_for_expr(
             }
             let iterable_type = match &iterable {
                 Value::Concrete(ConcreteValue::String(s)) => {
-                    format!("string \"{}\"", if s.len() > 50 { &s[..50] } else { s })
+                    let (truncated, marker) = crate::utils::truncate_chars_for_display(s, 50);
+                    format!("string {}{marker}", display_string_literal(&truncated))
                 }
                 Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
-                    let s = s.as_str();
-                    format!("identifier `{}`", if s.len() > 50 { &s[..50] } else { s })
+                    let (truncated, marker) =
+                        crate::utils::truncate_chars_for_display(s.as_str(), 50);
+                    format!("identifier `{truncated}`{marker}")
                 }
                 Value::Concrete(ConcreteValue::Int(i)) => format!("int {}", i),
                 Value::Concrete(ConcreteValue::Float(f)) => format!("float {}", f),

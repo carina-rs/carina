@@ -801,26 +801,26 @@ impl DiagnosticEngine {
                                 // Bool type should not receive String
                                 (
                                     carina_core::schema::Shape::Bool,
-                                    Value::Concrete(ConcreteValue::String(s)),
+                                    Value::Concrete(ConcreteValue::String(_)),
                                 ) => Some(format!(
-                                    "Type mismatch: expected Bool, got String \"{}\". Use true or false.",
-                                    s
+                                    "Type mismatch: expected Bool, got {}. Use true or false.",
+                                    carina_core::ValueDescription::of(attr_value)
                                 )),
                                 // Int type should not receive String
                                 (
                                     carina_core::schema::Shape::Int { .. },
-                                    Value::Concrete(ConcreteValue::String(s)),
+                                    Value::Concrete(ConcreteValue::String(_)),
                                 ) => Some(format!(
-                                    "Type mismatch: expected Int, got String \"{}\".",
-                                    s
+                                    "Type mismatch: expected Int, got {}.",
+                                    carina_core::ValueDescription::of(attr_value)
                                 )),
                                 // Float type should not receive String
                                 (
                                     carina_core::schema::Shape::Float { .. },
-                                    Value::Concrete(ConcreteValue::String(s)),
+                                    Value::Concrete(ConcreteValue::String(_)),
                                 ) => Some(format!(
-                                    "Type mismatch: expected Float, got String \"{}\".",
-                                    s
+                                    "Type mismatch: expected Float, got {}.",
+                                    carina_core::ValueDescription::of(attr_value)
                                 )),
                                 // Every statically typed deferred reference is
                                 // checked through the same BindingIndex source
@@ -1722,6 +1722,13 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             100,
             DiagnosticSeverity::ERROR,
             message.clone(),
+        ),
+        ParseError::InterpolationNotAllowedInLiteralString { line } => carina_diagnostic(
+            (*line as u32).saturating_sub(1),
+            0,
+            100,
+            DiagnosticSeverity::ERROR,
+            "interpolation is not allowed in this string literal".to_string(),
         ),
         ParseError::InvalidResourceIdentity { line, source } => carina_diagnostic(
             (*line as u32).saturating_sub(1),

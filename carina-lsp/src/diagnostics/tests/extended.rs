@@ -842,6 +842,54 @@ mode = "invalid_mode"
 }
 
 #[test]
+fn resource_scalar_string_mismatches_use_core_value_descriptions_once() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let schema = ResourceSchema::new("test.resource")
+        .attribute(AttributeSchema::new("enabled", AttributeType::bool()))
+        .attribute(AttributeSchema::new("count", AttributeType::int()))
+        .attribute(AttributeSchema::new("ratio", AttributeType::float()));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", schema);
+    let engine = custom_engine(schemas);
+    let doc = create_document(
+        r#"mock.test.resource {
+  enabled = "yes"
+  count   = "forty-two"
+  ratio   = "three-point-one-four"
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let mismatches = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.starts_with("Type mismatch: expected"))
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+
+    let expected = [
+        "Type mismatch: expected Bool, got string 'yes'. Use true or false.",
+        "Type mismatch: expected Int, got string 'forty-two'.",
+        "Type mismatch: expected Float, got string 'three-point-one-four'.",
+    ];
+    assert_eq!(
+        mismatches.len(),
+        expected.len(),
+        "diagnostics: {diagnostics:#?}"
+    );
+    for expected in expected {
+        assert_eq!(
+            mismatches
+                .iter()
+                .filter(|message| **message == expected)
+                .count(),
+            1,
+            "each scalar mismatch should be reported once: {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
 fn union_of_structs_reports_alternatives_at_the_attribute() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
@@ -4220,8 +4268,7 @@ fn multifile_sibling_let_violating_module_constraint_has_one_lsp_diagnostic() {
         "the expanded sibling let violation must be reported once: {diagnostics:#?}"
     );
     assert!(
-        matching[0].message.contains("\"abcd\"")
-            && !matching[0].message.contains("enum identifier"),
+        matching[0].message.contains("'abcd'") && !matching[0].message.contains("enum identifier"),
         "the diagnostic must render the expanded value: {diagnostics:#?}"
     );
 }
@@ -4302,7 +4349,7 @@ fn multifile_expanded_for_does_not_shift_checked_constraint_diagnostic() {
     );
     assert_eq!(
         matching[0].message,
-        "anonymous call to module 'checked': argument 'name': name must be at most three characters (got \"abcd\")"
+        "anonymous call to module 'checked': argument 'name': name must be at most three characters (got 'abcd')"
     );
     assert_eq!(matching[0].range.start.line, 6);
 }
@@ -4368,7 +4415,7 @@ checked {}
     );
     assert_eq!(
         matching[0].message,
-        "anonymous call to module 'checked': argument 'prefix': prefix must be at most three characters (got \"abcdef\")"
+        "anonymous call to module 'checked': argument 'prefix': prefix must be at most three characters (got 'abcdef')"
     );
     assert_eq!(matching[0].range.start.line, 2);
 }
@@ -5809,7 +5856,7 @@ fn lsp_quoted_literal_on_namespaced_enum_says_got_a_string_literal() {
             )
         });
     assert!(
-        bad.message.contains("\"aaa\""),
+        bad.message.contains("'aaa'"),
         "diagnostic must echo the user's literal, got: {}",
         bad.message
     );
@@ -5876,7 +5923,7 @@ fn lsp_quoted_literal_on_namespaced_custom_says_got_a_string_literal() {
             )
         });
     assert!(
-        bad.message.contains("\"aaa\""),
+        bad.message.contains("'aaa'"),
         "diagnostic must echo the user's literal, got: {}",
         bad.message
     );
@@ -7824,7 +7871,7 @@ web_tier {
                 .contains("expected 'dev' | 'stg' | 'prod'")
                 || diagnostic
                     .message
-                    .contains("expected Bool, got string \"yes\"")
+                    .contains("expected Bool, got string 'yes'")
         })
         .collect::<Vec<_>>();
 
@@ -7832,13 +7879,13 @@ web_tier {
     assert!(
         type_errors.iter().any(|diagnostic| diagnostic
             .message
-            .contains("expected 'dev' | 'stg' | 'prod', got string \"production\"")),
+            .contains("expected 'dev' | 'stg' | 'prod', got string 'production'")),
         "literal-union mismatch missing: {diagnostics:#?}"
     );
     assert!(
         type_errors.iter().any(|diagnostic| diagnostic
             .message
-            .contains("expected Bool, got string \"yes\". Use true or false.")),
+            .contains("expected Bool, got string 'yes'. Use true or false.")),
         "Bool mismatch missing: {diagnostics:#?}"
     );
 }
@@ -8047,7 +8094,7 @@ inner {
     assert!(
         diagnostics.iter().any(|diagnostic| diagnostic
             .message
-            .contains("expected Int, got string \"wrong\"")),
+            .contains("expected Int, got string 'wrong'")),
         "the context-free literal mismatch must survive a broken sibling: {diagnostics:#?}"
     );
     assert!(
@@ -8200,7 +8247,7 @@ fn export_value_typecheck_skips_buffer_guess_when_directory_merge_fails() {
     assert!(
         diagnostics.iter().any(|diagnostic| diagnostic
             .message
-            .contains("expected Int, got string \"wrong\"")),
+            .contains("expected Int, got string 'wrong'")),
         "a context-free export literal must still be checked: {diagnostics:#?}"
     );
     assert!(
@@ -8227,7 +8274,7 @@ fn attribute_value_typecheck_skips_buffer_guess_when_directory_merge_fails() {
     assert!(
         diagnostics.iter().any(|diagnostic| diagnostic
             .message
-            .contains("expected Int, got string \"wrong\"")),
+            .contains("expected Int, got string 'wrong'")),
         "a context-free attribute literal must still be checked: {diagnostics:#?}"
     );
     assert!(

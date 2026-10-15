@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Posi
 
 use crate::document::Document;
 use carina_core::builtins;
-use carina_core::parser::ArgumentParameter;
+use carina_core::parser::{ArgumentParameter, display_string_literal};
 use carina_core::resource::{ConcreteValue, Value};
 use carina_core::schema::{CompletionValue, ResourceSchema, SchemaRegistry};
 
@@ -50,7 +50,7 @@ fn find_use_import_path(
 /// Format a Value for hover display
 fn format_value_for_hover(value: &Value) -> String {
     match value {
-        Value::Concrete(ConcreteValue::String(s)) => format!("\"{}\"", s),
+        Value::Concrete(ConcreteValue::String(s)) => display_string_literal(s),
         Value::Concrete(ConcreteValue::Int(n)) => n.to_string(),
         Value::Concrete(ConcreteValue::Float(f)) => f.to_string(),
         Value::Concrete(ConcreteValue::Bool(b)) => b.to_string(),
@@ -811,6 +811,15 @@ mod tests {
     use super::*;
     use carina_core::parser::ProviderContext;
     use carina_core::schema::{AttributeSchema, AttributeType};
+
+    #[test]
+    fn format_value_for_hover_uses_canonical_string_literals() {
+        let value = Value::Concrete(ConcreteValue::String(r#"say "hi""#.to_string()));
+        assert_eq!(format_value_for_hover(&value), r#"'say "hi"'"#);
+
+        let value = Value::Concrete(ConcreteValue::String("${value}".to_string()));
+        assert_eq!(format_value_for_hover(&value), r#""\${value}""#);
+    }
 
     #[test]
     fn format_value_for_hover_renders_duration_as_canonical_form() {

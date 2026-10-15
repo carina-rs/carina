@@ -452,7 +452,7 @@ fn cli_rejects_concrete_attribute_literal_mismatch() {
         .iter()
         .filter(|diagnostic| {
             diagnostic.contains("attribute 'y'")
-                && diagnostic.contains("expected 'dev', got string \"prod\"")
+                && diagnostic.contains("expected 'dev', got string 'prod'")
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -522,7 +522,7 @@ let instance = checked {
     assert_eq!(
         lsp_constraint_messages,
         [
-            "module 'checked' (call 'instance'): argument 'x': x must be greater than five (got \"abc\"); error evaluating constraint: cannot compare string with int"
+            "module 'checked' (call 'instance'): argument 'x': x must be greater than five (got 'abc'); error evaluating constraint: cannot compare string with int"
         ]
     );
 }
@@ -680,7 +680,7 @@ checked {
     assert_eq!(lsp_messages, cli_messages);
     assert_eq!(
         lsp_messages,
-        ["anonymous call to module 'checked': argument 'name': name must not be empty (got \"\")"]
+        ["anonymous call to module 'checked': argument 'name': name must not be empty (got '')"]
     );
 }
 

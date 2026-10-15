@@ -5,7 +5,7 @@
 use super::Rule;
 use super::context::next_pair;
 use super::error::ParseError;
-use super::expressions::string_literal::{parse_string_literal, unescape_single_quoted};
+use super::expressions::string_literal::parse_string_literal;
 use crate::eval_value::EvalValue;
 use crate::resource::{ConcreteValue, DeferredValue, Value};
 
@@ -118,54 +118,6 @@ pub(crate) fn parse_state_block_address(
         resource_type,
         name,
     ))
-}
-
-pub(crate) fn extract_string_from_pair(
-    pair: pest::iterators::Pair<Rule>,
-) -> Result<String, ParseError> {
-    // Walk through expression -> pipe_expr -> primary -> string -> string_part -> string_literal
-    fn find_string(pair: pest::iterators::Pair<Rule>) -> Option<String> {
-        if pair.as_rule() == Rule::string_literal {
-            return Some(pair.as_str().to_string());
-        }
-        if pair.as_rule() == Rule::single_quoted_content {
-            return Some(unescape_single_quoted(pair.as_str()));
-        }
-        if pair.as_rule() == Rule::single_quoted_string {
-            return pair
-                .into_inner()
-                .next()
-                .map(|p| unescape_single_quoted(p.as_str()));
-        }
-        if pair.as_rule() == Rule::string {
-            let mut result = String::new();
-            for inner in pair.into_inner() {
-                if let Some(s) = find_string(inner) {
-                    result.push_str(&s);
-                }
-            }
-            return Some(result);
-        }
-        if pair.as_rule() == Rule::string_part {
-            for inner in pair.into_inner() {
-                if let Some(s) = find_string(inner) {
-                    return Some(s);
-                }
-            }
-            return None;
-        }
-        for inner in pair.into_inner() {
-            if let Some(s) = find_string(inner) {
-                return Some(s);
-            }
-        }
-        None
-    }
-
-    find_string(pair).ok_or_else(|| ParseError::InvalidExpression {
-        line: 0,
-        message: "expected a string literal".to_string(),
-    })
 }
 
 /// True if a parsed expression is exactly a plain (uninterpolated)

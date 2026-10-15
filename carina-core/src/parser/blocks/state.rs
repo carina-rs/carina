@@ -27,15 +27,8 @@ pub(in crate::parser) fn parse_import_state_block(
                     to = Some(parse_state_block_address(addr)?);
                 }
                 Rule::import_id_attr => {
-                    // carina#3329: parse via `parse_string_value` (not
-                    // `parse_string_literal`) so `"${binding.attr}|..."`
-                    // keeps its `${...}` segments as deferred `Expr`
-                    // parts. The pre-#3329 path called
-                    // `parse_string_literal`, which concatenated only the
-                    // raw literal segments and silently dropped every
-                    // interpolation — yielding a partially-substituted
-                    // string that the plan displayed as if it were the
-                    // real cloud identifier.
+                    // carina#3329: import IDs allow interpolation, unlike
+                    // state-block addresses parsed by `parse_string_literal`.
                     let str_pair = first_inner(inner, "string", "import id")?;
                     id = Some(parse_string_value(str_pair, ctx)?);
                 }

@@ -3,6 +3,13 @@
 use crate::resource::{ConcreteValue, Value};
 use crate::schema::{AttributeType, EnumParts};
 
+pub(crate) fn truncate_chars_for_display(value: &str, max_chars: usize) -> (String, &'static str) {
+    let mut chars = value.chars();
+    let rendered = chars.by_ref().take(max_chars).collect();
+    let marker = if chars.next().is_some() { "…" } else { "" };
+    (rendered, marker)
+}
+
 /// A namespaced DSL enum identifier, parsed once and reused.
 ///
 /// The DSL accepts enum values in four shapes:
@@ -1322,6 +1329,18 @@ mod tests {
             segments,
             kind: name.to_string(),
         }
+    }
+
+    #[test]
+    fn truncate_chars_for_display_is_unicode_safe() {
+        assert_eq!(
+            truncate_chars_for_display("abあいう", 4),
+            ("abあい".to_string(), "…")
+        );
+        assert_eq!(
+            truncate_chars_for_display("abあい", 4),
+            ("abあい".to_string(), "")
+        );
     }
 
     #[test]
