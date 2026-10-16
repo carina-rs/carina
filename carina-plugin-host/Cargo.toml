@@ -33,6 +33,7 @@ indexmap = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+carina-core = { path = "../carina-core", features = ["test-utils"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 wasmprinter = "0.245.1"

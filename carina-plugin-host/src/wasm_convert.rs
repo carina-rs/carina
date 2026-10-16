@@ -8,8 +8,9 @@ use carina_core::provider::{
     CreateOutcome as CoreCreateOutcome, CreateRequest as CoreCreateRequest,
     DeleteRequest as CoreDeleteRequest, ErrorDetail as CoreErrorDetail, PatchOp as CorePatchOp,
     PatchOpKind as CorePatchOpKind, ProviderError as CoreProviderError,
-    ReadRequest as CoreReadRequest, UpdateOutcome as CoreUpdateOutcome,
-    UpdatePatch as CoreUpdatePatch, UpdateRequest as CoreUpdateRequest,
+    ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
+    UpdateOutcome as CoreUpdateOutcome, UpdatePatch as CoreUpdatePatch,
+    UpdateRequest as CoreUpdateRequest,
 };
 use carina_core::resource::{
     ConcreteValue, DataSource as CoreDataSource, DeferredValue, Directives,
@@ -21,7 +22,9 @@ use carina_core::schema::{
     InputMode as CoreInputMode, ResourceSchema as CoreResourceSchema,
     StructField as CoreStructField, UniqueNameSpec as CoreUniqueNameSpec, legacy_validator,
 };
-use carina_core::value::{SerializationContext, SerializationError};
+use carina_core::value::{
+    SerializationContext, SerializationError, persisted_json_to_dsl_value, persisted_secret_marker,
+};
 use carina_core::wait::BindingPattern as CoreBindingPattern;
 use carina_core::wait::predicate::{AttrPath as CoreAttrPath, AttrPathError};
 
@@ -248,6 +251,19 @@ impl std::error::Error for WasmValueDecodeError {
 /// `"Secret(String(\"…\"))"` literally to the provider — a contract leak
 /// equivalent to the pre-#2387 `ResourceRef` debug-string.
 pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, SerializationError> {
+    core_to_wit_value_from(v, ValueWireSource::Desired)
+}
+
+#[derive(Clone, Copy)]
+enum ValueWireSource {
+    Desired,
+    PersistedState,
+}
+
+fn core_to_wit_value_from(
+    v: &CoreValue,
+    source: ValueWireSource,
+) -> Result<wit::Value, SerializationError> {
     match v {
         CoreValue::Concrete(ConcreteValue::String(s)) => {
             // Enum identifiers lower to the WIT boundary as plain
@@ -282,8 +298,10 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
             Ok(wit::Value::IntVal(d.as_secs() as i64))
         }
         CoreValue::Concrete(ConcreteValue::List(items)) => {
-            let json_items: Result<Vec<serde_json::Value>, _> =
-                items.iter().map(core_value_to_json).collect();
+            let json_items: Result<Vec<serde_json::Value>, _> = items
+                .iter()
+                .map(|value| core_value_to_json_from(value, source))
+                .collect();
             let json_str = serde_json::to_string(&json_items?)
                 .expect("serde_json::Value -> String is infallible");
             Ok(wit::Value::ListVal(json_str))
@@ -296,7 +314,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
         CoreValue::Concrete(ConcreteValue::Map(map)) => {
             let json_map: Result<serde_json::Map<String, serde_json::Value>, _> = map
                 .iter()
-                .map(|(k, v)| core_value_to_json(v).map(|jv| (k.clone(), jv)))
+                .map(|(k, v)| core_value_to_json_from(v, source).map(|jv| (k.clone(), jv)))
                 .collect();
             let json_str = serde_json::to_string(&json_map?)
                 .expect("serde_json::Value -> String is infallible");
@@ -332,18 +350,47 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
             })
         }
         CoreValue::Deferred(DeferredValue::Secret(inner)) => {
-            let json = core_value_to_json(inner)?;
+            let json = core_value_to_json_from(inner, source)?;
             let json_str =
                 serde_json::to_string(&json).expect("serde_json::Value -> String is infallible");
             Ok(wit::Value::SecretVal(json_str))
         }
+        CoreValue::Deferred(DeferredValue::RedactedSecret { hash }) => match source {
+            ValueWireSource::PersistedState => {
+                Ok(wit::Value::StrVal(persisted_secret_marker(hash)))
+            }
+            ValueWireSource::Desired => Err(SerializationError::RedactedSecretNotAllowed {
+                context: SerializationContext::WasmBoundary,
+            }),
+        },
     }
 }
 
 /// Convert a WIT Value to a core Value.
 pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDecodeError> {
+    wit_to_core_value_from(v, ValueDecodeSource::Provider)
+}
+
+#[derive(Clone, Copy)]
+enum ValueDecodeSource {
+    Provider,
+    PersistedState,
+}
+
+fn wit_to_core_value_from(
+    v: &wit::Value,
+    source: ValueDecodeSource,
+) -> Result<CoreValue, WasmValueDecodeError> {
     match v {
-        wit::Value::StrVal(s) => Ok(CoreValue::Concrete(ConcreteValue::String(s.clone().into()))),
+        wit::Value::StrVal(s) => match source {
+            ValueDecodeSource::Provider => {
+                Ok(CoreValue::Concrete(ConcreteValue::String(s.clone().into())))
+            }
+            ValueDecodeSource::PersistedState => Ok(persisted_json_to_dsl_value(
+                &serde_json::Value::String(s.clone()),
+            )
+            .expect("a JSON string always converts to a DSL value")),
+        },
         wit::Value::IntVal(i) => Ok(CoreValue::Concrete(ConcreteValue::Int(*i))),
         wit::Value::FloatVal(f) => Ok(CoreValue::Concrete(ConcreteValue::Float(*f))),
         wit::Value::BoolVal(b) => Ok(CoreValue::Concrete(ConcreteValue::Bool(*b))),
@@ -386,7 +433,7 @@ pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDe
                     WasmValueDecodeErrorKind::ExpectedArray,
                 ));
             }
-            json_to_core_value(&value, WitValueVariant::ListVal)
+            json_to_core_value(&value, WitValueVariant::ListVal, source)
         }
         wit::Value::MapVal(json) => {
             let value: serde_json::Value = serde_json::from_str(json).map_err(|source| {
@@ -401,7 +448,7 @@ pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDe
                     WasmValueDecodeErrorKind::ExpectedObject,
                 ));
             }
-            json_to_core_value(&value, WitValueVariant::MapVal)
+            json_to_core_value(&value, WitValueVariant::MapVal, source)
         }
         wit::Value::SecretVal(json) => {
             // Decode the JSON-encoded inner value the same way `ListVal` /
@@ -414,7 +461,11 @@ pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDe
                     WasmValueDecodeErrorKind::InvalidJson(source),
                 )
             })?;
-            let inner = json_to_core_value(&inner_json, WitValueVariant::SecretVal)?;
+            let inner = json_to_core_value(
+                &inner_json,
+                WitValueVariant::SecretVal,
+                ValueDecodeSource::Provider,
+            )?;
             Ok(CoreValue::Deferred(DeferredValue::Secret(Box::new(inner))))
         }
     }
@@ -468,7 +519,15 @@ pub(crate) fn wit_to_core_binding_pattern(
 /// `Err` for the same set of variants as `core_to_wit_value` — see
 /// that function's doc for the rationale and the strip-and-restore
 /// pass that keeps these arms unreachable in legitimate flows.
+#[cfg(test)]
 fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationError> {
+    core_value_to_json_from(v, ValueWireSource::Desired)
+}
+
+fn core_value_to_json_from(
+    v: &CoreValue,
+    source: ValueWireSource,
+) -> Result<serde_json::Value, SerializationError> {
     match v {
         CoreValue::Concrete(ConcreteValue::String(s)) => {
             Ok(serde_json::Value::String(s.expose_plaintext().to_owned()))
@@ -491,7 +550,10 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
             Ok(serde_json::Value::Number((d.as_secs() as i64).into()))
         }
         CoreValue::Concrete(ConcreteValue::List(items)) => {
-            let arr: Result<Vec<_>, _> = items.iter().map(core_value_to_json).collect();
+            let arr: Result<Vec<_>, _> = items
+                .iter()
+                .map(|value| core_value_to_json_from(value, source))
+                .collect();
             Ok(serde_json::Value::Array(arr?))
         }
         CoreValue::Concrete(ConcreteValue::StringList(items)) => Ok(serde_json::Value::Array(
@@ -503,7 +565,7 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         CoreValue::Concrete(ConcreteValue::Map(map)) => {
             let obj: Result<serde_json::Map<String, serde_json::Value>, _> = map
                 .iter()
-                .map(|(k, v)| core_value_to_json(v).map(|jv| (k.clone(), jv)))
+                .map(|(k, v)| core_value_to_json_from(v, source).map(|jv| (k.clone(), jv)))
                 .collect();
             Ok(serde_json::Value::Object(obj?))
         }
@@ -544,7 +606,15 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         // that decode `list-val` / `map-val` see the inner JSON shape;
         // `secret-val` is the channel used to mark the *attribute* itself
         // as a secret.
-        CoreValue::Deferred(DeferredValue::Secret(inner)) => core_value_to_json(inner),
+        CoreValue::Deferred(DeferredValue::Secret(inner)) => core_value_to_json_from(inner, source),
+        CoreValue::Deferred(DeferredValue::RedactedSecret { hash }) => match source {
+            ValueWireSource::PersistedState => {
+                Ok(serde_json::Value::String(persisted_secret_marker(hash)))
+            }
+            ValueWireSource::Desired => Err(SerializationError::RedactedSecretNotAllowed {
+                context: SerializationContext::WasmBoundary,
+            }),
+        },
     }
 }
 
@@ -552,11 +622,16 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
 fn json_to_core_value(
     v: &serde_json::Value,
     wit_variant: WitValueVariant,
+    source: ValueDecodeSource,
 ) -> Result<CoreValue, WasmValueDecodeError> {
     match v {
-        serde_json::Value::String(s) => {
-            Ok(CoreValue::Concrete(ConcreteValue::String(s.clone().into())))
-        }
+        serde_json::Value::String(s) => match source {
+            ValueDecodeSource::Provider => {
+                Ok(CoreValue::Concrete(ConcreteValue::String(s.clone().into())))
+            }
+            ValueDecodeSource::PersistedState => Ok(persisted_json_to_dsl_value(v)
+                .expect("a JSON string always converts to a DSL value")),
+        },
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(CoreValue::Concrete(ConcreteValue::Int(i)))
@@ -573,7 +648,7 @@ fn json_to_core_value(
         serde_json::Value::Array(items) => {
             let items = items
                 .iter()
-                .map(|item| json_to_core_value(item, wit_variant))
+                .map(|item| json_to_core_value(item, wit_variant, source))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(CoreValue::Concrete(ConcreteValue::List(items)))
         }
@@ -581,7 +656,7 @@ fn json_to_core_value(
             let map = map
                 .iter()
                 .map(|(key, value)| {
-                    json_to_core_value(value, wit_variant)
+                    json_to_core_value(value, wit_variant, source)
                         .map(|value| (key.clone(), value))
                         .map_err(|error| error.prepend_attribute(key))
                 })
@@ -608,6 +683,36 @@ where
         .collect()
 }
 
+fn core_to_wit_persisted_value_map<'a, M>(
+    map: M,
+) -> Result<Vec<(String, wit::Value)>, SerializationError>
+where
+    M: IntoIterator<Item = (&'a String, &'a CoreValue)>,
+{
+    map.into_iter()
+        .map(|(key, value)| {
+            core_to_wit_value_from(value, ValueWireSource::PersistedState)
+                .map(|value| (key.clone(), value))
+        })
+        .collect()
+}
+
+/// Encode one saved-attribute entry through the persisted-state wire policy.
+///
+/// `CoreSavedAttrs` can only be obtained from opaque `PersistedAttributes`
+/// views returned by state rows and then passed through
+/// `RawSavedAttrs::from_persisted(...).lift(...)`; desired attribute maps have
+/// no conversion into that provenance type.
+pub(crate) fn core_saved_attrs_to_wit(
+    saved_attrs: &CoreSavedAttrs,
+    id: &CoreResourceId,
+) -> Result<Option<Vec<(String, wit::Value)>>, SerializationError> {
+    saved_attrs
+        .get(id)
+        .map(core_to_wit_persisted_value_map)
+        .transpose()
+}
+
 pub(crate) fn wit_to_core_value_map(
     entries: &[(String, wit::Value)],
 ) -> Result<HashMap<String, CoreValue>, WasmValueDecodeError> {
@@ -615,6 +720,23 @@ pub(crate) fn wit_to_core_value_map(
         .iter()
         .map(|(key, value)| {
             wit_to_core_value(value)
+                .map(|value| (key.clone(), value))
+                .map_err(|error| error.prepend_attribute(key))
+        })
+        .collect()
+}
+
+/// Decode attributes returned from `normalize_state` or
+/// `hydrate_read_state`, restoring legacy marker strings to their typed
+/// persisted representation. Ordinary provider CRUD responses use
+/// [`wit_to_core_value_map`] and never acquire marker semantics.
+pub(crate) fn wit_to_core_persisted_value_map(
+    entries: &[(String, wit::Value)],
+) -> Result<HashMap<String, CoreValue>, WasmValueDecodeError> {
+    entries
+        .iter()
+        .map(|(key, value)| {
+            wit_to_core_value_from(value, ValueDecodeSource::PersistedState)
                 .map(|value| (key.clone(), value))
                 .map_err(|error| error.prepend_attribute(key))
         })
@@ -681,7 +803,7 @@ pub(crate) fn wit_to_core_resource_id(id: &wit::ResourceId) -> CoreResourceId {
 pub(crate) fn core_to_wit_state(state: &CoreState) -> Result<wit::State, SerializationError> {
     Ok(wit::State {
         identifier: state.identifier.clone(),
-        attributes: core_to_wit_value_map(&state.attributes)?,
+        attributes: core_to_wit_persisted_value_map(&state.attributes)?,
         exists: state.exists,
     })
 }
@@ -1173,8 +1295,12 @@ fn proto_attr_schema_to_core(
         .map(|value| {
             let json = serde_json::to_value(value)
                 .map_err(SchemaDecodeError::schema_default_value_encode)?;
-            json_to_core_value(&json, WitValueVariant::SchemaDefault)
-                .map_err(SchemaDecodeError::schema_default_value_decode)
+            json_to_core_value(
+                &json,
+                WitValueVariant::SchemaDefault,
+                ValueDecodeSource::Provider,
+            )
+            .map_err(SchemaDecodeError::schema_default_value_decode)
         })
         .transpose()
         .map_err(|error| error.prepend_attribute(name))?;
@@ -1914,6 +2040,20 @@ mod tests {
     }
 
     #[test]
+    fn redacted_saved_plan_secret_is_rejected_at_wasm_boundary() {
+        let value: CoreValue = serde_json::from_value(serde_json::json!({
+            "RedactedSecret": { "hash": "00".repeat(32) }
+        }))
+        .expect("deserialize saved-plan placeholder");
+        assert!(matches!(
+            core_to_wit_value(&value),
+            Err(SerializationError::RedactedSecretNotAllowed {
+                context: SerializationContext::WasmBoundary
+            })
+        ));
+    }
+
+    #[test]
     fn unknown_returns_err_in_core_value_to_json() {
         use carina_core::resource::{AccessPath, UnknownReason};
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".to_string()]);
@@ -2416,6 +2556,75 @@ mod tests {
         assert_eq!(back.identifier, Some("vpc-12345".into()));
     }
 
+    #[test]
+    fn persisted_state_and_saved_attrs_encode_redacted_secrets_as_legacy_marker_strings() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let marker = format!("{}{}", carina_core::value::SECRET_PREFIX, hash);
+        let redacted: CoreValue = serde_json::from_value(serde_json::json!({
+            "RedactedSecret": { "hash": hash }
+        }))
+        .expect("deserialize persisted secret marker");
+        let id = CoreResourceId::with_provider_identity("aws", "test.Resource", "example", None);
+        let state = CoreState::existing(
+            id.clone(),
+            HashMap::from([("token".to_string(), redacted.clone())]),
+        );
+
+        let wit_state = core_to_wit_state(&state)
+            .expect("persisted state must retain the provider's legacy string wire shape");
+        assert!(matches!(
+            wit_state.attributes.as_slice(),
+            [(key, wit::Value::StrVal(value))] if key == "token" && value == &marker
+        ));
+
+        let saved = carina_core::provider::RawSavedAttrs::from_decoded_values_for_test(
+            HashMap::from([(id.clone(), HashMap::from([("token".to_string(), redacted)]))]),
+        )
+        .lift(&carina_core::schema::SchemaRegistry::new());
+        let wit_saved = core_saved_attrs_to_wit(saved.as_provider_saved_attrs(), &id)
+            .expect("saved attributes must retain the provider's legacy string wire shape");
+        assert!(matches!(
+            wit_saved.as_deref(),
+            Some([(key, wit::Value::StrVal(value))]) if key == "token" && value == &marker
+        ));
+    }
+
+    #[test]
+    fn desired_resource_rejects_redacted_secret_placeholder() {
+        let redacted: CoreValue = serde_json::from_value(serde_json::json!({
+            "RedactedSecret": { "hash": "00".repeat(32) }
+        }))
+        .expect("deserialize saved-plan placeholder");
+        let resource = CoreResource::with_provider("aws", "test.Resource", "example", None)
+            .with_attribute("token", redacted);
+
+        assert!(matches!(
+            core_to_wit_resource(&resource),
+            Err(SerializationError::RedactedSecretNotAllowed {
+                context: SerializationContext::WasmBoundary
+            })
+        ));
+    }
+
+    #[test]
+    fn only_state_decode_assigns_secret_marker_semantics() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let marker = format!("{}{}", carina_core::value::SECRET_PREFIX, hash);
+        let wire = wit::Value::StrVal(marker.clone());
+
+        assert_eq!(
+            wit_to_core_value(&wire).expect("ordinary provider value"),
+            CoreValue::Concrete(ConcreteValue::String(marker.into()))
+        );
+        let state = wit_to_core_persisted_value_map(&[("token".to_string(), wire)])
+            .expect("persisted state value");
+        assert!(matches!(
+            state.get("token"),
+            Some(CoreValue::Deferred(DeferredValue::RedactedSecret { hash: loaded }))
+                if loaded.as_str() == hash
+        ));
+    }
+
     // -- Value map helpers --
 
     #[test]
@@ -2554,6 +2763,12 @@ mod tests {
     #[tokio::test]
     async fn test_update_patch_round_trip_preserves_op_order_and_kinds() {
         use carina_core::resource::Value as CV;
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let marker = format!("{}{}", carina_core::value::SECRET_PREFIX, hash);
+        let persisted_secret: CV = serde_json::from_value(serde_json::json!({
+            "RedactedSecret": { "hash": hash }
+        }))
+        .expect("deserialize persisted secret");
         let resource = CoreResource::new("test", "patch-round-trip")
             .with_attribute("a", CV::Concrete(ConcreteValue::String("alpha".into())))
             .with_attribute("b", CV::Concrete(ConcreteValue::Int(42)));
@@ -2565,6 +2780,7 @@ mod tests {
                     "c".to_string(),
                     CV::Concrete(ConcreteValue::String("removed".into())),
                 ),
+                ("persisted_token".to_string(), persisted_secret),
             ]),
         );
         let bindings = carina_core::binding_index::ResolvedBindings::default();
@@ -2586,8 +2802,13 @@ mod tests {
         )
         .await
         .expect("checked request should be prepared");
-        let wit_patch = core_to_wit_update_patch(request.patch()).unwrap();
-        let back: Vec<_> = wit_patch
+        let wit_request = core_to_wit_update_request(&request).unwrap();
+        assert!(wit_request.current.attributes.iter().any(|(key, value)| {
+            key == "persisted_token"
+                && matches!(value, wit::Value::StrVal(value) if value == &marker)
+        }));
+        let back: Vec<_> = wit_request
+            .patch
             .ops
             .iter()
             .map(wit_to_core_patch_op)

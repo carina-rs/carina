@@ -1,14 +1,17 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use colored::{ColoredString, Colorize};
 
 use carina_core::detail_rows::{
-    DetailRow, ListOfMapsDiffField, ListOfMapsDiffItem, ListOfMapsDiffItemKind,
-    ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows_by_instance,
+    DetailRow, HistoricalDisplayAttributes, ListOfMapsDiffField, ListOfMapsDiffItem,
+    ListOfMapsDiffItemKind, ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows_by_instance,
     build_replace_detail_rows_from_display, hidden_unchanged_summary,
 };
-use carina_core::effect::{DeletedInstanceKey, Effect};
+#[cfg(test)]
+use carina_core::effect::DeletedInstanceKey;
+use carina_core::effect::Effect;
 use carina_core::plan::{DeferredSummaryAction, Plan, PlanSummaryPart, ReplaceDisplayInfo};
 #[cfg(test)]
 use carina_core::plan_tree::shorten_attr_name;
@@ -22,6 +25,32 @@ use carina_core::schema::SchemaRegistry;
 use carina_core::value::format_value_pretty;
 
 use crate::DetailLevel;
+
+/// Source for the historical values consumed by plan renderers.
+///
+/// Production has exactly one implementation: the display-safe type built by
+/// the planning seam. The test-only legacy-map implementation keeps older
+/// rendering fixtures concise without reopening the production boundary.
+pub trait HistoricalDisplaySource {
+    fn historical_display<'a>(&'a self, plan: &Plan) -> Cow<'a, HistoricalDisplayAttributes>;
+}
+
+impl HistoricalDisplaySource for HistoricalDisplayAttributes {
+    fn historical_display<'a>(&'a self, _plan: &Plan) -> Cow<'a, HistoricalDisplayAttributes> {
+        Cow::Borrowed(self)
+    }
+}
+
+#[cfg(test)]
+impl HistoricalDisplaySource for HashMap<DeletedInstanceKey, HashMap<String, Value>> {
+    fn historical_display<'a>(&'a self, plan: &Plan) -> Cow<'a, HistoricalDisplayAttributes> {
+        let mut display = HistoricalDisplayAttributes::for_plan(plan);
+        for (key, attributes) in self {
+            display.set_delete_from_provider_and_persisted(key.clone(), attributes, None);
+        }
+        Cow::Owned(display)
+    }
+}
 
 const LEFT_MARGIN: &str = "  ";
 const ATTR_BASE: &str = "    ";
@@ -314,10 +343,10 @@ fn format_export_change(change: &crate::commands::plan::ExportChange) -> String 
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn print_plan(
+pub fn print_plan<D: HistoricalDisplaySource + ?Sized>(
     plan: &Plan,
     detail: DetailLevel,
-    delete_attributes: &HashMap<DeletedInstanceKey, HashMap<String, Value>>,
+    historical_display: &D,
     schemas: Option<&SchemaRegistry>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
     export_changes: &[crate::commands::plan::ExportChange],
@@ -330,7 +359,7 @@ pub fn print_plan(
         format_plan_with_delete_instances(
             plan,
             detail,
-            delete_attributes,
+            historical_display,
             schemas,
             moved_origins,
             export_changes,
@@ -351,10 +380,10 @@ pub fn print_plan(
 /// unchanged-attribute counting (refs awscc#206), so server-side default
 /// fields the user never wrote do not inflate the plan output.
 #[allow(clippy::too_many_arguments)]
-pub fn format_plan_with_delete_instances(
+pub fn format_plan_with_delete_instances<D: HistoricalDisplaySource + ?Sized>(
     plan: &Plan,
     detail: DetailLevel,
-    delete_attributes: &HashMap<DeletedInstanceKey, HashMap<String, Value>>,
+    historical_display: &D,
     schemas: Option<&SchemaRegistry>,
     moved_origins: &HashMap<ResourceId, ResourceId>,
     export_changes: &[crate::commands::plan::ExportChange],
@@ -378,15 +407,11 @@ pub fn format_plan_with_delete_instances(
     writeln!(out, "{}", "Execution Plan:".cyan().bold()).unwrap();
     writeln!(out).unwrap();
 
-    let attrs = if delete_attributes.is_empty() {
-        None
-    } else {
-        Some(delete_attributes)
-    };
+    let historical_display = historical_display.historical_display(plan);
     out.push_str(&format_plan_tree(
         plan,
         detail,
-        attrs,
+        &historical_display,
         schemas,
         moved_origins,
         prev_explicit,
@@ -513,10 +538,10 @@ fn format_deferred_for_expression(deferred: &carina_core::parser::DeferredForExp
     out
 }
 
-pub fn format_destroy_plan_with_delete_instances(
+pub fn format_destroy_plan_with_delete_instances<D: HistoricalDisplaySource + ?Sized>(
     plan: &Plan,
     detail: DetailLevel,
-    delete_attributes: &HashMap<DeletedInstanceKey, HashMap<String, Value>>,
+    historical_display: &D,
 ) -> String {
     let mut out = String::new();
 
@@ -527,10 +552,11 @@ pub fn format_destroy_plan_with_delete_instances(
     writeln!(out, "{}", "Destroy Plan:".red().bold()).unwrap();
     writeln!(out).unwrap();
 
+    let historical_display = historical_display.historical_display(plan);
     out.push_str(&format_plan_tree(
         plan,
         detail,
-        Some(delete_attributes),
+        &historical_display,
         None,
         &HashMap::new(),
         None,
@@ -552,7 +578,7 @@ struct TreeRenderContext<'a> {
     replacement_create_info: HashMap<usize, ReplaceDisplayInfo<'a>>,
     replacement_delete_indices: HashSet<usize>,
     detail: DetailLevel,
-    delete_attributes: Option<&'a HashMap<DeletedInstanceKey, HashMap<String, Value>>>,
+    historical_display: &'a HistoricalDisplayAttributes,
     schemas: Option<&'a SchemaRegistry>,
     moved_origins: &'a HashMap<ResourceId, ResourceId>,
     /// Per-resource user-authoring trees, used by `build_detail_rows`
@@ -893,8 +919,10 @@ impl<'a> TreeRenderContext<'a> {
                 if let (Effect::Create(r), Some(replacement)) = (effect, replacement_info) {
                     let explicit = self.prev_explicit.and_then(|map| map.get(&r.id));
                     build_replace_detail_rows_from_display(
+                        self.plan,
                         r,
                         replacement,
+                        self.historical_display,
                         self.schemas,
                         self.detail.to_core(),
                         explicit,
@@ -904,7 +932,7 @@ impl<'a> TreeRenderContext<'a> {
                         effect,
                         self.schemas,
                         self.detail.to_core(),
-                        self.delete_attributes,
+                        self.historical_display,
                         self.prev_explicit,
                     )
                 };
@@ -1100,13 +1128,13 @@ fn child_prefix_for_parent(
 
 /// Format the tree body of a plan (no header, no summary).
 ///
-/// `delete_attributes` optionally provides current state attributes for Delete
-/// effects, allowing the display to show what will be deleted.
+/// `historical_display` provides display-safe historical values for Update,
+/// Replace, and Delete effects.
 #[allow(clippy::too_many_arguments)]
 fn format_plan_tree<'a>(
     plan: &Plan,
     detail: DetailLevel,
-    delete_attributes: Option<&'a HashMap<DeletedInstanceKey, HashMap<String, Value>>>,
+    historical_display: &'a HistoricalDisplayAttributes,
     schemas: Option<&'a SchemaRegistry>,
     moved_origins: &'a HashMap<ResourceId, ResourceId>,
     prev_explicit: Option<&'a HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
@@ -1147,7 +1175,7 @@ fn format_plan_tree<'a>(
         replacement_create_info,
         replacement_delete_indices,
         detail,
-        delete_attributes,
+        historical_display,
         schemas,
         moved_origins,
         prev_explicit,

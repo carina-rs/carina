@@ -86,9 +86,11 @@ fn main() -> ExitCode {
     };
 
     let fp = build_plan_from_fixture_name(&fixture);
+    let historical_display =
+        delete_instance_attributes_from_plan(&fp.plan, &fp.current_states, fp.state_file.as_ref());
 
     if tui {
-        if let Err(e) = carina_tui::run(&fp.plan, &fp.schemas) {
+        if let Err(e) = carina_tui::run(&fp.plan, &fp.schemas, &historical_display) {
             eprintln!("TUI error: {}", e);
             return ExitCode::from(1);
         }
@@ -96,25 +98,15 @@ fn main() -> ExitCode {
     }
 
     if destroy {
-        let delete_attributes = delete_instance_attributes_from_plan(
-            &fp.plan,
-            &fp.current_states,
-            fp.state_file.as_ref(),
-        );
         print!(
             "{}",
-            format_destroy_plan_with_delete_instances(&fp.plan, detail, &delete_attributes)
+            format_destroy_plan_with_delete_instances(&fp.plan, detail, &historical_display)
         );
     } else {
-        let delete_attributes = delete_instance_attributes_from_plan(
-            &fp.plan,
-            &fp.current_states,
-            fp.state_file.as_ref(),
-        );
         print_plan(
             &fp.plan,
             detail,
-            &delete_attributes,
+            &historical_display,
             Some(&fp.schemas),
             &fp.moved_origins,
             &[],

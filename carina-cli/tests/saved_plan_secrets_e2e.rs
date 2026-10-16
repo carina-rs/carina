@@ -1,0 +1,1846 @@
+//! Saved-plan secret rehydration regressions (carina#3861 / carina#2674).
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use serde_json::Value;
+use tempfile::TempDir;
+
+use carina_core::resource::{ConcreteValue, DeferredValue, Value as CoreValue};
+use carina_core::value::{SecretHashContext, value_to_json_with_context};
+
+const SECRET_PREFIX: &str = "_secret:argon2:";
+
+struct Scenario {
+    _temp: TempDir,
+    project: PathBuf,
+    mock_state: PathBuf,
+}
+
+impl Scenario {
+    fn new(main: &str) -> Self {
+        Self::new_with_env(main, &[])
+    }
+
+    fn new_with_env(main: &str, env: &[(&str, &str)]) -> Self {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().to_path_buf();
+        fs::write(project.join("main.crn"), main).expect("write main.crn");
+        let scenario = Self {
+            mock_state: project.join("mock-provider-state.json"),
+            project,
+            _temp: temp,
+        };
+        assert_success(
+            "carina init",
+            &scenario.carina_with_env(&["init", "."], env),
+        );
+        scenario
+    }
+
+    fn write_main(&self, main: &str) {
+        fs::write(self.project.join("main.crn"), main).expect("rewrite main.crn");
+    }
+
+    fn write_module(&self, name: &str, source: &str) {
+        let directory = self.project.join(name);
+        fs::create_dir_all(&directory).expect("create module directory");
+        fs::write(directory.join("main.crn"), source).expect("write module main.crn");
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_carina"));
+        command
+            .current_dir(&self.project)
+            .env("NO_COLOR", "1")
+            .env("CARINA_MOCK_STATE_FILE", &self.mock_state)
+            .env_remove("CLICOLOR_FORCE")
+            .args(args);
+        command
+    }
+
+    fn carina(&self, args: &[&str]) -> Output {
+        self.command(args).output().expect("run carina")
+    }
+
+    fn carina_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut command = self.command(args);
+        command.envs(env.iter().copied());
+        command.output().expect("run carina with environment")
+    }
+
+    fn plan(&self) -> Output {
+        self.carina(&["plan", "--out", "plan.json", "."])
+    }
+
+    fn apply_plan(&self) -> Output {
+        self.carina(&["apply", "--auto-approve", "--lock=false", "plan.json"])
+    }
+
+    fn plan_with_env(&self, env: &[(&str, &str)]) -> Output {
+        self.carina_with_env(&["plan", "--out", "plan.json", "."], env)
+    }
+
+    fn apply_plan_with_env(&self, env: &[(&str, &str)]) -> Output {
+        self.carina_with_env(
+            &["apply", "--auto-approve", "--lock=false", "plan.json"],
+            env,
+        )
+    }
+
+    fn plan_text(&self) -> String {
+        fs::read_to_string(self.project.join("plan.json")).expect("read saved plan")
+    }
+
+    fn state_json(&self) -> Value {
+        read_json(&self.project.join("carina.state.json"))
+    }
+
+    fn provider_json(&self) -> Value {
+        read_json(&self.mock_state)
+    }
+}
+
+fn assert_success(label: &str, output: &Output) {
+    assert!(
+        output.status.success(),
+        "{label} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn assert_output_has_no_plaintext(label: &str, output: &Output, plaintexts: &[&str]) {
+    let rendered = output_text(output);
+    for plaintext in plaintexts {
+        assert!(
+            !rendered.contains(plaintext),
+            "{label} leaked secret plaintext {plaintext:?}:\n{rendered}",
+        );
+    }
+}
+
+fn output_text(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+fn assert_secret_verification_rejected_without_mutation(
+    scenario: &Scenario,
+    output: &Output,
+    plaintexts: &[&str],
+    expected_message: &str,
+    state_before: Option<Vec<u8>>,
+    provider_before: Option<Vec<u8>>,
+) {
+    let rendered = output_text(output);
+    assert!(
+        !output.status.success(),
+        "saved-plan secret verification unexpectedly succeeded:\n{rendered}",
+    );
+    assert!(
+        rendered.contains(expected_message) && rendered.contains("carina plan"),
+        "saved-plan secret verification reported the wrong cause:\n{rendered}",
+    );
+    assert_output_has_no_plaintext("rejected saved-plan apply", output, plaintexts);
+    assert_eq!(
+        fs::read(scenario.project.join("carina.state.json")).ok(),
+        state_before,
+        "state changed despite failed secret verification",
+    );
+    assert_eq!(
+        fs::read(&scenario.mock_state).ok(),
+        provider_before,
+        "provider state changed despite failed secret verification",
+    );
+}
+
+fn read_json(path: &Path) -> Value {
+    serde_json::from_str(&fs::read_to_string(path).expect("read JSON file"))
+        .expect("parse JSON file")
+}
+
+fn count_redacted_secrets(value: &Value) -> usize {
+    match value {
+        Value::Array(values) => values.iter().map(count_redacted_secrets).sum(),
+        Value::Object(values) => {
+            usize::from(values.contains_key("RedactedSecret"))
+                + values.values().map(count_redacted_secrets).sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
+fn assert_plan_is_redacted(scenario: &Scenario, plaintexts: &[&str]) {
+    let text = scenario.plan_text();
+    for plaintext in plaintexts {
+        assert!(
+            !text.contains(plaintext),
+            "saved plan leaked secret plaintext {plaintext:?}:\n{text}",
+        );
+    }
+    assert!(
+        !text.contains(SECRET_PREFIX),
+        "saved plan must not encode a secret hash as an ordinary string:\n{text}",
+    );
+    let json: Value = serde_json::from_str(&text).expect("valid saved-plan JSON");
+    assert!(
+        count_redacted_secrets(&json) > 0,
+        "saved plan must use a typed RedactedSecret placeholder:\n{text}",
+    );
+}
+
+fn provider_resource_by_name<'a>(provider: &'a Value, name: &str) -> &'a Value {
+    provider
+        .as_object()
+        .expect("provider state object")
+        .values()
+        .find(|attributes| attributes.get("name") == Some(&Value::String(name.to_string())))
+        .unwrap_or_else(|| panic!("provider state has no resource named {name}: {provider:#}"))
+}
+
+fn provider_resource_by_name_mut<'a>(provider: &'a mut Value, name: &str) -> &'a mut Value {
+    provider
+        .as_object_mut()
+        .expect("provider state object")
+        .values_mut()
+        .find(|attributes| attributes.get("name") == Some(&Value::String(name.to_string())))
+        .unwrap_or_else(|| panic!("provider state has no resource named {name}"))
+}
+
+fn state_resource_by_name<'a>(state: &'a Value, name: &str) -> &'a Value {
+    state["resources"]
+        .as_array()
+        .expect("state resources array")
+        .iter()
+        .find(|resource| {
+            resource.pointer("/attributes/name") == Some(&Value::String(name.to_string()))
+        })
+        .unwrap_or_else(|| panic!("Carina state has no resource named {name}: {state:#}"))
+}
+
+fn plan_resource_by_name<'a>(plan: &'a Value, name: &str) -> &'a Value {
+    plan["sorted_resources"]
+        .as_array()
+        .expect("plan sorted_resources array")
+        .iter()
+        .find(|resource| {
+            resource.pointer("/attributes/name/String") == Some(&Value::String(name.to_string()))
+        })
+        .unwrap_or_else(|| panic!("saved plan has no resource named {name}: {plan:#}"))
+}
+
+fn plan_comment_placeholder_hash<'a>(plan: &'a Value, name: &str) -> &'a str {
+    plan_resource_by_name(plan, name)
+        .pointer("/attributes/comment/RedactedSecret/hash")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("saved plan has no comment placeholder for {name}: {plan:#}"))
+}
+
+fn provider_attribute_placeholder_hash<'a>(plan: &'a Value, key: &str) -> &'a str {
+    plan.pointer(&format!(
+        "/provider_configs/0/attributes/{key}/RedactedSecret/hash"
+    ))
+    .and_then(Value::as_str)
+    .unwrap_or_else(|| panic!("saved plan has no provider placeholder for {key}: {plan:#}"))
+}
+
+fn contains_redacted_secret_hash(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .any(|value| contains_redacted_secret_hash(value, expected)),
+        Value::Object(values) => {
+            values
+                .get("RedactedSecret")
+                .and_then(|placeholder| placeholder.get("hash"))
+                .and_then(Value::as_str)
+                == Some(expected)
+                || values
+                    .values()
+                    .any(|value| contains_redacted_secret_hash(value, expected))
+        }
+        _ => false,
+    }
+}
+
+fn state_comment_hash<'a>(state: &'a Value, name: &str) -> &'a str {
+    state_resource_by_name(state, name)["attributes"]["comment"]
+        .as_str()
+        .expect("state secret hash")
+        .strip_prefix(SECRET_PREFIX)
+        .expect("state secret prefix")
+}
+
+fn current_state_comment_placeholder_hash<'a>(plan: &'a Value, identity: &str) -> &'a str {
+    plan["current_states"]
+        .as_array()
+        .expect("plan current_states array")
+        .iter()
+        .find(|entry| entry.pointer("/id/identity").and_then(Value::as_str) == Some(identity))
+        .and_then(|entry| {
+            entry
+                .pointer("/state/attributes/comment/RedactedSecret/hash")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_else(|| {
+            panic!("saved plan has no current-state comment placeholder for {identity}: {plan:#}")
+        })
+}
+
+fn assert_secret_hash(value: &Value) {
+    let hash = value.as_str().expect("secret state value is a string");
+    assert!(
+        hash.starts_with(SECRET_PREFIX),
+        "state must contain a secret hash, got {hash:?}",
+    );
+    assert_eq!(hash.len(), SECRET_PREFIX.len() + 64);
+}
+
+#[test]
+fn saved_plan_rehydrates_let_bound_and_anonymous_secrets() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let bound = mock.test.resource {
+  name    = "bound"
+  comment = secret("BOUND_PLAINTEXT_3861")
+}
+
+mock.test.resource {
+  name    = "anonymous"
+  comment = secret("ANONYMOUS_PLAINTEXT_2674")
+}
+"#,
+    );
+
+    assert_success("carina plan --out", &scenario.plan());
+    assert_plan_is_redacted(
+        &scenario,
+        &["BOUND_PLAINTEXT_3861", "ANONYMOUS_PLAINTEXT_2674"],
+    );
+    assert_success("carina apply saved plan", &scenario.apply_plan());
+
+    let provider = scenario.provider_json();
+    assert_eq!(
+        provider_resource_by_name(&provider, "bound")["comment"],
+        "BOUND_PLAINTEXT_3861",
+    );
+    assert_eq!(
+        provider_resource_by_name(&provider, "anonymous")["comment"],
+        "ANONYMOUS_PLAINTEXT_2674",
+    );
+
+    let state = scenario.state_json();
+    assert_secret_hash(&state_resource_by_name(&state, "bound")["attributes"]["comment"]);
+    assert_secret_hash(&state_resource_by_name(&state, "anonymous")["attributes"]["comment"]);
+}
+
+#[test]
+fn saved_plan_secret_hashes_use_resource_state_context() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+mock.test.resource {
+  name    = "same-secret-a"
+  comment = secret("SHARED_PLAINTEXT_3861")
+}
+
+mock.test.resource {
+  name    = "same-secret-b"
+  comment = secret("SHARED_PLAINTEXT_3861")
+}
+"#,
+    );
+
+    assert_success("carina plan --out", &scenario.plan());
+    assert_plan_is_redacted(&scenario, &["SHARED_PLAINTEXT_3861"]);
+    let plan = read_json(&scenario.project.join("plan.json"));
+    let first_plan_hash = plan_comment_placeholder_hash(&plan, "same-secret-a").to_string();
+    let second_plan_hash = plan_comment_placeholder_hash(&plan, "same-secret-b").to_string();
+    assert_ne!(
+        first_plan_hash, second_plan_hash,
+        "the plan must not reveal that two resources share a secret",
+    );
+
+    assert_success("carina apply saved plan", &scenario.apply_plan());
+    let state = scenario.state_json();
+    for (name, plan_hash) in [
+        ("same-secret-a", first_plan_hash),
+        ("same-secret-b", second_plan_hash),
+    ] {
+        let state_hash = state_resource_by_name(&state, name)["attributes"]["comment"]
+            .as_str()
+            .expect("state secret hash")
+            .strip_prefix(SECRET_PREFIX)
+            .expect("state secret prefix");
+        assert_eq!(
+            plan_hash, state_hash,
+            "saved-plan and state hashes must use the same resource context for {name}",
+        );
+    }
+}
+
+#[test]
+fn saved_plan_rehydrates_provider_config_secret_with_position_scoped_hash() {
+    const ENV: &[(&str, &str)] = &[(
+        "SAVED_PLAN_PROVIDER_TOKEN_3861",
+        "SHARED_POSITION_SECRET_3861",
+    )];
+    let scenario = Scenario::new_with_env(
+        r#"backend local { path = "carina.state.json" }
+provider mock {
+  token = secret(env("SAVED_PLAN_PROVIDER_TOKEN_3861"))
+}
+
+mock.test.resource {
+  name    = "provider-secret"
+  comment = secret(env("SAVED_PLAN_PROVIDER_TOKEN_3861"))
+}
+"#,
+        ENV,
+    );
+
+    assert_success("carina plan --out", &scenario.plan_with_env(ENV));
+    assert_plan_is_redacted(&scenario, &["SHARED_POSITION_SECRET_3861"]);
+    let plan = read_json(&scenario.project.join("plan.json"));
+    let provider_hash = provider_attribute_placeholder_hash(&plan, "token");
+    let resource_hash = plan_comment_placeholder_hash(&plan, "provider-secret");
+    assert_ne!(
+        provider_hash, resource_hash,
+        "provider and resource positions must use collision-separated salts",
+    );
+
+    assert_success(
+        "carina apply saved plan",
+        &scenario.apply_plan_with_env(ENV),
+    );
+    assert_eq!(
+        provider_resource_by_name(&scenario.provider_json(), "provider-secret")["comment"],
+        "SHARED_POSITION_SECRET_3861",
+    );
+}
+
+#[test]
+fn saved_plan_rejects_changed_provider_config_secret_before_provider_call() {
+    const ORIGINAL: &[(&str, &str)] =
+        &[("SAVED_PLAN_PROVIDER_ONLY_3861", "ORIGINAL_PROVIDER_3861")];
+    const CHANGED: &[(&str, &str)] = &[("SAVED_PLAN_PROVIDER_ONLY_3861", "CHANGED_PROVIDER_3861")];
+    let scenario = Scenario::new_with_env(
+        r#"backend local { path = "carina.state.json" }
+provider mock {
+  token = secret(env("SAVED_PLAN_PROVIDER_ONLY_3861"))
+}
+
+mock.test.resource {
+  name = "provider-only-secret"
+}
+"#,
+        ORIGINAL,
+    );
+
+    assert_success("carina plan --out", &scenario.plan_with_env(ORIGINAL));
+    assert_plan_is_redacted(&scenario, &["ORIGINAL_PROVIDER_3861"]);
+    let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+
+    let apply = scenario.apply_plan_with_env(CHANGED);
+    let rendered = output_text(&apply);
+    assert!(
+        !apply.status.success(),
+        "changed provider secret applied:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("secret changed since the plan") && rendered.contains("carina plan"),
+        "changed provider secret must produce replan guidance:\n{rendered}",
+    );
+    assert!(
+        !scenario.mock_state.exists(),
+        "provider must not be called before provider-config secret verification",
+    );
+    assert_eq!(
+        fs::read(scenario.project.join("carina.state.json")).ok(),
+        state_before,
+        "state must remain unchanged when provider-config verification fails",
+    );
+}
+
+#[test]
+fn saved_plan_rehydrates_nested_and_interpolated_secrets() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let nested = mock.test.resource {
+  name = "nested"
+  tags = {
+    password = secret("NESTED_PLAINTEXT_3861")
+  }
+}
+
+let interpolated = mock.test.resource {
+  name    = "interpolated"
+  comment = "prefix-${secret("INTERPOLATED_PLAINTEXT_3861")}-suffix"
+}
+"#,
+    );
+
+    assert_success("carina plan --out", &scenario.plan());
+    assert_plan_is_redacted(
+        &scenario,
+        &["NESTED_PLAINTEXT_3861", "INTERPOLATED_PLAINTEXT_3861"],
+    );
+    assert_success("carina apply saved plan", &scenario.apply_plan());
+
+    let provider = scenario.provider_json();
+    assert_eq!(
+        provider_resource_by_name(&provider, "nested")["tags"]["password"],
+        "NESTED_PLAINTEXT_3861",
+    );
+    assert_eq!(
+        provider_resource_by_name(&provider, "interpolated")["comment"],
+        "prefix-INTERPOLATED_PLAINTEXT_3861-suffix",
+    );
+
+    let state = scenario.state_json();
+    assert_secret_hash(&state_resource_by_name(&state, "nested")["attributes"]["tags"]["password"]);
+    assert_secret_hash(&state_resource_by_name(&state, "interpolated")["attributes"]["comment"]);
+}
+
+#[test]
+fn saved_plan_rehydrates_secret_interpolation_with_runtime_reference() {
+    const PLAINTEXT: &str = "RUNTIME_INTERPOLATION_PLAINX_3861";
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let origin = mock.test.resource {
+  name = "origin"
+}
+
+let dependent = mock.test.resource {
+  name    = "dependent"
+  comment = "${secret("RUNTIME_INTERPOLATION_PLAINX_3861")}-${origin.identifier}"
+}
+"#,
+    );
+
+    let plan = scenario.plan();
+    assert_success("carina plan --out", &plan);
+    assert_output_has_no_plaintext("carina plan --out", &plan, &[PLAINTEXT]);
+    assert_plan_is_redacted(&scenario, &[PLAINTEXT]);
+
+    let apply = scenario.apply_plan();
+    assert_success("carina apply saved plan", &apply);
+    assert_output_has_no_plaintext("carina apply saved plan", &apply, &[PLAINTEXT]);
+
+    let provider = scenario.provider_json();
+    let comment = provider_resource_by_name(&provider, "dependent")["comment"]
+        .as_str()
+        .expect("provider comment");
+    assert!(
+        comment.starts_with(&format!("{PLAINTEXT}-")),
+        "provider must receive the resolved interpolation, got {comment:?}",
+    );
+    assert_secret_hash(
+        &state_resource_by_name(&scenario.state_json(), "dependent")["attributes"]["comment"],
+    );
+}
+
+#[test]
+fn saved_plan_rehydrates_secret_in_module_expanded_resource() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let secrets = use { source = "./secrets" }
+let instance = secrets {
+  value = secret("MODULE_PLAINTEXT_3861")
+}
+"#,
+    );
+    scenario.write_module(
+        "secrets",
+        r#"arguments {
+  value: String
+}
+
+let item = mock.test.resource {
+  name    = "module-secret"
+  comment = value
+}
+"#,
+    );
+
+    assert_success("carina plan --out", &scenario.plan());
+    assert_plan_is_redacted(&scenario, &["MODULE_PLAINTEXT_3861"]);
+    assert_success("carina apply saved plan", &scenario.apply_plan());
+
+    let provider = scenario.provider_json();
+    assert_eq!(
+        provider_resource_by_name(&provider, "module-secret")["comment"],
+        "MODULE_PLAINTEXT_3861",
+    );
+    let state = scenario.state_json();
+    assert_secret_hash(&state_resource_by_name(&state, "module-secret")["attributes"]["comment"]);
+}
+
+#[test]
+fn saved_plan_rejects_changed_secret_before_provider_or_state_mutation() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let item = mock.test.resource {
+  name    = "changed"
+  comment = secret(env("SAVED_PLAN_SECRET_3861"))
+}
+"#,
+    );
+
+    let plan = scenario
+        .command(&["plan", "--out", "plan.json", "."])
+        .env("SAVED_PLAN_SECRET_3861", "ORIGINAL_ENV_PLAINTEXT_3861")
+        .output()
+        .expect("run carina plan");
+    assert_success("carina plan --out", &plan);
+    assert_plan_is_redacted(&scenario, &["ORIGINAL_ENV_PLAINTEXT_3861"]);
+
+    let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+    let apply = scenario
+        .command(&["apply", "--auto-approve", "--lock=false", "plan.json"])
+        .env("SAVED_PLAN_SECRET_3861", "CHANGED_ENV_PLAINTEXT_3861")
+        .output()
+        .expect("run carina apply");
+    let rendered = output_text(&apply);
+    assert!(
+        !apply.status.success(),
+        "changed secret apply passed:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("secret changed since the plan") && rendered.contains("carina plan"),
+        "changed-secret diagnostic must explain how to recover:\n{rendered}",
+    );
+    assert!(
+        !scenario.mock_state.exists(),
+        "provider must not be called when rehydration fails: {}",
+        scenario.mock_state.display(),
+    );
+    assert_eq!(
+        fs::read(scenario.project.join("carina.state.json")).ok(),
+        state_before,
+        "state must be unchanged when rehydration fails",
+    );
+}
+
+#[test]
+fn saved_plan_rejects_unavailable_secret_with_replan_guidance() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let item = mock.test.resource {
+  name    = "missing"
+  comment = secret(env("SAVED_PLAN_MISSING_SECRET_3861"))
+}
+"#,
+    );
+
+    let plan = scenario
+        .command(&["plan", "--out", "plan.json", "."])
+        .env(
+            "SAVED_PLAN_MISSING_SECRET_3861",
+            "AVAILABLE_AT_PLAN_TIME_3861",
+        )
+        .output()
+        .expect("run carina plan");
+    assert_success("carina plan --out", &plan);
+    assert_plan_is_redacted(&scenario, &["AVAILABLE_AT_PLAN_TIME_3861"]);
+
+    let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+    let apply = scenario
+        .command(&["apply", "--auto-approve", "--lock=false", "plan.json"])
+        .env_remove("SAVED_PLAN_MISSING_SECRET_3861")
+        .output()
+        .expect("run carina apply");
+    let rendered = output_text(&apply);
+    assert!(
+        !apply.status.success(),
+        "unavailable secret apply passed:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("could not be evaluated") && rendered.contains("carina plan"),
+        "unavailable-secret diagnostic must explain how to recover:\n{rendered}",
+    );
+    assert!(
+        !scenario.mock_state.exists(),
+        "provider must not be called when secret evaluation fails: {}",
+        scenario.mock_state.display(),
+    );
+    assert_eq!(
+        fs::read(scenario.project.join("carina.state.json")).ok(),
+        state_before,
+        "state must be unchanged when secret evaluation fails",
+    );
+}
+
+#[test]
+fn saved_plan_update_sends_plaintext_and_persists_hash() {
+    const CONFIG: fn(&str) -> String = |secret| {
+        format!(
+            r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let item = mock.test.resource {{
+  name    = "updated"
+  comment = secret("{secret}")
+}}
+"#,
+        )
+    };
+
+    let scenario = Scenario::new(&CONFIG("OLD_PLAINTEXT_3861"));
+    assert_success(
+        "initial live apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    let initial_state = scenario.state_json();
+    let old_state_hash = state_comment_hash(&initial_state, "updated").to_string();
+
+    scenario.write_main(&CONFIG("NEW_PLAINTEXT_3861"));
+    assert_success("carina plan --out", &scenario.plan());
+    assert_plan_is_redacted(&scenario, &["OLD_PLAINTEXT_3861", "NEW_PLAINTEXT_3861"]);
+    let plan = read_json(&scenario.project.join("plan.json"));
+    assert!(
+        contains_redacted_secret_hash(&plan, &old_state_hash),
+        "the historical side of an update must retain the state-context hash",
+    );
+    let desired_plan_hash = plan_comment_placeholder_hash(&plan, "updated").to_string();
+    assert_success("carina apply saved plan", &scenario.apply_plan());
+
+    let provider = scenario.provider_json();
+    assert_eq!(
+        provider_resource_by_name(&provider, "updated")["comment"],
+        "NEW_PLAINTEXT_3861",
+    );
+    let state = scenario.state_json();
+    let saved = &state_resource_by_name(&state, "updated")["attributes"]["comment"];
+    assert_secret_hash(saved);
+    assert_ne!(saved, "NEW_PLAINTEXT_3861");
+    assert_eq!(
+        desired_plan_hash,
+        state_comment_hash(&state, "updated"),
+        "the desired update placeholder must match the state-context hash",
+    );
+}
+
+#[test]
+fn saved_plan_replace_sends_plaintext_and_persists_hash() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let item = mock.test.resource {
+  name    = "replace-old"
+  comment = secret("REPLACE_OLD_PLAINTEXT_3861")
+}
+"#,
+    );
+    assert_success(
+        "initial live apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    let initial_state = scenario.state_json();
+    let old_state_hash = state_comment_hash(&initial_state, "replace-old").to_string();
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let item = mock.test.resource {
+  name    = "replace-new"
+  comment = secret("REPLACE_NEW_PLAINTEXT_3861")
+}
+"#,
+    );
+
+    assert_success("carina plan --out", &scenario.plan());
+    assert_plan_is_redacted(
+        &scenario,
+        &["REPLACE_OLD_PLAINTEXT_3861", "REPLACE_NEW_PLAINTEXT_3861"],
+    );
+    let plan = read_json(&scenario.project.join("plan.json"));
+    assert!(
+        contains_redacted_secret_hash(&plan, &old_state_hash),
+        "the historical side of a replacement must retain the state-context hash",
+    );
+    let desired_plan_hash = plan_comment_placeholder_hash(&plan, "replace-new").to_string();
+    assert_success("carina apply saved plan", &scenario.apply_plan());
+
+    let provider = scenario.provider_json();
+    assert_eq!(
+        provider_resource_by_name(&provider, "replace-new")["comment"],
+        "REPLACE_NEW_PLAINTEXT_3861",
+    );
+    let state = scenario.state_json();
+    assert_secret_hash(&state_resource_by_name(&state, "replace-new")["attributes"]["comment"]);
+    assert_eq!(
+        desired_plan_hash,
+        state_comment_hash(&state, "replace-new"),
+        "the desired replacement placeholder must match the state-context hash",
+    );
+}
+
+#[test]
+fn pre_typed_secret_plan_format_requires_replan() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+mock.test.resource {
+  name = "version-check"
+}
+"#,
+    );
+    assert_success("carina plan --out", &scenario.plan());
+    let plan_path = scenario.project.join("plan.json");
+    let mut plan = read_json(&plan_path);
+    plan["version"] = Value::from(11);
+    fs::write(
+        &plan_path,
+        serde_json::to_vec_pretty(&plan).expect("serialize legacy plan"),
+    )
+    .expect("write legacy plan");
+
+    let apply = scenario.apply_plan();
+    let rendered = output_text(&apply);
+    assert!(
+        !apply.status.success(),
+        "v11 saved plan applied:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Unsupported plan file version: 11") && rendered.contains("plan --out"),
+        "legacy format must fail with replan guidance:\n{rendered}",
+    );
+}
+
+#[test]
+fn validate_and_plan_reject_secret_derived_backend_attribute() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        temp.path().join("main.crn"),
+        r#"backend local {
+  path = secret("carina.state.json")
+}
+provider mock {}
+mock.test.resource { name = "backend-secret" }
+"#,
+    )
+    .expect("write main.crn");
+
+    for args in [vec!["validate", "."], vec!["plan", "."]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+            .current_dir(temp.path())
+            .env("NO_COLOR", "1")
+            .args(&args)
+            .output()
+            .expect("run carina");
+        let rendered = output_text(&output);
+        assert!(
+            !output.status.success(),
+            "carina {} accepted a secret backend path:\n{rendered}",
+            args[0],
+        );
+        assert!(
+            rendered.contains("backend")
+                && rendered.contains("path")
+                && rendered.contains("line 2")
+                && rendered.contains("secret")
+                && rendered.contains("plain string"),
+            "carina {} must explain that backend.path cannot be secret-derived:\n{rendered}",
+            args[0],
+        );
+        assert!(
+            !rendered.contains("carina.state.json"),
+            "backend validation must not echo the secret-derived value:\n{rendered}",
+        );
+    }
+}
+
+#[test]
+fn secret_free_saved_plan_ignores_later_unrelated_config_error() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+mock.test.resource { name = "saved-without-secrets" }
+"#,
+    );
+    let plan = scenario.plan();
+    assert_success("carina plan --out", &plan);
+    assert_eq!(
+        count_redacted_secrets(&read_json(&scenario.project.join("plan.json"))),
+        0,
+        "fixture must exercise the placeholder-free path",
+    );
+
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+mock.test.resource {
+  name = "unrelated-invalid-current-config"
+  attribute_that_does_not_exist = env("UNSET_AND_IRRELEVANT_TO_SAVED_PLAN_3861")
+}
+"#,
+    );
+
+    let apply = scenario.apply_plan();
+    assert_success(
+        "placeholder-free saved plan after unrelated config error",
+        &apply,
+    );
+    assert_eq!(
+        provider_resource_by_name(&scenario.provider_json(), "saved-without-secrets")["name"],
+        "saved-without-secrets",
+    );
+}
+
+#[test]
+fn saved_plan_verifies_mock_default_tag_secret_without_production_merge() {
+    const ENV_NAME: &str = "SAVED_PLAN_DEFAULT_TAG_SECRET_3861";
+    const PLAINTEXT: &str = "DEFAULT_TAG_PLAINTEXT_3861";
+    let scenario = Scenario::new_with_env(
+        r#"backend local { path = "carina.state.json" }
+provider mock {
+  default_tags = {
+    SecretTag = secret(env("SAVED_PLAN_DEFAULT_TAG_SECRET_3861"))
+  }
+}
+
+mock.test.resource { name = "default-tag-secret" }
+"#,
+        &[(ENV_NAME, PLAINTEXT)],
+    );
+
+    let plan = scenario.plan_with_env(&[(ENV_NAME, PLAINTEXT)]);
+    assert_success("carina plan --out", &plan);
+    assert_output_has_no_plaintext("carina plan --out", &plan, &[PLAINTEXT]);
+    assert_plan_is_redacted(&scenario, &[PLAINTEXT]);
+    let saved_plan = read_json(&scenario.project.join("plan.json"));
+    assert!(
+        saved_plan
+            .pointer("/provider_configs/0/default_tags/SecretTag/RedactedSecret/hash")
+            .and_then(Value::as_str)
+            .is_some(),
+        "the provider default-tag secret must retain its own saved-plan position: {saved_plan:#}",
+    );
+    assert!(
+        plan_resource_by_name(&saved_plan, "default-tag-secret")
+            .pointer("/attributes/tags")
+            .is_none(),
+        "the built-in mock must not gain production default-tag normalization",
+    );
+
+    let apply = scenario.apply_plan_with_env(&[(ENV_NAME, PLAINTEXT)]);
+    assert_success("carina apply saved plan", &apply);
+    assert_output_has_no_plaintext("carina apply saved plan", &apply, &[PLAINTEXT]);
+
+    let provider = scenario.provider_json();
+    assert!(
+        provider_resource_by_name(&provider, "default-tag-secret")
+            .get("tags")
+            .is_none(),
+        "the built-in mock must retain main's no-default-tag behavior",
+    );
+}
+
+#[test]
+fn saved_plan_rehydrates_anonymous_resource_after_state_identity_reconcile() {
+    let config = |secret: &str| {
+        format!(
+            r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+mock.test.resource {{
+  name    = "state-reconciled-anonymous"
+  comment = secret("{secret}")
+}}
+"#,
+        )
+    };
+    let scenario = Scenario::new(&config("ANONYMOUS_RECONCILE_OLD_3861"));
+    assert_success(
+        "initial live apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+
+    let mut state = scenario.state_json();
+    let old_identity = state["resources"][0]["identity"]
+        .as_str()
+        .expect("state identity")
+        .to_string();
+    let reconciled_identity = "state_preserved_anonymous_identity_3861";
+    state["resources"][0]["identity"] = Value::String(reconciled_identity.to_string());
+    state["resources"][0]["attributes"]["comment"] = value_to_json_with_context(
+        &CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
+            ConcreteValue::String("ANONYMOUS_RECONCILE_OLD_3861".into()),
+        )))),
+        Some(&SecretHashContext::new(
+            "mock.test.resource",
+            reconciled_identity,
+            "comment",
+        )),
+    )
+    .expect("rehash state secret for the reconciled identity");
+    fs::write(
+        scenario.project.join("carina.state.json"),
+        serde_json::to_vec_pretty(&state).expect("serialize reconciled state"),
+    )
+    .expect("write reconciled state");
+
+    let mut provider = scenario.provider_json();
+    let provider_object = provider.as_object_mut().expect("provider state object");
+    let old_key = provider_object
+        .keys()
+        .next()
+        .expect("provider resource key")
+        .clone();
+    let attributes = provider_object
+        .remove(&old_key)
+        .expect("provider resource attributes");
+    let reconciled_key = old_key.replace(&old_identity, reconciled_identity);
+    provider_object.insert(reconciled_key, attributes);
+    fs::write(
+        &scenario.mock_state,
+        serde_json::to_vec_pretty(&provider).expect("serialize reconciled provider state"),
+    )
+    .expect("write reconciled provider state");
+
+    scenario.write_main(&config("ANONYMOUS_RECONCILE_NEW_3861"));
+    let plan = scenario.carina(&["plan", "--refresh=false", "--out", "plan.json", "."]);
+    assert_success("carina plan --out", &plan);
+    assert_plan_is_redacted(
+        &scenario,
+        &[
+            "ANONYMOUS_RECONCILE_OLD_3861",
+            "ANONYMOUS_RECONCILE_NEW_3861",
+        ],
+    );
+    let apply = scenario.apply_plan();
+    assert_success("carina apply saved plan", &apply);
+    assert_output_has_no_plaintext(
+        "carina apply saved plan",
+        &apply,
+        &[
+            "ANONYMOUS_RECONCILE_OLD_3861",
+            "ANONYMOUS_RECONCILE_NEW_3861",
+        ],
+    );
+    assert_eq!(
+        provider_resource_by_name(&scenario.provider_json(), "state-reconciled-anonymous")["comment"],
+        "ANONYMOUS_RECONCILE_NEW_3861",
+    );
+}
+
+#[test]
+fn live_and_saved_plan_updates_never_print_historical_secret_plaintext() {
+    let config = |secret: &str| {
+        format!(
+            r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+let item = mock.test.resource {{
+  name    = "masked-update-output"
+  comment = secret("{secret}")
+}}
+"#,
+        )
+    };
+
+    let live = Scenario::new(&config("LIVE_OUTPUT_OLD_SECRET_3861"));
+    assert_success(
+        "initial live apply",
+        &live.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    live.write_main(&config("LIVE_OUTPUT_NEW_SECRET_3861"));
+    let live_update = live.carina(&["apply", "--auto-approve", "--lock=false", "."]);
+    assert_success("live update", &live_update);
+    assert_output_has_no_plaintext(
+        "live update",
+        &live_update,
+        &["LIVE_OUTPUT_OLD_SECRET_3861", "LIVE_OUTPUT_NEW_SECRET_3861"],
+    );
+
+    let saved = Scenario::new(&config("SAVED_OUTPUT_OLD_SECRET_3861"));
+    assert_success(
+        "initial saved-plan fixture apply",
+        &saved.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    saved.write_main(&config("SAVED_OUTPUT_NEW_SECRET_3861"));
+    let plan = saved.plan();
+    assert_success("saved update plan", &plan);
+    assert_output_has_no_plaintext(
+        "saved update plan",
+        &plan,
+        &[
+            "SAVED_OUTPUT_OLD_SECRET_3861",
+            "SAVED_OUTPUT_NEW_SECRET_3861",
+        ],
+    );
+    let saved_update = saved.apply_plan();
+    assert_success("saved update apply", &saved_update);
+    assert_output_has_no_plaintext(
+        "saved update apply",
+        &saved_update,
+        &[
+            "SAVED_OUTPUT_OLD_SECRET_3861",
+            "SAVED_OUTPUT_NEW_SECRET_3861",
+        ],
+    );
+}
+
+#[test]
+fn old_secret_is_masked_when_update_replaces_it_with_public_text() {
+    const PLAINTEXT: &str = "PUBLIC_REPLACEMENT_OLD_SECRET_PLAINABC_3861";
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+let item = mock.test.resource {
+  name    = "secret-to-public-output"
+  comment = "pre-${secret("PUBLIC_REPLACEMENT_OLD_SECRET_PLAINABC_3861")}-post"
+}
+"#,
+    );
+    assert_success(
+        "initial secret-to-public fixture apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+let item = mock.test.resource {
+  name    = "secret-to-public-output"
+  comment = "public"
+}
+"#,
+    );
+
+    let live_plan = scenario.carina(&["plan", "."]);
+    assert_success("live secret-to-public plan", &live_plan);
+    assert_output_has_no_plaintext("live secret-to-public plan", &live_plan, &[PLAINTEXT]);
+
+    let saved_plan = scenario.plan();
+    assert_success("saved secret-to-public plan", &saved_plan);
+    assert_output_has_no_plaintext("saved secret-to-public plan", &saved_plan, &[PLAINTEXT]);
+    assert!(
+        !scenario.plan_text().contains(PLAINTEXT),
+        "saved plan leaked the historical secret plaintext",
+    );
+
+    let apply = scenario.apply_plan();
+    assert_success("saved secret-to-public apply", &apply);
+    assert_output_has_no_plaintext("saved secret-to-public apply", &apply, &[PLAINTEXT]);
+    assert_eq!(
+        provider_resource_by_name(&scenario.provider_json(), "secret-to-public-output")["comment"],
+        "public",
+    );
+}
+
+#[test]
+fn old_secret_is_masked_when_replacement_uses_public_text() {
+    const PLAINTEXT: &str = "PUBLIC_REPLACE_OLD_SECRET_PLAINABC_3861";
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+let item = mock.test.resource {
+  name    = "secret-replace-old"
+  comment = "pre-${secret("PUBLIC_REPLACE_OLD_SECRET_PLAINABC_3861")}-post"
+}
+"#,
+    );
+    assert_success(
+        "initial replacement fixture apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+let item = mock.test.resource {
+  name    = "secret-replace-new"
+  comment = "public"
+}
+"#,
+    );
+
+    let live_plan = scenario.carina(&["plan", "."]);
+    assert_success("live secret replacement plan", &live_plan);
+    assert_output_has_no_plaintext("live secret replacement plan", &live_plan, &[PLAINTEXT]);
+
+    let saved_plan = scenario.plan();
+    assert_success("saved secret replacement plan", &saved_plan);
+    assert_output_has_no_plaintext("saved secret replacement plan", &saved_plan, &[PLAINTEXT]);
+    assert!(!scenario.plan_text().contains(PLAINTEXT));
+
+    let apply = scenario.apply_plan();
+    assert_success("saved secret replacement apply", &apply);
+    assert_output_has_no_plaintext("saved secret replacement apply", &apply, &[PLAINTEXT]);
+    assert_eq!(
+        provider_resource_by_name(&scenario.provider_json(), "secret-replace-new")["comment"],
+        "public",
+    );
+}
+
+#[test]
+fn saved_plan_rehydrates_folded_secret_import_identifier() {
+    const ENV_NAME: &str = "SAVED_PLAN_IMPORT_SECRET_3861";
+    const PLAINTEXT: &str = "IMPORT_IDENTIFIER_PLAINTEXT_3861";
+    let scenario = Scenario::new_with_env(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let import_secret = secret(env("SAVED_PLAN_IMPORT_SECRET_3861"))
+
+let imported = mock.test.resource {
+  name = "imported-secret"
+}
+
+import {
+  to = mock.test.resource "imported-secret"
+  id = "${import_secret}|tail"
+}
+"#,
+        &[(ENV_NAME, PLAINTEXT)],
+    );
+
+    let plan = scenario.plan_with_env(&[(ENV_NAME, PLAINTEXT)]);
+    assert_success("carina plan --out", &plan);
+    assert_output_has_no_plaintext("carina plan --out", &plan, &[PLAINTEXT]);
+    assert_plan_is_redacted(&scenario, &[PLAINTEXT]);
+
+    fs::write(
+        &scenario.mock_state,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "test.resource.imported-secret": {
+                "name": "imported-secret",
+                "comment": "provider-existing"
+            }
+        }))
+        .expect("serialize import provider state"),
+    )
+    .expect("write import provider state");
+
+    let apply = scenario.apply_plan_with_env(&[(ENV_NAME, PLAINTEXT)]);
+    assert_success("carina apply saved import plan", &apply);
+    assert_output_has_no_plaintext("carina apply saved import plan", &apply, &[PLAINTEXT]);
+    assert_eq!(
+        state_resource_by_name(&scenario.state_json(), "imported-secret")["attributes"]["name"],
+        "imported-secret",
+    );
+}
+
+#[test]
+fn saved_plan_reports_changed_historical_update_secret_as_drift() {
+    let config = |secret: &str| {
+        format!(
+            r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let item = mock.test.resource {{
+  name    = "historical-update-secret"
+  comment = secret("{secret}")
+}}
+"#,
+        )
+    };
+    let scenario = Scenario::new(&config("HISTORICAL_UPDATE_OLD_3861"));
+    assert_success(
+        "initial live apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    scenario.write_main(&config("HISTORICAL_UPDATE_NEW_3861"));
+    let plan = scenario.plan();
+    assert_success("saved update plan", &plan);
+    assert_output_has_no_plaintext(
+        "saved update plan",
+        &plan,
+        &["HISTORICAL_UPDATE_OLD_3861", "HISTORICAL_UPDATE_NEW_3861"],
+    );
+    assert_plan_is_redacted(
+        &scenario,
+        &["HISTORICAL_UPDATE_OLD_3861", "HISTORICAL_UPDATE_NEW_3861"],
+    );
+
+    let mut provider = scenario.provider_json();
+    provider_resource_by_name_mut(&mut provider, "historical-update-secret")["comment"] =
+        Value::String("HISTORICAL_UPDATE_DRIFTED_3861".to_string());
+    fs::write(
+        &scenario.mock_state,
+        serde_json::to_vec_pretty(&provider).expect("serialize drifted provider state"),
+    )
+    .expect("write drifted provider state");
+    let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+    let provider_before = fs::read(&scenario.mock_state).ok();
+
+    let apply = scenario.apply_plan();
+    let rendered = output_text(&apply);
+    assert!(!apply.status.success(), "drifted plan applied:\n{rendered}");
+    assert!(
+        rendered.contains("Infrastructure drift detected")
+            && rendered.contains("attributes have changed since plan was created"),
+        "historical secret mutation must be infrastructure drift:\n{rendered}",
+    );
+    assert!(
+        !rendered.contains("secret changed since the plan"),
+        "provider-side drift must not be reported as a configuration change:\n{rendered}",
+    );
+    assert_output_has_no_plaintext(
+        "historical update drift",
+        &apply,
+        &[
+            "HISTORICAL_UPDATE_OLD_3861",
+            "HISTORICAL_UPDATE_NEW_3861",
+            "HISTORICAL_UPDATE_DRIFTED_3861",
+        ],
+    );
+    assert_eq!(
+        fs::read(scenario.project.join("carina.state.json")).ok(),
+        state_before,
+        "state changed after drift rejection",
+    );
+    assert_eq!(
+        fs::read(&scenario.mock_state).ok(),
+        provider_before,
+        "provider state changed after drift rejection",
+    );
+}
+
+#[test]
+fn saved_plan_reports_vanished_secret_resource_as_drift_before_verification() {
+    const OLD: &str = "VANISHED_RESOURCE_OLD_SECRET_3861";
+    const NEW: &str = "VANISHED_RESOURCE_NEW_SECRET_3861";
+    let config = |secret: &str| {
+        format!(
+            r#"backend local {{ path = "carina.state.json" }}
+provider mock {{}}
+
+let item = mock.test.resource {{
+  name    = "vanished-secret-resource"
+  comment = secret("{secret}")
+}}
+"#,
+        )
+    };
+    let scenario = Scenario::new(&config(OLD));
+    assert_success(
+        "initial vanished-resource fixture apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    scenario.write_main(&config(NEW));
+    let plan = scenario.plan();
+    assert_success("vanished-resource saved plan", &plan);
+    assert_output_has_no_plaintext("vanished-resource saved plan", &plan, &[OLD, NEW]);
+    assert_plan_is_redacted(&scenario, &[OLD, NEW]);
+
+    fs::write(&scenario.mock_state, b"{}\n").expect("clear provider state out of band");
+    let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+    let provider_before = fs::read(&scenario.mock_state).ok();
+
+    let apply = scenario.apply_plan();
+    let rendered = output_text(&apply);
+    assert!(
+        !apply.status.success(),
+        "saved plan unexpectedly applied after the resource vanished:\n{rendered}",
+    );
+    assert!(
+        rendered.contains("Infrastructure drift detected")
+            && rendered.contains("resource existed at plan time but no longer exists"),
+        "a vanished resource must use the ordinary drift outcome before secret verification:\n{rendered}",
+    );
+    assert!(
+        !rendered.contains("recorded secret position no longer exists"),
+        "secret verification must not replace the vanished-resource drift outcome:\n{rendered}",
+    );
+    assert_output_has_no_plaintext("vanished-resource saved apply", &apply, &[OLD, NEW]);
+    assert_eq!(
+        fs::read(scenario.project.join("carina.state.json")).ok(),
+        state_before,
+        "state changed after drift rejection",
+    );
+    assert_eq!(
+        fs::read(&scenario.mock_state).ok(),
+        provider_before,
+        "provider state changed after drift rejection",
+    );
+}
+
+#[test]
+fn saved_plan_moved_secret_resource_reads_and_verifies_the_origin() {
+    const PLAINTEXT: &str = "MOVED_RESOURCE_SECRET_PLAINABC_3861";
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let r = mock.test.resource {
+  name    = "moved-secret-resource"
+  comment = secret("MOVED_RESOURCE_SECRET_PLAINABC_3861")
+}
+"#,
+    );
+    assert_success(
+        "initial moved-resource fixture apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+moved {
+  from = mock.test.resource 'r'
+  to   = mock.test.resource 'r2'
+}
+
+let r2 = mock.test.resource {
+  name    = "moved-secret-resource"
+  comment = secret("MOVED_RESOURCE_SECRET_PLAINABC_3861")
+}
+"#,
+    );
+
+    let plan = scenario.plan();
+    assert_success("moved-resource saved plan", &plan);
+    assert_output_has_no_plaintext("moved-resource saved plan", &plan, &[PLAINTEXT]);
+    assert_plan_is_redacted(&scenario, &[PLAINTEXT]);
+    let apply = scenario.apply_plan();
+    assert_success("moved-resource saved apply", &apply);
+    assert_output_has_no_plaintext("moved-resource saved apply", &apply, &[PLAINTEXT]);
+    assert_eq!(
+        provider_resource_by_name(&scenario.provider_json(), "moved-secret-resource")["comment"],
+        PLAINTEXT,
+    );
+    assert_secret_hash(
+        &state_resource_by_name(&scenario.state_json(), "moved-secret-resource")["attributes"]["comment"],
+    );
+}
+
+#[test]
+fn saved_plan_rejects_changed_anonymous_resource_secret() {
+    const ENV_NAME: &str = "SAVED_PLAN_ANONYMOUS_CHANGED_3861";
+    const PLANNED: &str = "ANONYMOUS_PLANNED_SECRET_3861";
+    const CHANGED: &str = "ANONYMOUS_CHANGED_SECRET_3861";
+    let scenario = Scenario::new_with_env(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+mock.test.resource {
+  name    = "anonymous-secret-change"
+  comment = secret(env("SAVED_PLAN_ANONYMOUS_CHANGED_3861"))
+}
+"#,
+        &[(ENV_NAME, PLANNED)],
+    );
+    let plan = scenario.plan_with_env(&[(ENV_NAME, PLANNED)]);
+    assert_success("anonymous secret plan", &plan);
+    assert_output_has_no_plaintext("anonymous secret plan", &plan, &[PLANNED]);
+    assert_plan_is_redacted(&scenario, &[PLANNED]);
+    let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+    let provider_before = fs::read(&scenario.mock_state).ok();
+
+    let apply = scenario.apply_plan_with_env(&[(ENV_NAME, CHANGED)]);
+    assert_secret_verification_rejected_without_mutation(
+        &scenario,
+        &apply,
+        &[PLANNED, CHANGED],
+        "secret changed since the plan",
+        state_before,
+        provider_before,
+    );
+}
+
+#[test]
+fn saved_plan_rejects_changed_provider_default_tag_secret() {
+    const ENV_NAME: &str = "SAVED_PLAN_DEFAULT_TAG_CHANGED_3861";
+    const PLANNED: &str = "DEFAULT_TAG_PLANNED_SECRET_3861";
+    const CHANGED: &str = "DEFAULT_TAG_CHANGED_SECRET_3861";
+    let scenario = Scenario::new_with_env(
+        r#"backend local { path = "carina.state.json" }
+provider mock {
+  default_tags = {
+    SecretTag = secret(env("SAVED_PLAN_DEFAULT_TAG_CHANGED_3861"))
+  }
+}
+
+mock.test.resource { name = "default-tag-change" }
+"#,
+        &[(ENV_NAME, PLANNED)],
+    );
+    let plan = scenario.plan_with_env(&[(ENV_NAME, PLANNED)]);
+    assert_success("default-tags secret plan", &plan);
+    assert_output_has_no_plaintext("default-tags secret plan", &plan, &[PLANNED]);
+    assert_plan_is_redacted(&scenario, &[PLANNED]);
+    let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+    let provider_before = fs::read(&scenario.mock_state).ok();
+
+    let apply = scenario.apply_plan_with_env(&[(ENV_NAME, CHANGED)]);
+    assert_secret_verification_rejected_without_mutation(
+        &scenario,
+        &apply,
+        &[PLANNED, CHANGED],
+        "secret changed since the plan",
+        state_before,
+        provider_before,
+    );
+}
+
+#[test]
+fn saved_plan_rejects_changed_data_source_secret() {
+    const ENV_NAME: &str = "SAVED_PLAN_DATA_SOURCE_CHANGED_3861";
+    const PLANNED: &str = "DATA_SOURCE_PLANNED_SECRET_3861";
+    const CHANGED: &str = "DATA_SOURCE_CHANGED_SECRET_3861";
+    let scenario = Scenario::new_with_env(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let roles = read mock.iam.Roles {
+  name_regex = secret(env("SAVED_PLAN_DATA_SOURCE_CHANGED_3861"))
+}
+"#,
+        &[(ENV_NAME, PLANNED)],
+    );
+    let plan = scenario.plan_with_env(&[(ENV_NAME, PLANNED)]);
+    assert_success("data-source secret plan", &plan);
+    assert_output_has_no_plaintext("data-source secret plan", &plan, &[PLANNED]);
+    assert_plan_is_redacted(&scenario, &[PLANNED]);
+    let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+    let provider_before = fs::read(&scenario.mock_state).ok();
+
+    let apply = scenario.apply_plan_with_env(&[(ENV_NAME, CHANGED)]);
+    assert_secret_verification_rejected_without_mutation(
+        &scenario,
+        &apply,
+        &[PLANNED, CHANGED],
+        "secret changed since the plan",
+        state_before,
+        provider_before,
+    );
+}
+
+#[test]
+fn saved_plan_rejects_changed_folded_import_secret() {
+    const ENV_NAME: &str = "SAVED_PLAN_IMPORT_CHANGED_3861";
+    const PLANNED: &str = "IMPORT_PLANNED_SECRET_3861";
+    const CHANGED: &str = "IMPORT_CHANGED_SECRET_3861";
+    let scenario = Scenario::new_with_env(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let import_secret = secret(env("SAVED_PLAN_IMPORT_CHANGED_3861"))
+let imported = mock.test.resource { name = "changed-import-secret" }
+
+import {
+  to = mock.test.resource "changed-import-secret"
+  id = "${import_secret}|tail"
+}
+"#,
+        &[(ENV_NAME, PLANNED)],
+    );
+    let plan = scenario.plan_with_env(&[(ENV_NAME, PLANNED)]);
+    assert_success("import secret plan", &plan);
+    assert_output_has_no_plaintext("import secret plan", &plan, &[PLANNED]);
+    assert_plan_is_redacted(&scenario, &[PLANNED]);
+    let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+    let provider_before = fs::read(&scenario.mock_state).ok();
+
+    let apply = scenario.apply_plan_with_env(&[(ENV_NAME, CHANGED)]);
+    assert_secret_verification_rejected_without_mutation(
+        &scenario,
+        &apply,
+        &[PLANNED, CHANGED],
+        "secret changed since the plan",
+        state_before,
+        provider_before,
+    );
+}
+
+#[test]
+fn saved_plan_rejects_changed_deferred_for_template_secret() {
+    const ENV_NAME: &str = "SAVED_PLAN_DEFERRED_FOR_CHANGED_3861";
+    const PLANNED: &str = "DEFERRED_FOR_PLANNED_SECRET_3861";
+    const CHANGED: &str = "DEFERRED_FOR_CHANGED_SECRET_3861";
+    let scenario = Scenario::new_with_env(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let origin = mock.test.resource { name = "deferred-for-origin" }
+let roles = read mock.iam.Roles {
+  name_regex = origin.identifier
+}
+
+for role_name in roles.names {
+  mock.test.resource {
+    name    = role_name
+    comment = secret(env("SAVED_PLAN_DEFERRED_FOR_CHANGED_3861"))
+  }
+}
+"#,
+        &[(ENV_NAME, PLANNED)],
+    );
+    let plan = scenario.plan_with_env(&[(ENV_NAME, PLANNED)]);
+    assert_success("deferred-for secret plan", &plan);
+    assert_output_has_no_plaintext("deferred-for secret plan", &plan, &[PLANNED]);
+    assert_plan_is_redacted(&scenario, &[PLANNED]);
+    let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+    let provider_before = fs::read(&scenario.mock_state).ok();
+
+    let apply = scenario.apply_plan_with_env(&[(ENV_NAME, CHANGED)]);
+    assert_secret_verification_rejected_without_mutation(
+        &scenario,
+        &apply,
+        &[PLANNED, CHANGED],
+        "secret changed since the plan",
+        state_before,
+        provider_before,
+    );
+}
+
+#[test]
+fn saved_plan_rejects_changed_orphan_delete_secret() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let orphan = mock.test.resource {
+  name    = "orphan-secret-delete"
+  comment = secret("ORPHAN_DELETE_PLANNED_SECRET_3861")
+}
+"#,
+    );
+    assert_success(
+        "initial orphan fixture apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+"#,
+    );
+    let plan = scenario.plan();
+    assert_success("orphan delete secret plan", &plan);
+    assert_output_has_no_plaintext(
+        "orphan delete secret plan",
+        &plan,
+        &["ORPHAN_DELETE_PLANNED_SECRET_3861"],
+    );
+    assert_plan_is_redacted(&scenario, &["ORPHAN_DELETE_PLANNED_SECRET_3861"]);
+
+    let mut provider = scenario.provider_json();
+    provider_resource_by_name_mut(&mut provider, "orphan-secret-delete")["comment"] =
+        Value::String("ORPHAN_DELETE_DRIFTED_SECRET_3861".to_string());
+    fs::write(
+        &scenario.mock_state,
+        serde_json::to_vec_pretty(&provider).expect("serialize drifted orphan provider state"),
+    )
+    .expect("write drifted orphan provider state");
+    let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+    let provider_before = fs::read(&scenario.mock_state).ok();
+
+    let apply = scenario.apply_plan();
+    assert_secret_verification_rejected_without_mutation(
+        &scenario,
+        &apply,
+        &[
+            "ORPHAN_DELETE_PLANNED_SECRET_3861",
+            "ORPHAN_DELETE_DRIFTED_SECRET_3861",
+        ],
+        "secret changed since the plan",
+        state_before,
+        provider_before,
+    );
+}
+
+#[test]
+fn refresh_false_saved_plan_preserves_moved_state_secret_hash_context() {
+    const PLAINTEXT: &str = "MOVE_PLAIN_3861";
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let old = mock.test.resource {
+  name    = "moved-hash-context"
+  comment = secret("MOVE_PLAIN_3861")
+}
+"#,
+    );
+    let initial_apply = scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]);
+    assert_success("initial moved-secret apply", &initial_apply);
+    assert_output_has_no_plaintext("initial moved-secret apply", &initial_apply, &[PLAINTEXT]);
+    let old_hash = state_comment_hash(&scenario.state_json(), "moved-hash-context").to_string();
+
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+moved {
+  from = mock.test.resource 'old'
+  to   = mock.test.resource 'renamed'
+}
+
+let renamed = mock.test.resource {
+  name    = "moved-hash-context"
+  comment = secret("MOVE_PLAIN_3861")
+}
+"#,
+    );
+    let plan = scenario.carina(&["plan", "--refresh=false", "--out", "plan.json", "."]);
+    assert_success("refresh=false moved-secret plan", &plan);
+    assert_output_has_no_plaintext("refresh=false moved-secret plan", &plan, &[PLAINTEXT]);
+    assert_plan_is_redacted(&scenario, &[PLAINTEXT]);
+    let saved_plan = read_json(&scenario.project.join("plan.json"));
+    assert_eq!(
+        current_state_comment_placeholder_hash(&saved_plan, "renamed"),
+        old_hash,
+        "a persisted state hash must be lifted, never hashed as plaintext under the moved-to identity",
+    );
+
+    let apply = scenario.apply_plan();
+    assert_success("apply refresh=false moved-secret plan", &apply);
+    assert_output_has_no_plaintext(
+        "apply refresh=false moved-secret plan",
+        &apply,
+        &[PLAINTEXT],
+    );
+    assert_eq!(
+        provider_resource_by_name(&scenario.provider_json(), "moved-hash-context")["comment"],
+        PLAINTEXT,
+    );
+    assert_secret_hash(
+        &state_resource_by_name(&scenario.state_json(), "moved-hash-context")["attributes"]["comment"],
+    );
+}
+
+#[test]
+fn remote_secret_change_is_reported_as_infrastructure_drift() {
+    const PLANNED: &str = "REMOTE_DRIFT_PLANNED_SECRET_3861";
+    const DRIFTED: &str = "REMOTE_DRIFT_ACTUAL_SECRET_3861";
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let item = mock.test.resource {
+  name    = "remote-secret-drift"
+  comment = secret("REMOTE_DRIFT_PLANNED_SECRET_3861")
+}
+"#,
+    );
+    let initial_apply = scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]);
+    assert_success("initial remote-secret fixture apply", &initial_apply);
+    assert_output_has_no_plaintext(
+        "initial remote-secret fixture apply",
+        &initial_apply,
+        &[PLANNED],
+    );
+
+    let plan = scenario.plan();
+    assert_success("remote-secret saved plan", &plan);
+    assert_output_has_no_plaintext("remote-secret saved plan", &plan, &[PLANNED]);
+    assert_plan_is_redacted(&scenario, &[PLANNED]);
+
+    let mut provider = scenario.provider_json();
+    provider_resource_by_name_mut(&mut provider, "remote-secret-drift")["comment"] =
+        Value::String(DRIFTED.to_string());
+    fs::write(
+        &scenario.mock_state,
+        serde_json::to_vec_pretty(&provider).expect("serialize drifted provider state"),
+    )
+    .expect("write drifted provider state");
+    let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+    let provider_before = fs::read(&scenario.mock_state).ok();
+
+    let apply = scenario.apply_plan();
+    let rendered = output_text(&apply);
+    assert!(
+        !apply.status.success(),
+        "drifted saved plan applied:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Infrastructure drift detected")
+            && rendered.contains("attributes have changed since plan was created"),
+        "remote secret drift must use the ordinary infrastructure-drift outcome:\n{rendered}",
+    );
+    assert!(
+        !rendered.contains("secret changed since the plan"),
+        "remote drift must not be classified as a configuration-secret change:\n{rendered}",
+    );
+    assert_output_has_no_plaintext("remote-secret saved apply", &apply, &[PLANNED, DRIFTED]);
+    assert_eq!(
+        fs::read(scenario.project.join("carina.state.json")).ok(),
+        state_before,
+        "state changed after drift rejection",
+    );
+    assert_eq!(
+        fs::read(&scenario.mock_state).ok(),
+        provider_before,
+        "provider state changed after drift rejection",
+    );
+}
+
+#[test]
+fn plan_rejects_export_of_state_retained_secret_before_apply() {
+    const PLAINTEXT: &str = "EXPORT_STATE_SECRET_HUNTER2_3861";
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let item = mock.test.resource {
+  name    = "state-secret-export"
+  comment = secret("EXPORT_STATE_SECRET_HUNTER2_3861")
+}
+"#,
+    );
+    let initial_apply = scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]);
+    assert_success("initial export-secret fixture apply", &initial_apply);
+    assert_output_has_no_plaintext(
+        "initial export-secret fixture apply",
+        &initial_apply,
+        &[PLAINTEXT],
+    );
+
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+
+let item = mock.test.resource {
+  name = "state-secret-export"
+}
+
+exports {
+  retained: String = item.comment
+}
+"#,
+    );
+
+    let provider_before = fs::read(&scenario.mock_state).expect("provider fixture state");
+    let state_before = fs::read(scenario.project.join("carina.state.json")).expect("Carina state");
+    let plan = scenario.carina(&["plan", "."]);
+    let rendered = output_text(&plan);
+    assert!(
+        !plan.status.success(),
+        "secret export unexpectedly planned:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("export 'retained' cannot hold a secret value"),
+        "plan used the wrong secret-export diagnostic:\n{rendered}",
+    );
+    assert_output_has_no_plaintext("secret export plan rejection", &plan, &[PLAINTEXT]);
+    assert_eq!(
+        fs::read(&scenario.mock_state).expect("provider fixture state after plan"),
+        provider_before,
+        "plan rejection mutated provider state",
+    );
+    assert_eq!(
+        fs::read(scenario.project.join("carina.state.json")).expect("Carina state after plan"),
+        state_before,
+        "plan rejection mutated Carina state",
+    );
+}

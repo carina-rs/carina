@@ -528,12 +528,18 @@ impl DiagnosticEngine {
             // itself carries any diagnostic-sensitivity provenance.
             let resolved_buffer = {
                 let mut resolved = parsed.clone();
-                carina_core::parser::resolve_resource_refs_with_config(
+                match carina_core::parser::resolve_resource_refs_with_config(
                     &mut resolved,
                     &self.provider_context,
-                )
-                .ok()
-                .map(|()| resolved)
+                ) {
+                    Ok(()) => Some(resolved),
+                    Err(error) => {
+                        if matches!(&error, ParseError::SecretDerivedBackendAttribute { .. }) {
+                            diagnostics.push(parse_error_to_diagnostic(&error));
+                        }
+                        None
+                    }
+                }
             };
             let resolved_buffer_resources = resolved_buffer.as_ref().map(|resolved| {
                 resolved
@@ -1764,6 +1770,18 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             100,
             DiagnosticSeverity::ERROR,
             message.clone(),
+        ),
+        ParseError::SecretDerivedBackendAttribute {
+            line,
+            start_column,
+            end_column,
+            ..
+        } => carina_diagnostic(
+            line.saturating_sub(1) as u32,
+            start_column.saturating_sub(1) as u32,
+            end_column.saturating_sub(1) as u32,
+            DiagnosticSeverity::ERROR,
+            error.to_string(),
         ),
         ParseError::InterpolationNotAllowedInLiteralString { line } => carina_diagnostic(
             (*line as u32).saturating_sub(1),

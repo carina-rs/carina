@@ -1,3 +1,5 @@
+mod saved_plan;
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::num::NonZeroUsize;
@@ -31,8 +33,9 @@ use carina_core::parser::{ProviderConfig, ProviderContext, ResolvedProviderConfi
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::{
-    CheckExportsPreApplyInput, PlanFile, ProviderUpstreamScope, ResolvedProviderInputs,
-    UpstreamMissingStatePolicy, collect_delete_attributes, load_and_resolve_provider_configs,
+    CheckExportsPreApplyInput, PlanFile, PreparedPlanIdentityInputs, ProviderUpstreamScope,
+    ResolvedProviderInputs, UpstreamMissingStatePolicy, collect_historical_display_attributes,
+    load_and_resolve_provider_configs, prepare_plan_identity_and_provider_inputs,
 };
 use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
@@ -52,16 +55,20 @@ use crate::commands::shared::state_writeback::{
 use crate::commands::state::map_lock_error;
 use crate::cursor::CursorReveal;
 use crate::display::print_plan;
-use crate::error::AppError;
+use crate::error::{AppError, SavedPlanSecretVerificationError};
 use crate::wiring::{
     DataSourceRefreshResolution, LateAnonymousIdentityInputs, WiringContext,
-    build_factories_from_providers, create_providers_from_configs, data_source_refresh_bindings,
-    get_provider_with_ctx, prepare_data_sources_for_plan, prepare_default_provider_ready_config,
-    read_data_source_with_retry, read_with_retry, reconcile_anonymous_identifiers_with_ctx,
-    reconcile_late_anonymous_identities, reconcile_prefixed_names,
-    resolve_data_source_refs_for_refresh,
+    build_factories_from_providers, create_normalizers_from_configs_with_ctx,
+    create_providers_from_configs_with_ctx, data_source_refresh_bindings, get_provider_with_ctx,
+    prepare_data_sources_for_plan, prepare_default_provider_ready_config,
+    prepare_desired_side_for_plan, read_data_source_with_retry, read_with_retry,
+    reconcile_anonymous_identifiers_with_ctx, reconcile_late_anonymous_identities,
+    reconcile_prefixed_names, resolve_data_source_refs_for_refresh,
 };
 use carina_core::hint::ProjectCommand;
+use saved_plan::{
+    DesiredPlanFile, HistoricalResourceAddresses, InspectedPlanFile, RehydratedPlanFile,
+};
 
 /// Re-export ExecutionResult as the public API for apply results.
 pub type ApplyResult = ExecutionResult;
@@ -75,6 +82,78 @@ struct PlanFileHeader {
     _timestamp: serde::de::IgnoredAny,
     #[serde(default)]
     source_path: Option<serde_json::Value>,
+}
+
+fn saved_plan_secret_rehydration_error(
+    error: carina_core::value::SecretRehydrationSiteError,
+    apply_target: ApplyTarget<'_>,
+) -> AppError {
+    let location = error.location.clone();
+    let replan = apply_target.replan_command().to_string();
+    let error = match &error.source {
+        carina_core::value::SecretRehydrationError::HashMismatch => {
+            SavedPlanSecretVerificationError::HashMismatch {
+                location,
+                replan,
+                source: error,
+            }
+        }
+        carina_core::value::SecretRehydrationError::EvaluationUnavailable => {
+            SavedPlanSecretVerificationError::SecretEvaluationUnavailable {
+                location,
+                replan,
+                source: error,
+            }
+        }
+        carina_core::value::SecretRehydrationError::OrphanVanished => {
+            SavedPlanSecretVerificationError::OrphanVanished {
+                resource: location,
+                replan,
+                source: error,
+            }
+        }
+        _ => SavedPlanSecretVerificationError::ConfigurationChanged {
+            location,
+            replan,
+            source: error,
+        },
+    };
+    AppError::SavedPlanSecretVerification(Box::new(error))
+}
+
+fn saved_plan_secret_shape_error(
+    location: impl Into<String>,
+    apply_target: ApplyTarget<'_>,
+) -> AppError {
+    saved_plan_secret_rehydration_error(
+        carina_core::value::SecretRehydrationSiteError::new(
+            location,
+            carina_core::value::SecretRehydrationError::ShapeMismatch,
+        ),
+        apply_target,
+    )
+}
+
+fn saved_plan_secret_evaluation_error(source: AppError, apply_target: ApplyTarget<'_>) -> AppError {
+    AppError::SavedPlanSecretVerification(Box::new(
+        SavedPlanSecretVerificationError::EvaluationUnavailable {
+            replan: apply_target.replan_command().to_string(),
+            source: Box::new(source),
+        },
+    ))
+}
+
+fn saved_plan_secret_orphan_vanished_error(
+    resource: impl Into<String>,
+    apply_target: ApplyTarget<'_>,
+) -> AppError {
+    saved_plan_secret_rehydration_error(
+        carina_core::value::SecretRehydrationSiteError::new(
+            resource,
+            carina_core::value::SecretRehydrationError::OrphanVanished,
+        ),
+        apply_target,
+    )
 }
 
 fn cli_observer_factory(plan: &Plan) -> Box<dyn ExecutionObserver> {
@@ -396,6 +475,47 @@ async fn execute_effects_with_observer(
     *bindings = result.bindings.clone();
 
     outcome
+}
+
+/// Saved-plan executor gateway. Requiring [`RehydratedPlanFile`] here makes it
+/// impossible for the deserialized `PlanFile` path to dispatch effects before
+/// all typed secret placeholders have been verified and removed.
+#[allow(clippy::too_many_arguments)]
+async fn execute_rehydrated_saved_plan(
+    plan_file: &RehydratedPlanFile,
+    provider: &dyn Provider,
+    normalizer: &dyn ProviderNormalizer,
+    provider_configs: &[ProviderConfig],
+    factories: &[Box<dyn carina_core::provider::ProviderFactory>],
+    schemas: &carina_core::schema::SchemaRegistry,
+    bindings: &mut ResolvedBindings,
+    current_states: &mut HashMap<ResourceId, State>,
+    unresolved_resources: &HashMap<ResourceId, UnresolvedResource>,
+    data_source_origins: &[DataSource],
+    compositions: &[carina_core::resource::Composition],
+    deferred_data_source_reads: DeferredDataSourceReads,
+    cancel: ShutdownToken,
+    parallelism: NonZeroUsize,
+    observer: Box<dyn ExecutionObserver>,
+) -> ExecutionOutcome {
+    execute_effects_with_observer(
+        plan_file.plan(),
+        provider,
+        normalizer,
+        provider_configs,
+        factories,
+        schemas,
+        bindings,
+        current_states,
+        unresolved_resources,
+        data_source_origins,
+        compositions,
+        deferred_data_source_reads,
+        cancel,
+        parallelism,
+        observer,
+    )
+    .await
 }
 
 /// Re-load each upstream declared in the saved plan and verify its
@@ -826,30 +946,66 @@ pub(crate) async fn persist_exports_only(
     }
 }
 
-/// Detect infrastructure drift by comparing planned states against actual infrastructure.
+/// Result of the saved-plan drift pass.
 ///
-/// Returns `Ok(None)` if no drift is detected, or `Ok(Some(messages))` with drift details.
-/// Returns `Err` if a resource is missing from planned_states or if a provider read fails.
+/// `verified_planned_states` contains the historical snapshot after each
+/// placeholder has been checked exactly once against the corresponding fresh
+/// provider read. The historical typestate gate consumes this map instead of
+/// repeating the Argon2 verification performed here.
+#[derive(Debug)]
+pub(crate) struct DriftCheckResult {
+    drift_messages: Option<Vec<String>>,
+    actual_states: HashMap<ResourceId, State>,
+    verified_planned_states: HashMap<ResourceId, State>,
+}
+
+impl DriftCheckResult {
+    pub(crate) fn drift_messages(&self) -> Option<&[String]> {
+        self.drift_messages.as_deref()
+    }
+
+    fn into_verified_states(self) -> (HashMap<ResourceId, State>, HashMap<ResourceId, State>) {
+        debug_assert!(self.drift_messages.is_none());
+        (self.actual_states, self.verified_planned_states)
+    }
+}
+
+/// Detect infrastructure drift and retain the single historical-secret
+/// verification pass for the saved-plan gate.
 pub(crate) async fn detect_drift(
     sorted_resources: &[Resource],
-    planned_states: &HashMap<ResourceId, State>,
+    planned_state_entries: &[crate::commands::plan::CurrentStateEntry],
+    historical_addresses: &HistoricalResourceAddresses,
     provider: &dyn Provider,
     apply_target: ApplyTarget<'_>,
-) -> Result<Option<Vec<String>>, AppError> {
+) -> Result<DriftCheckResult, AppError> {
     let mut drift_detected = false;
     let mut drift_messages: Vec<String> = Vec::new();
+    let mut actual_states = HashMap::new();
+    let mut verified_planned_states = HashMap::new();
+    let planned_states: HashMap<_, _> = planned_state_entries
+        .iter()
+        .map(|entry| (&entry.id, &entry.state))
+        .collect();
 
     for resource in sorted_resources {
         // carina#3181: `sorted_resources` is managed-only — drift
         // detection only operates over provider-backed managed
         // resources.
-        let planned_state = planned_states.get(&resource.id);
+        let planned_state = planned_states.get(&resource.id).copied();
         let identifier = planned_state.and_then(|s| s.identifier.as_deref());
+        let historical_id = historical_addresses
+            .origin_for(&resource.id)
+            .unwrap_or(&resource.id);
 
-        let actual_state = provider
-            .read(&resource.id, identifier, ReadRequest)
+        let mut actual_state = provider
+            .read(historical_id, identifier, ReadRequest)
             .await
             .map_err(AppError::Provider)?;
+        // The provider read uses the pre-move address, but every downstream
+        // saved-plan map is keyed by the moved-to runtime address.
+        actual_state.id = resource.id.clone();
+        actual_states.insert(resource.id.clone(), actual_state.clone());
 
         if let Some(planned) = planned_state {
             if planned.exists != actual_state.exists {
@@ -868,26 +1024,58 @@ pub(crate) async fn detect_drift(
                     ));
                 }
             } else if planned.exists && actual_state.exists {
+                let verification = carina_core::value::verify_historical_state_secrets(
+                    planned,
+                    &actual_state,
+                    historical_id,
+                )
+                .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
+                let secret_drift = verification.drifted_attributes();
+                let planned = verification.state();
+                verified_planned_states.insert(resource.id.clone(), planned.clone());
                 // Compare attributes for existing resources
                 let mut attr_diffs: Vec<String> = Vec::new();
                 for (key, planned_val) in &planned.attributes {
                     if key.starts_with('_') {
                         continue;
                     }
+                    let historical_shape = planned_state
+                        .and_then(|state| state.attributes.get(key))
+                        .unwrap_or(planned_val);
+                    let masked_planned = carina_core::value::mask_plaintext_using_secret_shape(
+                        planned_val,
+                        historical_shape,
+                    );
                     match actual_state.attributes.get(key) {
-                        Some(actual_val) if actual_val != planned_val => {
+                        Some(actual_val) if secret_drift.contains(key) => {
+                            let masked = carina_core::value::mask_plaintext_using_secret_shape(
+                                actual_val,
+                                historical_shape,
+                            );
                             attr_diffs.push(format!(
                                 "      {}: {} → {}",
                                 key,
-                                format_value(planned_val),
-                                format_value(actual_val)
+                                format_value(&masked_planned),
+                                format_value(&masked)
+                            ));
+                        }
+                        Some(actual_val) if actual_val != planned_val => {
+                            let masked = carina_core::value::mask_plaintext_using_secret_shape(
+                                actual_val,
+                                historical_shape,
+                            );
+                            attr_diffs.push(format!(
+                                "      {}: {} → {}",
+                                key,
+                                format_value(&masked_planned),
+                                format_value(&masked)
                             ));
                         }
                         None => {
                             attr_diffs.push(format!(
                                 "      {}: {} → (removed)",
                                 key,
-                                format_value(planned_val)
+                                format_value(&masked_planned)
                             ));
                         }
                         _ => {}
@@ -914,6 +1102,8 @@ pub(crate) async fn detect_drift(
                     ));
                     drift_messages.extend(attr_diffs);
                 }
+            } else {
+                verified_planned_states.insert(resource.id.clone(), planned.clone());
             }
         } else {
             return Err(AppError::Config(format!(
@@ -925,11 +1115,16 @@ pub(crate) async fn detect_drift(
         }
     }
 
-    if drift_detected {
-        Ok(Some(drift_messages))
+    let drift_messages = if drift_detected {
+        Some(drift_messages)
     } else {
-        Ok(None)
-    }
+        None
+    };
+    Ok(DriftCheckResult {
+        drift_messages,
+        actual_states,
+        verified_planned_states,
+    })
 }
 
 fn drift_replan_hint(apply_target: ApplyTarget<'_>) -> String {
@@ -1840,6 +2035,11 @@ async fn run_apply_locked(
     );
     crate::wiring::add_deferred_create_effects(&mut plan, &deferred_create_targets);
 
+    let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
+        .iter()
+        .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
+        .collect();
+
     render_plan_errors_and_abort(&plan)?;
 
     if can_use_export_only_fast_path(&plan, &deferred_data_source_reads) {
@@ -1863,6 +2063,8 @@ async fn run_apply_locked(
                 compositions: &parsed.compositions,
                 data_sources: &parsed.data_sources,
                 current_states: &current_states,
+                state_file: state_file.as_ref(),
+                moved_origins: &moved_origins,
                 schemas: ctx.schemas(),
                 wait_aliases: &wait_aliases,
                 provider_context,
@@ -1883,10 +2085,12 @@ async fn run_apply_locked(
             return Ok(None);
         }
 
+        let historical_display =
+            carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
         print_plan(
             &plan,
             DetailLevel::Full,
-            &HashMap::new(),
+            &historical_display,
             Some(ctx.schemas()),
             &HashMap::new(),
             &export_changes,
@@ -1933,13 +2137,9 @@ async fn run_apply_locked(
         return Ok(None);
     }
 
-    // Build delete attributes map from current states for display
-    let delete_attributes = collect_delete_attributes(&plan, &current_states, state_file.as_ref());
-
-    let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
-        .iter()
-        .map(|(from, to)| (to.as_inner().clone(), from.as_inner().clone()))
-        .collect();
+    // Build display-safe historical attributes from current and persisted state.
+    let historical_display =
+        collect_historical_display_attributes(&plan, &current_states, state_file.as_ref());
 
     let checked_exports_pre_apply =
         crate::commands::plan::check_exports_pre_apply(CheckExportsPreApplyInput {
@@ -1948,6 +2148,8 @@ async fn run_apply_locked(
             compositions: &parsed.compositions,
             data_sources: &parsed.data_sources,
             current_states: &current_states,
+            state_file: state_file.as_ref(),
+            moved_origins: &moved_origins,
             schemas: ctx.schemas(),
             wait_aliases: &wait_aliases,
             provider_context,
@@ -1962,7 +2164,7 @@ async fn run_apply_locked(
     print_plan(
         &plan,
         DetailLevel::Full,
-        &delete_attributes,
+        &historical_display,
         Some(ctx.schemas()),
         &moved_origins,
         &export_changes,
@@ -2078,6 +2280,261 @@ fn ensure_saved_plan_backend_matches_current(
     }
 }
 
+trait SavedPlanResourceLike {
+    fn id(&self) -> &ResourceId;
+    fn binding(&self) -> Option<&str>;
+    fn attributes(&self) -> &indexmap::IndexMap<String, Value>;
+}
+
+impl SavedPlanResourceLike for Resource {
+    fn id(&self) -> &ResourceId {
+        &self.id
+    }
+
+    fn binding(&self) -> Option<&str> {
+        self.binding.as_deref()
+    }
+
+    fn attributes(&self) -> &indexmap::IndexMap<String, Value> {
+        &self.attributes
+    }
+}
+
+impl SavedPlanResourceLike for DataSource {
+    fn id(&self) -> &ResourceId {
+        &self.id
+    }
+
+    fn binding(&self) -> Option<&str> {
+        self.binding.as_deref()
+    }
+
+    fn attributes(&self) -> &indexmap::IndexMap<String, Value> {
+        &self.attributes
+    }
+}
+
+fn rehydrate_saved_resource_like<T, Rehydrate>(
+    saved: &mut [T],
+    candidates: &HashMap<ResourceId, T>,
+    apply_target: ApplyTarget<'_>,
+    rehydrate: Rehydrate,
+) -> Result<(), AppError>
+where
+    T: SavedPlanResourceLike,
+    Rehydrate: Fn(&T, &T) -> Result<T, carina_core::value::SecretRehydrationSiteError>,
+{
+    for entry in saved {
+        if !entry
+            .attributes()
+            .values()
+            .any(carina_core::value::contains_redacted_secret)
+        {
+            continue;
+        }
+        let candidate = candidates
+            .get(entry.id())
+            .ok_or_else(|| saved_plan_secret_shape_error(entry.id().to_string(), apply_target))?;
+        *entry = rehydrate(entry, candidate)
+            .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
+    }
+    Ok(())
+}
+
+fn matching_resource_like<'a, T>(saved: &T, fresh: &'a [T]) -> Option<&'a T>
+where
+    T: SavedPlanResourceLike,
+{
+    fresh
+        .iter()
+        .find(|candidate| candidate.id() == saved.id())
+        .or_else(|| {
+            let binding = saved.binding()?;
+            fresh.iter().find(|candidate| {
+                candidate.binding() == Some(binding)
+                    && candidate.id().provider == saved.id().provider
+                    && candidate.id().resource_type == saved.id().resource_type
+                    && candidate.id().provider_instance == saved.id().provider_instance
+            })
+        })
+}
+
+fn import_identifiers_from_current_config(
+    plan: &Plan,
+    parsed: &carina_core::parser::InferredFile,
+) -> HashMap<ResourceId, Value> {
+    let mut identifiers = HashMap::new();
+    let bindings = bootstrap_resolved_bindings(parsed);
+    let unresolved_upstream_bindings = HashSet::new();
+    for effect in plan.effects() {
+        let carina_core::effect::Effect::Import { id, .. } = effect else {
+            continue;
+        };
+        if let Some(value) = parsed.state_blocks.iter().find_map(|block| match block {
+            carina_core::parser::StateBlock::Import { to, id: value }
+                if crate::wiring::resolve_import_target(to, &parsed.resources) == *id =>
+            {
+                Some(carina_core::resolver::resolve_value_for_plan(
+                    value,
+                    &bindings,
+                    &unresolved_upstream_bindings,
+                ))
+            }
+            _ => None,
+        }) {
+            identifiers.insert(id.as_inner().clone(), value);
+        }
+    }
+    identifiers
+}
+
+/// Reproduce the state-aware desired-side preparation that plan runs before
+/// persisting secret positions. This function deliberately builds only
+/// normalizers; CRUD-capable providers are created after every desired secret
+/// has been verified.
+async fn prepare_saved_plan_secret_candidates(
+    parsed: &mut carina_core::parser::InferredFile,
+    state_file: &Option<StateFile>,
+    base_dir: &Path,
+    provider_context: &ProviderContext,
+) -> Result<(ResolvedProviderInputs, WiringContext), AppError> {
+    let mut candidate_state = state_file.clone();
+    let PreparedPlanIdentityInputs {
+        wiring,
+        provider_inputs,
+        state_blocks: _,
+    } = prepare_plan_identity_and_provider_inputs(
+        parsed,
+        &mut candidate_state,
+        base_dir,
+        provider_context,
+        UpstreamMissingStatePolicy::Strict,
+    )
+    .await?;
+    let normalizers =
+        create_normalizers_from_configs_with_ctx(&wiring, provider_inputs.configs()).await?;
+    let stripped = prepare_desired_side_for_plan(
+        &mut parsed.resources,
+        &mut parsed.data_sources,
+        provider_inputs.configs().as_provider_configs(),
+        &normalizers,
+        &wiring,
+    )
+    .await
+    .map_err(AppError::Provider)?;
+    carina_core::executor::normalized::restore_stripped_attributes(&mut parsed.resources, stripped);
+
+    Ok((provider_inputs, wiring))
+}
+
+fn rehydrate_desired_plan_file(
+    mut plan_file: PlanFile,
+    parsed: &carina_core::parser::InferredFile,
+    provider_inputs: &ResolvedProviderInputs,
+    apply_target: ApplyTarget<'_>,
+) -> Result<PlanFile, AppError> {
+    let mut resource_candidates = HashMap::new();
+    for saved in &plan_file.sorted_resources {
+        if let Some(fresh) = matching_resource_like(saved, &parsed.resources) {
+            resource_candidates.insert(saved.id.clone(), fresh.clone());
+        }
+    }
+    let mut data_source_candidates = HashMap::new();
+    for saved in &plan_file.data_sources {
+        if let Some(fresh) = matching_resource_like(saved, &parsed.data_sources) {
+            data_source_candidates.insert(saved.id.clone(), fresh.clone());
+        }
+    }
+    let import_identifiers = import_identifiers_from_current_config(&plan_file.plan, parsed);
+
+    plan_file.plan = carina_core::value::rehydrate_plan_desired_secrets(
+        &plan_file.plan,
+        &resource_candidates,
+        &data_source_candidates,
+        &import_identifiers,
+        &parsed.deferred_for_expressions,
+    )
+    .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
+
+    rehydrate_saved_resource_like(
+        &mut plan_file.sorted_resources,
+        &resource_candidates,
+        apply_target,
+        carina_core::value::rehydrate_resource_secrets,
+    )?;
+    rehydrate_saved_resource_like(
+        &mut plan_file.unresolved_resources,
+        &resource_candidates,
+        apply_target,
+        carina_core::value::rehydrate_resource_secrets,
+    )?;
+
+    for composition in &mut plan_file.compositions {
+        let has_placeholder = composition
+            .signature
+            .arguments
+            .values()
+            .any(|argument| carina_core::value::contains_redacted_secret(argument.value()))
+            || composition.signature.attributes.values().any(|attribute| {
+                carina_core::value::contains_redacted_secret(&attribute.to_value())
+            });
+        if !has_placeholder {
+            continue;
+        }
+        let candidate = parsed
+            .compositions
+            .iter()
+            .find(|candidate| candidate.id == composition.id)
+            .or_else(|| {
+                let binding = composition.binding.as_deref()?;
+                parsed
+                    .compositions
+                    .iter()
+                    .find(|candidate| candidate.binding.as_deref() == Some(binding))
+            })
+            .ok_or_else(|| {
+                saved_plan_secret_shape_error(composition.id.to_string(), apply_target)
+            })?;
+        *composition = carina_core::value::rehydrate_composition_secrets(composition, candidate)
+            .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
+    }
+
+    rehydrate_saved_resource_like(
+        &mut plan_file.data_sources,
+        &data_source_candidates,
+        apply_target,
+        carina_core::value::rehydrate_data_source_secrets,
+    )?;
+    rehydrate_saved_resource_like(
+        &mut plan_file.data_source_origins,
+        &data_source_candidates,
+        apply_target,
+        carina_core::value::rehydrate_data_source_secrets,
+    )?;
+
+    let fresh_provider_configs =
+        carina_core::parser::SavedProviderConfigs::from(provider_inputs.configs());
+    plan_file.provider_configs = plan_file
+        .provider_configs
+        .rehydrate_secrets(&fresh_provider_configs)
+        .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
+    for (binding, attributes) in &mut plan_file.upstream_snapshot {
+        if let Some((key, _)) = attributes
+            .iter()
+            .find(|(_, value)| carina_core::value::contains_redacted_secret(value))
+        {
+            return Err(saved_plan_secret_shape_error(
+                format!(
+                    "upstream_state {binding}.{key}: secret placeholders cannot occur in valid upstream exports"
+                ),
+                apply_target,
+            ));
+        }
+    }
+
+    Ok(plan_file)
+}
+
 pub async fn run_apply_from_plan(
     plan_path: &Path,
     auto_approve: bool,
@@ -2148,7 +2605,12 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility. Plan-file version 10 persists
+    // Validate version compatibility. Plan-file version 12 stores secrets as
+    // typed placeholders bound to stable, position-unique contexts and makes
+    // saved-plan apply re-evaluate and verify them. A v11 plan's secret hashes
+    // are indistinguishable from user strings and must be regenerated.
+    //
+    // Plan-file version 10 persists
     // `Effect::Delete.generation`; older binaries would silently
     // degrade deposed deletes to current deletes through serde's
     // additive default, so v9 plans must not cross this boundary.
@@ -2224,29 +2686,77 @@ async fn run_apply_from_plan_with_observer_factory(
     );
 
     let base_dir = get_base_dir(&source_path);
-    let current_config = load_configuration_with_config(
+    let inspected_plan = InspectedPlanFile::inspect(plan_file);
+    let needs_secret_verification = inspected_plan.needs_secret_verification();
+    // Backend drift remains a mutation-safety gate even when the saved plan
+    // has no secrets. Loading the syntax tree is deliberately separate from
+    // validation and provider-config resolution: placeholder-free plans may
+    // outlive unrelated validation errors in the source configuration (R5),
+    // while a valid backend edit must still require migration or replanning.
+    let loaded_current_config = load_configuration_with_config(
         &source_path,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
-    )?;
-    let module_walk = crate::module_walk::ModuleWalk::load(&current_config.parsed, base_dir);
-    let duplicate_errors = crate::commands::duplicate_declaration_errors(
-        &current_config.duplicate_declarations,
-        &module_walk,
     );
-    if !duplicate_errors.is_empty() {
-        return Err(crate::commands::collapse_errors(duplicate_errors));
+    let mut loaded_current_config = match loaded_current_config {
+        Ok(config) => Some(config),
+        Err(source) if needs_secret_verification => {
+            return Err(saved_plan_secret_evaluation_error(
+                AppError::Config(source),
+                apply_target,
+            ));
+        }
+        Err(_) => None,
+    };
+    let parsed_backend = loaded_current_config
+        .as_ref()
+        .map(|config| config.parsed.backend.clone());
+    let mut current_parsed = if needs_secret_verification {
+        let mut current_config = loaded_current_config
+            .take()
+            .expect("secret verification requires a loaded current configuration");
+        let module_walk = crate::module_walk::ModuleWalk::load(&current_config.parsed, base_dir);
+        let duplicate_errors = crate::commands::duplicate_declaration_errors(
+            &current_config.duplicate_declarations,
+            &module_walk,
+        );
+        if !duplicate_errors.is_empty() {
+            return Err(saved_plan_secret_evaluation_error(
+                crate::commands::collapse_errors(duplicate_errors),
+                apply_target,
+            ));
+        }
+        crate::commands::validate_and_resolve_with_config(
+            &mut current_config.parsed,
+            base_dir,
+            false,
+            &current_config.inference_errors,
+            &current_config.duplicate_declarations,
+        )
+        .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
+        Some(current_config.parsed)
+    } else {
+        None
+    };
+    let current_backend = current_parsed
+        .as_ref()
+        .map(|parsed| parsed.backend.as_ref())
+        .or_else(|| parsed_backend.as_ref().map(Option::as_ref));
+    let backend_config = match current_backend {
+        Some(current_backend) => current_backend,
+        None => inspected_plan.backend_config(),
+    };
+    let verified_backend = verify_for_mutation(&source_path, backend_config, DriftCommand::Apply)?;
+    // Preserve the established gate order: configuration-vs-lock drift
+    // requires `init --migrate-state` first; only once that is clean can a
+    // plan-vs-current-source mismatch ask for a new plan.
+    if let Some(current_backend) = current_backend {
+        ensure_saved_plan_backend_matches_current(
+            inspected_plan.backend_config(),
+            current_backend,
+            apply_target,
+        )?;
     }
-    let verified_backend = verify_for_mutation(
-        &source_path,
-        current_config.parsed.backend.as_ref(),
-        DriftCommand::Apply,
-    )?;
-    ensure_saved_plan_backend_matches_current(
-        plan_file.backend_config.as_ref(),
-        current_config.parsed.backend.as_ref(),
-        apply_target,
-    )?;
 
     // Set up backend
     let backend: Box<dyn StateBackend> = verified_backend
@@ -2274,7 +2784,9 @@ async fn run_apply_from_plan_with_observer_factory(
     };
 
     let op_result = run_apply_from_plan_locked(
-        plan_file,
+        inspected_plan,
+        current_parsed.as_mut(),
+        provider_context,
         auto_approve,
         backend.as_ref(),
         lock_info.as_ref(),
@@ -2313,7 +2825,9 @@ async fn run_apply_from_plan_with_observer_factory(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_from_plan_locked(
-    plan_file: PlanFile,
+    inspected_plan: InspectedPlanFile,
+    current_parsed: Option<&mut carina_core::parser::InferredFile>,
+    provider_context: &ProviderContext,
     auto_approve: bool,
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
@@ -2323,10 +2837,6 @@ async fn run_apply_from_plan_locked(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
-    let resolved_provider_configs =
-        ResolvedProviderConfigs::try_from(plan_file.provider_configs)
-            .map_err(|source| AppError::SavedProviderConfig(Box::new(source)))?;
-    let raw_provider_configs = resolved_provider_configs.as_provider_configs();
     let project_dir = apply_target.source_dir();
     // Read current state and validate lineage. carina#3315: a
     // pending in-memory schema migration must be persisted under
@@ -2347,8 +2857,8 @@ async fn run_apply_from_plan_locked(
 
     if let Some(ref state) = state_file {
         // Validate state lineage
-        if let Some(ref plan_lineage) = plan_file.state_lineage
-            && &state.lineage != plan_lineage
+        if let Some(plan_lineage) = inspected_plan.state_lineage()
+            && state.lineage != plan_lineage
         {
             return Err(AppError::Config(format!(
                 "State lineage mismatch: plan was created for lineage '{}' but current state has '{}'",
@@ -2357,7 +2867,7 @@ async fn run_apply_from_plan_locked(
         }
 
         // Warn on serial mismatch (state may have drifted)
-        if let Some(plan_serial) = plan_file.state_serial
+        if let Some(plan_serial) = inspected_plan.state_serial()
             && state.serial != plan_serial
         {
             println!(
@@ -2372,10 +2882,10 @@ async fn run_apply_from_plan_locked(
         }
     }
 
-    // Now that the saved-plan integrity checks have run against the
-    // pristine on-disk view, persist any pending schema migration so
-    // the next short-circuit (`!plan.has_mutations()`) cannot leave
-    // the disk at the older version (carina#3315).
+    // Persist an in-memory schema migration after the saved-plan lineage and
+    // serial checks, but before drift detection or secret verification can
+    // return early (carina#3315). The migration is independent of plan values
+    // and records only the state schema upgrade performed while reading.
     if pending_migration.is_some()
         && let Some(state) = state_file.as_mut()
     {
@@ -2386,37 +2896,62 @@ async fn run_apply_from_plan_locked(
         }
     }
 
-    let plan = &plan_file.plan;
-    let sorted_resources = &plan_file.sorted_resources;
-    let resolved_sorted_resources =
-        ResolvedResource::collect_resolved(sorted_resources.iter().cloned())?;
-    let plan_compositions: &[carina_core::resource::Composition] = &plan_file.compositions;
-    let plan_data_sources: &[carina_core::resource::DataSource] = &plan_file.data_sources;
-    let plan_data_source_origins: &[carina_core::resource::DataSource] =
-        &plan_file.data_source_origins;
+    let (desired_plan, prepared_wiring) = match inspected_plan {
+        InspectedPlanFile::Verified(plan) => (DesiredPlanFile::Verified(plan), None),
+        InspectedPlanFile::NeedsSecretVerification(plan) => {
+            let parsed = current_parsed.ok_or_else(|| {
+                saved_plan_secret_evaluation_error(
+                    AppError::Config("the current configuration was unavailable".to_string()),
+                    apply_target,
+                )
+            })?;
+            let (provider_inputs, wiring) = prepare_saved_plan_secret_candidates(
+                parsed,
+                &state_file,
+                project_dir,
+                provider_context,
+            )
+            .await
+            .map_err(|source| saved_plan_secret_evaluation_error(source, apply_target))?;
+            (
+                plan.verify_desired(parsed, &provider_inputs, apply_target)?,
+                Some(wiring),
+            )
+        }
+    };
 
-    // Rebuild planned current_states HashMap from plan file
-    let planned_states: HashMap<ResourceId, State> = plan_file
-        .current_states
-        .into_iter()
-        .map(|entry| (entry.id, entry.state))
-        .collect();
-    let deferred_data_source_reads = deferred_data_source_reads_from_data_sources(
-        plan_data_source_origins,
-        sorted_resources,
-        &planned_states,
-    );
+    let resolved_provider_configs =
+        ResolvedProviderConfigs::try_from(desired_plan.provider_configs().clone())
+            .map_err(|source| AppError::SavedProviderConfig(Box::new(source)))?;
+    let raw_provider_configs = resolved_provider_configs.as_provider_configs();
 
-    // Create provider early for drift detection
-    let (provider, ctx) =
-        create_providers_from_configs(&resolved_provider_configs, project_dir).await?;
+    // Desired/config secret verification is complete before a CRUD-capable
+    // provider is constructed. Historical placeholders are verified by the
+    // drift reads below before the executor gate is minted.
+    let ctx = match prepared_wiring {
+        Some(wiring) => wiring,
+        None => {
+            let (factories, _) = build_factories_from_providers(raw_provider_configs, project_dir)?;
+            WiringContext::new(factories, raw_provider_configs)
+        }
+    };
+    let provider =
+        create_providers_from_configs_with_ctx(&ctx, &resolved_provider_configs, project_dir)
+            .await?;
 
     // Drift detection: re-read actual infrastructure state and compare against planned states
     println!("{}", "Checking for infrastructure drift...".cyan());
-    let drift_result =
-        detect_drift(sorted_resources, &planned_states, &provider, apply_target).await?;
+    let historical_addresses = desired_plan.historical_resource_addresses();
+    let drift_check = detect_drift(
+        desired_plan.sorted_resources(),
+        desired_plan.current_states(),
+        &historical_addresses,
+        &provider,
+        apply_target,
+    )
+    .await?;
 
-    if let Some(drift_messages) = drift_result {
+    if let Some(drift_messages) = drift_check.drift_messages() {
         println!();
         println!("{}", "Error: Infrastructure drift detected!".red().bold());
         println!(
@@ -2424,7 +2959,7 @@ async fn run_apply_from_plan_locked(
             "The following resources have changed since the plan was created:".red()
         );
         println!();
-        for msg in &drift_messages {
+        for msg in drift_messages {
             println!("{}", msg);
         }
         println!();
@@ -2435,6 +2970,38 @@ async fn run_apply_from_plan_locked(
     }
 
     println!("  {} No drift detected.", "✓".green());
+
+    let (mut actual_states, mut verified_planned_states) = drift_check.into_verified_states();
+
+    let rehydrated_plan_file = desired_plan
+        .verify_historical(
+            &provider,
+            &mut actual_states,
+            &mut verified_planned_states,
+            &historical_addresses,
+            apply_target,
+        )
+        .await?;
+
+    let plan = rehydrated_plan_file.plan();
+    let sorted_resources = rehydrated_plan_file.sorted_resources();
+    let resolved_sorted_resources =
+        ResolvedResource::collect_resolved(sorted_resources.iter().cloned())?;
+    let plan_compositions = rehydrated_plan_file.compositions();
+    let plan_data_sources = rehydrated_plan_file.data_sources();
+    let plan_data_source_origins: &[carina_core::resource::DataSource] =
+        rehydrated_plan_file.data_source_origins();
+
+    let planned_states: HashMap<ResourceId, State> = rehydrated_plan_file
+        .current_states()
+        .iter()
+        .map(|entry| (entry.id.clone(), entry.state.clone()))
+        .collect();
+    let deferred_data_source_reads = deferred_data_source_reads_from_data_sources(
+        plan_data_source_origins,
+        sorted_resources,
+        &planned_states,
+    );
 
     // Use the actual states (freshly read) as current_states for apply
     let mut current_states = planned_states;
@@ -2449,8 +3016,8 @@ async fn run_apply_from_plan_locked(
         // resource-apply pipeline. Mirrors the source-driven apply
         // path's gate (carina#3270 → run_apply_locked).
         // carina#3275.
-        let terminal_wait_aliases: Vec<WaitAliasSpec> = plan_file
-            .wait_bindings
+        let terminal_wait_aliases: Vec<WaitAliasSpec> = rehydrated_plan_file
+            .wait_bindings()
             .iter()
             .map(|wb| WaitAliasSpec {
                 binding: carina_core::parser::BindingName::new(wb.binding.clone()),
@@ -2468,7 +3035,7 @@ async fn run_apply_from_plan_locked(
                 compositions: plan_compositions,
                 data_sources: plan_data_sources,
                 current_states: &terminal_input_states,
-                remote_bindings: &plan_file.upstream_snapshot,
+                remote_bindings: rehydrated_plan_file.upstream_snapshot(),
                 wait_aliases: &terminal_wait_aliases,
             });
         finalize_module_constraints(plan_compositions, &terminal_bindings)?;
@@ -2476,13 +3043,14 @@ async fn run_apply_from_plan_locked(
         return Ok(None);
     }
 
-    // Build delete attributes map from current states for display
-    let delete_attributes = collect_delete_attributes(plan, &current_states, state_file.as_ref());
+    // Build display-safe historical attributes from current and persisted state.
+    let historical_display =
+        collect_historical_display_attributes(plan, &current_states, state_file.as_ref());
 
     print_plan(
         plan,
         DetailLevel::Full,
-        &delete_attributes,
+        &historical_display,
         None,
         &HashMap::new(),
         &[],
@@ -2501,10 +3069,10 @@ async fn run_apply_from_plan_locked(
     // compare against the persisted snapshot; if any binding's
     // attribute map disagrees, fail rather than silently mixing
     // plan-time and apply-time values during cascade re-resolution.
-    let upstream_snapshot = plan_file.upstream_snapshot.clone();
-    if !plan_file.upstream_sources.is_empty() {
+    let upstream_snapshot = rehydrated_plan_file.upstream_snapshot().clone();
+    if !rehydrated_plan_file.upstream_sources().is_empty() {
         verify_upstream_snapshot(
-            &plan_file.upstream_sources,
+            rehydrated_plan_file.upstream_sources(),
             &upstream_snapshot,
             apply_target,
         )
@@ -2516,8 +3084,8 @@ async fn run_apply_from_plan_locked(
     // plan path did (carina#3085). `PlanWaitBinding` (String) →
     // `WaitAliasSpec` (typed `BindingName`); the parser `WaitBinding`
     // is not serializable so it is reconstructed here, not deserialized.
-    let wait_aliases: Vec<WaitAliasSpec> = plan_file
-        .wait_bindings
+    let wait_aliases: Vec<WaitAliasSpec> = rehydrated_plan_file
+        .wait_bindings()
         .iter()
         .map(|wb| WaitAliasSpec {
             binding: carina_core::parser::BindingName::new(wb.binding.clone()),
@@ -2555,15 +3123,15 @@ async fn run_apply_from_plan_locked(
     // resource IDs rather than the unresolved snapshot's own identity.
     let unresolved_resources = saved_plan_unresolved_by_resolved_id(
         sorted_resources,
-        &plan_file.unresolved_resources,
+        rehydrated_plan_file.unresolved_resources(),
         apply_target,
     )?;
     // Same object in both positions: `ProviderRouter` is both the
     // `Provider` and the `ProviderNormalizer`, so apply re-normalizes
     // with the plan-time normalizer (carina#3060).
     let observer = observer_factory(plan);
-    let outcome = execute_effects_with_observer(
-        plan,
+    let outcome = execute_rehydrated_saved_plan(
+        &rehydrated_plan_file,
         &provider,
         &provider,
         raw_provider_configs,
@@ -2589,9 +3157,8 @@ async fn run_apply_from_plan_locked(
     execute_state_only_effects(plan, &mut result);
     let resources_finished = Instant::now();
 
-    // Build schemas for write-only attribute persistence
-    let (factories, _) = build_factories_from_providers(raw_provider_configs, project_dir)?;
-    let ctx = WiringContext::new(factories, raw_provider_configs);
+    // Reuse the exact factory/schema context that prepared and executed the
+    // saved plan for write-only attribute persistence.
     let provider_context = ProviderContext::default();
 
     let skipped_exports = finalize_after_execute(

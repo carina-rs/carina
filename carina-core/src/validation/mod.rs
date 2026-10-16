@@ -291,6 +291,7 @@ pub(crate) fn visit_refs_with_sink<'a>(
         | Value::Concrete(ConcreteValue::Bool(_))
         | Value::Concrete(ConcreteValue::Duration(_))
         | Value::Concrete(ConcreteValue::StringList(_))
+        | Value::Deferred(DeferredValue::RedactedSecret { .. })
         | Value::Deferred(DeferredValue::Unknown(_)) => {}
     }
 }
@@ -878,6 +879,7 @@ fn validate_user_function_ref_types_inner<E: crate::parser::ExportParamLike>(
             | Value::Concrete(ConcreteValue::StringList(_))
             | Value::Deferred(DeferredValue::ResourceRef { .. })
             | Value::Deferred(DeferredValue::BindingRef { .. })
+            | Value::Deferred(DeferredValue::RedactedSecret { .. })
             | Value::Deferred(DeferredValue::Unknown(_)) => {}
         }
     }
@@ -2102,6 +2104,7 @@ pub(crate) fn value_contains_unresolved_ref(value: &Value) -> bool {
         | Value::Deferred(DeferredValue::BindingRef { .. })
         | Value::Deferred(DeferredValue::Interpolation(_))
         | Value::Deferred(DeferredValue::FunctionCall { .. })
+        | Value::Deferred(DeferredValue::RedactedSecret { .. })
         | Value::Deferred(DeferredValue::Unknown(_)) => true,
         Value::Deferred(DeferredValue::Secret(inner)) => value_contains_unresolved_ref(inner),
         Value::Concrete(ConcreteValue::List(items)) => {

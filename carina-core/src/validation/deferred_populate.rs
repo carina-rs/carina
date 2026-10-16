@@ -214,7 +214,11 @@ fn collect_unsynchronized_refs(
         ) => {
             // Scalar leaves carry no references.
         }
-        Value::Deferred(DeferredValue::Unknown(_) | DeferredValue::BindingRef { .. }) => {
+        Value::Deferred(
+            DeferredValue::Unknown(_)
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::RedactedSecret { .. },
+        ) => {
             // BindingRef lacks the attribute path check_ref needs for deferred_populate.
             // Unknown is parser-deferred and likewise carries no resource attribute path.
         }

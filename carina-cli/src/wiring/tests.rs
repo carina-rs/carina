@@ -9,7 +9,7 @@ use carina_core::executor::{
 };
 use carina_core::provider::{
     BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, ProviderResult, ReadRequest,
-    UpdateOutcome, UpdateRequest,
+    SavedAttrs, UpdateOutcome, UpdateRequest, ready_noop,
 };
 use carina_core::resource::{
     Directives, ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
@@ -30,6 +30,94 @@ fn resolved_provider_configs<E>(
     parsed: &carina_core::parser::File<E>,
 ) -> carina_core::parser::ResolvedProviderConfigs {
     resolved_provider_configs_with_remote(parsed, &HashMap::new())
+}
+
+struct TestDefaultTagNormalizer;
+
+impl ProviderNormalizer for TestDefaultTagNormalizer {
+    fn normalize_desired<'a>(
+        &'a self,
+        _resources: &'a mut [Resource],
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        ready_noop()
+    }
+
+    fn normalize_state<'a>(
+        &'a self,
+        _current_states: &'a mut HashMap<ResourceId, State>,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        ready_noop()
+    }
+
+    fn hydrate_read_state<'a>(
+        &'a self,
+        _current_states: &'a mut HashMap<ResourceId, State>,
+        _saved_attrs: &'a SavedAttrs,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        ready_noop()
+    }
+
+    fn merge_default_tags<'a>(
+        &'a self,
+        resources: &'a mut [Resource],
+        default_tags: &'a IndexMap<String, Value>,
+        registry: &'a SchemaRegistry,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async move {
+            carina_core::provider::merge_default_tags_for_provider(
+                BUILTIN_PROVIDER_NAME,
+                resources,
+                default_tags,
+                registry,
+            );
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn shared_desired_pipeline_supports_test_injected_default_tag_normalization() {
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+        ConcreteValue::String("test-only-default-tag-secret".into()),
+    ))));
+    let provider_config = ProviderConfig {
+        name: BUILTIN_PROVIDER_NAME.to_string(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::from([("SecretTag".to_string(), secret.clone())]),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    };
+    let provider_configs = vec![provider_config];
+    let ctx = WiringContext::new(Vec::new(), &provider_configs);
+    let mut resources = vec![Resource::with_provider(
+        BUILTIN_PROVIDER_NAME,
+        "test.resource",
+        "default-tag-target",
+        None,
+    )];
+
+    let stripped = prepare_desired_side_for_plan(
+        &mut resources,
+        &mut [],
+        &provider_configs,
+        &TestDefaultTagNormalizer,
+        &ctx,
+    )
+    .await
+    .expect("test normalizer should traverse the shared desired pipeline");
+    restore_stripped_attributes(&mut resources, stripped);
+
+    let Value::Concrete(ConcreteValue::Map(tags)) = resources[0]
+        .attributes
+        .get("tags")
+        .expect("test normalizer should merge default tags")
+    else {
+        panic!("merged tags must be a map")
+    };
+    assert_eq!(tags.get("SecretTag"), Some(&secret));
 }
 
 fn resolved_provider_configs_with_remote<E>(
@@ -1525,13 +1613,13 @@ fn removed_block_does_not_suppress_deposed_generation_delete() {
     let mut state_file = StateFile::new();
     let mut rs = ResourceState::new("route53.RecordSet", "r.delegation_ns", "aws")
         .with_identifier("record-current");
-    rs.deposed.push(DeposedInstance {
-        key: deposed_key.clone(),
-        identifier: "record-deposed".to_string(),
-        provider_instance: None,
-        attributes: HashMap::new(),
-        dependency_bindings: BTreeSet::new(),
-    });
+    rs.deposed.push(DeposedInstance::from_persisted_json(
+        deposed_key.clone(),
+        "record-deposed".to_string(),
+        None,
+        HashMap::new(),
+        BTreeSet::new(),
+    ));
     state_file
         .upsert_resource(rs)
         .expect("test state setup must be valid");
@@ -1615,13 +1703,15 @@ fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
         ResourceId::with_provider_identity("aws", "example.Consumer", "consumer-id", None);
     let mut producer_row = ResourceState::new("example.Producer", "producer-id", "aws");
     producer_row.binding = Some("producer".to_string());
-    producer_row.deposed.push(DeposedInstance {
-        key: DeposedKey::new_unique(),
-        identifier: "producer-old".to_string(),
-        provider_instance: None,
-        attributes: HashMap::new(),
-        dependency_bindings: BTreeSet::new(),
-    });
+    producer_row
+        .deposed
+        .push(DeposedInstance::from_persisted_json(
+            DeposedKey::new_unique(),
+            "producer-old".to_string(),
+            None,
+            HashMap::new(),
+            BTreeSet::new(),
+        ));
     let mut state_file = StateFile::new();
     state_file
         .upsert_resource(producer_row)
@@ -1700,7 +1790,7 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
         Some("management".to_string()),
     );
     let mut plan = Plan::new();
-    plan.add(Effect::Create(resolved(resource)));
+    plan.add(Effect::Create(resolved(resource.clone())));
 
     // The import block address has no routing slot (`StateBlockAddress`
     // is routing-agnostic by construction). The downstream resolver
@@ -1721,7 +1811,7 @@ fn import_suppresses_create_when_target_resource_is_routed_to_named_instance() {
         &state_blocks,
         &None,
         &[],
-        &[],
+        &[resource],
         &bindings,
         &no_upstreams,
     );
@@ -2258,9 +2348,7 @@ fn route_table_state(binding: &str, id: &str) -> carina_state::state::ResourceSt
     let mut state =
         carina_state::state::ResourceState::new("ec2.RouteTable", test_identity(binding), "awscc");
     state.binding = Some(binding.to_string());
-    state
-        .attributes
-        .insert("id".to_string(), serde_json::Value::String(id.to_string()));
+    state.set_persisted_attribute("id".to_string(), serde_json::Value::String(id.to_string()));
     state
 }
 
@@ -2274,11 +2362,11 @@ fn association_state(
         test_identity(name),
         "awscc",
     );
-    state.attributes.insert(
+    state.set_persisted_attribute(
         "route_table_id".to_string(),
         serde_json::Value::String(route_table_id.to_string()),
     );
-    state.attributes.insert(
+    state.set_persisted_attribute(
         "subnet_id".to_string(),
         serde_json::Value::String(subnet_id.to_string()),
     );

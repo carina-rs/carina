@@ -12,7 +12,6 @@ use crate::resource::{
     ResourceId, Value,
 };
 use crate::utils::enum_display_value;
-use crate::value::SECRET_PREFIX;
 
 use super::ModuleError;
 
@@ -638,9 +637,6 @@ fn format_constraint_actual(value: &Value) -> String {
 }
 
 fn format_constraint_string(value: &str) -> String {
-    if value.starts_with(SECRET_PREFIX) {
-        return "(secret)".to_string();
-    }
     display_string_literal(enum_display_value(value).unwrap_or(value))
 }
 
@@ -676,6 +672,7 @@ impl EvalValue {
                 ConcreteValue::Map(_) => "map",
             },
             Self::Value(Value::Deferred(DeferredValue::Secret(_))) => "secret",
+            Self::Value(Value::Deferred(DeferredValue::RedactedSecret { .. })) => "secret",
             Self::Value(Value::Deferred(DeferredValue::ResourceRef { .. })) => "resource reference",
             Self::Value(Value::Deferred(DeferredValue::BindingRef { .. })) => "binding reference",
             Self::Value(Value::Deferred(DeferredValue::Interpolation(_))) => "interpolation",
@@ -871,6 +868,13 @@ mod tests {
 
     use super::*;
 
+    fn redacted_secret() -> Value {
+        serde_json::from_value(serde_json::json!({
+            "RedactedSecret": { "hash": "deadbeef".repeat(8) }
+        }))
+        .expect("deserialize persisted secret")
+    }
+
     fn length_at_least(variable: &str, minimum: i64) -> ValidateExpr {
         ValidateExpr::Compare {
             lhs: Box::new(ValidateExpr::FunctionCall {
@@ -963,12 +967,7 @@ mod tests {
                 "list".to_string(),
                 Value::Concrete(ConcreteValue::StringList(vec!["a".into(), "b".into()])),
             ),
-            (
-                "secret".to_string(),
-                Value::Concrete(ConcreteValue::String(
-                    format!("{}deadbeef", crate::value::SECRET_PREFIX).into(),
-                )),
-            ),
+            ("secret".to_string(), redacted_secret()),
         ])));
         assert_eq!(
             format_constraint_actual(&nested),
@@ -1022,12 +1021,7 @@ mod tests {
                 "enum_text".to_string(),
                 Value::Concrete(ConcreteValue::String("aws.Region.us_east_1".into())),
             ),
-            (
-                "secret_hash".to_string(),
-                Value::Concrete(ConcreteValue::String(
-                    format!("{}deadbeef", crate::value::SECRET_PREFIX).into(),
-                )),
-            ),
+            ("secret_hash".to_string(), redacted_secret()),
         ]);
 
         assert_eq!(

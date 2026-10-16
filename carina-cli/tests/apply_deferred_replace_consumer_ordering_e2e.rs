@@ -298,6 +298,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
                 "path".to_string(),
                 Value::Concrete(ConcreteValue::String("carina.state.json".into())),
             )]),
+            attribute_spans: Default::default(),
         }),
         plan,
         sorted_resources: sorted_resources.clone(),

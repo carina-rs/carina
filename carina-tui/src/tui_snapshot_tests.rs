@@ -44,7 +44,7 @@ fn render_tui_with_schemas(
 ) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
-    let mut app = App::new(plan, schemas);
+    let mut app = App::for_plan(plan, schemas);
 
     for _ in 0..selection {
         app.move_down();
@@ -511,7 +511,7 @@ fn snapshot_detail_panel_third_node() {
 fn render_tui_with_search(plan: &Plan, width: u16, height: u16, query: &str) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
-    let mut app = App::new(plan, &SchemaRegistry::new());
+    let mut app = App::for_plan(plan, &SchemaRegistry::new());
 
     // Simulate typing the search query and confirming with Enter
     app.search_active = true;

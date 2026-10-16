@@ -253,7 +253,8 @@ fn visit_unknowns(value: &Value, f: &mut impl FnMut(&UnknownReason)) {
         Value::Deferred(DeferredValue::Secret(inner)) => visit_unknowns(inner, f),
         Value::Concrete(_)
         | Value::Deferred(DeferredValue::ResourceRef { .. })
-        | Value::Deferred(DeferredValue::BindingRef { .. }) => {}
+        | Value::Deferred(DeferredValue::BindingRef { .. })
+        | Value::Deferred(DeferredValue::RedactedSecret { .. }) => {}
     }
 }
 

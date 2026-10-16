@@ -1430,7 +1430,7 @@ pub enum ConcreteValue {
 
 /// Deferred-axis variants: placeholders that resolve later
 /// (apply time, upstream load, function evaluation).
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub enum DeferredValue {
     /// Reference to another resource's attribute via an access path.
     ResourceRef { path: AccessPath },
@@ -1444,9 +1444,58 @@ pub enum DeferredValue {
     /// A secret value. The inner value is sent to the provider but
     /// stored as an Argon2id hash in state.
     Secret(Box<Value>),
+    /// An opaque secret hash loaded from persisted state or a serialized
+    /// saved plan.
+    ///
+    /// It is deliberately deferred (rather than an ordinary string) so no
+    /// redaction guide can mistake a state marker for plaintext. Desired-side
+    /// provider and state-write boundaries reject it; persisted-state
+    /// boundaries may preserve its original marker bytes for legacy provider
+    /// compatibility. The DSL parser has no syntax that can construct it.
+    RedactedSecret { hash: RedactedSecretHash },
     /// A value not known at plan time. RFC #2371.
-    #[serde(skip)]
     Unknown(UnknownReason),
+}
+
+impl Serialize for DeferredValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        enum SerializableDeferredValue<'a> {
+            ResourceRef { path: &'a AccessPath },
+            BindingRef { binding: &'a str },
+            Interpolation(&'a [InterpolationPart]),
+            FunctionCall { name: &'a str, args: &'a [Value] },
+            RedactedSecret { hash: &'a RedactedSecretHash },
+            Unknown(&'a UnknownReason),
+        }
+
+        match self {
+            Self::ResourceRef { path } => {
+                SerializableDeferredValue::ResourceRef { path }.serialize(serializer)
+            }
+            Self::BindingRef { binding } => SerializableDeferredValue::BindingRef {
+                binding: binding.as_str(),
+            }
+            .serialize(serializer),
+            Self::Interpolation(parts) => {
+                SerializableDeferredValue::Interpolation(parts).serialize(serializer)
+            }
+            Self::FunctionCall { name, args } => SerializableDeferredValue::FunctionCall {
+                name: name.as_str(),
+                args,
+            }
+            .serialize(serializer),
+            Self::Secret(_) => Err(serde::ser::Error::custom(
+                "raw secret values cannot be serialized; redact or materialize them at the typed boundary",
+            )),
+            Self::RedactedSecret { hash } => {
+                SerializableDeferredValue::RedactedSecret { hash }.serialize(serializer)
+            }
+            Self::Unknown(reason) => {
+                SerializableDeferredValue::Unknown(reason).serialize(serializer)
+            }
+        }
+    }
 }
 
 impl fmt::Debug for DeferredValue {
@@ -1466,8 +1515,33 @@ impl fmt::Debug for DeferredValue {
                 .field("args", args)
                 .finish(),
             Self::Secret(_) => f.write_str("Secret((secret))"),
+            Self::RedactedSecret { .. } => f.write_str("RedactedSecret((secret hash))"),
             Self::Unknown(reason) => f.debug_tuple("Unknown").field(reason).finish(),
         }
+    }
+}
+
+/// Opaque hash carried by [`DeferredValue::RedactedSecret`].
+///
+/// The constructor is crate-private so ordinary consumers cannot manufacture
+/// a value that masquerades as a saved-plan placeholder.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RedactedSecretHash(String);
+
+impl RedactedSecretHash {
+    pub(crate) fn new(hash: String) -> Self {
+        Self(hash)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RedactedSecretHash {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("(secret hash)")
     }
 }
 
@@ -1546,6 +1620,7 @@ pub enum DeferredValueRef<'a> {
     Interpolation(&'a [InterpolationPart]),
     FunctionCall { name: &'a str, args: &'a [Value] },
     Secret(&'a Value),
+    RedactedSecret(&'a RedactedSecretHash),
     Unknown(&'a UnknownReason),
 }
 
@@ -1587,6 +1662,7 @@ impl Value {
             | Value::Deferred(
                 DeferredValue::ResourceRef { .. }
                 | DeferredValue::BindingRef { .. }
+                | DeferredValue::RedactedSecret { .. }
                 | DeferredValue::Unknown(_),
             ) => false,
         }
@@ -1596,7 +1672,8 @@ impl Value {
     /// projection. Returns `None` for deferred-resolution variants
     /// ([`Value::ResourceRef`], [`Value::BindingRef`],
     /// [`Value::Interpolation`], [`Value::FunctionCall`],
-    /// [`Value::Secret`], [`Value::Unknown`]).
+    /// [`Value::Secret`], saved-plan secret placeholders, and
+    /// [`Value::Unknown`]).
     ///
     /// Concrete-only sub-systems should consume `Value` exclusively
     /// through this accessor — the returned [`ConcreteValueRef`]
@@ -1634,6 +1711,7 @@ impl Value {
                     DeferredValueRef::FunctionCall { name, args }
                 }
                 DeferredValue::Secret(inner) => DeferredValueRef::Secret(inner),
+                DeferredValue::RedactedSecret { hash } => DeferredValueRef::RedactedSecret(hash),
                 DeferredValue::Unknown(reason) => DeferredValueRef::Unknown(reason),
             }),
             Value::Concrete(_) => None,
@@ -1690,9 +1768,9 @@ pub enum UnknownReason {
     /// real element along `path` (carina#3136). Distinct from a
     /// resource `ResourceRef` so `resolve_ref_value` — which only
     /// resolves against resource bindings — never sees a loop variable
-    /// it cannot resolve. Lives under the `#[serde(skip)]`
-    /// `Unknown(..)` arm, so it inherits the never-equal `PartialEq`
-    /// invariant and is never serialized.
+    /// it cannot resolve. It inherits the never-equal `PartialEq`
+    /// invariant; saved plans serialize it so deferred templates retain
+    /// the information required for apply-time substitution.
     ForValuePath { path: AccessPath },
     /// Mid-edit empty `${}` interpolation. Carries no payload — the
     /// presence of the marker is enough for the LSP to surface a
@@ -1799,6 +1877,10 @@ impl PartialEq for Value {
             (
                 Value::Deferred(DeferredValue::Secret(a)),
                 Value::Deferred(DeferredValue::Secret(b)),
+            ) => a == b,
+            (
+                Value::Deferred(DeferredValue::RedactedSecret { hash: a }),
+                Value::Deferred(DeferredValue::RedactedSecret { hash: b }),
             ) => a == b,
             _ => false,
         }
@@ -2017,7 +2099,8 @@ impl Value {
             | Value::Concrete(ConcreteValue::Bool(_))
             | Value::Concrete(ConcreteValue::Duration(_))
             | Value::Concrete(ConcreteValue::StringList(_))
-            | Value::Deferred(DeferredValue::BindingRef { .. }) => {}
+            | Value::Deferred(DeferredValue::BindingRef { .. })
+            | Value::Deferred(DeferredValue::RedactedSecret { .. }) => {}
             // `Value::Unknown` is what a previously-unresolved
             // `ResourceRef` was *replaced with* by `stamp_unresolved_upstream`.
             // It carries an `AccessPath` for display, but it is no longer
@@ -2066,7 +2149,8 @@ impl Value {
             | Value::Concrete(ConcreteValue::Bool(_))
             | Value::Concrete(ConcreteValue::Duration(_))
             | Value::Concrete(ConcreteValue::StringList(_))
-            | Value::Deferred(DeferredValue::ResourceRef { .. }) => {}
+            | Value::Deferred(DeferredValue::ResourceRef { .. })
+            | Value::Deferred(DeferredValue::RedactedSecret { .. }) => {}
             // `Value::Unknown` is what a previously-unresolved reference was
             // *replaced with* by stamping passes. It is no longer a live
             // reference to walk.
@@ -2212,6 +2296,9 @@ impl Value {
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 inner.hash_into(hasher);
+            }
+            Value::Deferred(DeferredValue::RedactedSecret { hash }) => {
+                hash.as_str().hash(hasher);
             }
             Value::Deferred(DeferredValue::Unknown(reason)) => {
                 // `Value::Unknown` reaches `merge_lists_hashed` → this
@@ -2842,8 +2929,8 @@ fn pairing_hashes(
     match value {
         Value::Deferred(DeferredValue::Secret(inner)) => {
             // `type_aware_equal` checks Secret before schema dispatch. A
-            // secret can equal either its plaintext inner String or its
-            // `_secret:argon2:...` state representation, so candidate
+            // secret can equal either its plaintext inner String or its typed
+            // persisted-state hash, so candidate
             // generation must expose both relations as well. Recursive inner
             // hashes cover plaintext (including schema normalizations); the
             // fixed tag deliberately admits every state-secret spelling for
@@ -2851,11 +2938,7 @@ fn pairing_hashes(
             hashes.extend(pairing_hashes(inner, attr_type, defs));
             hashes.push(secret_state_pairing_hash());
         }
-        Value::Concrete(ConcreteValue::String(value))
-            if value
-                .expose_plaintext()
-                .starts_with(crate::value::SECRET_PREFIX) =>
-        {
+        Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
             hashes.push(secret_state_pairing_hash());
         }
         _ => {}
@@ -3890,6 +3973,9 @@ pub(crate) fn assert_value_fully_resolved(
             Ok(())
         }
         Value::Deferred(DeferredValue::Secret(inner)) => assert_value_fully_resolved(inner),
+        Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
+            Err(crate::value::SerializationError::RedactedSecretNotAllowed { context })
+        }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             Err(crate::value::SerializationError::UnresolvedResourceRef {
                 path: path.to_dot_string(),

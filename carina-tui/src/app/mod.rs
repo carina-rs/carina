@@ -3,7 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use carina_core::detail_rows::{
-    DetailLevel, DetailRow, build_detail_rows, build_replace_detail_rows_from_display,
+    DetailLevel, DetailRow, HistoricalDisplayAttributes, build_detail_rows_by_instance,
+    build_replace_detail_rows_from_display,
 };
 use carina_core::effect::Effect;
 use carina_core::plan::{Plan, PlanSummary, ReplaceDisplayInfo};
@@ -28,7 +29,7 @@ pub struct TreeNode {
     pub symbol: String,
     /// The effect kind for coloring
     pub kind: EffectKind,
-    /// Detail rows for the detail panel, computed from `build_detail_rows()`
+    /// Detail rows for the detail panel, computed by the shared core builder.
     pub detail_rows: Vec<DetailRow>,
     /// Indices of child nodes in the tree
     pub children: Vec<usize>,
@@ -97,7 +98,17 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(plan: &Plan, schemas: &SchemaRegistry) -> Self {
+    #[cfg(test)]
+    pub(crate) fn for_plan(plan: &Plan, schemas: &SchemaRegistry) -> Self {
+        let historical_display = HistoricalDisplayAttributes::for_plan(plan);
+        Self::new(plan, schemas, &historical_display)
+    }
+
+    pub fn new(
+        plan: &Plan,
+        schemas: &SchemaRegistry,
+        historical_display: &HistoricalDisplayAttributes,
+    ) -> Self {
         let schemas_opt = if schemas.is_empty() {
             None
         } else {
@@ -121,6 +132,7 @@ impl App {
                     plan,
                     e,
                     schemas_opt,
+                    historical_display,
                     replacement_create_info.get(&idx).copied(),
                 )
             })
@@ -719,20 +731,24 @@ fn effect_to_node(
     plan: &Plan,
     effect: &Effect,
     schemas: Option<&SchemaRegistry>,
+    historical_display: &HistoricalDisplayAttributes,
     replacement_info: Option<ReplaceDisplayInfo<'_>>,
 ) -> TreeNode {
-    let detail_rows =
-        if let (Effect::Create(resource), Some(replacement)) = (effect, replacement_info) {
-            build_replace_detail_rows_from_display(
-                resource,
-                replacement,
-                schemas,
-                DetailLevel::Full,
-                None,
-            )
-        } else {
-            build_detail_rows(effect, schemas, DetailLevel::Full, None, None)
-        };
+    let detail_rows = if let (Effect::Create(resource), Some(replacement)) =
+        (effect, replacement_info)
+    {
+        build_replace_detail_rows_from_display(
+            plan,
+            resource,
+            replacement,
+            historical_display,
+            schemas,
+            DetailLevel::Full,
+            None,
+        )
+    } else {
+        build_detail_rows_by_instance(effect, schemas, DetailLevel::Full, historical_display, None)
+    };
 
     match effect {
         Effect::Read { resource } => TreeNode {
@@ -785,8 +801,8 @@ fn effect_to_node(
             generation,
             ..
         } => {
-            // build_detail_rows returns empty for Delete without delete_attributes,
-            // so add the identifier as a manual attribute row
+            // A Delete without a historical display view has no attribute
+            // rows, so retain its provider identifier as a useful fallback.
             let mut rows = detail_rows;
             if rows.is_empty() && !identifier.is_empty() {
                 rows.push(DetailRow::Attribute {

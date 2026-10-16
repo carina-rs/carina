@@ -295,7 +295,17 @@ let db_host = env('DB_HOST')
 
 Marks a value as secret. The value is sent to the provider, and plan output displays `(secret)` instead of the actual value. The serialized representation of `Secret` in resource state is an Argon2id hash rather than plaintext. Applying `secret()` to an already-secret value is idempotent.
 
+`carina plan --out` also stores only an Argon2id hash in a typed secret
+placeholder. `carina apply <plan.json>` re-evaluates the source configuration,
+verifies that the secret is unchanged, and only then restores the plaintext
+for the provider. Change a secret by creating a new saved plan; an existing
+saved plan will refuse to apply it.
+
 Values derived from `secret()` or `decrypt()` cannot be published through `exports`; `carina validate` and `carina plan` report `export '<name>' cannot hold a secret value`.
+
+Backend attributes also cannot use secret-derived values. Backends accept only
+ordinary configuration values, so validation rejects `secret()` and
+`decrypt()` results in a `backend` block.
 
 ```
 secret(value: Any) -> Secret

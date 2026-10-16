@@ -133,6 +133,7 @@ mod tests {
         let config = ParserBackendConfig {
             backend_type: "unsupported".to_string(),
             attributes: HashMap::new(),
+            attribute_spans: Default::default(),
         };
 
         let result = resolve_backend_for_read(Some(&config), Path::new(".")).await;

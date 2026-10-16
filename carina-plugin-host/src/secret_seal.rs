@@ -183,7 +183,9 @@ pub(crate) fn seal(
                             "Skipping default_tag '{key}' with unresolvable value: {error}"
                         );
                     }
-                    SerializationError::NonFiniteFloat { .. } => {
+                    SerializationError::NonFiniteFloat { .. }
+                    | SerializationError::RedactedSecretNotAllowed { .. }
+                    | SerializationError::SavedPlanSecretContextUnavailable { .. } => {
                         return Err(SealError::DefaultTag {
                             key: key.clone(),
                             source: error,
@@ -335,6 +337,7 @@ impl Unsealer {
                     TokenIndex::Mangled => false,
                 }
             }
+            Value::Deferred(DeferredValue::RedactedSecret { .. }) => false,
             Value::Concrete(
                 ConcreteValue::String(_)
                 | ConcreteValue::EnumIdentifier(_)

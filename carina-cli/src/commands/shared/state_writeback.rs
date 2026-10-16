@@ -8,7 +8,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use carina_core::effect::{DeferredReplaceDelete, DeletedInstanceKey, Effect, EffectGeneration};
 use carina_core::executor::ExecutionResult;
-use carina_core::plan::{Plan, ReplaceDisplayInfo};
+use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesForStateWriteback};
+use carina_core::provider::PersistedAttributes;
 use carina_core::resource::{
     ConcreteValue, ResolvedResource, ResolvedResourceId, Resource, ResourceId, State, Value,
 };
@@ -115,13 +116,7 @@ impl PostApplyStates {
                 identity,
                 rs.directives.provider_instance.clone(),
             );
-            let attrs: HashMap<String, carina_core::resource::Value> = rs
-                .attributes
-                .iter()
-                .filter_map(|(k, v)| {
-                    carina_core::value::json_to_dsl_value(v).map(|val| (k.clone(), val))
-                })
-                .collect();
+            let attrs = rs.persisted_attributes().to_values();
             map.insert(
                 id.clone(),
                 carina_core::resource::State::existing(id, attrs),
@@ -626,6 +621,9 @@ pub(crate) fn dsl_value_to_json(
         Value::Deferred(DeferredValue::Secret(_)) => {
             Err(SerializationError::SecretNotAllowed { context: ctx })
         }
+        Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
+            Err(SerializationError::RedactedSecretNotAllowed { context: ctx })
+        }
     }
 }
 
@@ -810,7 +808,7 @@ struct ReplacementDeleteInput<'a> {
     provider_instance: Option<String>,
     generation: &'a EffectGeneration,
     fallback_dependency_bindings: BTreeSet<String>,
-    previous_attributes: Option<&'a HashMap<String, Value>>,
+    previous_attributes: Option<ReplacementPreviousAttributesForStateWriteback<'a>>,
 }
 
 static CURRENT_GENERATION: EffectGeneration = EffectGeneration::Current;
@@ -901,6 +899,7 @@ fn planned_depose(
         delete.id.identity_str(),
     );
     let current = current_states.get(delete.id.as_inner());
+    let existing_attributes = existing.map(ResourceState::persisted_attributes);
 
     let attributes = if let Some(existing) = existing
         && existing.identifier.as_deref() == Some(delete.identifier)
@@ -909,23 +908,19 @@ fn planned_depose(
         // on the old snapshot. That is the safe direction: hashes are
         // compare-only, and this also masks keys that only became
         // secret in the new config.
-        ResourceState::protect_state_json_for_resource_and_schema(
+        let persisted = existing_attributes.expect("existing row has persisted attributes");
+        ResourceState::protect_persisted_attributes_for_resource_and_schema(
             desired_resource,
             schema,
-            existing.attributes.clone(),
-            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&existing.attributes),
+            persisted.clone(),
+            PreviousSecretHashAuthority::AllPreviouslyHashedKeys(persisted),
         )
     } else {
-        let previous_hash_authority = existing
-            .map(|row| PreviousSecretHashAuthority::AllPreviouslyHashedKeys(&row.attributes))
+        let previous_hash_authority = existing_attributes
+            .map(PreviousSecretHashAuthority::AllPreviouslyHashedKeys)
             .unwrap_or(PreviousSecretHashAuthority::None);
         if let Some(previous) = delete.previous_attributes {
-            ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
-                desired_resource,
-                schema,
-                previous,
-                previous_hash_authority,
-            )
+            previous.encode(desired_resource, schema, previous_hash_authority)
         } else if let Some(current) = current {
             ResourceState::attributes_to_state_json_lossy_for_resource_and_schema(
                 desired_resource,
@@ -934,7 +929,7 @@ fn planned_depose(
                 previous_hash_authority,
             )
         } else {
-            HashMap::new()
+            PersistedAttributes::default()
         }
     };
 
@@ -947,19 +942,19 @@ fn planned_depose(
 
     PlannedDepose {
         id: delete.id.clone(),
-        instance: DeposedInstance {
-            key: DeposedKey::new_unique(),
-            identifier: delete.identifier.to_string(),
-            provider_instance: delete.provider_instance,
+        instance: DeposedInstance::from_persisted_attributes(
+            DeposedKey::new_unique(),
+            delete.identifier.to_string(),
+            delete.provider_instance,
             attributes,
             dependency_bindings,
-        },
+        ),
     }
 }
 
 fn delete_input_from_effect<'a>(
     effect: &'a Effect,
-    replacement: &'a ReplaceDisplayInfo<'a>,
+    previous_attributes: Option<ReplacementPreviousAttributesForStateWriteback<'a>>,
 ) -> Option<ReplacementDeleteInput<'a>> {
     let Effect::Delete {
         id,
@@ -977,7 +972,7 @@ fn delete_input_from_effect<'a>(
         provider_instance: id.as_inner().provider_instance.clone(),
         generation,
         fallback_dependency_bindings: dependencies.iter().cloned().collect(),
-        previous_attributes: Some(replacement.previous_attributes),
+        previous_attributes,
     })
 }
 
@@ -1148,7 +1143,9 @@ fn decompose<'a>(input: DecomposeInput<'a, '_>) -> Result<WritebackPlan<'a>, Wri
 
     for (idx, effect) in plan.effects().iter().enumerate() {
         if let Some(replacement) = replacement_by_delete_idx.get(&idx) {
-            if let Some(delete) = delete_input_from_effect(effect, replacement) {
+            let previous_attributes =
+                plan.replacement_previous_attributes_for_state_writeback(replacement.delete_idx);
+            if let Some(delete) = delete_input_from_effect(effect, previous_attributes) {
                 let create_id = plan.effects()[replacement.create_idx].resource_id();
                 let outcome = classify_replacement_outcome(
                     delete,
@@ -1350,11 +1347,7 @@ pub(crate) fn build_orphan_resource(
     let rs = sf
         .find_resource(&id.provider, &id.resource_type, id.identity_str())
         .expect("orphan must exist in state file");
-    let attributes: HashMap<String, Value> = rs
-        .attributes
-        .iter()
-        .filter_map(|(k, v)| carina_core::value::json_to_dsl_value(v).map(|val| (k.clone(), val)))
-        .collect();
+    let attributes = rs.persisted_attributes().to_values();
     Resource {
         id: id.as_inner().clone(),
         attributes: attributes.into_iter().collect(),
@@ -1554,7 +1547,13 @@ mod apply_state_save_tests {
             let row = state
                 .find_resource("mock", "listener.Listener", "listener")
                 .expect("written listener row");
-            let stored = row.attributes["rules"].as_array().expect("stored rules");
+            let stored_json = carina_core::value::value_to_json(
+                &row.persisted_attributes()
+                    .get("rules")
+                    .expect("stored rules"),
+            )
+            .expect("stored rules are JSON");
+            let stored = stored_json.as_array().expect("stored rules");
             assert_eq!(stored.len(), 2);
             assert_eq!(stored[0]["port"], 443);
             assert_eq!(stored[1]["port"], 80);
@@ -1793,13 +1792,13 @@ mod apply_state_save_tests {
         let deposed_key = DeposedKey::new_unique();
         let mut row = ResourceState::new("route53.Record", "validation_records[0]", "aws");
         row.identifier = Some("new-record-id".to_string());
-        row.deposed.push(DeposedInstance {
-            key: deposed_key.clone(),
-            identifier: "old-record-id".to_string(),
-            provider_instance: None,
-            attributes: HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
-            dependency_bindings: BTreeSet::from(["cert".to_string()]),
-        });
+        row.deposed.push(DeposedInstance::from_persisted_json(
+            deposed_key.clone(),
+            "old-record-id".to_string(),
+            None,
+            HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
+            BTreeSet::from(["cert".to_string()]),
+        ));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(row)
@@ -2188,8 +2187,8 @@ mod apply_state_save_tests {
         assert_eq!(row.deposed.len(), 1);
         assert_eq!(row.deposed[0].identifier, "vpc-old");
         assert_eq!(
-            row.deposed[0].attributes.get("cidr_block"),
-            Some(&serde_json::json!("10.0.0.0/16"))
+            row.deposed[0].persisted_attributes().get("cidr_block"),
+            carina_core::value::json_to_dsl_value(&serde_json::json!("10.0.0.0/16"))
         );
         assert_eq!(
             row.deposed[0].dependency_bindings,
@@ -2477,13 +2476,13 @@ mod apply_state_save_tests {
             .with_identifier("new-1-record-id")
             .with_attribute("name", serde_json::json!("new-1.example.com"));
         existing.directives.provider_instance = Some("west".to_string());
-        existing.deposed.push(DeposedInstance {
-            key: DeposedKey::new_unique(),
-            identifier: "old-record-id".to_string(),
-            provider_instance: Some("west".to_string()),
-            attributes: HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
-            dependency_bindings: BTreeSet::new(),
-        });
+        existing.deposed.push(DeposedInstance::from_persisted_json(
+            DeposedKey::new_unique(),
+            "old-record-id".to_string(),
+            Some("west".to_string()),
+            HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
+            BTreeSet::new(),
+        ));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -2587,13 +2586,13 @@ mod apply_state_save_tests {
             .with_identifier("new-1-record-id")
             .with_attribute("name", serde_json::json!("new-1.example.com"));
         existing.directives.provider_instance = Some("west".to_string());
-        existing.deposed.push(DeposedInstance {
-            key: DeposedKey::new_unique(),
-            identifier: "old-record-id".to_string(),
-            provider_instance: Some("west".to_string()),
-            attributes: HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
-            dependency_bindings: BTreeSet::new(),
-        });
+        existing.deposed.push(DeposedInstance::from_persisted_json(
+            DeposedKey::new_unique(),
+            "old-record-id".to_string(),
+            Some("west".to_string()),
+            HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
+            BTreeSet::new(),
+        ));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -2739,7 +2738,7 @@ mod apply_state_save_tests {
             .with_identifier("db-1")
             .with_attribute(
                 "password",
-                serde_json::json!(format!("{SECRET_PREFIX}previous")),
+                serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
             );
         let mut state_file = StateFile::new();
         state_file
@@ -2785,8 +2784,8 @@ mod apply_state_save_tests {
             .find_resource("awscc", "db.Instance", "main")
             .expect("row should be saved");
         assert_eq!(
-            row.attributes.get("password"),
-            Some(&serde_json::json!("plain-secret"))
+            row.persisted_attributes().get("password"),
+            carina_core::value::json_to_dsl_value(&serde_json::json!("plain-secret"))
         );
 
         let current_states = HashMap::from([(id.clone(), saved.build_state_for_resource(&id))]);
@@ -2824,7 +2823,7 @@ mod apply_state_save_tests {
             .with_identifier("db-1")
             .with_attribute(
                 "password",
-                serde_json::json!(format!("{SECRET_PREFIX}previous")),
+                serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
             );
         let mut state_file = StateFile::new();
         state_file
@@ -2862,8 +2861,8 @@ mod apply_state_save_tests {
             .find_resource("awscc", "db.Instance", "main")
             .expect("row should be saved");
         assert_eq!(
-            row.attributes.get("password"),
-            Some(&serde_json::json!("plain-secret"))
+            row.persisted_attributes().get("password"),
+            carina_core::value::json_to_dsl_value(&serde_json::json!("plain-secret"))
         );
         assert_eq!(row.write_only_attributes, vec!["password"]);
 
@@ -2949,18 +2948,17 @@ mod apply_state_save_tests {
             .deposed
             .first()
             .expect("old instance should be deposed");
-        let stored_secret = deposed
-            .attributes
-            .get("password")
-            .and_then(serde_json::Value::as_str)
+        let persisted = deposed.persisted_attributes();
+        let stored_secret = persisted
+            .redacted_secret_hash("password")
             .expect("secret fallback should be stored as a hash");
-        assert!(stored_secret.starts_with(SECRET_PREFIX));
+        assert_eq!(stored_secret.as_str().len(), 64);
         assert!(
-            !stored_secret.contains("plain-secret"),
+            !stored_secret.as_str().contains("plain-secret"),
             "deposed attributes must not persist plaintext secrets"
         );
         assert!(
-            !deposed.attributes.contains_key("unknown"),
+            !deposed.persisted_attributes().contains_key("unknown"),
             "unserializable fallback attributes should be skipped"
         );
     }
@@ -3000,7 +2998,7 @@ mod apply_state_save_tests {
             .with_identifier("stale-record-id")
             .with_attribute(
                 "password",
-                serde_json::json!(format!("{SECRET_PREFIX}previous")),
+                serde_json::json!(format!("{SECRET_PREFIX}{}", "ab".repeat(32))),
             );
         let mut state_file = StateFile::new();
         state_file
@@ -3033,12 +3031,11 @@ mod apply_state_save_tests {
             .find(|entry| entry.identifier == "old-record-id")
             .expect("old instance should be deposed");
         let stored_secret = deposed
-            .attributes
-            .get("password")
-            .and_then(serde_json::Value::as_str)
+            .persisted_attributes()
+            .redacted_secret_hash("password")
             .expect("old plaintext password should be re-hashed");
-        assert!(stored_secret.starts_with(SECRET_PREFIX));
-        assert!(!stored_secret.contains("plain-old"));
+        assert_eq!(stored_secret.as_str().len(), 64);
+        assert!(!stored_secret.as_str().contains("plain-old"));
     }
 
     #[test]
@@ -3101,11 +3098,11 @@ mod apply_state_save_tests {
             .expect("new child row should be persisted");
         let deposed = row.deposed.first().expect("old instance should be deposed");
         assert_eq!(
-            deposed.attributes.get("name"),
-            Some(&serde_json::json!("old.example.com"))
+            deposed.persisted_attributes().get("name"),
+            carina_core::value::json_to_dsl_value(&serde_json::json!("old.example.com"))
         );
         assert!(
-            !deposed.attributes.contains_key("password"),
+            !deposed.persisted_attributes().contains_key("password"),
             "schema write-only fallback must not persist removed plaintext"
         );
         let serialized = serde_json::to_string(&deposed).expect("deposed should serialize");
@@ -3129,16 +3126,13 @@ mod apply_state_save_tests {
             &mut state,
             PlannedDepose {
                 id: ResolvedResourceId::new(id.clone()),
-                instance: DeposedInstance {
-                    key: DeposedKey::new_unique(),
-                    identifier: "old-record-id".to_string(),
-                    provider_instance: Some("west".to_string()),
-                    attributes: HashMap::from([(
-                        "name".to_string(),
-                        serde_json::json!("old.example.com"),
-                    )]),
-                    dependency_bindings: BTreeSet::from(["cert".to_string()]),
-                },
+                instance: DeposedInstance::from_persisted_json(
+                    DeposedKey::new_unique(),
+                    "old-record-id".to_string(),
+                    Some("west".to_string()),
+                    HashMap::from([("name".to_string(), serde_json::json!("old.example.com"))]),
+                    BTreeSet::from(["cert".to_string()]),
+                ),
             },
         )
         .expect("test deposed setup must be valid");
@@ -3147,7 +3141,7 @@ mod apply_state_save_tests {
             .find_resource("aws", "route53.Record", "validation_records[0]")
             .expect("missing row should be created for deposed instance");
         assert_eq!(row.identifier, None);
-        assert!(row.attributes.is_empty());
+        assert!(row.persisted_attributes().is_empty());
         assert_eq!(row.directives.provider_instance.as_deref(), Some("west"));
         assert_eq!(row.deposed.len(), 1);
         assert_eq!(row.deposed[0].identifier, "old-record-id");
@@ -3167,13 +3161,13 @@ mod apply_state_save_tests {
         let replacement_west_key = DeposedKey::new_unique();
         let mut row = ResourceState::new("route53.Record", "validation_records[0]", "aws");
         row.directives.provider_instance = Some("west".to_string());
-        row.deposed.push(DeposedInstance {
-            key: east_key.clone(),
-            identifier: "old-record-id".to_string(),
-            provider_instance: Some("east".to_string()),
-            attributes: HashMap::from([("name".to_string(), serde_json::json!("stale"))]),
-            dependency_bindings: BTreeSet::from(["old".to_string()]),
-        });
+        row.deposed.push(DeposedInstance::from_persisted_json(
+            east_key.clone(),
+            "old-record-id".to_string(),
+            Some("east".to_string()),
+            HashMap::from([("name".to_string(), serde_json::json!("stale"))]),
+            BTreeSet::from(["old".to_string()]),
+        ));
         let mut state = StateFile::new();
         state
             .upsert_resource(row)
@@ -3183,13 +3177,13 @@ mod apply_state_save_tests {
             &mut state,
             PlannedDepose {
                 id: ResolvedResourceId::new(id.clone()),
-                instance: DeposedInstance {
-                    key: west_key.clone(),
-                    identifier: "old-record-id".to_string(),
-                    provider_instance: Some("west".to_string()),
-                    attributes: HashMap::from([("name".to_string(), serde_json::json!("fresh"))]),
-                    dependency_bindings: BTreeSet::from(["new".to_string()]),
-                },
+                instance: DeposedInstance::from_persisted_json(
+                    west_key.clone(),
+                    "old-record-id".to_string(),
+                    Some("west".to_string()),
+                    HashMap::from([("name".to_string(), serde_json::json!("fresh"))]),
+                    BTreeSet::from(["new".to_string()]),
+                ),
             },
         )
         .expect("test deposed setup must be valid");
@@ -3211,13 +3205,13 @@ mod apply_state_save_tests {
             &mut state,
             PlannedDepose {
                 id: ResolvedResourceId::new(id),
-                instance: DeposedInstance {
-                    key: replacement_west_key.clone(),
-                    identifier: "old-record-id".to_string(),
-                    provider_instance: Some("west".to_string()),
-                    attributes: HashMap::from([("name".to_string(), serde_json::json!("newer"))]),
-                    dependency_bindings: BTreeSet::from(["newer".to_string()]),
-                },
+                instance: DeposedInstance::from_persisted_json(
+                    replacement_west_key.clone(),
+                    "old-record-id".to_string(),
+                    Some("west".to_string()),
+                    HashMap::from([("name".to_string(), serde_json::json!("newer"))]),
+                    BTreeSet::from(["newer".to_string()]),
+                ),
             },
         )
         .expect("test deposed setup must be valid");
@@ -3231,8 +3225,8 @@ mod apply_state_save_tests {
         assert_eq!(deposed.key, replacement_west_key);
         assert_eq!(deposed.provider_instance.as_deref(), Some("west"));
         assert_eq!(
-            deposed.attributes.get("name"),
-            Some(&serde_json::json!("newer"))
+            deposed.persisted_attributes().get("name"),
+            carina_core::value::json_to_dsl_value(&serde_json::json!("newer"))
         );
         assert_eq!(
             deposed.dependency_bindings,
@@ -3265,13 +3259,13 @@ mod apply_state_save_tests {
         let mut existing = ResourceState::new("route53.Record", "validation_records[0]", "aws")
             .with_identifier("old-record-id")
             .with_attribute("name", serde_json::json!("old.example.com"));
-        existing.deposed.push(DeposedInstance {
-            key: first_key.clone(),
-            identifier: "older-record-id".to_string(),
-            provider_instance: None,
-            attributes: HashMap::from([("name".to_string(), serde_json::json!("older"))]),
-            dependency_bindings: BTreeSet::from(["cert".to_string()]),
-        });
+        existing.deposed.push(DeposedInstance::from_persisted_json(
+            first_key.clone(),
+            "older-record-id".to_string(),
+            None,
+            HashMap::from([("name".to_string(), serde_json::json!("older"))]),
+            BTreeSet::from(["cert".to_string()]),
+        ));
         let mut state_file = StateFile::new();
         state_file
             .upsert_resource(existing)
@@ -3529,8 +3523,8 @@ mod apply_state_save_tests {
         assert_eq!(row.deposed[0].identifier, "bucket-old-id");
         assert_eq!(row.deposed[0].provider_instance, None);
         assert_eq!(
-            row.deposed[0].attributes.get("bucket_name"),
-            Some(&serde_json::json!("old-name"))
+            row.deposed[0].persisted_attributes().get("bucket_name"),
+            carina_core::value::json_to_dsl_value(&serde_json::json!("old-name"))
         );
     }
 

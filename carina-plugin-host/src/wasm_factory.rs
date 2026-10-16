@@ -3367,7 +3367,7 @@ fn apply_wit_state_attribute_updates(
     let decoded = updates
         .into_iter()
         .map(|(id, attributes)| {
-            wasm_convert::wit_to_core_value_map(&attributes)
+            wasm_convert::wit_to_core_persisted_value_map(&attributes)
                 .map(|attributes| (id.clone(), attributes))
                 .map_err(|error| {
                     wasm_value_decode_provider_error(operation, error).for_resource(id)
@@ -3575,17 +3575,13 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                 let wit_state = wasm_convert::core_to_wit_state(state).map_err(|error| {
                     wasm_value_encode_provider_error("hydrate_read_state current state", error)
                 })?;
-                let wit_saved = saved_attrs
-                    .get(id)
-                    .map(|attrs| {
-                        wasm_convert::core_to_wit_value_map(attrs).map_err(|error| {
-                            wasm_value_encode_provider_error(
-                                "hydrate_read_state saved attributes",
-                                error,
-                            )
-                        })
-                    })
-                    .transpose()?;
+                let wit_saved =
+                    wasm_convert::core_saved_attrs_to_wit(saved_attrs, id).map_err(|error| {
+                        wasm_value_encode_provider_error(
+                            "hydrate_read_state saved attributes",
+                            error,
+                        )
+                    })?;
 
                 match id.identity_state() {
                     ResourceIdentityState::Pending(_) => {

@@ -1765,6 +1765,7 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
     });
 
     let moved_origins = HashMap::new();
+    let historical_display = HistoricalDisplayAttributes::for_plan(&plan);
     let mut ctx = TreeRenderContext {
         out: format!(
             "{}\n",
@@ -1779,7 +1780,7 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
         replacement_create_info: HashMap::new(),
         replacement_delete_indices: HashSet::new(),
         detail: DetailLevel::None,
-        delete_attributes: None,
+        historical_display: &historical_display,
         schemas: None,
         moved_origins: &moved_origins,
         prev_explicit: None,
@@ -1839,6 +1840,7 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
     });
 
     let moved_origins = HashMap::new();
+    let historical_display = HistoricalDisplayAttributes::for_plan(&plan);
     let mut ctx = TreeRenderContext {
         out: String::new(),
         printed: HashSet::new(),
@@ -1847,7 +1849,7 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
         replacement_create_info: HashMap::new(),
         replacement_delete_indices: HashSet::new(),
         detail: DetailLevel::Full,
-        delete_attributes: None,
+        historical_display: &historical_display,
         schemas: None,
         moved_origins: &moved_origins,
         prev_explicit: None,

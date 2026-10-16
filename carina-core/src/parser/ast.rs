@@ -1039,6 +1039,10 @@ pub struct BackendConfig {
     pub backend_type: String,
     /// Backend-specific attributes
     pub attributes: HashMap<String, Value>,
+    /// Parser-authored source spans for attribute keys. Runtime and saved-plan
+    /// representations deliberately omit this diagnostic-only metadata.
+    #[serde(skip)]
+    pub attribute_spans: HashMap<String, ModuleCallSourceSpan>,
 }
 
 /// Upstream state reference: `let <binding> = upstream_state { source = "<dir>" }`.
@@ -1739,6 +1743,9 @@ pub fn expand_deferred_children(
                 Err(ShapeMismatch::new("list", "deferred function call"))
             }
             Value::Deferred(DeferredValue::Secret(_)) => Err(ShapeMismatch::new("list", "secret")),
+            Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
+                Err(ShapeMismatch::new("list", "redacted secret"))
+            }
             Value::Deferred(DeferredValue::Unknown(_)) => {
                 Err(ShapeMismatch::new("list", "unknown"))
             }
@@ -1782,6 +1789,9 @@ pub fn expand_deferred_children(
                 Err(ShapeMismatch::new("list", "deferred function call"))
             }
             Value::Deferred(DeferredValue::Secret(_)) => Err(ShapeMismatch::new("list", "secret")),
+            Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
+                Err(ShapeMismatch::new("list", "redacted secret"))
+            }
             Value::Deferred(DeferredValue::Unknown(_)) => {
                 Err(ShapeMismatch::new("list", "unknown"))
             }
@@ -1829,6 +1839,9 @@ pub fn expand_deferred_children(
                 Err(ShapeMismatch::new("map", "deferred function call"))
             }
             Value::Deferred(DeferredValue::Secret(_)) => Err(ShapeMismatch::new("map", "secret")),
+            Value::Deferred(DeferredValue::RedactedSecret { .. }) => {
+                Err(ShapeMismatch::new("map", "redacted secret"))
+            }
             Value::Deferred(DeferredValue::Unknown(_)) => Err(ShapeMismatch::new("map", "unknown")),
         },
     }

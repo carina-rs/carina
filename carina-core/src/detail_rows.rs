@@ -1,7 +1,7 @@
 //! Output-neutral intermediate representation for plan detail rows.
 //!
 //! Both CLI and TUI consume `DetailRow` values to render effect details.
-//! The `build_detail_rows` function encapsulates all logic for deciding
+//! The shared row builders encapsulate all logic for deciding
 //! which rows to show for a given effect, keeping rendering frontends thin.
 
 use std::collections::{HashMap, HashSet};
@@ -14,7 +14,8 @@ use crate::diff_helpers::{
 };
 use crate::effect::{DeletedInstanceKey, Effect, EffectGeneration};
 use crate::non_empty::NonEmptyVec;
-use crate::plan::ReplaceDisplayInfo;
+use crate::plan::{Plan, ReplaceDisplayInfo};
+use crate::provider::PersistedAttributes;
 use crate::resource::{ConcreteValue, DeferredValue, ResourceId, Value, pair_list_elements};
 use crate::schema::{AttributeType, ResourceSchema, SchemaRegistry, empty_defs_for_schema_walks};
 use crate::value::{format_value, format_value_with_key, is_list_of_maps};
@@ -28,6 +29,188 @@ pub enum DetailLevel {
     Explicit,
     /// Show resource names only (no attributes)
     NamesOnly,
+}
+
+/// Historical attribute values prepared exclusively for display.
+///
+/// The maps are private and the only constructors mask provider plaintext
+/// using either the desired secret shape or the persisted state shape. This
+/// keeps update/replacement/delete renderers from ever accepting raw provider
+/// state directly, and keeps the update view out of the deleted-instance map.
+#[derive(Debug, Clone)]
+pub struct HistoricalDisplayAttributes {
+    updates: HashMap<ResourceId, HashMap<String, Value>>,
+    deletes: HashMap<DeletedInstanceKey, HashMap<String, Value>>,
+}
+
+impl HistoricalDisplayAttributes {
+    /// Build the fail-safe display view available from a plan alone. Desired
+    /// secret shapes mask their historical counterparts; callers with state
+    /// provenance should then refine it through the persisted-shape methods.
+    pub fn for_plan(plan: &Plan) -> Self {
+        let mut display = Self {
+            updates: HashMap::new(),
+            deletes: HashMap::new(),
+        };
+
+        for effect in plan.effects() {
+            match effect {
+                Effect::Update { from, to, .. } => {
+                    display.updates.insert(
+                        from.id.clone(),
+                        mask_attributes_using_secret_shape(&from.attributes, &to.attributes),
+                    );
+                }
+                Effect::Delete {
+                    id,
+                    identifier,
+                    generation,
+                    ..
+                } => {
+                    display.deletes.insert(
+                        DeletedInstanceKey::new(
+                            id.as_inner().clone(),
+                            generation.clone(),
+                            identifier.clone(),
+                        ),
+                        HashMap::new(),
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        for replacement in plan.replace_display_info() {
+            let Some(Effect::Create(to)) = plan.effects().get(replacement.create_idx) else {
+                continue;
+            };
+            let Some(Effect::Delete {
+                id,
+                identifier,
+                generation,
+                ..
+            }) = plan.effects().get(replacement.delete_idx)
+            else {
+                continue;
+            };
+            display.deletes.insert(
+                DeletedInstanceKey::new(
+                    id.as_inner().clone(),
+                    generation.clone(),
+                    identifier.clone(),
+                ),
+                mask_attributes_using_secret_shape(replacement.previous_attributes, &to.attributes),
+            );
+        }
+
+        display
+    }
+
+    /// Refine an Update's old-side view using persisted secret shape without
+    /// discarding the desired-secret mask established by [`Self::for_plan`].
+    pub fn set_update_from_provider_and_persisted(
+        &mut self,
+        id: ResourceId,
+        provider_attributes: &HashMap<String, Value>,
+        persisted_attributes: Option<&PersistedAttributes>,
+    ) {
+        let persisted_masked =
+            mask_attributes_using_persisted_shape(provider_attributes, persisted_attributes);
+        let masked = combine_with_desired_secret_shape(persisted_masked, self.updates.get(&id));
+        self.updates.insert(id, masked);
+    }
+
+    /// Replace a Delete generation's view using provider values and the
+    /// persisted JSON secret shape as masking authority.
+    pub fn set_delete_from_provider_and_persisted(
+        &mut self,
+        key: DeletedInstanceKey,
+        provider_attributes: &HashMap<String, Value>,
+        persisted_attributes: Option<&PersistedAttributes>,
+    ) {
+        let persisted_masked =
+            mask_attributes_using_persisted_shape(provider_attributes, persisted_attributes);
+        let masked = combine_with_desired_secret_shape(persisted_masked, self.deletes.get(&key));
+        self.deletes.insert(key, masked);
+    }
+
+    /// Decode a deposed generation directly from persisted JSON. Valid secret
+    /// markers become typed redacted values before reaching a renderer.
+    pub fn set_delete_from_persisted(
+        &mut self,
+        key: DeletedInstanceKey,
+        persisted_attributes: &PersistedAttributes,
+    ) {
+        let persisted = persisted_attributes.to_values();
+        let masked = combine_with_desired_secret_shape(persisted, self.deletes.get(&key));
+        self.deletes.insert(key, masked);
+    }
+
+    fn update(&self, id: &ResourceId) -> Option<&HashMap<String, Value>> {
+        self.updates.get(id)
+    }
+
+    fn delete(&self, key: &DeletedInstanceKey) -> Option<&HashMap<String, Value>> {
+        self.deletes.get(key)
+    }
+}
+
+fn mask_attributes_using_secret_shape(
+    plaintext: &HashMap<String, Value>,
+    shape: &IndexMap<String, Value>,
+) -> HashMap<String, Value> {
+    plaintext
+        .iter()
+        .map(|(key, value)| {
+            let value = shape.get(key).map_or_else(
+                || value.clone(),
+                |shape| crate::value::mask_plaintext_using_secret_shape(value, shape),
+            );
+            (key.clone(), value)
+        })
+        .collect()
+}
+
+fn mask_attributes_using_persisted_shape(
+    plaintext: &HashMap<String, Value>,
+    shape: Option<&PersistedAttributes>,
+) -> HashMap<String, Value> {
+    plaintext
+        .iter()
+        .map(|(key, value)| {
+            let value = shape.map_or_else(
+                || value.clone(),
+                |shape| crate::value::mask_plaintext_using_persisted_attribute(value, shape, key),
+            );
+            (key.clone(), value)
+        })
+        .collect()
+}
+
+fn mask_attributes_using_value_shape(
+    plaintext: &HashMap<String, Value>,
+    shape: &HashMap<String, Value>,
+) -> HashMap<String, Value> {
+    plaintext
+        .iter()
+        .map(|(key, value)| {
+            let value = shape.get(key).map_or_else(
+                || value.clone(),
+                |shape| crate::value::mask_plaintext_using_secret_shape(value, shape),
+            );
+            (key.clone(), value)
+        })
+        .collect()
+}
+
+fn combine_with_desired_secret_shape(
+    values: HashMap<String, Value>,
+    desired_shape: Option<&HashMap<String, Value>>,
+) -> HashMap<String, Value> {
+    desired_shape.map_or_else(
+        || values.clone(),
+        |shape| mask_attributes_using_value_shape(&values, shape),
+    )
 }
 
 /// Output-neutral representation of a detail row for plan display.
@@ -307,42 +490,13 @@ pub enum ListOfMapsDiffField {
     },
 }
 
-/// Build detail rows for an effect.
-///
-/// This function encapsulates ALL the logic for deciding what detail rows to
-/// show for a given effect. The caller only needs to render each `DetailRow`
-/// with appropriate formatting (colors, prefixes, etc.).
-///
-/// `prev_explicit` is the per-resource user-authoring tree the differ used.
-/// When provided, the actual-state side (`from.attributes`) is projected
-/// through it before unchanged-attribute counting so server-side default
-/// fields the user never wrote do not inflate the
-/// `# (n unchanged attributes hidden)` summary in Full mode (refs awscc#206).
-pub fn build_detail_rows(
-    effect: &Effect,
-    registry: Option<&SchemaRegistry>,
-    detail: DetailLevel,
-    delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
-    prev_explicit: Option<&HashMap<ResourceId, crate::explicit::ExplicitFields>>,
-) -> Vec<DetailRow> {
-    let keyed_delete_attributes =
-        delete_attributes.map(|attrs| current_delete_attributes_by_instance(effect, attrs));
-    build_detail_rows_by_instance(
-        effect,
-        registry,
-        detail,
-        keyed_delete_attributes.as_ref(),
-        prev_explicit,
-    )
-}
-
 /// Build detail rows for an effect using delete attributes keyed by resource
 /// id plus generation.
 pub fn build_detail_rows_by_instance(
     effect: &Effect,
     registry: Option<&SchemaRegistry>,
     detail: DetailLevel,
-    delete_attributes: Option<&HashMap<DeletedInstanceKey, HashMap<String, Value>>>,
+    historical_attributes: &HistoricalDisplayAttributes,
     prev_explicit: Option<&HashMap<ResourceId, crate::explicit::ExplicitFields>>,
 ) -> Vec<DetailRow> {
     if detail == DetailLevel::NamesOnly {
@@ -366,14 +520,24 @@ pub fn build_detail_rows_by_instance(
         } => {
             let explicit = prev_explicit.and_then(|map| map.get(&to.id));
             let schema = registry.and_then(|r| r.get_for(to));
-            build_update_rows(from, to, changed_attributes, schema, detail, explicit)
+            let Some(masked_from) = historical_attributes.update(&from.id) else {
+                return Vec::new();
+            };
+            build_update_rows(
+                masked_from,
+                to,
+                changed_attributes,
+                schema,
+                detail,
+                explicit,
+            )
         }
         Effect::Delete {
             id,
             identifier,
             generation,
             ..
-        } => build_delete_rows(id, identifier, generation, delete_attributes),
+        } => build_delete_rows(id, identifier, generation, historical_attributes),
         Effect::Read { resource } => {
             let schema = registry.and_then(|reg| reg.get_for_data_source(resource));
             build_create_rows(&resource.attributes, schema, detail)
@@ -399,22 +563,6 @@ pub fn build_detail_rows_by_instance(
         | Effect::DeferredCreate { .. }
         | Effect::DeferredReplace(_) => Vec::new(),
     }
-}
-
-fn current_delete_attributes_by_instance(
-    effect: &Effect,
-    delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
-) -> HashMap<DeletedInstanceKey, HashMap<String, Value>> {
-    effect
-        .deleted_resource_attribute_keys()
-        .into_iter()
-        .filter(|key| matches!(key.generation(), EffectGeneration::Current))
-        .filter_map(|key| {
-            delete_attributes
-                .get(key.id())
-                .map(|attrs| (key, attrs.clone()))
-        })
-        .collect()
 }
 
 fn build_create_rows(
@@ -553,7 +701,7 @@ fn build_expanded_tags_row(
 }
 
 fn build_update_rows(
-    from: &crate::resource::State,
+    historical_attributes: &HashMap<String, Value>,
     to: &crate::resource::Resource,
     changed_attributes: &[String],
     schema: Option<&ResourceSchema>,
@@ -564,12 +712,13 @@ fn build_update_rows(
     let defs = schema
         .map(|s| &s.defs)
         .unwrap_or(empty_defs_for_schema_walks());
-    let from_attrs_projected = project_from_attrs(from, explicit);
+    let from_attributes = historical_attributes;
+    let from_attrs_projected = project_from_attrs(from_attributes, explicit);
 
     let attr_rows = build_attribute_diff_rows(
         to,
         AttributeDiffContext::for_update(
-            &from.attributes,
+            from_attributes,
             &from_attrs_projected,
             schema,
             defs,
@@ -727,7 +876,7 @@ impl<'a> AttributeDiffContext<'a> {
 }
 
 fn project_from_attrs(
-    from: &crate::resource::State,
+    from_attributes: &HashMap<String, Value>,
     explicit: Option<&crate::explicit::ExplicitFields>,
 ) -> HashMap<String, Value> {
     // Project `from.attributes` through the user-authoring tree so
@@ -735,8 +884,8 @@ fn project_from_attrs(
     // the unchanged-count summary (refs awscc#206). Idempotent and a
     // no-op when `explicit` is None.
     match explicit {
-        Some(e) => crate::explicit::project_attributes(from.attributes.clone(), e),
-        None => from.attributes.clone(),
+        Some(e) => crate::explicit::project_attributes(from_attributes.clone(), e),
+        None => from_attributes.clone(),
     }
 }
 
@@ -909,20 +1058,38 @@ fn build_attribute_diff_rows(
 /// Build replacement detail rows for a decomposed Create/Delete replacement.
 ///
 /// Phase 4 stores replacement display metadata separately from the Create
-/// effect. This helper reconstructs the replacement diff by using metadata
-/// `previous_attributes` as the old side and the Create resource attributes as
-/// the new side.
+/// effect. This helper owns the delete-index lookup so every renderer consumes
+/// the same masked historical view rather than reconstructing that lookup.
 #[allow(clippy::too_many_arguments)]
 pub fn build_replace_detail_rows_from_display(
+    plan: &Plan,
     to: &crate::resource::Resource,
     replacement: ReplaceDisplayInfo<'_>,
+    historical_display: &HistoricalDisplayAttributes,
     registry: Option<&SchemaRegistry>,
     detail: DetailLevel,
     explicit: Option<&crate::explicit::ExplicitFields>,
 ) -> Vec<DetailRow> {
+    let Some(Effect::Delete {
+        id,
+        identifier,
+        generation,
+        ..
+    }) = plan.effects().get(replacement.delete_idx)
+    else {
+        return Vec::new();
+    };
+    let key = DeletedInstanceKey::new(
+        id.as_inner().clone(),
+        generation.clone(),
+        identifier.clone(),
+    );
+    let Some(historical_attributes) = historical_display.delete(&key) else {
+        return Vec::new();
+    };
     let schema = registry.and_then(|reg| reg.get_for(to));
     build_replace_rows_from_attributes(
-        replacement.previous_attributes,
+        historical_attributes,
         to,
         replacement.changed_create_only,
         replacement.temporary_name,
@@ -1103,12 +1270,12 @@ fn build_delete_rows(
     id: &ResourceId,
     identifier: &str,
     generation: &EffectGeneration,
-    delete_attributes: Option<&HashMap<DeletedInstanceKey, HashMap<String, Value>>>,
+    historical_attributes: &HistoricalDisplayAttributes,
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
 
     let key = DeletedInstanceKey::new(id.clone(), generation.clone(), identifier.to_string());
-    if let Some(attrs) = delete_attributes.and_then(|da| da.get(&key)) {
+    if let Some(attrs) = historical_attributes.delete(&key) {
         let mut keys: Vec<_> = attrs.keys().filter(|k| !k.starts_with('_')).collect();
         keys.sort();
         for key in keys {
@@ -1745,12 +1912,40 @@ fn string_list_inner_type<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::ReplaceDisplayInfo;
+    use crate::effect::{ChangedCreateOnly, EffectGeneration};
+    use crate::plan::ReplaceDisplayMetadata;
     use crate::resource::{ResolvedResource, Resource, ResourceId, State};
     use std::collections::HashSet;
 
     fn resolved(resource: Resource) -> ResolvedResource {
         ResolvedResource::new(resource)
+    }
+
+    fn build_detail_rows(
+        effect: &Effect,
+        registry: Option<&SchemaRegistry>,
+        detail: DetailLevel,
+        delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
+        prev_explicit: Option<&HashMap<ResourceId, crate::explicit::ExplicitFields>>,
+    ) -> Vec<DetailRow> {
+        let mut plan = Plan::new();
+        plan.add(effect.clone());
+        let mut historical_attributes = HistoricalDisplayAttributes::for_plan(&plan);
+        if let Some(delete_attributes) = delete_attributes {
+            for key in effect.deleted_resource_attribute_keys() {
+                if let Some(attributes) = delete_attributes.get(key.id()) {
+                    historical_attributes
+                        .set_delete_from_provider_and_persisted(key, attributes, None);
+                }
+            }
+        }
+        build_detail_rows_by_instance(
+            effect,
+            registry,
+            detail,
+            &historical_attributes,
+            prev_explicit,
+        )
     }
 
     fn replace_rows_for_test(
@@ -2050,20 +2245,36 @@ mod tests {
             "cidr_block".to_string(),
             Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
         )]);
-        let changed_create_only = vec!["cidr_block".to_string()];
-        let replacement = ReplaceDisplayInfo {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resolved(to.clone())));
+        plan.add(Effect::Delete {
+            id: crate::resource::ResolvedResourceId::new(to.id.clone()),
+            identifier: "vpc-old".to_string(),
+            generation: EffectGeneration::Current,
+            directives: Default::default(),
+            binding: None,
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        });
+        plan.replace_display_mut().push(ReplaceDisplayMetadata {
             create_idx: 0,
             delete_idx: 1,
             create_before_destroy: false,
-            changed_create_only: &changed_create_only,
-            cascade_ref_hints: &[],
+            changed_create_only: ChangedCreateOnly::try_from(vec!["cidr_block".to_string()])
+                .unwrap(),
+            cascade_ref_hints: Vec::new(),
             temporary_name: None,
-            previous_attributes: &previous_attributes,
-        };
+            previous_attributes,
+        });
+        let replacement = plan.replace_display_info().next().unwrap();
+        let historical = HistoricalDisplayAttributes::for_plan(&plan);
 
         let rows = build_replace_detail_rows_from_display(
+            &plan,
             &to,
             replacement,
+            &historical,
             None,
             DetailLevel::Explicit,
             None,
@@ -2076,6 +2287,81 @@ mod tests {
                 old: "\"10.0.0.0/16\"".to_string(),
                 new: "\"10.1.0.0/16\"".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn persisted_delete_view_keeps_replacement_desired_secret_mask() {
+        const PLAINTEXT: &str = "hunter2";
+        let to = Resource::new("test.Widget", "widget").with_attribute(
+            "comment",
+            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
+                ConcreteValue::String("rotated".into()),
+            )))),
+        );
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resolved(to.clone())));
+        plan.add(Effect::Delete {
+            id: crate::resource::ResolvedResourceId::new(to.id.clone()),
+            identifier: "old-widget".to_string(),
+            generation: EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique()),
+            directives: Default::default(),
+            binding: None,
+            dependencies: HashSet::new(),
+            explicit_dependencies: HashSet::new(),
+            blocked_by_updates: HashSet::new(),
+        });
+        plan.replace_display_mut().push(ReplaceDisplayMetadata {
+            create_idx: 0,
+            delete_idx: 1,
+            create_before_destroy: false,
+            changed_create_only: ChangedCreateOnly::try_from(vec!["comment".to_string()]).unwrap(),
+            cascade_ref_hints: Vec::new(),
+            temporary_name: None,
+            previous_attributes: HashMap::from([(
+                "comment".to_string(),
+                Value::Concrete(ConcreteValue::String(PLAINTEXT.into())),
+            )]),
+        });
+
+        let mut historical = HistoricalDisplayAttributes::for_plan(&plan);
+        let Effect::Delete {
+            id,
+            identifier,
+            generation,
+            ..
+        } = &plan.effects()[1]
+        else {
+            unreachable!()
+        };
+        let delete_key = DeletedInstanceKey::new(
+            id.as_inner().clone(),
+            generation.clone(),
+            identifier.clone(),
+        );
+        let persisted: PersistedAttributes = serde_json::from_value(serde_json::json!({
+            "comment": PLAINTEXT,
+        }))
+        .expect("persisted attributes");
+        historical.set_delete_from_persisted(delete_key, &persisted);
+
+        let rows = build_replace_detail_rows_from_display(
+            &plan,
+            &to,
+            plan.replace_display_info().next().unwrap(),
+            &historical,
+            None,
+            DetailLevel::Explicit,
+            None,
+        );
+        let rendered = format!("{rows:?}");
+        assert!(
+            !rendered.contains(PLAINTEXT),
+            "detail rows leaked: {rendered}"
+        );
+        assert!(
+            rendered.contains("(secret)"),
+            "secret was not masked: {rendered}"
         );
     }
 

@@ -105,9 +105,6 @@ fn value_serde_round_trip() {
                 ])),
             ],
         }),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("my-password".into()),
-        )))),
     ];
 
     for value in values {
@@ -1452,17 +1449,19 @@ fn pair_list_elements_secret_hash_pairing_is_threshold_independent() {
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
     let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
     let serialized = serde_json::to_string("p").expect("string serialization must succeed");
-    let state_hash = format!(
-        "{}{}",
-        crate::value::SECRET_PREFIX,
-        crate::value::argon2id_hash(serialized.as_bytes(), None)
-    );
+    let state_hash = crate::value::argon2id_hash(serialized.as_bytes(), None);
+    let persisted_secret = || {
+        serde_json::from_value::<Value>(serde_json::json!({
+            "RedactedSecret": { "hash": state_hash }
+        }))
+        .expect("deserialize production persisted-secret shape")
+    };
     let attr_type = AttributeType::string();
     let defs = crate::schema::empty_defs_for_schema_walks();
 
     for len in [2, HASH_THRESHOLD] {
         let mut desired = vec![secret("p")];
-        let mut saved = vec![string(&state_hash)];
+        let mut saved = vec![persisted_secret()];
         for index in 1..len {
             let filler = string(&format!("filler-{index}"));
             desired.push(filler.clone());
@@ -2641,31 +2640,22 @@ fn unknown_hash_does_not_panic_for_for_variants() {
 }
 
 #[test]
-fn unknown_cannot_round_trip_through_serde_json() {
-    // RFC #2371 constraint c: `Value::Deferred(DeferredValue::Unknown)` must never reach state
-    // files / plan files / providers. The variant has `#[serde(skip)]`
-    // so attempting to serialize it returns Err — even a hand-edited
-    // JSON cannot resurrect the variant via deserialization.
+fn unknown_round_trips_through_saved_plan_serde() {
+    // Residual deferred-for templates in saved plans need the typed reason in
+    // order to substitute their loop key/value at apply time. Runtime
+    // provider/state conversion still rejects Unknown through value_to_json.
     let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()]);
-    let v = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef { path }));
-
-    // Serialization must fail.
-    let r = serde_json::to_string(&v);
-    assert!(
-        r.is_err(),
-        "serializing Value::Deferred(DeferredValue::Unknown) must error, got Ok({:?})",
-        r
-    );
-
-    // Deserialization of `{"Unknown": {...}}` must fail (the variant is
-    // effectively absent from the externally-tagged enum).
-    let payload = r#"{"Unknown":{"UpstreamRef":{"path":{"binding":"x","attribute":"y","field_path":[],"subscripts":[]}}}}"#;
-    let r: Result<Value, _> = serde_json::from_str(payload);
-    assert!(
-        r.is_err(),
-        "deserializing Value::Deferred(DeferredValue::Unknown) must error, got Ok({:?})",
-        r
-    );
+    let value = Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+        path: path.clone(),
+    }));
+    let json = serde_json::to_string(&value).expect("serialize saved-plan unknown");
+    let decoded: Value = serde_json::from_str(&json).expect("deserialize saved-plan unknown");
+    assert!(matches!(
+        decoded,
+        Value::Deferred(DeferredValue::Unknown(UnknownReason::UpstreamRef {
+            path: decoded_path,
+        })) if decoded_path == path
+    ));
 }
 
 #[test]

@@ -1699,6 +1699,42 @@ backend local {
 }
 
 #[test]
+fn secret_derived_backend_attribute_matches_cli_diagnostic() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"backend local {
+    path = secret("carina.state.json")
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("backend local attribute 'path'")
+                && diagnostic.message.contains("plain string")
+                && diagnostic.message.contains("secret()")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+        "LSP must surface the same backend secret rejection as validate/plan: {diagnostics:#?}",
+            )
+        });
+    assert_eq!(diagnostic.range.start.line, 1);
+    assert_eq!(diagnostic.range.start.character, 4);
+    assert_eq!(diagnostic.range.end.line, 1);
+    assert_eq!(diagnostic.range.end.character, 8);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("carina.state.json")),
+        "LSP diagnostic must not echo secret-derived plaintext: {diagnostics:#?}",
+    );
+}
+
+#[test]
 fn arguments_with_sibling_backend_emits_error() {
     // Issue #2198 repro shape: arguments live in main.crn, backend lives
     // in backend.crn. The directory-scoped parse must merge them and the

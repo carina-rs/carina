@@ -10,6 +10,9 @@ homepage.workspace = true
 [lib]
 doctest = false
 
+[features]
+test-utils = []
+
 [dependencies]
 carina-core = { path = "../carina-core" }
 aws-config = "1"

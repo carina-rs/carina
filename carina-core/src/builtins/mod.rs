@@ -517,6 +517,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Deferred(DeferredValue::Interpolation(_)) => "Interpolation",
         Value::Deferred(DeferredValue::FunctionCall { .. }) => "FunctionCall",
         Value::Deferred(DeferredValue::Secret(_)) => "Secret",
+        Value::Deferred(DeferredValue::RedactedSecret { .. }) => "RedactedSecret",
         Value::Deferred(DeferredValue::Unknown(_)) => "Unknown",
     }
 }

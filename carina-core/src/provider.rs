@@ -14,9 +14,10 @@ use crate::effect::PlanOp;
 #[cfg(test)]
 use crate::resource::DataSource;
 use crate::resource::{
-    ConcreteValue, Directives, PartialReadMarker, Resource, ResourceId, State, Value,
+    ConcreteValue, DeferredValue, Directives, PartialReadMarker, ResolvedResource, Resource,
+    ResourceId, State, Value,
 };
-use crate::schema::{SchemaRegistry, TypeIdentity};
+use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
 use crate::wait::BindingPattern;
 use crate::wait::predicate::AttrPath;
 
@@ -571,25 +572,494 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Saved attribute values keyed by resource ID.
 ///
-/// Used by `ProviderNormalizer::hydrate_read_state` to carry forward
-/// attributes that APIs don't return in read responses. This structural alias
-/// remains the provider/plugin ABI representation; schema-aware callers use
-/// [`RawSavedAttrs`] and [`LiftedSavedAttrs`] to track whether persisted enum
-/// leaves are safe to expose at this boundary.
-pub type SavedAttrs = HashMap<ResourceId, HashMap<String, Value>>;
+/// The private field marks these values as originating in persisted state.
+/// Provider transports may preserve typed secret hashes from this map using
+/// their legacy state wire representation; desired resource maps have no
+/// conversion into this type and remain subject to the stricter encoder.
+///
+/// Persisted provenance cannot be asserted by wrapping an arbitrary map:
+///
+/// ```compile_fail
+/// use std::collections::HashMap;
+/// use carina_core::provider::SavedAttrs;
+///
+/// let _saved: SavedAttrs = HashMap::new().into();
+/// ```
+///
+/// Nor can callers add an arbitrary desired map after construction:
+///
+/// ```compile_fail
+/// use std::collections::HashMap;
+/// use carina_core::provider::SavedAttrs;
+///
+/// let mut saved = SavedAttrs::new();
+/// saved.insert(todo!("resource id"), HashMap::new());
+/// ```
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SavedAttrs(HashMap<ResourceId, HashMap<String, Value>>);
+
+impl SavedAttrs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, id: &ResourceId) -> Option<&HashMap<String, Value>> {
+        self.0.get(id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&ResourceId, &HashMap<String, Value>)> {
+        self.0.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a SavedAttrs {
+    type Item = (&'a ResourceId, &'a HashMap<String, Value>);
+    type IntoIter = std::collections::hash_map::Iter<'a, ResourceId, HashMap<String, Value>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+/// Attribute storage in the state-file JSON format.
+///
+/// Serde is the construction and serialization boundary because the state file
+/// itself is JSON. The invariant is that values from this type enter the DSL
+/// value layer only through [`Self::get`] or [`Self::to_values`], which decode
+/// complete persisted secret markers as typed `RedactedSecret` values rather
+/// than ordinary strings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PersistedAttributes(HashMap<String, serde_json::Value>);
+
+/// Which existing state hashes may classify provider plaintext as secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviousSecretHashAuthority<'a> {
+    None,
+    /// Protect every key that already contains a stored secret hash.
+    AllPreviouslyHashedKeys(&'a PersistedAttributes),
+    /// Protect stored hashes only for keys absent from the desired resource.
+    OnlyKeysAbsentFromDesired(&'a PersistedAttributes),
+}
+
+impl<'a> PreviousSecretHashAuthority<'a> {
+    fn protects_key(self, resource: &Resource, key: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::AllPreviouslyHashedKeys(_) => true,
+            Self::OnlyKeysAbsentFromDesired(_) => !resource.attributes.contains_key(key),
+        }
+    }
+
+    fn attributes(self) -> Option<&'a PersistedAttributes> {
+        match self {
+            Self::None => None,
+            Self::AllPreviouslyHashedKeys(attributes)
+            | Self::OnlyKeysAbsentFromDesired(attributes) => Some(attributes),
+        }
+    }
+}
+
+impl PersistedAttributes {
+    /// Decode one stored attribute with persisted secret-marker semantics.
+    pub fn get(&self, key: &str) -> Option<Value> {
+        self.0
+            .get(key)
+            .and_then(crate::value::persisted_json_to_dsl_value)
+    }
+
+    /// Decode every non-null stored attribute with persisted marker semantics.
+    pub fn to_values(&self) -> HashMap<String, Value> {
+        self.0
+            .iter()
+            .filter_map(|(key, value)| {
+                crate::value::persisted_json_to_dsl_value(value).map(|value| (key.clone(), value))
+            })
+            .collect()
+    }
+
+    /// Iterate stored attribute names without exposing their encoded values.
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.0.keys()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.0.contains_key(key)
+    }
+
+    /// Return the opaque hash for a top-level persisted secret attribute.
+    pub fn redacted_secret_hash(&self, key: &str) -> Option<crate::resource::RedactedSecretHash> {
+        match self.get(key)? {
+            Value::Deferred(crate::resource::DeferredValue::RedactedSecret { hash }) => Some(hash),
+            _ => None,
+        }
+    }
+
+    /// Return ordinary persisted string attributes for identity-prefix
+    /// reconciliation. Typed secret hashes are deliberately excluded.
+    pub fn plain_string_values(&self) -> HashMap<String, String> {
+        self.0
+            .iter()
+            .filter_map(
+                |(key, value)| match crate::value::persisted_json_to_dsl_value(value) {
+                    Some(Value::Concrete(ConcreteValue::String(value))) => {
+                        Some((key.clone(), value.into_plaintext()))
+                    }
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
+    /// Encode provider/history values for state writeback, skipping values
+    /// that cannot be represented and protecting all known secret shapes.
+    pub fn encode_values_for_resource_and_schema(
+        resource: &ResolvedResource,
+        schema: Option<&ResourceSchema>,
+        attributes: &HashMap<String, Value>,
+        previous_hash_authority: PreviousSecretHashAuthority<'_>,
+    ) -> Self {
+        let display_type = resource.id.display_type();
+        let identity = resource.identity_str();
+        let serialized = attributes
+            .iter()
+            .filter_map(|(key, value)| {
+                let context = crate::value::SecretHashContext::new(&display_type, identity, key);
+                persisted_state_value_to_json(value, &context)
+                    .ok()
+                    .map(|value| (key.clone(), value))
+            })
+            .collect();
+        Self::protect_serialized(resource, schema, serialized, previous_hash_authority, false)
+            .expect("lossy secret protection does not return serialization errors")
+    }
+
+    /// Apply desired/schema/previous-state secret protection to values already
+    /// encoded in the state-file representation.
+    pub fn protect_for_resource_and_schema(
+        self,
+        resource: &ResolvedResource,
+        schema: Option<&ResourceSchema>,
+        previous_hash_authority: PreviousSecretHashAuthority<'_>,
+    ) -> Self {
+        Self::protect_serialized(resource, schema, self.0, previous_hash_authority, false)
+            .expect("lossy secret protection does not return serialization errors")
+    }
+
+    /// Strict variant used after a provider read has already been encoded.
+    pub fn try_protect_for_resource_and_schema(
+        self,
+        resource: &ResolvedResource,
+        schema: Option<&ResourceSchema>,
+        previous_hash_authority: PreviousSecretHashAuthority<'_>,
+    ) -> Result<Self, crate::value::SerializationError> {
+        Self::protect_serialized(resource, schema, self.0, previous_hash_authority, true)
+    }
+
+    fn protect_serialized(
+        resource: &ResolvedResource,
+        schema: Option<&ResourceSchema>,
+        mut serialized: HashMap<String, serde_json::Value>,
+        previous_hash_authority: PreviousSecretHashAuthority<'_>,
+        strict_desired: bool,
+    ) -> Result<Self, crate::value::SerializationError> {
+        let display_type = resource.id.display_type();
+        let identity = resource.identity_str();
+        let mut protected_secret_keys = std::collections::HashSet::new();
+
+        for (key, desired_value) in &resource.attributes {
+            if !crate::value::contains_unredacted_secret(desired_value) {
+                continue;
+            }
+            let context = crate::value::SecretHashContext::new(&display_type, identity, key);
+            let masked = if let Some(provider_json) = serialized.get(key).cloned() {
+                crate::value::merge_secrets_into_provider_json(
+                    desired_value,
+                    &provider_json,
+                    Some(&context),
+                )
+            } else {
+                crate::value::value_to_json_with_context(desired_value, Some(&context))
+            };
+            match masked {
+                Ok(masked) => {
+                    serialized.insert(key.clone(), masked);
+                    protected_secret_keys.insert(key.clone());
+                }
+                Err(error) if strict_desired => return Err(error),
+                Err(_) => {
+                    serialized.remove(key);
+                }
+            }
+        }
+
+        protect_previously_hashed_secrets(
+            &display_type,
+            identity,
+            resource,
+            previous_hash_authority,
+            &mut serialized,
+            &mut protected_secret_keys,
+        );
+
+        if let Some(schema) = schema {
+            for (key, attribute) in &schema.attributes {
+                if attribute.write_only && !protected_secret_keys.contains(key) {
+                    serialized.remove(key);
+                }
+            }
+        }
+
+        Ok(Self(serialized))
+    }
+
+    pub(crate) fn encoded(&self) -> &HashMap<String, serde_json::Value> {
+        &self.0
+    }
+}
+
+fn persisted_state_value_to_json(
+    value: &Value,
+    context: &crate::value::SecretHashContext,
+) -> Result<serde_json::Value, crate::value::SerializationError> {
+    match value {
+        Value::Deferred(DeferredValue::RedactedSecret { hash }) => Ok(serde_json::Value::String(
+            crate::value::persisted_secret_marker(hash),
+        )),
+        Value::Concrete(ConcreteValue::List(values)) => values
+            .iter()
+            .map(|value| persisted_state_value_to_json(value, context))
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array),
+        Value::Concrete(ConcreteValue::Map(values)) => values
+            .iter()
+            .map(|(key, value)| {
+                persisted_state_value_to_json(value, context).map(|value| (key.clone(), value))
+            })
+            .collect::<Result<serde_json::Map<_, _>, _>>()
+            .map(serde_json::Value::Object),
+        _ if crate::value::contains_unredacted_secret(value) => {
+            crate::value::value_to_json_with_context(value, Some(context))
+        }
+        _ => crate::value::value_to_json(value),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretHashShape {
+    None,
+    TopLevel,
+    Nested,
+}
+
+fn secret_hash_shape(value: &serde_json::Value) -> SecretHashShape {
+    match value {
+        serde_json::Value::String(stored) if crate::value::is_persisted_secret(stored) => {
+            SecretHashShape::TopLevel
+        }
+        serde_json::Value::Array(items) if items.iter().any(contains_secret_hash_json) => {
+            SecretHashShape::Nested
+        }
+        serde_json::Value::Object(map) if map.values().any(contains_secret_hash_json) => {
+            SecretHashShape::Nested
+        }
+        _ => SecretHashShape::None,
+    }
+}
+
+fn contains_secret_hash_json(value: &serde_json::Value) -> bool {
+    secret_hash_shape(value) != SecretHashShape::None
+}
+
+fn protect_previously_hashed_secrets(
+    display_type: &str,
+    identity: &str,
+    resource: &Resource,
+    authority: PreviousSecretHashAuthority<'_>,
+    serialized: &mut HashMap<String, serde_json::Value>,
+    protected_secret_keys: &mut std::collections::HashSet<String>,
+) {
+    let Some(existing_attributes) = authority.attributes() else {
+        return;
+    };
+    for (key, previous_value) in existing_attributes.encoded() {
+        if protected_secret_keys.contains(key) || !authority.protects_key(resource, key) {
+            continue;
+        }
+        let shape = secret_hash_shape(previous_value);
+        if shape == SecretHashShape::None {
+            continue;
+        }
+        let context = crate::value::SecretHashContext::new(display_type, identity, key);
+        let masked = match (shape, serialized.get(key)) {
+            (SecretHashShape::TopLevel, Some(provider_json))
+                if secret_hash_shape(provider_json) == SecretHashShape::TopLevel =>
+            {
+                provider_json.clone()
+            }
+            (SecretHashShape::TopLevel, Some(provider_json)) => {
+                hash_provider_json_as_secret(provider_json, &context)
+                    .unwrap_or_else(|_| previous_value.clone())
+            }
+            (SecretHashShape::TopLevel, None) => previous_value.clone(),
+            (SecretHashShape::Nested, provider_json) => {
+                merge_previous_secret_hashes_into_provider_json(
+                    previous_value,
+                    provider_json,
+                    &context,
+                )
+            }
+            (SecretHashShape::None, _) => unreachable!("None shape is filtered above"),
+        };
+        serialized.insert(key.clone(), masked);
+        protected_secret_keys.insert(key.clone());
+    }
+}
+
+fn merge_previous_secret_hashes_into_provider_json(
+    previous_value: &serde_json::Value,
+    provider_value: Option<&serde_json::Value>,
+    context: &crate::value::SecretHashContext,
+) -> serde_json::Value {
+    match previous_value {
+        serde_json::Value::String(stored) if crate::value::is_persisted_secret(stored) => {
+            let Some(provider_value) = provider_value else {
+                return previous_value.clone();
+            };
+            if secret_hash_shape(provider_value) == SecretHashShape::TopLevel {
+                return provider_value.clone();
+            }
+            hash_provider_json_as_secret(provider_value, context)
+                .unwrap_or_else(|_| previous_value.clone())
+        }
+        serde_json::Value::Object(previous_object) => {
+            let Some(serde_json::Value::Object(provider_object)) = provider_value else {
+                return previous_value.clone();
+            };
+            let mut merged = provider_object.clone();
+            for (key, previous_child) in previous_object {
+                if contains_secret_hash_json(previous_child) {
+                    merged.insert(
+                        key.clone(),
+                        merge_previous_secret_hashes_into_provider_json(
+                            previous_child,
+                            provider_object.get(key),
+                            context,
+                        ),
+                    );
+                }
+            }
+            serde_json::Value::Object(merged)
+        }
+        serde_json::Value::Array(previous_items) => {
+            let Some(serde_json::Value::Array(provider_items)) = provider_value else {
+                return previous_value.clone();
+            };
+            if !previous_secret_hash_array_alignment_is_trusted(previous_items, provider_items) {
+                return hash_provider_json_as_secret(
+                    &serde_json::Value::Array(provider_items.clone()),
+                    context,
+                )
+                .unwrap_or_else(|_| previous_value.clone());
+            }
+            let mut merged = provider_items.clone();
+            for (index, previous_child) in previous_items.iter().enumerate() {
+                if contains_secret_hash_json(previous_child) {
+                    merged[index] = merge_previous_secret_hashes_into_provider_json(
+                        previous_child,
+                        provider_items.get(index),
+                        context,
+                    );
+                }
+            }
+            serde_json::Value::Array(merged)
+        }
+        _ => provider_value
+            .cloned()
+            .unwrap_or_else(|| previous_value.clone()),
+    }
+}
+
+fn previous_secret_hash_array_alignment_is_trusted(
+    previous_items: &[serde_json::Value],
+    provider_items: &[serde_json::Value],
+) -> bool {
+    previous_items.len() == provider_items.len()
+        && previous_items
+            .iter()
+            .zip(provider_items)
+            .filter(|(previous, _)| contains_secret_hash_json(previous))
+            .all(|(previous, provider)| {
+                let (
+                    serde_json::Value::Object(previous_object),
+                    serde_json::Value::Object(provider_object),
+                ) = (previous, provider)
+                else {
+                    return false;
+                };
+                let anchors: Vec<_> = previous_object
+                    .iter()
+                    .filter(|(_, value)| !contains_secret_hash_json(value))
+                    .collect();
+                !anchors.is_empty()
+                    && anchors
+                        .into_iter()
+                        .all(|(key, value)| provider_object.get(key) == Some(value))
+            })
+}
+
+fn hash_provider_json_as_secret(
+    provider_json: &serde_json::Value,
+    context: &crate::value::SecretHashContext,
+) -> Result<serde_json::Value, String> {
+    let provider_value = crate::value::json_to_dsl_value(provider_json)
+        .ok_or_else(|| "cannot hash null provider secret".to_string())?;
+    let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(provider_value)));
+    crate::value::value_to_json_with_context(&secret_value, Some(context))
+        .map_err(|error| error.to_string())
+}
 
 /// Saved attributes decoded from persisted state but not yet reconciled
 /// with the current provider schemas for enum or structural value shapes.
 ///
 /// This type cannot be passed to planning or refresh hydration. Consume it
 /// with [`RawSavedAttrs::lift`] to obtain [`LiftedSavedAttrs`].
+/// Arbitrary desired values cannot assert persisted provenance:
+///
+/// ```compile_fail
+/// use std::collections::HashMap;
+/// use carina_core::provider::RawSavedAttrs;
+/// use carina_core::resource::{ResourceId, Value};
+///
+/// let desired: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
+/// let _saved = RawSavedAttrs::from_persisted(desired);
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RawSavedAttrs(SavedAttrs);
 
 impl RawSavedAttrs {
-    /// Mark a structurally raw map as originating from persisted state.
-    pub fn from_persisted(saved_attrs: SavedAttrs) -> Self {
-        Self(saved_attrs)
+    /// Collect opaque attribute maps obtained from persisted state rows.
+    pub fn from_persisted(saved_attrs: HashMap<ResourceId, PersistedAttributes>) -> Self {
+        Self(SavedAttrs(
+            saved_attrs
+                .into_iter()
+                .map(|(id, attributes)| (id, attributes.to_values()))
+                .collect(),
+        ))
+    }
+
+    /// Construct saved attributes directly for tests that exercise invalid
+    /// or otherwise non-JSON-representable provider-boundary values.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn from_decoded_values_for_test(
+        saved_attrs: HashMap<ResourceId, HashMap<String, Value>>,
+    ) -> Self {
+        Self(SavedAttrs(saved_attrs))
     }
 
     /// Lift enum leaves and structurally canonicalize every persisted entry
@@ -598,7 +1068,7 @@ impl RawSavedAttrs {
     /// carina#3740: both rewrites live at this single raw-to-lifted seam so a
     /// saved map cannot reach hydration or the differ with only one applied.
     pub fn lift(mut self, registry: &SchemaRegistry) -> LiftedSavedAttrs {
-        crate::utils::lift_saved_state_enum_leaves(&mut self.0, registry);
+        crate::utils::lift_saved_state_enum_leaves(&mut self.0.0, registry);
         LiftedSavedAttrs(self.0)
     }
 
@@ -639,13 +1109,13 @@ impl LiftedSavedAttrs {
 
     /// Iterate resource IDs without exposing mutable map access.
     pub fn resource_ids(&self) -> impl Iterator<Item = &ResourceId> {
-        self.0.keys()
+        self.0.0.keys()
     }
 
     /// Transfer a resource's saved attributes to a new ID.
     pub fn remap_resource_id(&mut self, from: &ResourceId, to: ResourceId) {
-        if let Some(attrs) = self.0.remove(from) {
-            self.0.insert(to, attrs);
+        if let Some(attrs) = self.0.0.remove(from) {
+            self.0.0.insert(to, attrs);
         }
     }
 }
@@ -1738,7 +2208,7 @@ mod tests {
     #[test]
     fn lift_covers_orphan_entries_absent_from_any_resource_slice() {
         let orphan = ResourceId::with_provider_identity("aws", "service.Widget", "orphan", None);
-        let raw = RawSavedAttrs::from_persisted(HashMap::from([(
+        let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
             orphan.clone(),
             HashMap::from([(
                 "status".to_string(),
@@ -1759,7 +2229,7 @@ mod tests {
     fn raw_saved_attrs_lift_is_map_driven_and_remappable() {
         let from = ResourceId::with_provider_identity("aws", "service.Widget", "old", None);
         let to = ResourceId::with_provider_identity("aws", "service.Widget", "new", None);
-        let raw = RawSavedAttrs::from_persisted(HashMap::from([(
+        let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
             from.clone(),
             HashMap::from([(
                 "status".to_string(),
@@ -1802,7 +2272,7 @@ mod tests {
         );
 
         let id = ResourceId::with_provider_identity("aws", "iam.policy", "p1", None);
-        let raw = RawSavedAttrs::from_persisted(HashMap::from([(
+        let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
             id.clone(),
             HashMap::from([(
                 "statement".to_string(),
@@ -1829,7 +2299,7 @@ mod tests {
     fn raw_saved_attrs_lift_preserves_attribute_absent_from_schema() {
         let id = ResourceId::with_provider_identity("aws", "service.Widget", "widget", None);
         let original = Value::Concrete(ConcreteValue::String("opaque".into()));
-        let raw = RawSavedAttrs::from_persisted(HashMap::from([(
+        let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
             id.clone(),
             HashMap::from([("provider_extension".to_string(), original.clone())]),
         )]));
@@ -1847,7 +2317,7 @@ mod tests {
     fn raw_saved_attrs_lift_skips_resource_type_absent_from_registry() {
         let id = ResourceId::with_provider_identity("aws", "service.Unknown", "unknown", None);
         let original = Value::Concrete(ConcreteValue::String("Enabled".into()));
-        let raw = RawSavedAttrs::from_persisted(HashMap::from([(
+        let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
             id.clone(),
             HashMap::from([("status".to_string(), original.clone())]),
         )]));
@@ -1888,7 +2358,7 @@ mod tests {
                 )),
         );
         let id = ResourceId::with_provider_identity("aws", "service.Widget", "widget", None);
-        let raw = RawSavedAttrs::from_persisted(HashMap::from([(
+        let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
             id.clone(),
             HashMap::from([
                 (
@@ -1903,7 +2373,7 @@ mod tests {
         )]));
 
         let once = raw.lift(&registry);
-        let twice = RawSavedAttrs::from_persisted(once.0.clone()).lift(&registry);
+        let twice = RawSavedAttrs::from_decoded_values_for_test(once.0.0.clone()).lift(&registry);
         let sorted_pairs = |attrs: &HashMap<String, Value>| {
             let mut pairs: Vec<_> = attrs
                 .iter()
@@ -1921,9 +2391,8 @@ mod tests {
     }
 
     #[test]
-    fn raw_saved_attrs_lift_preserves_secret_hash_scalar_in_string_or_list_union() {
+    fn raw_saved_attrs_lift_preserves_redacted_secret_in_string_or_list_union() {
         use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
-        use crate::value::SECRET_PREFIX;
 
         let config = AttributeType::struct_(
             "Config".to_string(),
@@ -1942,14 +2411,17 @@ mod tests {
         );
 
         let id = ResourceId::with_provider_identity("test", "service.Widget", "widget", None);
-        let secret_hash = format!("{SECRET_PREFIX}deadbeef");
-        let raw = RawSavedAttrs::from_persisted(HashMap::from([(
+        let secret_hash: Value = serde_json::from_value(serde_json::json!({
+            "RedactedSecret": { "hash": "deadbeef".repeat(8) }
+        }))
+        .expect("deserialize persisted secret");
+        let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
             id.clone(),
             HashMap::from([(
                 "config".to_string(),
                 Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                     "password".to_string(),
-                    Value::Concrete(ConcreteValue::String(secret_hash.clone().into())),
+                    secret_hash.clone(),
                 )]))),
             )]),
         )]));
@@ -1960,8 +2432,7 @@ mod tests {
             panic!("config must remain a map");
         };
         assert_eq!(
-            config["password"],
-            Value::Concrete(ConcreteValue::String(secret_hash.into())),
+            config["password"], secret_hash,
             "carina#3740: a persisted secret hash is an opaque scalar sentinel, never a list"
         );
     }
@@ -2000,7 +2471,7 @@ mod tests {
         );
 
         let id = ResourceId::with_provider_identity("awscc", "example.Widget", "widget", None);
-        let raw = RawSavedAttrs::from_persisted(HashMap::from([(
+        let raw = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
             id.clone(),
             HashMap::from([(
                 "settings".to_string(),
@@ -3315,15 +3786,17 @@ mod tests {
         let id = ResourceId::with_identity("test", "example");
         let mut states = HashMap::new();
         states.insert(id.clone(), State::existing(id.clone(), HashMap::new()));
-        let mut saved: SavedAttrs = HashMap::new();
-        saved.insert(
+        let saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
             id.clone(),
             HashMap::from([(
                 "restored".to_string(),
                 Value::Concrete(ConcreteValue::String("data".into())),
             )]),
-        );
-        ext.hydrate_read_state(&mut states, &saved).await.unwrap();
+        )]))
+        .lift(&SchemaRegistry::new());
+        ext.hydrate_read_state(&mut states, saved.as_provider_saved_attrs())
+            .await
+            .unwrap();
         assert_eq!(
             states.get(&id).unwrap().attributes.get("restored"),
             Some(&Value::Concrete(ConcreteValue::String("data".into())))

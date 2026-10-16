@@ -572,6 +572,9 @@ fn deterministic_value_string(value: &Value) -> String {
         Value::Deferred(DeferredValue::Secret(inner)) => {
             format!("Secret({})", deterministic_value_string(inner))
         }
+        Value::Deferred(DeferredValue::RedactedSecret { hash }) => {
+            format!("RedactedSecret({})", hash.as_str())
+        }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             use crate::resource::UnknownReason;
             match reason {
@@ -602,7 +605,7 @@ fn deterministic_value_string(value: &Value) -> String {
     }
 }
 
-fn canonical_create_only_value_string(value: &Value) -> Option<String> {
+pub fn canonical_create_only_value_string(value: &Value) -> Option<String> {
     match value {
         Value::Concrete(ConcreteValue::String(s)) => Some(s.expose_plaintext().to_owned()),
         Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => Some(raw.as_str().to_string()),
@@ -649,17 +652,6 @@ fn canonical_create_only_value_string(value: &Value) -> Option<String> {
 
 fn canonical_create_only_feature_string(value: &Value) -> String {
     canonical_create_only_value_string(value).unwrap_or_else(|| deterministic_value_string(value))
-}
-
-/// Convert a persisted state JSON create-only attribute into the same canonical
-/// feature string used for desired-side anonymous identifier reconciliation.
-///
-/// The JSON reader preserves typed enum objects as `CanonicalEnum`; ordinary
-/// legacy enum strings remain strings and are not schema-resolved here.
-pub fn canonical_create_only_state_json_string(value: &serde_json::Value) -> Option<String> {
-    crate::value::json_to_dsl_value(value)
-        .as_ref()
-        .and_then(canonical_create_only_value_string)
 }
 
 /// Maximum Hamming distance (out of 64 bits) for SimHash-based reconciliation.

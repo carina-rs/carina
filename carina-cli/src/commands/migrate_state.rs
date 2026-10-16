@@ -396,6 +396,7 @@ mod tests {
                 );
                 m
             },
+            attribute_spans: HashMap::new(),
         };
 
         let outcome = run_init_migrate_state(base, Some(&cfg), false)
@@ -456,6 +457,7 @@ mod tests {
                 );
                 m
             },
+            attribute_spans: HashMap::new(),
         };
 
         run_init_migrate_state(base, Some(&cfg), false)

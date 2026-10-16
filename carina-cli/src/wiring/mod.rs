@@ -19,7 +19,7 @@ use carina_core::effect::{
     DeferredReplaceDelete, DeferredReplacePayload, Effect, EffectGeneration, NonEmptyDeletes,
 };
 use carina_core::executor::normalized::{
-    is_value_fully_concrete_for_expansion, restore_stripped_attributes,
+    StrippedAttributes, is_value_fully_concrete_for_expansion, restore_stripped_attributes,
     run_desired_normalization_stages, states_contain_unknown, strip_provider_boundary_attributes,
 };
 use carina_core::executor::{
@@ -650,11 +650,7 @@ pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<
         let sr = state_file.find_resource(provider, resource_type, name)?;
         Some(PrefixStateInfo {
             prefixes: sr.prefixes.clone(),
-            attribute_values: sr
-                .attributes
-                .iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect(),
+            attribute_values: sr.persisted_attributes().plain_string_values(),
         })
     });
 }
@@ -726,11 +722,12 @@ pub fn apply_anonymous_to_named_renames(
                 .resources_by_type(provider, resource_type)
                 .into_iter()
                 .map(|sr| {
+                    let persisted = sr.persisted_attributes();
                     let create_only_values = create_only_attrs
                         .iter()
                         .filter_map(|attr| {
-                            sr.attributes.get(*attr).and_then(|v| {
-                                identifier::canonical_create_only_state_json_string(v)
+                            persisted.get(attr).and_then(|value| {
+                                identifier::canonical_create_only_value_string(&value)
                                     .map(|s| (attr.to_string(), s))
                             })
                         })
@@ -779,10 +776,11 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
                 AnonymousIdBindingStateInfo {
                     name: sr.identity.to_string(),
                     attribute_values: sr
-                        .attributes
-                        .iter()
+                        .persisted_attributes()
+                        .to_values()
+                        .into_iter()
                         .filter_map(|(attr, value)| {
-                            identifier::canonical_create_only_state_json_string(value)
+                            identifier::canonical_create_only_value_string(&value)
                                 .map(|s| (attr.clone(), s))
                         })
                         .collect(),
@@ -812,11 +810,12 @@ pub fn reconcile_anonymous_identifiers_with_ctx(
                 .resources_by_type(provider, resource_type)
                 .into_iter()
                 .map(|sr| {
+                    let persisted = sr.persisted_attributes();
                     let create_only_values = create_only_attrs
                         .iter()
                         .filter_map(|attr| {
-                            sr.attributes.get(*attr).and_then(|v| {
-                                identifier::canonical_create_only_state_json_string(v)
+                            persisted.get(attr).and_then(|value| {
+                                identifier::canonical_create_only_value_string(&value)
                                     .map(|s| (attr.to_string(), s))
                             })
                         })
@@ -1148,7 +1147,6 @@ impl<'a> PlanPreprocessor<'a> {
         data_source_origins: &[DataSource],
         wait_bindings: &mut [carina_core::parser::WaitBinding],
     ) -> Result<(), PlanPreparationError> {
-        let schemas = self.ctx.schemas();
         let mut errors = validate_resolved_value_constraints(
             self.ctx,
             resources.resources(),
@@ -1164,17 +1162,14 @@ impl<'a> PlanPreprocessor<'a> {
         }
 
         let resources = resources.resources_mut();
-        carina_core::value::canonicalize_resources_with_schemas(resources, schemas);
-        carina_core::value::canonicalize_data_sources_with_schemas(data_sources, schemas);
-
-        // RFC #2371 stage 2 + #2387: strip every attribute the WASM
-        // provider boundary refuses to serialize — `Value::Deferred(DeferredValue::Unknown)`
-        // (#2378) and `Value::Deferred(DeferredValue::ResourceRef)` plus the wrappers that hide
-        // a ref (`Interpolation` / `FunctionCall` / `Secret`-of-ref,
-        // #2387) — before `normalize_desired` runs, then restore them
-        // at their original index. After this pass, `core_to_wit_value`
-        // is type-system-enforced to never see either kind.
-        let stripped = strip_provider_boundary_attributes(resources);
+        let stripped = prepare_desired_side_for_plan(
+            resources,
+            data_sources,
+            provider_configs,
+            self.normalizer,
+            self.ctx,
+        )
+        .await?;
         // Hard assert (not debug_assert): RFC #2371 constraint b says
         // state files never carry `Value::Deferred(DeferredValue::Unknown)`, and the
         // strip-and-restore design depends on it. A release-mode
@@ -1184,18 +1179,6 @@ impl<'a> PlanPreprocessor<'a> {
             !states_contain_unknown(current_states),
             "Value::Deferred(DeferredValue::Unknown) found in current_states — RFC #2371 constraint b violated"
         );
-        let desired_result = run_desired_normalization_stages(
-            resources,
-            provider_configs,
-            self.normalizer,
-            self.ctx.factories(),
-            schemas,
-        )
-        .await;
-        if let Err(error) = desired_result {
-            restore_stripped_attributes(resources, stripped);
-            return Err(PlanPreparationError::Provider(error));
-        }
         if let Err(error) = self.normalizer.normalize_state(current_states).await {
             restore_stripped_attributes(resources, stripped);
             return Err(PlanPreparationError::Provider(error));
@@ -1210,6 +1193,38 @@ impl<'a> PlanPreprocessor<'a> {
         restore_stripped_attributes(resources, stripped);
         Ok(())
     }
+}
+
+/// The complete desired-side portion of plan preprocessing. Saved-plan
+/// verification calls this same function, then restores the stripped values
+/// immediately because it has no state-side normalization work to perform.
+pub(crate) async fn prepare_desired_side_for_plan(
+    resources: &mut [Resource],
+    data_sources: &mut [DataSource],
+    provider_configs: &[ProviderConfig],
+    normalizer: &dyn ProviderNormalizer,
+    ctx: &WiringContext,
+) -> Result<StrippedAttributes, ProviderError> {
+    carina_core::value::canonicalize_resources_with_schemas(resources, ctx.schemas());
+    carina_core::value::canonicalize_data_sources_with_schemas(data_sources, ctx.schemas());
+
+    // Deferred values cannot cross a provider boundary. Retain them while the
+    // provider normalizes only the concrete desired attributes, then let the
+    // caller restore them at the point appropriate to its larger pipeline.
+    let stripped = strip_provider_boundary_attributes(resources);
+    if let Err(error) = run_desired_normalization_stages(
+        resources,
+        provider_configs,
+        normalizer,
+        ctx.factories(),
+        ctx.schemas(),
+    )
+    .await
+    {
+        restore_stripped_attributes(resources, stripped);
+        return Err(error);
+    }
+    Ok(stripped)
 }
 
 /// Normalize enum values in current states to match DSL format.
@@ -1887,19 +1902,18 @@ async fn load_source_provider(
 /// and schemas to re-apply the full normalization pipeline after
 /// apply-time reference re-resolution (carina#3063) — without it the
 /// from-plan path would silently undo enum-alias / canonicalize stages.
-pub async fn create_providers_from_configs(
+pub async fn create_providers_from_configs_with_ctx(
+    ctx: &WiringContext,
     configs: &ResolvedProviderConfigs,
     base_dir: &Path,
-) -> Result<(ProviderRouter, WiringContext), AppError> {
-    let (factories, _) = build_factories_from_providers(configs.as_provider_configs(), base_dir)?;
-    let ctx = WiringContext::new(factories, configs.as_provider_configs());
+) -> Result<ProviderRouter, AppError> {
     let mut router = ProviderRouter::new();
 
     // Same two-pass shape as `get_provider_with_ctx`: default instances
     // first (they may load the WASM plugin), then named instances reuse
     // the factory that was just loaded.
     for config in configs.iter().filter(|config| config.is_default()) {
-        instantiate_provider_into_router(&ctx, &mut router, config, base_dir, None, None).await?;
+        instantiate_provider_into_router(ctx, &mut router, config, base_dir, None, None).await?;
     }
     for (config, binding) in configs
         .iter()
@@ -1907,7 +1921,7 @@ pub async fn create_providers_from_configs(
     {
         let inherited_source = kind_default_source(configs, config.name());
         instantiate_provider_into_router(
-            &ctx,
+            ctx,
             &mut router,
             config,
             base_dir,
@@ -1922,7 +1936,33 @@ pub async fn create_providers_from_configs(
         router.add_provider(String::new(), Box::new(MockProvider::new()));
     }
 
-    Ok((router, ctx))
+    Ok(router)
+}
+
+/// Build only the desired-state normalizers needed to reproduce the plan-time
+/// candidate shape. Runtime providers are intentionally not constructed here:
+/// saved-plan secret verification must finish before CRUD-capable objects
+/// become available to the apply path.
+pub(crate) async fn create_normalizers_from_configs_with_ctx(
+    ctx: &WiringContext,
+    configs: &ResolvedProviderConfigs,
+) -> Result<ProviderRouter, AppError> {
+    let mut router = ProviderRouter::new();
+
+    for config in configs.iter() {
+        if let Some(factory) = provider_mod::find_factory(ctx.factories(), config.name()) {
+            let ready = prepare_provider_ready_config(factory, config)?;
+            router.add_normalizer(
+                config.name().to_string(),
+                factory
+                    .create_normalizer(config.binding(), &ready)
+                    .await
+                    .map_err(|error| AppError::Provider(error.for_provider(config.name())))?,
+            );
+        }
+    }
+
+    Ok(router)
 }
 
 /// The expanded children that are safe to re-read from the provider —
@@ -2401,7 +2441,8 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     // attribute from `Custom` to `Enum` (e.g. awscc#250 for IAM
     // policy `version`/`effect`) store enum values as plain JSON
     // strings. `build_saved_attrs` bridges those through the
-    // schema-blind `json_to_dsl_value` into `ConcreteValue::String`,
+    // schema-blind `persisted_json_to_dsl_value` into
+    // `ConcreteValue::String`,
     // which the strict carina#2986 Phase 4 validator then rejects at
     // the now-`Enum` position. Lift recognized members to
     // `ConcreteValue::EnumIdentifier` against each resource's current
@@ -2993,7 +3034,14 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     Ok(PlanContext {
         plan,
         provider,
-        sorted_resources: paired_unresolved_resources.clone(),
+        // Keep the evaluated desired view distinct from the authored
+        // pre-resolution snapshot. Before carina#3861 this field was filled
+        // with `paired_unresolved_resources`; for let-bound resources that
+        // pairing deliberately prefers `unresolved_parsed` and therefore
+        // restored unevaluated calls such as `secret("...")`. Anonymous
+        // resources have no binding and kept this evaluated view, producing
+        // the bound/anonymous saved-plan divergence.
+        sorted_resources: override_aware_resources.resources().to_vec(),
         unresolved_resources: paired_unresolved_resources,
         compositions: prepared_compositions,
         data_sources: data_sources_for_plan,
@@ -3383,7 +3431,7 @@ pub fn add_state_block_effects(
     for block in state_blocks {
         match block {
             StateBlock::Import { to, id } => {
-                let effective_to = resolve_import_target(to, plan);
+                let effective_to = resolve_import_target(to, desired_resources);
 
                 // Skip if resource already exists in state
                 let already_in_state = state_file.as_ref().is_some_and(|sf| {
@@ -3615,25 +3663,19 @@ pub(crate) fn deposed_delete_effects_for_row(row: &carina_state::ResourceState) 
 ///   suppressed.
 ///
 /// Match precedence:
-/// 1. Exact `(provider, resource_type, name)` against a Create effect.
-fn resolve_import_target(to: &StateBlockAddress, plan: &Plan) -> ResolvedResourceId {
-    if let Some(resource) = plan.effects().iter().find_map(|effect| match effect {
-        Effect::Create(resource)
-            if resource.id.provider == to.provider
-                && resource.id.resource_type == to.resource_type
-                && resource.id.identity_str() == Some(to.name_str()) =>
-        {
-            Some(resource)
-        }
-        _ => None,
-    }) {
-        return resource.resolved_id();
-    }
-
-    to.to_unrouted_resource_id()
+/// 1. Exact `(provider, resource_type, name)` against the prepared desired
+///    resources, inheriting its routed provider instance.
+/// 2. The routing-agnostic address from the state block.
+pub(crate) fn resolve_import_target(
+    to: &StateBlockAddress,
+    desired: &[Resource],
+) -> ResolvedResourceId {
+    match_import_target(to, desired.iter())
+        .map(|resource| ResolvedResourceId::new(resource.id.clone()))
+        .unwrap_or_else(|| to.to_unrouted_resource_id())
 }
 
-fn match_import_target<'a>(
+pub(crate) fn match_import_target<'a>(
     to: &StateBlockAddress,
     resources: impl Iterator<Item = &'a Resource>,
 ) -> Option<&'a Resource> {

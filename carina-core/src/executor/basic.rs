@@ -204,6 +204,7 @@ fn needs_apply_resolution(value: &Value) -> bool {
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Interpolation(_)
             | DeferredValue::FunctionCall { .. }
+            | DeferredValue::RedactedSecret { .. }
             | DeferredValue::Unknown(_),
         ) => true,
         Value::Deferred(DeferredValue::Secret(inner)) => needs_apply_resolution(inner),
@@ -316,6 +317,10 @@ fn assert_fully_resolved(
         Value::Deferred(DeferredValue::Secret(inner)) => {
             assert_fully_resolved(inner, attribute_key, bindings)
         }
+        Value::Deferred(DeferredValue::RedactedSecret { .. }) => Err(format!(
+            "Attribute '{}' contains a saved-plan secret that was not rehydrated; create a new saved plan before applying",
+            attribute_key
+        )),
         Value::Deferred(DeferredValue::ResourceRef { path }) => Err(unresolved_binding_message(
             attribute_key,
             UnresolvedSite::Ref {
@@ -410,6 +415,7 @@ fn collect_unresolved_bindings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
         Value::Deferred(DeferredValue::ResourceRef { path }) => out.push(path.binding()),
         Value::Deferred(DeferredValue::BindingRef { binding }) => out.push(binding.as_str()),
         Value::Deferred(DeferredValue::Secret(inner)) => collect_unresolved_bindings(inner, out),
+        Value::Deferred(DeferredValue::RedactedSecret { .. }) => {}
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             for p in parts {
                 if let InterpolationPart::Expr(v) = p {
@@ -942,6 +948,17 @@ mod assert_fully_resolved_tests {
         let err = assert_fully_resolved(&v, "name", &empty_bindings())
             .expect_err("Unknown must be rejected at apply seam");
         assert!(err.contains("value is not yet known"), "got: {err}");
+    }
+
+    #[test]
+    fn saved_plan_secret_placeholder_is_rejected_at_apply_seam() {
+        let v = Value::Deferred(DeferredValue::RedactedSecret {
+            hash: crate::resource::RedactedSecretHash::new("00".repeat(32)),
+        });
+        let err = assert_fully_resolved(&v, "password", &empty_bindings())
+            .expect_err("saved-plan placeholder must be rejected before provider dispatch");
+        assert!(err.contains("not rehydrated"), "got: {err}");
+        assert!(err.contains("new saved plan"), "got: {err}");
     }
 
     #[test]

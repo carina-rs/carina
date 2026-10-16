@@ -64,6 +64,7 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::Deferred(DeferredValue::Interpolation(_)) => "string",
         Value::Deferred(DeferredValue::FunctionCall { .. }) => "function call",
         Value::Deferred(DeferredValue::Secret(_)) => "secret",
+        Value::Deferred(DeferredValue::RedactedSecret { .. }) => "redacted secret",
         Value::Deferred(DeferredValue::Unknown(_)) => "unknown",
     }
 }

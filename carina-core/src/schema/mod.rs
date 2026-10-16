@@ -5198,6 +5198,7 @@ impl Value {
                 format!("FunctionCall({})", name)
             }
             Value::Deferred(DeferredValue::Secret(_)) => "Secret".to_string(),
+            Value::Deferred(DeferredValue::RedactedSecret { .. }) => "RedactedSecret".to_string(),
             Value::Deferred(DeferredValue::Unknown(_)) => "Unknown".to_string(),
         }
     }

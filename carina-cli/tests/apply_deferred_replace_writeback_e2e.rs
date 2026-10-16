@@ -251,6 +251,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
                 "path".to_string(),
                 Value::Concrete(ConcreteValue::String("carina.state.json".into())),
             )]),
+            attribute_spans: Default::default(),
         }),
         plan,
         sorted_resources: sorted_resources.clone(),
@@ -306,16 +307,16 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         .with_attribute("name", serde_json::json!("main-current"))
         .with_attribute("status", serde_json::json!("ACTIVE"));
     row.binding = Some("main".to_string());
-    row.deposed.push(DeposedInstance {
-        key: deposed_key.clone(),
-        identifier: "main-old".to_string(),
-        provider_instance: None,
-        attributes: HashMap::from([
+    row.deposed.push(DeposedInstance::from_persisted_json(
+        deposed_key.clone(),
+        "main-old".to_string(),
+        None,
+        HashMap::from([
             ("name".to_string(), serde_json::json!("main-old")),
             ("status".to_string(), serde_json::json!("STALE")),
         ]),
-        dependency_bindings: std::collections::BTreeSet::new(),
-    });
+        std::collections::BTreeSet::new(),
+    ));
     state
         .upsert_resource(row)
         .expect("test state setup must be valid");
@@ -362,6 +363,7 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
                 "path".to_string(),
                 Value::Concrete(ConcreteValue::String("carina.state.json".into())),
             )]),
+            attribute_spans: Default::default(),
         }),
         plan,
         sorted_resources: vec![],

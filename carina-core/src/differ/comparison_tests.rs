@@ -6,6 +6,15 @@ use crate::resource::{CanonicalEnumValue, ConcreteValue, DeferredValue, Value, V
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
 
+fn persisted_secret(marker: &str) -> Value {
+    let hash = crate::value::persisted_secret_hash(marker)
+        .expect("test fixture must be a complete persisted secret marker");
+    serde_json::from_value(serde_json::json!({
+        "RedactedSecret": { "hash": hash }
+    }))
+    .expect("deserialize persisted secret")
+}
+
 #[test]
 fn type_aware_int_float_coercion() {
     assert!(type_aware_equal(
@@ -845,14 +854,14 @@ fn secret_unchanged_same_hash() {
     // State has the hash string, desired has the Secret wrapper
     assert!(type_aware_equal(
         &secret_value,
-        &Value::Concrete(ConcreteValue::String(hash_str.clone().into())),
+        &persisted_secret(&hash_str),
         None,
         crate::schema::empty_defs_for_schema_walks(),
         None,
     ));
     // Reversed order should also work
     assert!(type_aware_equal(
-        &Value::Concrete(ConcreteValue::String(hash_str.into())),
+        &persisted_secret(&hash_str),
         &secret_value,
         None,
         crate::schema::empty_defs_for_schema_walks(),
@@ -877,7 +886,7 @@ fn secret_changed_different_hash() {
     // New desired vs old state hash should be different
     assert!(!type_aware_equal(
         &new_secret,
-        &Value::Concrete(ConcreteValue::String(old_hash_str.into())),
+        &persisted_secret(&old_hash_str),
         None,
         crate::schema::empty_defs_for_schema_walks(),
         None,
@@ -895,10 +904,7 @@ fn secret_in_find_changed_attributes_no_change() {
     let hash_str = hash_json.as_str().unwrap().to_string();
 
     let desired = HashMap::from([("password".to_string(), secret_value)]);
-    let current = HashMap::from([(
-        "password".to_string(),
-        Value::Concrete(ConcreteValue::String(hash_str.into())),
-    )]);
+    let current = HashMap::from([("password".to_string(), persisted_secret(&hash_str))]);
 
     let changed = find_changed_attributes(&desired, &current, None, None, None, None);
     assert!(
@@ -942,10 +948,7 @@ fn secret_in_find_changed_attributes_changed() {
     let old_hash_str = old_hash_json.as_str().unwrap().to_string();
 
     let desired = HashMap::from([("password".to_string(), new_secret)]);
-    let current = HashMap::from([(
-        "password".to_string(),
-        Value::Concrete(ConcreteValue::String(old_hash_str.into())),
-    )]);
+    let current = HashMap::from([("password".to_string(), persisted_secret(&old_hash_str))]);
 
     let changed = find_changed_attributes(&desired, &current, None, None, None, None);
     assert!(
@@ -1025,10 +1028,7 @@ fn secret_in_map_no_change_when_hash_matches() {
             "Name".to_string(),
             Value::Concrete(ConcreteValue::String("test".into())),
         ),
-        (
-            "SecretTag".to_string(),
-            Value::Concrete(ConcreteValue::String(hash_str.into())),
-        ),
+        ("SecretTag".to_string(), persisted_secret(&hash_str)),
     ])));
 
     let desired = HashMap::from([("tags".to_string(), desired_tags)]);
@@ -1067,10 +1067,7 @@ fn secret_with_context_no_change_when_hash_matches() {
     let hash_str = hash_json.as_str().unwrap().to_string();
 
     let desired = HashMap::from([("master_password".to_string(), secret_value)]);
-    let current = HashMap::from([(
-        "master_password".to_string(),
-        Value::Concrete(ConcreteValue::String(hash_str.into())),
-    )]);
+    let current = HashMap::from([("master_password".to_string(), persisted_secret(&hash_str))]);
 
     // find_changed_attributes builds context from resource_id
     let changed = find_changed_attributes(&desired, &current, None, None, None, Some(&resource_id));
@@ -1109,10 +1106,7 @@ fn secret_with_context_detects_change() {
     let hash_str = hash_json.as_str().unwrap().to_string();
 
     let desired = HashMap::from([("master_password".to_string(), new_secret)]);
-    let current = HashMap::from([(
-        "master_password".to_string(),
-        Value::Concrete(ConcreteValue::String(hash_str.into())),
-    )]);
+    let current = HashMap::from([("master_password".to_string(), persisted_secret(&hash_str))]);
 
     let changed = find_changed_attributes(&desired, &current, None, None, None, Some(&resource_id));
     assert!(
@@ -1151,9 +1145,7 @@ fn secret_same_password_different_resources_produces_different_hashes() {
     let desired1 = HashMap::from([("master_password".to_string(), secret.clone())]);
     let current1 = HashMap::from([(
         "master_password".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            hash1.as_str().unwrap().to_string().into(),
-        )),
+        persisted_secret(hash1.as_str().unwrap()),
     )]);
     let changed1 = find_changed_attributes(&desired1, &current1, None, None, None, Some(&id1));
     assert!(
@@ -1171,9 +1163,7 @@ fn secret_same_password_different_resources_produces_different_hashes() {
     let desired2 = HashMap::from([("master_password".to_string(), secret)]);
     let current2 = HashMap::from([(
         "master_password".to_string(),
-        Value::Concrete(ConcreteValue::String(
-            hash1.as_str().unwrap().to_string().into(),
-        )),
+        persisted_secret(hash1.as_str().unwrap()),
     )]);
     let changed2 = find_changed_attributes(&desired2, &current2, None, None, None, Some(&id2));
     assert!(
@@ -1669,7 +1659,7 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
     )]);
     canonicalize_states_with_schemas(&mut states, &registry);
 
-    let saved_attrs = RawSavedAttrs::from_persisted(HashMap::from([(
+    let saved_attrs = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
         id.clone(),
         HashMap::from([(
             "statement".to_string(),
@@ -1699,7 +1689,6 @@ fn carina3740_saved_nested_unauthored_union_scalar_is_no_change_via_pipeline() {
 fn carina3740_saved_nested_secret_hash_union_scalar_is_no_change() {
     use crate::provider::RawSavedAttrs;
     use crate::schema::{AttributeSchema, ResourceSchema, StructField};
-    use crate::value::SECRET_PREFIX;
 
     let config = AttributeType::struct_(
         "Config".to_string(),
@@ -1731,17 +1720,18 @@ fn carina3740_saved_nested_secret_hash_union_scalar_is_no_change() {
     );
     desired.id.provider = "test".to_string();
 
-    let secret_hash = format!("{SECRET_PREFIX}deadbeef");
+    let secret_hash = persisted_secret(&format!(
+        "{}{}",
+        crate::value::SECRET_PREFIX,
+        "deadbeef".repeat(8)
+    ));
     let persisted_config = || {
         IndexMap::from([
             (
                 "enabled".to_string(),
                 Value::Concrete(ConcreteValue::Bool(true)),
             ),
-            (
-                "password".to_string(),
-                Value::Concrete(ConcreteValue::String(secret_hash.clone().into())),
-            ),
+            ("password".to_string(), secret_hash.clone()),
         ])
     };
     let current = State::existing(
@@ -1751,7 +1741,7 @@ fn carina3740_saved_nested_secret_hash_union_scalar_is_no_change() {
             Value::Concrete(ConcreteValue::Map(persisted_config())),
         )]),
     );
-    let saved_attrs = RawSavedAttrs::from_persisted(HashMap::from([(
+    let saved_attrs = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
         desired.id.clone(),
         HashMap::from([(
             "config".to_string(),

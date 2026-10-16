@@ -186,8 +186,12 @@ pub fn run_module_info(signature: &FileSignature) -> io::Result<()> {
 /// When schemas are provided, the detail panel shows read-only attributes
 /// with `(known after apply)` and default values with `# default`,
 /// matching CLI `--detail full` behavior.
-pub fn run(plan: &Plan, schemas: &SchemaRegistry) -> io::Result<()> {
-    let mut app = App::new(plan, schemas);
+pub fn run(
+    plan: &Plan,
+    schemas: &SchemaRegistry,
+    historical_display: &carina_core::detail_rows::HistoricalDisplayAttributes,
+) -> io::Result<()> {
+    let mut app = App::new(plan, schemas, historical_display);
     run_tui(ui::draw, handle_key, &mut app)
 }
 
@@ -236,7 +240,7 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(create(Resource::new("s3.Bucket", "a")));
         plan.add(create(Resource::new("s3.Bucket", "b")));
-        App::new(&plan, &SchemaRegistry::new())
+        App::for_plan(&plan, &SchemaRegistry::new())
     }
 
     #[test]
@@ -296,7 +300,7 @@ mod tests {
                     ),
                 ),
         ));
-        App::new(&plan, &SchemaRegistry::new())
+        App::for_plan(&plan, &SchemaRegistry::new())
     }
 
     #[test]
@@ -496,7 +500,7 @@ mod tests {
         plan.add(create(
             Resource::with_provider("awscc", "s3.Bucket", "my-bucket", None).with_binding("bucket"),
         ));
-        App::new(&plan, &SchemaRegistry::new())
+        App::for_plan(&plan, &SchemaRegistry::new())
     }
 
     #[test]

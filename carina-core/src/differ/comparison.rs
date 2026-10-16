@@ -10,9 +10,7 @@ use crate::resource::{
     ConcreteValue, DeferredValue, ResolvedResourceId, SavedValueViews, Value, merge_with_saved,
 };
 use crate::schema::{AttributeType, ResourceSchema, empty_defs_for_schema_walks};
-use crate::value::{
-    SECRET_PREFIX, SecretHashContext, argon2id_hash, contains_secret, value_to_json_with_context,
-};
+use crate::value::{SecretHashContext, argon2id_hash, contains_secret, value_to_json_with_context};
 
 /// Type-aware semantic comparison of two Values.
 ///
@@ -28,7 +26,8 @@ use crate::value::{
 /// Without type information, falls back to `Value::semantically_equal()`.
 ///
 /// When `secret_ctx` is provided, it is used for context-specific salt when
-/// comparing `Value::Deferred(DeferredValue::Secret)` against state hash strings.
+/// comparing `Value::Deferred(DeferredValue::Secret)` against typed persisted
+/// state hashes.
 ///
 /// # Invariant: `Union[String, list(String)]` is canonicalized upstream
 ///
@@ -75,8 +74,8 @@ fn type_aware_equal_on_path<'a>(
     secret_ctx: Option<&SecretHashContext>,
     visited_refs: &[&'a str],
 ) -> bool {
-    // Secret comparison: compare the hash of the desired secret with the state hash string.
-    // State stores secrets as "_secret:argon2:<hex>", desired has Value::Deferred(DeferredValue::Secret(inner)).
+    // Secret comparison: compare the desired secret with the typed hash
+    // decoded from state. Desired carries `DeferredValue::Secret(inner)`.
     if let Value::Deferred(DeferredValue::Secret(inner)) = a {
         return secret_matches_state(inner, b, secret_ctx);
     }
@@ -498,8 +497,9 @@ fn is_type_default(
 /// Check if a secret's inner value matches a state value.
 ///
 /// Two cases are handled:
-/// 1. **Hash string** (from state file, `--refresh=false`): the state value is
-///    `"_secret:argon2:<hex>"`. We hash the inner value and compare hashes.
+/// 1. **Typed persisted hash** (from state file, `--refresh=false`): the state
+///    decoder has already lifted the marker to `RedactedSecret`. We hash the
+///    inner value and compare hashes.
 /// 2. **Plain-text string** (from provider read, `--refresh=true`): the state
 ///    value is the raw secret. We compare the inner value directly. This is the
 ///    fix for issue #1249 where secrets nested in Maps (e.g., tags) caused false
@@ -511,12 +511,11 @@ fn secret_matches_state(
     state_value: &Value,
     context: Option<&SecretHashContext>,
 ) -> bool {
-    let Value::Concrete(ConcreteValue::String(state_str)) = state_value else {
-        return false;
+    let state_hash = match state_value {
+        Value::Deferred(DeferredValue::RedactedSecret { hash }) => Some(hash.as_str()),
+        _ => None,
     };
-
-    // Case 1: State has a hashed value (from state file / --refresh=false)
-    if let Some(state_hash) = state_str.expose_plaintext().strip_prefix(SECRET_PREFIX) {
+    if let Some(state_hash) = state_hash {
         let Ok(inner_json) = value_to_json_with_context(inner, context) else {
             return false;
         };
@@ -529,8 +528,11 @@ fn secret_matches_state(
 
     // Case 2: State has plain-text value (from provider read / --refresh=true).
     // Compare the inner secret value directly against the raw state string.
-    match inner {
-        Value::Concrete(ConcreteValue::String(inner_str)) => inner_str == state_str,
+    match (inner, state_value) {
+        (
+            Value::Concrete(ConcreteValue::String(inner_str)),
+            Value::Concrete(ConcreteValue::String(state_str)),
+        ) => inner_str == state_str,
         _ => false,
     }
 }

@@ -56,9 +56,7 @@ impl DestroyCancellationFixture {
             let mut resource =
                 ResourceState::new("test.resource", identity, "mock").with_identifier("mock-id");
             resource.binding = Some(name.to_string());
-            resource
-                .attributes
-                .insert("name".to_string(), serde_json::json!(name));
+            resource.set_persisted_attribute("name".to_string(), serde_json::json!(name));
             state
                 .upsert_resource(resource)
                 .expect("test state setup must be valid");
@@ -87,9 +85,7 @@ impl DestroyCancellationFixture {
             let mut resource =
                 ResourceState::new("test.resource", identity, "mock").with_identifier("mock-id");
             resource.binding = Some(name.to_string());
-            resource
-                .attributes
-                .insert("name".to_string(), serde_json::json!(name));
+            resource.set_persisted_attribute("name".to_string(), serde_json::json!(name));
             state
                 .upsert_resource(resource)
                 .expect("test state setup must be valid");

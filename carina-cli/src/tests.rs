@@ -215,8 +215,8 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
 
     let saved_resource = saved.find_resource("aws", "s3.Bucket", "bucket").unwrap();
     assert_eq!(
-        saved_resource.attributes.get("status"),
-        Some(&json!("after"))
+        saved_resource.persisted_attributes().get("status"),
+        carina_core::value::json_to_dsl_value(&json!("after"))
     );
 }
 
@@ -317,8 +317,8 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
 
     let saved_resource = saved.find_resource("aws", "s3.Bucket", "bucket").unwrap();
     assert_eq!(
-        saved_resource.attributes.get("status"),
-        Some(&json!("saved"))
+        saved_resource.persisted_attributes().get("status"),
+        carina_core::value::json_to_dsl_value(&json!("saved"))
     );
 }
 
@@ -398,6 +398,7 @@ fn plan_file_serde_round_trip() {
                     Value::Concrete(ConcreteValue::String("prod/carina.state".into())),
                 ),
             ]),
+            attribute_spans: HashMap::new(),
         }),
         plan,
         sorted_resources: sorted_resources.clone(),
@@ -561,7 +562,7 @@ fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
 
     let mut state_file = StateFile::new();
     let mut rs = ResourceState::new("s3.Bucket", "test-bucket", "awscc");
-    rs.attributes.insert(
+    rs.set_persisted_attribute(
         "bucket_name".to_string(),
         serde_json::json!("my-app-existing1"),
     );
@@ -596,7 +597,7 @@ fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
 
     let mut state_file = StateFile::new();
     let mut rs = ResourceState::new("s3.Bucket", "test-bucket", "awscc");
-    rs.attributes.insert(
+    rs.set_persisted_attribute(
         "bucket_name".to_string(),
         serde_json::json!("old-prefix-existing1"),
     );
@@ -1176,11 +1177,12 @@ async fn detect_drift_errors_when_resource_missing_from_planned_states() {
     let provider = TestProvider::with_read_state(&id, "", State::not_found(id.clone()));
 
     // planned_states is empty - resource is missing
-    let planned_states: HashMap<ResourceId, State> = HashMap::new();
+    let planned_states = Vec::new();
 
     let result = detect_drift(
         &[resource],
         &planned_states,
+        &Default::default(),
         &provider,
         ApplyTarget::Project(std::path::Path::new(".")),
     )
@@ -1214,18 +1216,22 @@ async fn detect_drift_returns_none_when_no_drift() {
     .with_identifier(identifier);
 
     let provider = TestProvider::with_read_state(&id, identifier, state.clone());
-    let planned_states = HashMap::from([(id.clone(), state)]);
+    let planned_states = vec![CurrentStateEntry {
+        id: id.clone(),
+        state,
+    }];
 
     let result = detect_drift(
         &[resource],
         &planned_states,
+        &Default::default(),
         &provider,
         ApplyTarget::Project(std::path::Path::new(".")),
     )
-    .await;
+    .await
+    .expect("drift check succeeds");
 
-    assert!(result.is_ok());
-    assert!(result.unwrap().is_none(), "Should detect no drift");
+    assert!(result.drift_messages().is_none(), "Should detect no drift");
 }
 
 #[tokio::test]
@@ -1254,20 +1260,23 @@ async fn detect_drift_returns_messages_when_drift_detected() {
     .with_identifier(identifier);
 
     let provider = TestProvider::with_read_state(&id, identifier, actual);
-    let planned_states = HashMap::from([(id.clone(), planned)]);
+    let planned_states = vec![CurrentStateEntry {
+        id: id.clone(),
+        state: planned,
+    }];
 
     let result = detect_drift(
         &[resource],
         &planned_states,
+        &Default::default(),
         &provider,
         ApplyTarget::Project(std::path::Path::new(".")),
     )
-    .await;
+    .await
+    .expect("drift check succeeds");
 
-    assert!(result.is_ok());
-    let messages = result.unwrap();
-    assert!(messages.is_some(), "Should detect drift");
-    let msgs = messages.unwrap();
+    assert!(result.drift_messages().is_some(), "Should detect drift");
+    let msgs = result.drift_messages().unwrap();
     assert!(!msgs.is_empty(), "Should have drift messages");
 }
 
@@ -1775,13 +1784,13 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
 async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally() {
     let mut state = StateFile::new();
     let mut row = ResourceState::new("s3.Bucket", "deposed-bucket", "");
-    row.deposed.push(DeposedInstance {
-        key: DeposedKey::new_unique(),
-        identifier: "old-bucket".to_string(),
-        provider_instance: None,
-        attributes: HashMap::from([("bucket".to_string(), json!("old-bucket"))]),
-        dependency_bindings: BTreeSet::new(),
-    });
+    row.deposed.push(DeposedInstance::from_persisted_json(
+        DeposedKey::new_unique(),
+        "old-bucket".to_string(),
+        None,
+        HashMap::from([("bucket".to_string(), json!("old-bucket"))]),
+        BTreeSet::new(),
+    ));
     state
         .upsert_resource(row)
         .expect("test state setup must be valid");
@@ -1835,16 +1844,16 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
 
     let mut state = StateFile::new();
     let mut row = ResourceState::new("s3.Bucket", "alive-deposed-bucket", "");
-    row.deposed.push(DeposedInstance {
-        key: DeposedKey::new_unique(),
-        identifier: "old-bucket".to_string(),
-        provider_instance: None,
-        attributes: HashMap::from([
+    row.deposed.push(DeposedInstance::from_persisted_json(
+        DeposedKey::new_unique(),
+        "old-bucket".to_string(),
+        None,
+        HashMap::from([
             ("bucket".to_string(), json!("old-bucket")),
             ("status".to_string(), json!("stale")),
         ]),
-        dependency_bindings: BTreeSet::new(),
-    });
+        BTreeSet::new(),
+    ));
     state
         .upsert_resource(row)
         .expect("test state setup must be valid");
@@ -1879,8 +1888,8 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
         .expect("shell row should remain while the deposed generation is alive");
     assert_eq!(row.deposed.len(), 1);
     assert_eq!(
-        row.deposed[0].attributes.get("status"),
-        Some(&json!("alive"))
+        row.deposed[0].persisted_attributes().get("status"),
+        carina_core::value::json_to_dsl_value(&json!("alive"))
     );
 }
 
@@ -2441,8 +2450,10 @@ fn build_state_after_apply_persists_write_only_attributes() {
 
     // The write-only attribute should be persisted from the desired resource
     assert_eq!(
-        saved_resource.attributes.get("ipv4_netmask_length"),
-        Some(&json!(16)),
+        saved_resource
+            .persisted_attributes()
+            .get("ipv4_netmask_length"),
+        carina_core::value::json_to_dsl_value(&json!(16)),
         "write-only attribute should be persisted in state"
     );
     assert_eq!(
@@ -2453,8 +2464,8 @@ fn build_state_after_apply_persists_write_only_attributes() {
 
     // The regular attribute should also be there
     assert_eq!(
-        saved_resource.attributes.get("cidr_block"),
-        Some(&json!("10.0.0.0/16"))
+        saved_resource.persisted_attributes().get("cidr_block"),
+        carina_core::value::json_to_dsl_value(&json!("10.0.0.0/16"))
     );
 }
 
@@ -2611,8 +2622,10 @@ fn build_state_after_apply_write_only_detects_value_change() {
 
     // The write-only attribute should have the NEW value (24, not 16)
     assert_eq!(
-        saved_resource.attributes.get("ipv4_netmask_length"),
-        Some(&json!(24)),
+        saved_resource
+            .persisted_attributes()
+            .get("ipv4_netmask_length"),
+        carina_core::value::json_to_dsl_value(&json!(24)),
         "write-only attribute should reflect the updated desired value"
     );
 }
@@ -2620,7 +2633,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
 #[test]
 fn plan_file_serialization_redacts_secrets() {
     use carina_core::value::{
-        SECRET_PREFIX, redact_secrets_in_plan, redact_secrets_in_resource, redact_secrets_in_state,
+        redact_secrets_in_plan, redact_secrets_in_resource, redact_secrets_in_state,
     };
 
     // Build a plan with secrets in resources, states, and effects
@@ -2683,10 +2696,11 @@ fn plan_file_serialization_redacts_secrets() {
         json
     );
 
-    // The hash prefix should appear (secrets are replaced with hashes)
+    // The hash is carried only by the dedicated placeholder, never by an
+    // ordinary string that could cross the provider boundary.
     assert!(
-        json.contains(SECRET_PREFIX),
-        "Plan file JSON should contain secret hash prefix.\nJSON:\n{}",
+        json.contains("RedactedSecret") && json.contains("\"hash\""),
+        "Plan file JSON should contain a typed secret placeholder.\nJSON:\n{}",
         json
     );
 
