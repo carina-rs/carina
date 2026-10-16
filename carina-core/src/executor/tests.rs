@@ -496,62 +496,6 @@ impl crate::provider::ProviderNormalizer for CanonicalizingNormalizer {
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
-
-    fn merge_default_tags<'a>(
-        &'a self,
-        _resources: &'a mut [Resource],
-        _default_tags: &'a indexmap::IndexMap<String, Value>,
-        _registry: &'a crate::schema::SchemaRegistry,
-    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
-        crate::provider::ready_noop()
-    }
-}
-
-struct DefaultTagsNormalizer;
-
-impl crate::provider::ProviderNormalizer for DefaultTagsNormalizer {
-    fn normalize_desired<'a>(
-        &'a self,
-        _resources: &'a mut [Resource],
-    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
-        crate::provider::ready_noop()
-    }
-
-    fn normalize_state<'a>(
-        &'a self,
-        _current_states: &'a mut HashMap<ResourceId, State>,
-    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
-        crate::provider::ready_noop()
-    }
-
-    fn hydrate_read_state<'a>(
-        &'a self,
-        _current_states: &'a mut HashMap<ResourceId, State>,
-        _saved_attrs: &'a crate::provider::SavedAttrs,
-    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
-        crate::provider::ready_noop()
-    }
-
-    fn merge_default_tags<'a>(
-        &'a self,
-        resources: &'a mut [Resource],
-        default_tags: &'a indexmap::IndexMap<String, Value>,
-        _registry: &'a crate::schema::SchemaRegistry,
-    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
-        Box::pin(async move {
-            for resource in resources {
-                let mut tags = match resource.get_attr("tags") {
-                    Some(Value::Concrete(ConcreteValue::Map(tags))) => tags.clone(),
-                    _ => indexmap::IndexMap::new(),
-                };
-                for (key, value) in default_tags {
-                    tags.entry(key.clone()).or_insert_with(|| value.clone());
-                }
-                resource.set_attr("tags", Value::Concrete(ConcreteValue::Map(tags)));
-            }
-            Ok(())
-        })
-    }
 }
 
 struct SecretListToScalarNormalizer;
@@ -591,15 +535,6 @@ impl crate::provider::ProviderNormalizer for SecretListToScalarNormalizer {
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
-
-    fn merge_default_tags<'a>(
-        &'a self,
-        _resources: &'a mut [Resource],
-        _default_tags: &'a indexmap::IndexMap<String, Value>,
-        _registry: &'a crate::schema::SchemaRegistry,
-    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
-        crate::provider::ready_noop()
-    }
 }
 
 // -----------------------------------------------------------------------
@@ -613,6 +548,20 @@ use std::sync::LazyLock;
 /// Empty schema registry shared by tests that don't exercise the
 /// canonicalize stage. `'static` so it can back `&` in `ExecutionInput`.
 static TEST_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(SchemaRegistry::new);
+
+static DEFAULT_TAG_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "test",
+        ResourceSchema::new("test").attribute(AttributeSchema::new(
+            "tags",
+            AttributeType::map(AttributeType::string()),
+        )),
+    );
+    registry
+});
 
 /// Registry whose `test`-provider `sg` resource declares `subject` as
 /// `Union[String, list(String)]` (the `string_or_list_of_strings`
@@ -1573,15 +1522,6 @@ impl crate::provider::ProviderNormalizer for MustNotNormalizeInvalidValue {
         &'a self,
         _current_states: &'a mut HashMap<ResourceId, State>,
         _saved_attrs: &'a crate::provider::SavedAttrs,
-    ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
-        crate::provider::ready_noop()
-    }
-
-    fn merge_default_tags<'a>(
-        &'a self,
-        _resources: &'a mut [Resource],
-        _default_tags: &'a indexmap::IndexMap<String, Value>,
-        _registry: &'a crate::schema::SchemaRegistry,
     ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
         crate::provider::ready_noop()
     }
@@ -4186,7 +4126,7 @@ async fn test_apply_renormalizes_update_path() {
 #[tokio::test]
 async fn test_apply_update_patch_preserves_provider_default_tags() {
     let provider = MockProvider::new();
-    let mut to_resource = make_resource("tagged", &[]);
+    let mut to_resource = Resource::with_provider("test", "test", "tagged", None);
     let rid = to_resource.id.clone();
     let mut desired_tags = indexmap::IndexMap::new();
     desired_tags.insert(
@@ -4241,10 +4181,10 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
         bindings: ResolvedBindings::default(),
         current_states: HashMap::new(),
         deferred_data_source_reads: DeferredDataSourceReads::none(),
-        normalizer: &DefaultTagsNormalizer,
+        normalizer: &NoopNormalizer,
         provider_configs: &provider_configs,
         factories: &[],
-        schemas: &TEST_SCHEMAS,
+        schemas: &DEFAULT_TAG_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
     };
 
@@ -4710,15 +4650,6 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
             &'a self,
             _current_states: &'a mut HashMap<ResourceId, State>,
             _saved_attrs: &'a crate::provider::SavedAttrs,
-        ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
-            crate::provider::ready_noop()
-        }
-
-        fn merge_default_tags<'a>(
-            &'a self,
-            _resources: &'a mut [Resource],
-            _default_tags: &'a indexmap::IndexMap<String, Value>,
-            _registry: &'a crate::schema::SchemaRegistry,
         ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
             crate::provider::ready_noop()
         }
@@ -7793,15 +7724,6 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             &'a self,
             _current_states: &'a mut HashMap<ResourceId, State>,
             _saved_attrs: &'a crate::provider::SavedAttrs,
-        ) -> BoxFuture<'a, ProviderResult<()>> {
-            crate::provider::ready_noop()
-        }
-
-        fn merge_default_tags<'a>(
-            &'a self,
-            _resources: &'a mut [Resource],
-            _default_tags: &'a indexmap::IndexMap<String, Value>,
-            _registry: &'a crate::schema::SchemaRegistry,
         ) -> BoxFuture<'a, ProviderResult<()>> {
             crate::provider::ready_noop()
         }

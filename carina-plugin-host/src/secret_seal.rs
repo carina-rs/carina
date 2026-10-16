@@ -12,7 +12,6 @@ use std::future::Future;
 
 use carina_core::resource::{ConcreteValue, DeferredValue, Resource, Value};
 use carina_core::value::SerializationError;
-use indexmap::IndexMap;
 
 use crate::wasm_convert;
 use crate::wasm_factory::version_checked_bindings::wit_types as wit;
@@ -21,7 +20,6 @@ const TOKEN_NAMESPACE: &str = "carina-sealed-secret";
 
 pub(crate) struct SealedDesired {
     resources: Vec<wit::ResourceDef>,
-    default_tags: Vec<(String, wit::Value)>,
 }
 
 impl SealedDesired {
@@ -30,10 +28,10 @@ impl SealedDesired {
         call: F,
     ) -> Result<Result<GuestDesired, P>, E>
     where
-        F: FnOnce(&'a [wit::ResourceDef], &'a [(String, wit::Value)]) -> Fut,
+        F: FnOnce(&'a [wit::ResourceDef]) -> Fut,
         Fut: Future<Output = Result<Result<Vec<wit::ResourceDef>, P>, E>>,
     {
-        let result = call(&self.resources, &self.default_tags).await?;
+        let result = call(&self.resources).await?;
         Ok(result.map(GuestDesired::new))
     }
 }
@@ -59,17 +57,12 @@ pub(crate) struct Unsealer {
 #[derive(Debug)]
 pub(crate) enum SealError {
     ResourceValue(SerializationError),
-    DefaultTag {
-        key: String,
-        source: SerializationError,
-    },
 }
 
 impl fmt::Display for SealError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ResourceValue(_) => f.write_str("failed to encode sealed resource value"),
-            Self::DefaultTag { key, .. } => write!(f, "failed to encode default tag '{key}'"),
         }
     }
 }
@@ -77,7 +70,7 @@ impl fmt::Display for SealError {
 impl std::error::Error for SealError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::ResourceValue(source) | Self::DefaultTag { source, .. } => Some(source),
+            Self::ResourceValue(source) => Some(source),
         }
     }
 }
@@ -146,10 +139,7 @@ impl RestoredDesired {
     }
 }
 
-pub(crate) fn seal(
-    resources: &[Resource],
-    default_tags: Option<&IndexMap<String, Value>>,
-) -> Result<(SealedDesired, Unsealer), SealError> {
+pub(crate) fn seal(resources: &[Resource]) -> Result<(SealedDesired, Unsealer), SealError> {
     let nonce_prefix = format!("{TOKEN_NAMESPACE}:{}:", uuid::Uuid::new_v4().simple());
     let mut sealer = Sealer {
         nonce_prefix: nonce_prefix.clone(),
@@ -165,43 +155,10 @@ pub(crate) fn seal(
             wasm_convert::core_to_wit_resource(&sealed)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut encoded_default_tags = Vec::new();
-    for (key, value) in default_tags.into_iter().flatten() {
-        let checkpoint = sealer.secrets.len();
-        let sealed = sealer.seal_value(value);
-        match wasm_convert::core_to_wit_value(&sealed) {
-            Ok(value) => encoded_default_tags.push((key.clone(), value)),
-            Err(error) => {
-                sealer.secrets.truncate(checkpoint);
-                match &error {
-                    SerializationError::UnknownNotAllowed { .. }
-                    | SerializationError::UnresolvedResourceRef { .. }
-                    | SerializationError::UnresolvedInterpolation { .. }
-                    | SerializationError::UnresolvedFunctionCall { .. }
-                    | SerializationError::SecretNotAllowed { .. } => {
-                        log::error!(
-                            "Skipping default_tag '{key}' with unresolvable value: {error}"
-                        );
-                    }
-                    SerializationError::NonFiniteFloat { .. }
-                    | SerializationError::RedactedSecretNotAllowed { .. }
-                    | SerializationError::SavedPlanSecretContextUnavailable { .. } => {
-                        return Err(SealError::DefaultTag {
-                            key: key.clone(),
-                            source: error,
-                        });
-                    }
-                }
-            }
-        }
-    }
     let expected_resource_count = resources.len();
 
     Ok((
-        SealedDesired {
-            resources,
-            default_tags: encoded_default_tags,
-        },
+        SealedDesired { resources },
         Unsealer {
             nonce_prefix,
             secrets: sealer.secrets,
@@ -376,6 +333,7 @@ impl Unsealer {
 #[cfg(test)]
 mod tests {
     use carina_core::resource::{ConcreteValue, DeferredValue};
+    use indexmap::IndexMap;
 
     use super::*;
 
@@ -411,9 +369,6 @@ mod tests {
                 collect(value, &mut strings);
             }
         }
-        for (_, value) in &payload.default_tags {
-            collect(value, &mut strings);
-        }
         strings
     }
 
@@ -441,13 +396,13 @@ mod tests {
         resource
             .attributes
             .insert("sibling".to_string(), string("host-sibling"));
+        resource
+            .attributes
+            .insert("other".to_string(), secret(string("different-secret")));
         let mut resources = vec![resource];
         // The second secret makes index 1 valid, so non-canonical spellings
         // exercise exact-format validation rather than only bounds checking.
-        let default_tags =
-            IndexMap::from([("Other".to_string(), secret(string("different-secret")))]);
-        let (mut payload, unsealer) =
-            seal(&resources, Some(&default_tags)).expect("seal should succeed");
+        let (mut payload, unsealer) = seal(&resources).expect("seal should succeed");
         let wit::Value::StrVal(token) = guest_attribute_mut(&mut payload, "affected") else {
             panic!("expected a sealed token");
         };
@@ -478,7 +433,7 @@ mod tests {
                 resource_with_attribute("value", string("first")),
                 resource_with_attribute("value", string("second")),
             ];
-            let (mut payload, unsealer) = seal(&resources, None).expect("seal should succeed");
+            let (mut payload, unsealer) = seal(&resources).expect("seal should succeed");
 
             if return_extra_resource {
                 payload.resources.push(payload.resources[0].clone());
@@ -496,50 +451,6 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_default_tag_is_skipped() {
-        let resources = vec![Resource::with_provider(
-            "mock",
-            "test.resource",
-            "test",
-            None,
-        )];
-        let default_tags = IndexMap::from([(
-            "Owner".to_string(),
-            Value::Deferred(DeferredValue::Unknown(
-                carina_core::resource::UnknownReason::ForValue,
-            )),
-        )]);
-
-        let (payload, _) =
-            seal(&resources, Some(&default_tags)).expect("unresolved tags must be skipped");
-
-        assert!(payload.default_tags.is_empty());
-    }
-
-    #[test]
-    fn non_finite_default_tag_error_names_the_tag_key() {
-        let resources = vec![Resource::with_provider(
-            "mock",
-            "test.resource",
-            "test",
-            None,
-        )];
-        let default_tags = IndexMap::from([(
-            "InvalidFloatTag".to_string(),
-            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::Float(f64::NAN),
-            )])),
-        )]);
-
-        let error = match seal(&resources, Some(&default_tags)) {
-            Ok(_) => panic!("non-finite default tags must fail"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("InvalidFloatTag"), "{error}");
-    }
-
-    #[test]
     fn seal_restore_preserves_nested_map_and_list_secrets() {
         let original = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "items".to_string(),
@@ -553,98 +464,12 @@ mod tests {
             ])),
         )])));
         let mut resources = vec![resource_with_attribute("nested", original.clone())];
-        let (mut payload, unsealer) = seal(&resources, None).expect("seal should succeed");
+        let (mut payload, unsealer) = seal(&resources).expect("seal should succeed");
 
         let restored = unsealer.restore(take_guest_resources(&mut payload));
         restored.apply_to(&mut resources);
 
         assert_eq!(resources[0].get_attr("nested"), Some(&original));
-    }
-
-    #[test]
-    fn seal_restore_preserves_secret_from_default_tags() {
-        let original_secret = secret(string("default-tag-secret"));
-        let default_tags = IndexMap::from([("Token".to_string(), original_secret.clone())]);
-        let resources = vec![Resource::with_provider(
-            "mock",
-            "test.resource",
-            "test",
-            None,
-        )];
-        let (mut payload, unsealer) =
-            seal(&resources, Some(&default_tags)).expect("seal should succeed");
-        let (_, sealed_tag) = payload
-            .default_tags
-            .pop()
-            .expect("sealed default tag should be present");
-        let wit::Value::StrVal(token) = &sealed_tag else {
-            panic!("default-tag secret must be represented by an opaque string token");
-        };
-        assert!(!token.contains("default-tag-secret"));
-        payload.resources[0]
-            .attributes
-            .push(("copied_tag".to_string(), sealed_tag));
-        let mut restored_resources = resources;
-
-        let restored = unsealer.restore(take_guest_resources(&mut payload));
-        restored.apply_to(&mut restored_resources);
-
-        assert_eq!(
-            restored_resources[0].get_attr("copied_tag"),
-            Some(&original_secret)
-        );
-    }
-
-    #[test]
-    fn restore_allows_default_tag_secret_token_in_two_resources() {
-        let original_secret = secret(string("shared-default-tag-secret"));
-        let default_tags = IndexMap::from([("Token".to_string(), original_secret.clone())]);
-        let resources = vec![
-            Resource::with_provider("mock", "test.resource", "first", None),
-            Resource::with_provider("mock", "test.resource", "second", None),
-        ];
-        let (mut payload, unsealer) =
-            seal(&resources, Some(&default_tags)).expect("seal should succeed");
-        let (_, wit::Value::StrVal(token)) = payload
-            .default_tags
-            .pop()
-            .expect("sealed default tag should be present")
-        else {
-            panic!("default-tag secret must be represented by an opaque string token");
-        };
-        for resource in &mut payload.resources {
-            resource
-                .attributes
-                .push(("copied_tag".to_string(), wit::Value::StrVal(token.clone())));
-        }
-        let mut restored_resources = resources;
-
-        let restored = unsealer.restore(take_guest_resources(&mut payload));
-        restored.apply_to(&mut restored_resources);
-
-        for resource in &restored_resources {
-            assert_eq!(resource.get_attr("copied_tag"), Some(&original_secret));
-        }
-    }
-
-    #[test]
-    fn restore_allows_unused_default_tag_secret_token() {
-        let original_secret = secret(string("unused-default-tag-secret"));
-        let default_tags = IndexMap::from([("Token".to_string(), original_secret)]);
-        let resources = vec![Resource::with_provider(
-            "mock",
-            "test.resource",
-            "untaggable",
-            None,
-        )];
-        let (mut payload, unsealer) =
-            seal(&resources, Some(&default_tags)).expect("seal should succeed");
-        let mut restored_resources = resources;
-
-        let restored = unsealer.restore(take_guest_resources(&mut payload));
-        restored.apply_to(&mut restored_resources);
-
-        assert!(restored_resources[0].attributes.is_empty());
     }
 
     #[test]
@@ -654,7 +479,7 @@ mod tests {
             secret(string("second-secret")),
         ]));
         let mut resources = vec![resource_with_attribute("items", original)];
-        let (mut payload, unsealer) = seal(&resources, None).expect("seal should succeed");
+        let (mut payload, unsealer) = seal(&resources).expect("seal should succeed");
         let wit::Value::ListVal(json) = &mut payload.resources[0].attributes[0].1 else {
             panic!("expected a sealed list");
         };
@@ -679,7 +504,7 @@ mod tests {
     fn restore_flattens_secret_val_wrapped_token() {
         let original_secret = secret(string("secret-val-wrapped-token"));
         let mut resources = vec![resource_with_attribute("secret", original_secret.clone())];
-        let (mut payload, unsealer) = seal(&resources, None).expect("seal should succeed");
+        let (mut payload, unsealer) = seal(&resources).expect("seal should succeed");
         let wit::Value::StrVal(token) = &payload.resources[0].attributes[0].1 else {
             panic!("expected a sealed token");
         };
@@ -697,7 +522,7 @@ mod tests {
     fn restore_expands_string_list_token_to_secret_value() {
         let original_secret = secret(string("string-list-token"));
         let mut resources = vec![resource_with_attribute("items", original_secret.clone())];
-        let (mut payload, unsealer) = seal(&resources, None).expect("seal should succeed");
+        let (mut payload, unsealer) = seal(&resources).expect("seal should succeed");
         let wit::Value::StrVal(token) = &payload.resources[0].attributes[0].1 else {
             panic!("expected a sealed token");
         };
@@ -725,7 +550,7 @@ mod tests {
             .attributes
             .insert("sibling".to_string(), string("host-sibling"));
         let mut resources = vec![resource];
-        let (mut payload, unsealer) = seal(&resources, None).expect("seal should succeed");
+        let (mut payload, unsealer) = seal(&resources).expect("seal should succeed");
         let (_, wit::Value::StrVal(token)) = payload.resources[0]
             .attributes
             .iter()
@@ -771,7 +596,7 @@ mod tests {
             .attributes
             .insert("sibling".to_string(), string("host-sibling"));
         let mut resources = vec![resource];
-        let (mut payload, unsealer) = seal(&resources, None).expect("seal should succeed");
+        let (mut payload, unsealer) = seal(&resources).expect("seal should succeed");
         let secret_attribute = payload.resources[0]
             .attributes
             .iter_mut()
@@ -876,7 +701,7 @@ mod tests {
             .attributes
             .insert("sibling".to_string(), string("host-sibling"));
         let mut resources = vec![resource];
-        let (mut payload, unsealer) = seal(&resources, None).expect("seal should succeed");
+        let (mut payload, unsealer) = seal(&resources).expect("seal should succeed");
         *guest_attribute_mut(&mut payload, "affected") = wit::Value::StringListVal(
             serde_json::to_string(&vec!["first", "second"])
                 .expect("string list JSON serialization should succeed"),
@@ -910,7 +735,7 @@ mod tests {
             .insert("sibling".to_string(), string("host-sibling"));
         let second = resource_with_attribute("other", string("host-other"));
         let mut resources = vec![first, second];
-        let (mut payload, unsealer) = seal(&resources, None).expect("seal should succeed");
+        let (mut payload, unsealer) = seal(&resources).expect("seal should succeed");
         let (_, wit::Value::StrVal(token)) = payload.resources[0]
             .attributes
             .iter_mut()
@@ -948,7 +773,7 @@ mod tests {
     fn restore_replaces_duplicated_resource_attribute_token_everywhere() {
         let original_secret = secret(string("duplicated-secret"));
         let mut resources = vec![resource_with_attribute("secret", original_secret.clone())];
-        let (mut payload, unsealer) = seal(&resources, None).expect("seal should succeed");
+        let (mut payload, unsealer) = seal(&resources).expect("seal should succeed");
         let wit::Value::StrVal(token) = &payload.resources[0].attributes[0].1 else {
             panic!("expected a sealed token");
         };
@@ -972,7 +797,7 @@ mod tests {
             .attributes
             .insert("sibling".to_string(), string("host-sibling"));
         let mut resources = vec![resource];
-        let (mut payload, unsealer) = seal(&resources, None).expect("seal should succeed");
+        let (mut payload, unsealer) = seal(&resources).expect("seal should succeed");
         payload.resources[0]
             .attributes
             .retain(|(key, _)| key != "secret");
@@ -1010,15 +835,9 @@ mod tests {
                 secret(string("resource-plaintext-must-not-cross")),
             )]))),
         )];
-        let default_tags = IndexMap::from([(
-            "Token".to_string(),
-            secret(string("default-tag-plaintext-must-not-cross")),
-        )]);
-
-        let (payload, _) = seal(&resources, Some(&default_tags)).expect("seal should succeed");
+        let (payload, _) = seal(&resources).expect("seal should succeed");
         let wire_strings = payload_strings(&payload).join("\n");
 
         assert!(!wire_strings.contains("resource-plaintext-must-not-cross"));
-        assert!(!wire_strings.contains("default-tag-plaintext-must-not-cross"));
     }
 }

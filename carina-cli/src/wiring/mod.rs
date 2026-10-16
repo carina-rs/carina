@@ -936,7 +936,8 @@ pub fn compute_anonymous_identifiers_with_ctx(
 ///
 /// 1. `normalize_desired` — resolve DSL enum identifiers
 /// 2. `normalize_state` — convert raw API values to match DSL format
-/// 3. `merge_default_tags` — add provider-level default tags (must run after normalize_desired)
+/// 3. Host default-tag merge — add tags from each routed provider instance
+///    (must run after `normalize_desired`)
 /// 4. `resolve_enum_aliases` — convert to canonical AWS values in both resources and states
 pub struct PlanPreprocessor<'a> {
     normalizer: &'a dyn ProviderNormalizer,
@@ -1598,21 +1599,16 @@ pub async fn get_provider_with_ctx(
     // instance (`let <name> = provider <kind> { ... }`), reusing the
     // factory the default instance already brought in.
     for provider_config in configs.iter().filter(|config| config.is_default()) {
-        instantiate_provider_into_router(ctx, &mut router, provider_config, base_dir, None, None)
-            .await?;
+        instantiate_provider_into_router(ctx, &mut router, provider_config, base_dir, None).await?;
     }
 
-    for (provider_config, binding) in configs
-        .iter()
-        .filter_map(|config| config.binding().map(|binding| (config, binding)))
-    {
+    for provider_config in configs.iter().filter(|config| !config.is_default()) {
         let inherited_source = kind_default_source(configs, provider_config.name());
         instantiate_provider_into_router(
             ctx,
             &mut router,
             provider_config,
             base_dir,
-            Some(binding.to_string()),
             inherited_source,
         )
         .await?;
@@ -1691,9 +1687,8 @@ fn format_provider_using_line(
     }
 }
 
-/// Register a single provider instance into `router`. `binding = None`
-/// is the kind's default instance; `binding = Some(name)` is a named
-/// instance and routes resources tagged `directives { provider = name }`.
+/// Register a single provider instance into `router`. The config's binding
+/// determines whether this is the kind's default or a named instance.
 ///
 /// Source-loading (`provider <kind> { source = ... }`) is only invoked
 /// when this is the kind's default instance — named instances reuse the
@@ -1703,14 +1698,14 @@ async fn instantiate_provider_into_router(
     router: &mut ProviderRouter,
     provider_config: &ResolvedProviderConfig,
     base_dir: &Path,
-    binding: Option<String>,
     inherited_source: Option<&str>,
 ) -> Result<(), AppError> {
+    let binding = provider_config.binding();
     // Named instances inherit `source`/`version`/`revision` from the
     // kind's default — these fields are rejected by the parser when set
     // on `let <name> = provider <kind> { ... }`. Only the default
     // instance can trigger the source-loading path.
-    if binding.is_none()
+    if provider_config.is_default()
         && let Some(source) = provider_config.source()
     {
         try_add_source_provider(router, source, provider_config, base_dir).await?;
@@ -1721,41 +1716,34 @@ async fn instantiate_provider_into_router(
         let config = prepare_provider_ready_config(factory, provider_config)?;
         let region = factory.extract_region(config.attributes());
         // Reaching this branch implies `provider_config.source` is None:
-        // the early-return above handles `binding.is_none() && source.is_some()`,
+        // the early-return above handles a default config with a source,
         // and the parser rejects `source` on named instances. So the only
         // candidate for the log line is the kind default's source, threaded
         // in by the caller as `inherited_source`.
         println!(
             "{}",
-            format_provider_using_line(
-                factory.name(),
-                &region,
-                binding.as_deref(),
-                inherited_source,
-            )
-            .cyan()
+            format_provider_using_line(factory.name(), &region, binding, inherited_source).cyan()
         );
         let provider = factory
-            .create_provider(binding.as_deref(), &config)
+            .create_provider(binding, &config)
             .await
             .map_err(|e| e.for_provider(provider_config.name().to_string()))?;
         router.add_normalizer(
             provider_config.name().to_string(),
             factory
-                .create_normalizer(binding.as_deref(), &config)
+                .create_normalizer(binding, &config)
                 .await
                 .map_err(|e| e.for_provider(provider_config.name().to_string()))?,
         );
-        router.add_provider_instance(provider_config.name().to_string(), binding, provider);
+        router.add_provider_config(provider_config.as_provider_config(), provider);
     } else if ctx.uses_builtin_mock() && provider_config.name() == BUILTIN_PROVIDER_NAME {
         println!("{}", "Using mock provider".cyan());
-        router.add_provider_instance(
-            provider_config.name().to_string(),
-            binding,
+        router.add_provider_config(
+            provider_config.as_provider_config(),
             Box::new(MockProvider::new()),
         );
     } else if !provider_config.name().is_empty() {
-        let message = match &binding {
+        let message = match binding {
             // Named instance whose kind's default did not register a
             // factory — usually the default instance failed to load
             // (a separate error has already been printed for it).
@@ -1788,7 +1776,7 @@ async fn try_add_source_provider(
                 "{}",
                 format_provider_using_line(&name, &region, None, Some(source)).cyan()
             );
-            router.add_provider(name, provider);
+            router.add_provider_config(config.as_provider_config(), provider);
             router.add_normalizer(
                 config.name().to_string(),
                 factory
@@ -1798,6 +1786,7 @@ async fn try_add_source_provider(
             );
             Ok(())
         }
+        Err(LoadSourceError::KindMismatch(error)) => Err(error),
         Err(LoadSourceError::Provider(e)) => {
             // Provider init failure (e.g. allowed_account_ids mismatch).
             // Propagate verbatim so the CLI boundary can render it
@@ -1827,12 +1816,31 @@ async fn try_add_source_provider(
     }
 }
 
+fn ensure_source_provider_kind_matches(
+    configured: &str,
+    loaded: &str,
+    source: &str,
+) -> Result<(), AppError> {
+    if configured == loaded {
+        return Ok(());
+    }
+
+    Err(AppError::SourceProviderKindMismatch {
+        configured: configured.to_string(),
+        loaded: loaded.to_string(),
+        provider_source: source.to_string(),
+    })
+}
+
 /// Failure mode for `load_source_provider`. Distinguishing between a
 /// provider init rejection and other plumbing failures lets the caller
 /// surface the former as a structured error without the
 /// "Failed to load provider '...': ..." wrapper that obscures the
 /// real message (#2407).
 enum LoadSourceError {
+    /// The loaded artifact reported a provider kind other than the block
+    /// that selected it.
+    KindMismatch(AppError),
     /// Resolved provider configuration failed the construction gate.
     Config(carina_core::executor::ProviderConfigPreparationError),
     /// The provider's `init` step rejected the configuration (e.g.,
@@ -1886,6 +1894,8 @@ async fn load_source_provider(
             .map_err(LoadSourceError::Wasm)?,
     );
     let name = factory.name().to_string();
+    ensure_source_provider_kind_matches(config.name(), &name, source)
+        .map_err(LoadSourceError::KindMismatch)?;
 
     let ready_config =
         prepare_provider_ready_config(factory.as_ref(), config).map_err(LoadSourceError::Config)?;
@@ -1913,22 +1923,12 @@ pub async fn create_providers_from_configs_with_ctx(
     // first (they may load the WASM plugin), then named instances reuse
     // the factory that was just loaded.
     for config in configs.iter().filter(|config| config.is_default()) {
-        instantiate_provider_into_router(ctx, &mut router, config, base_dir, None, None).await?;
+        instantiate_provider_into_router(ctx, &mut router, config, base_dir, None).await?;
     }
-    for (config, binding) in configs
-        .iter()
-        .filter_map(|config| config.binding().map(|binding| (config, binding)))
-    {
+    for config in configs.iter().filter(|config| !config.is_default()) {
         let inherited_source = kind_default_source(configs, config.name());
-        instantiate_provider_into_router(
-            ctx,
-            &mut router,
-            config,
-            base_dir,
-            Some(binding.to_string()),
-            inherited_source,
-        )
-        .await?;
+        instantiate_provider_into_router(ctx, &mut router, config, base_dir, inherited_source)
+            .await?;
     }
 
     if router.is_empty() && ctx.uses_builtin_mock() {
@@ -2892,7 +2892,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
     let prepared_compositions = parsed.compositions.clone();
 
     // Run the normalization pipeline: normalize_desired → normalize_state →
-    // merge_default_tags → resolve_enum_aliases (resources, states, and
+    // host default-tag merge → resolve_enum_aliases (resources, states, and
     // wait `until` predicates — carina#3358). Order matters.
     let mut wait_bindings = parsed.wait_bindings.clone();
     let preprocessor = PlanPreprocessor::new(&provider, ctx);

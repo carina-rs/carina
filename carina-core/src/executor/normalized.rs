@@ -66,7 +66,7 @@
 use std::collections::HashMap;
 
 use crate::parser::ProviderConfig;
-use crate::provider::{ProviderFactory, ProviderNormalizer, ProviderResult};
+use crate::provider::{ProviderFactory, ProviderNormalizer, ProviderResult, merge_default_tags};
 use crate::resource::{
     ConcreteValue, DeferredValue, InterpolationPart, Resource, ResourceId, State, Value,
     contains_resource_ref,
@@ -148,8 +148,8 @@ pub async fn apply_desired_normalization_slice(
 /// Stages, in order:
 ///
 /// 1. [`ProviderNormalizer::normalize_desired`]
-/// 2. [`ProviderNormalizer::merge_default_tags`] for each [`ProviderConfig`]
-///    with non-empty `default_tags`
+/// 2. Host-owned default-tag merging for each [`ProviderConfig`], scoped to
+///    that config's provider instance
 /// 3. `resolve_enum_aliases_for_resources`
 ///
 /// Caller responsibilities:
@@ -178,11 +178,7 @@ pub async fn run_desired_normalization_stages(
 ) -> ProviderResult<()> {
     normalizer.normalize_desired(resources).await?;
     for config in provider_configs {
-        if !config.default_tags.is_empty() {
-            normalizer
-                .merge_default_tags(resources, &config.default_tags, schemas)
-                .await?;
-        }
+        merge_default_tags(config, resources, schemas)?;
     }
     crate::value::resolve_enum_aliases_for_resources(resources, factories);
     Ok(())

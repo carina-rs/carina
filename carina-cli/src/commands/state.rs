@@ -2800,15 +2800,6 @@ mod tests {
                 Ok(())
             })
         }
-
-        fn merge_default_tags<'a>(
-            &'a self,
-            _resources: &'a mut [Resource],
-            _default_tags: &'a indexmap::IndexMap<String, Value>,
-            _registry: &'a SchemaRegistry,
-        ) -> BoxFuture<'a, ProviderResult<()>> {
-            Box::pin(async { Ok(()) })
-        }
     }
 
     fn deposed_key(raw: &str) -> DeposedKey {

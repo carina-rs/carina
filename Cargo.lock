@@ -1052,6 +1052,7 @@ dependencies = [
  "carina-provider-protocol",
  "futures",
  "indexmap 2.13.0",
+ "log",
  "pest",
  "pest_derive",
  "regex",

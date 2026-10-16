@@ -142,17 +142,3 @@ pub struct HydrateReadStateParams {
 pub struct HydrateReadStateResult {
     pub states: HashMap<String, State>,
 }
-
-// -- merge_default_tags --
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MergeDefaultTagsParams {
-    pub resources: Vec<Resource>,
-    pub default_tags: HashMap<String, Value>,
-    pub schemas: Vec<ResourceSchema>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MergeDefaultTagsResult {
-    pub resources: Vec<Resource>,
-}

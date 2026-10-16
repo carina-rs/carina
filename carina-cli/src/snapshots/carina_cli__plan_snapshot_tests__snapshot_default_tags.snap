@@ -8,6 +8,7 @@ Execution Plan:
       cidr_block: "10.0.0.0/16"
       tags:
         Environment: "staging"
+        ManagedBy: "carina"  # default_tags
         Name: "main-vpc"
         │
         └─ + awscc.ec2.RouteTable awscc_ec2_route_table_634bd335

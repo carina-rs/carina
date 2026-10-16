@@ -11,13 +11,15 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::effect::PlanOp;
+use crate::parser::ProviderConfig;
 #[cfg(test)]
 use crate::resource::DataSource;
 use crate::resource::{
     ConcreteValue, DeferredValue, Directives, PartialReadMarker, ResolvedResource, Resource,
     ResourceId, State, Value,
 };
-use crate::schema::{ResourceSchema, SchemaRegistry, TypeIdentity};
+use crate::schema::{ResourceSchema, SchemaRegistry, Shape, TypeIdentity};
+use crate::value::SerializationError;
 use crate::wait::BindingPattern;
 use crate::wait::predicate::AttrPath;
 
@@ -1463,27 +1465,6 @@ pub trait ProviderNormalizer: Send + Sync {
         current_states: &'a mut HashMap<ResourceId, State>,
         saved_attrs: &'a SavedAttrs,
     ) -> BoxFuture<'a, ProviderResult<()>>;
-
-    /// Merge default tags from provider configuration into resources that support tags.
-    ///
-    /// For each resource whose schema includes a `tags` attribute:
-    /// - If the resource has no `tags`, set it to `default_tags`
-    /// - If the resource has `tags`, merge default_tags (resource-level tags win on conflict)
-    ///
-    /// Records which tag keys came from defaults in the `_default_tag_keys` internal
-    /// metadata attribute.
-    ///
-    /// No default body: an implicit no-op silently swallowed
-    /// `WasmProviderNormalizer`'s missing dispatch in
-    /// carina-rs/carina-provider-awscc#192. Every implementation now picks
-    /// explicitly between [`merge_default_tags_for_provider`], a custom
-    /// merge, or [`ready_noop`]'s deliberate no-op.
-    fn merge_default_tags<'a>(
-        &'a self,
-        resources: &'a mut [Resource],
-        default_tags: &'a IndexMap<String, Value>,
-        registry: &'a SchemaRegistry,
-    ) -> BoxFuture<'a, ProviderResult<()>>;
 }
 
 /// A no-op normalizer for providers that don't need plan-time normalization.
@@ -1511,44 +1492,157 @@ impl ProviderNormalizer for NoopNormalizer {
     ) -> BoxFuture<'a, ProviderResult<()>> {
         ready_noop()
     }
+}
 
-    fn merge_default_tags<'a>(
-        &'a self,
-        _resources: &'a mut [Resource],
-        _default_tags: &'a IndexMap<String, Value>,
-        _registry: &'a SchemaRegistry,
-    ) -> BoxFuture<'a, ProviderResult<()>> {
-        ready_noop()
+/// The routing identity shared by provider dispatch and host-owned default-tag
+/// normalization.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderRouteKey {
+    provider: String,
+    provider_instance: Option<String>,
+}
+
+impl ProviderRouteKey {
+    fn new(provider: impl Into<String>, provider_instance: Option<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            provider_instance,
+        }
+    }
+
+    fn matches(&self, id: &ResourceId) -> bool {
+        self.provider == id.provider && self.provider_instance == id.provider_instance
     }
 }
 
-/// Shared implementation for merging default tags into resources.
+impl From<&ProviderConfig> for ProviderRouteKey {
+    fn from(config: &ProviderConfig) -> Self {
+        Self::new(config.name.clone(), config.binding.clone())
+    }
+}
+
+impl From<&ResourceId> for ProviderRouteKey {
+    fn from(id: &ResourceId) -> Self {
+        Self::new(id.provider.clone(), id.provider_instance.clone())
+    }
+}
+
+/// Check a default-tag value before host-owned merging. Unresolved values are
+/// skippable; non-finite floats at any depth and redacted secrets are fatal.
+fn assert_default_tag_value_encodable(value: &Value) -> Result<(), SerializationError> {
+    match value {
+        Value::Concrete(ConcreteValue::List(items)) => {
+            for item in items {
+                assert_default_tag_value_encodable(item)?;
+            }
+            Ok(())
+        }
+        Value::Concrete(ConcreteValue::Map(entries)) => {
+            for value in entries.values() {
+                assert_default_tag_value_encodable(value)?;
+            }
+            Ok(())
+        }
+        // The former seal path replaced a whole secret with an opaque token
+        // before encoding, so its plaintext was not inspected by the boundary.
+        Value::Deferred(DeferredValue::Secret(_)) => Ok(()),
+        Value::Concrete(ConcreteValue::Float(value)) if !value.is_finite() => {
+            Err(SerializationError::NonFiniteFloat {
+                value: *value,
+                context: crate::value::SerializationContext::WasmBoundary,
+            })
+        }
+        Value::Concrete(ConcreteValue::String(_))
+        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
+        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
+        | Value::Concrete(ConcreteValue::Int(_))
+        | Value::Concrete(ConcreteValue::Float(_))
+        | Value::Concrete(ConcreteValue::Bool(_))
+        | Value::Concrete(ConcreteValue::Duration(_))
+        | Value::Concrete(ConcreteValue::StringList(_))
+        | Value::Deferred(DeferredValue::RedactedSecret { .. })
+        | Value::Deferred(DeferredValue::ResourceRef { .. })
+        | Value::Deferred(DeferredValue::BindingRef { .. })
+        | Value::Deferred(DeferredValue::Interpolation(_))
+        | Value::Deferred(DeferredValue::FunctionCall { .. })
+        | Value::Deferred(DeferredValue::Unknown(_)) => {
+            crate::resource::assert_value_fully_resolved(value)
+        }
+    }
+}
+
+/// Merge one provider instance's default tags into resources routed to it.
 ///
-/// For each resource matching `provider_name` whose schema includes a `tags` attribute:
-/// - If the resource has no `tags`, set it to `default_tags`
-/// - If the resource has `tags`, merge default_tags (resource-level tags win on conflict)
+/// For each resource matching the [`ProviderConfig`]'s `(name, binding)`
+/// routing key whose schema includes a `tags` attribute:
+/// - If the resource has no `tags`, set it to the config's `default_tags`
+/// - If the resource has `tags`, merge defaults in (resource-level tags win)
 ///
 /// Records which tag keys came from defaults in the `_default_tag_keys` internal
 /// metadata attribute.
-pub fn merge_default_tags_for_provider(
-    provider_name: &str,
+pub fn merge_default_tags(
+    config: &ProviderConfig,
     resources: &mut [Resource],
-    default_tags: &IndexMap<String, Value>,
     registry: &SchemaRegistry,
-) {
-    if default_tags.is_empty() {
-        return;
+) -> ProviderResult<()> {
+    if config.default_tags.is_empty() {
+        return Ok(());
     }
 
+    // Validate every tag before touching resources so a fatal encoding error
+    // cannot leave a partially merged desired state behind.
+    let mut default_tags = IndexMap::new();
+    for (key, value) in &config.default_tags {
+        match assert_default_tag_value_encodable(value) {
+            Ok(()) => {
+                default_tags.insert(key.clone(), value.clone());
+            }
+            Err(
+                error @ (SerializationError::UnknownNotAllowed { .. }
+                | SerializationError::UnresolvedResourceRef { .. }
+                | SerializationError::UnresolvedInterpolation { .. }
+                | SerializationError::UnresolvedFunctionCall { .. }
+                | SerializationError::SecretNotAllowed { .. }),
+            ) => {
+                log::error!("Skipping default_tag '{key}' with unresolvable value: {error}");
+            }
+            Err(
+                source @ (SerializationError::NonFiniteFloat { .. }
+                | SerializationError::RedactedSecretNotAllowed { .. }
+                | SerializationError::SavedPlanSecretContextUnavailable { .. }),
+            ) => {
+                return Err(ProviderError::invalid_input(format!(
+                    "failed to encode default tag '{key}' for provider '{}'",
+                    config.name
+                ))
+                .with_cause(source)
+                .for_provider(config.name.clone()));
+            }
+        }
+    }
+    if default_tags.is_empty() {
+        return Ok(());
+    }
+
+    let route = ProviderRouteKey::from(config);
     for resource in resources.iter_mut() {
-        if resource.id.provider != provider_name {
+        if !route.matches(&resource.id) {
             continue;
         }
 
-        // Check if the resource schema has a `tags` attribute
-        let has_tags = registry
-            .get_for(resource)
-            .is_some_and(|s| s.attributes.contains_key("tags"));
+        // Only a map(string) attribute can receive provider default tags.
+        // Some providers use the same attribute name for list/struct shapes;
+        // presence alone is therefore not enough to opt a resource in.
+        let has_tags = registry.get_for(resource).is_some_and(|schema| {
+            let Some(tags) = schema.attributes.get("tags") else {
+                return false;
+            };
+            let Shape::Map { key, value } = schema.shape_of(&tags.attr_type) else {
+                return false;
+            };
+            matches!(schema.shape_of(key), Shape::String { .. })
+                && matches!(schema.shape_of(value), Shape::String { .. })
+        });
 
         if !has_tags {
             continue;
@@ -1558,7 +1652,7 @@ pub fn merge_default_tags_for_provider(
         let mut default_tag_keys: Vec<String> = Vec::new();
         match resource.get_attr_mut("tags") {
             Some(Value::Concrete(ConcreteValue::Map(existing_tags))) => {
-                for (key, value) in default_tags {
+                for (key, value) in &default_tags {
                     if !existing_tags.contains_key(key) {
                         existing_tags.insert(key.clone(), value.clone());
                         default_tag_keys.push(key.clone());
@@ -1590,6 +1684,8 @@ pub fn merge_default_tags_for_provider(
             );
         }
     }
+
+    Ok(())
 }
 
 /// A provider that routes operations to the correct sub-provider
@@ -1602,7 +1698,7 @@ pub fn merge_default_tags_for_provider(
 ///   `let <name> = provider <kind> { ... }` and selected via
 ///   `directives { provider = <name> }`.
 pub struct ProviderRouter {
-    providers: HashMap<(String, Option<String>), Box<dyn Provider>>,
+    providers: HashMap<ProviderRouteKey, Box<dyn Provider>>,
     normalizers: Vec<(String, Box<dyn ProviderNormalizer>)>,
 }
 
@@ -1623,19 +1719,15 @@ impl ProviderRouter {
     /// Register the kind's default instance (resources with
     /// `provider_instance = None` route here).
     pub fn add_provider(&mut self, kind: String, provider: Box<dyn Provider>) {
-        self.providers.insert((kind, None), provider);
+        self.providers
+            .insert(ProviderRouteKey::new(kind, None), provider);
     }
 
-    /// Register a provider instance. `binding = None` registers the
-    /// kind's default instance; `binding = Some(name)` registers a
-    /// named instance.
-    pub fn add_provider_instance(
-        &mut self,
-        kind: String,
-        binding: Option<String>,
-        provider: Box<dyn Provider>,
-    ) {
-        self.providers.insert((kind, binding), provider);
+    /// Register a provider under the same route derived from its config by
+    /// host-owned normalization.
+    pub fn add_provider_config(&mut self, config: &ProviderConfig, provider: Box<dyn Provider>) {
+        self.providers
+            .insert(ProviderRouteKey::from(config), provider);
     }
 
     pub fn add_normalizer(
@@ -1651,7 +1743,7 @@ impl ProviderRouter {
     }
 
     fn get_provider_or_error(&self, id: &ResourceId) -> ProviderResult<&dyn Provider> {
-        let key = (id.provider.clone(), id.provider_instance.clone());
+        let key = ProviderRouteKey::from(id);
         self.providers.get(&key).map(|p| p.as_ref()).ok_or_else(|| {
             ProviderError::internal(match &id.provider_instance {
                 Some(binding) => format!(
@@ -1783,22 +1875,6 @@ impl ProviderNormalizer for ProviderRouter {
         Box::pin(async move {
             for (provider_name, ext) in &self.normalizers {
                 ext.hydrate_read_state(current_states, saved_attrs)
-                    .await
-                    .map_err(|error| error.for_provider(provider_name.clone()))?;
-            }
-            Ok(())
-        })
-    }
-
-    fn merge_default_tags<'a>(
-        &'a self,
-        resources: &'a mut [Resource],
-        default_tags: &'a IndexMap<String, Value>,
-        registry: &'a SchemaRegistry,
-    ) -> BoxFuture<'a, ProviderResult<()>> {
-        Box::pin(async move {
-            for (provider_name, ext) in &self.normalizers {
-                ext.merge_default_tags(resources, default_tags, registry)
                     .await
                     .map_err(|error| error.for_provider(provider_name.clone()))?;
             }
@@ -2184,6 +2260,61 @@ impl Provider for Box<dyn Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_default_tags_skips_unresolved_values() {
+        let config = ProviderConfig {
+            name: "aws".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::from([
+                (
+                    "ManagedBy".to_string(),
+                    Value::Concrete(ConcreteValue::String("carina".into())),
+                ),
+                (
+                    "Owner".to_string(),
+                    Value::resource_ref("management", "owner", Vec::new()),
+                ),
+            ]),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        };
+        let mut resources = vec![Resource::with_provider(
+            "aws",
+            "service.Widget",
+            "example",
+            None,
+        )];
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "aws",
+            crate::schema::ResourceSchema::new("service.Widget").attribute(
+                crate::schema::AttributeSchema::new(
+                    "tags",
+                    crate::schema::AttributeType::map(crate::schema::AttributeType::string()),
+                ),
+            ),
+        );
+
+        merge_default_tags(&config, &mut resources, &registry).unwrap();
+
+        assert_eq!(
+            resources[0].get_attr("tags"),
+            Some(&Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "ManagedBy".to_string(),
+                Value::Concrete(ConcreteValue::String("carina".into())),
+            )]))))
+        );
+        assert_eq!(
+            resources[0].get_attr("_default_tag_keys"),
+            Some(&Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("ManagedBy".into())),
+            ])))
+        );
+    }
 
     fn widget_status_registry() -> SchemaRegistry {
         let mut registry = SchemaRegistry::new();
@@ -2930,15 +3061,6 @@ mod tests {
             ) -> BoxFuture<'a, ProviderResult<()>> {
                 ready_noop()
             }
-
-            fn merge_default_tags<'a>(
-                &'a self,
-                _resources: &'a mut [Resource],
-                _default_tags: &'a IndexMap<String, Value>,
-                _registry: &'a SchemaRegistry,
-            ) -> BoxFuture<'a, ProviderResult<()>> {
-                ready_noop()
-            }
         }
 
         let mut router = ProviderRouter::new();
@@ -3510,16 +3632,21 @@ mod tests {
     async fn provider_router_dispatches_to_named_instance() {
         // Two instances of the same kind ("mock") routed by binding.
         let mut router = ProviderRouter::new();
-        router.add_provider_instance(
+        router.add_provider(
             "mock".to_string(),
-            None,
             Box::new(TaggedProvider { tag: "default" }),
         );
-        router.add_provider_instance(
-            "mock".to_string(),
-            Some("us".to_string()),
-            Box::new(TaggedProvider { tag: "us" }),
-        );
+        let named_config = ProviderConfig {
+            name: "mock".to_string(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::new(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: Some("us".to_string()),
+        };
+        router.add_provider_config(&named_config, Box::new(TaggedProvider { tag: "us" }));
 
         let default_id = ResourceId::with_provider_identity("mock", "test", "a", None);
         let state = router.read(&default_id, None, ReadRequest).await.unwrap();
@@ -3757,15 +3884,6 @@ mod tests {
                     Ok(())
                 })
             }
-
-            fn merge_default_tags<'a>(
-                &'a self,
-                _resources: &'a mut [Resource],
-                _default_tags: &'a IndexMap<String, Value>,
-                _registry: &'a SchemaRegistry,
-            ) -> BoxFuture<'a, ProviderResult<()>> {
-                ready_noop()
-            }
         }
 
         // Test normalize_desired
@@ -3908,15 +4026,6 @@ mod tests {
                 &'a self,
                 _current_states: &'a mut HashMap<ResourceId, State>,
                 _saved_attrs: &'a SavedAttrs,
-            ) -> BoxFuture<'a, ProviderResult<()>> {
-                ready_noop()
-            }
-
-            fn merge_default_tags<'a>(
-                &'a self,
-                _resources: &'a mut [Resource],
-                _default_tags: &'a IndexMap<String, Value>,
-                _registry: &'a SchemaRegistry,
             ) -> BoxFuture<'a, ProviderResult<()>> {
                 ready_noop()
             }

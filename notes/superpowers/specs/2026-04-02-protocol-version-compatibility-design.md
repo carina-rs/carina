@@ -1,10 +1,11 @@
 # Protocol Version Compatibility Design
 
 > Historical note (2026-10): the examples below describe the original v1
-> rollout. The current protocol and minimum supported protocol are both v3.
-> Protocol v3 changes the four normalizer exports to return structured
-> `provider-error` results and rejects v1/v2 components before typed WIT
-> binding.
+> rollout. Protocol v3 made normalizer exports return structured
+> `provider-error` results. Protocol v4 makes default-tag merging host-owned
+> and instance-scoped, removing its provider normalizer method, SDK/RPC method,
+> and WIT export. The current protocol and minimum supported protocol are both
+> v4; v1-v3 components are rejected before typed WIT binding.
 
 ## Problem
 

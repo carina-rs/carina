@@ -88,7 +88,7 @@ pub trait CarinaProvider {
 
     /// Return the list of optional capabilities this provider supports.
     /// Possible values: "normalize_desired", "normalize_state",
-    /// "hydrate_read_state", "merge_default_tags".
+    /// "hydrate_read_state".
     fn capabilities(&self) -> Vec<String> {
         vec![]
     }
@@ -234,17 +234,6 @@ pub trait CarinaProvider {
         saved_attrs: &HashMap<String, HashMap<String, Value>>,
     ) -> Result<(), ProviderError> {
         let _ = (states, saved_attrs);
-        Ok(())
-    }
-
-    /// Merge provider default_tags into resources.
-    fn merge_default_tags(
-        &self,
-        resources: &mut Vec<Resource>,
-        default_tags: &HashMap<String, Value>,
-        schemas: &Vec<ResourceSchema>,
-    ) -> Result<(), ProviderError> {
-        let _ = (resources, default_tags, schemas);
         Ok(())
     }
 }
@@ -421,19 +410,6 @@ fn dispatch(provider: &mut impl CarinaProvider, request: &Request) -> Response {
             let mut states = params.states;
             match provider.hydrate_read_state(&mut states, &params.saved_attrs) {
                 Ok(()) => Response::success(id, methods::HydrateReadStateResult { states }),
-                Err(e) => Response::error(id, -1, e.message),
-            }
-        }
-
-        "merge_default_tags" => {
-            let params: methods::MergeDefaultTagsParams = match parse_params(&request.params) {
-                Ok(p) => p,
-                Err(e) => return Response::error(id, -32602, e),
-            };
-            let mut resources = params.resources;
-            match provider.merge_default_tags(&mut resources, &params.default_tags, &params.schemas)
-            {
-                Ok(()) => Response::success(id, methods::MergeDefaultTagsResult { resources }),
                 Err(e) => Response::error(id, -1, e.message),
             }
         }

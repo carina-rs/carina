@@ -1776,7 +1776,7 @@ pub(crate) mod version_checked_bindings {
             desired: &secret_seal::SealedDesired,
         ) -> wasmtime::Result<Result<secret_seal::GuestDesired, wit_types::ProviderError>> {
             desired
-                .send(|resources, _| async move {
+                .send(|resources| async move {
                     match &self.raw {
                         RawWasmBindings::Basic(b) => {
                             b.carina_provider_provider()
@@ -1853,29 +1853,6 @@ pub(crate) mod version_checked_bindings {
                         .await
                 }
             }
-        }
-
-        pub(super) async fn call_merge_default_tags(
-            &self,
-            store: &mut Store<HostState>,
-            desired: &secret_seal::SealedDesired,
-        ) -> wasmtime::Result<Result<secret_seal::GuestDesired, wit_types::ProviderError>> {
-            desired
-                .send(|resources, default_tags| async move {
-                    match &self.raw {
-                        RawWasmBindings::Basic(b) => {
-                            b.carina_provider_provider()
-                                .call_merge_default_tags(store, resources, default_tags)
-                                .await
-                        }
-                        RawWasmBindings::Http(b) => {
-                            b.carina_provider_provider()
-                                .call_merge_default_tags(store, resources, default_tags)
-                                .await
-                        }
-                    }
-                })
-                .await
         }
     }
 }
@@ -3432,7 +3409,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         resources: &'a mut [Resource],
     ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
-            let (sealed, unsealer) = secret_seal::seal(resources, None)
+            let (sealed, unsealer) = secret_seal::seal(resources)
                 .map_err(|error| wasm_value_encode_provider_error("normalize_desired", error))?;
 
             // Plain `.await`, not a nested `block_on`: the guarded store is
@@ -3679,46 +3656,6 @@ impl ProviderNormalizer for WasmProviderNormalizer {
             }
 
             apply_wit_state_attribute_updates("hydrate_read_state", current_states, updates)?;
-            Ok(())
-        })
-    }
-
-    fn merge_default_tags<'a>(
-        &'a self,
-        resources: &'a mut [Resource],
-        default_tags: &'a IndexMap<String, Value>,
-        _registry: &'a carina_core::schema::SchemaRegistry,
-    ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
-        Box::pin(async move {
-            if default_tags.is_empty() {
-                return Ok(());
-            }
-
-            let (sealed, unsealer) = secret_seal::seal(resources, Some(default_tags))
-                .map_err(|error| wasm_value_encode_provider_error("merge_default_tags", error))?;
-
-            // Plain `.await`, not a nested `block_on` — see `normalize_desired`.
-            let result = {
-                let mut locked = LockedStore::acquire(&self.instance, "merge_default_tags").await?;
-                let call = self
-                    .instance
-                    .bindings
-                    .call_merge_default_tags(locked.store(), &sealed)
-                    .await;
-                finish_normalizer_guest_call(
-                    &self.instance,
-                    "merge_default_tags",
-                    &mut locked,
-                    call,
-                )
-            };
-            let result = result?;
-            // Guest preserves resource order; zip and overwrite
-            // attributes (merge may add `tags` and `_default_tag_keys`).
-            let restored = unsealer
-                .try_restore(result)
-                .map_err(|error| wasm_value_decode_provider_error("merge_default_tags", error))?;
-            restored.apply_to(resources);
             Ok(())
         })
     }
